@@ -146,6 +146,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bwa-neon"
+version = "0.0.0"
+dependencies = [
+ "bwa-extend",
+]
+
+[[package]]
 name = "bwa-sam"
 version = "0.0.0"
 

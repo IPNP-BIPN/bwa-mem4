@@ -42,12 +42,16 @@ Statut : **phases 0-7 terminees, phase 8 quasi terminee**.
   **8,1 Go** contre ~25 Go avant, ~16 o/base). `scripts/scale_test.sh` gere le gate par chromosome.
 - **Phase 8b (genome entier)** : **GRCh38 complet (3,1 Gbp, 194 contigs) construit par notre
   indexeur et gate d'octet-identite PASSE** : les 5 fichiers (`.pac`/`.ann`/`.amb`/`.bwt.2bit.64`/
-  `.0123`) **octet-identiques** a `bwa-mem2 index`. Build ~12 min, pic RSS **61-71 Go** (bien sous
-  la projection ~100 Go et les 128 Go ; garde memoire jamais declenchee). L'indexeur est
-  **mono-thread** (SA-IS sequentiel, comme le `saisxx` de bwa-mem2 ; cout unique). **Bug trouve par
-  le build genome-entier** : notre `.amb` fusionnait les N-runs a travers les frontieres de contigs
-  (telomere N de chr1 + N de chr2 comptes en un seul trou) ; `add1` de bwa-mem2 reset `lasts` par
-  contig, corrige (`build.rs`, teste). chr1/chr20 seuls (contig unique) ne l'exposaient pas.
+  `.0123`) **octet-identiques** a `bwa-mem2 index`. Pic RSS **~75 Go** (`/usr/bin/time -l`, sous les
+  128 Go ; garde memoire jamais declenchee). **Bug trouve par le build genome-entier** : notre
+  `.amb` fusionnait les N-runs a travers les frontieres de contigs (telomere N de chr1 + N de chr2
+  comptes en un seul trou) ; `add1` de bwa-mem2 reset `lasts` par contig, corrige (`build.rs`,
+  teste). chr1/chr20 seuls (contig unique) ne l'exposaient pas.
+- **Phase 8c (Tier A, perf indexeur)** : parallelisation rayon du post-traitement FM (BWT, CP_OCC,
+  echantillonnage SA, RC du `.0123`) + liberation des buffers d'entree avant le SA. Sortie
+  **octet-identique** (verifie tiny + chr20 + genome complet). Genome entier : **741 s -> 518 s
+  (~30 %, 12,3 -> 8,6 min)**, pic RSS ~inchange (le tableau SA i64 domine). **SA-IS reste
+  mono-thread** (Tier B = SA-IS parallele, reporte).
 
 ## Phase 9a : backend NEON (collaboration @nh13, PR bwa-mem2#288)
 

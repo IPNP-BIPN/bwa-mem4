@@ -22,6 +22,7 @@ bwa-sam = { path = "crates/bwa-sam" }
 bwa-mem = { path = "crates/bwa-mem" }
 bwa-diff = { path = "crates/bwa-diff" }
 bwa-gpu = { path = "crates/bwa-gpu" }
+bwa-neon = { path = "crates/bwa-neon" }
 # --- external ---
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

@@ -1,0 +1,11 @@
+[package]
+name = "bwa-neon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+bwa-extend = { workspace = true }
