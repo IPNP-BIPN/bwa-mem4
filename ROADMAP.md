@@ -107,18 +107,24 @@ fork/PR accordes sur `IPNP-BIPN/bwa-mem3-rs`). Voir `DEPENDENCIES.md` pour la pr
 
 **Phase 9a terminee.** Gate rempli : octet-identique au scalaire/oracle **et** speedup mesure.
 
-**Head-to-head M4 Max, `-t1`, 500k reads (region 2 Mbp), meme sortie octet-identique a l'oracle** :
+**Head-to-head M4 Max, `-t1`, 500k reads (region 2 Mbp), meme sortie octet-identique a l'oracle**
+(mediane de 3) :
 
 | Binaire | Temps reel | vs bwa-mem2 |
 |---|---|---|
-| `bwa-mem2` 2.3 (sse2neon, oracle) | 23,6 s | 1,00x |
-| **bwa-mem3-rs (nous)** | **15,9 s** | **1,48x** |
-| `fg-labs/bwa-mem3` (fork @nh13, natif) | 9,2 s | 2,58x |
+| `bwa-mem2` 2.3 (sse2neon, oracle) | 23,5 s | 1,00x |
+| **bwa-mem3-rs (nous)** | **11,8 s** | **2,00x** |
+| `fg-labs/bwa-mem3` (fork @nh13, natif) | 9,1 s | 2,59x |
 
-Le fork de @nh13 est **2,58x** sur M4 (sa revendication de 2x est conservatrice), et **1,74x plus
-rapide que nous**. L'ecart vient de ce qu'il a en plus, **hors chemin d'octet-identite** : `kswv` NEON
-natif (mate rescue, chez nous encore scalaire), build **PGO**, allocateur **mimalloc**, prefetch
-logiciel, `Accelerate`, alignement cache 128 o ; et sa bande `bandedSWA` plus grossiere evite le
-travail "union-band" que notre reproduction exacte de `ksw_extend2` impose. Notre kernel d'extension
-seul fait 1,6-2,16x vs notre scalaire ; le bout-en-bout est dilue par le seeding/chainage/IO non
-accelere. Reliquat perf pur (future phase) : `kswv` NEON, tuning P/E-core, PGO. Voir `DEPENDENCIES.md`.
+**Optimisations perf (phase 9a-perf, toutes octet-identiques)** partant de 15,9 s :
+- **Score DNA en compare vectoriel** (plus de gather par cellule) : `score = N ? npen : (t==q ? a : mm)`
+  via `vceqq`/`vbslq`, comme `bandedSWA`. Kernel 1,6->2,5x (melange), 2,2->3,4x (uniforme). 15,9->12,5 s.
+- **mimalloc** (allocateur global) : 12,5->11,9 s.
+- **`target-cpu=native`** + `backward_ext` (chargement bloc unique) : 11,9->11,8 s.
+
+Nous sommes passes de **1,48x a 2,00x** vs bwa-mem2 ; l'ecart au fork de @nh13 est tombe de **1,74x a
+1,30x**. **Il reste devant.** Le profil montre que le goulot est desormais le **seeding FM-index**
+(`backward_ext`+`smems_from_pos`, ~40-50 %), pas l'extension. Pour le depasser, reliquat (future phase,
+en gardant l'octet-identite) : **occ FM-index vectorise** facon `FMI_search` de bwa-mem2 (calcul des 4
+bases en un coup), port de la gestion de bande exacte de `getScores16`, `kswv` NEON pour le mate-rescue
+(PE), PGO (sans gain net ici, LTO deja agressif). Voir `DEPENDENCIES.md`.
