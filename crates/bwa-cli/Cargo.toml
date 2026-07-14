@@ -18,5 +18,6 @@ bwa-index = { workspace = true }
 bwa-mem = { workspace = true }
 bwa-neon = { workspace = true }
 clap = { workspace = true }
+mimalloc = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }

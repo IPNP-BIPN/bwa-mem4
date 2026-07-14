@@ -2,6 +2,12 @@
 
 use clap::{Parser, Subcommand};
 
+// mimalloc as the global allocator: the pipeline makes many small short-lived allocations (per-job
+// query/target buffers, per-chunk DP scratch, per-read region vectors); a fast allocator with good
+// locality cuts wall time noticeably. Does not affect output bytes (byte-identity preserved).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cmd_index;
 mod cmd_mem;
 
