@@ -32,7 +32,11 @@ Statut : **phases 0-7 terminees, phase 8 quasi terminee**.
 - **Phase 8a (rayon)** : parallelisation SE+PE, sortie octet-identique quel que soit `-t` (a `-K`
   fixe), ~6.5x sur 8 coeurs. Sur `phase8-scale`.
 - **Phase 8b (scaling)** : indexeur + aligneur valides **octet-identiques** jusqu'a **chr1 complet
-  (248 Mbp)** ; chr20 (64 Mbp) PE 8886/10000. **Bloqueur memoire resolu** : SA-IS **in-place**
+  (248 Mbp)**. **chr20 complet (64 Mbp)** apres la resorption de la traine : les 5 fichiers d'index
+  **octet-identiques**, PE **9994/10000** (99,94 %, contre 8886 avant le fix chaines+MAPQ). Les 6
+  residus sont la meme famille (regions sous-optimales sur loci repetitifs) : 3 `XA`/`XS`
+  cosmetiques, 1 MAPQ, 1 paire avec placement `POS`/`TLEN` different. **Bloqueur memoire resolu** :
+  SA-IS **in-place**
   (`crate::sais`, sous-probleme empaquete dans le tableau SA, pas de copie i64 de l'entree ni de
   tableaux O(n) par niveau). Index **octet-identique** confirme chr20 (RSS 2,2 Go) et chr1 (RSS
   **8,1 Go** contre ~25 Go avant, ~16 o/base). Genome entier 3,1 Gbp projete a **~100 Go < 128 Go**
