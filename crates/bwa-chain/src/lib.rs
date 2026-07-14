@@ -184,7 +184,149 @@ pub fn build_chains(
     for c in &mut chains {
         c.frac_rep = frac;
     }
+    // bwa-mem2 stores chains in a position-keyed kbtree and emits them via an in-order traversal,
+    // so `mem_chain_flt` receives them sorted by `pos` ascending. We build in seed-occurrence order,
+    // so re-sort to match; this ordering drives the (unstable) tie-break among equal-weight chains.
+    chains.sort_by_key(|c| c.pos);
     chains
+}
+
+/// Insertion sort over `a`, moving an element left while it is strictly `lt` its predecessor.
+/// Faithful port of klib's `__ks_insertsort` (stable for equal keys). `lt(x, y)` = `x < y`.
+fn ks_insertsort_by<T>(a: &mut [T], lt: &impl Fn(&T, &T) -> bool) {
+    for i in 1..a.len() {
+        let mut j = i;
+        while j > 0 && lt(&a[j], &a[j - 1]) {
+            a.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
+/// Comb sort, klib's `ks_combsort` (introsort's depth-limit fallback), ending with an insertion
+/// sort pass. `lt(x, y)` = `x < y`.
+fn ks_combsort_by<T>(a: &mut [T], lt: &impl Fn(&T, &T) -> bool) {
+    let n = a.len();
+    if n == 0 {
+        return;
+    }
+    const SHRINK: f64 = 1.2473309501039786540366528676643;
+    let mut gap = n;
+    loop {
+        if gap > 2 {
+            gap = (gap as f64 / SHRINK) as usize;
+            if gap == 9 || gap == 10 {
+                gap = 11;
+            }
+        }
+        let mut do_swap = false;
+        if gap < n {
+            let mut i = 0;
+            while i < n - gap {
+                let j = i + gap;
+                if lt(&a[j], &a[i]) {
+                    a.swap(i, j);
+                    do_swap = true;
+                }
+                i += 1;
+            }
+        }
+        if !(do_swap || gap > 2) {
+            break;
+        }
+    }
+    if gap != 1 {
+        ks_insertsort_by(a, lt);
+    }
+}
+
+/// Introspective sort, a faithful port of klib's `ks_introsort` (median-of-3 quicksort with a
+/// depth-limited comb-sort fallback and a final insertion-sort pass). This is deliberately the
+/// exact same (unstable) permutation bwa-mem2 applies in `mem_chain_flt`, so equal-weight chains
+/// resolve identically to the oracle. `lt(x, y)` = `x < y`.
+fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
+    let n = a.len();
+    if n < 1 {
+        return;
+    }
+    if n == 2 {
+        if lt(&a[1], &a[0]) {
+            a.swap(0, 1);
+        }
+        return;
+    }
+    let mut dd = 2usize;
+    while (1usize << dd) < n {
+        dd += 1;
+    }
+    let mut stack: Vec<(usize, usize, i64)> = Vec::new();
+    let mut s = 0usize;
+    let mut t = n - 1;
+    let mut d: i64 = (dd as i64) << 1;
+    loop {
+        if s < t {
+            d -= 1;
+            if d == 0 {
+                ks_combsort_by(&mut a[s..=t], &lt);
+                t = s;
+                continue;
+            }
+            let mut i = s;
+            let mut j = t;
+            // Median-of-3 pivot selection (klib picks the middle-biased index k).
+            let mut k = i + ((j - i) >> 1) + 1;
+            if lt(&a[k], &a[i]) {
+                if lt(&a[k], &a[j]) {
+                    k = j;
+                }
+            } else {
+                k = if lt(&a[j], &a[i]) { i } else { j };
+            }
+            if k != t {
+                a.swap(k, t);
+            }
+            // Pivot value now lives at index `t` and is untouched until the final swap below.
+            loop {
+                loop {
+                    i += 1;
+                    if !lt(&a[i], &a[t]) {
+                        break;
+                    }
+                }
+                loop {
+                    j -= 1;
+                    if !(i <= j && lt(&a[t], &a[j])) {
+                        break;
+                    }
+                }
+                if j <= i {
+                    break;
+                }
+                a.swap(i, j);
+            }
+            a.swap(i, t);
+            let is = i - s;
+            let ti = t - i;
+            if is > ti {
+                if is > 16 {
+                    stack.push((s, i - 1, d));
+                }
+                s = if ti > 16 { i + 1 } else { t };
+            } else {
+                if ti > 16 {
+                    stack.push((i + 1, t, d));
+                }
+                t = if is > 16 { i - 1 } else { s };
+            }
+        } else if let Some((l, r, dep)) = stack.pop() {
+            s = l;
+            t = r;
+            d = dep;
+        } else {
+            ks_insertsort_by(a, &lt);
+            return;
+        }
+    }
 }
 
 /// Filter chains for a single read: drop light chains, then prune overlapping ones. Port of
@@ -206,8 +348,9 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
         return a;
     }
 
-    // Sort by weight descending (`flt_lt`).
-    a.sort_by_key(|c| std::cmp::Reverse(c.w));
+    // Sort by weight descending with bwa-mem2's exact (unstable) `ks_introsort`, so equal-weight
+    // overlapping chains are ordered identically to the oracle (`flt_lt(a, b) = a.w > b.w`).
+    ks_introsort_by(&mut a, |x, y| x.w > y.w);
 
     a[0].kept = 3;
     let mut kept_idx: Vec<usize> = vec![0];
@@ -285,6 +428,45 @@ mod tests {
             FmIndex::load(Path::new(prefix)).unwrap(),
             BntSeq::load(Path::new(prefix)).unwrap(),
         )
+    }
+
+    // A brute-force reference introsort matching klib's structure is unnecessary; we assert the
+    // two invariants that must hold for any faithful port: the result is fully sorted by the
+    // comparator, and it is a permutation of the input. Byte-identity to the oracle's *unstable*
+    // permutation is covered by the end-to-end SAM gate.
+    #[test]
+    fn introsort_sorts_and_permutes_various_sizes() {
+        // Deterministic LCG so the test is reproducible without extra deps.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i32 % 100
+        };
+        for &n in &[0usize, 1, 2, 3, 5, 16, 17, 33, 64, 200, 1000] {
+            let orig: Vec<i32> = (0..n).map(|_| next()).collect();
+            let mut a = orig.clone();
+            ks_introsort_by(&mut a, |x, y| x > y); // descending, like flt_lt
+            for w in a.windows(2) {
+                assert!(w[0] >= w[1], "not sorted desc at n={n}: {a:?}");
+            }
+            let mut s1 = orig.clone();
+            let mut s2 = a.clone();
+            s1.sort_unstable();
+            s2.sort_unstable();
+            assert_eq!(s1, s2, "not a permutation at n={n}");
+        }
+    }
+
+    #[test]
+    fn introsort_two_element_special_case() {
+        let mut a = [1i32, 2];
+        ks_introsort_by(&mut a, |x, y| x > y);
+        assert_eq!(a, [2, 1]);
+        let mut b = [5i32, 3];
+        ks_introsort_by(&mut b, |x, y| x > y);
+        assert_eq!(b, [5, 3]);
     }
 
     #[test]

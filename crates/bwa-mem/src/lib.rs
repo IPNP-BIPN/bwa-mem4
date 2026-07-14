@@ -259,8 +259,8 @@ fn dump_regs(bns: &BntSeq, tag: &str, regs: &[MemAlnReg]) {
         let (rid, pos, rev) = region_to_pos(bns, r);
         let strand = if rev { '-' } else { '+' };
         eprintln!(
-            "  #{i} q[{},{}) r[{},{}) rid={rid} {strand}pos={pos} score={} truesc={} sub={} seedcov={} seedlen0={}",
-            r.qb, r.qe, r.rb, r.re, r.score, r.truesc, r.sub, r.seedcov, r.seedlen0
+            "  #{i} q[{},{}) r[{},{}) rid={rid} {strand}pos={pos} score={} truesc={} sub={} sub_n={} seedcov={} seedlen0={} frac_rep={}",
+            r.qb, r.qe, r.rb, r.re, r.score, r.truesc, r.sub, r.sub_n, r.seedcov, r.seedlen0, r.frac_rep
         );
     }
 }

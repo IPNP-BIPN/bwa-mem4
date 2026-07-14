@@ -279,4 +279,38 @@ mod tests {
         assert_ne!(hash_64(0), hash_64(1));
         assert_ne!(hash_64(1000), hash_64(1001));
     }
+
+    fn reg(score: i32, sub: i32, sub_n: i32, seedcov: i32, len: i32) -> MemAlnReg {
+        MemAlnReg {
+            rb: 0,
+            re: i64::from(len),
+            qb: 0,
+            qe: len,
+            rid: 0,
+            score,
+            truesc: score,
+            sub,
+            csub: 0,
+            sub_n,
+            seedcov,
+            seedlen0: 0,
+            secondary: -1,
+            secondary_all: -1,
+            w: 0,
+            frac_rep: 0.0,
+            is_alt: false,
+            hash: 0,
+            n_comp: 0,
+        }
+    }
+
+    #[test]
+    fn mapq_uses_truncated_int_coef_fac() {
+        // Oracle read `_96f`: score=145 sub=140 sub_n=1 seedcov=323 l=150 frac_rep=0 -> mapq=8.
+        // bwa-mem2's `mapQ_coef_fac` is an int = (int)log(50) = 3, not the float 3.912; the float
+        // yields 15 here, the int yields 8.
+        let opt = MemOpt::default();
+        let a = reg(145, 140, 1, 323, 150);
+        assert_eq!(mem_approx_mapq_se(&opt, &a), 8);
+    }
 }

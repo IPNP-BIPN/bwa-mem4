@@ -8,29 +8,40 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   `bwa-mem2`. Exclu du gate d'octet-identite (on compare `@SQ` + lignes d'alignement). Decision finale
   (spoof eventuel de `@PG`) reportee en fin de projet.
 
-## En cours
+## Résolu (phase 8, via oracle instrumenté)
 
-- **Parité des régions sous-optimales (`XS:i`, et indirectement `sub_n` donc parfois MAPQ), SE et
-  PE.** Sur 5000 reads/paires wgsim (chr20 2 Mb), état actuel (après portage `XA`) :
-  - **SE** : byte-identique sur **4660/5000** lignes ; tail = **317 `XS`-seul + 23 MAPQ**.
-  - **PE** : byte-identique sur **9366/10000** enregistrements ; tail = **626 `XS`-seul + 6 MAPQ
-    + 2 mate-rescue**. Cœur (FLAG/POS/CIGAR/RNEXT/PNEXT/TLEN/MC) quasi 100%, `mem_pestat` identique
-    bit-à-bit, `mem_pair` + MAPQ combinée vérifiés.
+- **Parité des régions sous-optimales (`XS`) + MAPQ, SE et PE : RÉSOLU.** Sur 5000 reads/paires
+  wgsim (chr20 2 Mb) : **SE 5000/5000** (100%), **PE 9999/10000**. Deux causes racines, trouvées en
+  comparant à un **oracle bit-identique instrumenté** (rebuild sse2neon v1.8.0 + safestringlib
+  v1.2.0 + les 2 patches, recette Homebrew reproduite dans `scratchpad/oracle-build` ; sortie
+  byte-identique au binaire installé hors `@PG`) qui dumpe SMEMs, chaînes pré/post-`mem_chain_flt`,
+  régions post-`mark_primary` et les entrées de `mem_approx_mapq_se` :
 
-  **Cause racine unique** (diagnostiquée, catégorisée) : notre ensemble de régions **sous-optimales
-  chevauchant le primaire sur la query** diffère légèrement de celui de l'oracle. `XS = sub` =
-  score de la meilleure telle région (`mem_mark_primary_se_core`), et `sub_n` = nombre de ces
-  régions à ≤ 7 pts du primaire (d'où l'écart MAPQ). Les 626 `XS` + 6 MAPQ PE (632/634 du tail) en
-  découlent tous. Le primaire (AS/POS/CIGAR) est **toujours** byte-identique ; seule la
-  sous-optimale diffère. Exemple SE `_514496` : oracle `XS`=44, nous 26 (on ne produit qu'un seed
-  26 bp à un autre locus). Écarts **dans les deux sens** (369 oracle>nous, 257 nous>oracle) → pas un
-  biais de bande SW mais la **complétude/parité exacte de la cascade seed→chain→extension des
-  sous-optimales**.
-  **Impact** : `XS` purement cosmétique (aucun effet POS/CIGAR/MAPQ) ; les 6 MAPQ sont réels mais
-  même cause. **Blocage diagnostic** : pinpointer exige la liste interne des régions de l'oracle
-  (avant `mem_mark_primary_se`), donc un **build instrumenté bit-identique** de l'oracle (yak-shave
-  sse2neon arm64). `bwa-mem2` n'a pas de sous-commande `fastmap` (le patch porte sur le driver
-  `mem`), donc pas de dump SMEM direct.
+  1. **Ordre des chaînes + tri instable dans `mem_chain_flt`** (résout 340 SE + 622 PE, tous des
+     régions sous-optimales à un locus différent). bwa-mem2 stocke les chaînes dans un kbtree keyé
+     par `pos` et les parcourt **in-order** (donc `pos` croissant) avant un `ks_introsort` **instable**
+     (comparateur `flt_lt = a.w > b.w`). Pour deux chaînes de **poids égal** qui se chevauchent sur
+     la query, le gagnant dépend (a) de l'ordre d'entrée et (b) de la permutation exacte de
+     l'introsort. On construisait les chaînes en ordre d'occurrence + tri **stable** → on gardait
+     l'autre locus. Fix : `build_chains` trie les chaînes par `pos`, et `mem_chain_flt` utilise un
+     portage fidèle de `ks_introsort` (quicksort médiane-de-3 + fallback combsort + insertsort final)
+     dans `crates/bwa-chain/src/lib.rs`. Le primaire (poids max) est toujours choisi identiquement.
+
+  2. **`mapQ_coef_fac` est un `int` dans bwa-mem2** (résout 23 SE + 6 PE, MAPQ seule, régions
+     identiques). `o->mapQ_coef_fac = (int)log(50) = 3`, pas `3.912`. On stockait le flottant
+     `ln(50)` → MAPQ trop élevée sur les cas limites (ex. `_96f` : oracle 8, nous 15). Fix :
+     `MemOpt::mapq_coef_fac = (50.0_f64.ln() as i32) as f64` dans `crates/bwa-core/src/opt.rs`.
+
+  Vérifié sans régression, `-t8` == `-t1` byte-identique (hors `@PG`).
+
+## En cours (résidu)
+
+- **1 enregistrement PE (`XS` cosmétique).** `_f3e` mate-2 : oracle `XS:i:33`, nous `44` ; MAPQ=60,
+  FLAG/POS/CIGAR/AS/MC identiques. La chaîne sous-optimale est au **même locus** (`rb=3189858`)
+  mais avec une **composition de seeds différente** (`seedcov` oracle 50 vs nous 20) sur un locus
+  répétitif, d'où une extension SW banded qui termine à un score différent. Cause **distincte** des
+  deux ci-dessus (extension, pas chaînage/MAPQ). `XS` purement cosmétique ; non poursuivi pour ne
+  pas risquer la parité SE 100 % / extension du primaire.
 
 - **`XA:Z` (hits alternatifs, `mem_gen_alt`) : PORTÉ (phase 8, byte-identique).** `xa_group` +
   `mem_gen_alt` (`crates/bwa-mem/src/alt.rs`), champ `secondary_all` sur `MemAlnReg` (swap

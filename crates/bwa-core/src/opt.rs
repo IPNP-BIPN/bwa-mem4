@@ -55,7 +55,9 @@ pub struct MemOpt {
     pub mask_level_redun: f32,
     /// MAPQ coefficient length.
     pub mapq_coef_len: f64,
-    /// MAPQ coefficient factor (`ln(mapq_coef_len)`).
+    /// MAPQ coefficient factor. bwa-mem2 declares this `int` and sets it to `(int)log(mapq_coef_len)`,
+    /// so the fractional part is truncated (`log(50) = 3.912` becomes `3`). We keep it as an `f64`
+    /// holding that already-truncated integer value; the truncation matters for borderline MAPQs.
     pub mapq_coef_fac: f64,
     /// Max insert size.
     pub max_ins: i32,
@@ -105,7 +107,8 @@ impl Default for MemOpt {
             xa_drop_ratio: 0.80,
             mask_level_redun: 0.95,
             mapq_coef_len: 50.0,
-            mapq_coef_fac: 50.0f64.ln(),
+            // (int)log(50) = 3, matching bwa-mem2's integer `mapQ_coef_fac`.
+            mapq_coef_fac: (50.0f64.ln() as i32) as f64,
             max_ins: 10000,
             max_matesw: 50,
             max_mem_intv: 20,
