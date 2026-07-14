@@ -123,6 +123,7 @@ name = "bwa-index"
 version = "0.0.0"
 dependencies = [
  "bwa-core",
+ "rayon",
 ]
 
 [[package]]
