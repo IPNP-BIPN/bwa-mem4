@@ -10,6 +10,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use bwa_core::{dna, Error, Result};
+use rayon::prelude::*;
 
 use crate::rand48::Rand48;
 use crate::sais::suffix_array_inplace;
@@ -93,6 +94,9 @@ pub fn build_index(fasta: &Path) -> Result<()> {
 
     let l_pac = forward.len() as i64;
     let n_seqs = anns.len() as i32;
+    // `contigs` is no longer needed (names/annotations are copied into `anns`); drop it before the
+    // memory-heavy suffix-array stage.
+    drop(contigs);
 
     // 2. Write .pac (2-bit packed forward reference).
     write_pac(&sibling(fasta, "pac"), &forward)?;
@@ -101,12 +105,18 @@ pub fn build_index(fasta: &Path) -> Result<()> {
     write_ann(&sibling(fasta, "ann"), l_pac, n_seqs, &anns)?;
     write_amb(&sibling(fasta, "amb"), l_pac, n_seqs, &ambs)?;
 
-    // 4. Build the forward++reverse-complement binary reference and write .0123.
-    let mut bref = Vec::with_capacity(2 * forward.len());
-    bref.extend_from_slice(&forward);
-    for &c in forward.iter().rev() {
-        bref.push(if c < 4 { 3 - c } else { c });
-    }
+    // 4. Build the forward++reverse-complement binary reference and write .0123. The RC half is
+    //    filled in parallel: bref[L + i] = complement(forward[L - 1 - i]).
+    let l = forward.len();
+    let mut bref = vec![0u8; 2 * l];
+    bref[..l].copy_from_slice(&forward);
+    let (fwd_half, rc_half) = bref.split_at_mut(l);
+    rc_half.par_iter_mut().enumerate().for_each(|(i, b)| {
+        let c = fwd_half[l - 1 - i];
+        *b = if c < 4 { 3 - c } else { c };
+    });
+    // `forward` is now captured in bref; free it before the suffix array (~3 GB at genome scale).
+    drop(forward);
     File::create(sibling(fasta, "0123")).and_then(|f| BufWriter::new(f).write_all(&bref))?;
 
     // 5. Build and write the FM-index (.bwt.2bit.64).
@@ -195,11 +205,25 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     let sa = suffix_array_inplace(bref); // length N = 2L+1, sa[0] = 2L (memory-efficient SA-IS)
     let n = sa.len(); // reference_seq_len = 2L + 1
 
-    // count[5] = {0, #A, #A+#C, #A+#C+#G, 2L} over the 2L binary bases.
-    let mut hist = [0i64; 4];
-    for &c in bref {
-        hist[c as usize] += 1;
-    }
+    // count[5] = {0, #A, #A+#C, #A+#C+#G, 2L} over the 2L binary bases (parallel histogram reduce).
+    let hist = bref
+        .par_iter()
+        .fold(
+            || [0i64; 4],
+            |mut h, &c| {
+                h[c as usize] += 1;
+                h
+            },
+        )
+        .reduce(
+            || [0i64; 4],
+            |mut a, b| {
+                for k in 0..4 {
+                    a[k] += b[k];
+                }
+                a
+            },
+        );
     let count: [i64; 5] = [
         0,
         hist[0],
@@ -208,50 +232,65 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
         two_l as i64,
     ];
 
-    // BWT: bwt[i] = 4 (sentinel) if sa[i]==0 else bref[sa[i]-1].
+    // BWT: bwt[i] = 4 (sentinel) if sa[i]==0 else bref[sa[i]-1]. Each entry is independent, so fill
+    // in parallel; the sentinel row (the unique sa[i]==0) is found by a parallel search.
     let mut bwt = vec![6u8; n];
-    let mut sentinel_index = 0i64;
-    for (i, &sai) in sa.iter().enumerate() {
-        if sai == 0 {
-            bwt[i] = 4;
-            sentinel_index = i as i64;
+    bwt.par_iter_mut().zip(sa.par_iter()).for_each(|(b, &sai)| {
+        *b = if sai == 0 {
+            4
         } else {
-            bwt[i] = bref[(sai - 1) as usize];
-        }
-    }
+            bref[(sai - 1) as usize]
+        };
+    });
+    let sentinel_index = sa
+        .par_iter()
+        .position_any(|&sai| sai == 0)
+        .expect("suffix array must contain the sentinel (0)") as i64;
 
-    // CP_OCC checkpoints, one per 64-base block.
+    // CP_OCC checkpoints, one per 64-base block. `one_hot[bi]` is independent per block; `cp_count[bi]`
+    // is the running base-count prefix over prior blocks. Compute both per block in parallel, then a
+    // cheap sequential prefix sum turns per-block counts into the running totals.
     let n_blocks = (n >> 6) + 1;
     let mut cp_count = vec![[0i64; 4]; n_blocks];
     let mut one_hot = vec![[0u64; 4]; n_blocks];
+    cp_count
+        .par_iter_mut()
+        .zip(one_hot.par_iter_mut())
+        .enumerate()
+        .for_each(|(bi, (cc, oh))| {
+            let i0 = bi * 64;
+            for j in 0..64 {
+                let idx = i0 + j;
+                let c = if idx < n { bwt[idx] } else { 6 };
+                for w in oh.iter_mut() {
+                    *w <<= 1;
+                }
+                if (c as usize) < 4 {
+                    oh[c as usize] |= 1;
+                    cc[c as usize] += 1; // per-block count, converted to a running prefix below
+                }
+            }
+        });
+    // Sequential prefix sum over blocks (n/64 iterations): cp_count[bi] becomes the count of each
+    // base in bwt[0..bi*64), matching the original running-total semantics.
     let mut running = [0i64; 4];
-    for (bi, (cc, oh)) in cp_count.iter_mut().zip(one_hot.iter_mut()).enumerate() {
-        *cc = running; // counts of each base in bwt[0..bi*64)
-        let i0 = bi * 64;
-        for j in 0..64 {
-            let idx = i0 + j;
-            let c = if idx < n { bwt[idx] } else { 6 };
-            for w in oh.iter_mut() {
-                *w <<= 1;
-            }
-            if (c as usize) < 4 {
-                oh[c as usize] |= 1;
-                running[c as usize] += 1;
-            }
+    for cc in cp_count.iter_mut() {
+        let block = *cc;
+        *cc = running;
+        for k in 0..4 {
+            running[k] += block[k];
         }
     }
 
     // Compressed suffix array: sample every 8th entry (N is odd, so exactly (N>>3)+1 samples).
     let sa_count = (n >> 3) + 1;
-    let mut sa_ms_byte = Vec::with_capacity(sa_count);
-    let mut sa_ls_word = Vec::with_capacity(sa_count);
-    let mut i = 0usize;
-    while i < n {
-        let v = sa[i] as u64;
-        sa_ls_word.push((v & 0xFFFF_FFFF) as u32);
-        sa_ms_byte.push(((v >> 32) & 0xFF) as u8);
-        i += 8;
-    }
+    let (sa_ls_word, sa_ms_byte): (Vec<u32>, Vec<u8>) = (0..sa_count)
+        .into_par_iter()
+        .map(|k| {
+            let v = sa[k * 8] as u64;
+            ((v & 0xFFFF_FFFF) as u32, ((v >> 32) & 0xFF) as u8)
+        })
+        .unzip();
     debug_assert_eq!(sa_ms_byte.len(), sa_count);
 
     // Serialize.
