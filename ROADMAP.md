@@ -13,8 +13,9 @@ Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.
 | 5 | `phase5-extension` | SW bande scalaire (`SwBackend`) + `mem_chain2aln` | `AS` + coords == oracle |
 | 6 | `phase6-se-sam` | primaire/MAPQ/CIGAR/tags | **SAM SE octet-identique** |
 | 7 | `phase7-pe` | `mem_pestat`/`mem_matesw`/`mem_pair` | **SAM PE octet-identique** |
-| 8 | `phase8-scale` | GRCh38 complet, rayon, (NEON optionnel) | ~100% concordance reads reels |
-| 9 | `phase9-gpu` | backend Metal du SW (entier -> bit-identique) | identique au scalaire + speedup |
+| 8 | `phase8-scale` | GRCh38 complet, rayon, resorption de la traine | ~100% concordance reads reels |
+| 9a | `phase9a-neon` | backend NEON du SW derriere `SwBackend` (portage des optim. de @nh13, PR #288) | identique au scalaire + speedup mesure |
+| 9b | `phase9b-gpu` | backend Metal du SW (entier -> bit-identique) | identique au scalaire + speedup |
 | 10+ | | gate GIAB `hap.py`/`vcfeval` ; packaging | |
 
 Statut : **phases 0-7 terminees, phase 8 quasi terminee**.
@@ -37,3 +38,22 @@ Statut : **phases 0-7 terminees, phase 8 quasi terminee**.
   **8,1 Go** contre ~25 Go avant, ~16 o/base). Genome entier 3,1 Gbp projete a **~100 Go < 128 Go**
   (build non lance ici pour eviter tout risque OOM). `scripts/scale_test.sh` gere le gate par
   chromosome.
+
+## Phase 9a : backend NEON (collaboration @nh13, PR bwa-mem2#288)
+
+Le SW scalaire est la source de verite ; NEON est un backend **entier** derriere le trait
+`SwBackend`, donc l'octet-identite au scalaire/oracle est **preservee** et testable (property test
+`scalaire == NEON` sur batches aleatoires + `oracle_diff.sh` toujours 100%). Optimisations a porter
+depuis le fork de Nils Homer (`fg-labs/bwa-mem3`, ~2x plus rapide) et sa PR #288 :
+
+- **`kswv` NEON natif** : Smith-Waterman vectoriel ecrit en NEON (vs traduction sse2neon), ~7 %.
+- **`bandedSWA` blendv NEON** : `vbslq` a la place du blendv emule, ~4 %.
+- **Tuning Apple Silicon** (hors chemin d'octet-identite, ne touche que perf/threads) : detection
+  P-core/E-core via `sysctl`, taille du cache L2 pour dimensionner le batch, alignement lignes de
+  cache 128 o (vs 64 o x86), hints QoS coeurs perf, link `Accelerate.framework`.
+- **Build** : cible `arch=arm64`, PGO (`pgo-generate`/`pgo-use`), `simd_compat.h` (couche
+  d'abstraction SSE/NEON), garde `memset_s` macOS.
+
+**Gate** : sortie octet-identique au backend scalaire (property test + `oracle_diff.sh`) **et**
+speedup mesure (`/usr/bin/time`). A faire sur une branche partagee avec @nh13 (acces lecture +
+fork/PR accordes sur `IPNP-BIPN/bwa-mem3-rs`). Voir `DEPENDENCIES.md` pour la provenance.
