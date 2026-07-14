@@ -50,11 +50,13 @@ pub fn build_index(fasta: &Path) -> Result<()> {
     let mut forward: Vec<u8> = Vec::new();
     let mut anns: Vec<AnnRec> = Vec::new();
     let mut ambs: Vec<AmbRec> = Vec::new();
-    let mut lasts: u8 = 0;
 
     for c in &contigs {
         let start = forward.len();
         let mut n_ambs = 0i32;
+        // `lasts` resets per contig (bwa-mem2's `add1` does `for (i = lasts = 0; ...)`), so an
+        // N-run at a contig boundary is split into one hole per contig, never merged across.
+        let mut lasts: u8 = 0;
         for &raw in &c.seq {
             let mut code = dna::nt4(raw);
             if code >= 4 {
@@ -273,4 +275,38 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     w.write_all(&sentinel_index.to_le_bytes())?;
     w.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An N-run must NOT be merged across a contig boundary: bwa-mem2's `add1` resets its
+    /// `lasts` tracker to 0 at the start of every contig, so N at the end of one contig and N at
+    /// the start of the next are recorded as two separate `.amb` holes, not one.
+    #[test]
+    fn amb_holes_not_merged_across_contig_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "bwa3_amb_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fasta = dir.join("t.fa");
+        // c1 ends with NN (pos 4,5); c2 starts with NN (pos 6,7). l_pac = 12.
+        std::fs::write(&fasta, ">c1\nACGTNN\n>c2\nNNACGT\n").unwrap();
+
+        build_index(&fasta).unwrap();
+        let amb = std::fs::read_to_string(dir.join("t.fa.amb")).unwrap();
+        let lines: Vec<&str> = amb.lines().collect();
+
+        assert_eq!(lines[0], "12 2 2", "header l_pac n_seqs n_holes");
+        assert_eq!(lines[1], "4 2 N", "chr1 trailing NN, its own hole");
+        assert_eq!(lines[2], "6 2 N", "chr2 leading NN, a separate hole");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
