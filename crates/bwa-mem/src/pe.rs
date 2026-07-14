@@ -85,14 +85,14 @@ fn cal_sub(opt: &MemOpt, r: &[MemAlnReg]) -> i32 {
 
 /// Estimate insert-size distributions for the four orientations over a whole batch. `regs` holds the
 /// dedup'd regions of `2N` interleaved reads (`regs[2i]`=R1, `regs[2i+1]`=R2). Port of `mem_pestat`.
-pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[Vec<MemAlnReg>]) -> [PeStat; 4] {
+pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4] {
     let mut pes = [PeStat::default(); 4];
     let mut isize: [Vec<i64>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
     let n_pairs = regs.len() / 2;
     for i in 0..n_pairs {
-        let r0 = &regs[i << 1];
-        let r1 = &regs[(i << 1) | 1];
+        let r0 = regs[i << 1];
+        let r1 = regs[(i << 1) | 1];
         if r0.is_empty() || r1.is_empty() {
             continue;
         }

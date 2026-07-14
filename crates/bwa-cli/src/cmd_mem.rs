@@ -7,10 +7,11 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use clap::Args;
+use rayon::prelude::*;
 
 use bwa_core::{dna, MemOpt};
 use bwa_index::{BntSeq, FmIndex};
-use bwa_io::{sam, FastqReader, PairedFastqReader, SqRecord};
+use bwa_io::{sam, FastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
     align_read_dedup, align_read_se, cigar_string, mem_approx_mapq_se, mem_pestat, mem_sam_pe,
     reg2aln, MemAlnReg,
@@ -34,6 +35,13 @@ pub struct MemArgs {
 
 pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let opt = MemOpt::default();
+    let n_threads = args.threads.max(1) as usize;
+    // Fixed-size rayon pool. Output order and global read ids are independent of thread count, so
+    // byte-identity holds at any `-t` once `-K` fixes the batch boundaries.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build_global()
+        .ok();
     let k_batch = args
         .k_batch
         .unwrap_or(opt.chunk_size * i64::from(args.threads))
@@ -69,71 +77,90 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     }
 
     let mut reader = FastqReader::from_path(&args.reads)?;
-    let mut read_id = 0u64;
+    let mut base_id = 0u64;
     loop {
         let batch = reader.next_batch(k_batch)?;
         if batch.is_empty() {
             break;
         }
-        for rec in &batch {
-            let codes: Vec<u8> = rec.seq.iter().map(|&b| dna::nt4(b)).collect();
-            let regs = align_read_se(&fm, &bns, &opt, &codes, read_id);
-            read_id += 1;
-            // After marking, regs[0] is the highest-scoring primary region.
-            let best = regs.first().filter(|r| r.score >= opt.t);
-
-            match best {
-                Some(r) => {
-                    let aln = reg2aln(&fm, &bns, &opt, codes.len() as i32, &codes, r);
-                    let mapq = mem_approx_mapq_se(&opt, r);
-                    let rname = &bns.contigs[aln.rid as usize].name;
-                    let flag = if aln.is_rev { 16 } else { 0 };
-                    let cigar = cigar_string(&aln.cigar);
-                    let tags = format!(
-                        "NM:i:{}\tMD:Z:{}\tAS:i:{}\tXS:i:{}",
-                        aln.nm, aln.md, aln.score, aln.sub
-                    );
-                    let pos = aln.pos + 1;
-                    if aln.is_rev {
-                        let seq = dna::revcomp_ascii(&rec.seq);
-                        let qual = rec.qual.as_ref().map(|q| {
-                            let mut v = q.clone();
-                            v.reverse();
-                            v
-                        });
-                        sam::write_mapped_se(
-                            &mut out,
-                            &rec.name,
-                            flag,
-                            rname,
-                            pos,
-                            mapq,
-                            &cigar,
-                            &seq,
-                            qual.as_deref(),
-                            &tags,
-                        )?;
-                    } else {
-                        sam::write_mapped_se(
-                            &mut out,
-                            &rec.name,
-                            flag,
-                            rname,
-                            pos,
-                            mapq,
-                            &cigar,
-                            &rec.seq,
-                            rec.qual.as_deref(),
-                            &tags,
-                        )?;
-                    }
-                }
-                None => sam::write_unmapped(&mut out, &rec.name, &rec.seq, rec.qual.as_deref())?,
-            }
+        // Align reads in parallel; each read's global id (base_id + i) and the output order are
+        // fixed by batch position, so the result is byte-identical to single-threaded.
+        let lines: Vec<Vec<u8>> = batch
+            .par_iter()
+            .enumerate()
+            .map(|(i, rec)| format_se(&fm, &bns, &opt, rec, base_id + i as u64))
+            .collect();
+        for l in &lines {
+            out.write_all(l)?;
         }
+        base_id += batch.len() as u64;
     }
     out.flush()?;
     Ok(())
+}
+
+/// Align one read single-end and format its SAM record into a fresh buffer. Pure (no shared state
+/// beyond the immutable index/options), so it is safe to run across rayon workers.
+fn format_se(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, rec: &Record, read_id: u64) -> Vec<u8> {
+    let codes: Vec<u8> = rec.seq.iter().map(|&b| dna::nt4(b)).collect();
+    let regs = align_read_se(fm, bns, opt, &codes, read_id);
+    // After marking, regs[0] is the highest-scoring primary region.
+    let best = regs.first().filter(|r| r.score >= opt.t);
+    let mut buf = Vec::new();
+    match best {
+        Some(r) => {
+            let aln = reg2aln(fm, bns, opt, codes.len() as i32, &codes, r);
+            let mapq = mem_approx_mapq_se(opt, r);
+            let rname = &bns.contigs[aln.rid as usize].name;
+            let flag = if aln.is_rev { 16 } else { 0 };
+            let cigar = cigar_string(&aln.cigar);
+            let tags = format!(
+                "NM:i:{}\tMD:Z:{}\tAS:i:{}\tXS:i:{}",
+                aln.nm, aln.md, aln.score, aln.sub
+            );
+            let pos = aln.pos + 1;
+            if aln.is_rev {
+                let seq = dna::revcomp_ascii(&rec.seq);
+                let qual = rec.qual.as_ref().map(|q| {
+                    let mut v = q.clone();
+                    v.reverse();
+                    v
+                });
+                sam::write_mapped_se(
+                    &mut buf,
+                    &rec.name,
+                    flag,
+                    rname,
+                    pos,
+                    mapq,
+                    &cigar,
+                    &seq,
+                    qual.as_deref(),
+                    &tags,
+                )
+                .expect("write to Vec");
+            } else {
+                sam::write_mapped_se(
+                    &mut buf,
+                    &rec.name,
+                    flag,
+                    rname,
+                    pos,
+                    mapq,
+                    &cigar,
+                    &rec.seq,
+                    rec.qual.as_deref(),
+                    &tags,
+                )
+                .expect("write to Vec");
+            }
+        }
+        None => {
+            sam::write_unmapped(&mut buf, &rec.name, &rec.seq, rec.qual.as_deref())
+                .expect("write to Vec");
+        }
+    }
+    buf
 }
 
 /// Paired-end driver: per batch, align+dedup both ends of every pair, estimate insert sizes
@@ -150,35 +177,83 @@ fn run_pe<W: std::io::Write>(
     out: &mut W,
 ) -> anyhow::Result<()> {
     let mut reader = PairedFastqReader::from_paths(reads1, reads2)?;
-    let mut pair_id = 0u64;
+    let mut base_pair = 0u64;
     loop {
         let batch = reader.next_batch(k_batch)?;
         if batch.is_empty() {
             break;
         }
-        // nt4-encode and align+dedup both ends of every pair (interleaved: 2i=R1, 2i+1=R2).
-        let mut codes: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch.len());
-        let mut regs: Vec<Vec<MemAlnReg>> = Vec::with_capacity(batch.len() * 2);
-        for (r1, r2) in &batch {
-            let c1: Vec<u8> = r1.seq.iter().map(|&b| dna::nt4(b)).collect();
-            let c2: Vec<u8> = r2.seq.iter().map(|&b| dna::nt4(b)).collect();
-            regs.push(align_read_dedup(fm, bns, opt, &c1));
-            regs.push(align_read_dedup(fm, bns, opt, &c2));
-            codes.push((c1, c2));
+        // Align + dedup both ends of every pair in parallel (regions only; primary marking and
+        // pairing happen later, per bwa-mem2). No cross-pair state, so order is preserved.
+        let mut prepared: Vec<PrepPair> = batch
+            .par_iter()
+            .map(|(r1, r2)| {
+                let c1: Vec<u8> = r1.seq.iter().map(|&b| dna::nt4(b)).collect();
+                let c2: Vec<u8> = r2.seq.iter().map(|&b| dna::nt4(b)).collect();
+                let a1 = align_read_dedup(fm, bns, opt, &c1);
+                let a2 = align_read_dedup(fm, bns, opt, &c2);
+                PrepPair {
+                    c1,
+                    c2,
+                    a1,
+                    a2,
+                    name1: r1.name.clone(),
+                    name2: r2.name.clone(),
+                    q1: r1.qual.clone(),
+                    q2: r2.qual.clone(),
+                }
+            })
+            .collect();
+
+        // Insert-size stats over the whole batch (interleaved region slices, no copy).
+        let regs_ref: Vec<&[MemAlnReg]> = prepared
+            .iter()
+            .flat_map(|p| [p.a1.as_slice(), p.a2.as_slice()])
+            .collect();
+        let pes = mem_pestat(opt, bns.l_pac, &regs_ref);
+
+        // Emit paired SAM in parallel (each pair owns its regions; global pair id fixes hashes).
+        let bufs: Vec<Vec<u8>> = prepared
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i, p)| {
+                let names = [p.name1.clone(), p.name2.clone()];
+                let seqs = [p.c1.as_slice(), p.c2.as_slice()];
+                let quals = [p.q1.as_deref(), p.q2.as_deref()];
+                let mut buf = Vec::new();
+                mem_sam_pe(
+                    fm,
+                    bns,
+                    opt,
+                    &pes,
+                    base_pair + i as u64,
+                    &names,
+                    &seqs,
+                    &quals,
+                    &mut p.a1,
+                    &mut p.a2,
+                    &mut buf,
+                )
+                .expect("write to Vec");
+                buf
+            })
+            .collect();
+        for b in &bufs {
+            out.write_all(b)?;
         }
-        let pes = mem_pestat(opt, bns.l_pac, &regs);
-        for (i, (r1, r2)) in batch.iter().enumerate() {
-            let mut a1 = std::mem::take(&mut regs[2 * i]);
-            let mut a2 = std::mem::take(&mut regs[2 * i + 1]);
-            let names = [r1.name.clone(), r2.name.clone()];
-            let (c1, c2) = &codes[i];
-            let seqs = [c1.as_slice(), c2.as_slice()];
-            let quals = [r1.qual.as_deref(), r2.qual.as_deref()];
-            mem_sam_pe(
-                fm, bns, opt, &pes, pair_id, &names, &seqs, &quals, &mut a1, &mut a2, out,
-            )?;
-            pair_id += 1;
-        }
+        base_pair += batch.len() as u64;
     }
     Ok(())
+}
+
+/// One read pair prepared for the pairing/output stage: nt4 codes, dedup'd regions, names, quals.
+struct PrepPair {
+    c1: Vec<u8>,
+    c2: Vec<u8>,
+    a1: Vec<MemAlnReg>,
+    a2: Vec<MemAlnReg>,
+    name1: String,
+    name2: String,
+    q1: Option<Vec<u8>>,
+    q2: Option<Vec<u8>>,
 }
