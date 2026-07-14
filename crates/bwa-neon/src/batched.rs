@@ -50,6 +50,36 @@ pub fn batched_extend(
     )
 }
 
+/// True if `mat` is the standard bwa `m x m` DNA matrix: a constant `a` on the diagonal, a constant
+/// `mm` off-diagonal among the 4 concrete bases, and a constant `npen` on every ambiguous row/column
+/// (index `m-1`). The NEON kernels score with a vector compare that relies on exactly this shape;
+/// anything else falls back to the scalar reference (which reads `mat` directly).
+#[cfg(target_arch = "aarch64")]
+fn is_uniform_dna(mat: &[i8], m: usize) -> bool {
+    if m < 2 || mat.len() < m * m {
+        return false;
+    }
+    let a = mat[0];
+    let mm = mat[1];
+    let npen = mat[m - 1];
+    for i in 0..m {
+        for j in 0..m {
+            let v = mat[i * m + j];
+            let want = if i == m - 1 || j == m - 1 {
+                npen
+            } else if i == j {
+                a
+            } else {
+                mm
+            };
+            if v != want {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Per-job cell-value ceiling for a local extension: `h0 + qlen*max_score + end_bonus`. Every
 /// `H`/`E`/`F` value stays in `[0, bound]`, so `bound < i8/i16::MAX` (minus a small margin for
 /// negative gap intermediates) proves the corresponding NEON kernel is byte-identical.
@@ -77,6 +107,14 @@ fn neon_dispatch(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
+    // The NEON kernels score DNA with a vector compare that assumes the uniform bwa matrix
+    // (diagonal `a`, off-diagonal `mm`, ambiguous row/col = `npen`). Any other matrix -> scalar.
+    if !is_uniform_dna(mat, m) {
+        return batched_extend_scalar(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
+
     // int8 guard: cell values in [0, bound] must fit i8, and the DP indices (j, beg, end, mj, i) must
     // too; `bound`, qlen and tlen all below 120 keeps everything inside int8 with margin.
     const GUARD8: i32 = 120; // < i8::MAX (127)
@@ -397,6 +435,7 @@ mod neon {
             dup = $dup:path, lds = $lds:path, sts = $sts:path, ldu = $ldu:path,
             add = $add:path, sub = $sub:path, max = $max:path,
             ceqz = $ceqz:path, cge = $cge:path, clt = $clt:path,
+            ceq = $ceq:path, orru = $orru:path,
             andu = $andu:path, bsl = $bsl:path
         ) => {
             /// # Safety
@@ -428,6 +467,13 @@ mod neon {
                 let e_del_v = $dup(e_del as $elem);
                 let e_ins_v = $dup(e_ins as $elem);
                 let zero_v = $dup(0);
+                // DNA scoring as a vector compare (no per-cell gather): the caller (neon_dispatch)
+                // only reaches here for the uniform bwa matrix, so score = N ? npen : (t==q ? a : mm),
+                // with a = mat[0][0], mm = mat[0][1], npen = mat[0][m-1] (the ambiguous-base -1).
+                let a_v = $dup(mat[0] as $elem);
+                let mm_v = $dup(mat[1] as $elem);
+                let npen_v = $dup(mat[m - 1] as $elem);
+                let amb_v = $dup(4); // code 4 = N; codes are 0..=4
 
                 for chunk_start in (0..jobs.len()).step_by(LANES) {
                     let nlane = (jobs.len() - chunk_start).min(LANES);
@@ -451,12 +497,13 @@ mod neon {
                     let mut eh_h = vec![0 as $elem; stride * LANES];
                     let mut eh_e = vec![0 as $elem; stride * LANES];
 
-                    // Per-lane query padded to `stride` (0 past qlen): branchless, in-bounds gather.
-                    let mut qpad = vec![0usize; stride * LANES];
+                    // Per-lane query codes padded to `stride` (0 past qlen) for a branchless,
+                    // in-bounds vector load of the 8/16 lanes' base at column j.
+                    let mut qcode = vec![0 as $elem; stride * LANES];
                     for l in 0..nlane {
                         let q = jobs[chunk_start + l].query;
                         for (ju, &c) in q.iter().enumerate() {
-                            qpad[ju * LANES + l] = c as usize;
+                            qcode[ju * LANES + l] = c as $elem;
                         }
                     }
 
@@ -525,29 +572,30 @@ mod neon {
                         let mut beg_a = [0 as $elem; LANES];
                         let mut end_a = [0 as $elem; LANES];
                         let mut act_a = [0 as $umask; LANES];
-                        let mut tbase = [0usize; LANES];
+                        let mut trow = [0 as $elem; LANES]; // this row's target base per lane
                         for l in 0..nlane {
                             if active[l] {
                                 beg_a[l] = beg[l] as $elem;
                                 end_a[l] = end[l] as $elem;
                                 act_a[l] = <$umask>::MAX;
-                                tbase[l] = jobs[chunk_start + l].target[i as usize] as usize * m;
+                                trow[l] = jobs[chunk_start + l].target[i as usize] as $elem;
                             }
                         }
                         let beg_v = $lds(beg_a.as_ptr());
                         let end_v = $lds(end_a.as_ptr());
                         let active_v = $ldu(act_a.as_ptr());
+                        let t_v = $lds(trow.as_ptr());
 
                         for j in gbeg..gend {
                             let jrow = j as usize * LANES;
                             let j_v = $dup(j as $elem);
                             let band = $andu(active_v, $andu($cge(j_v, beg_v), $clt(j_v, end_v)));
 
-                            let mut score_arr = [0 as $elem; LANES];
-                            for l in 0..nlane {
-                                score_arr[l] = mat[tbase[l] + qpad[jrow + l]] as $elem;
-                            }
-                            let score_v = $lds(score_arr.as_ptr());
+                            // DNA score vector: no gather. base = (t==q) ? a : mm; N -> npen.
+                            let q_v = $lds(qcode.as_ptr().add(jrow));
+                            let base_v = $bsl($ceq(t_v, q_v), a_v, mm_v);
+                            let is_n = $orru($cge(t_v, amb_v), $cge(q_v, amb_v));
+                            let score_v = $bsl(is_n, npen_v, base_v);
 
                             let m_v = $lds(eh_h.as_ptr().add(jrow)); // H(i-1, j-1)
                             let e_v = $lds(eh_e.as_ptr().add(jrow)); // E(i-1, j)
@@ -680,6 +728,8 @@ mod neon {
         ceqz = vceqzq_s16,
         cge = vcgeq_s16,
         clt = vcltq_s16,
+        ceq = vceqq_s16,
+        orru = vorrq_u16,
         andu = vandq_u16,
         bsl = vbslq_s16
     );
@@ -699,6 +749,8 @@ mod neon {
         ceqz = vceqzq_s8,
         cge = vcgeq_s8,
         clt = vcltq_s8,
+        ceq = vceqq_s8,
+        orru = vorrq_u8,
         andu = vandq_u8,
         bsl = vbslq_s8
     );
