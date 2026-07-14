@@ -25,14 +25,23 @@ pub struct Smem {
     pub s: i64,
 }
 
+/// One 64-base checkpoint block, interleaved exactly as bwa-mem2's `CP_OCC`: the cumulative counts
+/// and the one-hot BWT bitvectors for the 4 bases sit together in a single 64-byte, cache-line-aligned
+/// record, so a single occ lookup touches one cache line instead of two.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct CpOcc {
+    cp_count: [i64; 4],
+    one_hot: [u64; 4],
+}
+
 /// Loaded FM-index plus the binary reference for O(1) base access.
 pub struct FmIndex {
     /// `reference_seq_len` = 2L + 1.
     pub ref_seq_len: i64,
     /// Cumulative base counts, already incremented by 1 as bwa-mem2's `load_index` does.
     count: [i64; 5],
-    cp_count: Vec<[i64; 4]>,
-    one_hot: Vec<[u64; 4]>,
+    cp_occ: Vec<CpOcc>,
     sa_ms_byte: Vec<i8>,
     sa_ls_word: Vec<u32>,
     sentinel_index: i64,
@@ -78,23 +87,21 @@ impl FmIndex {
             *c += 1; // as load_index does
         }
         let cp_size = ((ref_seq_len >> 6) + 1) as usize;
-        let mut cp_count = Vec::with_capacity(cp_size);
-        let mut one_hot = Vec::with_capacity(cp_size);
+        let mut cp_occ = Vec::with_capacity(cp_size);
         for _ in 0..cp_size {
-            let cc = [
+            let cp_count = [
                 rd_i64(&d, &mut p),
                 rd_i64(&d, &mut p),
                 rd_i64(&d, &mut p),
                 rd_i64(&d, &mut p),
             ];
-            let oh = [
+            let one_hot = [
                 rd_u64(&d, &mut p),
                 rd_u64(&d, &mut p),
                 rd_u64(&d, &mut p),
                 rd_u64(&d, &mut p),
             ];
-            cp_count.push(cc);
-            one_hot.push(oh);
+            cp_occ.push(CpOcc { cp_count, one_hot });
         }
         let sa_size = ((ref_seq_len >> 3) + 1) as usize;
         let mut sa_ms_byte = Vec::with_capacity(sa_size);
@@ -120,8 +127,7 @@ impl FmIndex {
         Ok(FmIndex {
             ref_seq_len,
             count,
-            cp_count,
-            one_hot,
+            cp_occ,
             sa_ms_byte,
             sa_ls_word,
             sentinel_index,
@@ -133,11 +139,9 @@ impl FmIndex {
     /// Occurrences of base `c` in `bwt[0..pp)`, i.e. bwa-mem2's `GET_OCC`.
     #[inline]
     pub fn get_occ(&self, pp: i64, c: usize) -> i64 {
-        let occ_id = (pp >> 6) as usize;
+        let block = &self.cp_occ[(pp >> 6) as usize];
         let y = (pp & 63) as usize;
-        let block = occ_id;
-        self.cp_count[block][c]
-            + (self.one_hot[block][c] & self.one_hot_mask[y]).count_ones() as i64
+        block.cp_count[c] + (block.one_hot[c] & self.one_hot_mask[y]).count_ones() as i64
     }
 
     /// The full interval `[0, ref_seq_len)` (the empty match), for starting a backward search.
@@ -159,17 +163,15 @@ impl FmIndex {
         // the block index and re-indexing per base as `get_occ` would. Values are identical.
         let sp = smem.k;
         let ep = smem.k + smem.s;
-        let cp_sp = &self.cp_count[(sp >> 6) as usize];
-        let cp_ep = &self.cp_count[(ep >> 6) as usize];
-        let oh_sp = &self.one_hot[(sp >> 6) as usize];
-        let oh_ep = &self.one_hot[(ep >> 6) as usize];
+        let blk_sp = &self.cp_occ[(sp >> 6) as usize];
+        let blk_ep = &self.cp_occ[(ep >> 6) as usize];
         let msk_sp = self.one_hot_mask[(sp & 63) as usize];
         let msk_ep = self.one_hot_mask[(ep & 63) as usize];
         let mut k = [0i64; 4];
         let mut s = [0i64; 4];
         for b in 0..4 {
-            let occ_sp = cp_sp[b] + (oh_sp[b] & msk_sp).count_ones() as i64;
-            let occ_ep = cp_ep[b] + (oh_ep[b] & msk_ep).count_ones() as i64;
+            let occ_sp = blk_sp.cp_count[b] + (blk_sp.one_hot[b] & msk_sp).count_ones() as i64;
+            let occ_ep = blk_ep.cp_count[b] + (blk_ep.one_hot[b] & msk_ep).count_ones() as i64;
             k[b] = self.count[b] + occ_sp;
             s[b] = occ_ep - occ_sp;
         }
@@ -200,7 +202,7 @@ impl FmIndex {
         loop {
             let occ_id = (sp >> 6) as usize;
             let y = 63 - (sp & 63);
-            let oh = self.one_hot[occ_id];
+            let oh = self.cp_occ[occ_id].one_hot;
             let b = if (oh[0] >> y) & 1 == 1 {
                 0
             } else if (oh[1] >> y) & 1 == 1 {
