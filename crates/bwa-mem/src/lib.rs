@@ -235,7 +235,28 @@ pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec
 /// primaries themselves.
 pub fn align_read_dedup(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec<MemAlnReg> {
     let regs = align_read(fm, bns, opt, codes);
-    mem_sort_dedup_patch(fm, opt, codes, regs)
+    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+        dump_regs(bns, "pre-dedup", &regs);
+    }
+    let deduped = mem_sort_dedup_patch(fm, opt, codes, regs);
+    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+        dump_regs(bns, "post-dedup", &deduped);
+    }
+    deduped
+}
+
+/// Env-gated (`BWA3_DUMP_REGS`) diagnostic: print every region with its query span, reference
+/// span, mapped position and scores. Used to compare our suboptimal-region set against the oracle.
+fn dump_regs(bns: &BntSeq, tag: &str, regs: &[MemAlnReg]) {
+    eprintln!("--- regs [{}] n={} ---", tag, regs.len());
+    for (i, r) in regs.iter().enumerate() {
+        let (rid, pos, rev) = region_to_pos(bns, r);
+        let strand = if rev { '-' } else { '+' };
+        eprintln!(
+            "  #{i} q[{},{}) r[{},{}) rid={rid} {strand}pos={pos} score={} truesc={} sub={} seedcov={} seedlen0={}",
+            r.qb, r.qe, r.rb, r.re, r.score, r.truesc, r.sub, r.seedcov, r.seedlen0
+        );
+    }
 }
 
 /// Full single-end alignment for one read: extension regions, deduplicated and primary-marked
