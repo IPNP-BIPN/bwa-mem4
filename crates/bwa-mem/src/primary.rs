@@ -23,6 +23,9 @@ fn mem_patch_reg(
     a: &MemAlnReg,
     b: &MemAlnReg,
 ) -> Option<(i32, i32)> {
+    if codes.is_empty() {
+        return None; // `query == 0` (mem_matesw's dedup): merging is disabled
+    }
     let l_pac = fm.l_pac();
     if a.rb < l_pac && b.rb >= l_pac {
         return None; // different strands

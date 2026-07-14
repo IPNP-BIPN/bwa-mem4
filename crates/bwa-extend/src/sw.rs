@@ -315,6 +315,204 @@ pub fn ksw_global2(
     (score, cigar)
 }
 
+/// Result of `ksw_align2`: a local (Smith-Waterman) alignment with start/end coordinates and the
+/// 2nd-best score. Mirrors bwa's `kswr_t` (the fields mem_matesw uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KswAlignResult {
+    pub score: i32,
+    /// 0-based query end / start of the best alignment (`qb <= qe`).
+    pub qb: i32,
+    pub qe: i32,
+    /// 0-based target end / start of the best alignment (`tb <= te`).
+    pub tb: i32,
+    pub te: i32,
+    /// 2nd-best score on a target-end column far from `te`, and its column (`-1`/`0` if none).
+    pub score2: i32,
+    pub te2: i32,
+}
+
+/// One forward local-SW pass. Returns `(score, te, qe, score2, te2)`. `minsc` gates the
+/// suboptimal (`b`-array) tracking (`KSW_XSUBO`); `endsc` stops early once a column max reaches it
+/// (`KSW_XSTOP`, use `i32::MAX` to disable). `max_sc` is the maximum single-cell match score.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn ksw_local_fwd(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    minsc: i32,
+    endsc: i32,
+    max_sc: i32,
+) -> (i32, i32, i32, i32, i32) {
+    let qlen = query.len();
+    let tlen = target.len();
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+
+    let mut h_prev = vec![0i32; qlen]; // H(i-1, .)
+    let mut h_cur = vec![0i32; qlen]; // H(i, .)
+    let mut e = vec![0i32; qlen]; // E(i, j), persists across target rows
+    let mut hmax_col = vec![0i32; qlen]; // H column at the best target end `te`
+    let mut gmax = 0i32;
+    let mut te = -1i32;
+    // Suboptimal tracker `b`: (column max score, column), consecutive columns merged (keep higher).
+    let mut b: Vec<(i32, i32)> = Vec::new();
+
+    for i in 0..tlen {
+        let s_row = target[i] as usize * m;
+        let mut f = 0i32;
+        let mut h_diag = 0i32; // H(i-1, -1) = 0
+        let mut imax = 0i32;
+        for j in 0..qlen {
+            let sc = i32::from(mat[s_row + query[j] as usize]);
+            // H(i,j) = max{0, H(i-1,j-1)+s, E(i,j), F(i,j)}  (E,F are already >= 0)
+            let mut h = h_diag + sc;
+            if h < 0 {
+                h = 0;
+            }
+            if e[j] > h {
+                h = e[j];
+            }
+            if f > h {
+                h = f;
+            }
+            if h > imax {
+                imax = h;
+            }
+            h_cur[j] = h;
+            // E(i+1,j) = max{0, E(i,j)-e_del, H(i,j)-o_del-e_del}
+            let mut en = e[j] - e_del;
+            let td = h - oe_del;
+            if td > en {
+                en = td;
+            }
+            e[j] = en.max(0);
+            // F(i,j+1) = max{0, F(i,j)-e_ins, H(i,j)-o_ins-e_ins}
+            let mut fn_ = f - e_ins;
+            let ti = h - oe_ins;
+            if ti > fn_ {
+                fn_ = ti;
+            }
+            f = fn_.max(0);
+            h_diag = h_prev[j];
+        }
+        if imax >= minsc {
+            match b.last() {
+                Some(&(_, col)) if col + 1 == i as i32 => {
+                    if b.last().unwrap().0 < imax {
+                        *b.last_mut().unwrap() = (imax, i as i32);
+                    }
+                }
+                _ => b.push((imax, i as i32)),
+            }
+        }
+        if imax > gmax {
+            gmax = imax;
+            te = i as i32;
+            hmax_col.copy_from_slice(&h_cur);
+            if gmax >= endsc {
+                break;
+            }
+        }
+        std::mem::swap(&mut h_prev, &mut h_cur);
+    }
+
+    // Query end: smallest query index reaching the column max at `te` (ksw picks min index on tie).
+    let mut qe = -1i32;
+    if te >= 0 {
+        let mut mx = -1i32;
+        for (j, &v) in hmax_col.iter().enumerate() {
+            if v > mx {
+                mx = v;
+                qe = j as i32;
+            }
+        }
+    }
+
+    // 2nd-best score: best `b` entry whose column lies outside [te - w, te + w], w = ceil(score/max).
+    let mut score2 = 0i32;
+    let mut te2 = -1i32;
+    if gmax > 0 && !b.is_empty() {
+        let w = (gmax + max_sc - 1) / max_sc;
+        let (low, high) = (te - w, te + w);
+        for &(bs, bc) in &b {
+            if (bc < low || bc > high) && bs > score2 {
+                score2 = bs;
+                te2 = bc;
+            }
+        }
+    }
+    (gmax, te, qe, score2, te2)
+}
+
+/// Local Smith-Waterman with affine gaps, returning best-alignment coords and the 2nd-best score.
+/// Faithful scalar port of `ksw_align2` (with `KSW_XSTART | KSW_XSUBO`). `max_sc` is the maximum
+/// single match score (`opt.a`), used for the suboptimal-window width.
+#[allow(clippy::too_many_arguments)]
+pub fn ksw_align2(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    minsc: i32,
+    max_sc: i32,
+) -> KswAlignResult {
+    let (score, te, qe, score2, te2) = ksw_local_fwd(
+        query,
+        target,
+        m,
+        mat,
+        o_del,
+        e_del,
+        o_ins,
+        e_ins,
+        minsc,
+        i32::MAX,
+        max_sc,
+    );
+    let mut r = KswAlignResult {
+        score,
+        qb: -1,
+        qe,
+        tb: -1,
+        te,
+        score2,
+        te2,
+    };
+    // KSW_XSTART: recover the start by aligning the reversed prefixes and stopping at `score`.
+    if score < minsc || qe < 0 {
+        return r;
+    }
+    let qrev: Vec<u8> = query[..=qe as usize].iter().rev().copied().collect();
+    let trev: Vec<u8> = target[..=te as usize].iter().rev().copied().collect();
+    let (rscore, rte, rqe, _, _) = ksw_local_fwd(
+        &qrev,
+        &trev,
+        m,
+        mat,
+        o_del,
+        e_del,
+        o_ins,
+        e_ins,
+        i32::MAX,
+        score,
+        max_sc,
+    );
+    if score == rscore {
+        r.tb = te - rte;
+        r.qb = qe - rqe;
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +534,31 @@ mod tests {
             k += 1;
         }
         mat
+    }
+
+    #[test]
+    fn ksw_align2_perfect_match() {
+        // query == target: full-length local alignment, score = len*a, spanning both from 0.
+        let mat = scmat(1, 4);
+        let q = [0u8, 1, 2, 3, 0, 1, 2, 3];
+        let r = ksw_align2(&q, &q, 5, &mat, 6, 1, 6, 1, 4, 1);
+        assert_eq!(r.score, 8);
+        assert_eq!((r.qb, r.qe), (0, 7));
+        assert_eq!((r.tb, r.te), (0, 7));
+    }
+
+    #[test]
+    fn ksw_align2_local_trims_flanks() {
+        // A perfect core flanked by mismatches: local alignment picks the core only.
+        // query core AACC at query[2..6]; target has the core at target[1..5].
+        let mat = scmat(1, 4);
+        //            0  1  2  3  4  5  6  7
+        let q = [3u8, 3, 0, 0, 1, 1, 3, 3];
+        let t = [2u8, 0, 0, 1, 1, 2];
+        let r = ksw_align2(&q, &t, 5, &mat, 6, 1, 6, 1, 1, 1);
+        assert_eq!(r.score, 4); // 4 matching bases
+        assert_eq!((r.qb, r.qe), (2, 5));
+        assert_eq!((r.tb, r.te), (1, 4));
     }
 
     /// Unbanded reference of the same recurrence (no band, no zdrop, no zero-row break), for
