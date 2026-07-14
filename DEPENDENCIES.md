@@ -25,5 +25,11 @@ Dev-only (jamais dans le binaire livre) : `noodles-*` (validation SAM/BAM cote t
   `arch=arm64` + PGO. Collaboration via fork/PR sur `IPNP-BIPN/bwa-mem3-rs` (acces lecture accorde a
   @nh13). Reimplementation en Rust natif (pas de copie de code C++) ; on s'inspire de l'algorithmique
   NEON, le SW scalaire restant la source de verite octet-identique.
+  **Livre (phase 9a terminee)** : kernel `bandedSWA` NEON **int16x8** en Rust natif
+  (`crates/bwa-neon/src/batched.rs`) reproduisant le layout SoA `[colonne*8 + lane]` et le blendv
+  `vbslq` (`NEON_BLENDV` de son `neon_utils.h`), plus le portage de `mem_chain2aln_across_reads_V2`
+  (collecte/tri-par-longueur/batch/scatter, `crates/bwa-mem/src/across.rs`). Octet-identique au
+  scalaire/oracle (gate property + `oracle_diff` SE 5000/5000, PE 10000/10000), **~1,5x** mono-thread.
+  Reliquat (perf pure) : `kswv` NEON natif, int8x16 (16 lanes), tuning P/E-core, PGO.
 - **sse2neon** v1.8.0 (licence MIT) : uniquement cote *oracle* (rebuild instrumente bit-identique du
   binaire bwa-mem2 patche pour le diagnostic de parite), jamais dans notre binaire Rust.

@@ -13,9 +13,10 @@ use bwa_core::{dna, MemOpt};
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
-    align_read_dedup, align_read_se, alt::mem_gen_alt, cigar_string, mem_approx_mapq_se,
-    mem_pestat, mem_sam_pe, reg2aln, MemAlnReg,
+    align_reads_batched, alt::mem_gen_alt, cigar_string, mem_approx_mapq_se, mem_mark_primary_se,
+    mem_pestat, mem_sam_pe, mem_sort_dedup_patch, reg2aln, MemAlnReg,
 };
+use bwa_neon::NeonBackend;
 
 #[derive(Args)]
 pub struct MemArgs {
@@ -83,12 +84,29 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         if batch.is_empty() {
             break;
         }
-        // Align reads in parallel; each read's global id (base_id + i) and the output order are
-        // fixed by batch position, so the result is byte-identical to single-threaded.
+        let all_codes: Vec<Vec<u8>> = batch
+            .iter()
+            .map(|rec| rec.seq.iter().map(|&b| dna::nt4(b)).collect())
+            .collect();
+        // Seed -> chain -> BATCHED seed extension across the whole read batch (NEON backend),
+        // mirroring bwa-mem2's mem_chain2aln_across_reads_V2. Chunked so extension parallelizes; each
+        // read's regions are independent of chunk composition, so output stays byte-identical at any
+        // thread count once -K fixes the batch boundaries.
+        let regs_all = batched_regs(&fm, &bns, &opt, &all_codes);
         let lines: Vec<Vec<u8>> = batch
             .par_iter()
             .enumerate()
-            .map(|(i, rec)| format_se(&fm, &bns, &opt, rec, base_id + i as u64))
+            .map(|(i, rec)| {
+                finish_se(
+                    &fm,
+                    &bns,
+                    &opt,
+                    rec,
+                    &all_codes[i],
+                    regs_all[i].clone(),
+                    base_id + i as u64,
+                )
+            })
             .collect();
         for l in &lines {
             out.write_all(l)?;
@@ -99,18 +117,43 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Align one read single-end and format its SAM record into a fresh buffer. Pure (no shared state
-/// beyond the immutable index/options), so it is safe to run across rayon workers.
-fn format_se(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, rec: &Record, read_id: u64) -> Vec<u8> {
-    let codes: Vec<u8> = rec.seq.iter().map(|&b| dna::nt4(b)).collect();
-    let regs = align_read_se(fm, bns, opt, &codes, read_id);
+/// Seed + chain + batched extension for a whole read batch, returning each read's pre-dedup regions
+/// (byte-identical to `align_read` per read). Chunked across the rayon pool so extension batches run
+/// in parallel; per-read results are independent of the chunking.
+fn batched_regs(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[Vec<u8>],
+) -> Vec<Vec<MemAlnReg>> {
+    let nthreads = rayon::current_num_threads().max(1);
+    let chunk = codes.len().div_ceil(nthreads).max(1);
+    codes
+        .par_chunks(chunk)
+        .flat_map(|c| align_reads_batched(fm, bns, opt, c, &NeonBackend))
+        .collect()
+}
+
+/// Deduplicate + primary-mark a read's batched regions, then format its SAM record. Pure (no shared
+/// state beyond the immutable index/options), so it is safe across rayon workers.
+fn finish_se(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    rec: &Record,
+    codes: &[u8],
+    regs_pre: Vec<MemAlnReg>,
+    read_id: u64,
+) -> Vec<u8> {
+    let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs_pre);
+    mem_mark_primary_se(opt, &mut regs, read_id);
     // After marking, regs[0] is the highest-scoring primary region.
-    let xa = mem_gen_alt(fm, bns, opt, &regs, codes.len() as i32, &codes);
+    let xa = mem_gen_alt(fm, bns, opt, &regs, codes.len() as i32, codes);
     let best = regs.first().filter(|r| r.score >= opt.t);
     let mut buf = Vec::new();
     match best {
         Some(r) => {
-            let aln = reg2aln(fm, bns, opt, codes.len() as i32, &codes, r);
+            let aln = reg2aln(fm, bns, opt, codes.len() as i32, codes, r);
             let mapq = mem_approx_mapq_se(opt, r);
             let rname = &bns.contigs[aln.rid as usize].name;
             let flag = if aln.is_rev { 16 } else { 0 };
@@ -188,15 +231,27 @@ fn run_pe<W: std::io::Write>(
         if batch.is_empty() {
             break;
         }
-        // Align + dedup both ends of every pair in parallel (regions only; primary marking and
-        // pairing happen later, per bwa-mem2). No cross-pair state, so order is preserved.
+        // Seed -> chain -> BATCHED extension over both ends of every pair (interleaved c1,c2,...),
+        // then per-read dedup. Regions are per-read independent, so this is byte-identical to the
+        // per-read path; primary marking and pairing happen later, per bwa-mem2.
+        let all_codes: Vec<Vec<u8>> = batch
+            .iter()
+            .flat_map(|(r1, r2)| {
+                [
+                    r1.seq.iter().map(|&b| dna::nt4(b)).collect::<Vec<u8>>(),
+                    r2.seq.iter().map(|&b| dna::nt4(b)).collect::<Vec<u8>>(),
+                ]
+            })
+            .collect();
+        let regs_all = batched_regs(fm, bns, opt, &all_codes);
         let mut prepared: Vec<PrepPair> = batch
             .par_iter()
-            .map(|(r1, r2)| {
-                let c1: Vec<u8> = r1.seq.iter().map(|&b| dna::nt4(b)).collect();
-                let c2: Vec<u8> = r2.seq.iter().map(|&b| dna::nt4(b)).collect();
-                let a1 = align_read_dedup(fm, bns, opt, &c1);
-                let a2 = align_read_dedup(fm, bns, opt, &c2);
+            .enumerate()
+            .map(|(i, (r1, r2))| {
+                let c1 = all_codes[2 * i].clone();
+                let c2 = all_codes[2 * i + 1].clone();
+                let a1 = mem_sort_dedup_patch(fm, opt, &c1, regs_all[2 * i].clone());
+                let a2 = mem_sort_dedup_patch(fm, opt, &c2, regs_all[2 * i + 1].clone());
                 PrepPair {
                     c1,
                     c2,

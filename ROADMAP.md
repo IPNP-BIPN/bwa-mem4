@@ -14,11 +14,11 @@ Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.
 | 6 | `phase6-se-sam` | primaire/MAPQ/CIGAR/tags | **SAM SE octet-identique** |
 | 7 | `phase7-pe` | `mem_pestat`/`mem_matesw`/`mem_pair` | **SAM PE octet-identique** |
 | 8 | `phase8-scale` | GRCh38 complet, rayon, resorption de la traine | ~100% concordance reads reels |
-| 9a | `phase9a-neon` | backend NEON du SW derriere `SwBackend` (portage des optim. de @nh13, PR #288) | identique au scalaire + speedup mesure |
+| 9a | `phase9a-neon` | backend NEON du SW derriere `SwBackend` (portage des optim. de @nh13, PR #288) | **FAIT** : identique au scalaire + ~1,5x mesure |
 | 9b | `phase9b-gpu` | backend Metal du SW (entier -> bit-identique) | identique au scalaire + speedup |
 | 10+ | | gate GIAB `hap.py`/`vcfeval` ; packaging | |
 
-Statut : **phases 0-7 terminees, phase 8 quasi terminee**.
+Statut : **phases 0-7 terminees, phase 8 quasi terminee, phase 9a terminee**.
 - **SE** : ligne entiere **5000/5000 byte-identique** (100%).
 - **PE** : **9999/10000** enregistrements byte-identiques ; `mem_pestat` identique bit-a-bit,
   `mem_pair`/flags/TLEN/MC/MAPQ combinee OK. `XA:Z` (`mem_gen_alt`) et mate rescue
@@ -80,6 +80,25 @@ fork/PR accordes sur `IPNP-BIPN/bwa-mem3-rs`). Voir `DEPENDENCIES.md` pour la pr
   ligne-cible + boucle query partagees sur la bande-union, chaque lane masquee sur sa propre bande
   et sa terminaison (ligne nulle / z-drop). Le **flot de controle divergent par lane** (le plus
   dur) est porte et **octet-identique** a `ksw_extend2` ; arithmetique des cellules encore scalaire.
-- **Step 2b-ii** (a faire) : remplacer l'arithmetique de cellule par des intrinsics NEON (int32x4
-  d'abord, puis int8/int16 = 16/8 lanes pour le vrai gain facon `bandedSWA`). Le layout SoA
-  par-lane est deja pret pour ca.
+- **Step 2b-ii** (fait) : kernel NEON **int16x8** (`crates/bwa-neon/src/batched.rs`, `#[cfg(aarch64)]`)
+  suivant `bandedSWA` et `neon_utils.h` de @nh13 : layout SoA `[colonne*8 + lane]`, blendv `vbslq`
+  pour le masque de bande par lane, 8 lanes int16 par registre. Recurrence en `vaddq_s16`/`vsubq_s16`
+  **non saturants**, exacte car les valeurs `H`/`E`/`F` d'une extension locale sont bornees bien en
+  deca de int16 (le kernel de @nh13 obtient la meme garantie via ops saturantes + binning
+  `MAX_SEQ_LEN16`) ; garde `fits_i16` -> repli scalaire sinon. La boucle interne **sans branche**
+  (masque de bande vectoriel + gather de score depuis une query paddee) fait passer le gain de 0,5x
+  (squelette scalaire) a **1,37x** (longueurs melangees) et **2,16x** (uniformes 150 pb) sur
+  `bench_batch`. Octet-identique : gate partagee + test property taille-read (qlen/tlen ~260).
+- **Step 3** (fait) : portage de **`mem_chain2aln_across_reads_V2`** (`crates/bwa-mem/src/across.rs`,
+  `align_reads_batched`) : collecte des extensions gauche/droite de **tous les reads** du batch, tri
+  par longueur (packing des lanes SIMD), passage par le `SwBackend` NEON, scatter avec la logique
+  d'acceptation exacte `MAX_BAND_TRY`. Chaque region ne dependant que de ses propres entrees, le
+  batching est **preservant-resultat** (test d'equivalence batched == per-read sur 400 reads varies).
+  Drivers SE/PE cables (chunk par pool rayon, invariant au nombre de threads). Verifie bout-en-bout :
+  `oracle_diff` **SE 5000/5000** et **PE 10000/10000** `all_fields_match`, `-t1 == -t4`, **~1,5x**
+  wall-clock mono-thread (SE 0,25 -> 0,17 s, PE 0,50 -> 0,33 s).
+
+**Phase 9a terminee.** Gate rempli : octet-identique au scalaire/oracle **et** speedup mesure.
+Reliquat possible (perf pure, hors octet-identite) : kernel **int8x16** (16 lanes) pour les paires
+courtes facon `MAX_SEQ_LEN8`, tuning P-core/E-core Apple Silicon. Voir `DEPENDENCIES.md` (provenance
+@nh13).

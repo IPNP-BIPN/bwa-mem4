@@ -91,6 +91,7 @@ dependencies = [
  "bwa-index",
  "bwa-io",
  "bwa-mem",
+ "bwa-neon",
  "clap",
  "rayon",
 ]
@@ -142,6 +143,7 @@ dependencies = [
  "bwa-core",
  "bwa-extend",
  "bwa-index",
+ "bwa-neon",
  "bwa-seed",
 ]
 

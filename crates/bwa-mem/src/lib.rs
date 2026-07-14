@@ -9,18 +9,20 @@ use bwa_core::MemOpt;
 use bwa_extend::ksw_extend2;
 use bwa_index::{BntSeq, FmIndex};
 
+pub mod across;
 pub mod alt;
 pub mod cigar;
 pub mod pe;
 pub mod primary;
+pub use across::align_reads_batched;
 pub use cigar::{cigar_string, reg2aln, MemAln};
 pub use pe::{mem_pestat, mem_sam_pe, PeStat};
 pub use primary::{mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch};
 
 /// Sentinel for uninitialized region bounds (bwa's `H0_`).
-const H0_SENTINEL: i64 = -99;
+pub(crate) const H0_SENTINEL: i64 = -99;
 /// bwa's `MAX_BAND_TRY`.
-const MAX_BAND_TRY: i32 = 2;
+pub(crate) const MAX_BAND_TRY: i32 = 2;
 
 /// A scored alignment region (bwa-mem2's `mem_alnreg_t`, phase-6 subset).
 #[derive(Debug, Clone)]
@@ -49,7 +51,7 @@ pub struct MemAlnReg {
     pub n_comp: i32,
 }
 
-fn cal_max_gap(opt: &MemOpt, qlen: i32) -> i32 {
+pub(crate) fn cal_max_gap(opt: &MemOpt, qlen: i32) -> i32 {
     let a = f64::from(opt.a);
     let l_del = ((f64::from(qlen) * a - f64::from(opt.o_del)) / f64::from(opt.e_del) + 1.0) as i32;
     let l_ins = ((f64::from(qlen) * a - f64::from(opt.o_ins)) / f64::from(opt.e_ins) + 1.0) as i32;
