@@ -110,21 +110,27 @@ fork/PR accordes sur `IPNP-BIPN/bwa-mem3-rs`). Voir `DEPENDENCIES.md` pour la pr
 **Head-to-head M4 Max, `-t1`, 500k reads (region 2 Mbp), meme sortie octet-identique a l'oracle**
 (mediane de 3) :
 
-| Binaire | Temps reel | vs bwa-mem2 |
-|---|---|---|
-| `bwa-mem2` 2.3 (sse2neon, oracle) | 23,5 s | 1,00x |
-| **bwa-mem3-rs (nous)** | **11,8 s** | **2,00x** |
-| `fg-labs/bwa-mem3` (fork @nh13, natif) | 9,1 s | 2,59x |
+| Binaire | vs bwa-mem2 (mediane, ratio) |
+|---|---|
+| `bwa-mem2` 2.3 (sse2neon, oracle) | 1,00x |
+| **bwa-mem3-rs (nous)** | **~2,2x** |
+| `fg-labs/bwa-mem3` (fork @nh13, natif) | ~2,65x |
 
-**Optimisations perf (phase 9a-perf, toutes octet-identiques)** partant de 15,9 s :
+(Ratios ; les temps absolus derivent avec le thermique. Depart de la phase perf : nous 1,48x, ~15,9 s.)
+
+**Optimisations perf (phase 9a-perf, toutes octet-identiques, verifiees `oracle_diff` SE 5000/5000 +
+PE 10000/10000)** :
 - **Score DNA en compare vectoriel** (plus de gather par cellule) : `score = N ? npen : (t==q ? a : mm)`
-  via `vceqq`/`vbslq`, comme `bandedSWA`. Kernel 1,6->2,5x (melange), 2,2->3,4x (uniforme). 15,9->12,5 s.
-- **mimalloc** (allocateur global) : 12,5->11,9 s.
-- **`target-cpu=native`** + `backward_ext` (chargement bloc unique) : 11,9->11,8 s.
+  via `vceqq`/`vbslq`, comme `bandedSWA`. Kernel 1,6->2,5x (melange), 2,2->3,4x (uniforme). Le plus gros gain.
+- **`CpOcc` cache-line** : cp_count+one_hot interleaves en un enregistrement 64 o `#[repr(C, align(64))]`
+  (comme le `CP_OCC` de bwa-mem2) -> 1 ligne de cache par lookup occ au lieu de 2. ~8 % (seeding).
+- **mimalloc** (allocateur global), **`target-cpu=native`**, `backward_ext` (bloc unique), precompute
+  des codes query/target du kernel.
 
-Nous sommes passes de **1,48x a 2,00x** vs bwa-mem2 ; l'ecart au fork de @nh13 est tombe de **1,74x a
-1,30x**. **Il reste devant.** Le profil montre que le goulot est desormais le **seeding FM-index**
-(`backward_ext`+`smems_from_pos`, ~40-50 %), pas l'extension. Pour le depasser, reliquat (future phase,
-en gardant l'octet-identite) : **occ FM-index vectorise** facon `FMI_search` de bwa-mem2 (calcul des 4
-bases en un coup), port de la gestion de bande exacte de `getScores16`, `kswv` NEON pour le mate-rescue
-(PE), PGO (sans gain net ici, LTO deja agressif). Voir `DEPENDENCIES.md`.
+Nous sommes passes de **1,48x a ~2,2x** vs bwa-mem2 ; l'ecart au fork de @nh13 est tombe de **1,74x a
+~1,19x**. **Il reste devant** (nous ne l'avons pas battu). Le goulot alterne extension DP / seeding
+FM-index selon le profil. Reliquat pour le depasser (future phase, en gardant l'octet-identite) : port
+de la bande SIMD exacte de `getScores16` (plus rapide que notre reproduction fidele de la bande
+adaptative de `ksw_extend2`, dont on ne peut retirer le shrink a cause du gate `gscore`), occ FM-index
+vectorise (4 bases d'un coup), `kswv` NEON pour le mate-rescue (PE). PGO : pas de gain net (LTO deja
+agressif). Voir `DEPENDENCIES.md`.
