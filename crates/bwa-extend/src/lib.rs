@@ -192,24 +192,31 @@ pub fn assert_backend_batch_matches_scalar<B: SwBackend>(backend: &B) {
             .wrapping_add(1442695040888963407);
         state >> 33
     };
-    let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
 
-    // Batch sizes chosen to straddle common SIMD widths (8, 16) and leave partial tails.
-    for &batch_size in &[1usize, 3, 7, 8, 9, 16, 17, 20] {
-        // Scoring/band is shared across a batch, per the extend_batch contract.
+    // Many rounds, each a batch with shared scoring/band (per the contract) but varied content,
+    // sizes straddling common SIMD widths (8, 16) with partial tails, and varied gap penalties.
+    for round in 0..200u32 {
+        let batch_size = *[1usize, 2, 3, 4, 7, 8, 9, 15, 16, 17, 20, 31]
+            .get((next() % 12) as usize)
+            .unwrap();
         let w = 1 + (next() % 30) as i32;
         let zdrop = (next() % 120) as i32;
         let end_bonus = (next() % 10) as i32;
+        // Vary affine gaps too (kept >= 1 and with o+e sane).
+        let o_del = 4 + (next() % 4) as i32;
+        let e_del = 1 + (next() % 2) as i32;
+        let o_ins = 4 + (next() % 4) as i32;
+        let e_ins = 1 + (next() % 2) as i32;
 
         let queries: Vec<Vec<u8>> = (0..batch_size)
             .map(|_| {
-                let qlen = 1 + (next() % 60) as usize;
+                let qlen = 1 + (next() % 80) as usize;
                 (0..qlen).map(|_| (next() % 4) as u8).collect()
             })
             .collect();
         let targets: Vec<Vec<u8>> = (0..batch_size)
             .map(|_| {
-                let tlen = 1 + (next() % 60) as usize;
+                let tlen = 1 + (next() % 80) as usize;
                 (0..tlen).map(|_| (next() % 4) as u8).collect()
             })
             .collect();
@@ -229,12 +236,22 @@ pub fn assert_backend_batch_matches_scalar<B: SwBackend>(backend: &B) {
         assert_eq!(got.len(), batch_size);
         for (i, g) in got.iter().enumerate() {
             let expected = ksw_extend2(
-                &queries[i], &targets[i], 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                &queries[i],
+                &targets[i],
+                5,
+                &mat,
+                o_del,
+                e_del,
+                o_ins,
+                e_ins,
+                w,
+                end_bonus,
+                zdrop,
                 h0s[i],
             );
             assert_eq!(
                 *g, expected,
-                "backend {:?} extend_batch diverged at job {i}/{batch_size} (w={w} zdrop={zdrop})",
+                "backend {:?} extend_batch diverged at round {round} job {i}/{batch_size} (w={w} zdrop={zdrop} gaps={o_del},{e_del},{o_ins},{e_ins})",
                 backend.name()
             );
         }

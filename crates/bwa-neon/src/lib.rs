@@ -28,7 +28,9 @@
 //! Acceptance: `assert_backend_batch_matches_scalar(&NeonBackend)` must pass, then a measured
 //! speedup over the scalar backend on a realistic batch.
 
-use bwa_extend::{ksw_extend2, ExtendResult, SwBackend};
+use bwa_extend::{ksw_extend2, ExtendJob, ExtendResult, SwBackend};
+
+mod batched;
 
 /// The NEON seed-extension backend. See the module docs: it delegates to the scalar kernel today
 /// and is the drop-in point for the lane-parallel NEON DP (phase 9a).
@@ -62,8 +64,27 @@ impl SwBackend for NeonBackend {
         )
     }
 
-    // extend_batch uses the default (loops `extend`) for now; the NEON kernel will override it to
-    // process SIMD_WIDTH lanes at once.
+    #[allow(clippy::too_many_arguments)]
+    fn extend_batch(
+        &self,
+        jobs: &[ExtendJob],
+        m: usize,
+        mat: &[i8],
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        w: i32,
+        end_bonus: i32,
+        zdrop: i32,
+    ) -> Vec<ExtendResult> {
+        // Step 2b-i: lane-batched control flow with scalar per-lane arithmetic (byte-identical to
+        // ksw_extend2). Step 2b-ii swaps the inner cell arithmetic for NEON int32x4 ops; the lane
+        // layout and masked control flow are already in the shape the intrinsics need.
+        batched::batched_extend(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+        )
+    }
 }
 
 #[cfg(test)]
