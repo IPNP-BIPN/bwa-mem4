@@ -126,6 +126,9 @@ fn smems_from_pos(
                 curr_s = new_smem.s;
                 prev[num_curr] = new_smem;
                 num_curr += 1;
+                // Prefetch the checkpoint blocks the next SMEM step's backward_ext on this kept
+                // interval will touch, one step ahead (bwa-mem2 / nh13 `ENABLE_PREFETCH`).
+                fm.prefetch_occ(new_smem.k, new_smem.k + new_smem.s);
                 break;
             }
             p += 1;
@@ -139,6 +142,7 @@ fn smems_from_pos(
                 curr_s = new_smem.s;
                 prev[num_curr] = new_smem;
                 num_curr += 1;
+                fm.prefetch_occ(new_smem.k, new_smem.k + new_smem.s);
             }
             p += 1;
         }
