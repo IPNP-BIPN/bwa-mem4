@@ -39,9 +39,15 @@ Statut : **phases 0-7 terminees, phase 8 quasi terminee**.
   SA-IS **in-place**
   (`crate::sais`, sous-probleme empaquete dans le tableau SA, pas de copie i64 de l'entree ni de
   tableaux O(n) par niveau). Index **octet-identique** confirme chr20 (RSS 2,2 Go) et chr1 (RSS
-  **8,1 Go** contre ~25 Go avant, ~16 o/base). Genome entier 3,1 Gbp projete a **~100 Go < 128 Go**
-  (build non lance ici pour eviter tout risque OOM). `scripts/scale_test.sh` gere le gate par
-  chromosome.
+  **8,1 Go** contre ~25 Go avant, ~16 o/base). `scripts/scale_test.sh` gere le gate par chromosome.
+- **Phase 8b (genome entier)** : **GRCh38 complet (3,1 Gbp, 194 contigs) construit par notre
+  indexeur et gate d'octet-identite PASSE** : les 5 fichiers (`.pac`/`.ann`/`.amb`/`.bwt.2bit.64`/
+  `.0123`) **octet-identiques** a `bwa-mem2 index`. Build ~12 min, pic RSS **61-71 Go** (bien sous
+  la projection ~100 Go et les 128 Go ; garde memoire jamais declenchee). L'indexeur est
+  **mono-thread** (SA-IS sequentiel, comme le `saisxx` de bwa-mem2 ; cout unique). **Bug trouve par
+  le build genome-entier** : notre `.amb` fusionnait les N-runs a travers les frontieres de contigs
+  (telomere N de chr1 + N de chr2 comptes en un seul trou) ; `add1` de bwa-mem2 reset `lasts` par
+  contig, corrige (`build.rs`, teste). chr1/chr20 seuls (contig unique) ne l'exposaient pas.
 
 ## Phase 9a : backend NEON (collaboration @nh13, PR bwa-mem2#288)
 
