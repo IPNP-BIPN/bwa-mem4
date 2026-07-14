@@ -17,9 +17,16 @@ Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.
 | 9 | `phase9-gpu` | backend Metal du SW (entier -> bit-identique) | identique au scalaire + speedup |
 | 10+ | | gate GIAB `hap.py`/`vcfeval` ; packaging | |
 
-Statut : **phases 0-7 quasi terminees**.
+Statut : **phases 0-7 quasi terminees, phase 8 en cours**.
 - **SE** : FLAG/POS/CIGAR 100%, MAPQ 99.5%, ligne entiere **4658/5000** byte-identique.
 - **PE** : **9329/10000** enregistrements byte-identiques ; `mem_pestat` identique bit-a-bit,
   `mem_pair`/flags/TLEN/MC/MAPQ combinee OK. Reste (commun SE/PE) : parite exacte des seeds
   sous-optimaux (`XS`), `mem_gen_alt` (`XA`), et mate rescue (`mem_matesw`/`ksw_align2`). Voir
   `DIVERGENCES.md`.
+- **Phase 8a (rayon)** : parallelisation SE+PE, sortie octet-identique quel que soit `-t` (a `-K`
+  fixe), ~6.5x sur 8 coeurs. Sur `phase8-scale`.
+- **Phase 8b (scaling)** : indexeur + aligneur valides **octet-identiques** jusqu'a **chr1 complet
+  (248 Mbp)** ; chr20 (64 Mbp) PE 8886/10000. **Bloqueur genome complet** : notre SA-IS garde le SA
+  i64 entier en memoire (~50 o/base, pic **25 Go pour chr1** -> **~312 Go projetes** pour 3.1 Gbp,
+  > 137 Go RAM). Il faut une construction du SA **par blocs / externe** (comme bwa-mem2) pour le
+  genome entier. `scripts/scale_test.sh` gere le gate par chromosome.
