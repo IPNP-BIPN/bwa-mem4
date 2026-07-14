@@ -305,10 +305,11 @@ pub fn batched_extend_scalar(
                         mj[l] = j;
                         row_max[l] = h;
                     }
-                    let t = (big_m - oe_del).max(0);
+                    // Gaps open from H (= max(M, E, F)), matching bandedSWA / `ksw_extend2`.
+                    let t = (h - oe_del).max(0);
                     e = (e - e_del).max(t);
                     eh_e[base + ju] = e;
-                    let t = (big_m - oe_ins).max(0);
+                    let t = (h - oe_ins).max(0);
                     f[l] = (f[l] - e_ins).max(t);
                 }
             }
@@ -616,13 +617,13 @@ mod neon {
                             rowmax_v = $bsl(upd, h_v, rowmax_v);
                             mj_v = $bsl(upd, $dup(j as $elem), mj_v);
 
-                            // e = max(e - e_del, max(big_m - oe_del, 0)); store in-band
-                            let t1 = $max($sub(bigm_v, oe_del_v), zero_v);
+                            // e = max(e - e_del, max(h - oe_del, 0)); gaps open from H (bandedSWA).
+                            let t1 = $max($sub(h_v, oe_del_v), zero_v);
                             let e_new = $max($sub(e_v, e_del_v), t1);
                             $sts(eh_e.as_mut_ptr().add(jrow), $bsl(band, e_new, e_v));
 
-                            // f = max(f - e_ins, max(big_m - oe_ins, 0)) in-band
-                            let t2 = $max($sub(bigm_v, oe_ins_v), zero_v);
+                            // f = max(f - e_ins, max(h - oe_ins, 0)) in-band
+                            let t2 = $max($sub(h_v, oe_ins_v), zero_v);
                             let f_new = $max($sub(f_v, e_ins_v), t2);
                             f_v = $bsl(band, f_new, f_v);
                         }

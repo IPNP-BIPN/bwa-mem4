@@ -129,12 +129,16 @@ pub fn ksw_extend2(
             h1 = h;
             mj = if row_max > h { mj } else { j };
             row_max = if row_max > h { row_max } else { h };
-            let mut t = big_m - oe_del;
+            // bwa-mem2's vectorized bandedSWA (and nh13's fork, both byte-identical to bwa-mem2)
+            // open gaps from the just-computed cell score H = max(M, E, F), not from M. On real
+            // seed extensions H == M at the alignment so results match; this is the exact recurrence
+            // of `MAIN_CODE16_CORE`, kept here as the scalar source of truth for the SIMD backends.
+            let mut t = h - oe_del;
             t = t.max(0);
             e -= e_del;
             e = if e > t { e } else { t };
             eh_e[ju] = e;
-            let mut t = big_m - oe_ins;
+            let mut t = h - oe_ins;
             t = t.max(0);
             f -= e_ins;
             f = if f > t { f } else { t };
