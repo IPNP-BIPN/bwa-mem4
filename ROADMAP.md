@@ -129,8 +129,44 @@ PE 10000/10000)** :
 
 Nous sommes passes de **1,48x a ~2,2x** vs bwa-mem2 ; l'ecart au fork de @nh13 est tombe de **1,74x a
 ~1,19x**. **Il reste devant** (nous ne l'avons pas battu). Le goulot alterne extension DP / seeding
-FM-index selon le profil. Reliquat pour le depasser (future phase, en gardant l'octet-identite) : port
-de la bande SIMD exacte de `getScores16` (plus rapide que notre reproduction fidele de la bande
-adaptative de `ksw_extend2`, dont on ne peut retirer le shrink a cause du gate `gscore`), occ FM-index
-vectorise (4 bases d'un coup), `kswv` NEON pour le mate-rescue (PE). PGO : pas de gain net (LTO deja
-agressif). Voir `DEPENDENCIES.md`.
+FM-index selon le profil. Voir `DEPENDENCIES.md`.
+
+## Phase 9c : recurrence bandedSWA (H) + evaluation du reliquat perf
+
+Branche `phase9c-bandedswa`. Le « reliquat » du ROADMAP a ete instruit **avec mesure/profilage**, pas
+par speculation. Resultats :
+
+- **Recurrence bandedSWA (fait, commite, oracle-identique).** `ksw_extend2`, la reference scalaire
+  batchee et le kernel NEON ouvrent desormais les gaps depuis **H = max(M, E, F)** (et non depuis M),
+  soit la recurrence exacte de `MAIN_CODE16_CORE` de bwa-mem2/bandedSWA que le fork `fg-labs/bwa-mem3`
+  documente comme byte-identique a bwa-mem2. Sur donnees reelles H == M a l'alignement, donc sortie
+  inchangee : **oracle SE 5000/5000 + PE 10000/10000**, property test (NEON == scalaire) vert, tous les
+  consommateurs de `ksw_extend2` (CIGAR, extension) passent. **Durcissement** : si un read reel touchait
+  un cas H != M, l'ancien code M pouvait diverger de l'oracle ; le nouveau code H ne le peut pas.
+  **Pas de speedup** (changement de fidelite/robustesse, pas de perf).
+
+- **Kernel d'extension : pas de gain gate-safe (mesure).** La boucle interne est **latency-bound sur la
+  chaine portee `f -> h -> f`** de la recurrence affine, pas ALU-bound. Preuves : (1) le **score-prepass**
+  facon `SBT_PREPASS` (calcul du score hors de la boucle DP) **regresse a 0,90x** (le round-trip store/load
+  `sbt` par cellule coute plus que recalculer le score en place, que l'OoO masque deja) ; (2) retrait de
+  masques ALU redondants **perf-neutre**. Le fork partage la **meme** recurrence latency-bound
+  (`MAIN_CODE16_CORE` a la meme chaine `f11 -> h11 -> f21`), donc son avance ne vient pas du kernel.
+
+- **occ FM-index vectorise : NEGATIF (mesure).** Popcount NEON 4-bases (`vcntq_u8` + reduction pairwise)
+  **0,89x** vs 4 `count_ones()` scalaires : LLVM compile deja `count_ones` en `cnt`/`addv` optimal, la
+  chaine de reduction u8->u64 coute plus. Gain reserve au `GET_OCC` large d'AVX2, pas a la granularite
+  u64 sur Apple Silicon.
+
+- **kswv NEON mate-rescue (PE) : SANS OBJET (profil).** Le mate-rescue est saute sur les paires
+  concordantes ; `ksw_align2`/`matesw` **n'apparait pas** au profil de la run PE. Zero gain mesurable.
+
+- **minibwa (`nh13/minibwa`) n'est PAS une cible valide.** Il est rapide (2x bwa-mem2) parce qu'il
+  utilise l'algo d'alignement de **minimap2 (`ksw2_extd2`)** + heuristiques (`skip mate rescue`,
+  `reduced effort in repetitive regions`) : « comparable accuracy », **sortie differente** de bwa-mem2.
+  Incompatible avec notre gate d'octet-identite.
+
+**Conclusion.** Le kernel bandedSWA est proche de sa limite (latency-bound) et le fort byte-identique le
+partage : son avance ~1,19x vit **ailleurs** que le kernel, probablement dans le **prefetch de seeding**
+et le **skip de travail prouve-inutile** (levier cite par minibwa), a resultat preserve. Prochain levier
+possible (future phase, gate-safe) : prefetch FM-index dans la marche SMEM, skip early des passes
+mate-rescue/regions repetitives quand la sortie ne peut pas changer.
