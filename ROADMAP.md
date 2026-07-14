@@ -98,7 +98,27 @@ fork/PR accordes sur `IPNP-BIPN/bwa-mem3-rs`). Voir `DEPENDENCIES.md` pour la pr
   `oracle_diff` **SE 5000/5000** et **PE 10000/10000** `all_fields_match`, `-t1 == -t4`, **~1,5x**
   wall-clock mono-thread (SE 0,25 -> 0,17 s, PE 0,50 -> 0,33 s).
 
+- **Step 2b-iii** (fait) : kernel **int8x16** (16 lanes) en plus de l'int16x8, **genere par une seule
+  macro** (les deux largeurs ne peuvent pas diverger), avec binning par longueur facon
+  `MAX_SEQ_LEN8`/`MAX_SEQ_LEN16` : int8 si borne < 120 (et qlen,tlen < 120), sinon int16 (< 30000),
+  sinon scalaire ; fast-path homogene (pas de gather/scatter si tout le batch tombe dans un bin).
+  Octet-identique (gate + test taille-read + `oracle_diff` SE 5000/5000, PE 10000/10000). Kernel
+  `bench_batch` : **1,60x** (longueurs melangees, gain int8) et **2,16x** (uniformes 150 pb).
+
 **Phase 9a terminee.** Gate rempli : octet-identique au scalaire/oracle **et** speedup mesure.
-Reliquat possible (perf pure, hors octet-identite) : kernel **int8x16** (16 lanes) pour les paires
-courtes facon `MAX_SEQ_LEN8`, tuning P-core/E-core Apple Silicon. Voir `DEPENDENCIES.md` (provenance
-@nh13).
+
+**Head-to-head M4 Max, `-t1`, 500k reads (region 2 Mbp), meme sortie octet-identique a l'oracle** :
+
+| Binaire | Temps reel | vs bwa-mem2 |
+|---|---|---|
+| `bwa-mem2` 2.3 (sse2neon, oracle) | 23,6 s | 1,00x |
+| **bwa-mem3-rs (nous)** | **15,9 s** | **1,48x** |
+| `fg-labs/bwa-mem3` (fork @nh13, natif) | 9,2 s | 2,58x |
+
+Le fork de @nh13 est **2,58x** sur M4 (sa revendication de 2x est conservatrice), et **1,74x plus
+rapide que nous**. L'ecart vient de ce qu'il a en plus, **hors chemin d'octet-identite** : `kswv` NEON
+natif (mate rescue, chez nous encore scalaire), build **PGO**, allocateur **mimalloc**, prefetch
+logiciel, `Accelerate`, alignement cache 128 o ; et sa bande `bandedSWA` plus grossiere evite le
+travail "union-band" que notre reproduction exacte de `ksw_extend2` impose. Notre kernel d'extension
+seul fait 1,6-2,16x vs notre scalaire ; le bout-en-bout est dilue par le seeding/chainage/IO non
+accelere. Reliquat perf pur (future phase) : `kswv` NEON, tuning P/E-core, PGO. Voir `DEPENDENCIES.md`.
