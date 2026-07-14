@@ -193,16 +193,11 @@ fn sa_is(s: &[usize], k: usize) -> Vec<usize> {
 /// of the ~50 bytes/base of the array-heavy version. This is what lets the full genome index fit in
 /// RAM. The SA is unique, so the output is byte-identical to any correct construction.
 pub fn suffix_array_inplace(s: &[u8]) -> Vec<i64> {
-    // Map bytes to 1..=256 with a 0 sentinel appended (uniquely smallest), then run SA-IS on the
-    // full length-(n+1) string; the sentinel suffix sorts first, so sa[0] == n automatically.
-    let big_n = s.len() + 1;
-    let mut t: Vec<i64> = Vec::with_capacity(big_n);
-    for &b in s {
-        t.push(i64::from(b) + 1);
-    }
-    t.push(0);
-    let mut sa = vec![0i64; big_n];
-    sais_rec(&t, &mut sa, 257);
+    // The input is read as `b+1` with a `0` sentinel appended (uniquely smallest) via `ByteStr`,
+    // with no i64 copy of the input. SA-IS runs on the full length-(n+1) string; the sentinel
+    // suffix sorts first, so sa[0] == n automatically.
+    let mut sa = vec![0i64; s.len() + 1];
+    sais_rec(&ByteStr(s), &mut sa, 257);
     sa
 }
 
@@ -230,11 +225,48 @@ impl TypeBits {
     }
 }
 
-/// Bucket end offsets for an integer string (`out[c]` = one past symbol `c`'s bucket).
-fn bucket_ends_i(s: &[i64], k: usize) -> Vec<i64> {
+/// Read-only integer string for SA-IS. Implemented for the byte reference at the top level (no i64
+/// copy of the input) and for an i64 slice (the reduced sub-problem packed inside the SA array).
+trait IntStr {
+    fn get(&self, i: usize) -> i64;
+    fn len(&self) -> usize;
+}
+
+/// Top-level: the byte reference mapped to `b+1` with a `0` sentinel appended (uniquely smallest).
+struct ByteStr<'a>(&'a [u8]);
+impl IntStr for ByteStr<'_> {
+    #[inline]
+    fn get(&self, i: usize) -> i64 {
+        if i < self.0.len() {
+            i64::from(self.0[i]) + 1
+        } else {
+            0 // appended sentinel
+        }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len() + 1
+    }
+}
+
+/// Recursion levels: the reduced string, an i64 slice living in the SA array's tail.
+struct IntSlice<'a>(&'a [i64]);
+impl IntStr for IntSlice<'_> {
+    #[inline]
+    fn get(&self, i: usize) -> i64 {
+        self.0[i]
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Bucket end offsets (`out[c]` = one past symbol `c`'s bucket).
+fn bucket_ends_i<S: IntStr>(s: &S, k: usize) -> Vec<i64> {
     let mut c = vec![0i64; k];
-    for &x in s {
-        c[x as usize] += 1;
+    for i in 0..s.len() {
+        c[s.get(i) as usize] += 1;
     }
     let mut sum = 0;
     for slot in c.iter_mut() {
@@ -244,11 +276,11 @@ fn bucket_ends_i(s: &[i64], k: usize) -> Vec<i64> {
     c
 }
 
-/// Bucket start offsets for an integer string.
-fn bucket_starts_i(s: &[i64], k: usize) -> Vec<i64> {
+/// Bucket start offsets.
+fn bucket_starts_i<S: IntStr>(s: &S, k: usize) -> Vec<i64> {
     let mut c = vec![0i64; k];
-    for &x in s {
-        c[x as usize] += 1;
+    for i in 0..s.len() {
+        c[s.get(i) as usize] += 1;
     }
     let mut sum = 0;
     for slot in c.iter_mut() {
@@ -260,13 +292,13 @@ fn bucket_starts_i(s: &[i64], k: usize) -> Vec<i64> {
 }
 
 /// Induce L-type then S-type suffixes from the LMS suffixes already placed in `sa`.
-fn induce_i(sa: &mut [i64], s: &[i64], ty: &TypeBits, k: usize) {
+fn induce_i<S: IntStr>(sa: &mut [i64], s: &S, ty: &TypeBits, k: usize) {
     let n = s.len();
     let mut starts = bucket_starts_i(s, k);
     for i in 0..n {
         let j = sa[i];
         if j > 0 && !ty.is_s((j - 1) as usize) {
-            let c = s[(j - 1) as usize] as usize;
+            let c = s.get((j - 1) as usize) as usize;
             sa[starts[c] as usize] = j - 1;
             starts[c] += 1;
         }
@@ -275,7 +307,7 @@ fn induce_i(sa: &mut [i64], s: &[i64], ty: &TypeBits, k: usize) {
     for i in (0..n).rev() {
         let j = sa[i];
         if j > 0 && ty.is_s((j - 1) as usize) {
-            let c = s[(j - 1) as usize] as usize;
+            let c = s.get((j - 1) as usize) as usize;
             ends[c] -= 1;
             sa[ends[c] as usize] = j - 1;
         }
@@ -284,7 +316,7 @@ fn induce_i(sa: &mut [i64], s: &[i64], ty: &TypeBits, k: usize) {
 
 /// Whether the LMS substrings starting at `a` and `b` are equal (same symbols and S/L types up to
 /// and including the next LMS boundary).
-fn lms_eq(s: &[i64], ty: &TypeBits, a: usize, b: usize) -> bool {
+fn lms_eq<S: IntStr>(s: &S, ty: &TypeBits, a: usize, b: usize) -> bool {
     if a == b {
         return true;
     }
@@ -295,7 +327,7 @@ fn lms_eq(s: &[i64], ty: &TypeBits, a: usize, b: usize) -> bool {
         if pa >= n || pb >= n {
             return pa >= n && pb >= n;
         }
-        if s[pa] != s[pb] || ty.is_s(pa) != ty.is_s(pb) {
+        if s.get(pa) != s.get(pb) || ty.is_s(pa) != ty.is_s(pb) {
             return false;
         }
         if i > 0 {
@@ -311,7 +343,7 @@ fn lms_eq(s: &[i64], ty: &TypeBits, a: usize, b: usize) -> bool {
 /// In-place SA-IS on integer string `s` (values in `0..k`, `s[n-1]` the unique smallest sentinel),
 /// writing the suffix array of `s` into `sa` (length `n`). The reduced sub-problem is packed into
 /// `sa` itself, so no per-level O(n) array is allocated (only a type bitvector and one stage-3 temp).
-fn sais_rec(s: &[i64], sa: &mut [i64], k: usize) {
+fn sais_rec<S: IntStr>(s: &S, sa: &mut [i64], k: usize) {
     let n = s.len();
     if n == 0 {
         return;
@@ -325,7 +357,8 @@ fn sais_rec(s: &[i64], sa: &mut [i64], k: usize) {
     let mut ty = TypeBits::new(n);
     ty.set_s(n - 1);
     for i in (0..n - 1).rev() {
-        if s[i] < s[i + 1] || (s[i] == s[i + 1] && ty.is_s(i + 1)) {
+        let (si, si1) = (s.get(i), s.get(i + 1));
+        if si < si1 || (si == si1 && ty.is_s(i + 1)) {
             ty.set_s(i);
         }
     }
@@ -335,7 +368,7 @@ fn sais_rec(s: &[i64], sa: &mut [i64], k: usize) {
     let mut ends = bucket_ends_i(s, k);
     for i in (1..n).rev() {
         if ty.is_lms(i) {
-            let c = s[i] as usize;
+            let c = s.get(i) as usize;
             ends[c] -= 1;
             sa[ends[c] as usize] = i as i64;
         }
@@ -387,7 +420,7 @@ fn sais_rec(s: &[i64], sa: &mut [i64], k: usize) {
     // Solve the reduced problem: SA1 into sa[0..m].
     if num_names < m {
         let (head, tail) = sa.split_at_mut(n - m);
-        sais_rec(tail, &mut head[..m], num_names);
+        sais_rec(&IntSlice(tail), &mut head[..m], num_names);
     } else {
         // All names distinct: SA1 is the inverse permutation of RA.
         for i in 0..m {
@@ -414,7 +447,7 @@ fn sais_rec(s: &[i64], sa: &mut [i64], k: usize) {
     sa.fill(IEMPTY);
     let mut ends = bucket_ends_i(s, k);
     for &p in sorted_lms.iter().rev() {
-        let c = s[p as usize] as usize;
+        let c = s.get(p as usize) as usize;
         ends[c] -= 1;
         sa[ends[c] as usize] = p;
     }
