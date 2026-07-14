@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use bwa_core::{dna, Error, Result};
 
 use crate::rand48::Rand48;
-use crate::sais::suffix_array_with_sentinel;
+use crate::sais::suffix_array_inplace;
 
 /// bwa-mem2's fixed RNG seed for ambiguous-base randomization (`.ann` third field).
 const SEED: u32 = 11;
@@ -190,7 +190,7 @@ fn write_amb(path: &Path, l_pac: i64, n_seqs: i32, ambs: &[AmbRec]) -> Result<()
 /// | sentinel_index:i64]`, all little-endian. `bref` is the 2L forward++RC binary reference.
 fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     let two_l = bref.len(); // 2L
-    let sa = suffix_array_with_sentinel(bref); // length N = 2L+1, sa[0] = 2L
+    let sa = suffix_array_inplace(bref); // length N = 2L+1, sa[0] = 2L (memory-efficient SA-IS)
     let n = sa.len(); // reference_seq_len = 2L + 1
 
     // count[5] = {0, #A, #A+#C, #A+#C+#G, 2L} over the 2L binary bases.

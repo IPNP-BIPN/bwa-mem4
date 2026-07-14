@@ -27,7 +27,9 @@ Statut : **phases 0-7 quasi terminees, phase 8 en cours**.
 - **Phase 8a (rayon)** : parallelisation SE+PE, sortie octet-identique quel que soit `-t` (a `-K`
   fixe), ~6.5x sur 8 coeurs. Sur `phase8-scale`.
 - **Phase 8b (scaling)** : indexeur + aligneur valides **octet-identiques** jusqu'a **chr1 complet
-  (248 Mbp)** ; chr20 (64 Mbp) PE 8886/10000. **Bloqueur genome complet** : notre SA-IS garde le SA
-  i64 entier en memoire (~50 o/base, pic **25 Go pour chr1** -> **~312 Go projetes** pour 3.1 Gbp,
-  > 137 Go RAM). Il faut une construction du SA **par blocs / externe** (comme bwa-mem2) pour le
-  genome entier. `scripts/scale_test.sh` gere le gate par chromosome.
+  (248 Mbp)** ; chr20 (64 Mbp) PE 8886/10000. **Bloqueur memoire resolu** : SA-IS **in-place**
+  (`crate::sais`, sous-probleme empaquete dans le tableau SA, pas de copie i64 de l'entree ni de
+  tableaux O(n) par niveau). Index **octet-identique** confirme chr20 (RSS 2,2 Go) et chr1 (RSS
+  **8,1 Go** contre ~25 Go avant, ~16 o/base). Genome entier 3,1 Gbp projete a **~100 Go < 128 Go**
+  (build non lance ici pour eviter tout risque OOM). `scripts/scale_test.sh` gere le gate par
+  chromosome.
