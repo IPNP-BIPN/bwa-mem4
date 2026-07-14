@@ -18,11 +18,12 @@ Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.
 | 10+ | | gate GIAB `hap.py`/`vcfeval` ; packaging | |
 
 Statut : **phases 0-7 quasi terminees, phase 8 en cours**.
-- **SE** : FLAG/POS/CIGAR 100%, MAPQ 99.5%, ligne entiere **4658/5000** byte-identique.
-- **PE** : **9329/10000** enregistrements byte-identiques ; `mem_pestat` identique bit-a-bit,
-  `mem_pair`/flags/TLEN/MC/MAPQ combinee OK. Reste (commun SE/PE) : parite exacte des seeds
-  sous-optimaux (`XS`), `mem_gen_alt` (`XA`), et mate rescue (`mem_matesw`/`ksw_align2`). Voir
-  `DIVERGENCES.md`.
+- **SE** : FLAG/POS/CIGAR 100%, MAPQ 99.5%, ligne entiere **4660/5000** byte-identique.
+- **PE** : **9366/10000** enregistrements byte-identiques ; `mem_pestat` identique bit-a-bit,
+  `mem_pair`/flags/TLEN/MC/MAPQ combinee OK. `XA:Z` (`mem_gen_alt`) **porte, byte-identique**
+  (branche `phase8-parity`). Reste (une seule cause racine) : parite exacte des regions
+  **sous-optimales** (`XS` cosmetique + `sub_n`->MAPQ ; 632/634 du tail PE), plus mate rescue
+  (`mem_matesw`/`ksw_align2`, 2 enreg.). Voir `DIVERGENCES.md`.
 - **Phase 8a (rayon)** : parallelisation SE+PE, sortie octet-identique quel que soit `-t` (a `-K`
   fixe), ~6.5x sur 8 coeurs. Sur `phase8-scale`.
 - **Phase 8b (scaling)** : indexeur + aligneur valides **octet-identiques** jusqu'a **chr1 complet
