@@ -224,6 +224,11 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
             .then(x.hash.cmp(&y.hash))
     });
     mark_primary_core(opt, a);
+    // No ALT contigs: `secondary_all` mirrors `secondary` (the C's else-branch when n_pri == n).
+    // `mem_gen_alt`/the PE swap read `secondary_all` separately from `secondary`.
+    for r in a.iter_mut() {
+        r.secondary_all = r.secondary;
+    }
     n_pri
 }
 

@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 
+use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
 use crate::primary::{hash_64, mem_approx_mapq_se, mem_mark_primary_se};
 use crate::MemAlnReg;
@@ -300,7 +301,7 @@ fn get_rlen(cigar: &[u32]) -> i64 {
 
 /// Append a CIGAR string, converting soft-clips to hard-clips for supplementary alignments
 /// (`which != 0`). Port of `add_cigar` (non-ALT, no `-Y` soft-clip flag).
-fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
+pub(crate) fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
     if cigar.is_empty() {
         out.push(b'*');
         return;
@@ -523,6 +524,11 @@ fn mem_aln2sam(
             }
         }
     }
+    // XA:Z (alternate hits), after SA/pa per mem_aln2sam. `pa` needs ALT contigs, so never emitted.
+    if let Some(xa) = &p.xa {
+        out.extend_from_slice(b"\tXA:Z:");
+        out.extend_from_slice(xa.as_bytes());
+    }
     out.push(b'\n');
 }
 
@@ -655,16 +661,38 @@ pub fn mem_sam_pe<W: Write>(
                     q_se[1] = mem_approx_mapq_se(opt, &a1[0]) as i32;
                 }
 
+                // Primary/secondary swap on `secondary_all` so `mem_gen_alt` attributes the
+                // paired region z[i]'s siblings to it as XA hits (mem_sam_pe lines 474-483).
+                let n_pri = [n_pri0, n_pri1];
+                for i in 0..2 {
+                    let a = if i == 0 { &mut *a0 } else { &mut *a1 };
+                    let zi = z[i] as i32;
+                    let k = a[z[i]].secondary_all;
+                    if k >= 0 && (k as usize) < n_pri[i] {
+                        for r in a.iter_mut() {
+                            if r.secondary_all == k {
+                                r.secondary_all = zi;
+                            }
+                        }
+                        a[k as usize].secondary_all = zi;
+                        a[z[i]].secondary_all = -1;
+                    }
+                }
+                let xa0 = mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]);
+                let xa1 = mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]);
+
                 let h0 = {
                     let mut h = reg2aln(fm, bns, opt, seqs[0].len() as i32, seqs[0], &a0[z[0]]);
                     h.mapq = q_se[0].max(0) as u32;
                     h.flag |= 0x40 | extra_flag;
+                    h.xa = xa0[z[0]].clone();
                     h
                 };
                 let h1 = {
                     let mut h = reg2aln(fm, bns, opt, seqs[1].len() as i32, seqs[1], &a1[z[1]]);
                     h.mapq = q_se[1].max(0) as u32;
                     h.flag |= 0x80 | extra_flag;
+                    h.xa = xa1[z[1]].clone();
                     h
                 };
                 let mut buf0 = Vec::new();

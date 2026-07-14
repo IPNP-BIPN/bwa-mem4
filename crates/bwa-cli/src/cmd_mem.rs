@@ -13,8 +13,8 @@ use bwa_core::{dna, MemOpt};
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
-    align_read_dedup, align_read_se, cigar_string, mem_approx_mapq_se, mem_pestat, mem_sam_pe,
-    reg2aln, MemAlnReg,
+    align_read_dedup, align_read_se, alt::mem_gen_alt, cigar_string, mem_approx_mapq_se,
+    mem_pestat, mem_sam_pe, reg2aln, MemAlnReg,
 };
 
 #[derive(Args)]
@@ -105,6 +105,7 @@ fn format_se(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, rec: &Record, read_id: u6
     let codes: Vec<u8> = rec.seq.iter().map(|&b| dna::nt4(b)).collect();
     let regs = align_read_se(fm, bns, opt, &codes, read_id);
     // After marking, regs[0] is the highest-scoring primary region.
+    let xa = mem_gen_alt(fm, bns, opt, &regs, codes.len() as i32, &codes);
     let best = regs.first().filter(|r| r.score >= opt.t);
     let mut buf = Vec::new();
     match best {
@@ -114,10 +115,14 @@ fn format_se(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, rec: &Record, read_id: u6
             let rname = &bns.contigs[aln.rid as usize].name;
             let flag = if aln.is_rev { 16 } else { 0 };
             let cigar = cigar_string(&aln.cigar);
-            let tags = format!(
+            let mut tags = format!(
                 "NM:i:{}\tMD:Z:{}\tAS:i:{}\tXS:i:{}",
                 aln.nm, aln.md, aln.score, aln.sub
             );
+            if let Some(xa0) = &xa[0] {
+                tags.push_str("\tXA:Z:");
+                tags.push_str(xa0);
+            }
             let pos = aln.pos + 1;
             if aln.is_rev {
                 let seq = dna::revcomp_ascii(&rec.seq);

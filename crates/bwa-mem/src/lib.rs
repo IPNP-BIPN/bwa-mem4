@@ -9,6 +9,7 @@ use bwa_core::MemOpt;
 use bwa_extend::ksw_extend2;
 use bwa_index::{BntSeq, FmIndex};
 
+pub mod alt;
 pub mod cigar;
 pub mod pe;
 pub mod primary;
@@ -37,6 +38,10 @@ pub struct MemAlnReg {
     pub seedcov: i32,
     pub seedlen0: i32,
     pub secondary: i32,
+    /// Rank-preserving secondary index used only by `mem_gen_alt` (`get_pri_idx`). Equals
+    /// `secondary` after marking on a no-ALT reference, but the PE primary/secondary swap mutates
+    /// it independently of `secondary` (which the `-2` sentinel repurposes for the emitted record).
+    pub secondary_all: i32,
     pub w: i32,
     pub frac_rep: f32,
     pub is_alt: bool,
@@ -146,6 +151,7 @@ pub fn mem_chain2aln(
             seedcov: 0,
             seedlen0: s.len,
             secondary: -1,
+            secondary_all: -1,
             w: opt.w,
             frac_rep: chain.frac_rep,
             is_alt: chain.is_alt,
