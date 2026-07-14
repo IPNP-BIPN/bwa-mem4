@@ -71,3 +71,15 @@ depuis le fork de Nils Homer (`fg-labs/bwa-mem3`, ~2x plus rapide) et sa PR #288
 **Gate** : sortie octet-identique au backend scalaire (property test + `oracle_diff.sh`) **et**
 speedup mesure (`/usr/bin/time`). A faire sur une branche partagee avec @nh13 (acces lecture +
 fork/PR accordes sur `IPNP-BIPN/bwa-mem3-rs`). Voir `DEPENDENCIES.md` pour la provenance.
+
+**Avancement** :
+- **Fondations** (fait) : API `extend_batch` sur `SwBackend` (batch inter-sequences comme
+  `bandedSWA`), gate de parite batch (`assert_backend_batch_matches_scalar`, 200 rounds), crate
+  `bwa-neon` + `NeonBackend`.
+- **Step 2b-i** (fait) : squelette DP **par lots** (`crates/bwa-neon/src/batched.rs`) : boucle
+  ligne-cible + boucle query partagees sur la bande-union, chaque lane masquee sur sa propre bande
+  et sa terminaison (ligne nulle / z-drop). Le **flot de controle divergent par lane** (le plus
+  dur) est porte et **octet-identique** a `ksw_extend2` ; arithmetique des cellules encore scalaire.
+- **Step 2b-ii** (a faire) : remplacer l'arithmetique de cellule par des intrinsics NEON (int32x4
+  d'abord, puis int8/int16 = 16/8 lanes pour le vrai gain facon `bandedSWA`). Le layout SoA
+  par-lane est deja pret pour ca.
