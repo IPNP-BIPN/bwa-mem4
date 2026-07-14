@@ -18,3 +18,4 @@ bwa-index = { workspace = true }
 bwa-mem = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+rayon = { workspace = true }

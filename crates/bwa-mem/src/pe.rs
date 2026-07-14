@@ -2,16 +2,18 @@
 //! `mem_pestat` / `mem_pair` / `mem_sam_pe` / `mem_aln2sam` (`reference/bwa-mem2/src/bwamem_pair.cpp`
 //! and `bwamem.cpp`).
 //!
-//! Mate rescue (`mem_matesw`, needing `ksw_align2`) is deferred; on concordant pairs it performs no
-//! Smith-Waterman, so the pairing/SAM path is exercised first.
+//! Mate rescue (`mem_matesw`) uses `ksw_align2`; on concordant pairs all orientations are skipped
+//! so it performs no Smith-Waterman and leaves the region set untouched.
 
 use std::io::{self, Write};
 
 use bwa_core::MemOpt;
+use bwa_extend::ksw_align2;
 use bwa_index::{BntSeq, FmIndex};
 
+use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
-use crate::primary::{hash_64, mem_approx_mapq_se, mem_mark_primary_se};
+use crate::primary::{hash_64, mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch};
 use crate::MemAlnReg;
 
 extern "C" {
@@ -61,6 +63,162 @@ fn mem_infer_dir(l_pac: i64, b1: i64, b2: i64) -> (usize, i64) {
     (dir, dist)
 }
 
+/// Fetch reference `[rb, re)` (in 2*l_pac space) clamped to the contig containing `mid`, returning
+/// the clamped bounds, the contig id, and the nt4 sequence (`.0123`, forward++reverse-complement).
+/// Port of `bns_fetch_seq`.
+fn bns_fetch_seq(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    rb: i64,
+    mid: i64,
+    re: i64,
+) -> (i64, i64, i32, Vec<u8>) {
+    let (mut rb, mut re) = if re < rb { (re, rb) } else { (rb, re) };
+    let (dep, is_rev) = bns.depos(mid);
+    let rid = bns.pos2rid(dep);
+    let (mut far_beg, mut far_end) = if rid >= 0 {
+        let c = &bns.contigs[rid as usize];
+        (c.offset, c.offset + i64::from(c.len))
+    } else {
+        (0, bns.l_pac << 1)
+    };
+    if is_rev {
+        let tmp = far_beg;
+        far_beg = (bns.l_pac << 1) - far_end;
+        far_end = (bns.l_pac << 1) - tmp;
+    }
+    rb = rb.max(far_beg);
+    re = re.min(far_end);
+    let seq: Vec<u8> = (rb..re).map(|p| fm.base(p)).collect();
+    (rb, re, rid, seq)
+}
+
+/// Smith-Waterman mate rescue: given an anchor region `a` for one read, try to align the mate `ms`
+/// (nt4) in each insert-consistent orientation not already satisfied, appending any hit to `ma`.
+/// Port of `mem_matesw` (non-MATE_SORT path). Returns the number of SW attempts that ran.
+fn mem_matesw(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    a: &MemAlnReg,
+    ms: &[u8],
+    ma: &mut Vec<MemAlnReg>,
+) -> i32 {
+    let l_pac = bns.l_pac;
+    let l_ms = ms.len() as i64;
+    let mut skip = [0i32; 4];
+    for (r, sk) in skip.iter_mut().enumerate() {
+        *sk = i32::from(pes[r].failed);
+    }
+    for m in ma.iter() {
+        let (r, dist) = mem_infer_dir(l_pac, a.rb, m.rb);
+        if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
+            skip[r] = 1;
+        }
+    }
+    if skip.iter().sum::<i32>() == 4 {
+        return 0; // a consistent pair already exists; no SW needed
+    }
+
+    let mut n = 0;
+    for r in 0..4 {
+        if skip[r] != 0 {
+            continue;
+        }
+        let is_rev = (r >> 1) != (r & 1);
+        let is_larger = (r >> 1) == 0;
+        let seq: Vec<u8> = if is_rev {
+            // reverse complement of ms
+            ms.iter()
+                .rev()
+                .map(|&b| if b < 4 { 3 - b } else { 4 })
+                .collect()
+        } else {
+            ms.to_vec()
+        };
+        let (lo, hi) = (i64::from(pes[r].low), i64::from(pes[r].high));
+        let (rb0, re0) = if !is_rev {
+            let rb = if is_larger { a.rb + lo } else { a.rb - hi };
+            let re = (if is_larger { a.rb + hi } else { a.rb - lo }) + l_ms;
+            (rb, re)
+        } else {
+            let rb = (if is_larger { a.rb + lo } else { a.rb - hi }) - l_ms;
+            let re = if is_larger { a.rb + hi } else { a.rb - lo };
+            (rb, re)
+        };
+        let rb0 = rb0.max(0);
+        let re0 = re0.min(l_pac << 1);
+        if rb0 < re0 {
+            let (rb, re, rid, refseq) = bns_fetch_seq(fm, bns, rb0, (rb0 + re0) >> 1, re0);
+            if a.rid == rid && re - rb >= i64::from(opt.min_seed_len) {
+                let minsc = opt.min_seed_len * opt.a;
+                let aln = ksw_align2(
+                    &seq, &refseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc,
+                    opt.a,
+                );
+                if aln.score >= opt.min_seed_len && aln.qb >= 0 {
+                    let qb = if is_rev {
+                        l_ms as i32 - (aln.qe + 1)
+                    } else {
+                        aln.qb
+                    };
+                    let qe = if is_rev {
+                        l_ms as i32 - aln.qb
+                    } else {
+                        aln.qe + 1
+                    };
+                    let brb = if is_rev {
+                        (l_pac << 1) - (rb + i64::from(aln.te) + 1)
+                    } else {
+                        rb + i64::from(aln.tb)
+                    };
+                    let bre = if is_rev {
+                        (l_pac << 1) - (rb + i64::from(aln.tb))
+                    } else {
+                        rb + i64::from(aln.te) + 1
+                    };
+                    let seedcov = ((bre - brb).min(i64::from(qe - qb)) >> 1) as i32;
+                    let b = MemAlnReg {
+                        rb: brb,
+                        re: bre,
+                        qb,
+                        qe,
+                        rid: a.rid,
+                        score: aln.score,
+                        truesc: 0,
+                        sub: 0,
+                        csub: aln.score2,
+                        sub_n: 0,
+                        seedcov,
+                        seedlen0: 0,
+                        secondary: -1,
+                        secondary_all: 0,
+                        w: 0,
+                        frac_rep: 0.0,
+                        is_alt: a.is_alt,
+                        hash: 0,
+                        n_comp: 0,
+                    };
+                    // Insert keeping `ma` sorted by score descending (bwa's manual insertion).
+                    let mut ins = 0;
+                    while ins < ma.len() && ma[ins].score >= b.score {
+                        ins += 1;
+                    }
+                    ma.insert(ins, b);
+                }
+                n += 1;
+            }
+        }
+        // Dedup after each orientation, null query (merging disabled), per mem_matesw.
+        if n > 0 {
+            let taken = std::mem::take(ma);
+            *ma = mem_sort_dedup_patch(fm, opt, &[], taken);
+        }
+    }
+    n
+}
+
 /// Second-best non-overlapping score among a read's dedup'd regions (`a[0]` is the best). Port of
 /// `cal_sub`.
 fn cal_sub(opt: &MemOpt, r: &[MemAlnReg]) -> i32 {
@@ -85,14 +243,14 @@ fn cal_sub(opt: &MemOpt, r: &[MemAlnReg]) -> i32 {
 
 /// Estimate insert-size distributions for the four orientations over a whole batch. `regs` holds the
 /// dedup'd regions of `2N` interleaved reads (`regs[2i]`=R1, `regs[2i+1]`=R2). Port of `mem_pestat`.
-pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[Vec<MemAlnReg>]) -> [PeStat; 4] {
+pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4] {
     let mut pes = [PeStat::default(); 4];
     let mut isize: [Vec<i64>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
     let n_pairs = regs.len() / 2;
     for i in 0..n_pairs {
-        let r0 = &regs[i << 1];
-        let r1 = &regs[(i << 1) | 1];
+        let r0 = regs[i << 1];
+        let r1 = regs[(i << 1) | 1];
         if r0.is_empty() || r1.is_empty() {
             continue;
         }
@@ -300,7 +458,7 @@ fn get_rlen(cigar: &[u32]) -> i64 {
 
 /// Append a CIGAR string, converting soft-clips to hard-clips for supplementary alignments
 /// (`which != 0`). Port of `add_cigar` (non-ALT, no `-Y` soft-clip flag).
-fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
+pub(crate) fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
     if cigar.is_empty() {
         out.push(b'*');
         return;
@@ -523,6 +681,11 @@ fn mem_aln2sam(
             }
         }
     }
+    // XA:Z (alternate hits), after SA/pa per mem_aln2sam. `pa` needs ALT contigs, so never emitted.
+    if let Some(xa) = &p.xa {
+        out.extend_from_slice(b"\tXA:Z:");
+        out.extend_from_slice(xa.as_bytes());
+    }
     out.push(b'\n');
 }
 
@@ -596,6 +759,32 @@ pub fn mem_sam_pe<W: Write>(
     a1: &mut Vec<MemAlnReg>,
     w: &mut W,
 ) -> io::Result<()> {
+    // Mate rescue (mem_matesw), before primary marking. Snapshot each read's near-best regions as
+    // anchors, then SW-rescue the other read's mate in any missing insert-consistent orientation.
+    // On concordant pairs every orientation is skipped, so this is a no-op. Port of the non-
+    // MATE_SORT rescue block in mem_sam_pe (bwamem_pair.cpp lines 378-414).
+    if !a0.is_empty() && !a1.is_empty() {
+        let pen = opt.pen_unpaired;
+        let cap = opt.max_matesw.max(0) as usize;
+        let (best0, best1) = (a0[0].score, a1[0].score);
+        let b0: Vec<MemAlnReg> = a0
+            .iter()
+            .filter(|r| r.score >= best0 - pen)
+            .cloned()
+            .collect();
+        let b1: Vec<MemAlnReg> = a1
+            .iter()
+            .filter(|r| r.score >= best1 - pen)
+            .cloned()
+            .collect();
+        for anchor in b0.iter().take(cap) {
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1);
+        }
+        for anchor in b1.iter().take(cap) {
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0);
+        }
+    }
+
     let n_pri0 = mem_mark_primary_se(opt, a0, id << 1) as usize;
     let n_pri1 = mem_mark_primary_se(opt, a1, (id << 1) | 1) as usize;
     let extra_flag: u32 = 1;
@@ -655,16 +844,38 @@ pub fn mem_sam_pe<W: Write>(
                     q_se[1] = mem_approx_mapq_se(opt, &a1[0]) as i32;
                 }
 
+                // Primary/secondary swap on `secondary_all` so `mem_gen_alt` attributes the
+                // paired region z[i]'s siblings to it as XA hits (mem_sam_pe lines 474-483).
+                let n_pri = [n_pri0, n_pri1];
+                for i in 0..2 {
+                    let a = if i == 0 { &mut *a0 } else { &mut *a1 };
+                    let zi = z[i] as i32;
+                    let k = a[z[i]].secondary_all;
+                    if k >= 0 && (k as usize) < n_pri[i] {
+                        for r in a.iter_mut() {
+                            if r.secondary_all == k {
+                                r.secondary_all = zi;
+                            }
+                        }
+                        a[k as usize].secondary_all = zi;
+                        a[z[i]].secondary_all = -1;
+                    }
+                }
+                let xa0 = mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]);
+                let xa1 = mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]);
+
                 let h0 = {
                     let mut h = reg2aln(fm, bns, opt, seqs[0].len() as i32, seqs[0], &a0[z[0]]);
                     h.mapq = q_se[0].max(0) as u32;
                     h.flag |= 0x40 | extra_flag;
+                    h.xa = xa0[z[0]].clone();
                     h
                 };
                 let h1 = {
                     let mut h = reg2aln(fm, bns, opt, seqs[1].len() as i32, seqs[1], &a1[z[1]]);
                     h.mapq = q_se[1].max(0) as u32;
                     h.flag |= 0x80 | extra_flag;
+                    h.xa = xa1[z[1]].clone();
                     h
                 };
                 let mut buf0 = Vec::new();

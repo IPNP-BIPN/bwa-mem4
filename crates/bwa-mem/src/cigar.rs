@@ -27,6 +27,9 @@ pub struct MemAln {
     pub score: i32,
     /// Suboptimal score (`XS:i`), `max(sub, csub)`. `-1` suppresses the tag (secondary hits).
     pub sub: i32,
+    /// Alternate hits (`XA:Z:`), pre-formatted `rname,±pos,cigar,NM;`... or `None`. Set by the
+    /// caller via `mem_gen_alt`; `reg2aln` leaves it `None`.
+    pub xa: Option<String>,
 }
 
 impl MemAln {
@@ -43,6 +46,7 @@ impl MemAln {
             md: String::new(),
             score: -1,
             sub: -1,
+            xa: None,
         }
     }
 }
@@ -258,6 +262,7 @@ pub fn reg2aln(
         md,
         score: reg.score,
         sub: reg.sub.max(reg.csub),
+        xa: None,
     }
 }
 

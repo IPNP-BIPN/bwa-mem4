@@ -23,6 +23,9 @@ fn mem_patch_reg(
     a: &MemAlnReg,
     b: &MemAlnReg,
 ) -> Option<(i32, i32)> {
+    if codes.is_empty() {
+        return None; // `query == 0` (mem_matesw's dedup): merging is disabled
+    }
     let l_pac = fm.l_pac();
     if a.rb < l_pac && b.rb >= l_pac {
         return None; // different strands
@@ -224,6 +227,11 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
             .then(x.hash.cmp(&y.hash))
     });
     mark_primary_core(opt, a);
+    // No ALT contigs: `secondary_all` mirrors `secondary` (the C's else-branch when n_pri == n).
+    // `mem_gen_alt`/the PE swap read `secondary_all` separately from `secondary`.
+    for r in a.iter_mut() {
+        r.secondary_all = r.secondary;
+    }
     n_pri
 }
 

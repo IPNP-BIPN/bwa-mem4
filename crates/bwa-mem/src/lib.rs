@@ -9,6 +9,7 @@ use bwa_core::MemOpt;
 use bwa_extend::ksw_extend2;
 use bwa_index::{BntSeq, FmIndex};
 
+pub mod alt;
 pub mod cigar;
 pub mod pe;
 pub mod primary;
@@ -37,6 +38,10 @@ pub struct MemAlnReg {
     pub seedcov: i32,
     pub seedlen0: i32,
     pub secondary: i32,
+    /// Rank-preserving secondary index used only by `mem_gen_alt` (`get_pri_idx`). Equals
+    /// `secondary` after marking on a no-ALT reference, but the PE primary/secondary swap mutates
+    /// it independently of `secondary` (which the `-2` sentinel repurposes for the emitted record).
+    pub secondary_all: i32,
     pub w: i32,
     pub frac_rep: f32,
     pub is_alt: bool,
@@ -146,6 +151,7 @@ pub fn mem_chain2aln(
             seedcov: 0,
             seedlen0: s.len,
             secondary: -1,
+            secondary_all: -1,
             w: opt.w,
             frac_rep: chain.frac_rep,
             is_alt: chain.is_alt,
@@ -235,7 +241,28 @@ pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec
 /// primaries themselves.
 pub fn align_read_dedup(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec<MemAlnReg> {
     let regs = align_read(fm, bns, opt, codes);
-    mem_sort_dedup_patch(fm, opt, codes, regs)
+    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+        dump_regs(bns, "pre-dedup", &regs);
+    }
+    let deduped = mem_sort_dedup_patch(fm, opt, codes, regs);
+    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+        dump_regs(bns, "post-dedup", &deduped);
+    }
+    deduped
+}
+
+/// Env-gated (`BWA3_DUMP_REGS`) diagnostic: print every region with its query span, reference
+/// span, mapped position and scores. Used to compare our suboptimal-region set against the oracle.
+fn dump_regs(bns: &BntSeq, tag: &str, regs: &[MemAlnReg]) {
+    eprintln!("--- regs [{}] n={} ---", tag, regs.len());
+    for (i, r) in regs.iter().enumerate() {
+        let (rid, pos, rev) = region_to_pos(bns, r);
+        let strand = if rev { '-' } else { '+' };
+        eprintln!(
+            "  #{i} q[{},{}) r[{},{}) rid={rid} {strand}pos={pos} score={} truesc={} sub={} seedcov={} seedlen0={}",
+            r.qb, r.qe, r.rb, r.re, r.score, r.truesc, r.sub, r.seedcov, r.seedlen0
+        );
+    }
 }
 
 /// Full single-end alignment for one read: extension regions, deduplicated and primary-marked

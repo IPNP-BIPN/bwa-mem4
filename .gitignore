@@ -5,8 +5,10 @@
 /reference/
 
 # Transient working dirs: all derived indexes, generated FASTQ/FASTA, oracle/ours SAMs,
-# time/RSS logs and concordance reports live here so they are never committed.
+# time/RSS logs and concordance reports live here so they are never committed. `work*`
+# covers per-phase scratch dirs (work, work8, ...).
 /work/
+/work*/
 /scratch/
 
 # Committed fixtures live under testdata/ and crates/*/tests/golden/ and are NOT ignored.
