@@ -9,3 +9,4 @@ repository.workspace = true
 
 [dependencies]
 bwa-core = { workspace = true }
+rayon = { workspace = true }
