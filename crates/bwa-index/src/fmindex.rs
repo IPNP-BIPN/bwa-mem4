@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use bwa_core::Result;
 
 /// A bidirectional FM-index interval, mirroring bwa-mem2's `SMEM`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Smem {
     pub rid: u32,
     pub m: u32,

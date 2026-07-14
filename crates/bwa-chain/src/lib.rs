@@ -110,7 +110,20 @@ pub fn build_chains(
     codes: &[u8],
     seqid: i32,
 ) -> Vec<MemChain> {
-    let mut smems = mem_collect_smem(fm, codes, opt);
+    let smems = mem_collect_smem(fm, codes, opt);
+    build_chains_from_smems(fm, bns, opt, codes, seqid, smems)
+}
+
+/// Build chains from **pre-computed** SMEMs (e.g. from batched lockstep seeding). Identical to
+/// [`build_chains`] given the same seed set; only the SMEM source differs.
+pub fn build_chains_from_smems(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[u8],
+    seqid: i32,
+    mut smems: Vec<bwa_index::Smem>,
+) -> Vec<MemChain> {
     // Intra-read SMEM order: by (m, n) ascending (bwa's `intv_lt1`).
     smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
 

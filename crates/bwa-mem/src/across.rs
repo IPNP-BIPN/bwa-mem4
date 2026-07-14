@@ -16,10 +16,11 @@
 //! bit-for-bit identical.
 
 use crate::{cal_max_gap, MemAlnReg, H0_SENTINEL, MAX_BAND_TRY};
-use bwa_chain::{build_chains, mem_chain_flt, MemChain};
+use bwa_chain::{build_chains_from_smems, mem_chain_flt, MemChain};
 use bwa_core::MemOpt;
 use bwa_extend::{ExtendJob, SwBackend};
 use bwa_index::{BntSeq, FmIndex};
+use bwa_seed::mem_collect_smem_batched;
 
 /// One pending one-sided extension, with a back-pointer to the region it fills.
 struct SideJob {
@@ -45,10 +46,17 @@ pub fn align_reads_batched<B: SwBackend>(
 ) -> Vec<Vec<MemAlnReg>> {
     let l_pac = bns.l_pac;
 
-    // Seed + chain every read independently (same as align_read's front half).
-    let per_read_chains: Vec<Vec<MemChain>> = reads
-        .iter()
-        .map(|codes| mem_chain_flt(opt, build_chains(fm, bns, opt, codes, 0)))
+    // Round-1 SMEMs for the whole batch in lockstep (hides FM-index latency across reads), then
+    // chain each read. Result-identical to per-read `build_chains` (batched seeding is verified equal
+    // to per-read `collect_smems`).
+    let refs: Vec<&[u8]> = reads.iter().map(|c| c.as_slice()).collect();
+    let per_read_smems = mem_collect_smem_batched(fm, &refs, opt);
+    let per_read_chains: Vec<Vec<MemChain>> = per_read_smems
+        .into_iter()
+        .zip(reads.iter())
+        .map(|(smems, codes)| {
+            mem_chain_flt(opt, build_chains_from_smems(fm, bns, opt, codes, 0, smems))
+        })
         .collect();
 
     let mut regs: Vec<Vec<MemAlnReg>> = vec![Vec::new(); reads.len()];
