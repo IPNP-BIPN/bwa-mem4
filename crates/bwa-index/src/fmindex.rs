@@ -155,13 +155,21 @@ impl FmIndex {
 
     /// Extend `smem` by one base `a` on the left, i.e. bwa-mem2's `backwardExt`.
     pub fn backward_ext(&self, smem: Smem, a: usize) -> Smem {
+        // Load the sp/ep checkpoint blocks once (all 4 bases share them), rather than re-deriving
+        // the block index and re-indexing per base as `get_occ` would. Values are identical.
+        let sp = smem.k;
+        let ep = smem.k + smem.s;
+        let cp_sp = &self.cp_count[(sp >> 6) as usize];
+        let cp_ep = &self.cp_count[(ep >> 6) as usize];
+        let oh_sp = &self.one_hot[(sp >> 6) as usize];
+        let oh_ep = &self.one_hot[(ep >> 6) as usize];
+        let msk_sp = self.one_hot_mask[(sp & 63) as usize];
+        let msk_ep = self.one_hot_mask[(ep & 63) as usize];
         let mut k = [0i64; 4];
         let mut s = [0i64; 4];
         for b in 0..4 {
-            let sp = smem.k;
-            let ep = smem.k + smem.s;
-            let occ_sp = self.get_occ(sp, b);
-            let occ_ep = self.get_occ(ep, b);
+            let occ_sp = cp_sp[b] + (oh_sp[b] & msk_sp).count_ones() as i64;
+            let occ_ep = cp_ep[b] + (oh_ep[b] & msk_ep).count_ones() as i64;
             k[b] = self.count[b] + occ_sp;
             s[b] = occ_ep - occ_sp;
         }

@@ -1,0 +1,5 @@
+# Tune codegen for the build machine's CPU (Apple Silicon NEON). This changes only instruction
+# selection/scheduling, never output bytes, so index/SAM byte-identity is preserved; it is resolved
+# per build machine, so the binary stays correct wherever it is compiled.
+[build]
+rustflags = ["-C", "target-cpu=native"]
