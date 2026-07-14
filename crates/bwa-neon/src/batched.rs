@@ -119,19 +119,20 @@ fn neon_dispatch(
         );
     }
 
-    // bwa-mem2's `MAX_SEQ_LEN8`/`MAX_SEQ_LEN16` length-binning (`sort_classify`): int8 when both
-    // lengths and the score ceiling fit under 128 (DP indices j/beg/end/mj/i also fit signed int8
-    // then), else int16 under 32768, else scalar. The int8 path packs 16 lanes vs int16's 8.
-    const MAX_SEQ_LEN8: usize = 128;
+    // Length/score binning. The 8-bit kernel is **unsigned u8** (values 0..=255, positions <256), so
+    // it takes any job whose score ceiling `minval` and both lengths fit under 256 — twice the reach
+    // of bwa-mem2's signed `MAX_SEQ_LEN8=128`, hence far more jobs run in 16 lanes vs int16's 8. Both
+    // kernels are exact in range, so this only changes which one runs, never the result.
+    const U8_LEN: usize = 256;
     const MAX_SEQ_LEN16: usize = 32768;
     let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
 
-    let (mut i8_idx, mut i16_idx, mut sc_idx) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut u8_idx, mut i16_idx, mut sc_idx) = (Vec::new(), Vec::new(), Vec::new());
     for (k, j) in jobs.iter().enumerate() {
         let minval = cell_bound(j, max_sc);
         let (ql, tl) = (j.query.len(), j.target.len());
-        if ql < MAX_SEQ_LEN8 && tl < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8 as i32 {
-            i8_idx.push(k);
+        if ql < U8_LEN && tl < U8_LEN && minval < U8_LEN as i32 {
+            u8_idx.push(k);
         } else if ql < MAX_SEQ_LEN16 && tl < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16 as i32 {
             i16_idx.push(k);
         } else {
@@ -141,16 +142,16 @@ fn neon_dispatch(
 
     // Homogeneous fast path: whole batch in one bin -> run the kernel on `jobs` with no gather/scatter.
     let n = jobs.len();
-    if i8_idx.len() == n {
-        // SAFETY: neon available (checked by caller); GUARD8 bounds keep all values inside i8.
+    if u8_idx.len() == n {
+        // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
         return unsafe {
-            neon::batched_extend_neon_i8(
+            neon::batched_extend_neon_u8(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             )
         };
     }
     if i16_idx.len() == n {
-        // SAFETY: neon available; GUARD16 bounds keep all values inside i16.
+        // SAFETY: neon available; MAX_SEQ_LEN16 bounds keep all values inside i16.
         return unsafe {
             neon::batched_extend_neon_i16(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
@@ -175,12 +176,12 @@ fn neon_dispatch(
             out[k] = res[p];
         }
     };
-    run(&i8_idx, &|s| unsafe {
-        // SAFETY: neon available (checked by caller); GUARD8 bounds keep all values inside i8.
-        neon::batched_extend_neon_i8(s, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop)
+    run(&u8_idx, &|s| unsafe {
+        // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
+        neon::batched_extend_neon_u8(s, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop)
     });
     run(&i16_idx, &|s| unsafe {
-        // SAFETY: neon available; GUARD16 bounds keep all values inside i16.
+        // SAFETY: neon available; MAX_SEQ_LEN16 bounds keep all values inside i16.
         neon::batched_extend_neon_i16(s, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop)
     });
     run(&sc_idx, &|s| {
@@ -474,12 +475,16 @@ mod neon {
                 let e_del_v = $dup(e_del as $elem);
                 let e_ins_v = $dup(e_ins as $elem);
                 let zero_v = $dup(0);
-                // DNA scoring as a vector compare (no per-cell gather): the caller (neon_dispatch)
-                // only reaches here for the uniform bwa matrix, so score = N ? npen : (t==q ? a : mm),
-                // with a = mat[0][0], mm = mat[0][1], npen = mat[0][m-1] (the ambiguous-base -1).
-                let a_v = $dup(mat[0] as $elem);
-                let mm_v = $dup(mat[1] as $elem);
-                let npen_v = $dup(mat[m - 1] as $elem);
+                // DNA score as a vector compare (no per-cell gather): the caller (neon_dispatch) only
+                // reaches here for the uniform bwa matrix. The signed substitution score
+                // (`N ? npen : (t==q ? a : mm)`) is kept as its **positive** parts so the recurrence
+                // works in unsigned-saturating u8 as well as signed i16: `sbt_pos` (match bonus `a`)
+                // via saturating add, `sbt_neg` (mismatch `|mm|` / ambiguous `|npen|`) via saturating
+                // sub. For the signed kernels `(m + pos) - neg == m + score` exactly (no wrap), so this
+                // is byte-identical; for u8 it is bwa-mem2's `MAIN_CODE8_CORE`.
+                let a_pos_v = $dup(mat[0] as $elem); // a >= 0
+                let mm_mag_v = $dup((-(i32::from(mat[1]))) as $elem); // |mm|
+                let npen_mag_v = $dup((-(i32::from(mat[m - 1]))) as $elem); // |npen|
                 let amb_v = $dup(4); // code 4 = N; codes are 0..=4
 
                 for chunk_start in (0..jobs.len()).step_by(LANES) {
@@ -577,7 +582,7 @@ mod neon {
                         let mut h1_v = $lds(h1.as_ptr());
                         let mut f_v = zero_v;
                         let mut rowmax_v = zero_v;
-                        let mut mj_v = $dup(-1);
+                        let mut mj_v = $dup((-1i32) as $elem);
 
                         let mut beg_a = [0 as $elem; LANES];
                         let mut end_a = [0 as $elem; LANES];
@@ -593,17 +598,20 @@ mod neon {
                         let end_v = $lds(end_a.as_ptr());
                         let active_v = $ldu(act_a.as_ptr());
                         let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
+                        let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
 
                         for j in gbeg..gend {
                             let jrow = j as usize * LANES;
                             let j_v = $dup(j as $elem);
                             let band = $andu(active_v, $andu($cge(j_v, beg_v), $clt(j_v, end_v)));
 
-                            // DNA score vector: no gather. base = (t==q) ? a : mm; N -> npen.
+                            // DNA substitution score split into positive parts (no gather):
+                            //   sbt_pos = (t==q && !N) ? a : 0 ;  sbt_neg = N ? |npen| : (t==q ? 0 : |mm|)
                             let q_v = $lds(qcode.as_ptr().add(jrow));
-                            let base_v = $bsl($ceq(t_v, q_v), a_v, mm_v);
-                            let is_n = $orru($cge(t_v, amb_v), $cge(q_v, amb_v));
-                            let score_v = $bsl(is_n, npen_v, base_v);
+                            let is_eq = $ceq(t_v, q_v);
+                            let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                            let sbt_pos = $bsl(is_n, zero_v, $bsl(is_eq, a_pos_v, zero_v));
+                            let sbt_neg = $bsl(is_n, npen_mag_v, $bsl(is_eq, zero_v, mm_mag_v));
 
                             let m_v = $lds(eh_h.as_ptr().add(jrow)); // H(i-1, j-1)
                             let e_v = $lds(eh_e.as_ptr().add(jrow)); // E(i-1, j)
@@ -611,9 +619,10 @@ mod neon {
                             // eh_h[j] <- h1 (old) for in-band lanes; out-of-band keep old m_v.
                             $sts(eh_h.as_mut_ptr().add(jrow), $bsl(band, h1_v, m_v));
 
-                            // big_m = if m != 0 { m + score } else { 0 }
-                            let zero_mask = $ceqz(m_v);
-                            let bigm_v = $bsl(zero_mask, zero_v, $add(m_v, score_v));
+                            // M = ((m + sbt_pos) - sbt_neg); m==0 -> local restart (0). Saturating for
+                            // u8, plain for signed; identical either way in the guaranteed range.
+                            let bigm_pre = $sub($add(m_v, sbt_pos), sbt_neg);
+                            let bigm_v = $bsl($ceqz(m_v), zero_v, bigm_pre);
 
                             let h_v = $max($max(bigm_v, e_v), f_v);
                             h1_v = $bsl(band, h_v, h1_v);
@@ -742,24 +751,27 @@ mod neon {
         bsl = vbslq_s16
     );
 
+    // 8-bit kernel: **unsigned** u8 [0,255] with saturating add/sub, so a local extension whose score
+    // ceiling lands in [128,255] (bwa-mem2 would route it to int16) still runs in 16 lanes. Values are
+    // non-negative and positions are `< 256`, so u8 holds both. This is bwa-mem2's `smithWaterman*_8`.
     define_neon_kernel!(
-        batched_extend_neon_i8,
-        i8,
+        batched_extend_neon_u8,
+        u8,
         u8,
         16,
-        dup = vdupq_n_s8,
-        lds = vld1q_s8,
-        sts = vst1q_s8,
+        dup = vdupq_n_u8,
+        lds = vld1q_u8,
+        sts = vst1q_u8,
         ldu = vld1q_u8,
-        add = vaddq_s8,
-        sub = vsubq_s8,
-        max = vmaxq_s8,
-        ceqz = vceqzq_s8,
-        cge = vcgeq_s8,
-        clt = vcltq_s8,
-        ceq = vceqq_s8,
+        add = vqaddq_u8,
+        sub = vqsubq_u8,
+        max = vmaxq_u8,
+        ceqz = vceqzq_u8,
+        cge = vcgeq_u8,
+        clt = vcltq_u8,
+        ceq = vceqq_u8,
         orru = vorrq_u8,
         andu = vandq_u8,
-        bsl = vbslq_s8
+        bsl = vbslq_u8
     );
 }
