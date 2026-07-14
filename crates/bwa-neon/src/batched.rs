@@ -80,13 +80,17 @@ fn is_uniform_dna(mat: &[i8], m: usize) -> bool {
     true
 }
 
-/// Per-job cell-value ceiling for a local extension: `h0 + qlen*max_score + end_bonus`. Every
-/// `H`/`E`/`F` value stays in `[0, bound]`, so `bound < i8/i16::MAX` (minus a small margin for
-/// negative gap intermediates) proves the corresponding NEON kernel is byte-identical.
+/// bwa-mem2's exact per-pair score ceiling (`sort_classify` in `bwamem.cpp`):
+/// `minval = h0 + min(len1, len2) * score_a`. Because a local extension matches at most
+/// `min(qlen, tlen)` bases and only *loses* score to mismatches/gaps, every `H`/`E`/`F` value (and
+/// the intermediate `M = m + score` that becomes an `H`) stays in `[<0-ish>, minval]`. So
+/// `minval < MAX_SEQ_LEN8 (128)` proves the signed-int8 kernel is exact (values fit `[0,127]`), and
+/// `< MAX_SEQ_LEN16 (32768)` proves the int16 kernel is exact. This matches the oracle's own binning,
+/// so the classification never changes results — only which (exact) kernel runs.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-fn cell_bound(j: &ExtendJob, max_sc: i32, end_bonus: i32) -> i32 {
-    j.h0 + (j.query.len() as i32) * max_sc.max(0) + end_bonus.max(0)
+fn cell_bound(j: &ExtendJob, max_sc: i32) -> i32 {
+    j.h0 + (j.query.len().min(j.target.len()) as i32) * max_sc.max(0)
 }
 
 /// NEON dispatch: bin each job by length into int8 (16 lanes), int16 (8 lanes), or the scalar
@@ -115,18 +119,20 @@ fn neon_dispatch(
         );
     }
 
-    // int8 guard: cell values in [0, bound] must fit i8, and the DP indices (j, beg, end, mj, i) must
-    // too; `bound`, qlen and tlen all below 120 keeps everything inside int8 with margin.
-    const GUARD8: i32 = 120; // < i8::MAX (127)
-    const GUARD16: i32 = 30_000; // < i16::MAX (32767)
+    // bwa-mem2's `MAX_SEQ_LEN8`/`MAX_SEQ_LEN16` length-binning (`sort_classify`): int8 when both
+    // lengths and the score ceiling fit under 128 (DP indices j/beg/end/mj/i also fit signed int8
+    // then), else int16 under 32768, else scalar. The int8 path packs 16 lanes vs int16's 8.
+    const MAX_SEQ_LEN8: usize = 128;
+    const MAX_SEQ_LEN16: usize = 32768;
     let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
 
     let (mut i8_idx, mut i16_idx, mut sc_idx) = (Vec::new(), Vec::new(), Vec::new());
     for (k, j) in jobs.iter().enumerate() {
-        let bound = cell_bound(j, max_sc, end_bonus);
-        if bound < GUARD8 && j.query.len() < 120 && j.target.len() < 120 {
+        let minval = cell_bound(j, max_sc);
+        let (ql, tl) = (j.query.len(), j.target.len());
+        if ql < MAX_SEQ_LEN8 && tl < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8 as i32 {
             i8_idx.push(k);
-        } else if bound < GUARD16 {
+        } else if ql < MAX_SEQ_LEN16 && tl < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16 as i32 {
             i16_idx.push(k);
         } else {
             sc_idx.push(k);
