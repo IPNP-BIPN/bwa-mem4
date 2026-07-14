@@ -497,13 +497,16 @@ mod neon {
                     let mut eh_h = vec![0 as $elem; stride * LANES];
                     let mut eh_e = vec![0 as $elem; stride * LANES];
 
-                    // Per-lane query codes padded to `stride` (0 past qlen) for a branchless,
-                    // in-bounds vector load of the 8/16 lanes' base at column j.
+                    // Per-lane query/target codes padded (0 past len) for branchless, in-bounds
+                    // vector loads of the 8/16 lanes' base at column j (query) or row i (target).
                     let mut qcode = vec![0 as $elem; stride * LANES];
+                    let mut tcode = vec![0 as $elem; (max_t + 1) * LANES];
                     for l in 0..nlane {
-                        let q = jobs[chunk_start + l].query;
-                        for (ju, &c) in q.iter().enumerate() {
+                        for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
                             qcode[ju * LANES + l] = c as $elem;
+                        }
+                        for (iu, &c) in jobs[chunk_start + l].target.iter().enumerate() {
+                            tcode[iu * LANES + l] = c as $elem;
                         }
                     }
 
@@ -572,19 +575,17 @@ mod neon {
                         let mut beg_a = [0 as $elem; LANES];
                         let mut end_a = [0 as $elem; LANES];
                         let mut act_a = [0 as $umask; LANES];
-                        let mut trow = [0 as $elem; LANES]; // this row's target base per lane
                         for l in 0..nlane {
                             if active[l] {
                                 beg_a[l] = beg[l] as $elem;
                                 end_a[l] = end[l] as $elem;
                                 act_a[l] = <$umask>::MAX;
-                                trow[l] = jobs[chunk_start + l].target[i as usize] as $elem;
                             }
                         }
                         let beg_v = $lds(beg_a.as_ptr());
                         let end_v = $lds(end_a.as_ptr());
                         let active_v = $ldu(act_a.as_ptr());
-                        let t_v = $lds(trow.as_ptr());
+                        let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
 
                         for j in gbeg..gend {
                             let jrow = j as usize * LANES;
