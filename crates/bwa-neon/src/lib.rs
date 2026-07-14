@@ -198,4 +198,121 @@ mod tests {
             }
         }
     }
+
+    /// Exercise the ungapped diagonal HIT fast path directly: many perfect diagonals (which trigger
+    /// the closed form) plus near-diagonals (0-2 substitutions/indels) and short targets, asserting
+    /// the batched NEON result equals `ksw_extend2` for every job. Guards the HIT closed form against
+    /// any divergence from the real DP on the exact cases it fires.
+    #[test]
+    fn neon_ungapped_hit_matches_scalar() {
+        use bwa_extend::{ksw_extend2, ExtendJob};
+        let (a, b) = (1i8, 4i8);
+        let mut mat = vec![0i8; 25];
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { a } else { -b };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+
+        let mut state = 0x51ED_5EED_D1A6_0000u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+
+        for round in 0..300u32 {
+            let batch = *[1usize, 4, 8, 13, 16, 24]
+                .get((next() % 6) as usize)
+                .unwrap();
+            let w = 1 + (next() % 150) as i32;
+            let zdrop = (next() % 200) as i32;
+            let end_bonus = (next() % 12) as i32;
+            let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+
+            let mut queries: Vec<Vec<u8>> = Vec::new();
+            let mut targets: Vec<Vec<u8>> = Vec::new();
+            let mut h0s: Vec<i32> = Vec::new();
+            for _ in 0..batch {
+                let qlen = 1 + (next() % 200) as usize;
+                let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                // Target = query diagonal, then a mode: perfect / longer / shorter / few edits / N.
+                let mode = next() % 5;
+                let extra = (next() % 40) as usize;
+                let mut t: Vec<u8> = q.clone();
+                match mode {
+                    0 => t.extend((0..extra).map(|_| (next() % 4) as u8)), // perfect, longer target
+                    1 => {}                                                // perfect, equal length
+                    2 => {
+                        t.truncate(qlen.saturating_sub(1 + (next() % 3) as usize)); // shorter target
+                        t.extend((0..extra).map(|_| (next() % 4) as u8));
+                    }
+                    3 => {
+                        // 1-2 substitutions
+                        for _ in 0..(1 + next() % 2) {
+                            if !t.is_empty() {
+                                let p = (next() as usize) % t.len();
+                                t[p] = ((t[p] + 1 + (next() % 3) as u8) % 4) as u8;
+                            }
+                        }
+                        t.extend((0..extra).map(|_| (next() % 4) as u8));
+                    }
+                    _ => {
+                        // inject an N somewhere
+                        if !t.is_empty() {
+                            let p = (next() as usize) % t.len();
+                            t[p] = 4;
+                        }
+                        t.extend((0..extra).map(|_| (next() % 4) as u8));
+                    }
+                }
+                queries.push(q);
+                targets.push(t);
+                h0s.push(1 + (next() % 40) as i32);
+            }
+            let jobs: Vec<ExtendJob> = (0..batch)
+                .map(|i| ExtendJob {
+                    query: &queries[i],
+                    target: &targets[i],
+                    h0: h0s[i],
+                })
+                .collect();
+            let got = NeonBackend.extend_batch(
+                &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+            );
+            for (i, g) in got.iter().enumerate() {
+                let expected = ksw_extend2(
+                    &queries[i],
+                    &targets[i],
+                    5,
+                    &mat,
+                    o_del,
+                    e_del,
+                    o_ins,
+                    e_ins,
+                    w,
+                    end_bonus,
+                    zdrop,
+                    h0s[i],
+                );
+                assert_eq!(
+                    *g,
+                    expected,
+                    "ungapped HIT diverged at round {round} job {i} qlen={} tlen={} h0={}",
+                    queries[i].len(),
+                    targets[i].len(),
+                    h0s[i],
+                );
+            }
+        }
+    }
 }

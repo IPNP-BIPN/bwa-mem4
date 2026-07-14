@@ -93,6 +93,38 @@ fn cell_bound(j: &ExtendJob, max_sc: i32) -> i32 {
     j.h0 + (j.query.len().min(j.target.len()) as i32) * max_sc.max(0)
 }
 
+/// Ungapped diagonal fast path (nh13's `ungapped_analyze` HIT case, `bwamem.cpp`): when the whole
+/// query matches the target on the diagonal with **no** mismatch and no ambiguous base (and the
+/// target is at least as long, `h0 > 0`), the banded Smith-Waterman result is the closed form
+/// `score = gscore = h0 + n*a`, `qle = tle = gtle = n`, `max_off = 0` — so the DP is skipped
+/// entirely. Returns `None` (fall through to the kernel) for any mismatch/ambiguous/short-target
+/// case. This is byte-identical to [`bwa_extend::ksw_extend2`] for the jobs it accepts (gated by the
+/// property test), matching bwa-mem2's own output. `a` is the match score (`mat[0]`).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn ungapped_hit(j: &ExtendJob, a: i32) -> Option<ExtendResult> {
+    let n = j.query.len();
+    if n == 0 || j.h0 <= 0 || j.target.len() < n {
+        return None;
+    }
+    for k in 0..n {
+        // SAFETY of indexing: target.len() >= n checked above.
+        let (q, t) = (j.query[k], j.target[k]);
+        if q >= 4 || t >= 4 || q != t {
+            return None;
+        }
+    }
+    let score = j.h0 + n as i32 * a;
+    Some(ExtendResult {
+        score,
+        qle: n as i32,
+        tle: n as i32,
+        gtle: n as i32,
+        gscore: score,
+        max_off: 0,
+    })
+}
+
 /// NEON dispatch: bin each job by length into int8 (16 lanes), int16 (8 lanes), or the scalar
 /// fallback, process each bin with the matching kernel, and scatter results back by index. This is
 /// bwa-mem2's `MAX_SEQ_LEN8`/`MAX_SEQ_LEN16` length-binning: the int8 path packs twice the lanes for
@@ -119,10 +151,59 @@ fn neon_dispatch(
         );
     }
 
-    // Length/score binning. The 8-bit kernel is **unsigned u8** (values 0..=255, positions <256), so
-    // it takes any job whose score ceiling `minval` and both lengths fit under 256 — twice the reach
-    // of bwa-mem2's signed `MAX_SEQ_LEN8=128`, hence far more jobs run in 16 lanes vs int16's 8. Both
-    // kernels are exact in range, so this only changes which one runs, never the result.
+    let a = mat[0] as i32; // match score for the uniform matrix
+
+    // Ungapped diagonal HIT fast path: a perfect-diagonal extension gets its result in closed form,
+    // skipping banded SW. Common on clean reads, so this removes a large slice of DP work while
+    // staying byte-identical (see `ungapped_hit`). Non-HIT jobs fall through to the kernel binning.
+    let mut out = vec![default_result(); jobs.len()];
+    let mut rest: Vec<usize> = Vec::new();
+    for (k, j) in jobs.iter().enumerate() {
+        match ungapped_hit(j, a) {
+            Some(r) => out[k] = r,
+            None => rest.push(k),
+        }
+    }
+    if rest.is_empty() {
+        return out;
+    }
+    if rest.len() == jobs.len() {
+        // No HITs: bin `jobs` directly (avoid the gather).
+        return dispatch_bins(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
+    let sub: Vec<ExtendJob> = rest.iter().map(|&k| jobs[k]).collect();
+    let res = dispatch_bins(
+        &sub, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+    );
+    for (p, &k) in rest.iter().enumerate() {
+        out[k] = res[p];
+    }
+    out
+}
+
+/// Length/score binning + kernel dispatch for the jobs that are not ungapped HITs. Bins each into
+/// int8 (16 lanes) / int16 (8 lanes) / scalar, runs each bin, scatters back. This is bwa-mem2's
+/// `MAX_SEQ_LEN8`/`MAX_SEQ_LEN16` binning; the 8-bit path packs twice the lanes for short pairs.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_bins(
+    jobs: &[ExtendJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w0: i32,
+    end_bonus: i32,
+    zdrop: i32,
+) -> Vec<ExtendResult> {
+    // The 8-bit kernel is **unsigned u8** (values 0..=255, positions <256), so it takes any job whose
+    // score ceiling `minval` and both lengths fit under 256 — twice the reach of bwa-mem2's signed
+    // `MAX_SEQ_LEN8=128`, hence far more jobs run in 16 lanes vs int16's 8. Both kernels are exact in
+    // range, so this only changes which one runs, never the result.
     const U8_LEN: usize = 256;
     const MAX_SEQ_LEN16: usize = 32768;
     let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
