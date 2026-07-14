@@ -39,8 +39,8 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   l'intérieur** d'enregistrements déjà touchés par la cascade sous-optimale (jeu de régions
   différent), pas un bug de `mem_gen_alt`.
 
-- **Mate rescue (`mem_matesw` / `ksw_align2`) non porté.** ~2 enregistrements sur ces données
-  propres (l'oracle réaligne un bout avec soft-clip, ex. paire `_822229` : `5S145M` vs notre
-  `150M`, même score 140), ~11 sur données réelles. Requiert un portage scalaire complet de
-  `ksw_align2` (SW local avec coords début/fin + score sous-optimal). **Plan** : `ksw_align2` puis
-  `mem_matesw`.
+- **Mate rescue (`mem_matesw` / `ksw_align2`) : PORTÉ (phase 8, byte-identique).** `ksw_align2`
+  scalaire (SW local avec coords début/fin via passe inverse + 2ᵉ meilleur score) dans
+  `bwa-extend`, `mem_matesw` + `bns_fetch_seq` dans `pe.rs`, branché dans `mem_sam_pe` avant le
+  marquage primaire. Sur paires concordantes toutes les orientations sont « skip » → no-op (pas de
+  régression). Résout la paire `_822229` (mate `5S145M` réaligné + `MC`) : PE 9366 → **9369/10000**.
