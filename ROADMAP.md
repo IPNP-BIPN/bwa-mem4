@@ -166,7 +166,33 @@ par speculation. Resultats :
   Incompatible avec notre gate d'octet-identite.
 
 **Conclusion.** Le kernel bandedSWA est proche de sa limite (latency-bound) et le fort byte-identique le
-partage : son avance ~1,19x vit **ailleurs** que le kernel, probablement dans le **prefetch de seeding**
-et le **skip de travail prouve-inutile** (levier cite par minibwa), a resultat preserve. Prochain levier
-possible (future phase, gate-safe) : prefetch FM-index dans la marche SMEM, skip early des passes
-mate-rescue/regions repetitives quand la sortie ne peut pas changer.
+partage : son avance ~1,19x vit **ailleurs** que le kernel, dans le **prefetch de seeding** et le **skip
+de travail prouve-inutile** (levier cite par minibwa), a resultat preserve.
+
+## Phase 9d : prefetch de seeding (FM-index)
+
+Branche `phase9d-seeding`. Port de `ENABLE_PREFETCH` de bwa-mem2/nh13 : dans la boucle de recherche
+**backward** des SMEM, apres avoir garde un intervalle, `prfm pldl1keep` sur les deux blocs checkpoint
+que le `backward_ext` de l'etape suivante lira (`cp_occ[k>>6]`, `cp_occ[(k+s)>>6]`), **une iteration
+externe en avance**, pour masquer la latence DRAM des chargements data-dependent. Pur hint (resultat
+inchange). `FmIndex::prefetch_occ` en `asm!("prfm ...")` (l'intrinseque `_prefetch` est instable).
+
+- **Oracle-neutre** : SE 5000/5000, PE 10000/10000 ; alignements genome byte-identiques.
+- **Gain (mesure, genome 10 Go, 100k reads genome-wide, `-t1`, min de 5)** : **~1,02x total, ~1,03x
+  align-only** (prefetch < base a chaque rep). **Ne compte que quand `cp_occ` depasse le cache**
+  (genome entier) ; nul sur la region 2 Mbp cache-residente.
+- **Marche forward** : le walk reste dans une petite region deja en cache -> prefetch **net-negatif**,
+  donc omis. Prochain palier possible : **recherche FM lockstep** (interleave de plusieurs reads,
+  lookahead cross-slot T1) comme `getSMEMsOnePosOneThread_lockstep` du fork -> plus que le prefetch
+  1-pas, mais gros restructure.
+
+## Note DRAGEN (cadrage vitesse)
+
+Objectif « battre DRAGEN sur la vitesse » : DRAGEN est un **accelerateur materiel FPGA/ASIC** (Illumina)
+qui execute tout le pipeline sur du silicium dedie (~25-40 min pour un genome 30x). Un aligneur **CPU
+logiciel ne peut pas battre du FPGA/ASIC dedie** a materiel comparable (1-2 ordres de grandeur). La seule
+voie « classe DRAGEN » est **GPU** (cf. NVIDIA Parabricks qui *egale* DRAGEN via GPU) ou FPGA : c'est
+exactement la **phase 9b (backend Metal GPU)**. De plus, DRAGEN n'utilise **pas** l'algo de bwa-mem2 (il
+a son propre mappeur materiel), donc « octet-identique a bwa-mem2 » **et** « battre DRAGEN » sont deux
+contraintes en tension. Cible CPU realiste : **le plus rapide des aligneurs octet-identiques a
+bwa-mem2** (depasser le fork nh13). Cible « classe DRAGEN » : reactiver **9b (GPU)**.
