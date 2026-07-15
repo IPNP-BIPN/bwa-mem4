@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use clap::Args;
 use rayon::prelude::*;
 
+use rust_htslib::bam;
+
 use bwa_core::{dna, MemOpt};
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, PairedFastqReader, Record, SqRecord};
@@ -32,10 +34,51 @@ pub struct MemArgs {
     pub reads: PathBuf,
     /// Optional mate reads (R2): triggers paired-end mode.
     pub reads2: Option<PathBuf>,
+    /// Output path. A `.bam` extension writes BAM (via htslib, rust-bio's rust-htslib); any other
+    /// path writes SAM text; omitted writes SAM text to stdout.
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
     /// Route seed extension through the Metal GPU backend (macOS only; opt-in, byte-identical to the
     /// CPU path). Ignored on other platforms.
     #[arg(long)]
     pub gpu: bool,
+}
+
+/// SAM/BAM output sink. Records are formatted once as SAM text lines (all our existing formatting);
+/// the BAM sink re-parses each line into a `bam::Record` against the header and writes binary BAM.
+enum SamSink {
+    Text(BufWriter<Box<dyn Write>>),
+    Bam {
+        writer: Box<bam::Writer>,
+        header: bam::HeaderView,
+    },
+}
+
+impl SamSink {
+    /// Write one or more already-formatted SAM record lines (a buffer may hold several, e.g. both
+    /// mates of a pair). Text passes bytes through; BAM parses each `\n`-terminated line to a record.
+    fn write_line(&mut self, sam_bytes: &[u8]) -> anyhow::Result<()> {
+        match self {
+            SamSink::Text(w) => w.write_all(sam_bytes)?,
+            SamSink::Bam { writer, header } => {
+                for line in sam_bytes.split(|&c| c == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let rec = bam::Record::from_sam(header, line)?;
+                    writer.write(&rec)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> anyhow::Result<()> {
+        if let SamSink::Text(w) = &mut self {
+            w.flush()?;
+        }
+        Ok(()) // Bam writer flushes + writes EOF block on drop
+    }
 }
 
 pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
@@ -63,23 +106,15 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         })
         .collect();
 
-    let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
     let cl = argv.join(" ");
-    sam::write_header(
-        &mut out,
-        &sqs,
-        "bwa-mem3",
-        "bwa-mem3",
-        env!("CARGO_PKG_VERSION"),
-        &cl,
-    )?;
+    let version = env!("CARGO_PKG_VERSION");
+    let mut sink = build_sink(&args.output, &sqs, version, &cl, n_threads)?;
 
     let backend = Backend::select(args.gpu);
 
     if let Some(reads2) = args.reads2.clone() {
-        run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, &mut out)?;
-        out.flush()?;
+        run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, &mut sink)?;
+        sink.finish()?;
         return Ok(());
     }
 
@@ -111,12 +146,57 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
             })
             .collect();
         for l in &lines {
-            out.write_all(l)?;
+            sink.write_line(l)?;
         }
         base_id += batch.len() as u64;
     }
-    out.flush()?;
+    sink.finish()?;
     Ok(())
+}
+
+/// Build the output sink from `-o`: `.bam` → binary BAM via htslib (header installed here); any other
+/// path → SAM text file; `None` → SAM text on stdout.
+fn build_sink(
+    output: &Option<PathBuf>,
+    sqs: &[SqRecord],
+    version: &str,
+    cl: &str,
+    n_threads: usize,
+) -> anyhow::Result<SamSink> {
+    let is_bam = output
+        .as_deref()
+        .and_then(|p| p.extension())
+        .is_some_and(|e| e.eq_ignore_ascii_case("bam"));
+    if let (true, Some(path)) = (is_bam, output.as_deref()) {
+        let mut header = bam::header::Header::new();
+        for sq in sqs {
+            let mut r = bam::header::HeaderRecord::new(b"SQ");
+            r.push_tag(b"SN", &sq.name);
+            r.push_tag(b"LN", sq.len);
+            header.push_record(&r);
+        }
+        let mut pg = bam::header::HeaderRecord::new(b"PG");
+        pg.push_tag(b"ID", "bwa-mem3")
+            .push_tag(b"PN", "bwa-mem3")
+            .push_tag(b"VN", version)
+            .push_tag(b"CL", cl);
+        header.push_record(&pg);
+        let mut writer = bam::Writer::from_path(path, &header, bam::Format::Bam)?;
+        // htslib multi-threaded BGZF compression for the output blocks.
+        let _ = writer.set_threads(n_threads.max(1));
+        let hv = bam::HeaderView::from_header(&header);
+        return Ok(SamSink::Bam {
+            writer: Box::new(writer),
+            header: hv,
+        });
+    }
+    let inner: Box<dyn Write> = match output.as_deref() {
+        Some(path) => Box::new(std::fs::File::create(path)?),
+        None => Box::new(std::io::stdout()),
+    };
+    let mut w = BufWriter::new(inner);
+    sam::write_header(&mut w, sqs, "bwa-mem3", "bwa-mem3", version, cl)?;
+    Ok(SamSink::Text(w))
 }
 
 /// Seed + chain + batched extension for a whole read batch, returning each read's pre-dedup regions
@@ -266,7 +346,7 @@ fn finish_se(
 /// (`mem_pestat`), then emit paired SAM (`mem_sam_pe`). The pair index is global across batches (for
 /// the `hash` tie-break), matching bwa-mem2's `(n_processed>>1)+i`.
 #[allow(clippy::too_many_arguments)]
-fn run_pe<W: std::io::Write>(
+fn run_pe(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
@@ -274,7 +354,7 @@ fn run_pe<W: std::io::Write>(
     reads2: &std::path::Path,
     k_batch: usize,
     backend: Backend,
-    out: &mut W,
+    out: &mut SamSink,
 ) -> anyhow::Result<()> {
     let mut reader = PairedFastqReader::from_paths(reads1, reads2)?;
     let mut base_pair = 0u64;
@@ -363,7 +443,7 @@ fn run_pe<W: std::io::Write>(
             })
             .collect();
         for b in &bufs {
-            out.write_all(b)?;
+            out.write_line(b)?;
         }
         base_pair += batch.len() as u64;
     }
