@@ -17,6 +17,7 @@
 use crate::rmi::Rmi;
 use crate::sais::suffix_array_with_sentinel;
 use std::cmp::Ordering;
+use rayon::prelude::*;
 
 /// Bases packed into one learned key (BWA-MEME uses 32: a 64-bit 2-bit-packed key).
 pub const K: usize = 32;
@@ -127,7 +128,7 @@ impl LearnedSa {
     /// `n_leaves` sizes the RMI (a few thousand per million suffixes is reasonable).
     pub fn build(ref_seq: Vec<u8>, n_leaves: usize) -> Self {
         let sa = suffix_array_with_sentinel(&ref_seq);
-        let keys: Vec<u64> = sa.iter().map(|&p| kmer_key(&ref_seq, p)).collect();
+        let keys: Vec<u64> = sa.par_iter().map(|&p| kmer_key(&ref_seq, p)).collect();
         let rmi = Rmi::build(&keys, n_leaves);
         LearnedSa {
             ref_seq,
@@ -144,7 +145,7 @@ impl LearnedSa {
     /// trains the RMI over them.
     pub fn from_sa(ref_seq: Vec<u8>, sa: Vec<i64>, n_leaves: usize) -> Self {
         debug_assert_eq!(sa.len(), ref_seq.len() + 1, "sa must include the sentinel row");
-        let keys: Vec<u64> = sa.iter().map(|&p| kmer_key(&ref_seq, p)).collect();
+        let keys: Vec<u64> = sa.par_iter().map(|&p| kmer_key(&ref_seq, p)).collect();
         let rmi = Rmi::build(&keys, n_leaves);
         LearnedSa {
             ref_seq,
@@ -339,13 +340,11 @@ impl LearnedSa {
             return (len, lo, hi);
         }
         // Occurrence count is non-increasing in the prefix length, so the target length (longest L
-        // with occ(L) >= min_intv) is a threshold crossing: binary-search it instead of shortening one
-        // base at a time (which is O(len) searches — the dominant cost of round-2 reseeding).
-        let occ = |l: usize| -> i64 {
-            let (a, b) = self.exact_interval(&pattern[..l]);
+        // with occ(L) >= min_intv) is a threshold crossing: binary-search it in [1, len].
+        let occ = |q: usize| -> i64 {
+            let (a, b) = self.exact_interval(&pattern[..q]);
             (b - a) as i64
         };
-        // Smallest L in [1, len] with occ(L) < min_intv (occ(len) < min_intv guaranteed here).
         let (mut a, mut b) = (1usize, len);
         while a < b {
             let mid = a + (b - a) / 2;
