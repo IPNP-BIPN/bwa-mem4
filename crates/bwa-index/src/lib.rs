@@ -7,6 +7,7 @@ pub mod bntseq;
 pub mod build;
 pub mod fmindex;
 pub mod rand48;
+pub mod rmi;
 pub mod sais;
 
 pub use bntseq::{Amb, BntSeq, Contig};
