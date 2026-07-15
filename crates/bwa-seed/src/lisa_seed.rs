@@ -388,11 +388,17 @@ fn bwt_seed_strategy_lsa_fast(
     }
 }
 
+/// Rounds 1+2 only (no round-3 `bwt_seed_strategy`), for isolating round costs in benchmarks.
+pub fn mem_collect_smem_lsa_12(lsa: &LearnedSa, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
+    let mut smems = collect_smems_lsa_zigzag(lsa, codes, opt.min_seed_len);
+    smem_round_2_lsa_fast(lsa, codes, opt, &mut smems);
+    smems
+}
+
 /// Full fast SMEM collection: round-1 zigzag + round-2 reseed + round-3 strategy, the LISA analog of
 /// [`crate::mem_collect_smem`]. Concordant seed set (validated against the FM path on real reads).
 pub fn mem_collect_smem_lsa_fast(lsa: &LearnedSa, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
-    let mut smems = collect_smems_lsa_zigzag(lsa, codes, opt.min_seed_len);
-    smem_round_2_lsa_fast(lsa, codes, opt, &mut smems);
+    let mut smems = mem_collect_smem_lsa_12(lsa, codes, opt);
     if opt.max_mem_intv > 0 {
         bwt_seed_strategy_lsa_fast(lsa, codes, opt.max_mem_intv, opt.min_seed_len + 1, &mut smems);
     }

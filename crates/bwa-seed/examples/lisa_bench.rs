@@ -16,7 +16,10 @@
 use bwa_core::MemOpt;
 use bwa_index::lisa::LearnedSa;
 use bwa_index::{FmIndex, Smem};
-use bwa_seed::lisa_seed::{collect_smems_lsa_zigzag, mem_collect_smem_lsa};
+use bwa_seed::lisa_seed::{
+    collect_smems_lsa_zigzag, mem_collect_smem_lsa, mem_collect_smem_lsa_12,
+    mem_collect_smem_lsa_fast,
+};
 use bwa_seed::{collect_smems, mem_collect_smem};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -204,6 +207,44 @@ fn main() {
                 "ZZ   : {} reads, {} smems, {:.3}s, {:.0} reads/s, {:.2} Mbase/s, checksum {:016x}",
                 reads.len(), nsmem, el, reads.len() as f64 / el, total_bases as f64 / el / 1e6, hash
             );
+        }
+        "lsafull" => {
+            // Full fast seeder (rounds 1+2+3) vs the FM `fm` mode (mem_collect_smem).
+            let reference = std::fs::read(format!("{prefix}.0123")).expect("read .0123");
+            let sa = load_sa(sa_path, reference.len() + 1);
+            let n_leaves = (sa.len() >> leaves_shift).max(1);
+            eprintln!("building LearnedSa ({} leaves)...", n_leaves);
+            let tb = Instant::now();
+            let lsa = LearnedSa::from_sa(reference, sa, n_leaves);
+            eprintln!("LearnedSa built in {:.0}s", tb.elapsed().as_secs_f64());
+            for (name, f) in [
+                ("R1  ", &collect_smems_lsa_zigzag as &dyn Fn(&LearnedSa, &[u8], i32) -> Vec<_>),
+            ] {
+                let t = Instant::now();
+                let mut nsmem = 0usize;
+                for r in &reads {
+                    nsmem += f(&lsa, r, opt.min_seed_len).len();
+                }
+                let el = t.elapsed().as_secs_f64();
+                println!("{name}: {nsmem} smems, {:.3}s, {:.0} reads/s", el, reads.len() as f64 / el);
+            }
+            for (name, f) in [
+                ("R1+2 ", &mem_collect_smem_lsa_12 as &dyn Fn(&LearnedSa, &[u8], &MemOpt) -> Vec<_>),
+                ("R1+2+3", &mem_collect_smem_lsa_fast as &dyn Fn(&LearnedSa, &[u8], &MemOpt) -> Vec<_>),
+            ] {
+                let t = Instant::now();
+                let (mut hash, mut nsmem) = (0xcbf29ce484222325u64, 0usize);
+                for r in &reads {
+                    let smems = f(&lsa, r, &opt);
+                    nsmem += smems.len();
+                    hash_smems(&mut hash, &smems);
+                }
+                let el = t.elapsed().as_secs_f64();
+                println!(
+                    "{name}: {nsmem} smems, {:.3}s, {:.0} reads/s, {:.2} Mbase/s, cs {:016x}",
+                    el, reads.len() as f64 / el, total_bases as f64 / el / 1e6, hash
+                );
+            }
         }
         "lem" => {
             // Micro-benchmark the fast forward LEM primitive: for each read, cover it with
