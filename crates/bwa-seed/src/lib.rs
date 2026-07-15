@@ -67,7 +67,7 @@ pub fn collect_smems_batched(
     let mut next_read = 0usize;
     for _ in 0..N {
         if next_read < reads.len() {
-            slots.push(Some(LsSlot::new(next_read, max_len)));
+            slots.push(Some(LsSlot::new(next_read, 0, min_intv, false, max_len)));
             next_read += 1;
         } else {
             slots.push(None);
@@ -80,11 +80,11 @@ pub fn collect_smems_batched(
             let Some(slot) = slot_opt.as_mut() else {
                 continue;
             };
-            slot.step(fm, reads[slot.ridx], min_seed_len, min_intv, &counts);
+            slot.step(fm, reads[slot.ridx], min_seed_len, &counts);
             if slot.phase == LsPhase::Done {
                 output[slot.ridx] = std::mem::take(&mut slot.out);
                 if next_read < reads.len() {
-                    slot.reset(next_read);
+                    slot.reset_to(next_read, 0, min_intv, false);
                     next_read += 1;
                 } else {
                     *slot_opt = None;
@@ -113,6 +113,11 @@ enum LsPhase {
 struct LsSlot {
     ridx: usize,
     x: usize,
+    /// Occurrence-count floor for this walk (`min_intv`). Round 1 shares one value across the batch;
+    /// round-2 re-seeds each carry their own (`parent.s + 1`), so it lives per-slot.
+    min_intv: i64,
+    /// Round 2 re-seeds a *single* position and stops (`single_pos`); round 1 sweeps every position.
+    single_pos: bool,
     phase: LsPhase,
     smem: Smem,
     num_prev: usize,
@@ -124,10 +129,12 @@ struct LsSlot {
 }
 
 impl LsSlot {
-    fn new(ridx: usize, max_len: usize) -> Self {
+    fn new(ridx: usize, x: usize, min_intv: i64, single_pos: bool, max_len: usize) -> Self {
         LsSlot {
             ridx,
-            x: 0,
+            x,
+            min_intv,
+            single_pos,
             phase: LsPhase::Start,
             smem: Smem::default(),
             num_prev: 0,
@@ -139,23 +146,19 @@ impl LsSlot {
         }
     }
 
-    /// Re-point this slot at a new read, reusing the `prev` buffer (sized to the batch max length).
-    fn reset(&mut self, ridx: usize) {
+    /// Re-point this slot at a new walk, reusing the `prev` buffer (sized to the batch max length).
+    fn reset_to(&mut self, ridx: usize, x: usize, min_intv: i64, single_pos: bool) {
         self.ridx = ridx;
-        self.x = 0;
+        self.x = x;
+        self.min_intv = min_intv;
+        self.single_pos = single_pos;
         self.phase = LsPhase::Start;
         self.num_prev = 0;
         self.out.clear();
     }
 
-    fn step(
-        &mut self,
-        fm: &FmIndex,
-        codes: &[u8],
-        min_seed_len: i32,
-        min_intv: i64,
-        counts: &[i64; 5],
-    ) {
+    fn step(&mut self, fm: &FmIndex, codes: &[u8], min_seed_len: i32, counts: &[i64; 5]) {
+        let min_intv = self.min_intv;
         let readlength = codes.len();
         match self.phase {
             LsPhase::Start => {
@@ -167,8 +170,9 @@ impl LsSlot {
                 let a = codes[self.x];
                 if a >= 4 {
                     // No SMEM at an ambiguous base; advance one position (smems_from_pos returns x+1).
+                    // A round-2 re-seed handles exactly one position, so it stops here regardless.
                     self.x = self.next_x;
-                    if self.x >= readlength {
+                    if self.single_pos || self.x >= readlength {
                         self.phase = LsPhase::Done;
                     }
                     return;
@@ -288,7 +292,9 @@ impl LsSlot {
                     }
                 }
                 self.x = self.next_x;
-                self.phase = if self.x >= readlength {
+                // Round-2 re-seeds a single position (matching one `smems_from_pos` call); round 1
+                // sweeps the whole read.
+                self.phase = if self.single_pos || self.x >= readlength {
                     LsPhase::Done
                 } else {
                     LsPhase::Start
@@ -659,12 +665,16 @@ pub fn mem_collect_smem(fm: &FmIndex, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
 /// forward seeding) run per read. Returns, for every read, exactly what [`mem_collect_smem`] would.
 pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> Vec<Vec<Smem>> {
     let mut per_read = collect_smems_batched(fm, reads, opt.min_seed_len, 1);
-    // Round 2 stays per-read (only a few long non-repetitive SMEMs re-seed), but round 3 (the
-    // universal per-position forward seeding) runs in lockstep across the batch so its `cp_occ`
-    // loads overlap — the same latency-hiding trick as round 1. Order per read is preserved
-    // (round 1, then round 2, then round 3), so this is byte-identical to the per-read path.
-    for (r, codes) in reads.iter().enumerate() {
-        smem_round_2(fm, codes, opt, &mut per_read[r]);
+    // Rounds 2 and 3 both run in lockstep across the batch so their data-dependent `cp_occ` loads
+    // overlap — the same latency-hiding trick as round 1. Order per read is preserved (round 1,
+    // then round 2, then round 3), so this is identical to the per-read path.
+    // `BWA3_SEED_R2_SERIAL` forces the old per-read round 2, for regression/parity verification.
+    if std::env::var_os("BWA3_SEED_R2_SERIAL").is_some() {
+        for (r, codes) in reads.iter().enumerate() {
+            smem_round_2(fm, codes, opt, &mut per_read[r]);
+        }
+    } else {
+        smem_round_2_batched(fm, reads, opt, &mut per_read);
     }
     if opt.max_mem_intv > 0 {
         bwt_seed_strategy_batched(fm, reads, opt.max_mem_intv, opt.min_seed_len + 1, &mut per_read);
@@ -697,6 +707,94 @@ fn smem_round_2(fm: &FmIndex, codes: &[u8], opt: &MemOpt, smems: &mut Vec<Smem>)
         }
         let x = ((end + start) >> 1) as usize;
         smems_from_pos(fm, codes, x, opt.min_seed_len, p.s + 1, &mut scratch, smems);
+    }
+}
+
+/// A single round-2 re-seed: re-run the SMEM walk of read `ridx` from position `x` with occurrence
+/// floor `min_intv` (the parent SMEM's `s + 1`). Enumerated up front from the round-1 output so the
+/// walks across the whole batch can run in lockstep.
+struct ReseedJob {
+    ridx: usize,
+    x: usize,
+    min_intv: i64,
+}
+
+/// Batched round 2: the per-read [`smem_round_2`] runs each midpoint re-seed as an isolated,
+/// latency-exposed [`smems_from_pos`] walk — measured as ~half of all seeding time on a genome-scale
+/// index, because unlike rounds 1 and 3 it is not lockstepped, so every data-dependent `cp_occ` load
+/// stalls on DRAM. This enumerates all re-seed jobs across the batch (in `(read, round-1 SMEM index)`
+/// order) and advances `N` of them round-robin, so each slot's prefetch covers a full cycle before
+/// its block is used. Each job's SMEMs are appended to its read in job order, identical to running
+/// [`smem_round_2`] per read.
+fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &mut [Vec<Smem>]) {
+    const N: usize = 8;
+    let split_len = (opt.min_seed_len as f32 * opt.split_factor + 0.499) as i32;
+
+    // Enumerate the re-seed jobs, preserving per-read append order (round-1 SMEM index ascending).
+    let mut jobs: Vec<ReseedJob> = Vec::new();
+    for (ridx, smems) in per_read.iter().enumerate() {
+        for p in smems.iter() {
+            let start = p.m as i32;
+            let end = p.n as i32 + 1;
+            if end - start < split_len || p.s > i64::from(opt.split_width) {
+                continue;
+            }
+            jobs.push(ReseedJob {
+                ridx,
+                x: ((end + start) >> 1) as usize,
+                min_intv: p.s + 1,
+            });
+        }
+    }
+    if jobs.is_empty() {
+        return;
+    }
+
+    let counts = fm.counts();
+    let max_len = reads.iter().map(|r| r.len()).max().unwrap_or(0);
+    // Each job's output, filled as it completes; appended in job order at the end.
+    let mut results: Vec<Vec<Smem>> = (0..jobs.len()).map(|_| Vec::new()).collect();
+
+    let mut slots: Vec<Option<(usize, LsSlot)>> = Vec::with_capacity(N);
+    let mut next_job = 0usize;
+    for _ in 0..N {
+        if next_job < jobs.len() {
+            let j = &jobs[next_job];
+            slots.push(Some((
+                next_job,
+                LsSlot::new(j.ridx, j.x, j.min_intv, true, max_len),
+            )));
+            next_job += 1;
+        } else {
+            slots.push(None);
+        }
+    }
+
+    let mut live = slots.iter().filter(|s| s.is_some()).count();
+    while live > 0 {
+        for slot_opt in slots.iter_mut() {
+            let Some((job_id, slot)) = slot_opt.as_mut() else {
+                continue;
+            };
+            slot.step(fm, reads[slot.ridx], opt.min_seed_len, &counts);
+            if slot.phase == LsPhase::Done {
+                results[*job_id] = std::mem::take(&mut slot.out);
+                if next_job < jobs.len() {
+                    let j = &jobs[next_job];
+                    *job_id = next_job;
+                    slot.reset_to(j.ridx, j.x, j.min_intv, true);
+                    next_job += 1;
+                } else {
+                    *slot_opt = None;
+                    live -= 1;
+                }
+            }
+        }
+    }
+
+    // Append each job's SMEMs to its read, in job order (= per-read round-1-index order).
+    for (job, res) in jobs.iter().zip(results) {
+        per_read[job.ridx].extend(res);
     }
 }
 
@@ -819,6 +917,55 @@ mod tests {
                     read.len()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn batched_full_seeding_equals_per_read() {
+        // Full 3-round seeding (mem_collect_smem_batched, incl. the lockstep round 2) must match the
+        // per-read mem_collect_smem for every read. Favor long exact slices so round-2 midpoint
+        // re-seeding actually fires (SMEMs >= split_len), plus mutated slices and randoms.
+        let fm = tiny();
+        let mut state = 0x51A7_ED00_C0FF_EE01u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let reflen = fm.reference().len() as i64;
+        let mut reads: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..80 {
+            let kind = next() % 5;
+            let len = 40 + (next() % 150) as usize;
+            let mut r: Vec<u8> = match kind {
+                0 => (0..len).map(|_| (next() % 4) as u8).collect(), // random (shallow)
+                _ => {
+                    // exact reference slice (deep SMEM -> triggers round 2)
+                    let start = (next() as i64) % (reflen - len as i64).max(1);
+                    (0..len).map(|i| fm.base(start + i as i64)).collect()
+                }
+            };
+            // Mutate a couple of bases in some slices (splits SMEMs, varied reseed geometry).
+            if kind >= 3 && r.len() > 4 {
+                for _ in 0..2 {
+                    let p = (next() as usize) % r.len();
+                    r[p] = (next() % 4) as u8;
+                }
+            }
+            reads.push(r);
+        }
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+
+        let opt = MemOpt::default();
+        let batched = mem_collect_smem_batched(&fm, &refs, &opt);
+        for (r, read) in reads.iter().enumerate() {
+            let per_read = mem_collect_smem(&fm, read, &opt);
+            assert_eq!(
+                batched[r], per_read,
+                "batched full != per-read at read {r} (len {})",
+                read.len()
+            );
         }
     }
 
