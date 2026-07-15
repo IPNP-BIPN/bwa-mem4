@@ -191,6 +191,26 @@ impl LearnedSa {
         Ordering::Equal
     }
 
+    /// Compare `pattern` against the suffix at SA row `i` using the **co-located 2-bit key**
+    /// (`keys[i]`, one memory access) for the first `min(len, K)` bases, and only touch the reference
+    /// on a tie. This is BWA-MEME's co-located-suffix comparison: the last-mile binary search resolves
+    /// almost every step from a single cache line (`keys[i]`) instead of two random accesses
+    /// (`sa[i]` → `ref_seq[start..]`). `pkey` is `pattern_key(pattern)`, precomputed once per search.
+    ///
+    /// Correctness: keys are 2-bit packed MSB-first, zero-padded past a suffix's end. Padding with `A`
+    /// (0, the smallest base) can only make a short suffix compare *smaller*, never falsely `Greater`,
+    /// so a decisive `Less`/`Greater` from the key is always correct; a key tie (`Equal`) is re-verified
+    /// against the reference (handles short/padded suffixes and matches longer than `K`).
+    #[inline]
+    fn cmp_key(&self, i: usize, pkey: u64, pattern: &[u8]) -> Ordering {
+        let l = pattern.len().min(K);
+        let shift = 2 * (K - l) as u32; // keep only the top `l` bases of each key
+        match (self.keys[i] >> shift).cmp(&(pkey >> shift)) {
+            Ordering::Equal => self.cmp_pattern(i, pattern),
+            other => other,
+        }
+    }
+
     /// The suffix-array interval `[lo, hi)` of rows whose suffix has `pattern` as a prefix — i.e.
     /// every occurrence of `pattern` in the reference. Uses the learned index to seed the search.
     /// Empty pattern returns the whole array. Result-identical to a plain two-sided binary search
@@ -201,12 +221,13 @@ impl LearnedSa {
             return (0, n);
         }
         // RMI predicts where this key sorts among the stored first-K keys; a good seed for both ends.
-        let hint = self.rmi.lower_bound(&self.keys, pattern_key(pattern));
+        let pkey = pattern_key(pattern);
+        let hint = self.rmi.lower_bound(&self.keys, pkey);
         // lower bound: first row whose suffix is NOT < pattern.
-        let lo = seeded_partition_point(n, hint, |i| self.cmp_pattern(i, pattern) == Ordering::Less);
+        let lo = seeded_partition_point(n, hint, |i| self.cmp_key(i, pkey, pattern) == Ordering::Less);
         // upper bound: first row whose suffix is > pattern (prefix comparison).
         let hi =
-            seeded_partition_point(n, hint, |i| self.cmp_pattern(i, pattern) != Ordering::Greater);
+            seeded_partition_point(n, hint, |i| self.cmp_key(i, pkey, pattern) != Ordering::Greater);
         (lo, hi)
     }
 
@@ -267,9 +288,10 @@ impl LearnedSa {
         // Suffix-order lower bound of the full pattern (first suffix not < pattern), RMI-seeded. The
         // suffix with the longest common prefix with `pattern` is always at this insertion point or
         // its predecessor (a sorted-suffix-array property), so the LEM is the larger of the two LCPs.
-        let hint = self.rmi.lower_bound(&self.keys, pattern_key(pattern));
+        let pkey = pattern_key(pattern);
+        let hint = self.rmi.lower_bound(&self.keys, pkey);
         let lo_full =
-            seeded_partition_point(n, hint, |i| self.cmp_pattern(i, pattern) == Ordering::Less);
+            seeded_partition_point(n, hint, |i| self.cmp_key(i, pkey, pattern) == Ordering::Less);
         let ref_len = self.ref_seq.len();
         let lcp = |row: usize| -> usize {
             let start = self.sa[row] as usize;
@@ -294,13 +316,14 @@ impl LearnedSa {
         // When the whole pattern matched, `lo_full` already *is* the lower bound; only the upper
         // bound needs a search.
         let best_pat = &pattern[..best];
+        let bkey = pattern_key(best_pat);
         let lo = if best == pattern.len() {
             lo_full
         } else {
-            seeded_partition_point(n, lo_full, |i| self.cmp_pattern(i, best_pat) == Ordering::Less)
+            seeded_partition_point(n, lo_full, |i| self.cmp_key(i, bkey, best_pat) == Ordering::Less)
         };
         let hi = seeded_partition_point(n, lo_full, |i| {
-            self.cmp_pattern(i, best_pat) != Ordering::Greater
+            self.cmp_key(i, bkey, best_pat) != Ordering::Greater
         });
         (best, lo, hi)
     }
