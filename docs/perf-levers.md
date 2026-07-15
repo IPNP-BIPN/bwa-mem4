@@ -44,11 +44,14 @@ Ported nh13's `ungapped_analyze` HIT case beyond perfect-match: a diagonal exten
 optimal → scalar local-SW walk gives the result, DP skipped. **57% of extension jobs skip DP** (SE).
 Byte-identical (5000/5000 SE, 10000/10000 PE). Commit `18c462a`.
 
-**3b. TIGHT band — assessed, deferred.** For `>x_threshold` mismatches, nh13 runs SW with a tightened
-band. In our kernel the **adaptive band already narrows** to the diagonal within ~1–2 rows, so the
-extra initial width is the only saving → estimated ~3% wall, against byte-identity-risky per-job band
-plumbing (the `band=0` sentinel, `max_sc_proof` formula, `max_off` interaction). Deferred pending a
-go/no-go: low reward, real parity risk.
+**3b. TIGHT band — implemented, byte-identical, ~0%, reverted.** Ported the full classification
+(`Hit`/`Tight(band)`/`Fallback`) with `max_sc_proof`-derived `tight_band = ceil((n·a+h0−max_sc_proof−o_min)/e_min)`,
+running the tight group's SW at `max(tight_band) ⊆ w0`. **Parity held exactly** (SE 5000/5000, PE
+10000/10000 all_fields_match — the reduced band provably contains the same optimum). But **measured
+SE 5.99→6.02s, PE 12.57→12.70s (~0%, a hair slower)**: our adaptive band already narrows to the
+diagonal in ~1–2 rows, so a tighter *start* saves almost nothing, and splitting non-HIT jobs into two
+groups (tight + fallback) **fragments the SIMD batches** (worse lane fill), cancelling it. Reverted —
+correct but not worth the complexity on this workload (may help on higher-error real data).
 
 ## Cumulative (this session, main baseline → LEVER 3a, code only, no PGO)
 
