@@ -46,6 +46,31 @@ was reverted (not shipped); a native-NEON byte-identity gate (`neon_verify`) was
 32 zmm**. A 2-group interleave *might* pay off on AVX-512 (more registers + the recurrence is the same
 latency-bound shape). Untestable on Apple; revisit only when the Intel/AVX-512 path gets CI. The
 `define_sw_kernel_ilp!` approach (in git history on `feat/sw-kernel-ilp`) is the starting point.
+
+### Idea "port getScores16's exact band" — refuted by reading the reference (2026-07)
+
+Studied bwa-mem2's actual SIMD kernel (`reference/bwa-mem2/src/bandedSWA.cpp`,
+`smithWaterman256_8` / `MAIN_CODE8`). It is **structurally identical to ours**, so porting it changes
+nothing on NEON:
+- Same column-carried serial chain: bwa-mem2 carries `e11` (E-gap) across columns in a register,
+  reset to 0 per row (line 805) — the exact analog of our `f_v` (E↔F swapped by convention). Same
+  `e→h→e` latency chain.
+- Same memory-streaming: H/E/F live in arrays (`H_h`, `F`), loaded/stored every cell — not a
+  register-resident band. So there is **no "fixed band frees registers"** to exploit; if anything
+  bwa-mem2 keeps *more* live vectors (`head/tail/myband/qlen/mlen/i256/i1_256` + `MAIN_CODE` temps).
+- Its only extra is `#pragma unroll(4)` on the column loop, which unrolls the *same* serial chain — a
+  true dependency it cannot break (consistent with the f_v-break proof that the chain is the limiter).
+
+bwa-mem2 is not faster *per cell* than us on the same ISA; its absolute speed is **AVX-512 width
+(64 u8 lanes vs our 16)** — the Apple width ceiling again. **Do not port getScores16 expecting a NEON
+win.** The kernel is at the byte-identical ceiling on Apple Silicon.
+
+### PGO reassessed — low value here (~2% overall)
+
+PGO/BOLT only helps branchy code (driver, dispatch, seeding ≈ 15% of runtime). The 85% is hand-written
+branchless NEON that PGO can't improve. So the realistic overall gain is ~2%, not the ~10-15% the
+generic figure suggests — and this host is homebrew-rust with an external `llvm-profdata` (version
+friction). Deprioritized below the bounded-but-real wins (vectorized Occ, kswv mate-rescue).
 | 2 | **Difference recurrence** (Suzuki-Kasahara / KSW2) | Store adjacent score *differences*, not absolutes: critical path ~8→4 ops/cell, differences bounded so int8 is unconditional. Orthogonal to layout; stacks with #1. | ~2.1x reported | Score exact; verify CIGAR tie-break | Medium-high |
 | 3 | **Ungapped-first / skip-DP** (minibwa q-mer prefilter) | Most 150bp extensions are gapless. Cheap ungapped score first; full gap-affine DP only when a gap could improve. minibwa: q=7, run SW only if max q-mer count ≥ 10. | Removes a slice of the 85% | Exact only if the skip provably can't change the winner (else a validated divergence) | Low-medium |
 | 4 | **WFA for hard extensions** (hybrid) | O(n·s): ~10x fewer cells for low-error reads (2-6x vs KSW2). Keep SIMD banded DP for tiny bands, dispatch WFA only for wide bands. | High for the hard subset | Risky: WFA's M>X>D>I CIGAR tie-break ≠ bwa's; needs canonicalization | High (spike) |
