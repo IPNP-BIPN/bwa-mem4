@@ -13,7 +13,5 @@ bwa-index = { workspace = true }
 bwa-seed = { workspace = true }
 bwa-chain = { workspace = true }
 bwa-extend = { workspace = true }
-
-[dev-dependencies]
-# NEON backend, exercised end-to-end by the across-reads batched-extension equivalence test.
+# SIMD kernels: the batched mate-rescue local-SW (self-dispatching NEON/scalar).
 bwa-neon = { workspace = true }

@@ -8,8 +8,9 @@
 use std::io::{self, Write};
 
 use bwa_core::MemOpt;
-use bwa_extend::ksw_align2;
+use bwa_extend::{ksw_align2, KswAlignResult};
 use bwa_index::{BntSeq, FmIndex};
+use bwa_neon::{batched_ksw_align2, KswJob};
 
 use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
@@ -217,6 +218,300 @@ fn mem_matesw(
         }
     }
     n
+}
+
+/// One insert-consistent orientation's mate-rescue local-SW job (built by [`matesw_collect`]): the
+/// mate `query` in this orientation vs the `target` window, plus the coordinates needed to place the
+/// hit ([`matesw_apply`]).
+struct Orient {
+    query: Vec<u8>,
+    target: Vec<u8>,
+    rb: i64,
+    is_rev: bool,
+}
+
+/// One anchor's mate rescue, split into the SW-independent `collect` (which orientations to run) and
+/// the SW-dependent `apply` (insert the hits). Mirrors [`mem_matesw`] exactly but lets the SW of many
+/// anchors, across the whole pair batch, run through one vectorized [`batched_ksw_align2`].
+struct RescueCall {
+    skip: [i32; 4],
+    per_r: [Option<Orient>; 4],
+    l_ms: i64,
+    rid: i32,
+    is_alt: bool,
+    rb: i64,
+}
+
+/// Collect the orientations that would run mate rescue for anchor `a` against mate `ms`, reading the
+/// current `ma`. Returns `None` when a consistent pair already exists (all four skipped — no SW), so
+/// the caller records nothing. The SW jobs depend only on `(query, target)`, not on `ma`.
+fn matesw_collect(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    a: &MemAlnReg,
+    ms: &[u8],
+    ma: &[MemAlnReg],
+) -> Option<RescueCall> {
+    let l_pac = bns.l_pac;
+    let l_ms = ms.len() as i64;
+    let mut skip = [0i32; 4];
+    for (r, sk) in skip.iter_mut().enumerate() {
+        *sk = i32::from(pes[r].failed);
+    }
+    for m in ma.iter() {
+        let (r, dist) = mem_infer_dir(l_pac, a.rb, m.rb);
+        if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
+            skip[r] = 1;
+        }
+    }
+    if skip.iter().sum::<i32>() == 4 {
+        return None;
+    }
+    let mut per_r: [Option<Orient>; 4] = [None, None, None, None];
+    for r in 0..4 {
+        if skip[r] != 0 {
+            continue;
+        }
+        let is_rev = (r >> 1) != (r & 1);
+        let is_larger = (r >> 1) == 0;
+        let seq: Vec<u8> = if is_rev {
+            ms.iter()
+                .rev()
+                .map(|&b| if b < 4 { 3 - b } else { 4 })
+                .collect()
+        } else {
+            ms.to_vec()
+        };
+        let (lo, hi) = (i64::from(pes[r].low), i64::from(pes[r].high));
+        let (rb0, re0) = if !is_rev {
+            let rb = if is_larger { a.rb + lo } else { a.rb - hi };
+            let re = (if is_larger { a.rb + hi } else { a.rb - lo }) + l_ms;
+            (rb, re)
+        } else {
+            let rb = (if is_larger { a.rb + lo } else { a.rb - hi }) - l_ms;
+            let re = if is_larger { a.rb + hi } else { a.rb - lo };
+            (rb, re)
+        };
+        let rb0 = rb0.max(0);
+        let re0 = re0.min(l_pac << 1);
+        if rb0 < re0 {
+            let (rb, re, rid, refseq) = bns_fetch_seq(fm, bns, rb0, (rb0 + re0) >> 1, re0);
+            if a.rid == rid && re - rb >= i64::from(opt.min_seed_len) {
+                per_r[r] = Some(Orient {
+                    query: seq,
+                    target: refseq,
+                    rb,
+                    is_rev,
+                });
+            }
+        }
+    }
+    Some(RescueCall {
+        skip,
+        per_r,
+        l_ms,
+        rid: a.rid,
+        is_alt: a.is_alt,
+        rb: a.rb,
+    })
+}
+
+/// The `KswJob`s of a `RescueCall`, in orientation order (the order `matesw_apply` consumes results).
+fn rescue_jobs(call: &RescueCall) -> impl Iterator<Item = KswJob<'_>> {
+    call.per_r.iter().flatten().map(|o| KswJob {
+        query: &o.query,
+        target: &o.target,
+    })
+}
+
+/// Apply a `RescueCall`'s SW results (`alns`, one per collected orientation, in order) to `ma`,
+/// inserting each accepted hit and deduping after each orientation, exactly as [`mem_matesw`] does.
+fn matesw_apply(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    call: &RescueCall,
+    alns: &[KswAlignResult],
+    ma: &mut Vec<MemAlnReg>,
+) {
+    let l_pac = bns.l_pac;
+    let l_ms = call.l_ms;
+    let mut n = 0;
+    let mut ai = 0usize;
+    for r in 0..4 {
+        if call.skip[r] != 0 {
+            continue;
+        }
+        if let Some(o) = &call.per_r[r] {
+            let aln = alns[ai];
+            ai += 1;
+            if aln.score >= opt.min_seed_len && aln.qb >= 0 {
+                let (rb, is_rev) = (o.rb, o.is_rev);
+                let qb = if is_rev {
+                    l_ms as i32 - (aln.qe + 1)
+                } else {
+                    aln.qb
+                };
+                let qe = if is_rev {
+                    l_ms as i32 - aln.qb
+                } else {
+                    aln.qe + 1
+                };
+                let brb = if is_rev {
+                    (l_pac << 1) - (rb + i64::from(aln.te) + 1)
+                } else {
+                    rb + i64::from(aln.tb)
+                };
+                let bre = if is_rev {
+                    (l_pac << 1) - (rb + i64::from(aln.tb))
+                } else {
+                    rb + i64::from(aln.te) + 1
+                };
+                let seedcov = ((bre - brb).min(i64::from(qe - qb)) >> 1) as i32;
+                let b = MemAlnReg {
+                    rb: brb,
+                    re: bre,
+                    qb,
+                    qe,
+                    rid: call.rid,
+                    score: aln.score,
+                    truesc: 0,
+                    sub: 0,
+                    csub: aln.score2,
+                    sub_n: 0,
+                    seedcov,
+                    seedlen0: 0,
+                    secondary: -1,
+                    secondary_all: 0,
+                    w: 0,
+                    frac_rep: 0.0,
+                    is_alt: call.is_alt,
+                    hash: 0,
+                    n_comp: 0,
+                };
+                let mut ins = 0;
+                while ins < ma.len() && ma[ins].score >= b.score {
+                    ins += 1;
+                }
+                ma.insert(ins, b);
+            }
+            n += 1;
+        }
+        if n > 0 {
+            let taken = std::mem::take(ma);
+            *ma = mem_sort_dedup_patch(fm, opt, &[], taken);
+        }
+    }
+}
+
+/// One read pair's rescue inputs for [`batch_mate_rescue`]: the two mates' nt4 codes and their
+/// (mutable) dedup'd region vectors. `a0`/`seq0` is read 1, `a1`/`seq1` is read 2.
+pub struct PairRescueData<'a> {
+    pub seq0: &'a [u8],
+    pub seq1: &'a [u8],
+    pub a0: &'a mut Vec<MemAlnReg>,
+    pub a1: &'a mut Vec<MemAlnReg>,
+}
+
+/// Batched mate rescue across a whole pair batch: identical to running [`mem_matesw`] inside each
+/// pair's `mem_sam_pe`, but every anchor's insert-window SW (across all pairs) runs in one vectorized
+/// [`batched_ksw_align2`], filling the SIMD lanes that a single pair's <=4 orientations cannot.
+///
+/// bwa-mem2's rescue snapshots each read's near-best regions as anchors (before any rescue), then, per
+/// anchor, SW-rescues the mate in each missing orientation. Anchors of one read against one mate are
+/// applied in order (later anchors' `skip` sees earlier inserts), so this proceeds in **rounds**: round
+/// `k` collects the `k`-th anchor of every (pair, direction), batches their SW, then applies — keeping
+/// the per-array insertion order byte-identical to the per-pair path. The two directions target
+/// disjoint arrays (`a1` vs `a0`), and different pairs are independent, so a round batches freely.
+pub fn batch_mate_rescue(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    pairs: &mut [PairRescueData],
+) {
+    let cap = opt.max_matesw.max(0) as usize;
+    if cap == 0 {
+        return;
+    }
+    let pen = opt.pen_unpaired;
+
+    // Snapshot near-best anchors per (pair, direction), before any rescue. dir 0: read-1 anchors that
+    // rescue read 2 (`a1`); dir 1: read-2 anchors that rescue read 1 (`a0`).
+    let mut anchors: Vec<[Vec<MemAlnReg>; 2]> = Vec::with_capacity(pairs.len());
+    let mut max_rounds = 0usize;
+    for p in pairs.iter() {
+        let a = if !p.a0.is_empty() && !p.a1.is_empty() {
+            let best0 = p.a0[0].score;
+            let best1 = p.a1[0].score;
+            let b0: Vec<MemAlnReg> = p
+                .a0
+                .iter()
+                .filter(|r| r.score >= best0 - pen)
+                .take(cap)
+                .cloned()
+                .collect();
+            let b1: Vec<MemAlnReg> = p
+                .a1
+                .iter()
+                .filter(|r| r.score >= best1 - pen)
+                .take(cap)
+                .cloned()
+                .collect();
+            max_rounds = max_rounds.max(b0.len()).max(b1.len());
+            [b0, b1]
+        } else {
+            [Vec::new(), Vec::new()]
+        };
+        anchors.push(a);
+    }
+
+    for round in 0..max_rounds {
+        // Collect this round's rescue calls across all pairs and both directions.
+        let mut calls: Vec<(usize, usize, RescueCall)> = Vec::new(); // (pair, dir, call)
+        for (pi, p) in pairs.iter().enumerate() {
+            for dir in 0..2 {
+                let anc = &anchors[pi][dir];
+                if round >= anc.len() {
+                    continue;
+                }
+                let (ms, target): (&[u8], &Vec<MemAlnReg>) = if dir == 0 {
+                    (p.seq1, p.a1)
+                } else {
+                    (p.seq0, p.a0)
+                };
+                if let Some(call) = matesw_collect(fm, bns, opt, pes, &anc[round], ms, target) {
+                    calls.push((pi, dir, call));
+                }
+            }
+        }
+        if calls.is_empty() {
+            continue;
+        }
+        // Flatten every call's orientation jobs into one batch (spans map each call to its slice).
+        let mut jobs: Vec<KswJob> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (_, _, call) in &calls {
+            let start = jobs.len();
+            jobs.extend(rescue_jobs(call));
+            spans.push((start, jobs.len() - start));
+        }
+        let alns = batched_ksw_align2(
+            &jobs, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins,
+            opt.min_seed_len * opt.a, opt.a,
+        );
+        for (idx, (pi, dir, call)) in calls.iter().enumerate() {
+            let (start, count) = spans[idx];
+            let target = if *dir == 0 {
+                &mut *pairs[*pi].a1
+            } else {
+                &mut *pairs[*pi].a0
+            };
+            matesw_apply(fm, bns, opt, call, &alns[start..start + count], target);
+        }
+    }
 }
 
 /// Second-best non-overlapping score among a read's dedup'd regions (`a[0]` is the best). Port of
@@ -757,13 +1052,15 @@ pub fn mem_sam_pe<W: Write>(
     quals: &[Option<&[u8]>; 2],
     a0: &mut Vec<MemAlnReg>,
     a1: &mut Vec<MemAlnReg>,
+    rescue_done: bool,
     w: &mut W,
 ) -> io::Result<()> {
     // Mate rescue (mem_matesw), before primary marking. Snapshot each read's near-best regions as
     // anchors, then SW-rescue the other read's mate in any missing insert-consistent orientation.
     // On concordant pairs every orientation is skipped, so this is a no-op. Port of the non-
-    // MATE_SORT rescue block in mem_sam_pe (bwamem_pair.cpp lines 378-414).
-    if !a0.is_empty() && !a1.is_empty() {
+    // MATE_SORT rescue block in mem_sam_pe (bwamem_pair.cpp lines 378-414). Skipped when the caller
+    // already ran it batched across the whole pair batch ([`batch_mate_rescue`]).
+    if !rescue_done && !a0.is_empty() && !a1.is_empty() {
         let pen = opt.pen_unpaired;
         let cap = opt.max_matesw.max(0) as usize;
         let (best0, best1) = (a0[0].score, a1[0].score);
