@@ -1134,3 +1134,131 @@ mod avx2_verify {
         }
     }
 }
+
+/// Native-NEON byte-identity gate, runnable on this Apple-Silicon host (`cargo test -p bwa-neon`).
+///
+/// The `avx2_verify` test validates the shared `define_sw_kernel!` logic, but only on x86 (under
+/// Rosetta / native x86 CI). This module exercises the actual NEON u8 (16-lane) and i16 (8-lane)
+/// kernels that ship on aarch64, asserting every `ExtendResult` field matches the scalar
+/// `ksw_extend2` reference across randomized short/long jobs and batch sizes that straddle the lane
+/// boundary. It is the on-device counterpart to `avx2_verify`.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod neon_verify {
+    use super::neon::{batched_extend_neon_i16, batched_extend_neon_u8};
+    use bwa_extend::{ksw_extend2, ExtendJob};
+
+    fn scoring() -> Vec<i8> {
+        let (a, b) = (1i8, 4i8);
+        let mut mat = vec![0i8; 25];
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { a } else { -b };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+        mat
+    }
+
+    #[test]
+    fn neon_u8_and_i16_match_scalar() {
+        let mat = scoring();
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        for round in 0..400u32 {
+            let w = 1 + (next() % 150) as i32;
+            let zdrop = (next() % 200) as i32;
+            let end_bonus = (next() % 12) as i32;
+            // Straddle the 8/16-lane boundaries: partial and empty tail lanes, exact multiples.
+            let batch = *[1usize, 7, 8, 9, 16, 17, 31, 32, 33, 48]
+                .get((next() % 10) as usize)
+                .unwrap();
+
+            for &big in &[false, true] {
+                let mut queries: Vec<Vec<u8>> = Vec::new();
+                let mut targets: Vec<Vec<u8>> = Vec::new();
+                let mut h0s: Vec<i32> = Vec::new();
+                for _ in 0..batch {
+                    // u8 kernel: lengths + score ceiling < 256; i16 kernel: a longer-length set.
+                    let qlen = if big {
+                        200 + (next() % 400) as usize
+                    } else {
+                        1 + (next() % 90) as usize
+                    };
+                    let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                    let tlen = qlen + (next() % 30) as usize;
+                    let mut t: Vec<u8> = Vec::with_capacity(tlen);
+                    let mut qi = 0usize;
+                    while t.len() < tlen {
+                        if qi < q.len() && next() % 100 >= 5 {
+                            t.push(q[qi]);
+                            qi += 1;
+                        } else {
+                            t.push((next() % 4) as u8);
+                            if next() % 2 == 0 {
+                                qi += 1;
+                            }
+                        }
+                    }
+                    queries.push(q);
+                    targets.push(t);
+                    h0s.push(1 + (next() % 20) as i32);
+                }
+                let jobs: Vec<ExtendJob> = (0..batch)
+                    .map(|i| ExtendJob {
+                        query: &queries[i],
+                        target: &targets[i],
+                        h0: h0s[i],
+                    })
+                    .collect();
+                // SAFETY: this host has NEON (aarch64).
+                let got = unsafe {
+                    if big {
+                        batched_extend_neon_i16(
+                            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                        )
+                    } else {
+                        batched_extend_neon_u8(
+                            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                        )
+                    }
+                };
+                for (i, g) in got.iter().enumerate() {
+                    let expected = ksw_extend2(
+                        &queries[i],
+                        &targets[i],
+                        5,
+                        &mat,
+                        o_del,
+                        e_del,
+                        o_ins,
+                        e_ins,
+                        w,
+                        end_bonus,
+                        zdrop,
+                        h0s[i],
+                    );
+                    assert_eq!(
+                        *g, expected,
+                        "NEON {} diverged round {round} job {i} (batch {batch}) qlen={} tlen={}",
+                        if big { "i16" } else { "u8" },
+                        queries[i].len(),
+                        targets[i].len()
+                    );
+                }
+            }
+        }
+    }
+}
