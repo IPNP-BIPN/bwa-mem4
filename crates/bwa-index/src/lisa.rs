@@ -252,6 +252,47 @@ impl LearnedSa {
         (lt, le)
     }
 
+    /// Longest exact match (a prefix of `pattern`) present in the reference, with its SA interval:
+    /// returns `(match_len, lo, hi)` where `ref_seq[..]` contains `pattern[..match_len]` at exactly
+    /// the rows `[lo, hi)`. This is BWA-MEME's fast LEM: one RMI jump to the pattern's sorted position,
+    /// an LCP against the two neighbouring suffixes (the longest common prefix is always at the
+    /// insertion point in a sorted suffix array), then one deep-interval search — fast precisely
+    /// because a *long* match has a *narrow* interval, unlike the base-by-base narrowing of a byte-
+    /// identical SMEM walk which must also touch the wide shallow intervals.
+    pub fn lem(&self, pattern: &[u8]) -> (usize, usize, usize) {
+        let n = self.sa.len();
+        if pattern.is_empty() {
+            return (0, 0, n);
+        }
+        // Suffix-order lower bound of the full pattern (first suffix not < pattern), RMI-seeded. The
+        // suffix with the longest common prefix with `pattern` is always at this insertion point or
+        // its predecessor (a sorted-suffix-array property), so the LEM is the larger of the two LCPs.
+        let hint = self.rmi.lower_bound(&self.keys, pattern_key(pattern));
+        let lo_full =
+            seeded_partition_point(n, hint, |i| self.cmp_pattern(i, pattern) == Ordering::Less);
+        let ref_len = self.ref_seq.len();
+        let lcp = |row: usize| -> usize {
+            let start = self.sa[row] as usize;
+            let mut l = 0usize;
+            while l < pattern.len() && start + l < ref_len && self.ref_seq[start + l] == pattern[l] {
+                l += 1;
+            }
+            l
+        };
+        let mut best = 0usize;
+        if lo_full < n {
+            best = best.max(lcp(lo_full));
+        }
+        if lo_full > 0 {
+            best = best.max(lcp(lo_full - 1));
+        }
+        if best == 0 {
+            return (0, 0, 0);
+        }
+        let (lo, hi) = self.exact_interval(&pattern[..best]);
+        (best, lo, hi)
+    }
+
     /// Reference positions where `pattern` occurs exactly (the `sa` values of [`Self::exact_interval`]).
     pub fn occurrences(&self, pattern: &[u8]) -> Vec<i64> {
         let (lo, hi) = self.exact_interval(pattern);
@@ -399,6 +440,38 @@ mod tests {
                     // At every prefix length, the narrowed interval must equal exact_interval.
                     let (elo, ehi) = lsa.exact_interval(&pat[..=depth]);
                     assert_eq!((lo, hi), (elo, ehi), "prefix depth {depth} of pat@{s}");
+                }
+            }
+        }
+    }
+
+    /// `lem` must return the longest prefix of the pattern present in the reference, with the correct
+    /// interval, matching brute force.
+    #[test]
+    fn lem_matches_bruteforce() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for trial in 0..8 {
+            let len = 300 + (lcg(&mut seed) as usize % 1500);
+            let alpha = if trial % 2 == 0 { 4 } else { 2 };
+            let ref_seq: Vec<u8> = (0..len).map(|_| (lcg(&mut seed) % alpha) as u8).collect();
+            let lsa = LearnedSa::build(ref_seq.clone(), 256);
+            for _ in 0..200 {
+                let mlen = 1 + (lcg(&mut seed) as usize % 50);
+                let pat: Vec<u8> = if lcg(&mut seed) % 2 == 0 && len > mlen {
+                    let s = lcg(&mut seed) as usize % (len - mlen);
+                    ref_seq[s..s + mlen].to_vec()
+                } else {
+                    (0..mlen).map(|_| (lcg(&mut seed) % alpha) as u8).collect()
+                };
+                // Brute: longest L with pat[..L] present.
+                let brute_len = (0..=pat.len())
+                    .rev()
+                    .find(|&l| l == 0 || !brute(&ref_seq, &pat[..l]).is_empty())
+                    .unwrap();
+                let (ml, lo, hi) = lsa.lem(&pat);
+                assert_eq!(ml, brute_len, "lem len, pat={pat:?}");
+                if ml > 0 {
+                    assert_eq!((lo, hi), lsa.exact_interval(&pat[..ml]), "lem interval");
                 }
             }
         }

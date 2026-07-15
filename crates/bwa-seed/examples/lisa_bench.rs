@@ -167,6 +167,35 @@ fn main() {
                 reads.len(), nsmem, el, reads.len() as f64 / el, total_bases as f64 / el / 1e6, hash
             );
         }
+        "lem" => {
+            // Micro-benchmark the fast forward LEM primitive: for each read, cover it with
+            // forward LEMs (jump the pivot by each match length), a proxy for the zigzag's LEM count.
+            let reference = std::fs::read(format!("{prefix}.0123")).expect("read .0123");
+            let sa = load_sa(sa_path, reference.len() + 1);
+            let n_leaves = (sa.len() >> leaves_shift).max(1);
+            eprintln!("building LearnedSa ({} leaves)...", n_leaves);
+            let tb = Instant::now();
+            let lsa = LearnedSa::from_sa(reference, sa, n_leaves);
+            eprintln!("LearnedSa built in {:.0}s", tb.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let (mut nlem, mut covered) = (0usize, 0usize);
+            for r in &reads {
+                let mut pos = 0usize;
+                while pos < r.len() {
+                    let (ml, _lo, _hi) = lsa.lem(&r[pos..]);
+                    nlem += 1;
+                    let adv = ml.max(1);
+                    covered += adv;
+                    pos += adv;
+                }
+            }
+            let el = t.elapsed().as_secs_f64();
+            println!(
+                "LEM  : {} reads, {} lems ({:.1}/read), {:.3}s, {:.0} reads/s, {:.0} lems/s, {:.2} Mbase/s",
+                reads.len(), nlem, nlem as f64 / reads.len() as f64, el,
+                reads.len() as f64 / el, nlem as f64 / el, covered as f64 / el / 1e6
+            );
+        }
         _ => {
             eprintln!("unknown mode {mode}");
             std::process::exit(2);
