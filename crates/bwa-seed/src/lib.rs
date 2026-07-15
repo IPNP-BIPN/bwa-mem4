@@ -477,6 +477,173 @@ fn bwt_seed_strategy(
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum BwtPhase {
+    Start,
+    Fwd,
+    Done,
+}
+
+/// One read's round-3 (`bwt_seed_strategy`) forward-seeding walk as a resumable state machine, so a
+/// batch of reads can run their walks in lockstep (see [`bwt_seed_strategy_batched`]) and hide the
+/// `cp_occ` DRAM latency of the forward extension. Mirrors [`bwt_seed_strategy`] exactly: `Start`
+/// seeds the single-base interval at `x`, `Fwd` runs one forward-extension iteration.
+struct BwtSeedSlot {
+    ridx: usize,
+    x: usize,
+    next_x: usize,
+    j: usize,
+    smem: Smem,
+    phase: BwtPhase,
+    out: Vec<Smem>,
+}
+
+impl BwtSeedSlot {
+    fn new(ridx: usize) -> Self {
+        BwtSeedSlot {
+            ridx,
+            x: 0,
+            next_x: 0,
+            j: 0,
+            smem: Smem::default(),
+            phase: BwtPhase::Start,
+            out: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self, ridx: usize) {
+        self.ridx = ridx;
+        self.x = 0;
+        self.phase = BwtPhase::Start;
+        self.out.clear();
+    }
+
+    /// End the current position: advance `x` to `next_x` and return to `Start` (or finish).
+    #[inline]
+    fn end_pos(&mut self, readlength: usize) {
+        self.x = self.next_x;
+        self.phase = if self.x >= readlength {
+            BwtPhase::Done
+        } else {
+            BwtPhase::Start
+        };
+    }
+
+    fn step(
+        &mut self,
+        fm: &FmIndex,
+        codes: &[u8],
+        max_intv: i64,
+        min_seed_len: i32,
+        counts: &[i64; 5],
+    ) {
+        let readlength = codes.len();
+        match self.phase {
+            BwtPhase::Start => {
+                if self.x >= readlength {
+                    self.phase = BwtPhase::Done;
+                    return;
+                }
+                self.next_x = self.x + 1;
+                if codes[self.x] >= 4 {
+                    self.end_pos(readlength);
+                    return;
+                }
+                let a = codes[self.x] as usize;
+                self.smem = Smem {
+                    rid: 0,
+                    m: self.x as u32,
+                    n: self.x as u32,
+                    k: counts[a],
+                    l: counts[3 - a],
+                    s: counts[a + 1] - counts[a],
+                };
+                self.j = self.x + 1;
+                self.phase = BwtPhase::Fwd;
+            }
+            BwtPhase::Fwd => {
+                if self.j >= readlength {
+                    self.end_pos(readlength);
+                    return;
+                }
+                self.next_x = self.j + 1;
+                let aj = codes[self.j];
+                if aj >= 4 {
+                    self.end_pos(readlength);
+                    return;
+                }
+                let mut fwd = self.smem;
+                std::mem::swap(&mut fwd.k, &mut fwd.l);
+                let ext = fm.backward_ext(fwd, 3 - aj as usize);
+                let mut new_smem = ext;
+                std::mem::swap(&mut new_smem.k, &mut new_smem.l);
+                new_smem.n = self.j as u32;
+                self.smem = new_smem;
+                if self.smem.s < max_intv
+                    && (i64::from(self.smem.n) - i64::from(self.smem.m) + 1)
+                        >= i64::from(min_seed_len)
+                {
+                    if self.smem.s > 0 {
+                        self.out.push(self.smem);
+                    }
+                    self.end_pos(readlength);
+                    return;
+                }
+                // Next forward step swaps k/l, so its backward_ext reads the blocks at `smem.l`.
+                fm.prefetch_occ(self.smem.l, self.smem.l + self.smem.s);
+                self.j += 1;
+            }
+            BwtPhase::Done => {}
+        }
+    }
+}
+
+/// Batched round-3 seeding: run every read's [`bwt_seed_strategy`] walk in lockstep (N in flight,
+/// round-robin) so the forward-extension `cp_occ` loads of independent reads overlap. Appends each
+/// read's round-3 SMEMs to `out[ridx]`, byte-identical to calling [`bwt_seed_strategy`] per read.
+fn bwt_seed_strategy_batched(
+    fm: &FmIndex,
+    reads: &[&[u8]],
+    max_intv: i64,
+    min_seed_len: i32,
+    out: &mut [Vec<Smem>],
+) {
+    const N: usize = 8;
+    if reads.is_empty() {
+        return;
+    }
+    let counts = fm.counts();
+    let mut slots: Vec<Option<BwtSeedSlot>> = Vec::with_capacity(N);
+    let mut next_read = 0usize;
+    for _ in 0..N {
+        if next_read < reads.len() {
+            slots.push(Some(BwtSeedSlot::new(next_read)));
+            next_read += 1;
+        } else {
+            slots.push(None);
+        }
+    }
+    let mut live = slots.iter().filter(|s| s.is_some()).count();
+    while live > 0 {
+        for slot_opt in slots.iter_mut() {
+            let Some(slot) = slot_opt.as_mut() else {
+                continue;
+            };
+            slot.step(fm, reads[slot.ridx], max_intv, min_seed_len, &counts);
+            if slot.phase == BwtPhase::Done {
+                out[slot.ridx].append(&mut slot.out);
+                if next_read < reads.len() {
+                    slot.reset(next_read);
+                    next_read += 1;
+                } else {
+                    *slot_opt = None;
+                    live -= 1;
+                }
+            }
+        }
+    }
+}
+
 /// Collect SMEMs across bwa-mem2's three rounds (`mem_collect_smem`): round-1 all-position SMEMs,
 /// round-2 re-seeding of long non-repetitive SMEMs from their midpoint, and round-3 interval-capped
 /// forward seeding. This is the full seed set feeding chaining.
@@ -492,8 +659,15 @@ pub fn mem_collect_smem(fm: &FmIndex, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
 /// forward seeding) run per read. Returns, for every read, exactly what [`mem_collect_smem`] would.
 pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> Vec<Vec<Smem>> {
     let mut per_read = collect_smems_batched(fm, reads, opt.min_seed_len, 1);
+    // Round 2 stays per-read (only a few long non-repetitive SMEMs re-seed), but round 3 (the
+    // universal per-position forward seeding) runs in lockstep across the batch so its `cp_occ`
+    // loads overlap — the same latency-hiding trick as round 1. Order per read is preserved
+    // (round 1, then round 2, then round 3), so this is byte-identical to the per-read path.
     for (r, codes) in reads.iter().enumerate() {
-        smem_rounds_2_3(fm, codes, opt, &mut per_read[r]);
+        smem_round_2(fm, codes, opt, &mut per_read[r]);
+    }
+    if opt.max_mem_intv > 0 {
+        bwt_seed_strategy_batched(fm, reads, opt.max_mem_intv, opt.min_seed_len + 1, &mut per_read);
     }
     per_read
 }
@@ -502,10 +676,17 @@ pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> 
 /// seeding), appended to the round-1 `smems` in place. Shared by the per-read and batched entry
 /// points so they stay identical.
 fn smem_rounds_2_3(fm: &FmIndex, codes: &[u8], opt: &MemOpt, smems: &mut Vec<Smem>) {
+    smem_round_2(fm, codes, opt, smems);
+    // Round 3.
+    if opt.max_mem_intv > 0 {
+        bwt_seed_strategy(fm, codes, opt.max_mem_intv, opt.min_seed_len + 1, smems);
+    }
+}
+
+/// Round 2: re-seed each long, non-repetitive round-1 SMEM from its midpoint (appends in place).
+fn smem_round_2(fm: &FmIndex, codes: &[u8], opt: &MemOpt, smems: &mut Vec<Smem>) {
     let split_len = (opt.min_seed_len as f32 * opt.split_factor + 0.499) as i32;
     let num1 = smems.len();
-
-    // Round 2: re-seed each long, non-repetitive round-1 SMEM from its midpoint.
     let mut scratch: Vec<Smem> = vec![Smem::default(); codes.len() + 2];
     for idx in 0..num1 {
         let p = smems[idx];
@@ -516,11 +697,6 @@ fn smem_rounds_2_3(fm: &FmIndex, codes: &[u8], opt: &MemOpt, smems: &mut Vec<Sme
         }
         let x = ((end + start) >> 1) as usize;
         smems_from_pos(fm, codes, x, opt.min_seed_len, p.s + 1, &mut scratch, smems);
-    }
-
-    // Round 3.
-    if opt.max_mem_intv > 0 {
-        bwt_seed_strategy(fm, codes, opt.max_mem_intv, opt.min_seed_len + 1, smems);
     }
 }
 
