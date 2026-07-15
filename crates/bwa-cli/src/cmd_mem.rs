@@ -52,6 +52,15 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         .unwrap_or(opt.chunk_size * i64::from(args.threads))
         .max(1) as usize;
 
+    // Detect the CPU and choose the seeding engine. The learned index (BWA-MEME) is only worthwhile
+    // on x86-64 and only when its P-RMI/suffix-array files are present; AArch64 always uses the FM
+    // index (measured ~5x faster there). No learned index is built yet, so this is FM everywhere for
+    // now — the detection is the routing hook for the x86 learned path.
+    let learned_index_available = false;
+    let seed_engine = bwa_core::recommended_seed_engine(learned_index_available);
+    eprintln!("[bwa-mem3] {}", bwa_core::arch::summary(learned_index_available));
+    let _ = seed_engine; // routing consumes this once the learned seeder is wired in
+
     let fm = FmIndex::load(&args.index_prefix)?;
     let bns = BntSeq::load(&args.index_prefix)?;
     let sqs: Vec<SqRecord> = bns
