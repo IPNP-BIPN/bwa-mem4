@@ -339,7 +339,10 @@ pub struct KswAlignResult {
 /// suboptimal (`b`-array) tracking (`KSW_XSUBO`); `endsc` stops early once a column max reaches it
 /// (`KSW_XSTOP`, use `i32::MAX` to disable). `max_sc` is the maximum single-cell match score.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn ksw_local_fwd(
+/// Forward local-SW pass returning `(score, te, qe, score2, te2)` (no start coords). This is the
+/// per-lane semantics a batched/vectorized mate-rescue kernel must reproduce: [`ksw_align2`] is just
+/// this forward pass plus a second, reversed forward pass to recover `qb`/`tb` (`KSW_XSTART`).
+pub fn ksw_local_fwd(
     query: &[u8],
     target: &[u8],
     m: usize,

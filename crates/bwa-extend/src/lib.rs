@@ -5,7 +5,7 @@
 
 pub mod sw;
 
-pub use sw::{ksw_align2, ksw_extend2, ksw_global2, ExtendResult, KswAlignResult};
+pub use sw::{ksw_align2, ksw_extend2, ksw_global2, ksw_local_fwd, ExtendResult, KswAlignResult};
 
 /// A banded Smith-Waterman seed-extension backend.
 ///
