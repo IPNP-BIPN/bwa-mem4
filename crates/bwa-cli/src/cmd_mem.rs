@@ -13,8 +13,9 @@ use bwa_core::{dna, MemOpt};
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
-    align_reads_batched, alt::mem_gen_alt, cigar_string, mem_approx_mapq_se, mem_mark_primary_se,
-    mem_pestat, mem_sam_pe, mem_sort_dedup_patch, reg2aln, MemAlnReg,
+    align_reads_batched, alt::mem_gen_alt, batch_mate_rescue, cigar_string, mem_approx_mapq_se,
+    mem_mark_primary_se, mem_pestat, mem_sam_pe, mem_sort_dedup_patch, reg2aln, MemAlnReg,
+    PairRescueData,
 };
 use bwa_neon::NeonBackend;
 
@@ -473,6 +474,23 @@ fn run_pe(
             .collect();
         let pes = mem_pestat(opt, bns.l_pac, &regs_ref);
 
+        // Mate rescue, batched across the whole pair batch so the per-anchor insert-window SW fills
+        // the SIMD lanes. Byte-identical to the per-pair rescue in `mem_sam_pe` (which is then told to
+        // skip it). `BWA3_SCALAR_RESCUE` keeps the per-pair path for A/B verification.
+        let scalar_rescue = std::env::var_os("BWA3_SCALAR_RESCUE").is_some();
+        if !scalar_rescue {
+            let mut rd: Vec<PairRescueData> = prepared
+                .iter_mut()
+                .map(|p| PairRescueData {
+                    seq0: p.c1.as_slice(),
+                    seq1: p.c2.as_slice(),
+                    a0: &mut p.a1,
+                    a1: &mut p.a2,
+                })
+                .collect();
+            batch_mate_rescue(fm, bns, opt, &pes, &mut rd);
+        }
+
         // Emit paired SAM in parallel (each pair owns its regions; global pair id fixes hashes).
         let bufs: Vec<Vec<u8>> = prepared
             .par_iter_mut()
@@ -493,6 +511,7 @@ fn run_pe(
                     &quals,
                     &mut p.a1,
                     &mut p.a2,
+                    !scalar_rescue,
                     &mut buf,
                 )
                 .expect("write to Vec");

@@ -16,7 +16,7 @@ pub mod pe;
 pub mod primary;
 pub use across::align_reads_batched;
 pub use cigar::{cigar_string, reg2aln, MemAln};
-pub use pe::{mem_pestat, mem_sam_pe, PeStat};
+pub use pe::{batch_mate_rescue, mem_pestat, mem_sam_pe, PairRescueData, PeStat};
 pub use primary::{mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch};
 
 /// Sentinel for uninitialized region bounds (bwa's `H0_`).
