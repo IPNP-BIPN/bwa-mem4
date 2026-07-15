@@ -137,6 +137,23 @@ impl LearnedSa {
         }
     }
 
+    /// Build from a **prebuilt** suffix array (skipping SAIS): `sa` must be
+    /// `suffix_array_with_sentinel(&ref_seq)` — e.g. extracted from an existing FM-index via
+    /// `FmIndex::get_sa` for every row, which is byte-identical to running SAIS but far cheaper on a
+    /// genome-scale reference and guarantees `sa[i] == fm.get_sa(i)`. Computes the first-`K` keys and
+    /// trains the RMI over them.
+    pub fn from_sa(ref_seq: Vec<u8>, sa: Vec<i64>, n_leaves: usize) -> Self {
+        debug_assert_eq!(sa.len(), ref_seq.len() + 1, "sa must include the sentinel row");
+        let keys: Vec<u64> = sa.iter().map(|&p| kmer_key(&ref_seq, p)).collect();
+        let rmi = Rmi::build(&keys, n_leaves);
+        LearnedSa {
+            ref_seq,
+            sa,
+            keys,
+            rmi,
+        }
+    }
+
     /// Number of suffix-array rows (including the sentinel row).
     pub fn len(&self) -> usize {
         self.sa.len()

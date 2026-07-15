@@ -19,46 +19,30 @@ struct LinearModel {
 }
 
 impl LinearModel {
-    /// Least-squares fit of `(keys[i] as f64, targets[i] as f64)`. Falls back to a flat model (slope
-    /// 0, intercept = mean target) when the keys are degenerate (all equal / single point), which
-    /// keeps prediction finite and the error bound correct.
-    fn fit(keys: &[u64], targets: &[f64]) -> Self {
-        let n = keys.len();
+
+    /// Least-squares fit from precomputed sums over points `(x_i - x0, y_i)`: `n` points, `sx=Σx`,
+    /// `sy=Σy`, `sxx=Σx²`, `sxy=Σxy`, with `x0` the origin folded back in. Bit-identical to [`fit`]
+    /// (which computes these very sums), but lets the caller stream the points without materializing
+    /// per-leaf key/target arrays — essential at genome scale.
+    fn from_sums(n: usize, sx: f64, sy: f64, sxx: f64, sxy: f64, x0: f64) -> Self {
         if n == 0 {
             return LinearModel::default();
         }
-        let mean_target = targets.iter().sum::<f64>() / n as f64;
         if n == 1 {
             return LinearModel {
                 slope: 0.0,
-                intercept: mean_target,
+                intercept: sy, // single target == its own mean
             };
-        }
-        // Use the min key as the origin to keep the sums well-conditioned on genome-scale keys.
-        let x0 = keys[0] as f64;
-        let mut sx = 0.0;
-        let mut sy = 0.0;
-        let mut sxx = 0.0;
-        let mut sxy = 0.0;
-        for (i, &k) in keys.iter().enumerate() {
-            let x = k as f64 - x0;
-            let y = targets[i];
-            sx += x;
-            sy += y;
-            sxx += x * x;
-            sxy += x * y;
         }
         let nf = n as f64;
         let denom = nf * sxx - sx * sx;
         if denom.abs() < f64::EPSILON {
             return LinearModel {
                 slope: 0.0,
-                intercept: mean_target,
+                intercept: sy / nf,
             };
         }
         let slope = (nf * sxy - sx * sy) / denom;
-        // intercept is relative to x0; fold x0 back in: pos = slope*(key - x0) + b  =>
-        // pos = slope*key + (b - slope*x0).
         let b = (sy - slope * sx) / nf;
         LinearModel {
             slope,
@@ -101,29 +85,48 @@ impl Rmi {
         debug_assert!(keys.windows(2).all(|w| w[0] <= w[1]), "keys must be sorted");
         let n_leaves = n_leaves.clamp(1, n);
 
-        // Root model maps key -> leaf index. Train it on (key_i -> leaf target), where the target
-        // leaf is the position scaled into [0, n_leaves): leaf_target = i * n_leaves / n.
-        let root_targets: Vec<f64> = (0..n)
-            .map(|i| (i as f64) * (n_leaves as f64) / (n as f64))
-            .collect();
-        let root = LinearModel::fit(keys, &root_targets);
+        // Root model maps key -> leaf index, trained on (key_i -> leaf_target = i * n_leaves / n).
+        // Accumulate the least-squares sums directly (no n-length target array) with x0 = keys[0].
+        let x0r = keys[0] as f64;
+        let (mut sx, mut sy, mut sxx, mut sxy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let scale = n_leaves as f64 / n as f64;
+        for (i, &k) in keys.iter().enumerate() {
+            let x = k as f64 - x0r;
+            let y = i as f64 * scale;
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
+        }
+        let root = LinearModel::from_sums(n, sx, sy, sxx, sxy, x0r);
 
-        // Assign each key to a leaf via the (clamped) root prediction, then fit each leaf on the
-        // absolute positions of the keys routed to it.
         let leaf_of = |key: u64| -> usize {
             let p = root.predict(key);
             (p.max(0.0) as usize).min(n_leaves - 1)
         };
-        let mut leaf_keys: Vec<Vec<u64>> = vec![Vec::new(); n_leaves];
-        let mut leaf_pos: Vec<Vec<f64>> = vec![Vec::new(); n_leaves];
-        for (i, &k) in keys.iter().enumerate() {
-            let li = leaf_of(k);
-            leaf_keys[li].push(k);
-            leaf_pos[li].push(i as f64);
-        }
-        let mut leaves = Vec::with_capacity(n_leaves);
-        for li in 0..n_leaves {
-            leaves.push(LinearModel::fit(&leaf_keys[li], &leaf_pos[li]));
+
+        // Fit each leaf on the absolute positions of the keys routed to it. `leaf_of` is monotonic
+        // non-decreasing in the (sorted) key (the root slope is non-negative for position-vs-key), so
+        // the keys of each leaf form one contiguous run — we stream the sums per run instead of
+        // bucketing every key. Result-identical to fitting `leaf_pos[li]` explicitly.
+        let mut leaves = vec![LinearModel::default(); n_leaves];
+        let mut i = 0usize;
+        while i < n {
+            let li = leaf_of(keys[i]);
+            let x0 = keys[i] as f64;
+            let (mut lsx, mut lsy, mut lsxx, mut lsxy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let mut j = i;
+            while j < n && leaf_of(keys[j]) == li {
+                let x = keys[j] as f64 - x0;
+                let y = j as f64;
+                lsx += x;
+                lsy += y;
+                lsxx += x * x;
+                lsxy += x * y;
+                j += 1;
+            }
+            leaves[li] = LinearModel::from_sums(j - i, lsx, lsy, lsxx, lsxy, x0);
+            i = j;
         }
 
         // Per-leaf error bound: the max over the leaf's keys of |round(predict) - actual position|.

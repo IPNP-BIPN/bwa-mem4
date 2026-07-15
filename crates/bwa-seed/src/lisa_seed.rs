@@ -41,25 +41,29 @@ fn smems_from_pos_lsa(
     out: &mut Vec<Smem>,
 ) -> usize {
     let readlength = codes.len();
+    let n_sa = lsa.len();
     let mut next_x = x + 1;
     let a = codes[x];
     if a >= 4 {
         return next_x;
     }
 
-    // Initial single-base interval, span [x, x].
-    let (k0, s0) = interval_of(lsa, codes, x, x);
+    // Initial single-base interval, span [x, x]. Appending a base always nests within the current
+    // interval, so the whole forward extension is a sequence of `narrow` calls (each two partition
+    // points over the shrinking interval) instead of a from-scratch search per step — identical
+    // result (`narrow` is proven to reproduce `exact_interval` for every prefix length).
+    let (mut lo, mut hi) = lsa.narrow(0, n_sa, 0, a);
     let mut smem = Smem {
         rid: 0,
         m: x as u32,
         n: x as u32,
-        k: k0,
+        k: lo as i64,
         l: 0,
-        s: s0,
+        s: (hi - lo) as i64,
     };
     let mut num_prev = 0usize;
 
-    // Forward extension: span [x, j], j increasing.
+    // Forward extension: span [x, j], j increasing (append codes[j] at column j-x).
     let mut j = x + 1;
     while j < readlength {
         let aj = codes[j];
@@ -67,14 +71,14 @@ fn smems_from_pos_lsa(
         if aj >= 4 {
             break;
         }
-        let (k, s) = interval_of(lsa, codes, x, j);
+        let (nlo, nhi) = lsa.narrow(lo, hi, j - x, aj);
         let new_smem = Smem {
             rid: 0,
             m: x as u32,
             n: j as u32,
-            k,
+            k: nlo as i64,
             l: 0,
-            s,
+            s: (nhi - nlo) as i64,
         };
 
         prev[num_prev] = smem;
@@ -86,6 +90,8 @@ fn smems_from_pos_lsa(
             break;
         }
         smem = new_smem;
+        lo = nlo;
+        hi = nhi;
         j += 1;
     }
     if smem.s >= min_intv {
@@ -191,12 +197,13 @@ fn bwt_seed_strategy_lsa(
     out: &mut Vec<Smem>,
 ) {
     let readlength = codes.len();
+    let n_sa = lsa.len();
     let mut x = 0usize;
     while x < readlength {
         let mut next_x = x + 1;
         if codes[x] < 4 {
-            // The FM path carries a single-base interval that `backward_ext` reads to extend; the
-            // span lookup recomputes each interval from scratch, so no starting interval is needed.
+            // Forward-only: fully incremental narrowing (append codes[j] at column j-x).
+            let (mut lo, mut hi) = lsa.narrow(0, n_sa, 0, codes[x]);
             let mut j = x + 1;
             while j < readlength {
                 next_x = j + 1;
@@ -204,12 +211,13 @@ fn bwt_seed_strategy_lsa(
                 if aj >= 4 {
                     break;
                 }
-                let (k, s) = interval_of(lsa, codes, x, j);
+                let (nlo, nhi) = lsa.narrow(lo, hi, j - x, aj);
+                let s = (nhi - nlo) as i64;
                 let smem = Smem {
                     rid: 0,
                     m: x as u32,
                     n: j as u32,
-                    k,
+                    k: nlo as i64,
                     l: 0,
                     s,
                 };
@@ -221,6 +229,8 @@ fn bwt_seed_strategy_lsa(
                     }
                     break;
                 }
+                lo = nlo;
+                hi = nhi;
                 j += 1;
             }
         }
