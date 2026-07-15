@@ -3,8 +3,8 @@
 //! Phase 6: seed -> chain -> extend -> best region -> `reg2aln` (exact CIGAR + NM/MD). MAPQ and
 //! secondary/XA handling follow.
 
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use rayon::prelude::*;
@@ -32,10 +32,79 @@ pub struct MemArgs {
     pub reads: PathBuf,
     /// Optional mate reads (R2): triggers paired-end mode.
     pub reads2: Option<PathBuf>,
+    /// Write SAM to PATH instead of stdout. A `.gz`/`.bgz` suffix selects BGZF (block-gzip) output,
+    /// compressed in parallel on `-t` worker threads (readable by samtools/bgzip/tabix).
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
     /// Route seed extension through the Metal GPU backend (macOS only; opt-in, byte-identical to the
     /// CPU path). Ignored on other platforms.
     #[arg(long)]
     pub gpu: bool,
+}
+
+/// The SAM output sink: plain (stdout or an uncompressed file) or parallel BGZF (block-gzip). Both
+/// expose `std::io::Write` so the formatting/writing paths stay generic; `finish` drains the BGZF
+/// worker pool and writes the EOF marker (surfacing errors the `Drop` path would swallow).
+enum Output {
+    Plain(Box<dyn Write>),
+    Bgzf(Box<bgzf::MultithreadedWriter<Box<dyn Write + Send>>>),
+}
+
+impl Write for Output {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Output::Plain(w) => w.write(buf),
+            Output::Bgzf(w) => w.write(buf),
+        }
+    }
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Output::Plain(w) => w.flush(),
+            Output::Bgzf(w) => w.flush(),
+        }
+    }
+}
+
+impl Output {
+    /// Open the output sink. `None` writes uncompressed SAM to stdout; a path with a `.gz`/`.bgz`
+    /// suffix writes BGZF compressed in parallel on `threads` workers; any other path writes an
+    /// uncompressed file.
+    fn open(path: Option<&Path>, threads: usize) -> anyhow::Result<Self> {
+        match path {
+            None => Ok(Output::Plain(Box::new(BufWriter::new(std::io::stdout())))),
+            Some(p) => {
+                let bgzf = p
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("gz") || e.eq_ignore_ascii_case("bgz"));
+                let file = std::fs::File::create(p)?;
+                if bgzf {
+                    let sink: Box<dyn Write + Send> = Box::new(BufWriter::new(file));
+                    let level = bgzf::CompressionLevel::new(6)
+                        .map_err(|e| anyhow::anyhow!("bgzf compression level: {e}"))?;
+                    let workers = std::num::NonZero::new(threads.max(1))
+                        .unwrap_or(std::num::NonZero::<usize>::MIN);
+                    Ok(Output::Bgzf(Box::new(
+                        bgzf::MultithreadedWriter::with_worker_count(workers, sink, level),
+                    )))
+                } else {
+                    Ok(Output::Plain(Box::new(BufWriter::new(file))))
+                }
+            }
+        }
+    }
+
+    /// Flush and finalize (BGZF: drain workers + write the EOF marker). Consumes the sink.
+    fn finish(self) -> anyhow::Result<()> {
+        match self {
+            Output::Plain(mut w) => w.flush()?,
+            Output::Bgzf(mut w) => {
+                w.finish()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
@@ -63,8 +132,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         })
         .collect();
 
-    let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    let mut out = Output::open(args.output.as_deref(), n_threads)?;
     let cl = argv.join(" ");
     sam::write_header(
         &mut out,
@@ -79,7 +147,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
 
     if let Some(reads2) = args.reads2.clone() {
         run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, &mut out)?;
-        out.flush()?;
+        out.finish()?;
         return Ok(());
     }
 
@@ -119,7 +187,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         }
         base_id += batch.len() as u64;
     }
-    out.flush()?;
+    out.finish()?;
     Ok(())
 }
 
