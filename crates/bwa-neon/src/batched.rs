@@ -109,34 +109,79 @@ fn cell_bound(j: &ExtendJob, max_sc: i32) -> i32 {
     j.h0 + (j.query.len().min(j.target.len()) as i32) * max_sc.max(0)
 }
 
-/// Ungapped diagonal fast path (nh13's `ungapped_analyze` HIT case, `bwamem.cpp`): when the whole
-/// query matches the target on the diagonal with **no** mismatch and no ambiguous base (and the
-/// target is at least as long, `h0 > 0`), the banded Smith-Waterman result is the closed form
-/// `score = gscore = h0 + n*a`, `qle = tle = gtle = n`, `max_off = 0` — so the DP is skipped
-/// entirely. Returns `None` (fall through to the kernel) for any mismatch/ambiguous/short-target
-/// case. This is byte-identical to [`bwa_extend::ksw_extend2`] for the jobs it accepts (gated by the
-/// property test), matching bwa-mem2's own output. `a` is the match score (`mat[0]`).
+/// Ungapped diagonal fast path — nh13's `ungapped_analyze` HIT case (`bwamem.cpp`). When the
+/// diagonal extension has **at most `x_threshold` mismatches** and no ambiguous base (target at least
+/// as long, `h0 > 0`), no gapped alignment can beat it, so the banded SW result equals the ungapped
+/// walk and the DP is skipped. `x_threshold = o_min / (a + b − e_min)` (default bwa params → 1), the
+/// number of mismatches below which a gap costs more than it saves.
+///
+/// - `total_mis == 0` → closed form `score = gscore = h0 + n*a`, `qle = tle = gtle = n`.
+/// - `0 < total_mis <= x_threshold` → the scalar local-SW walk (`cur` floored at 0; `>=` tie-break =
+///   rightmost argmax, mirroring `MAIN_CODE`'s `maxRS` tracker) gives `score=max_sc`, `qle=tle=max_i`,
+///   `gtle=n`, `gscore=cur`. `max_off = 0` (on-diagonal).
+/// - ambiguous base, or `total_mis > x_threshold` → `None`: fall through to banded SW at `w0`, which
+///   contains the same optimum as nh13's tightened band, so byte-identical (just wider DP).
+///
+/// Byte-identical to [`bwa_extend::ksw_extend2`] for accepted jobs; gated end-to-end by `oracle_diff`.
+/// `a` = match score (`mat[0]`), `b` = mismatch magnitude (`-mat[1]`).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
-fn ungapped_hit(j: &ExtendJob, a: i32) -> Option<ExtendResult> {
+fn ungapped_hit(j: &ExtendJob, a: i32, b: i32, x_threshold: i32) -> Option<ExtendResult> {
     let n = j.query.len();
-    if n == 0 || j.h0 <= 0 || j.target.len() < n {
+    if n == 0 || j.h0 <= 0 || j.target.len() < n || x_threshold < 0 {
         return None;
     }
+    // One pass: count mismatches, bail on ambiguous base or once mismatches exceed the HIT bound.
+    let mut total_mis = 0i32;
     for k in 0..n {
         // SAFETY of indexing: target.len() >= n checked above.
         let (q, t) = (j.query[k], j.target[k]);
-        if q >= 4 || t >= 4 || q != t {
-            return None;
+        if q >= 4 || t >= 4 {
+            return None; // ambiguous → FALLBACK (SW handles it)
+        }
+        if q != t {
+            total_mis += 1;
+            if total_mis > x_threshold {
+                return None; // not a provable HIT → banded SW (w0 ⊇ tight band)
+            }
         }
     }
-    let score = j.h0 + n as i32 * a;
+    if total_mis == 0 {
+        let score = j.h0 + n as i32 * a;
+        return Some(ExtendResult {
+            score,
+            qle: n as i32,
+            tle: n as i32,
+            gtle: n as i32,
+            gscore: score,
+            max_off: 0,
+        });
+    }
+    // Mismatch-tolerant HIT: local-SW walk along the diagonal (no gap can improve it here).
+    let (mut cur, mut max_sc, mut max_i) = (j.h0, j.h0, 0i32);
+    for k in 0..n {
+        if cur == 0 {
+            continue;
+        }
+        if j.query[k] == j.target[k] {
+            cur += a;
+        } else {
+            cur -= b;
+            if cur < 0 {
+                cur = 0;
+            }
+        }
+        if cur >= max_sc {
+            max_sc = cur;
+            max_i = k as i32 + 1;
+        }
+    }
     Some(ExtendResult {
-        score,
-        qle: n as i32,
-        tle: n as i32,
+        score: max_sc,
+        qle: max_i,
+        tle: max_i,
         gtle: n as i32,
-        gscore: score,
+        gscore: cur,
         max_off: 0,
     })
 }
@@ -168,14 +213,20 @@ fn simd_dispatch(
     }
 
     let a = mat[0] as i32; // match score for the uniform matrix
+    let b = -(mat[1] as i32); // mismatch magnitude (mat[1] < 0)
+    // nh13's ungapped fast-path threshold: mismatches below which no gap can beat the diagonal.
+    let o_min = o_del.min(o_ins);
+    let e_min = e_del.min(e_ins);
+    let denom = a + b - e_min;
+    let x_threshold = if denom > 0 { o_min / denom } else { -1 };
 
-    // Ungapped diagonal HIT fast path: a perfect-diagonal extension gets its result in closed form,
-    // skipping banded SW. Common on clean reads, so this removes a large slice of DP work while
-    // staying byte-identical (see `ungapped_hit`). Non-HIT jobs fall through to the kernel binning.
+    // Ungapped diagonal HIT fast path: a diagonal extension with <= x_threshold mismatches is
+    // provably banded-SW-optimal, so its result is closed-form / a scalar walk, skipping the DP.
+    // Common on clean reads, removing a large slice of DP work byte-identically (see `ungapped_hit`).
     let mut out = vec![default_result(); jobs.len()];
     let mut rest: Vec<usize> = Vec::new();
     for (k, j) in jobs.iter().enumerate() {
-        match ungapped_hit(j, a) {
+        match ungapped_hit(j, a, b, x_threshold) {
             Some(r) => out[k] = r,
             None => rest.push(k),
         }
