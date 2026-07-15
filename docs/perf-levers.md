@@ -53,12 +53,45 @@ diagonal in ~1–2 rows, so a tighter *start* saves almost nothing, and splittin
 groups (tight + fallback) **fragments the SIMD batches** (worse lane fill), cancelling it. Reverted —
 correct but not worth the complexity on this workload (may help on higher-error real data).
 
-## Cumulative (this session, main baseline → LEVER 3a, code only, no PGO)
+## FINAL — cumulative, load-consistent (main baseline vs PGO+scratch+HIT, back-to-back)
 
-SE 7.96 → 5.99s = **1.33x**; PE 16.19 → 12.57s = **1.29x**. PGO stacks (~+3–4.5%) on top.
-Starting from the ~2.2x-vs-bwa-mem2 reference point, this puts the cumulative near **~2.9x** — i.e.
-already at/above the ~2.65x fork target on this workload (relative gains are the solid result; the
-absolute vs-oracle ratio is machine/setup-dependent).
+Both binaries benched head-to-head under identical machine load (removes cross-time drift):
+
+| | main baseline | final (PGO+scratch+HIT) | cumulative |
+|---|---:|---:|---:|
+| SE wall (méd/5) | 7.75s | **5.95s** | **1.30x** (+30%) |
+| PE wall (méd/3) | 15.97s | **12.64s** | **1.26x** (+26%) |
+| peak RSS | 1747/2413 MB | 1668/2299 MB | lower |
+
+**Parity: byte-identical** (SE 5000/5000, PE 10000/10000 all_fields_match vs bwa-mem2 2.3).
+
+## LEVER 4 (difference recurrence) — STOP by analysis, grounded in this session's measurements
+
+The diff-recurrence's two benefits are **already realized** in our kernel, so it cannot beat it:
+1. *Shorter critical path* — our carried chain is already **2 ops** (the min for a serial affine-gap
+   max-plus scan) after the byte-identical chain-shortening on `main`.
+2. *int8 via bounded differences* — our hot kernel is **already u8** (16 lanes).
+
+And the binding constraint is **latency, not throughput** (measured: breaking the `f`-chain → 1.55x;
+a 2nd stream to hide it → register spill, ILP experiment = parity/102 spills). The diff-recurrence cuts
+*total ops* (throughput), which is free-but-useless on a latency-bound kernel — it neither shortens the
+2-op chain nor frees registers for a 2nd stream. The "~2.1x reported elsewhere" is versus a naive
+kernel with neither optimization. Full anti-diagonal SIMD port would also mis-fit short reads (short
+anti-diagonals → poor lane fill) and risks 6-field byte-identity. Not pursued.
+
+## Per-lever summary
+
+| Lever | Parity | Isolated gain | Note |
+|-------|:------:|---------------|------|
+| 1. PGO | ✅/✅ | SE +3–6%, PE +4.5% | build process, reproducible (`scripts/pgo.sh`) |
+| 2. nh13 last-mile | ✅/✅ | scratch reuse +1% | 4 items no-op here (kswv/P-core/128B/L2), measured |
+| 3a. mismatch-tolerant HIT | ✅/✅ | **SE +24%, PE +21%** | the unlock; 57% of jobs skip DP |
+| 3b. TIGHT band | ✅/✅ | ~0% | byte-identical but adaptive band + fragmentation → reverted |
+| 4. diff-recurrence | — | — | STOP by analysis (benefits already realized) |
+
+**Cumulative ~1.30x SE / 1.26x PE over the baseline, byte-identical.** Applied to the ~2.2x-vs-bwa-mem2
+reference → **~2.8–2.9x**, at/above the ~2.65x fork target. Direct oracle measurement on this host
+gives ours ≈ **2.9–3.0x** bwa-mem2 2.3 (SE ~23.3s, PE ~48s vs our 5.95/12.64s).
 
 **PGO notes:** below the ~10–15% estimate because ~85% of runtime is hand-written branchless NEON
 that PGO cannot improve; the gain comes from the branchy driver/seeding/SAM path. Reproducible via
