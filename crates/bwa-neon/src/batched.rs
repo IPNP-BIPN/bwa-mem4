@@ -714,7 +714,10 @@ macro_rules! define_sw_kernel {
                         let bigm_pre = $sub($add(m_v, sbt_pos), sbt_neg);
                         let bigm_v = $bsl($ceqz(m_v), zero_v, bigm_pre);
 
-                        let h_v = $max($max(bigm_v, e_v), f_v);
+                        // A = max(M, E) is independent of the loop-carried f; splitting it out lets
+                        // the f-recurrence below skip the f→h→f dependency (see the `f` update).
+                        let a_v = $max(bigm_v, e_v);
+                        let h_v = $max(a_v, f_v);
                         h1_v = $bsl(band, h_v, h1_v);
 
                         // if row_max <= h { mj = j; row_max = h } (ties take larger j)
@@ -727,9 +730,15 @@ macro_rules! define_sw_kernel {
                         let e_new = $max($sub(e_v, e_del_v), t1);
                         $sts(eh_e.as_mut_ptr().add(jrow), $bsl(band, e_new, e_v));
 
-                        // f = max(f - e_ins, max(h - oe_ins, 0)) in-band
-                        let t2 = $max($sub(h_v, oe_ins_v), zero_v);
-                        let f_new = $max($sub(f_v, e_ins_v), t2);
+                        // f = max(f - e_ins, max(h - oe_ins, 0)), reformulated to shorten the
+                        // loop-carried critical path. Since h = max(A, f) with A = max(M,E) independent
+                        // of the carried f, and oe_ins >= e_ins makes the (f - oe_ins) term dominated by
+                        // (f - e_ins), the recurrence is exactly f_new = max(f - e_ins, max(A - oe_ins, 0)).
+                        // The C = max(A - oe_ins, 0) term is off the carried path, so the carried chain is
+                        // just sub+max (~2 ops) instead of f→h→f (~4). Byte-identical (proven under both
+                        // u8-saturating and i16-signed arithmetic); gated by avx2_verify / neon_verify.
+                        let c_v = $max($sub(a_v, oe_ins_v), zero_v);
+                        let f_new = $max($sub(f_v, e_ins_v), c_v);
                         f_v = $bsl(band, f_new, f_v);
                     }
 
