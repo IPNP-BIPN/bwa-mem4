@@ -27,6 +27,9 @@
 use bwa_extend::{ksw_extend2, ExtendJob, ExtendResult, SwBackend};
 
 mod batched;
+mod matesw;
+
+pub use matesw::{batched_ksw_align2, KswJob};
 
 /// The NEON seed-extension backend. See the module docs: it delegates to the scalar kernel today
 /// and is the drop-in point for the lane-parallel NEON DP (phase 9a).
