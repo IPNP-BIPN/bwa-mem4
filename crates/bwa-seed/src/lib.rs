@@ -10,6 +10,8 @@
 use bwa_core::MemOpt;
 use bwa_index::{FmIndex, Smem};
 
+pub mod lisa_seed;
+
 /// A seed: an exact match between the read and the reference (bwa-mem2's `mem_seed_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemSeed {

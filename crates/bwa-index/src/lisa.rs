@@ -142,6 +142,14 @@ impl LearnedSa {
         self.sa.len()
     }
 
+    /// The suffix-array values (reference positions in the `[fwd][rc]` space), row-indexed. `sa[row]`
+    /// equals `FmIndex::get_sa(row)` over the same reference (both are the suffix array with sentinel),
+    /// so seeds materialized as `sa[k + i]` are byte-identical to the FM path.
+    #[inline]
+    pub fn sa(&self) -> &[i64] {
+        &self.sa
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ref_seq.is_empty()
     }
