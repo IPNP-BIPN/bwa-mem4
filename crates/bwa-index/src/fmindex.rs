@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use bwa_core::Result;
+use memmap2::Mmap;
 
 /// A bidirectional FM-index interval, mirroring bwa-mem2's `SMEM`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,8 +47,9 @@ pub struct FmIndex {
     sa_ls_word: Vec<u32>,
     sentinel_index: i64,
     one_hot_mask: [u64; 64],
-    /// The `.0123` reference: forward then reverse-complement, one byte/base (2L bytes).
-    reference: Vec<u8>,
+    /// The `.0123` reference (forward++reverse-complement, one byte/base, 2L bytes), memory-mapped:
+    /// the 6.2 GB file is not copied into RAM at load, and its pages are shared via the OS page cache.
+    reference: Mmap,
 }
 
 fn sibling(prefix: &Path, ext: &str) -> PathBuf {
@@ -76,44 +78,60 @@ fn rd_u32(d: &[u8], p: &mut usize) -> u32 {
 impl FmIndex {
     /// Load `<prefix>.bwt.2bit.64` and `<prefix>.0123`.
     pub fn load(prefix: &Path) -> Result<Self> {
-        let d = std::fs::read(sibling(prefix, "bwt.2bit.64"))?;
+        // Memory-map the BWT and bulk-copy each array out in one memcpy: the `cp_occ` blocks need
+        // 64-byte alignment the file doesn't provide, so they can't be borrowed in place, but the
+        // copy is a single `memcpy` (from page-cached pages) instead of ~800M element-wise reads.
+        let bwt_file = std::fs::File::open(sibling(prefix, "bwt.2bit.64"))?;
+        // SAFETY: index files are not mutated while a run holds them open (same as bwa-mem2's mmap).
+        let mm = unsafe { Mmap::map(&bwt_file)? };
+        let d: &[u8] = &mm;
         let mut p = 0usize;
-        let ref_seq_len = rd_i64(&d, &mut p);
+        let ref_seq_len = rd_i64(d, &mut p);
         let mut count = [0i64; 5];
         for c in &mut count {
-            *c = rd_i64(&d, &mut p);
+            *c = rd_i64(d, &mut p);
         }
         for c in &mut count {
             *c += 1; // as load_index does
         }
+        // On-disk layout after the header: `cp_occ[cp_size]`, `sa_ms_byte[sa_size]` (i8),
+        // `sa_ls_word[sa_size]` (u32 LE), `sentinel_index` (i64). All little-endian, matching the
+        // in-memory representation on this (LE) target, so each block is one bulk copy.
         let cp_size = ((ref_seq_len >> 6) + 1) as usize;
-        let mut cp_occ = Vec::with_capacity(cp_size);
-        for _ in 0..cp_size {
-            let cp_count = [
-                rd_i64(&d, &mut p),
-                rd_i64(&d, &mut p),
-                rd_i64(&d, &mut p),
-                rd_i64(&d, &mut p),
-            ];
-            let one_hot = [
-                rd_u64(&d, &mut p),
-                rd_u64(&d, &mut p),
-                rd_u64(&d, &mut p),
-                rd_u64(&d, &mut p),
-            ];
-            cp_occ.push(CpOcc { cp_count, one_hot });
-        }
         let sa_size = ((ref_seq_len >> 3) + 1) as usize;
-        let mut sa_ms_byte = Vec::with_capacity(sa_size);
-        for _ in 0..sa_size {
-            sa_ms_byte.push(d[p] as i8);
-            p += 1;
+
+        // SAFETY of the three copies below: each source range is in-bounds in the mapped file (its
+        // length is exactly `header + cp_size*64 + sa_size*(1+4) + 8`), the destination `Vec` is
+        // freshly allocated with matching capacity, `CpOcc`/`i8`/`u32` are all plain-old-data with no
+        // padding-sensitive invariants, and `set_len` is reached only after the bytes are written.
+        let mut cp_occ = Vec::<CpOcc>::with_capacity(cp_size);
+        let cp_bytes = cp_size * std::mem::size_of::<CpOcc>();
+        unsafe {
+            std::ptr::copy_nonoverlapping(d[p..].as_ptr(), cp_occ.as_mut_ptr() as *mut u8, cp_bytes);
+            cp_occ.set_len(cp_size);
         }
-        let mut sa_ls_word = Vec::with_capacity(sa_size);
-        for _ in 0..sa_size {
-            sa_ls_word.push(rd_u32(&d, &mut p));
+        p += cp_bytes;
+
+        let mut sa_ms_byte = Vec::<i8>::with_capacity(sa_size);
+        unsafe {
+            std::ptr::copy_nonoverlapping(d[p..].as_ptr(), sa_ms_byte.as_mut_ptr() as *mut u8, sa_size);
+            sa_ms_byte.set_len(sa_size);
         }
-        let sentinel_index = rd_i64(&d, &mut p);
+        p += sa_size;
+
+        let mut sa_ls_word = Vec::<u32>::with_capacity(sa_size);
+        let ls_bytes = sa_size * 4;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                d[p..].as_ptr(),
+                sa_ls_word.as_mut_ptr() as *mut u8,
+                ls_bytes,
+            );
+            sa_ls_word.set_len(sa_size);
+        }
+        p += ls_bytes;
+
+        let sentinel_index = rd_i64(d, &mut p);
 
         let mut one_hot_mask = [0u64; 64];
         let base = 0x8000_0000_0000_0000u64;
@@ -122,7 +140,11 @@ impl FmIndex {
             one_hot_mask[i] = (one_hot_mask[i - 1] >> 1) | base;
         }
 
-        let reference = std::fs::read(sibling(prefix, "0123"))?;
+        // Memory-map `.0123` instead of reading it: no 6.2 GB copy, pages shared via the page cache.
+        let ref_file = std::fs::File::open(sibling(prefix, "0123"))?;
+        // SAFETY: the index files are not mutated while a run holds them open; a concurrent external
+        // truncation is out of scope (same assumption as bwa-mem2's mmap'd index).
+        let reference = unsafe { Mmap::map(&ref_file)? };
 
         Ok(FmIndex {
             ref_seq_len,
@@ -369,7 +391,7 @@ impl FmIndex {
     /// The `.0123` binary reference (forward ++ reverse-complement, 2L bytes).
     #[inline]
     pub fn reference(&self) -> &[u8] {
-        &self.reference
+        &self.reference[..]
     }
 
     /// Length of the forward reference `L` (`ref_seq_len` is `2L + 1`).
