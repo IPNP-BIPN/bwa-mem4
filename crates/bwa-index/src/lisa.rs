@@ -185,6 +185,48 @@ impl LearnedSa {
         (lo, hi)
     }
 
+    /// The bwa-mem2 bidirectional FMD interval `(k, l, s)` for `pattern`, reproduced from the plain
+    /// `[fwd][rc]` suffix array (validated byte-identical to `FmIndex::backward_ext` walked over the
+    /// same pattern, `bidirectional_interval_matches_fmindex`):
+    ///   * `k` = SA lower-bound of `pattern` (forward interval start),
+    ///   * `s` = interval size (occurrence count),
+    ///   * `l` = SA lower-bound of `revcomp(pattern)` (reverse-complement interval start).
+    /// `revcomp` here is reverse order with base complement `3 - c`, matching bwa's `nst_nt4`.
+    pub fn bi_interval(&self, pattern: &[u8]) -> (i64, i64, i64) {
+        let (lo, hi) = self.exact_interval(pattern);
+        let rc: Vec<u8> = pattern.iter().rev().map(|&c| 3 - c).collect();
+        let (rlo, _) = self.exact_interval(&rc);
+        (lo as i64, rlo as i64, (hi - lo) as i64)
+    }
+
+    /// Narrow the SA interval `[lo, hi)` (all rows sharing a common `depth`-length prefix) to the
+    /// sub-block whose character at column `depth` equals `c`. Returns the nested `[lo', hi')`. This is
+    /// the cheap "append one base" step: appending to the pattern always nests within the current
+    /// interval, so the whole forward extension of a match is a sequence of these narrowings, touching
+    /// only the (shrinking) interval's rows and the reference — no FM `Occ`. `[lo, hi)` must be a valid
+    /// interval whose rows agree on their first `depth` characters.
+    pub fn narrow(&self, lo: usize, hi: usize, depth: usize, c: u8) -> (usize, usize) {
+        // Rows in [lo, hi) are sorted, and among them the column-`depth` character is nondecreasing
+        // (shorter suffixes — None — sort first, then 0,1,2,3). Two partition points bracket `c`.
+        let lt = lo
+            + self.sa[lo..hi].partition_point(|&p| {
+                let idx = p as usize + depth;
+                match self.ref_seq.get(idx) {
+                    None => true,          // shorter suffix: sorts before any character
+                    Some(&ch) => ch < c,
+                }
+            });
+        let le = lo
+            + self.sa[lo..hi].partition_point(|&p| {
+                let idx = p as usize + depth;
+                match self.ref_seq.get(idx) {
+                    None => true,
+                    Some(&ch) => ch <= c,
+                }
+            });
+        (lt, le)
+    }
+
     /// Reference positions where `pattern` occurs exactly (the `sa` values of [`Self::exact_interval`]).
     pub fn occurrences(&self, pattern: &[u8]) -> Vec<i64> {
         let (lo, hi) = self.exact_interval(pattern);
@@ -245,6 +287,94 @@ mod tests {
                 want.sort_unstable();
                 let got = lsa.occurrences(&pattern);
                 assert_eq!(got, want, "ref_len={len} pattern={pattern:?}");
+            }
+        }
+    }
+
+    /// Reverse-complement of a binary pattern (codes 0..=3): reverse order, complement `3 - c`
+    /// (A=0<->T=3, C=1<->G=2), matching bwa's `nst_nt4` complement.
+    fn revcomp(p: &[u8]) -> Vec<u8> {
+        p.iter().rev().map(|&c| 3 - c).collect()
+    }
+
+    /// Cross-check the SA-based bidirectional interval hypothesis against the real `FmIndex`:
+    /// walking `backward_ext` over pattern `P` yields `(k, l, s)`; the claim is
+    ///   k == exact_interval(P).lo,  s == hi - lo,  l == exact_interval(revcomp(P)).lo
+    /// over the same `[fwd][rc]` reference. If this holds, `LearnedSa` can reproduce bwa-mem2's
+    /// FMD bi-interval byte-for-byte without the FM Occ function.
+    #[test]
+    fn bidirectional_interval_matches_fmindex() {
+        use crate::fmindex::FmIndex;
+        use std::path::Path;
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let fm = FmIndex::load(Path::new(prefix)).unwrap();
+        let reference = fm.reference().to_vec();
+        let lsa = LearnedSa::build(reference.clone(), 4096);
+        let two_l = reference.len();
+
+        let mut seed = 0xdead_beef_cafe_babeu64;
+        let mut checked = 0usize;
+        for _ in 0..4000 {
+            let mlen = 1 + (lcg(&mut seed) as usize % 60);
+            if mlen >= two_l {
+                continue;
+            }
+            let start = lcg(&mut seed) as usize % (two_l - mlen);
+            let pat = &reference[start..start + mlen];
+
+            // Ground truth from the FM-index bi-interval walk.
+            let mut sm = fm.full_interval();
+            for &c in pat.iter().rev() {
+                sm = fm.backward_ext(sm, c as usize);
+            }
+
+            let (lo, hi) = lsa.exact_interval(pat);
+            assert_eq!(sm.k, lo as i64, "k mismatch, pattern@{start} len {mlen}");
+            assert_eq!(sm.s, (hi - lo) as i64, "s mismatch, pattern@{start} len {mlen}");
+
+            let rc = revcomp(pat);
+            let (rlo, rhi) = lsa.exact_interval(&rc);
+            assert_eq!(
+                sm.l, rlo as i64,
+                "l mismatch, pattern@{start} len {mlen}: fm.l={} exact_lo(revcomp)={rlo}",
+                sm.l
+            );
+            // Sanity: the revcomp interval has the same size as P's (strand symmetry).
+            assert_eq!(rhi - rlo, hi - lo, "revcomp size mismatch, pattern@{start}");
+            checked += 1;
+        }
+        assert!(checked > 3000, "too few patterns checked ({checked})");
+    }
+
+    /// Iterating `narrow` one base at a time from the full interval must reproduce `exact_interval`
+    /// (and its size must track occurrence counts), for every prefix length of the pattern.
+    #[test]
+    fn narrow_reproduces_exact_interval() {
+        let mut seed = 0x0f1e_2d3c_4b5a_6978u64;
+        for trial in 0..8 {
+            let len = 300 + (lcg(&mut seed) as usize % 1500);
+            let alpha = if trial % 2 == 0 { 4 } else { 2 };
+            let ref_seq: Vec<u8> = (0..len).map(|_| (lcg(&mut seed) % alpha) as u8).collect();
+            let lsa = LearnedSa::build(ref_seq.clone(), 256);
+            let n = lsa.len();
+            for _ in 0..200 {
+                let mlen = 1 + (lcg(&mut seed) as usize % 45);
+                let s = if len > mlen {
+                    lcg(&mut seed) as usize % (len - mlen)
+                } else {
+                    0
+                };
+                let pat = &ref_seq[s..(s + mlen).min(len)];
+                // Walk narrow from the full interval, one base at a time.
+                let (mut lo, mut hi) = (0usize, n);
+                for (depth, &c) in pat.iter().enumerate() {
+                    let (nlo, nhi) = lsa.narrow(lo, hi, depth, c);
+                    lo = nlo;
+                    hi = nhi;
+                    // At every prefix length, the narrowed interval must equal exact_interval.
+                    let (elo, ehi) = lsa.exact_interval(&pat[..=depth]);
+                    assert_eq!((lo, hi), (elo, ehi), "prefix depth {depth} of pat@{s}");
+                }
             }
         }
     }
