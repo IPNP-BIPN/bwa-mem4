@@ -488,7 +488,11 @@ fn run_pe(
                     a1: &mut p.a2,
                 })
                 .collect();
-            batch_mate_rescue(fm, bns, opt, &pes, &mut rd);
+            // Each pair's rescue is independent, so run chunks in parallel; a chunk of a few hundred
+            // pairs still has enough rescue jobs to fill the SIMD lanes. Keeps -t8 scaling (the rescue
+            // is otherwise a serial section) while byte-identical to the per-pair path.
+            rd.par_chunks_mut(512)
+                .for_each(|chunk| batch_mate_rescue(fm, bns, opt, &pes, chunk));
         }
 
         // Emit paired SAM in parallel (each pair owns its regions; global pair id fixes hashes).
