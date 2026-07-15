@@ -305,6 +305,31 @@ impl LearnedSa {
         (best, lo, hi)
     }
 
+    /// Longest exact prefix of `pattern` that occurs **at least `min_intv` times**, with its SA
+    /// interval. For `min_intv <= 1` this is just [`Self::lem`]. Otherwise, since occurrence count
+    /// grows monotonically as the match shortens, we shorten one base at a time from the LEM until the
+    /// interval is large enough (a few steps for the small `min_intv` used in reseeding). Used by
+    /// round-2 reseeding, which searches for shorter, more-frequent seeds inside a long SMEM.
+    pub fn lem_min_intv(&self, pattern: &[u8], min_intv: i64) -> (usize, usize, usize) {
+        let (len, lo, hi) = self.lem(pattern);
+        if len == 0 || (hi - lo) as i64 >= min_intv {
+            return (len, lo, hi);
+        }
+        let mut l = len;
+        loop {
+            if l <= 1 {
+                // Even the single base is too rare (only under min_intv > its global count): no seed.
+                let (a, b) = self.exact_interval(&pattern[..1]);
+                return if (b - a) as i64 >= min_intv { (1, a, b) } else { (0, 0, 0) };
+            }
+            l -= 1;
+            let (a, b) = self.exact_interval(&pattern[..l]);
+            if (b - a) as i64 >= min_intv {
+                return (l, a, b);
+            }
+        }
+    }
+
     /// Reference positions where `pattern` occurs exactly (the `sa` values of [`Self::exact_interval`]).
     pub fn occurrences(&self, pattern: &[u8]) -> Vec<i64> {
         let (lo, hi) = self.exact_interval(pattern);

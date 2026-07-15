@@ -171,11 +171,11 @@ fn smems_from_pos_lsa(
     next_x
 }
 
-/// Backward LEM: longest exact match ending at `pivot` and extending left, i.e. the length of the
-/// longest match of `codes[.. =pivot]` read right-to-left. Realised as a forward LEM of the
-/// reverse-complement pattern `p[t] = 3 - codes[pivot - t]` over the `[fwd][rc]` SA (this is how the
-/// concatenated reference gives left-extension "for free"). Stops at a read boundary or an `N`.
-fn backward_lem(lsa: &LearnedSa, codes: &[u8], pivot: usize) -> usize {
+/// Backward LEM: longest exact match ending at `pivot` and extending left, occurring at least
+/// `min_intv` times. Realised as a forward LEM of the reverse-complement pattern
+/// `p[t] = 3 - codes[pivot - t]` over the `[fwd][rc]` SA (this is how the concatenated reference gives
+/// left-extension "for free"). Stops at a read boundary or an `N`.
+fn backward_lem(lsa: &LearnedSa, codes: &[u8], pivot: usize, min_intv: i64) -> usize {
     let mut pat = Vec::with_capacity(pivot + 1);
     let mut t = 0usize;
     loop {
@@ -190,87 +190,213 @@ fn backward_lem(lsa: &LearnedSa, codes: &[u8], pivot: usize) -> usize {
         pat.push(3 - c);
         t += 1;
     }
-    lsa.lem(&pat).0
+    lsa.lem_min_intv(&pat, min_intv).0
 }
 
-/// Forward LEM from `pivot`, capped at the first `N`: `(match_len, lo, hi)` for `codes[pivot..]`.
-fn forward_lem(lsa: &LearnedSa, codes: &[u8], pivot: usize) -> (usize, usize, usize) {
-    // lem() itself stops comparing at a mismatch; we must also stop the pattern at an N so the match
-    // never spans an ambiguous base.
+/// Forward LEM from `pivot`, occurring at least `min_intv` times, capped at the first `N`.
+fn forward_lem(lsa: &LearnedSa, codes: &[u8], pivot: usize, min_intv: i64) -> (usize, usize, usize) {
     let end = codes[pivot..]
         .iter()
         .position(|&c| c >= 4)
         .map(|p| pivot + p)
         .unwrap_or(codes.len());
-    lsa.lem(&codes[pivot..end])
+    lsa.lem_min_intv(&codes[pivot..end], min_intv)
 }
 
-/// Round-1 SMEM collection via BWA-MEME's fast zigzag (transliterated from
-/// `Learned_getSMEMsAllPosOneThread` / `_step1`, mode-1 non-tradeoff path): never computes shallow
-/// intervals — each step jumps straight to a LEM. Emits SMEMs `>= min_seed_len`. The result is
-/// bwa-mem2-concordant (BWA-MEME reproduces bwa-mem2 seeds); validated against the FM path below.
+#[inline]
+fn push_smem(out: &mut Vec<Smem>, lo: usize, hi: usize, m: usize, n: usize) {
+    out.push(Smem {
+        rid: 0,
+        m: m as u32,
+        n: n as u32,
+        k: lo as i64,
+        l: 0,
+        s: (hi - lo) as i64,
+    });
+}
+
+/// The shared zigzag body: starting at `start`, alternate backward (find left boundary, no emit) and
+/// forward (emit) LEMs, marching the right boundary until it reaches `next_pivot`. `min_intv` gates
+/// the LEM occurrence count (1 for round 1, parent-hitcount+1 for round-2 reseeding).
+fn zigzag_march(
+    lsa: &LearnedSa,
+    codes: &[u8],
+    start: usize,
+    next_pivot: usize,
+    min_intv: i64,
+    min_seed_len: usize,
+    out: &mut Vec<Smem>,
+) {
+    let l_seq = codes.len();
+    let mut search_pivot = start;
+    let mut cur = start;
+    while search_pivot < next_pivot {
+        if codes[search_pivot] >= 4 {
+            if l_seq - search_pivot < min_seed_len {
+                break;
+            }
+            search_pivot += 1;
+            continue;
+        }
+        // Left extension (no emit): longest match ending at `cur`.
+        let left_len = backward_lem(lsa, codes, cur, min_intv);
+        cur = cur + 1 - left_len;
+        if next_pivot - cur < min_seed_len {
+            break;
+        }
+        // Right extension (emit): longest match starting at the new left boundary.
+        let (rlen, lo, hi) = forward_lem(lsa, codes, cur, min_intv);
+        if rlen >= min_seed_len {
+            push_smem(out, lo, hi, cur, cur + rlen - 1);
+        }
+        search_pivot = cur + rlen;
+        cur = search_pivot;
+    }
+}
+
+/// Round-1 SMEM collection via BWA-MEME's fast zigzag (`Learned_getSMEMsAllPosOneThread`/`_step1`,
+/// mode-1 non-tradeoff): never computes shallow intervals — each step jumps to a LEM. Emits SMEMs
+/// `>= min_seed_len`. bwa-mem2-concordant (validated against the FM path below).
 pub fn collect_smems_lsa_zigzag(lsa: &LearnedSa, codes: &[u8], min_seed_len: i32) -> Vec<Smem> {
     let l_seq = codes.len();
     let min_seed_len = min_seed_len as usize;
     let mut out = Vec::new();
-
-    let emit = |lo: usize, hi: usize, m: usize, n: usize, out: &mut Vec<Smem>| {
-        out.push(Smem {
-            rid: 0,
-            m: m as u32,
-            n: n as u32,
-            k: lo as i64,
-            l: 0,
-            s: (hi - lo) as i64,
-        });
-    };
-
     let mut pivot = 0usize;
     while pivot < l_seq {
-        // Ambiguous base at the pivot: skip it exactly as _step1 does.
         if codes[pivot] >= 4 {
             pivot = if l_seq - pivot < min_seed_len { l_seq } else { pivot + 1 };
             continue;
         }
         if pivot != 0 && codes[pivot - 1] < 4 {
-            // Middle pivot: zigzag left/right, emitting on each forward pass.
-            let next_pivot = l_seq;
-            let mut search_pivot = pivot;
-            let mut cur = pivot; // raux->pivot
-            while search_pivot < next_pivot {
-                if codes[search_pivot] >= 4 {
-                    if l_seq - search_pivot < min_seed_len {
-                        search_pivot = l_seq;
-                    } else {
-                        search_pivot += 1;
-                    }
-                    continue;
-                }
-                // Left extension (no emit): longest match ending at `cur`.
-                let left_len = backward_lem(lsa, codes, cur);
-                cur = cur + 1 - left_len; // new left boundary
-                if next_pivot - cur < min_seed_len {
-                    break;
-                }
-                // Right extension (emit): longest match starting at `cur`.
-                let (rlen, lo, hi) = forward_lem(lsa, codes, cur);
-                if rlen >= min_seed_len {
-                    emit(lo, hi, cur, cur + rlen - 1, &mut out);
-                }
-                search_pivot = cur + rlen;
-                cur = search_pivot;
-            }
-            pivot = next_pivot;
+            // Middle pivot: march to the read end (all-position step1).
+            zigzag_march(lsa, codes, pivot, l_seq, 1, min_seed_len, &mut out);
+            pivot = l_seq;
         } else {
             // Read start (or preceded by N): a single forward SMEM.
-            let (rlen, lo, hi) = forward_lem(lsa, codes, pivot);
+            let (rlen, lo, hi) = forward_lem(lsa, codes, pivot, 1);
             if rlen >= min_seed_len {
-                emit(lo, hi, pivot, pivot + rlen - 1, &mut out);
+                push_smem(&mut out, lo, hi, pivot, pivot + rlen - 1);
             }
             pivot += rlen.max(1);
         }
     }
     out
+}
+
+/// Single-position SMEM search (`Learned_getSMEMsOnePosOneThread`), for round-2 reseeding from a
+/// pivot with a given `min_intv`. Like step1 but `next_pivot` is bounded by this pivot's forward
+/// reach (an initial forward LEM) rather than the read end.
+fn smems_one_pos(
+    lsa: &LearnedSa,
+    codes: &[u8],
+    pivot: usize,
+    min_intv: i64,
+    min_seed_len: usize,
+    out: &mut Vec<Smem>,
+) {
+    if codes[pivot] >= 4 {
+        return;
+    }
+    if pivot != 0 && codes[pivot - 1] < 4 {
+        let (freach, _, _) = forward_lem(lsa, codes, pivot, min_intv);
+        let next_pivot = pivot + freach;
+        zigzag_march(lsa, codes, pivot, next_pivot, min_intv, min_seed_len, out);
+    } else {
+        let (rlen, lo, hi) = forward_lem(lsa, codes, pivot, min_intv);
+        if rlen >= min_seed_len {
+            push_smem(out, lo, hi, pivot, pivot + rlen - 1);
+        }
+    }
+}
+
+/// Round-2 reseeding (fast): re-seed each long, non-repetitive round-1 SMEM from its midpoint with
+/// `min_intv = hitcount + 1`, appending in place. Mirrors `smem_round_2`.
+fn smem_round_2_lsa_fast(lsa: &LearnedSa, codes: &[u8], opt: &MemOpt, smems: &mut Vec<Smem>) {
+    let split_len = (opt.min_seed_len as f32 * opt.split_factor + 0.499) as i32;
+    let num1 = smems.len();
+    let msl = opt.min_seed_len as usize;
+    for idx in 0..num1 {
+        let p = smems[idx];
+        let start = p.m as i32;
+        let end = p.n as i32 + 1;
+        if end - start < split_len || p.s > i64::from(opt.split_width) {
+            continue;
+        }
+        let x = ((end + start) >> 1) as usize;
+        smems_one_pos(lsa, codes, x, p.s + 1, msl, smems);
+    }
+}
+
+/// Round-3 forward-only seeding (fast): for each pivot emit the shortest forward match that first
+/// drops below `max_intv` occurrences (and is `>= min_seed_len`). Mirrors `bwt_seed_strategy`, but
+/// jumps to the LEM and binary-searches the length where the occurrence count crosses `max_intv`
+/// instead of narrowing base-by-base.
+fn bwt_seed_strategy_lsa_fast(
+    lsa: &LearnedSa,
+    codes: &[u8],
+    max_intv: i64,
+    min_seed_len: i32,
+    out: &mut Vec<Smem>,
+) {
+    let l_seq = codes.len();
+    let min_seed_len = min_seed_len as usize;
+    let occ = |x: usize, l: usize| -> (i64, usize, usize) {
+        let (a, b) = lsa.exact_interval(&codes[x..x + l]);
+        ((b - a) as i64, a, b)
+    };
+    let mut x = 0usize;
+    while x < l_seq {
+        let mut next_x = x + 1;
+        if codes[x] < 4 {
+            let (lem_len, _, _) = forward_lem(lsa, codes, x, 1);
+            if lem_len == 0 {
+                x = next_x;
+                continue;
+            }
+            let (occ_lem, _, _) = occ(x, lem_len);
+            if lem_len >= min_seed_len && occ_lem < max_intv {
+                // Smallest L in [min_seed_len, lem_len] with occ(L) < max_intv (occ decreasing).
+                let l_star = if occ(x, min_seed_len).0 < max_intv {
+                    min_seed_len
+                } else {
+                    let (mut lo, mut hi) = (min_seed_len + 1, lem_len);
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        if occ(x, mid).0 < max_intv {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
+                    }
+                    lo
+                };
+                let (s, lo, hi) = occ(x, l_star);
+                if s > 0 {
+                    push_smem(out, lo, hi, x, x + l_star - 1);
+                }
+                next_x = x + l_star;
+            } else {
+                // No emit: advance past the explored match (matches FM's next_x after the forward
+                // loop stops — approximate for the no-emit branch; validated against the FM path).
+                next_x = (x + lem_len + 1).min(l_seq);
+                if lem_len < min_seed_len {
+                    next_x = (x + min_seed_len).min(l_seq);
+                }
+            }
+        }
+        x = next_x;
+    }
+}
+
+/// Full fast SMEM collection: round-1 zigzag + round-2 reseed + round-3 strategy, the LISA analog of
+/// [`crate::mem_collect_smem`]. Concordant seed set (validated against the FM path on real reads).
+pub fn mem_collect_smem_lsa_fast(lsa: &LearnedSa, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
+    let mut smems = collect_smems_lsa_zigzag(lsa, codes, opt.min_seed_len);
+    smem_round_2_lsa_fast(lsa, codes, opt, &mut smems);
+    if opt.max_mem_intv > 0 {
+        bwt_seed_strategy_lsa_fast(lsa, codes, opt.max_mem_intv, opt.min_seed_len + 1, &mut smems);
+    }
+    smems
 }
 
 /// Collect all round-1 SMEMs of `codes` via the learned index (LISA analog of [`crate::collect_smems`]).
@@ -448,6 +574,64 @@ mod tests {
             }
         }
         assert_eq!(mism, 0, "{mism}/500 reads had differing round-1 SMEM sets");
+    }
+
+    /// The full fast path (rounds 1+2+3) must produce a concordant SEED set to the FM
+    /// `mem_collect_smem`. Compares the derived seeds (rbeg, qbeg, len) as a set, since the fast path
+    /// emits in a different order and may differ in benign ways (duplicate/contained seeds that
+    /// chaining discards). Reports the Jaccard overlap; requires exact-or-near-exact match.
+    #[test]
+    fn fast_full_seedset_concordant_with_fmindex() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let fm = FmIndex::load(Path::new(prefix)).unwrap();
+        let reference = fm.reference().to_vec();
+        let lsa = LearnedSa::build(reference.clone(), 4096);
+        let opt = MemOpt::default();
+        let l_pac = fm.l_pac() as usize;
+
+        let seeds_set = |smems: &[Smem], seeds_of: &dyn Fn(&Smem) -> Vec<MemSeed>| {
+            let mut v: Vec<(i64, i32, i32)> = smems
+                .iter()
+                .flat_map(|s| seeds_of(s).into_iter().map(|d| (d.rbeg, d.qbeg, d.len)))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+
+        let mut seed = 0xf00d_1234_5678u64;
+        let (mut total, mut exact, mut worst_jac) = (0usize, 0usize, 1.0f64);
+        for _ in 0..500 {
+            let rlen = 60 + (lcg(&mut seed) as usize % 100);
+            let start = lcg(&mut seed) as usize % (l_pac - rlen);
+            let mut codes: Vec<u8> = reference[start..start + rlen].to_vec();
+            for _ in 0..(lcg(&mut seed) as usize % 4) {
+                let p = lcg(&mut seed) as usize % rlen;
+                codes[p] = (lcg(&mut seed) % 4) as u8;
+            }
+
+            let fm_smems = crate::mem_collect_smem(&fm, &codes, &opt);
+            let lsa_smems = mem_collect_smem_lsa_fast(&lsa, &codes, &opt);
+            let fm_seeds = seeds_set(&fm_smems, &|s| crate::seeds_from_smem(&fm, s, opt.max_occ));
+            let lsa_seeds = seeds_set(&lsa_smems, &|s| seeds_from_smem_lsa(&lsa, s, opt.max_occ));
+
+            total += 1;
+            if fm_seeds == lsa_seeds {
+                exact += 1;
+            } else {
+                let inter = fm_seeds.iter().filter(|x| lsa_seeds.binary_search(x).is_ok()).count();
+                let uni = fm_seeds.len() + lsa_seeds.len() - inter;
+                let jac = if uni == 0 { 1.0 } else { inter as f64 / uni as f64 };
+                if jac < worst_jac {
+                    worst_jac = jac;
+                }
+            }
+        }
+        eprintln!("fast full: {exact}/{total} exact, worst Jaccard {worst_jac:.3}");
+        assert!(
+            exact as f64 / total as f64 >= 0.98 && worst_jac >= 0.9,
+            "seed concordance too low: {exact}/{total} exact, worst Jaccard {worst_jac:.3}"
+        );
     }
 
     /// The LISA SMEM set must byte-match the FM path on real reads over the tiny reference, at both
