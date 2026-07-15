@@ -21,3 +21,6 @@ clap = { workspace = true }
 mimalloc = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bwa-gpu = { workspace = true }

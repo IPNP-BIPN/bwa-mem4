@@ -32,6 +32,10 @@ pub struct MemArgs {
     pub reads: PathBuf,
     /// Optional mate reads (R2): triggers paired-end mode.
     pub reads2: Option<PathBuf>,
+    /// Route seed extension through the Metal GPU backend (macOS only; opt-in, byte-identical to the
+    /// CPU path). Ignored on other platforms.
+    #[arg(long)]
+    pub gpu: bool,
 }
 
 pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
@@ -71,8 +75,10 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         &cl,
     )?;
 
+    let backend = Backend::select(args.gpu);
+
     if let Some(reads2) = args.reads2.clone() {
-        run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, &mut out)?;
+        run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, &mut out)?;
         out.flush()?;
         return Ok(());
     }
@@ -92,7 +98,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         // mirroring bwa-mem2's mem_chain2aln_across_reads_V2. Chunked so extension parallelizes; each
         // read's regions are independent of chunk composition, so output stays byte-identical at any
         // thread count once -K fixes the batch boundaries.
-        let regs_all = batched_regs(&fm, &bns, &opt, &all_codes);
+        let regs_all = batched_regs(&fm, &bns, &opt, &all_codes, backend);
         let lines: Vec<Vec<u8>> = batch
             .par_iter()
             .enumerate()
@@ -125,13 +131,62 @@ fn batched_regs(
     bns: &BntSeq,
     opt: &MemOpt,
     codes: &[Vec<u8>],
+    backend: Backend,
 ) -> Vec<Vec<MemAlnReg>> {
     let nthreads = rayon::current_num_threads().max(1);
     let chunk = codes.len().div_ceil(nthreads).max(1);
     codes
         .par_chunks(chunk)
-        .flat_map(|c| align_reads_batched(fm, bns, opt, c, &NeonBackend))
+        .flat_map(|c| backend.align(fm, bns, opt, c))
         .collect()
+}
+
+/// Seed-extension backend chosen at startup. `Metal` only exists on macOS with a GPU; everywhere
+/// else `--gpu` degrades to the SIMD CPU backend. The choice is per-process, so byte-identity of the
+/// output is unaffected either way (both are byte-identical to the oracle).
+#[derive(Clone, Copy)]
+enum Backend {
+    Cpu,
+    #[cfg(target_os = "macos")]
+    Metal,
+}
+
+impl Backend {
+    fn select(want_gpu: bool) -> Self {
+        if !want_gpu {
+            return Backend::Cpu;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if bwa_gpu::metal_available() {
+                eprintln!("[bwa-mem3] seed extension: Metal GPU backend");
+                return Backend::Metal;
+            }
+            eprintln!("[bwa-mem3] --gpu requested but no Metal device; using CPU backend");
+            Backend::Cpu
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("[bwa-mem3] --gpu is macOS-only; using CPU backend");
+            Backend::Cpu
+        }
+    }
+
+    fn align(
+        self,
+        fm: &FmIndex,
+        bns: &BntSeq,
+        opt: &MemOpt,
+        codes: &[Vec<u8>],
+    ) -> Vec<Vec<MemAlnReg>> {
+        match self {
+            Backend::Cpu => align_reads_batched(fm, bns, opt, codes, &NeonBackend),
+            #[cfg(target_os = "macos")]
+            Backend::Metal => {
+                align_reads_batched(fm, bns, opt, codes, &bwa_gpu::MetalBackend)
+            }
+        }
+    }
 }
 
 /// Deduplicate + primary-mark a read's batched regions, then format its SAM record. Pure (no shared
@@ -222,6 +277,7 @@ fn run_pe<W: std::io::Write>(
     reads1: &std::path::Path,
     reads2: &std::path::Path,
     k_batch: usize,
+    backend: Backend,
     out: &mut W,
 ) -> anyhow::Result<()> {
     let mut reader = PairedFastqReader::from_paths(reads1, reads2)?;
@@ -243,7 +299,7 @@ fn run_pe<W: std::io::Write>(
                 ]
             })
             .collect();
-        let regs_all = batched_regs(fm, bns, opt, &all_codes);
+        let regs_all = batched_regs(fm, bns, opt, &all_codes, backend);
         let mut prepared: Vec<PrepPair> = batch
             .par_iter()
             .enumerate()

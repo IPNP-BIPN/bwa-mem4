@@ -100,6 +100,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bwa-core",
+ "bwa-gpu",
  "bwa-index",
  "bwa-io",
  "bwa-mem",

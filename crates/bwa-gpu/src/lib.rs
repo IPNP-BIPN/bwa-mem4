@@ -26,6 +26,9 @@ mod metal_ctx {
         pub device: Device,
         pub queue: metal::CommandQueue,
         pub library: Library,
+        /// The `sw_extend` pipeline state, built once (compiling a PSO per `extend_batch` call was
+        /// pure launch overhead on the hot path).
+        pub sw_extend: Option<ComputePipelineState>,
     }
 
     // SAFETY: Metal objects are internally reference-counted; each call builds its own command
@@ -43,16 +46,24 @@ mod metal_ctx {
                 let library = device
                     .new_library_with_source(super::MSL_SRC, &metal::CompileOptions::new())
                     .ok()?;
+                let sw_extend = library.get_function("sw_extend", None).ok().and_then(|f| {
+                    device.new_compute_pipeline_state_with_function(&f).ok()
+                });
                 Some(MetalCtx {
                     device,
                     queue,
                     library,
+                    sw_extend,
                 })
             })
             .as_ref()
         }
 
+        /// The cached `sw_extend` pipeline; any other kernel is built on demand (test-only path).
         pub fn pipeline(&self, name: &str) -> Option<ComputePipelineState> {
+            if name == "sw_extend" {
+                return self.sw_extend.clone();
+            }
             let f: Function = self.library.get_function(name, None).ok()?;
             self.device
                 .new_compute_pipeline_state_with_function(&f)
@@ -206,6 +217,14 @@ pub fn square_u32(data: &mut [u32]) -> bool {
     let out = unsafe { std::slice::from_raw_parts(buf.contents() as *const u32, n) };
     data.copy_from_slice(out);
     true
+}
+
+/// True when a Metal device with the `sw_extend` pipeline is available (so `--gpu` can route here).
+#[cfg(target_os = "macos")]
+pub fn metal_available() -> bool {
+    metal_ctx::MetalCtx::get()
+        .map(|c| c.sw_extend.is_some())
+        .unwrap_or(false)
 }
 
 #[cfg(all(test, target_os = "macos"))]
