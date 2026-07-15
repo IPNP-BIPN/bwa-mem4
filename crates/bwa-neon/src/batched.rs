@@ -664,6 +664,14 @@ macro_rules! define_sw_kernel {
             let npen_mag_v = $dup((-(i32::from(mat[m - 1]))) as $elem); // |npen|
             let amb_v = $dup(4); // code 4 = N; codes are 0..=4
 
+            // Per-chunk DP scratch, allocated once and reused across chunks (clear+resize keeps the
+            // capacity, so it grows to the largest chunk's size then stops reallocating). Byte-safe:
+            // resize-from-empty zero-fills, identical to the old per-chunk `vec![0; ..]`.
+            let mut eh_h: Vec<$elem> = Vec::new();
+            let mut eh_e: Vec<$elem> = Vec::new();
+            let mut qcode: Vec<$elem> = Vec::new();
+            let mut tcode: Vec<$elem> = Vec::new();
+
             for chunk_start in (0..jobs.len()).step_by(LANES) {
                 let nlane = (jobs.len() - chunk_start).min(LANES);
 
@@ -682,13 +690,17 @@ macro_rules! define_sw_kernel {
                 let max_t = tlen[..nlane].iter().copied().max().unwrap_or(0);
 
                 let stride = max_q + 1;
-                let mut eh_h = vec![0 as $elem; stride * LANES];
-                let mut eh_e = vec![0 as $elem; stride * LANES];
+                eh_h.clear();
+                eh_h.resize(stride * LANES, 0 as $elem);
+                eh_e.clear();
+                eh_e.resize(stride * LANES, 0 as $elem);
 
                 // Per-lane query/target codes padded (0 past len) for branchless, in-bounds
                 // vector loads of the 8/16 lanes' base at column j (query) or row i (target).
-                let mut qcode = vec![0 as $elem; stride * LANES];
-                let mut tcode = vec![0 as $elem; (max_t + 1) * LANES];
+                qcode.clear();
+                qcode.resize(stride * LANES, 0 as $elem);
+                tcode.clear();
+                tcode.resize((max_t + 1) * LANES, 0 as $elem);
                 for l in 0..nlane {
                     for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
                         qcode[ju * LANES + l] = c as $elem;
