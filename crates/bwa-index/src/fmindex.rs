@@ -139,15 +139,16 @@ impl FmIndex {
     /// Prefetch the two checkpoint blocks a future [`backward_ext`] on an interval `[sp, ep)` will
     /// touch (`cp_occ[sp>>6]` and `cp_occ[ep>>6]`). Issued one SMEM step ahead in the seeding walk to
     /// hide the DRAM latency of the data-dependent block loads, exactly as bwa-mem2's / nh13's
-    /// `ENABLE_PREFETCH` does. A pure hint: results are unchanged. No-op off AArch64.
+    /// `ENABLE_PREFETCH` does. A pure hint: results are unchanged. No-op off AArch64/x86_64.
     #[inline]
     pub fn prefetch_occ(&self, sp: i64, ep: i64) {
+        // SAFETY (both arches): forming the block pointers is in-bounds (`sp`/`ep` are valid BWT
+        // positions, so `>>6` indexes an allocated `cp_occ` slot); the prefetch is a hint that never
+        // faults or writes.
         #[cfg(target_arch = "aarch64")]
         {
             let base = self.cp_occ.as_ptr();
-            // SAFETY: forming the block pointers is in-bounds (`sp`/`ep` are valid BWT positions, so
-            // `>>6` indexes an allocated `cp_occ` slot); `prfm` is a hint that never faults or writes.
-            // `pldl1keep` = prefetch-for-load into L1, keep (the AArch64 equivalent of `_MM_HINT_T0`).
+            // `pldl1keep` = prefetch-for-load into L1, keep (AArch64 equivalent of `_MM_HINT_T0`).
             unsafe {
                 let p_sp = base.add((sp >> 6) as usize);
                 let p_ep = base.add((ep >> 6) as usize);
@@ -155,7 +156,16 @@ impl FmIndex {
                 std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_ep, options(nostack, readonly, preserves_flags));
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let base = self.cp_occ.as_ptr();
+            unsafe {
+                _mm_prefetch(base.add((sp >> 6) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(base.add((ep >> 6) as usize) as *const i8, _MM_HINT_T0);
+            }
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             let _ = (sp, ep);
         }
