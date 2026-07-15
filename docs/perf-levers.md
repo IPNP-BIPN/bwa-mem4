@@ -32,6 +32,31 @@ real-data/multithread robustness items; 128B-align and L2-batch are ruled out by
 kernel evidence (a score prepass already regressed to 0.90x). The real per-read win on clean data is
 **LEVER 3 (ungapped skip-DP)**, where most reads bypass the DP entirely.
 
+## LEVER 3 (ungapped skip-DP) — mismatch-tolerant HIT
+
+| Step | Parity | SE wall | PE wall | peak RSS | isolated gain |
+|------|--------|--------:|--------:|---------:|---------------|
+| prev (scratch reuse) | ✅/✅ | 7.87s | 15.96s | 1744/2419 MB | — |
+| **3a. mismatch-tolerant HIT** | ✅/✅ | **5.99s** | **12.57s** | 1668/2299 MB | **SE +23.9%, PE +21.2%** |
+
+Ported nh13's `ungapped_analyze` HIT case beyond perfect-match: a diagonal extension with
+`total_mis ≤ x_threshold` (= `o_min/(a+b−e_min)` = **1** for default params) is provably banded-SW
+optimal → scalar local-SW walk gives the result, DP skipped. **57% of extension jobs skip DP** (SE).
+Byte-identical (5000/5000 SE, 10000/10000 PE). Commit `18c462a`.
+
+**3b. TIGHT band — assessed, deferred.** For `>x_threshold` mismatches, nh13 runs SW with a tightened
+band. In our kernel the **adaptive band already narrows** to the diagonal within ~1–2 rows, so the
+extra initial width is the only saving → estimated ~3% wall, against byte-identity-risky per-job band
+plumbing (the `band=0` sentinel, `max_sc_proof` formula, `max_off` interaction). Deferred pending a
+go/no-go: low reward, real parity risk.
+
+## Cumulative (this session, main baseline → LEVER 3a, code only, no PGO)
+
+SE 7.96 → 5.99s = **1.33x**; PE 16.19 → 12.57s = **1.29x**. PGO stacks (~+3–4.5%) on top.
+Starting from the ~2.2x-vs-bwa-mem2 reference point, this puts the cumulative near **~2.9x** — i.e.
+already at/above the ~2.65x fork target on this workload (relative gains are the solid result; the
+absolute vs-oracle ratio is machine/setup-dependent).
+
 **PGO notes:** below the ~10–15% estimate because ~85% of runtime is hand-written branchless NEON
 that PGO cannot improve; the gain comes from the branchy driver/seeding/SAM path. Reproducible via
 `scripts/pgo.sh` (instrument → profile 500k SE+PE → optimized rebuild). BOLT skipped (no LLVM+BOLT on
