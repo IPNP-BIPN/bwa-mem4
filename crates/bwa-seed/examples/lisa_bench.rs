@@ -16,8 +16,8 @@
 use bwa_core::MemOpt;
 use bwa_index::lisa::LearnedSa;
 use bwa_index::{FmIndex, Smem};
-use bwa_seed::lisa_seed::mem_collect_smem_lsa;
-use bwa_seed::mem_collect_smem;
+use bwa_seed::lisa_seed::{collect_smems_lsa_zigzag, mem_collect_smem_lsa};
+use bwa_seed::{collect_smems, mem_collect_smem};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -164,6 +164,44 @@ fn main() {
             let el = t.elapsed().as_secs_f64();
             println!(
                 "LISA : {} reads, {} smems, {:.3}s, {:.0} reads/s, {:.2} Mbase/s, checksum {:016x}",
+                reads.len(), nsmem, el, reads.len() as f64 / el, total_bases as f64 / el / 1e6, hash
+            );
+        }
+        "fm1" => {
+            // FM round-1 only (collect_smems, min_intv=1), for a fair head-to-head with the zigzag.
+            let fm = FmIndex::load(Path::new(&prefix)).expect("load fm");
+            let t = Instant::now();
+            let (mut hash, mut nsmem) = (0xcbf29ce484222325u64, 0usize);
+            for r in &reads {
+                let smems = collect_smems(&fm, r, opt.min_seed_len, 1);
+                nsmem += smems.len();
+                hash_smems(&mut hash, &smems);
+            }
+            let el = t.elapsed().as_secs_f64();
+            println!(
+                "FM1  : {} reads, {} smems, {:.3}s, {:.0} reads/s, {:.2} Mbase/s, checksum {:016x}",
+                reads.len(), nsmem, el, reads.len() as f64 / el, total_bases as f64 / el / 1e6, hash
+            );
+        }
+        "zz" => {
+            // Zigzag round-1 only.
+            let reference = std::fs::read(format!("{prefix}.0123")).expect("read .0123");
+            let sa = load_sa(sa_path, reference.len() + 1);
+            let n_leaves = (sa.len() >> leaves_shift).max(1);
+            eprintln!("building LearnedSa ({} leaves)...", n_leaves);
+            let tb = Instant::now();
+            let lsa = LearnedSa::from_sa(reference, sa, n_leaves);
+            eprintln!("LearnedSa built in {:.0}s", tb.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let (mut hash, mut nsmem) = (0xcbf29ce484222325u64, 0usize);
+            for r in &reads {
+                let smems = collect_smems_lsa_zigzag(&lsa, r, opt.min_seed_len);
+                nsmem += smems.len();
+                hash_smems(&mut hash, &smems);
+            }
+            let el = t.elapsed().as_secs_f64();
+            println!(
+                "ZZ   : {} reads, {} smems, {:.3}s, {:.0} reads/s, {:.2} Mbase/s, checksum {:016x}",
                 reads.len(), nsmem, el, reads.len() as f64 / el, total_bases as f64 / el / 1e6, hash
             );
         }

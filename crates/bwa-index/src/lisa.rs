@@ -289,7 +289,19 @@ impl LearnedSa {
         if best == 0 {
             return (0, 0, 0);
         }
-        let (lo, hi) = self.exact_interval(&pattern[..best]);
+        // Interval of the LEM prefix. `lo_full` (the full pattern's lower bound) sits inside this
+        // prefix interval, so it is a tight seed for both partition points — no second RMI lookup.
+        // When the whole pattern matched, `lo_full` already *is* the lower bound; only the upper
+        // bound needs a search.
+        let best_pat = &pattern[..best];
+        let lo = if best == pattern.len() {
+            lo_full
+        } else {
+            seeded_partition_point(n, lo_full, |i| self.cmp_pattern(i, best_pat) == Ordering::Less)
+        };
+        let hi = seeded_partition_point(n, lo_full, |i| {
+            self.cmp_pattern(i, best_pat) != Ordering::Greater
+        });
         (best, lo, hi)
     }
 
