@@ -52,9 +52,10 @@ pub fn collect_smems_batched(
     min_seed_len: i32,
     min_intv: i64,
 ) -> Vec<Vec<Smem>> {
-    /// Lockstep width. 8 independent walks in flight is enough to cover DRAM latency (~a few hundred
-    /// cycles) with the per-slot work between two visits to the same slot.
-    const N: usize = 8;
+    /// Lockstep width: independent walks kept in flight so each slot's prefetch has a full cycle to
+    /// land before the block is used. 16 measured ~2.8% faster than 8 on a genome-scale index (M4 Max,
+    /// SE); 24 ties it and 32 regresses, so 16 is the knee. Shared by all three batched seeding rounds.
+    const N: usize = 16;
 
     let counts = fm.counts();
     let mut output: Vec<Vec<Smem>> = (0..reads.len()).map(|_| Vec::new()).collect();
@@ -614,7 +615,7 @@ fn bwt_seed_strategy_batched(
     min_seed_len: i32,
     out: &mut [Vec<Smem>],
 ) {
-    const N: usize = 8;
+    const N: usize = 16;
     if reads.is_empty() {
         return;
     }
@@ -727,7 +728,7 @@ struct ReseedJob {
 /// its block is used. Each job's SMEMs are appended to its read in job order, identical to running
 /// [`smem_round_2`] per read.
 fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &mut [Vec<Smem>]) {
-    const N: usize = 8;
+    const N: usize = 16;
     let split_len = (opt.min_seed_len as f32 * opt.split_factor + 0.499) as i32;
 
     // Enumerate the re-seed jobs, preserving per-read append order (round-1 SMEM index ascending).
