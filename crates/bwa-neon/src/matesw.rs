@@ -11,7 +11,7 @@
 //! [`bwa_extend::ksw_align2`] on that job. The scalar per-job loop is the portable fallback and the
 //! source of truth the NEON kernels are validated against (`matesw_equals_scalar`).
 
-use bwa_extend::{ksw_local_fwd, KswAlignResult};
+use bwa_extend::KswAlignResult;
 
 /// One mate-rescue local-SW job: align `query` against `target` (both `0..=4` codes).
 #[derive(Clone, Copy)]
@@ -107,9 +107,15 @@ pub fn batched_ksw_align2(
     out
 }
 
+/// Lanes processed in lockstep per group. 8 = one NEON `int16x8`.
+const LANES: usize = 8;
+
+/// Query-column / target-row padding sentinel (`>= m`, so its cell score is forced very negative and
+/// the padded cells stay `0` — neutral to the real lanes).
+const PAD: u8 = 255;
+
 /// Batched forward local-SW pass: `out[i] = (score, te, qe, score2, te2)` for `jobs[i]`, each equal to
-/// [`ksw_local_fwd`]. The NEON inter-sequence kernel plugs in here; the scalar per-job loop is the
-/// portable fallback and the byte-identity source of truth.
+/// [`ksw_local_fwd`]. Dispatches to the NEON i16 kernel where available, else the scalar lockstep.
 #[allow(clippy::too_many_arguments)]
 fn fwd_local_sw_batch(
     jobs: &[FwdJob],
@@ -121,13 +127,389 @@ fn fwd_local_sw_batch(
     e_ins: i32,
     max_sc: i32,
 ) -> Vec<(i32, i32, i32, i32, i32)> {
-    jobs.iter()
-        .map(|j| {
-            ksw_local_fwd(
-                j.query, j.target, m, mat, o_del, e_del, o_ins, e_ins, j.minsc, j.endsc, max_sc,
-            )
-        })
-        .collect()
+    #[cfg(target_arch = "aarch64")]
+    {
+        // i16 kernel is exact while every cell fits i16. Mate-rescue scores are small; guard anyway.
+        if std::arch::is_aarch64_feature_detected!("neon") && mat_is_standard(m, mat) {
+            let safe = jobs.iter().all(|j| {
+                j.query.len() < 30000 && j.target.len() < 30000 && j.query.len() as i32 * max_sc < 30000
+            });
+            if safe {
+                // SAFETY: neon detected; i16 range guaranteed by `safe`; mat is the standard form.
+                return unsafe {
+                    fwd_local_sw_neon(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                };
+            }
+        }
+    }
+    fwd_local_sw_scalar(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+}
+
+/// Whether `mat` is bwa's standard 5x5 form (uniform match on the diagonal, uniform mismatch
+/// off-diagonal for `0..4`, `-1` for any N row/col) so the NEON kernel can compute cell scores from
+/// three scalars instead of a per-cell table lookup.
+fn mat_is_standard(m: usize, mat: &[i8]) -> bool {
+    if m != 5 {
+        return false;
+    }
+    let (mtch, mis) = (mat[0], mat[1]);
+    for i in 0..4 {
+        for j in 0..4 {
+            let want = if i == j { mtch } else { mis };
+            if mat[i * 5 + j] != want {
+                return false;
+            }
+        }
+        if mat[i * 5 + 4] != -1 || mat[4 * 5 + i] != -1 {
+            return false;
+        }
+    }
+    mat[4 * 5 + 4] == -1
+}
+
+/// Scalar lockstep reference: processes `LANES` jobs with shared row/column loops and per-lane state
+/// and masking, the structure the NEON kernel vectorizes. The scalar per-cell arithmetic here is the
+/// byte-identity source of truth (`matesw_equals_scalar`).
+#[allow(clippy::too_many_arguments)]
+fn fwd_local_sw_scalar(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    let mut out = vec![(0i32, -1i32, -1i32, 0i32, -1i32); jobs.len()];
+
+    for (g, group) in jobs.chunks(LANES).enumerate() {
+        let n = group.len();
+        let qmax = group.iter().map(|j| j.query.len()).max().unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        // SoA sequences (padded), per-lane bounds/params.
+        let mut seq_q = vec![PAD; qmax * LANES];
+        let mut seq_t = vec![PAD; tmax * LANES];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) =
+            ([0usize; LANES], [0usize; LANES], [i32::MAX; LANES], [i32::MAX; LANES]);
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES + l] = b;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES + l] = b;
+            }
+        }
+
+        // DP state (SoA over query columns).
+        let mut h_prev = vec![0i32; qmax * LANES];
+        let mut h_cur = vec![0i32; qmax * LANES];
+        let mut e = vec![0i32; qmax * LANES];
+        let mut hmax_col = vec![0i32; qmax * LANES];
+        let mut rowmax = vec![0i32; tmax * LANES]; // per-row imax, for score2
+        let mut gmax = [0i32; LANES];
+        let mut te = [-1i32; LANES];
+        let mut limit = [-1i32; LANES]; // last processed row (inclusive)
+        let mut frozen = [false; LANES];
+        for l in 0..n {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+
+        for i in 0..tmax {
+            let mut f = [0i32; LANES];
+            let mut h_diag = [0i32; LANES];
+            let mut imax = [0i32; LANES];
+            for j in 0..qmax {
+                for l in 0..LANES {
+                    let t = seq_t[i * LANES + l] as usize;
+                    let q = seq_q[j * LANES + l] as usize;
+                    let sc = if t >= m || q >= m {
+                        -30000
+                    } else {
+                        i32::from(mat[t * m + q])
+                    };
+                    let idx = j * LANES + l;
+                    let mut h = h_diag[l] + sc;
+                    if h < 0 {
+                        h = 0;
+                    }
+                    if e[idx] > h {
+                        h = e[idx];
+                    }
+                    if f[l] > h {
+                        h = f[l];
+                    }
+                    if h > imax[l] {
+                        imax[l] = h;
+                    }
+                    h_cur[idx] = h;
+                    let mut en = e[idx] - e_del;
+                    let td = h - oe_del;
+                    if td > en {
+                        en = td;
+                    }
+                    e[idx] = en.max(0);
+                    let mut fnv = f[l] - e_ins;
+                    let ti = h - oe_ins;
+                    if ti > fnv {
+                        fnv = ti;
+                    }
+                    f[l] = fnv.max(0);
+                    h_diag[l] = h_prev[idx];
+                }
+            }
+            // Per-row bookkeeping (only active lanes: within target and not frozen).
+            for l in 0..n {
+                if i >= tlen[l] || frozen[l] {
+                    continue;
+                }
+                rowmax[i * LANES + l] = imax[l];
+                if imax[l] > gmax[l] {
+                    gmax[l] = imax[l];
+                    te[l] = i as i32;
+                    for j in 0..qmax {
+                        hmax_col[j * LANES + l] = h_cur[j * LANES + l];
+                    }
+                    if gmax[l] >= endsc[l] {
+                        frozen[l] = true;
+                        limit[l] = i as i32;
+                    }
+                }
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+        }
+
+        extract_group(
+            n, g, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
+        );
+    }
+    out
+}
+
+/// Shared per-lane output extraction (`qe`, `score2`/`te2`) from a group's filled DP state, exactly
+/// as [`ksw_local_fwd`]. Used by both the scalar and NEON DP paths so they cannot drift. `rowmax`
+/// (per-row imax) and `hmax_col` (H column at the best row) are SoA `[pos*LANES + lane]`.
+#[allow(clippy::too_many_arguments)]
+fn extract_group(
+    n: usize,
+    g: usize,
+    qlen: &[usize; LANES],
+    minsc: &[i32; LANES],
+    max_sc: i32,
+    gmax: &[i32; LANES],
+    te: &[i32; LANES],
+    limit: &[i32; LANES],
+    rowmax: &[i32],
+    hmax_col: &[i32],
+    out: &mut [(i32, i32, i32, i32, i32)],
+) {
+    for l in 0..n {
+        let g_ = gmax[l];
+        let te_ = te[l];
+        // qe = smallest query column reaching the H max at the best target row (min index on tie).
+        let mut qe = -1i32;
+        if te_ >= 0 {
+            let mut mx = -1i32;
+            for j in 0..qlen[l] {
+                let v = hmax_col[j * LANES + l];
+                if v > mx {
+                    mx = v;
+                    qe = j as i32;
+                }
+            }
+        }
+        // score2: rebuild ksw_local_fwd's `b` list (row-maxes >= minsc, consecutive rows merged
+        // keeping the higher AND advancing the column only on an update), then take the best entry
+        // whose column lies outside [te - w, te + w].
+        let mut score2 = 0i32;
+        let mut te2 = -1i32;
+        let mut b: Vec<(i32, i32)> = Vec::new();
+        if limit[l] >= 0 {
+            for i in 0..=limit[l] {
+                let im = rowmax[i as usize * LANES + l];
+                if im >= minsc[l] {
+                    match b.last() {
+                        Some(&(_, col)) if col + 1 == i => {
+                            if b.last().unwrap().0 < im {
+                                *b.last_mut().unwrap() = (im, i);
+                            }
+                        }
+                        _ => b.push((im, i)),
+                    }
+                }
+            }
+        }
+        if g_ > 0 && !b.is_empty() {
+            let w = (g_ + max_sc - 1) / max_sc;
+            let (low, high) = (te_ - w, te_ + w);
+            for &(bs, bc) in &b {
+                if (bc < low || bc > high) && bs > score2 {
+                    score2 = bs;
+                    te2 = bc;
+                }
+            }
+        }
+        out[g * LANES + l] = (g_, te_, qe, score2, te2);
+    }
+}
+
+/// NEON i16x8 forward local-SW. Vectorizes the [`fwd_local_sw_scalar`] control flow across `LANES`
+/// jobs: the inner cell recurrence runs on `int16x8` (one lane per job), the per-row bookkeeping and
+/// [`extract_group`] stay scalar. Requires the standard 5x5 `mat` (checked by the caller) so a cell
+/// score is `match`/`mismatch`/`-1(N)` chosen by compares. Every value must fit i16 (caller-guarded).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fwd_local_sw_neon(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    use std::arch::aarch64::*;
+
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    let mtch = mat[0] as i16;
+    let mis = mat[1] as i16;
+    let mut out = vec![(0i32, -1i32, -1i32, 0i32, -1i32); jobs.len()];
+
+    // Broadcast constants.
+    let zero = vdupq_n_s16(0);
+    let mtch_v = vdupq_n_s16(mtch);
+    let mis_v = vdupq_n_s16(mis);
+    let n_v = vdupq_n_s16(-1);
+    let neg_v = vdupq_n_s16(-30000);
+    let four_v = vdupq_n_s16(4);
+    let m_v = vdupq_n_s16(m as i16);
+    let e_del_v = vdupq_n_s16(e_del as i16);
+    let oe_del_v = vdupq_n_s16(oe_del as i16);
+    let e_ins_v = vdupq_n_s16(e_ins as i16);
+    let oe_ins_v = vdupq_n_s16(oe_ins as i16);
+
+    for (g, group) in jobs.chunks(LANES).enumerate() {
+        let n = group.len();
+        let qmax = group.iter().map(|j| j.query.len()).max().unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        // SoA sequences (u8, padded) + per-lane bounds/params.
+        let mut seq_q = vec![PAD; qmax * LANES];
+        let mut seq_t = vec![PAD; tmax * LANES];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) =
+            ([0usize; LANES], [0usize; LANES], [i32::MAX; LANES], [i32::MAX; LANES]);
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES + l] = b;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES + l] = b;
+            }
+        }
+
+        // i16 SoA DP state.
+        let mut h_prev = vec![0i16; qmax * LANES];
+        let mut h_cur = vec![0i16; qmax * LANES];
+        let mut e = vec![0i16; qmax * LANES];
+        let mut hmax_col = vec![0i32; qmax * LANES];
+        let mut rowmax = vec![0i32; tmax * LANES];
+        let mut gmax = [0i32; LANES];
+        let mut te = [-1i32; LANES];
+        let mut limit = [-1i32; LANES];
+        let mut frozen = [false; LANES];
+        for l in 0..n {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+
+        // Widen 8 u8 codes at `off` into an int16x8 (lanes = jobs).
+        let load_codes = |buf: &[u8], off: usize| -> int16x8_t {
+            vreinterpretq_s16_u16(vmovl_u8(vld1_u8(buf.as_ptr().add(off))))
+        };
+
+        for i in 0..tmax {
+            let t_v = load_codes(&seq_t, i * LANES);
+            let mut f_v = zero;
+            let mut h_diag_v = zero;
+            let mut imax_v = zero;
+            for j in 0..qmax {
+                let q_v = load_codes(&seq_q, j * LANES);
+                // Cell score: match/mismatch, then N override (-1), then padding override (very neg).
+                let eq = vceqq_s16(t_v, q_v);
+                let n_mask = vorrq_u16(vceqq_s16(t_v, four_v), vceqq_s16(q_v, four_v));
+                let pad_mask = vorrq_u16(vcgeq_s16(t_v, m_v), vcgeq_s16(q_v, m_v));
+                let mut sc = vbslq_s16(eq, mtch_v, mis_v);
+                sc = vbslq_s16(n_mask, n_v, sc);
+                sc = vbslq_s16(pad_mask, neg_v, sc);
+
+                let e_v = vld1q_s16(e.as_ptr().add(j * LANES));
+                let mut h_v = vaddq_s16(h_diag_v, sc);
+                h_v = vmaxq_s16(h_v, zero);
+                h_v = vmaxq_s16(h_v, e_v);
+                h_v = vmaxq_s16(h_v, f_v);
+                imax_v = vmaxq_s16(imax_v, h_v);
+                vst1q_s16(h_cur.as_mut_ptr().add(j * LANES), h_v);
+
+                let en = vmaxq_s16(vsubq_s16(e_v, e_del_v), vsubq_s16(h_v, oe_del_v));
+                vst1q_s16(e.as_mut_ptr().add(j * LANES), vmaxq_s16(en, zero));
+                let fnv = vmaxq_s16(vsubq_s16(f_v, e_ins_v), vsubq_s16(h_v, oe_ins_v));
+                f_v = vmaxq_s16(fnv, zero);
+                h_diag_v = vld1q_s16(h_prev.as_ptr().add(j * LANES));
+            }
+
+            // Per-row bookkeeping (scalar per lane).
+            let mut imax_arr = [0i16; LANES];
+            vst1q_s16(imax_arr.as_mut_ptr(), imax_v);
+            for l in 0..n {
+                if i >= tlen[l] || frozen[l] {
+                    continue;
+                }
+                let im = imax_arr[l] as i32;
+                rowmax[i * LANES + l] = im;
+                if im > gmax[l] {
+                    gmax[l] = im;
+                    te[l] = i as i32;
+                    for j in 0..qmax {
+                        hmax_col[j * LANES + l] = h_cur[j * LANES + l] as i32;
+                    }
+                    if gmax[l] >= endsc[l] {
+                        frozen[l] = true;
+                        limit[l] = i as i32;
+                    }
+                }
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+
+            // Early exit once no lane can still advance.
+            if (0..n).all(|l| frozen[l] || i + 1 >= tlen[l]) {
+                break;
+            }
+        }
+
+        extract_group(
+            n, g, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -174,22 +556,34 @@ mod tests {
         // Build a pool of jobs and their owned buffers.
         let mut qbufs: Vec<Vec<u8>> = Vec::new();
         let mut tbufs: Vec<Vec<u8>> = Vec::new();
-        for _ in 0..400 {
-            let qlen = 40 + (next() % 111) as usize; // 40..=150
-            let tlen = qlen + (next() % 400) as usize; // window >= query
+        for _ in 0..2000 {
+            let qlen = 5 + (next() % 146) as usize; // 5..=150 (varied lens exercise padding)
+            let tlen = qlen + (next() % 500) as usize; // window >= query
             let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
             let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
-            // Embed a mutated copy of the query into the target so a local alignment exists.
-            if next() % 4 != 0 {
-                let at = (next() as usize) % (tlen - qlen + 1);
-                for k in 0..qlen {
-                    t[at + k] = q[k];
+            // Embed one or two mutated copies of the query into the target so local alignments (and a
+            // 2nd-best, for score2) exist.
+            let copies = 1 + (next() % 2);
+            if next() % 5 != 0 {
+                for _ in 0..copies {
+                    if tlen > qlen {
+                        let at = (next() as usize) % (tlen - qlen + 1);
+                        for k in 0..qlen {
+                            t[at + k] = q[k];
+                        }
+                    }
                 }
-                // a couple of substitutions
                 for _ in 0..(next() % 4) {
                     let p = (next() as usize) % qlen;
                     q[p] = (next() % 4) as u8;
                 }
+            }
+            // Inject N bases (code 4) sometimes, in query and/or target.
+            if next() % 4 == 0 {
+                q[(next() as usize) % qlen] = 4;
+            }
+            if next() % 4 == 0 {
+                t[(next() as usize) % tlen] = 4;
             }
             qbufs.push(q);
             tbufs.push(t);
