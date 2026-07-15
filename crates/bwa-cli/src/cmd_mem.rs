@@ -220,19 +220,15 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
             .map(|rec| rec.seq.iter().map(|&b| dna::nt4(b)).collect())
             .collect();
         let regs_all = batched_regs(&fm, &bns, &opt, &all_codes, backend);
+        // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
+        // `into_par_iter` yields the owned `Vec<MemAlnReg>`, dropping a per-read Vec allocation+copy.
         let lines: Vec<Vec<u8>> = batch
             .par_iter()
+            .zip(all_codes.par_iter())
+            .zip(regs_all.into_par_iter())
             .enumerate()
-            .map(|(i, rec)| {
-                finish_se(
-                    &fm,
-                    &bns,
-                    &opt,
-                    rec,
-                    &all_codes[i],
-                    regs_all[i].clone(),
-                    base_id + i as u64,
-                )
+            .map(|(i, ((rec, codes), regs_pre))| {
+                finish_se(&fm, &bns, &opt, rec, codes, regs_pre, base_id + i as u64)
             })
             .collect();
         let mut buf = Vec::with_capacity(lines.iter().map(Vec::len).sum());
@@ -437,14 +433,26 @@ fn run_pe(
             })
             .collect();
         let regs_all = batched_regs(fm, bns, opt, &all_codes, backend);
+        // Pair up each mate's owned codes + regions by sequential moves (no content copy), so the
+        // parallel prep can consume them instead of cloning `all_codes[2i]`/`regs_all[2i]` per pair.
+        let mut code_it = all_codes.into_iter();
+        let mut reg_it = regs_all.into_iter();
+        #[allow(clippy::type_complexity)]
+        let paired: Vec<((Vec<u8>, Vec<u8>), (Vec<MemAlnReg>, Vec<MemAlnReg>))> = (0..batch.len())
+            .map(|_| {
+                let c1 = code_it.next().unwrap();
+                let c2 = code_it.next().unwrap();
+                let r1 = reg_it.next().unwrap();
+                let r2 = reg_it.next().unwrap();
+                ((c1, c2), (r1, r2))
+            })
+            .collect();
         let mut prepared: Vec<PrepPair> = batch
             .par_iter()
-            .enumerate()
-            .map(|(i, (r1, r2))| {
-                let c1 = all_codes[2 * i].clone();
-                let c2 = all_codes[2 * i + 1].clone();
-                let a1 = mem_sort_dedup_patch(fm, opt, &c1, regs_all[2 * i].clone());
-                let a2 = mem_sort_dedup_patch(fm, opt, &c2, regs_all[2 * i + 1].clone());
+            .zip(paired.into_par_iter())
+            .map(|((r1, r2), ((c1, c2), (rg1, rg2)))| {
+                let a1 = mem_sort_dedup_patch(fm, opt, &c1, rg1);
+                let a2 = mem_sort_dedup_patch(fm, opt, &c2, rg2);
                 PrepPair {
                     c1,
                     c2,
