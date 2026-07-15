@@ -137,7 +137,13 @@ pub fn mem_chain2aln(
         std::cmp::Reverse((u64::from(chain.seeds[i].score as u32) << 32) | i as u64)
     });
 
+    // Same contained-seed extension skip as the batched path (they must stay region-identical).
+    let skip_contained = crate::across::skip_contained_enabled();
+
     for &si in &order {
+        if skip_contained && crate::across::seed_ext_redundant(&chain.seeds, si) {
+            continue;
+        }
         let s = chain.seeds[si];
         let mut a = MemAlnReg {
             rb: H0_SENTINEL,

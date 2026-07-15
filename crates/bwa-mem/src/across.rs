@@ -20,7 +20,64 @@ use bwa_chain::{build_chains_from_smems, mem_chain_flt, MemChain};
 use bwa_core::MemOpt;
 use bwa_extend::{ExtendJob, SwBackend};
 use bwa_index::{BntSeq, FmIndex};
-use bwa_seed::mem_collect_smem_batched;
+use bwa_seed::{mem_collect_smem_batched, MemSeed};
+
+/// nh13's `mem_seed_ext_redundant` (`--skip-contained-ext`, byte-identical on non-methylation SE/PE):
+/// true when seed `si` is strictly contained, on the same diagonal, in a longer seed of the same
+/// chain, and no comparably long seed interferes on a different diagonal. The longest seed on a
+/// diagonal is always extended and its alnreg covers the contained one, whose own region is dropped by
+/// the containment dedup anyway — so skipping its banded-SW extension is output-preserving. The seed
+/// stays in the chain, so seedcov/MAPQ are unaffected. This lets the batched extension recover the
+/// per-seed skip bwa-mem2 does sequentially (and which up-front batching otherwise loses).
+/// Whether same-diagonal contained-seed extension skipping is enabled (nh13 `--skip-contained-ext`).
+/// On by default (byte-identical, measured +7.7% SE / +5% PE); `BWA3_NO_SKIP_CONTAINED` opts out.
+/// Cached: the two extension paths (batched [`align_reads_batched`] and per-read `mem_chain2aln`)
+/// must agree, so they share this one decision.
+pub(crate) fn skip_contained_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BWA3_NO_SKIP_CONTAINED").is_none())
+}
+
+pub(crate) fn seed_ext_redundant(seeds: &[MemSeed], si: usize) -> bool {
+    let s = seeds[si];
+    let sd = s.rbeg - i64::from(s.qbeg);
+    let mut has_container = false;
+    for (j, t) in seeds.iter().enumerate() {
+        if j == si || t.len <= s.len {
+            continue; // must be strictly longer
+        }
+        if t.rbeg - i64::from(t.qbeg) != sd {
+            continue; // must be the same diagonal
+        }
+        if s.qbeg >= t.qbeg && s.qbeg + s.len <= t.qbeg + t.len {
+            has_container = true;
+            break;
+        }
+    }
+    if !has_container {
+        return false;
+    }
+    // Interference guard (mirrors the PE18 purge): a seed >= 0.95*len overlapping s on a *different*
+    // diagonal by >= s.len/4 could lead to a distinct alignment, so s must be extended after all.
+    for (j, u) in seeds.iter().enumerate() {
+        if j == si || (f64::from(u.len)) < f64::from(s.len) * 0.95 {
+            continue;
+        }
+        if s.qbeg <= u.qbeg
+            && s.qbeg + s.len - u.qbeg >= s.len >> 2
+            && i64::from(u.qbeg) - i64::from(s.qbeg) != u.rbeg - s.rbeg
+        {
+            return false;
+        }
+        if u.qbeg <= s.qbeg
+            && u.qbeg + u.len - s.qbeg >= s.len >> 2
+            && i64::from(s.qbeg) - i64::from(u.qbeg) != s.rbeg - u.rbeg
+        {
+            return false;
+        }
+    }
+    true
+}
 
 /// One pending one-sided extension, with a back-pointer to the region it fills.
 struct SideJob {
@@ -66,6 +123,9 @@ pub fn align_reads_batched<B: SwBackend>(
     let mut left_jobs: Vec<SideJob> = Vec::new();
     let mut right_jobs: Vec<SideJob> = Vec::new();
 
+    // Skip banded-SW for same-diagonal contained seeds (output-preserving; nh13 --skip-contained-ext).
+    let skip_contained = skip_contained_enabled();
+
     // ---- collection pass: one region skeleton + up to one left and one right job per seed ----
     for (r, codes) in reads.iter().enumerate() {
         let l_query = codes.len() as i32;
@@ -104,6 +164,9 @@ pub fn align_reads_batched<B: SwBackend>(
             });
 
             for &si in &order {
+                if skip_contained && seed_ext_redundant(&chain.seeds, si) {
+                    continue;
+                }
                 let s = chain.seeds[si];
                 let mut a = MemAlnReg {
                     rb: H0_SENTINEL,
