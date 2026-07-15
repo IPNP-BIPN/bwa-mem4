@@ -46,7 +46,7 @@ pub struct MemArgs {
 /// expose `std::io::Write` so the formatting/writing paths stay generic; `finish` drains the BGZF
 /// worker pool and writes the EOF marker (surfacing errors the `Drop` path would swallow).
 enum Output {
-    Plain(Box<dyn Write>),
+    Plain(Box<dyn Write + Send>),
     Bgzf(Box<bgzf::MultithreadedWriter<Box<dyn Write + Send>>>),
 }
 
@@ -80,7 +80,7 @@ impl Output {
                     .is_some_and(|e| e.eq_ignore_ascii_case("gz") || e.eq_ignore_ascii_case("bgz"));
                 let file = std::fs::File::create(p)?;
                 if bgzf {
-                    let sink: Box<dyn Write + Send> = Box::new(BufWriter::new(file));
+                    let sink: Box<dyn Write + Send> = Box::new(BufWriter::with_capacity(1 << 20, file));
                     let level = bgzf::CompressionLevel::new(6)
                         .map_err(|e| anyhow::anyhow!("bgzf compression level: {e}"))?;
                     let workers = std::num::NonZero::new(threads.max(1))
@@ -105,6 +105,48 @@ impl Output {
         }
         Ok(())
     }
+}
+
+/// Overlap I/O with compute. A **reader** thread produces batches (opening the FASTQ *inside* the
+/// thread, so the reader never crosses a thread boundary — only the `Send` record batches do), the
+/// main thread aligns+formats each batch (internally parallel across the rayon pool) into one byte
+/// buffer, and a **writer** thread drains those buffers. Bounded channels cap the batches in flight.
+///
+/// Output order equals read order (one reader → sequential main → one writer), and batch boundaries
+/// are fixed by `-K`, so the output is byte-identical to the old serial read→align→write loop — the
+/// serial read and write are simply hidden behind the next batch's compute.
+fn run_pipeline<B: Send>(
+    out: Output,
+    read_batches: impl FnOnce(std::sync::mpsc::SyncSender<(B, u64)>) -> anyhow::Result<()> + Send,
+    process: impl Fn(B, u64) -> Vec<u8>,
+) -> anyhow::Result<()> {
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        // A couple of batches read-ahead / write-behind is enough to hide I/O behind compute.
+        let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<(B, u64)>(2);
+        let (line_tx, line_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(3);
+
+        let reader = scope.spawn(move || read_batches(batch_tx));
+        let writer = scope.spawn(move || -> anyhow::Result<()> {
+            let mut out = out;
+            for buf in line_rx {
+                out.write_all(&buf)?;
+            }
+            out.finish()?;
+            Ok(())
+        });
+
+        for (batch, base_id) in batch_rx {
+            let buf = process(batch, base_id);
+            if line_tx.send(buf).is_err() {
+                break; // writer exited; its error surfaces on join below
+            }
+        }
+        drop(line_tx);
+
+        reader.join().expect("reader thread panicked")?;
+        writer.join().expect("writer thread panicked")?;
+        Ok(())
+    })
 }
 
 pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
@@ -146,26 +188,37 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let backend = Backend::select(args.gpu);
 
     if let Some(reads2) = args.reads2.clone() {
-        run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, &mut out)?;
-        out.finish()?;
-        return Ok(());
+        return run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, out);
     }
 
-    let mut reader = FastqReader::from_path(&args.reads)?;
-    let mut base_id = 0u64;
-    loop {
-        let batch = reader.next_batch(k_batch)?;
-        if batch.is_empty() {
-            break;
+    // Reader thread: open the FASTQ here and stream fixed-`-K` batches with their cumulative base id.
+    let reads_path = args.reads.clone();
+    let read_batches = move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
+        let mut reader = FastqReader::from_path(&reads_path)?;
+        let mut base_id = 0u64;
+        loop {
+            let batch = reader.next_batch(k_batch)?;
+            if batch.is_empty() {
+                break;
+            }
+            let n = batch.len() as u64;
+            if tx.send((batch, base_id)).is_err() {
+                break;
+            }
+            base_id += n;
         }
+        Ok(())
+    };
+
+    // Main: seed -> chain -> BATCHED seed extension across the whole read batch (NEON backend),
+    // mirroring bwa-mem2's mem_chain2aln_across_reads_V2. Chunked so extension parallelizes; each
+    // read's regions are independent of chunk composition, so output stays byte-identical at any
+    // thread count once -K fixes the batch boundaries.
+    let process = |batch: Vec<Record>, base_id: u64| -> Vec<u8> {
         let all_codes: Vec<Vec<u8>> = batch
             .iter()
             .map(|rec| rec.seq.iter().map(|&b| dna::nt4(b)).collect())
             .collect();
-        // Seed -> chain -> BATCHED seed extension across the whole read batch (NEON backend),
-        // mirroring bwa-mem2's mem_chain2aln_across_reads_V2. Chunked so extension parallelizes; each
-        // read's regions are independent of chunk composition, so output stays byte-identical at any
-        // thread count once -K fixes the batch boundaries.
         let regs_all = batched_regs(&fm, &bns, &opt, &all_codes, backend);
         let lines: Vec<Vec<u8>> = batch
             .par_iter()
@@ -182,13 +235,14 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
                 )
             })
             .collect();
+        let mut buf = Vec::with_capacity(lines.iter().map(Vec::len).sum());
         for l in &lines {
-            out.write_all(l)?;
+            buf.extend_from_slice(l);
         }
-        base_id += batch.len() as u64;
-    }
-    out.finish()?;
-    Ok(())
+        buf
+    };
+
+    run_pipeline(out, read_batches, process)
 }
 
 /// Seed + chain + batched extension for a whole read batch, returning each read's pre-dedup regions
@@ -338,7 +392,7 @@ fn finish_se(
 /// (`mem_pestat`), then emit paired SAM (`mem_sam_pe`). The pair index is global across batches (for
 /// the `hash` tie-break), matching bwa-mem2's `(n_processed>>1)+i`.
 #[allow(clippy::too_many_arguments)]
-fn run_pe<W: std::io::Write>(
+fn run_pe(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
@@ -346,18 +400,33 @@ fn run_pe<W: std::io::Write>(
     reads2: &std::path::Path,
     k_batch: usize,
     backend: Backend,
-    out: &mut W,
+    out: Output,
 ) -> anyhow::Result<()> {
-    let mut reader = PairedFastqReader::from_paths(reads1, reads2)?;
-    let mut base_pair = 0u64;
-    loop {
-        let batch = reader.next_batch(k_batch)?;
-        if batch.is_empty() {
-            break;
-        }
-        // Seed -> chain -> BATCHED extension over both ends of every pair (interleaved c1,c2,...),
-        // then per-read dedup. Regions are per-read independent, so this is byte-identical to the
-        // per-read path; primary marking and pairing happen later, per bwa-mem2.
+    // Reader thread: open the mate files here and stream fixed-`-K` pair batches with the cumulative
+    // pair id (global across batches for the `hash` tie-break, matching bwa-mem2's `(n_processed>>1)+i`).
+    let (reads1, reads2) = (reads1.to_owned(), reads2.to_owned());
+    let read_batches =
+        move |tx: std::sync::mpsc::SyncSender<(Vec<(Record, Record)>, u64)>| -> anyhow::Result<()> {
+            let mut reader = PairedFastqReader::from_paths(&reads1, &reads2)?;
+            let mut base_pair = 0u64;
+            loop {
+                let batch = reader.next_batch(k_batch)?;
+                if batch.is_empty() {
+                    break;
+                }
+                let n = batch.len() as u64;
+                if tx.send((batch, base_pair)).is_err() {
+                    break;
+                }
+                base_pair += n;
+            }
+            Ok(())
+        };
+
+    // Seed -> chain -> BATCHED extension over both ends of every pair (interleaved c1,c2,...), then
+    // per-read dedup. Regions are per-read independent, so this is byte-identical to the per-read
+    // path; primary marking and pairing happen later, per bwa-mem2.
+    let process = |batch: Vec<(Record, Record)>, base_pair: u64| -> Vec<u8> {
         let all_codes: Vec<Vec<u8>> = batch
             .iter()
             .flat_map(|(r1, r2)| {
@@ -422,12 +491,14 @@ fn run_pe<W: std::io::Write>(
                 buf
             })
             .collect();
+        let mut buf = Vec::with_capacity(bufs.iter().map(Vec::len).sum());
         for b in &bufs {
-            out.write_all(b)?;
+            buf.extend_from_slice(b);
         }
-        base_pair += batch.len() as u64;
-    }
-    Ok(())
+        buf
+    };
+
+    run_pipeline(out, read_batches, process)
 }
 
 /// One read pair prepared for the pairing/output stage: nt4 codes, dedup'd regions, names, quals.
