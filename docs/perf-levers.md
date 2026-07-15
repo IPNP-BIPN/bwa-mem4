@@ -76,8 +76,17 @@ And the binding constraint is **latency, not throughput** (measured: breaking th
 a 2nd stream to hide it → register spill, ILP experiment = parity/102 spills). The diff-recurrence cuts
 *total ops* (throughput), which is free-but-useless on a latency-bound kernel — it neither shortens the
 2-op chain nor frees registers for a 2nd stream. The "~2.1x reported elsewhere" is versus a naive
-kernel with neither optimization. Full anti-diagonal SIMD port would also mis-fit short reads (short
-anti-diagonals → poor lane fill) and risks 6-field byte-identity. Not pursued.
+kernel with neither optimization.
+
+**Attempted + measured (the decisive STOP): the diff-recurrence is algorithmically incompatible with
+byte-identity.** Its int8/short-chain algebra needs a **non-local** recurrence (`M = H(i-1,j-1)+s`),
+but bwa-mem2's `ksw_extend2` is **local** — `M = (H(i-1,j-1)==0)?0:H+s`, a Smith-Waterman restart whose
+`==0` is an *absolute* test that pure differences cannot express. Implemented the non-local recurrence
+(`crates/bwa-extend/src/sw_diff.rs`, verbatim `ksw_extend2` minus the restart) and ran the acceptance
+gate: **diverged 3498/20000 = 17.5%** of cases (test `diff_recurrence_divergence_rate`). Wherever the
+local restart fires, the diff-recurrence gives a different alignment. STOP — cannot be made
+byte-identical without abandoning the difference algebra that is its only benefit. (This is why the
+fork and bwa-mem2 both use materialized-`H` `bandedSWA`, not a difference recurrence.)
 
 ## Per-lever summary
 

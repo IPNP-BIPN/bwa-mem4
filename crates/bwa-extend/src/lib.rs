@@ -4,6 +4,7 @@
 //! NEON/Metal backends must reproduce its integer results.
 
 pub mod sw;
+pub mod sw_diff;
 
 pub use sw::{ksw_align2, ksw_extend2, ksw_global2, ExtendResult, KswAlignResult};
 
