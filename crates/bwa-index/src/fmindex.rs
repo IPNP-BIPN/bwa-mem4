@@ -264,6 +264,96 @@ impl FmIndex {
         sa_entry + offset
     }
 
+    /// Prefetch the single `cp_occ` checkpoint block that the LF-walk step at `pos` will touch. A
+    /// pure hint (never faults or writes); no-op off AArch64/x86_64.
+    #[inline]
+    fn prefetch_cp(&self, pos: i64) {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let p = self.cp_occ.as_ptr().add((pos >> 6) as usize);
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(self.cp_occ.as_ptr().add((pos >> 6) as usize) as *const i8, _MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = pos;
+    }
+
+    /// [`get_sa`] for many independent positions at once. Each `get_sa` is a data-dependent LF-walk
+    /// (each step a random `cp_occ` block load), but distinct positions are independent, so running a
+    /// **window** of them in lockstep — prefetch every active slot's next block, then advance all one
+    /// step — keeps many DRAM misses in flight and hides the latency. Result-identical to calling
+    /// [`get_sa`] per position; `out[i]` receives `get_sa(positions[i])`.
+    pub fn get_sa_batch(&self, positions: &[i64], out: &mut [i64]) {
+        debug_assert_eq!(positions.len(), out.len());
+        const W: usize = 32;
+        let sa = |p: i64| -> i64 {
+            let idx = (p >> 3) as usize;
+            (i64::from(self.sa_ms_byte[idx]) << 32) + i64::from(self.sa_ls_word[idx])
+        };
+        let mut base = 0usize;
+        while base < positions.len() {
+            let w = (positions.len() - base).min(W);
+            let mut sp = [0i64; W];
+            let mut off = [0i32; W];
+            let mut slot = [0u8; W]; // still-walking local indices [0, w)
+            let mut nact = 0usize;
+            for j in 0..w {
+                let pos = positions[base + j];
+                if pos & 7 == 0 {
+                    out[base + j] = sa(pos);
+                } else {
+                    sp[j] = pos;
+                    off[j] = 0;
+                    slot[nact] = j as u8;
+                    nact += 1;
+                }
+            }
+            while nact > 0 {
+                for a in 0..nact {
+                    self.prefetch_cp(sp[slot[a] as usize]);
+                }
+                let mut wr = 0usize;
+                for a in 0..nact {
+                    let j = slot[a] as usize;
+                    let spi = sp[j];
+                    let occ_id = (spi >> 6) as usize;
+                    let y = 63 - (spi & 63);
+                    let oh = self.cp_occ[occ_id].one_hot;
+                    let b = if (oh[0] >> y) & 1 == 1 {
+                        0
+                    } else if (oh[1] >> y) & 1 == 1 {
+                        1
+                    } else if (oh[2] >> y) & 1 == 1 {
+                        2
+                    } else if (oh[3] >> y) & 1 == 1 {
+                        3
+                    } else {
+                        4
+                    };
+                    if b == 4 {
+                        out[base + j] = i64::from(off[j]);
+                        continue;
+                    }
+                    let nsp = self.count[b] + self.get_occ(spi, b);
+                    off[j] += 1;
+                    if nsp & 7 == 0 {
+                        out[base + j] = sa(nsp) + i64::from(off[j]);
+                    } else {
+                        sp[j] = nsp;
+                        slot[wr] = j as u8;
+                        wr += 1;
+                    }
+                }
+                nact = wr;
+            }
+            base += w;
+        }
+    }
+
     /// The binary reference base (0-3) at position `pos` in `[0, 2L)`.
     #[inline]
     pub fn base(&self, pos: i64) -> u8 {

@@ -150,15 +150,33 @@ pub fn build_chains_from_smems(
     let mut chains: Vec<MemChain> = Vec::new();
     let mut tree: BTreeMap<i64, usize> = BTreeMap::new();
 
+    // Pass 1: gather every sampled occurrence position (in the exact order the merge consumes them)
+    // and each SMEM's sampled count. Each `get_sa` is a random-access LF-walk, so resolving them all
+    // in one lockstep+prefetch batch hides the DRAM latency (vs. one serial walk per occurrence).
+    let mut positions: Vec<i64> = Vec::new();
+    let mut counts: Vec<i64> = Vec::with_capacity(smems.len());
     for p in &smems {
-        let slen = (p.n + 1 - p.m) as i32;
         let step = if p.s > max_occ { p.s / max_occ } else { 1 };
         let mut k = 0i64;
         let mut count = 0i64;
         while k < p.s && count < max_occ {
-            let rbeg = fm.get_sa(p.k + k);
+            positions.push(p.k + k);
             k += step;
             count += 1;
+        }
+        counts.push(count);
+    }
+    let mut rbegs = vec![0i64; positions.len()];
+    fm.get_sa_batch(&positions, &mut rbegs);
+
+    // Pass 2: merge, replaying the original per-occurrence logic with precomputed `rbeg` values
+    // (same values, same order -> byte-identical chains).
+    let mut pi = 0usize;
+    for (si, p) in smems.iter().enumerate() {
+        let slen = (p.n + 1 - p.m) as i32;
+        for _ in 0..counts[si] {
+            let rbeg = rbegs[pi];
+            pi += 1;
             let s = MemSeed {
                 rbeg,
                 qbeg: p.m as i32,
