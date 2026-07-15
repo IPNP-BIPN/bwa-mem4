@@ -315,19 +315,29 @@ impl LearnedSa {
         if len == 0 || (hi - lo) as i64 >= min_intv {
             return (len, lo, hi);
         }
-        let mut l = len;
-        loop {
-            if l <= 1 {
-                // Even the single base is too rare (only under min_intv > its global count): no seed.
-                let (a, b) = self.exact_interval(&pattern[..1]);
-                return if (b - a) as i64 >= min_intv { (1, a, b) } else { (0, 0, 0) };
-            }
-            l -= 1;
+        // Occurrence count is non-increasing in the prefix length, so the target length (longest L
+        // with occ(L) >= min_intv) is a threshold crossing: binary-search it instead of shortening one
+        // base at a time (which is O(len) searches — the dominant cost of round-2 reseeding).
+        let occ = |l: usize| -> i64 {
             let (a, b) = self.exact_interval(&pattern[..l]);
-            if (b - a) as i64 >= min_intv {
-                return (l, a, b);
+            (b - a) as i64
+        };
+        // Smallest L in [1, len] with occ(L) < min_intv (occ(len) < min_intv guaranteed here).
+        let (mut a, mut b) = (1usize, len);
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if occ(mid) < min_intv {
+                b = mid;
+            } else {
+                a = mid + 1;
             }
         }
+        let l = a - 1; // longest length still occurring >= min_intv times
+        if l == 0 {
+            return (0, 0, 0);
+        }
+        let (lo2, hi2) = self.exact_interval(&pattern[..l]);
+        (l, lo2, hi2)
     }
 
     /// Reference positions where `pattern` occurs exactly (the `sa` values of [`Self::exact_interval`]).
