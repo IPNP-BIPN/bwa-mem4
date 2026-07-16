@@ -105,7 +105,7 @@ pub fn mem_chain2aln(
     chain: &MemChain,
     out: &mut Vec<MemAlnReg>,
 ) {
-    mem_chain2aln_meta(fm, bns, opt, codes, 0, chain, out, &mut Vec::new());
+    mem_chain2aln_meta(fm, bns, opt, codes, 0, chain, out, &mut Vec::new(), &mut Vec::new());
 }
 
 /// `mem_chain2aln`, additionally recording each emitted region's [`RegMeta`] so the caller can run
@@ -120,6 +120,7 @@ pub(crate) fn mem_chain2aln_meta(
     chain: &MemChain,
     out: &mut Vec<MemAlnReg>,
     meta: &mut Vec<RegMeta>,
+    preskip: &mut Vec<bool>,
 ) {
     if chain.seeds.is_empty() {
         return;
@@ -159,11 +160,34 @@ pub(crate) fn mem_chain2aln_meta(
 
     // Same contained-seed extension skip as the batched path (they must stay region-identical), and
     // the same mutual exclusion with the discard pass, which needs one slot per seed.
-    let skip_contained =
-        crate::across::skip_contained_enabled() && !crate::across::discard_enabled();
+    let skip_contained = crate::across::skip_contained_enabled();
 
     for (pos, &si) in order.iter().enumerate() {
         if skip_contained && crate::across::seed_ext_redundant(&chain.seeds, si) {
+            // Keep the slot (the discard pass reproduces bwa-mem2's scan order), skip the DP.
+            meta.push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+            preskip.push(true);
+            out.push(MemAlnReg {
+                rb: -1,
+                re: -1,
+                qb: -1,
+                qe: -1,
+                rid: chain.rid,
+                score: -1,
+                truesc: -1,
+                sub: 0,
+                csub: 0,
+                sub_n: 0,
+                seedcov: 0,
+                seedlen0: chain.seeds[si].len,
+                secondary: -1,
+                secondary_all: -1,
+                w: opt.w,
+                frac_rep: chain.frac_rep,
+                is_alt: chain.is_alt,
+                hash: 0,
+                n_comp: 1,
+            });
             continue;
         }
         let s = chain.seeds[si];
@@ -253,6 +277,7 @@ pub(crate) fn mem_chain2aln_meta(
             }
         }
         meta.push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+        preskip.push(false);
         out.push(a);
     }
 }
@@ -262,13 +287,21 @@ pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec
     let chains = mem_chain_flt(opt, build_chains(fm, bns, opt, codes, 0));
     let mut regs = Vec::new();
     let mut meta = Vec::new();
+    let mut preskip = Vec::new();
     for (ci, c) in chains.iter().enumerate() {
-        mem_chain2aln_meta(fm, bns, opt, codes, ci, c, &mut regs, &mut meta);
+        mem_chain2aln_meta(fm, bns, opt, codes, ci, c, &mut regs, &mut meta, &mut preskip);
     }
     // bwa-mem2 purges covered seeds only once every chain of the read has been extended, so this
     // cannot live inside the per-chain body above.
     if crate::across::discard_enabled() {
-        crate::across::discard_contained(opt, codes.len() as i32, &chains, &mut regs, &meta);
+        crate::across::discard_contained(
+            opt,
+            codes.len() as i32,
+            &chains,
+            &mut regs,
+            &meta,
+            &preskip,
+        );
     }
     regs
 }

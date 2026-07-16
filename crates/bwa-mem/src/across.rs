@@ -111,11 +111,17 @@ pub(crate) fn discard_contained(
     chains: &[MemChain],
     regs: &mut Vec<MemAlnReg>,
     meta: &[RegMeta],
+    preskip: &[bool],
 ) {
     let n = regs.len();
     let mut lim: i32 = 0;
-    let mut purged = vec![false; n]; // bwa-mem2's `srt2[k] = UINT_MAX`
+    // bwa-mem2's `srt2[k] = UINT_MAX`. Seeds skipped up front (nh13's `seed_ext_redundant`) start
+    // out purged: their slot exists to preserve scan order, but they were never extended.
+    let mut purged: Vec<bool> = preskip.to_vec();
     for idx in 0..n {
+        if purged[idx] {
+            continue; // pre-skipped: never extended, and contributes no `lim`
+        }
         let m = meta[idx];
         let c = &chains[m.chain as usize];
         let s = c.seeds[m.seed as usize];
@@ -248,6 +254,9 @@ pub fn align_reads_batched<B: SwBackend>(
     let mut reg_chain: Vec<Vec<usize>> = vec![Vec::new(); reads.len()];
     // Per-region (chain, order position, seed) for the discard pass.
     let mut reg_meta: Vec<Vec<RegMeta>> = vec![Vec::new(); reads.len()];
+    // Seeds whose extension nh13's skip elided: they keep a slot (so the discard pass reproduces
+    // bwa-mem2's scan order) but start purged.
+    let mut reg_preskip: Vec<Vec<bool>> = vec![Vec::new(); reads.len()];
 
     let mut left_jobs: Vec<SideJob> = Vec::new();
     let mut right_jobs: Vec<SideJob> = Vec::new();
@@ -256,7 +265,7 @@ pub fn align_reads_batched<B: SwBackend>(
     // below needs one slot per seed to reproduce bwa-mem2's scan order, so a skipped seed would shift
     // every later slot; the two are mutually exclusive for now.
     let purge = discard_enabled();
-    let skip_contained = skip_contained_enabled() && !purge;
+    let skip_contained = skip_contained_enabled();
 
     // ---- collection pass: one region skeleton + up to one left and one right job per seed ----
     for (r, codes) in reads.iter().enumerate() {
@@ -300,6 +309,32 @@ pub fn align_reads_batched<B: SwBackend>(
 
             for (pos, &si) in order.iter().enumerate() {
                 if skip_contained && seed_ext_redundant(&chain.seeds, si) {
+                    // Keep the slot, skip the DP: the discard pass would purge this seed anyway
+                    // (its container is a longer same-diagonal seed, extended earlier).
+                    reg_chain[r].push(ci);
+                    reg_meta[r].push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+                    reg_preskip[r].push(true);
+                    regs[r].push(MemAlnReg {
+                        rb: -1,
+                        re: -1,
+                        qb: -1,
+                        qe: -1,
+                        rid: chain.rid,
+                        score: -1,
+                        truesc: -1,
+                        sub: 0,
+                        csub: 0,
+                        sub_n: 0,
+                        seedcov: 0,
+                        seedlen0: chain.seeds[si].len,
+                        secondary: -1,
+                        secondary_all: -1,
+                        w: opt.w,
+                        frac_rep: chain.frac_rep,
+                        is_alt: chain.is_alt,
+                        hash: 0,
+                        n_comp: 1,
+                    });
                     continue;
                 }
                 let s = chain.seeds[si];
@@ -372,6 +407,7 @@ pub fn align_reads_batched<B: SwBackend>(
 
                 reg_chain[r].push(ci);
                 reg_meta[r].push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+                reg_preskip[r].push(false);
                 regs[r].push(a);
             }
         }
@@ -395,7 +431,7 @@ pub fn align_reads_batched<B: SwBackend>(
     // ---- seedcov, per region, from final bounds (mirrors mem_chain2aln's tail) ----
     for r in 0..reads.len() {
         for (idx, a) in regs[r].iter_mut().enumerate() {
-            if a.rb != H0_SENTINEL && a.qb != H0_SENTINEL as i32 {
+            if a.rb != H0_SENTINEL && a.qb != H0_SENTINEL as i32 && a.qb != -1 {
                 let chain = &per_read_chains[r][reg_chain[r][idx]];
                 a.seedcov = 0;
                 for t in &chain.seeds {
@@ -415,7 +451,14 @@ pub fn align_reads_batched<B: SwBackend>(
     if purge {
         for r in 0..reads.len() {
             let l_query = reads[r].len() as i32;
-            discard_contained(opt, l_query, &per_read_chains[r], &mut regs[r], &reg_meta[r]);
+            discard_contained(
+                opt,
+                l_query,
+                &per_read_chains[r],
+                &mut regs[r],
+                &reg_meta[r],
+                &reg_preskip[r],
+            );
         }
     }
 
