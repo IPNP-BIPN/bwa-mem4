@@ -536,6 +536,14 @@ fn cal_sub(opt: &MemOpt, r: &[MemAlnReg]) -> i32 {
 
 /// Estimate insert-size distributions for the four orientations over a whole batch. `regs` holds the
 /// dedup'd regions of `2N` interleaved reads (`regs[2i]`=R1, `regs[2i+1]`=R2). Port of `mem_pestat`.
+/// Env-gated (`BWA3_DUMP_PESTAT`) insert-size stats, in bwa's `[PE]` wording so the two diff
+/// directly. The distribution is per batch, so a difference here moves rescue decisions for every
+/// pair in it, not just one read.
+fn dump_pestat() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA3_DUMP_PESTAT").is_some())
+}
+
 pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4] {
     let mut pes = [PeStat::default(); 4];
     let mut isize: [Vec<i64>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
@@ -562,6 +570,15 @@ pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4
         }
     }
 
+    if dump_pestat() {
+        eprintln!(
+            "[PE] # candidate unique pairs for (FF, FR, RF, RR): ({}, {}, {}, {})",
+            isize[0].len(),
+            isize[1].len(),
+            isize[2].len(),
+            isize[3].len()
+        );
+    }
     for d in 0..4 {
         let r = &mut pes[d];
         let q = &mut isize[d];
@@ -605,6 +622,14 @@ pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4
         }
         if r.low < 1 {
             r.low = 1;
+        }
+        if dump_pestat() {
+            eprintln!(
+                "[PE] dir={d} (25, 50, 75) percentile: ({p25}, {}, {p75})",
+                q[(0.50 * n as f64 + 0.499) as usize]
+            );
+            eprintln!("[PE] dir={d} mean and std.dev: ({:.2}, {:.2})", r.avg, r.std);
+            eprintln!("[PE] dir={d} low and high boundaries for proper pairs: ({}, {})", r.low, r.high);
         }
     }
 
