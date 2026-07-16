@@ -982,7 +982,7 @@ fn mem_aln2sam(
     out.push(b'\n');
 }
 
-/// Emit SAM for one read's regions (the `no_pairing` path). Port of `mem_reg2sam` (non-ALT, no XA).
+/// Emit SAM for one read's regions (the `no_pairing` path). Port of `mem_reg2sam` (non-ALT).
 #[allow(clippy::too_many_arguments)]
 fn mem_reg2sam(
     fm: &FmIndex,
@@ -996,9 +996,12 @@ fn mem_reg2sam(
     m: Option<&MemAln>,
     out: &mut Vec<u8>,
 ) {
+    // Shadowed hits are not emitted here; they surface as the primary's XA:Z, which this path used
+    // to omit entirely (~1% of PE records carried no XA where bwa emits one).
+    let xa = mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq);
     let mut aa: Vec<MemAln> = Vec::new();
     let mut l = 0;
-    for p in a {
+    for (k, p) in a.iter().enumerate() {
         if p.score < opt.t {
             continue;
         }
@@ -1011,6 +1014,7 @@ fn mem_reg2sam(
             continue;
         }
         let mut q = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
+        q.xa = xa[k].clone();
         q.flag |= extra_flag;
         if p.secondary >= 0 {
             q.sub = -1;
@@ -1018,7 +1022,7 @@ fn mem_reg2sam(
         if l > 0 && p.secondary < 0 {
             q.flag |= 0x800; // supplementary
         }
-        if l > 0 && q.mapq > aa[0].mapq {
+        if l > 0 && !p.is_alt && q.mapq > aa[0].mapq {
             q.mapq = aa[0].mapq;
         }
         aa.push(q);

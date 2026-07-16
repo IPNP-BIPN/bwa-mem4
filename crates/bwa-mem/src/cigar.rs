@@ -44,8 +44,11 @@ impl MemAln {
             cigar: Vec::new(),
             nm: 0,
             md: String::new(),
-            score: -1,
-            sub: -1,
+            // Zero, not -1: bwa builds this from `memset(&a, 0, sizeof(mem_aln_t))`, so an unmapped
+            // record clears `mem_aln2sam`'s `score >= 0` / `sub >= 0` guards and carries
+            // `AS:i:0 XS:i:0`. Signalling "absent" with -1 silently drops both tags.
+            score: 0,
+            sub: 0,
             xa: None,
         }
     }
