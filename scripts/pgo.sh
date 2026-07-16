@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-IDX="work/region.fa"
+IDX="${IDX:-work/region.fa}"
 K="${K:-100000000}"
 
 command -v cargo-pgo >/dev/null || { echo "cargo-pgo not installed (cargo install cargo-pgo)" >&2; exit 1; }
