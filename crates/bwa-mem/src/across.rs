@@ -24,22 +24,26 @@ use bwa_seed::{mem_collect_smem_batched, MemSeed};
 
 /// nh13's `mem_seed_ext_redundant` (`--skip-contained-ext`): true when seed `si` is strictly
 /// contained, on the same diagonal, in a longer seed of the same chain, and no comparably long seed
-/// interferes on a different diagonal. Skipping its banded-SW saves ~7.7% SE / ~5% PE.
+/// interferes on a different diagonal. Skipping its banded-SW saves ~7% SE.
 ///
-/// **Off by default: it is not output-preserving.** The skipped seed still needs a region slot (the
-/// discard pass reproduces bwa-mem2's scan order, which is slot-ordered), but with no DP that slot
-/// has no real `rb`/`re`. `mem_sort_dedup_patch` sorts regions by `re` with an *unstable* introsort
-/// and lets purged regions take part as `p`, so the placeholder bounds move real regions around in
-/// the sort and change which alignment survives a score tie. bwa extends these seeds and purges them
-/// afterwards, keeping their true `rb`/`re` -- values we cannot fabricate without doing the DP we are
-/// trying to skip. Measured cost of enabling it: 2 extra diverging records per 100k real reads.
+/// **On by default, and byte-identical to bwa-mem2** -- verified over 1M real HG002 reads and 1M
+/// pairs with it both on and off. A skipped seed still gets a region slot, because the discard pass
+/// reproduces bwa-mem2's slot-ordered scan; the slot carries no DP result, so it starts purged
+/// (`qb = qe = -1`) and the compaction before `mem_sort_dedup_patch` drops it. That compaction is
+/// what makes this safe: the placeholder bounds never reach the dedup's `re` sort, which is unstable
+/// and decides who survives a score tie. Without it the fake bounds shifted real regions across ties.
 ///
-/// `BWA3_SKIP_CONTAINED=1` opts in, trading that exactness for the speed. Cached: the two extension
-/// paths (batched [`align_reads_batched`] and per-read `mem_chain2aln`) must agree, so they share
-/// this one decision.
+/// The skip is sound rather than lucky: it fires only when the seed is contained, on the same
+/// diagonal, in a *longer* seed of the same chain. That container is extended earlier (descending
+/// score order), its region covers the seed, the shared diagonal makes `qd - rd == 0` trivially
+/// within the band, and the `seedlen0` guard cannot fire because the container is longer -- so the
+/// discard pass would purge this seed anyway. nh13's test is a conservative subset of the purge.
+///
+/// `BWA3_NO_SKIP_CONTAINED` opts out. Cached: the two extension paths (batched
+/// [`align_reads_batched`] and per-read `mem_chain2aln`) must agree, so they share this one decision.
 pub(crate) fn skip_contained_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("BWA3_SKIP_CONTAINED").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("BWA3_NO_SKIP_CONTAINED").is_none())
 }
 
 pub(crate) fn seed_ext_redundant(seeds: &[MemSeed], si: usize) -> bool {
