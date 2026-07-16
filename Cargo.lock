@@ -198,6 +198,8 @@ version = "0.0.0"
 dependencies = [
  "bwa-core",
  "bwa-index",
+ "bwa-neon",
+ "needletail",
 ]
 
 [[package]]
