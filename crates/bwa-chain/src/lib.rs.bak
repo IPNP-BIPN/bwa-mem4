@@ -201,6 +201,7 @@ pub fn build_chains_from_resolved(
     l_rep += e - b;
 
     let l_pac = bns.l_pac;
+    let max_occ = i64::from(opt.max_occ);
     let mut chains: Vec<MemChain> = Vec::new();
     // bwa keys chains by `pos` in a klib kbtree, whose exact shape is observable (see `kbtree`).
     let mut tree = crate::kbtree::KbTree::new();

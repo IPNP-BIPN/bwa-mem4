@@ -258,11 +258,85 @@ pub fn align_reads_batched<B: SwBackend>(
         }
     }
     let dump_chains = std::env::var_os("BWA3_DUMP_CHAINS").is_some();
+
+    // Resolve EVERY read's SA occurrences in ONE lockstep pass instead of one ~42-position call per
+    // read. `get_sa_batch`'s W=32 window needs a long run of independent walks to keep the core's
+    // ~28 memory-level-parallelism lanes busy; ~42 positions is 1.3 windows, so the pipeline never
+    // reaches steady state. Measured (bwa-index's sa_batch_bench, genome index): 275.6 ns/lookup at
+    // chunk=42 vs 186.9 at chunk>=128.
+    //
+    // Byte-identical by construction: `sa_positions_for_read` touches no FM index, `get_sa_batch` is
+    // result-identical at any chunk size, and each read's slice keeps its own positions in their own
+    // order. BWA3_SA_PER_READ=1 restores the per-read calls for A/B.
+    let mut per_read_smems: Vec<Vec<bwa_index::Smem>> = per_read_smems;
+    let batched_sa = std::env::var_os("BWA3_SA_PER_READ").is_none();
+    let (all_positions, per_read_counts): (Vec<i64>, Vec<Vec<i64>>) = if batched_sa {
+        let mut pos = Vec::new();
+        let counts = per_read_smems
+            .iter_mut()
+            .map(|smems| bwa_chain::sa_positions_for_read(opt, smems, &mut pos))
+            .collect();
+        (pos, counts)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let all_rbegs: Vec<i64> = if batched_sa {
+        let mut r = vec![0i64; all_positions.len()];
+        let t = bwa_chain::chain_time::enabled().then(std::time::Instant::now);
+        if std::env::var_os("BWA3_SA_SORT").is_some() {
+            // SPIKE (Zhang et al., CCGrid 2013 "Optimizing BWT-Based Sequence Alignment on Multicore
+            // Architectures", §IV): resolve the SA lookups in ASCENDING POSITION order so that
+            // consecutive walks land in nearby cp_occ pages, amortising page walks over many lookups
+            // instead of one. A full sort is the pessimistic bound on the idea -- O(n log n) where a
+            // 1-pass radix partition would be O(n) -- so if this loses, radix cannot save it.
+            //
+            // Byte-identical: get_sa_batch resolves each position independently, so resolution order
+            // is unobservable; the original order is restored by the packed index before use.
+            const IDX_BITS: u32 = 26;
+            assert!(
+                all_positions.len() < (1 << IDX_BITS) && fm.ref_seq_len < (1 << (64 - IDX_BITS)),
+                "packed (position, index) key would overflow"
+            );
+            let mut keyed: Vec<u64> = all_positions
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| ((p as u64) << IDX_BITS) | (i as u64))
+                .collect();
+            keyed.sort_unstable();
+            let sorted: Vec<i64> = keyed.iter().map(|k| (k >> IDX_BITS) as i64).collect();
+            let mut sorted_r = vec![0i64; sorted.len()];
+            fm.get_sa_batch(&sorted, &mut sorted_r);
+            for (i, k) in keyed.iter().enumerate() {
+                r[(k & ((1 << IDX_BITS) - 1)) as usize] = sorted_r[i];
+            }
+        } else {
+            fm.get_sa_batch(&all_positions, &mut r);
+        }
+        if let Some(t) = t {
+            use std::sync::atomic::Ordering::Relaxed;
+            bwa_chain::chain_time::GET_SA_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            bwa_chain::chain_time::GET_SA_N.fetch_add(all_positions.len() as u64, Relaxed);
+        }
+        r
+    } else {
+        Vec::new()
+    };
+    let mut sa_cursor = 0usize;
+
     let per_read_chains: Vec<Vec<MemChain>> = per_read_smems
         .into_iter()
+        .enumerate()
         .zip(reads.iter())
-        .map(|(smems, codes)| {
-            let pre = build_chains_from_smems(fm, bns, opt, codes, 0, smems);
+        .map(|((ridx, smems), codes)| {
+            let pre = if batched_sa {
+                let counts = &per_read_counts[ridx];
+                let n: usize = counts.iter().map(|c| *c as usize).sum();
+                let rbegs = &all_rbegs[sa_cursor..sa_cursor + n];
+                sa_cursor += n;
+                bwa_chain::build_chains_from_resolved(bns, opt, codes, 0, &smems, counts, rbegs)
+            } else {
+                build_chains_from_smems(fm, bns, opt, codes, 0, smems)
+            };
             if dump_chains {
                 eprintln!("PRECHAIN nchains={}", pre.len());
                 for (ci, c) in pre.iter().enumerate() {
