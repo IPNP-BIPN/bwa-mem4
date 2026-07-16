@@ -289,7 +289,7 @@ fn ks_combsort_by<T>(a: &mut [T], lt: &impl Fn(&T, &T) -> bool) {
 /// depth-limited comb-sort fallback and a final insertion-sort pass). This is deliberately the
 /// exact same (unstable) permutation bwa-mem2 applies in `mem_chain_flt`, so equal-weight chains
 /// resolve identically to the oracle. `lt(x, y)` = `x < y`.
-fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
+pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
     let n = a.len();
     if n < 1 {
         return;
