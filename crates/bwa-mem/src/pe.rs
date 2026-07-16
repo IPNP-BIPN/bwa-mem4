@@ -118,6 +118,17 @@ fn mem_matesw(
             skip[r] = 1;
         }
     }
+    if dump_pestat() {
+        eprintln!(
+            "[MATESW] rb={} ma_n={} skip={}{}{}{}",
+            a.rb,
+            ma.len(),
+            skip[0],
+            skip[1],
+            skip[2],
+            skip[3]
+        );
+    }
     if skip.iter().sum::<i32>() == 4 {
         return 0; // a consistent pair already exists; no SW needed
     }
@@ -152,6 +163,12 @@ fn mem_matesw(
         let re0 = re0.min(l_pac << 1);
         if rb0 < re0 {
             let (rb, re, rid, refseq) = bns_fetch_seq(fm, bns, rb0, (rb0 + re0) >> 1, re0);
+            if dump_pestat() {
+                eprintln!(
+                    "[MSW_R] anchor={} r={r} rb={rb} re={re} rid={rid} a_rid={}",
+                    a.rb, a.rid
+                );
+            }
             if a.rid == rid && re - rb >= i64::from(opt.min_seed_len) {
                 let minsc = opt.min_seed_len * opt.a;
                 // bwa's `xtra`: KSW_XBYTE (the u8 kernel, 16 lanes) when the mate cannot overflow a
@@ -164,8 +181,8 @@ fn mem_matesw(
                 );
                 if dump_pestat() {
                     eprintln!(
-                        "[RESCUE] score={} score2={} qb={} qe={} tb={} te={} te2={} tlen={}",
-                        aln.score, aln.score2, aln.qb, aln.qe, aln.tb, aln.te, aln.te2,
+                        "[RESCUE] anchor={} r={r} score={} score2={} qb={} qe={} tb={} te={} te2={} tlen={}",
+                        a.rb, aln.score, aln.score2, aln.qb, aln.qe, aln.tb, aln.te, aln.te2,
                         refseq.len()
                     );
                 }
@@ -308,6 +325,12 @@ fn matesw_collect(
         let re0 = re0.min(l_pac << 1);
         if rb0 < re0 {
             let (rb, re, rid, refseq) = bns_fetch_seq(fm, bns, rb0, (rb0 + re0) >> 1, re0);
+            if dump_pestat() {
+                eprintln!(
+                    "[MSW_R] anchor={} r={r} rb={rb} re={re} rid={rid} a_rid={}",
+                    a.rb, a.rid
+                );
+            }
             if a.rid == rid && re - rb >= i64::from(opt.min_seed_len) {
                 per_r[r] = Some(Orient {
                     query: seq,
@@ -452,29 +475,20 @@ pub fn batch_mate_rescue(
     let mut anchors: Vec<[Vec<MemAlnReg>; 2]> = Vec::with_capacity(pairs.len());
     let mut max_rounds = 0usize;
     for p in pairs.iter() {
-        let a = if !p.a0.is_empty() && !p.a1.is_empty() {
-            let best0 = p.a0[0].score;
-            let best1 = p.a1[0].score;
-            let b0: Vec<MemAlnReg> = p
-                .a0
-                .iter()
-                .filter(|r| r.score >= best0 - pen)
-                .take(cap)
-                .cloned()
-                .collect();
-            let b1: Vec<MemAlnReg> = p
-                .a1
-                .iter()
-                .filter(|r| r.score >= best1 - pen)
-                .take(cap)
-                .cloned()
-                .collect();
-            max_rounds = max_rounds.max(b0.len()).max(b1.len());
-            [b0, b1]
-        } else {
-            [Vec::new(), Vec::new()]
+        // Each side is snapshotted on its own: bwa gates only on MEM_F_NO_RESCUE, never on both
+        // reads having regions. A read with no regions simply contributes no anchors -- but it is
+        // still the *rescue target* of the other read's anchors, which is exactly how an unmapped
+        // mate gets rescued. Requiring both sides non-empty leaves it unmapped.
+        let near_best = |regs: &[MemAlnReg]| -> Vec<MemAlnReg> {
+            let Some(best) = regs.first().map(|r| r.score) else {
+                return Vec::new();
+            };
+            regs.iter().filter(|r| r.score >= best - pen).take(cap).cloned().collect()
         };
-        anchors.push(a);
+        let b0 = near_best(&p.a0);
+        let b1 = near_best(&p.a1);
+        max_rounds = max_rounds.max(b0.len()).max(b1.len());
+        anchors.push([b0, b1]);
     }
 
     for round in 0..max_rounds {
@@ -1098,20 +1112,21 @@ pub fn mem_sam_pe<W: Write>(
     // On concordant pairs every orientation is skipped, so this is a no-op. Port of the non-
     // MATE_SORT rescue block in mem_sam_pe (bwamem_pair.cpp lines 378-414). Skipped when the caller
     // already ran it batched across the whole pair batch ([`batch_mate_rescue`]).
-    if !rescue_done && !a0.is_empty() && !a1.is_empty() {
+    if !rescue_done {
         let pen = opt.pen_unpaired;
         let cap = opt.max_matesw.max(0) as usize;
-        let (best0, best1) = (a0[0].score, a1[0].score);
-        let b0: Vec<MemAlnReg> = a0
-            .iter()
-            .filter(|r| r.score >= best0 - pen)
-            .cloned()
-            .collect();
-        let b1: Vec<MemAlnReg> = a1
-            .iter()
-            .filter(|r| r.score >= best1 - pen)
-            .cloned()
-            .collect();
+        // Each side is snapshotted on its own: bwa gates only on MEM_F_NO_RESCUE, never on both
+        // reads having regions. A read with no regions contributes no anchors, yet is still the
+        // *rescue target* of the other read's anchors -- which is exactly how an unmapped mate gets
+        // rescued. Requiring both sides non-empty leaves it unmapped.
+        let near_best = |regs: &[MemAlnReg]| -> Vec<MemAlnReg> {
+            let Some(best) = regs.first().map(|r| r.score) else {
+                return Vec::new();
+            };
+            regs.iter().filter(|r| r.score >= best - pen).cloned().collect()
+        };
+        let b0 = near_best(a0);
+        let b1 = near_best(a1);
         for anchor in b0.iter().take(cap) {
             mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1);
         }
