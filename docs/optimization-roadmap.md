@@ -219,6 +219,22 @@ Z-drop cell, and band width match bwa-mem2 exactly — any deviation is both a c
 wasted SW. Highest ROI, zero risk.
 
 ## Do NOT
+- **Port minibwa's 10-mer cache. Built it, measured 0%, reverted (2026-07-17).** Li & Homer
+  (arXiv:2606.15357 §2.5) precompute the ds-intervals of all 10-mers "to reduce the number calls to
+  BackStep()" and measure *"10% faster to find (19,1)-SMEMs"*. **Their own sentence says "on real
+  short reads WITHOUT BATCHING"** — and that qualifier is the whole story. Our round 3
+  (`bwt_seed_strategy`) is lockstep-batched (`BwtSeedSlot`, N=16) with per-step `cp_occ` prefetch, so
+  the 10 forward extensions the cache removes were **already latency-hidden and nearly free**; the
+  cache replaces them with one random miss into a 25 MB table that does not fit the 16 MB L2.
+  Measured, byte-identical throughout (SE 500k + PE 1M `cmp`-clean, oracle 5000/5000): SE -t1
+  0.959/1.018/1.014, **SE -t8 0.994/0.994/0.997**, PE -t8 0.998/0.994/1.000. Note it can only ever
+  apply to round 3 anyway: rounds 1/2 write `prev[num_prev] = smem` at every distinct-`s` step and
+  `prev[]` is the entire input to their backward phase, so a LUT would skip exactly the steps whose
+  outputs are needed.
+  **This is the third lever killed by the same mechanism** (LISA's learned index, the flat SA, this):
+  our lockstep+prefetch batching has already eaten the DRAM latency each of them was designed to hide.
+  **Before porting any "fewer memory accesses" idea, check whether the accesses it removes are ones we
+  already overlap.**
 - **Try to engage Apple's DMP** (the pointer-chasing prefetcher). It is built for exactly our shape of
   problem -- Apple's patent (US 9,886,385) names "pointer chasing" with "poor locality"; Augury
   (IEEE S&P'22) measures **3-8x** on array-of-pointers traversal, vanishing on DMP-less Icestorm
