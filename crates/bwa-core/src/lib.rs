@@ -6,6 +6,7 @@
 pub mod dna;
 pub mod error;
 pub mod opt;
+pub mod sysram;
 
 pub use error::{Error, Result};
 pub use opt::MemOpt;

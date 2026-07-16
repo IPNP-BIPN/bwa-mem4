@@ -129,16 +129,17 @@ pub fn ksw_extend2(
             h1 = h;
             mj = if row_max > h { mj } else { j };
             row_max = if row_max > h { row_max } else { h };
-            // bwa-mem2's vectorized bandedSWA (and nh13's fork, both byte-identical to bwa-mem2)
-            // open gaps from the just-computed cell score H = max(M, E, F), not from M. On real
-            // seed extensions H == M at the alignment so results match; this is the exact recurrence
-            // of `MAIN_CODE16_CORE`, kept here as the scalar source of truth for the SIMD backends.
-            let mut t = h - oe_del;
+            // Gaps open from M (the diagonal score), not from H = max(M, E, F). Both `ksw_extend2`
+            // and the vectorized `bandedSWA` do this: MAIN_CODE16 subtracts oe_ins/oe_del from
+            // `m11`, not `h11`. Using H instead only agrees while H == M, which holds on ordinary
+            // extensions but not inside satellite repeats, where it silently turns a local extension
+            // into a to-end one (wrong gscore => wrong qe/re, and a lost supplementary record).
+            let mut t = big_m - oe_del;
             t = t.max(0);
             e -= e_del;
             e = if e > t { e } else { t };
             eh_e[ju] = e;
-            let mut t = h - oe_ins;
+            let mut t = big_m - oe_ins;
             t = t.max(0);
             f -= e_ins;
             f = if f > t { f } else { t };
@@ -339,7 +340,18 @@ pub struct KswAlignResult {
 /// suboptimal (`b`-array) tracking (`KSW_XSUBO`); `endsc` stops early once a column max reaches it
 /// (`KSW_XSTOP`, use `i32::MAX` to disable). `max_sc` is the maximum single-cell match score.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn ksw_local_fwd(
+/// Forward local-SW pass returning `(score, te, qe, score2, te2)` (no start coords). This is the
+/// per-lane semantics a batched/vectorized mate-rescue kernel must reproduce: [`ksw_align2`] is just
+/// this forward pass plus a second, reversed forward pass to recover `qb`/`tb` (`KSW_XSTART`).
+///
+/// `lanes` is ksw's SIMD width (16 for the u8 kernel, 8 for i16), and it is **not** a performance
+/// knob: `ksw_qinit` rounds the query profile up to `slen * lanes` columns and fills the tail with
+/// score 0 (`(k >= qlen? 0 : ma[query[k]]) + shift`). A zero-score column leaves `h = h_diag`, so
+/// the padding carries a diagonal forward and its cells land in ksw's per-row `max` -- which feeds
+/// the `b` array and hence `score2`. Dropping the padding makes row maxima decay where bwa's plateau,
+/// so `score2` (and the `csub` mate rescue derives from it) comes out too low.
+#[allow(clippy::too_many_arguments)]
+pub fn ksw_local_fwd(
     query: &[u8],
     target: &[u8],
     m: usize,
@@ -351,8 +363,12 @@ fn ksw_local_fwd(
     minsc: i32,
     endsc: i32,
     max_sc: i32,
+    lanes: usize,
 ) -> (i32, i32, i32, i32, i32) {
-    let qlen = query.len();
+    let qlen_real = query.len();
+    // `slen * lanes` columns, the tail scoring 0 (see above).
+    let slen = qlen_real.div_ceil(lanes);
+    let qlen = slen * lanes;
     let tlen = target.len();
     let oe_del = o_del + e_del;
     let oe_ins = o_ins + e_ins;
@@ -372,7 +388,11 @@ fn ksw_local_fwd(
         let mut h_diag = 0i32; // H(i-1, -1) = 0
         let mut imax = 0i32;
         for j in 0..qlen {
-            let sc = i32::from(mat[s_row + query[j] as usize]);
+            let sc = if j < qlen_real {
+                i32::from(mat[s_row + query[j] as usize])
+            } else {
+                0 // padding column: h = h_diag, carrying the diagonal forward
+            };
             // H(i,j) = max{0, H(i-1,j-1)+s, E(i,j), F(i,j)}  (E,F are already >= 0)
             let mut h = h_diag + sc;
             if h < 0 {
@@ -425,20 +445,29 @@ fn ksw_local_fwd(
         std::mem::swap(&mut h_prev, &mut h_cur);
     }
 
-    // Query end: smallest query index reaching the column max at `te` (ksw picks min index on tie).
+    // Query end: smallest query column reaching the max at `te` (ksw scans Hmax in *striped byte*
+    // order, mapping byte i to column `i/lanes + i%lanes*slen`, but only the min-on-tie survives, so
+    // the order does not matter -- the padded columns being in range does).
     let mut qe = -1i32;
     if te >= 0 {
         let mut mx = -1i32;
-        for (j, &v) in hmax_col.iter().enumerate() {
+        for i in 0..qlen {
+            let col = i / lanes + (i % lanes) * slen;
+            let v = hmax_col[col];
             if v > mx {
                 mx = v;
-                qe = j as i32;
+                qe = col as i32;
+            } else if v == mx && (col as i32) < qe {
+                qe = col as i32;
             }
         }
     }
 
     // 2nd-best score: best `b` entry whose column lies outside [te - w, te + w], w = ceil(score/max).
-    let mut score2 = 0i32;
+    // Starts at -1, not 0: ksw returns `g_defr = {0, -1, -1, -1, -1, -1, -1}` when nothing qualifies,
+    // and mem_matesw copies it straight into `csub`. The sign matters downstream -- mem_sam_pe caps
+    // MAPQ with `raw_mapq(score - csub, a)`, so csub = -1 yields score+1 where 0 yields score.
+    let mut score2 = -1i32;
     let mut te2 = -1i32;
     if gmax > 0 && !b.is_empty() {
         let w = (gmax + max_sc - 1) / max_sc;
@@ -455,7 +484,9 @@ fn ksw_local_fwd(
 
 /// Local Smith-Waterman with affine gaps, returning best-alignment coords and the 2nd-best score.
 /// Faithful scalar port of `ksw_align2` (with `KSW_XSTART | KSW_XSUBO`). `max_sc` is the maximum
-/// single match score (`opt.a`), used for the suboptimal-window width.
+/// single match score (`opt.a`), used for the suboptimal-window width. `lanes` selects ksw's kernel
+/// width (16 = u8 / `KSW_XBYTE`, 8 = i16); both passes use the same one, and it changes the result
+/// (see [`ksw_local_fwd`]).
 #[allow(clippy::too_many_arguments)]
 pub fn ksw_align2(
     query: &[u8],
@@ -468,6 +499,7 @@ pub fn ksw_align2(
     e_ins: i32,
     minsc: i32,
     max_sc: i32,
+    lanes: usize,
 ) -> KswAlignResult {
     let (score, te, qe, score2, te2) = ksw_local_fwd(
         query,
@@ -481,6 +513,7 @@ pub fn ksw_align2(
         minsc,
         i32::MAX,
         max_sc,
+        lanes,
     );
     let mut r = KswAlignResult {
         score,
@@ -495,8 +528,15 @@ pub fn ksw_align2(
     if score < minsc || qe < 0 {
         return r;
     }
+    // bwa does `revseq(r.qe + 1, query); revseq(r.te + 1, target);` -- both *in place* -- then
+    // re-inits the query profile at length `qe + 1` but calls the kernel with the **full** `tlen`.
+    // So the query really is truncated, while the target is not: only its first `te + 1` bases are
+    // reversed and the untouched tail still gets scanned. That matters, because the pass stops via
+    // KSW_XSTOP once it reaches `score`, and if the reversed prefix alone never gets there the tail
+    // can still reach it -- which sets qb/tb, and mem_matesw drops the rescue when qb < 0.
     let qrev: Vec<u8> = query[..=qe as usize].iter().rev().copied().collect();
-    let trev: Vec<u8> = target[..=te as usize].iter().rev().copied().collect();
+    let mut trev: Vec<u8> = target.to_vec();
+    trev[..=te as usize].reverse();
     let (rscore, rte, rqe, _, _) = ksw_local_fwd(
         &qrev,
         &trev,
@@ -509,6 +549,7 @@ pub fn ksw_align2(
         i32::MAX,
         score,
         max_sc,
+        lanes,
     );
     if score == rscore {
         r.tb = te - rte;
@@ -545,7 +586,7 @@ mod tests {
         // query == target: full-length local alignment, score = len*a, spanning both from 0.
         let mat = scmat(1, 4);
         let q = [0u8, 1, 2, 3, 0, 1, 2, 3];
-        let r = ksw_align2(&q, &q, 5, &mat, 6, 1, 6, 1, 4, 1);
+        let r = ksw_align2(&q, &q, 5, &mat, 6, 1, 6, 1, 4, 1, 16);
         assert_eq!(r.score, 8);
         assert_eq!((r.qb, r.qe), (0, 7));
         assert_eq!((r.tb, r.te), (0, 7));
@@ -559,7 +600,7 @@ mod tests {
         //            0  1  2  3  4  5  6  7
         let q = [3u8, 3, 0, 0, 1, 1, 3, 3];
         let t = [2u8, 0, 0, 1, 1, 2];
-        let r = ksw_align2(&q, &t, 5, &mat, 6, 1, 6, 1, 1, 1);
+        let r = ksw_align2(&q, &t, 5, &mat, 6, 1, 6, 1, 1, 1, 16);
         assert_eq!(r.score, 4); // 4 matching bases
         assert_eq!((r.qb, r.qe), (2, 5));
         assert_eq!((r.tb, r.te), (1, 4));

@@ -10,3 +10,4 @@ repository.workspace = true
 [dependencies]
 bwa-core = { workspace = true }
 rayon = { workspace = true }
+memmap2 = { workspace = true }

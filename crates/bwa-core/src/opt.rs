@@ -1,5 +1,17 @@
 //! Alignment options, mirroring bwa-mem2's `mem_opt_t` and its `mem_opt_init()` defaults.
 
+/// `MemOpt::flag` bits, mirroring bwa-mem2's `MEM_F_*` (`reference/bwa-mem2/src/bwamem.h`).
+pub mod flags {
+    /// Paired-end input (`-p`/two input files).
+    pub const PE: i32 = 0x2;
+    /// Output all found alignments, secondary ones included (`-a`).
+    pub const ALL: i32 = 0x8;
+    /// Mark shadowed hits 0x100 rather than 0x800 (`-M`).
+    pub const NO_MULTI: i32 = 0x10;
+    /// Soft-clip supplementary alignments too, instead of hard-clipping them (`-Y`).
+    pub const SOFTCLIP: i32 = 0x200;
+}
+
 /// Alignment parameters. Field names and default values mirror bwa-mem2's `mem_opt_t`
 /// (see `reference/bwa-mem2/src/bwamem.cpp::mem_opt_init`).
 #[derive(Debug, Clone)]

@@ -5,6 +5,7 @@
 //! Includes the `mem_patch_reg` region-merge branch (collinear regions re-aligned into one),
 //! which fires on split/long-indel alignments.
 
+use bwa_chain::ks_introsort_by;
 use bwa_core::MemOpt;
 use bwa_index::FmIndex;
 
@@ -95,11 +96,19 @@ pub fn mem_sort_dedup_patch(
     if a.len() <= 1 {
         return a;
     }
-    let mlr = f64::from(opt.mask_level_redun);
+    // f32, not f64: `mask_level_redun` is a C `float`, and `or_ > opt->mask_level_redun * mr`
+    // promotes the int64 to float, so the whole comparison happens in single precision. Widening to
+    // f64 changes the result at the boundary -- 0.95f is really 0.9499999880790710, so f32 rounds
+    // 0.95f * 40 back up to exactly 38.0 (38 > 38.0 is false, hit kept) while f64 keeps
+    // 37.99999952 (38 > that is true, hit dropped). One region's fate per boundary case.
+    let mlr = opt.mask_level_redun;
     let max_gap = i64::from(opt.max_chain_gap);
 
-    // Sort by END position on the reference.
-    a.sort_by_key(|r| r.re);
+    // Sort by END position on the reference (`alnreg_slt2`). bwa's `ks_introsort` is *unstable* and
+    // the key is `re` alone, so ties are both common and consequential: the redundancy test below
+    // drops `q` (the earlier entry) whenever the scores tie, meaning the order among equal-`re`
+    // regions decides which alignment survives. A stable sort silently picks a different one.
+    ks_introsort_by(&mut a, |x, y| x.re < y.re);
     for r in &mut a {
         r.n_comp = 1;
     }
@@ -129,7 +138,7 @@ pub fn mem_sort_dedup_patch(
             };
             let mr = (a[ju].re - a[ju].rb).min(p_re - p_rb);
             let mq = (a[ju].qe - a[ju].qb).min(p_qe - p_qb);
-            if or_ as f64 > mlr * mr as f64 && f64::from(oq) > mlr * f64::from(mq) {
+            if or_ as f32 > mlr * mr as f32 && oq as f32 > mlr * mq as f32 {
                 if p_score < a[ju].score {
                     a[i].qe = a[i].qb;
                     break;
@@ -156,12 +165,10 @@ pub fn mem_sort_dedup_patch(
     }
     a.retain(|r| r.qe > r.qb);
 
-    // Sort by score desc, then rb, then qb; drop identical hits.
-    a.sort_by(|x, y| {
-        y.score
-            .cmp(&x.score)
-            .then(x.rb.cmp(&y.rb))
-            .then(x.qb.cmp(&y.qb))
+    // Sort by score desc, then rb, then qb (`alnreg_slt`), again with bwa's unstable introsort.
+    ks_introsort_by(&mut a, |x, y| {
+        x.score > y.score
+            || (x.score == y.score && (x.rb < y.rb || (x.rb == y.rb && x.qb < y.qb)))
     });
     for i in 1..a.len() {
         if a[i].score == a[i - 1].score && a[i].rb == a[i - 1].rb && a[i].qb == a[i - 1].qb {
@@ -185,7 +192,8 @@ fn mark_primary_core(opt: &MemOpt, a: &mut [MemAlnReg]) {
             let e_min = a[j].qe.min(i_qe);
             if e_min > b_max {
                 let min_l = (i_qe - i_qb).min(a[j].qe - a[j].qb);
-                if f64::from(e_min - b_max) >= f64::from(min_l) * f64::from(opt.mask_level) {
+                // f32: `min_l * opt->mask_level` is float arithmetic in C (see `mlr` above).
+                if (e_min - b_max) as f32 >= min_l as f32 * opt.mask_level {
                     if a[j].sub == 0 {
                         a[j].sub = i_score;
                     }
@@ -219,12 +227,21 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
             n_pri += 1;
         }
     }
-    // Sort by (score desc, is_alt asc, hash asc) — `alnreg_hlt`.
-    a.sort_by(|x, y| {
-        y.score
-            .cmp(&x.score)
-            .then(x.is_alt.cmp(&y.is_alt))
-            .then(x.hash.cmp(&y.hash))
+    if std::env::var_os("BWA3_DUMP_PRESORT").map_or(false, |v| v.to_string_lossy() == id.to_string()) {
+        eprintln!("PRESORT id={id} n={}", a.len());
+        for (i, r) in a.iter().enumerate() {
+            eprintln!(
+                "  pre{i} q[{},{}) r[{},{}) score={} hash={}",
+                r.qb, r.qe, r.rb, r.re, r.score, r.hash
+            );
+        }
+    }
+    // Sort by (score desc, is_alt asc, hash asc) — `alnreg_hlt`, unstable as in bwa.
+    ks_introsort_by(a, |x, y| {
+        x.score > y.score
+            || (x.score == y.score
+                && (!x.is_alt && y.is_alt
+                    || (x.is_alt == y.is_alt && x.hash < y.hash)))
     });
     mark_primary_core(opt, a);
     // No ALT contigs: `secondary_all` mirrors `secondary` (the C's else-branch when n_pri == n).

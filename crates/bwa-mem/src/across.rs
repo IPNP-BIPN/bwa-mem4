@@ -20,7 +20,201 @@ use bwa_chain::{build_chains_from_smems, mem_chain_flt, MemChain};
 use bwa_core::MemOpt;
 use bwa_extend::{ExtendJob, SwBackend};
 use bwa_index::{BntSeq, FmIndex};
-use bwa_seed::mem_collect_smem_batched;
+use bwa_seed::{mem_collect_smem_batched, MemSeed};
+
+/// nh13's `mem_seed_ext_redundant` (`--skip-contained-ext`): true when seed `si` is strictly
+/// contained, on the same diagonal, in a longer seed of the same chain, and no comparably long seed
+/// interferes on a different diagonal. Skipping its banded-SW saves ~7.7% SE / ~5% PE.
+///
+/// **Off by default: it is not output-preserving.** The skipped seed still needs a region slot (the
+/// discard pass reproduces bwa-mem2's scan order, which is slot-ordered), but with no DP that slot
+/// has no real `rb`/`re`. `mem_sort_dedup_patch` sorts regions by `re` with an *unstable* introsort
+/// and lets purged regions take part as `p`, so the placeholder bounds move real regions around in
+/// the sort and change which alignment survives a score tie. bwa extends these seeds and purges them
+/// afterwards, keeping their true `rb`/`re` -- values we cannot fabricate without doing the DP we are
+/// trying to skip. Measured cost of enabling it: 2 extra diverging records per 100k real reads.
+///
+/// `BWA3_SKIP_CONTAINED=1` opts in, trading that exactness for the speed. Cached: the two extension
+/// paths (batched [`align_reads_batched`] and per-read `mem_chain2aln`) must agree, so they share
+/// this one decision.
+pub(crate) fn skip_contained_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BWA3_SKIP_CONTAINED").is_some())
+}
+
+pub(crate) fn seed_ext_redundant(seeds: &[MemSeed], si: usize) -> bool {
+    let s = seeds[si];
+    let sd = s.rbeg - i64::from(s.qbeg);
+    let mut has_container = false;
+    for (j, t) in seeds.iter().enumerate() {
+        if j == si || t.len <= s.len {
+            continue; // must be strictly longer
+        }
+        if t.rbeg - i64::from(t.qbeg) != sd {
+            continue; // must be the same diagonal
+        }
+        if s.qbeg >= t.qbeg && s.qbeg + s.len <= t.qbeg + t.len {
+            has_container = true;
+            break;
+        }
+    }
+    if !has_container {
+        return false;
+    }
+    // Interference guard (mirrors the PE18 purge): a seed >= 0.95*len overlapping s on a *different*
+    // diagonal by >= s.len/4 could lead to a distinct alignment, so s must be extended after all.
+    for (j, u) in seeds.iter().enumerate() {
+        if j == si || (f64::from(u.len)) < f64::from(s.len) * 0.95 {
+            continue;
+        }
+        if s.qbeg <= u.qbeg
+            && s.qbeg + s.len - u.qbeg >= s.len >> 2
+            && i64::from(u.qbeg) - i64::from(s.qbeg) != u.rbeg - s.rbeg
+        {
+            return false;
+        }
+        if u.qbeg <= s.qbeg
+            && u.qbeg + u.len - s.qbeg >= s.len >> 2
+            && i64::from(s.qbeg) - i64::from(u.qbeg) != s.rbeg - u.rbeg
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Where a region came from, so the discard pass can recover its seed. `pos` is the seed's index in
+/// the chain's descending-score order, which is also the region's offset within its chain's block of
+/// slots, so region `idx` of `(chain, q)` is `idx - pos + q`.
+#[derive(Clone, Copy)]
+pub(crate) struct RegMeta {
+    pub chain: u32,
+    pub pos: u32,
+    pub seed: u32,
+}
+
+/// bwa-mem2's discard pass (the tail of `mem_chain2aln_across_reads_V2`, `bwamem.cpp:2895-2990`).
+///
+/// bwa-mem2 extends every seed up front, then walks each read's chains (seeds in descending score
+/// order, the same order the collection pass emits slots in) and **purges** the region of any seed
+/// that a previously-kept region already covers within the band -- unless a comparably long seed on
+/// a different diagonal interferes, meaning the seed could still yield a distinct alignment. Purged
+/// regions are marked `qb = qe = -1`, exactly as bwa-mem2 does; `mem_sort_dedup_patch`'s compaction
+/// drops them later.
+///
+/// This is what keeps repeat-region reads from accumulating near-duplicate regions that survive the
+/// dedup's redundancy test and inflate `sub` (hence collapse MAPQ). It is not an optimization: the
+/// extensions have already run.
+///
+/// `lim` (seeds kept so far for this read) bounding the scan is bwa-mem2's own, and it is
+/// load-bearing: it caps how many regions are examined, so the outcome depends on the **slot order**
+/// of `regs[r]`. That order must therefore match bwa-mem2's `s->aln` slots, i.e. one slot per seed.
+pub(crate) fn discard_contained(
+    opt: &MemOpt,
+    l_query: i32,
+    chains: &[MemChain],
+    regs: &mut Vec<MemAlnReg>,
+    meta: &[RegMeta],
+    preskip: &[bool],
+) {
+    let n = regs.len();
+    let mut lim: i32 = 0;
+    // bwa-mem2's `srt2[k] = UINT_MAX`. Seeds skipped up front (nh13's `seed_ext_redundant`) start
+    // out purged: their slot exists to preserve scan order, but they were never extended.
+    let mut purged: Vec<bool> = preskip.to_vec();
+    for idx in 0..n {
+        if purged[idx] {
+            continue; // pre-skipped: never extended, and contributes no `lim`
+        }
+        let m = meta[idx];
+        let c = &chains[m.chain as usize];
+        let s = c.seeds[m.seed as usize];
+
+        // "test whether extension has been made before": scan this read's regions in slot order,
+        // stopping once `lim` non-purged ones have been examined without finding a container.
+        let mut v: i32 = 0;
+        let mut i = 0usize;
+        while i < n && v < lim {
+            let p = &regs[i];
+            if p.qb == -1 && p.qe == -1 {
+                i += 1;
+                continue; // already purged: not counted against `lim`
+            }
+            if s.rbeg < p.rb
+                || s.rbeg + i64::from(s.len) > p.re
+                || s.qbeg < p.qb
+                || s.qbeg + s.len > p.qe
+            {
+                v += 1;
+                i += 1;
+                continue; // not fully contained
+            }
+            if f64::from(s.len - p.seedlen0) > 0.1 * f64::from(l_query) {
+                v += 1;
+                i += 1;
+                continue; // this seed may give a better alignment
+            }
+            // Ahead of the seed: is it "around" this hit, within the gap the band still allows?
+            let qd = i64::from(s.qbeg - p.qb);
+            let rd = s.rbeg - p.rb;
+            let max_gap = i64::from(cal_max_gap(opt, qd.min(rd) as i32));
+            let w = max_gap.min(i64::from(p.w));
+            if qd - rd < w && rd - qd < w {
+                break;
+            }
+            // Same test behind the seed.
+            let qd = i64::from(p.qe - (s.qbeg + s.len));
+            let rd = p.re - (s.rbeg + i64::from(s.len));
+            let max_gap = i64::from(cal_max_gap(opt, qd.min(rd) as i32));
+            let w = max_gap.min(i64::from(p.w));
+            if qd - rd < w && rd - qd < w {
+                break;
+            }
+            v += 1;
+            i += 1;
+        }
+
+        if v < lim {
+            // The seed is (almost) contained in an existing alignment. Confirm it cannot lead to a
+            // different one: look for a comparably long, already-processed seed of the same chain
+            // that overlaps it on a *different* diagonal. bwa scans `srt2[k+1..]` (higher scores,
+            // i.e. our earlier positions); only whether one exists matters, not which.
+            let first = idx - m.pos as usize; // this chain's first slot
+            let mut interferes = false;
+            for q in 0..m.pos as usize {
+                let t_idx = first + q;
+                if purged[t_idx] {
+                    continue;
+                }
+                let t = c.seeds[meta[t_idx].seed as usize];
+                if f64::from(t.len) < f64::from(s.len) * 0.95 {
+                    continue;
+                }
+                if s.qbeg <= t.qbeg
+                    && s.qbeg + s.len - t.qbeg >= s.len >> 2
+                    && i64::from(t.qbeg - s.qbeg) != t.rbeg - s.rbeg
+                {
+                    interferes = true;
+                    break;
+                }
+                if t.qbeg <= s.qbeg
+                    && t.qbeg + t.len - s.qbeg >= s.len >> 2
+                    && i64::from(s.qbeg - t.qbeg) != s.rbeg - t.rbeg
+                {
+                    interferes = true;
+                    break;
+                }
+            }
+            if !interferes {
+                regs[idx].qb = -1;
+                regs[idx].qe = -1;
+                purged[idx] = true;
+                continue; // purged seeds do not count towards `lim`
+            }
+        }
+        lim += 1;
+    }
+}
 
 /// One pending one-sided extension, with a back-pointer to the region it fills.
 struct SideJob {
@@ -51,20 +245,67 @@ pub fn align_reads_batched<B: SwBackend>(
     // to per-read `collect_smems`).
     let refs: Vec<&[u8]> = reads.iter().map(|c| c.as_slice()).collect();
     let per_read_smems = mem_collect_smem_batched(fm, &refs, opt);
+    if std::env::var_os("BWA3_DUMP_SMEMS").is_some() {
+        for sm in &per_read_smems {
+            eprintln!("SMEM tot={}", sm.len());
+            for p in sm {
+                eprintln!("  smem q[{},{}) len={} s={} k={}", p.m, p.n + 1, p.n + 1 - p.m, p.s, p.k);
+            }
+        }
+    }
+    let dump_chains = std::env::var_os("BWA3_DUMP_CHAINS").is_some();
     let per_read_chains: Vec<Vec<MemChain>> = per_read_smems
         .into_iter()
         .zip(reads.iter())
         .map(|(smems, codes)| {
-            mem_chain_flt(opt, build_chains_from_smems(fm, bns, opt, codes, 0, smems))
+            let pre = build_chains_from_smems(fm, bns, opt, codes, 0, smems);
+            if dump_chains {
+                eprintln!("PRECHAIN nchains={}", pre.len());
+                for (ci, c) in pre.iter().enumerate() {
+                    eprintln!(
+                        "  prechain{ci} pos={} nseed={} w={} qbeg={} qend={}",
+                        c.pos,
+                        c.seeds.len(),
+                        bwa_chain::mem_chain_weight(c),
+                        c.seeds.first().map_or(0, |s| s.qbeg),
+                        c.seeds.last().map_or(0, |s| s.qbeg + s.len),
+                    );
+                }
+            }
+            let out = mem_chain_flt(opt, pre);
+            if dump_chains {
+                eprintln!("CHAIN nchains={}", out.len());
+                for (ci, c) in out.iter().enumerate() {
+                    eprintln!(
+                        "  chain{ci} pos={} nseed={} w={} kept={}",
+                        c.pos,
+                        c.seeds.len(),
+                        c.w,
+                        c.kept
+                    );
+                }
+            }
+            out
         })
         .collect();
 
     let mut regs: Vec<Vec<MemAlnReg>> = vec![Vec::new(); reads.len()];
     // region -> owning chain index (for the final seedcov pass).
     let mut reg_chain: Vec<Vec<usize>> = vec![Vec::new(); reads.len()];
+    // Per-region (chain, order position, seed) for the discard pass.
+    let mut reg_meta: Vec<Vec<RegMeta>> = vec![Vec::new(); reads.len()];
+    // Seeds whose extension nh13's skip elided: they keep a slot (so the discard pass reproduces
+    // bwa-mem2's scan order) but start purged.
+    let mut reg_preskip: Vec<Vec<bool>> = vec![Vec::new(); reads.len()];
 
     let mut left_jobs: Vec<SideJob> = Vec::new();
     let mut right_jobs: Vec<SideJob> = Vec::new();
+
+    // Skip banded-SW for same-diagonal contained seeds (nh13 --skip-contained-ext). The discard pass
+    // below needs one slot per seed to reproduce bwa-mem2's scan order, so a skipped seed would shift
+    // every later slot; the two are mutually exclusive for now.
+    let purge = discard_enabled();
+    let skip_contained = skip_contained_enabled();
 
     // ---- collection pass: one region skeleton + up to one left and one right job per seed ----
     for (r, codes) in reads.iter().enumerate() {
@@ -95,6 +336,9 @@ pub fn align_reads_batched<B: SwBackend>(
                     rmax0 = l_pac;
                 }
             }
+                // `bns_fetch_seq`: trim the window to the seed's contig so extension cannot run off its end
+                // into the next contig's sequence (visible on the circular MT genome).
+                let (rmax0, rmax1, _rid) = bns.fetch_bounds(rmax0, rmax1, chain.seeds[0].rbeg);
             let rseq: Vec<u8> = (rmax0..rmax1).map(|p| fm.base(p)).collect();
 
             // Seeds in descending (score, index) order.
@@ -103,7 +347,36 @@ pub fn align_reads_batched<B: SwBackend>(
                 std::cmp::Reverse((u64::from(chain.seeds[i].score as u32) << 32) | i as u64)
             });
 
-            for &si in &order {
+            for (pos, &si) in order.iter().enumerate() {
+                if skip_contained && seed_ext_redundant(&chain.seeds, si) {
+                    // Keep the slot, skip the DP: the discard pass would purge this seed anyway
+                    // (its container is a longer same-diagonal seed, extended earlier).
+                    reg_chain[r].push(ci);
+                    reg_meta[r].push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+                    reg_preskip[r].push(true);
+                    regs[r].push(MemAlnReg {
+                        rb: -1,
+                        re: -1,
+                        qb: -1,
+                        qe: -1,
+                        rid: chain.rid,
+                        score: -1,
+                        truesc: -1,
+                        sub: 0,
+                        csub: 0,
+                        sub_n: 0,
+                        seedcov: 0,
+                        seedlen0: chain.seeds[si].len,
+                        secondary: -1,
+                        secondary_all: -1,
+                        w: opt.w,
+                        frac_rep: chain.frac_rep,
+                        is_alt: chain.is_alt,
+                        hash: 0,
+                        n_comp: 1,
+                    });
+                    continue;
+                }
                 let s = chain.seeds[si];
                 let mut a = MemAlnReg {
                     rb: H0_SENTINEL,
@@ -173,6 +446,8 @@ pub fn align_reads_batched<B: SwBackend>(
                 }
 
                 reg_chain[r].push(ci);
+                reg_meta[r].push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+                reg_preskip[r].push(false);
                 regs[r].push(a);
             }
         }
@@ -196,7 +471,7 @@ pub fn align_reads_batched<B: SwBackend>(
     // ---- seedcov, per region, from final bounds (mirrors mem_chain2aln's tail) ----
     for r in 0..reads.len() {
         for (idx, a) in regs[r].iter_mut().enumerate() {
-            if a.rb != H0_SENTINEL && a.qb != H0_SENTINEL as i32 {
+            if a.rb != H0_SENTINEL && a.qb != H0_SENTINEL as i32 && a.qb != -1 {
                 let chain = &per_read_chains[r][reg_chain[r][idx]];
                 a.seedcov = 0;
                 for t in &chain.seeds {
@@ -212,7 +487,36 @@ pub fn align_reads_batched<B: SwBackend>(
         }
     }
 
+    // ---- bwa-mem2's discard pass, after every extension has landed ----
+    if purge {
+        for r in 0..reads.len() {
+            let l_query = reads[r].len() as i32;
+            discard_contained(
+                opt,
+                l_query,
+                &per_read_chains[r],
+                &mut regs[r],
+                &reg_meta[r],
+                &reg_preskip[r],
+            );
+        }
+    }
+
+    // Drop the purged regions before returning, as bwa-mem2 does between the discard pass and
+    // `mem_sort_dedup_patch`. Not cosmetic: the dedup sorts by `re` with an *unstable* introsort, so
+    // leaving purged entries in would change the array it partitions and hence the order of
+    // equal-`re` regions -- which is exactly what decides who survives a score tie.
+    for r in regs.iter_mut() {
+        r.retain(|a| a.qe > a.qb);
+    }
+
     regs
+}
+
+/// Whether bwa-mem2's post-extension discard pass runs (`BWA3_NO_DISCARD` opts out).
+pub(crate) fn discard_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BWA3_NO_DISCARD").is_none())
 }
 
 /// Run one side (left or right) of all pending extensions through `MAX_BAND_TRY` band-doubling

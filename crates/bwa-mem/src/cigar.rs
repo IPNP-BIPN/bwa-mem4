@@ -44,11 +44,22 @@ impl MemAln {
             cigar: Vec::new(),
             nm: 0,
             md: String::new(),
-            score: -1,
-            sub: -1,
+            // Zero, not -1: bwa builds this from `memset(&a, 0, sizeof(mem_aln_t))`, so an unmapped
+            // record clears `mem_aln2sam`'s `score >= 0` / `sub >= 0` guards and carries
+            // `AS:i:0 XS:i:0`. Signalling "absent" with -1 silently drops both tags.
+            score: 0,
+            sub: 0,
             xa: None,
         }
     }
+}
+
+/// Env-gated (`BWA3_DUMP_BW`) trace of the band-width retry loop, in bwa's `-v 4` format so the two
+/// can be diffed directly. Cached: `reg2aln` runs per emitted alignment, so a `var_os` per call
+/// would show up in the profile.
+fn dump_bw() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA3_DUMP_BW").is_some())
 }
 
 /// Inferred band width, port of `infer_bw`.
@@ -191,6 +202,9 @@ pub fn reg2aln(
         w2 = w2.min(reg.w);
     }
 
+    if dump_bw() {
+        eprintln!("* Band width: inferred={w2}, cmd_opt={}, alnreg={}", opt.w, reg.w);
+    }
     let mut i = 0;
     let mut last_sc = -(1 << 30);
     let (_score, mut cigar, nm, md) = loop {
@@ -205,6 +219,9 @@ pub fn reg2aln(
             re,
         )
         .expect("gen_cigar2");
+        if dump_bw() {
+            eprintln!("* Final alignment: w2={w2}, global_sc={sc}, local_sc={}", reg.truesc);
+        }
         if sc == last_sc || w2 == opt.w << 2 {
             break (sc, cg, nm_, md_);
         }
@@ -276,6 +293,26 @@ pub fn cigar_string(cigar: &[u32]) -> String {
     for &c in cigar {
         s.push_str(&(c >> 4).to_string());
         s.push(OPS[(c & 0xf) as usize]);
+    }
+    s
+}
+
+/// `add_cigar`: like [`cigar_string`], but rewrites clip ops for the record being emitted. A
+/// supplementary record (`which != 0`) hard-clips what the primary soft-clips, so that the read's
+/// bases are stored exactly once; `-Y` (`flags::SOFTCLIP`) and ALT hits keep soft clips.
+pub fn cigar_string_which(cigar: &[u32], which: usize, is_alt: bool, softclip: bool) -> String {
+    if cigar.is_empty() {
+        return "*".to_string();
+    }
+    const OPS: [char; 5] = ['M', 'I', 'D', 'S', 'H'];
+    let mut s = String::new();
+    for &c in cigar {
+        let mut op = (c & 0xf) as usize;
+        if !softclip && !is_alt && (op == 3 || op == 4) {
+            op = if which != 0 { 4 } else { 3 };
+        }
+        s.push_str(&(c >> 4).to_string());
+        s.push(OPS[op]);
     }
     s
 }

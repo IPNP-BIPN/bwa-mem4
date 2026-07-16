@@ -4,6 +4,7 @@
 //! Phase 6 (first milestone): produce alignment regions and pick the best mapping position. Full
 //! byte-identical SAM (dedup, primary marking, MAPQ, CIGAR, tags) is layered on top of this.
 
+use crate::across::RegMeta;
 use bwa_chain::{build_chains, mem_chain_flt, MemChain};
 use bwa_core::MemOpt;
 use bwa_extend::ksw_extend2;
@@ -16,7 +17,7 @@ pub mod pe;
 pub mod primary;
 pub use across::align_reads_batched;
 pub use cigar::{cigar_string, reg2aln, MemAln};
-pub use pe::{mem_pestat, mem_sam_pe, PeStat};
+pub use pe::{batch_mate_rescue, mem_pestat, mem_sam_pe, PairRescueData, PeStat};
 pub use primary::{mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch};
 
 /// Sentinel for uninitialized region bounds (bwa's `H0_`).
@@ -104,6 +105,23 @@ pub fn mem_chain2aln(
     chain: &MemChain,
     out: &mut Vec<MemAlnReg>,
 ) {
+    mem_chain2aln_meta(fm, bns, opt, codes, 0, chain, out, &mut Vec::new(), &mut Vec::new());
+}
+
+/// `mem_chain2aln`, additionally recording each emitted region's [`RegMeta`] so the caller can run
+/// bwa-mem2's discard pass over the read's full region set once every chain has been extended.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mem_chain2aln_meta(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[u8],
+    ci: usize,
+    chain: &MemChain,
+    out: &mut Vec<MemAlnReg>,
+    meta: &mut Vec<RegMeta>,
+    preskip: &mut Vec<bool>,
+) {
     if chain.seeds.is_empty() {
         return;
     }
@@ -129,6 +147,9 @@ pub fn mem_chain2aln(
             rmax0 = l_pac;
         }
     }
+    // `bns_fetch_seq`: trim the window to the seed's contig so extension cannot run off its end
+    // into the next contig's sequence (visible on the circular MT genome).
+    let (rmax0, rmax1, _rid) = bns.fetch_bounds(rmax0, rmax1, chain.seeds[0].rbeg);
     let rseq: Vec<u8> = (rmax0..rmax1).map(|p| fm.base(p)).collect();
 
     // Seeds in descending (score, index) order.
@@ -137,7 +158,38 @@ pub fn mem_chain2aln(
         std::cmp::Reverse((u64::from(chain.seeds[i].score as u32) << 32) | i as u64)
     });
 
-    for &si in &order {
+    // Same contained-seed extension skip as the batched path (they must stay region-identical), and
+    // the same mutual exclusion with the discard pass, which needs one slot per seed.
+    let skip_contained = crate::across::skip_contained_enabled();
+
+    for (pos, &si) in order.iter().enumerate() {
+        if skip_contained && crate::across::seed_ext_redundant(&chain.seeds, si) {
+            // Keep the slot (the discard pass reproduces bwa-mem2's scan order), skip the DP.
+            meta.push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+            preskip.push(true);
+            out.push(MemAlnReg {
+                rb: -1,
+                re: -1,
+                qb: -1,
+                qe: -1,
+                rid: chain.rid,
+                score: -1,
+                truesc: -1,
+                sub: 0,
+                csub: 0,
+                sub_n: 0,
+                seedcov: 0,
+                seedlen0: chain.seeds[si].len,
+                secondary: -1,
+                secondary_all: -1,
+                w: opt.w,
+                frac_rep: chain.frac_rep,
+                is_alt: chain.is_alt,
+                hash: 0,
+                n_comp: 1,
+            });
+            continue;
+        }
         let s = chain.seeds[si];
         let mut a = MemAlnReg {
             rb: H0_SENTINEL,
@@ -224,6 +276,8 @@ pub fn mem_chain2aln(
                 }
             }
         }
+        meta.push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+        preskip.push(false);
         out.push(a);
     }
 }
@@ -232,9 +286,25 @@ pub fn mem_chain2aln(
 pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec<MemAlnReg> {
     let chains = mem_chain_flt(opt, build_chains(fm, bns, opt, codes, 0));
     let mut regs = Vec::new();
-    for c in &chains {
-        mem_chain2aln(fm, bns, opt, codes, c, &mut regs);
+    let mut meta = Vec::new();
+    let mut preskip = Vec::new();
+    for (ci, c) in chains.iter().enumerate() {
+        mem_chain2aln_meta(fm, bns, opt, codes, ci, c, &mut regs, &mut meta, &mut preskip);
     }
+    // bwa-mem2 purges covered seeds only once every chain of the read has been extended, so this
+    // cannot live inside the per-chain body above.
+    if crate::across::discard_enabled() {
+        crate::across::discard_contained(
+            opt,
+            codes.len() as i32,
+            &chains,
+            &mut regs,
+            &meta,
+            &preskip,
+        );
+    }
+    // Same compaction the batched path does, and for the same reason (the dedup's unstable sort).
+    regs.retain(|a| a.qe > a.qb);
     regs
 }
 
@@ -255,7 +325,7 @@ pub fn align_read_dedup(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) 
 
 /// Env-gated (`BWA3_DUMP_REGS`) diagnostic: print every region with its query span, reference
 /// span, mapped position and scores. Used to compare our suboptimal-region set against the oracle.
-fn dump_regs(bns: &BntSeq, tag: &str, regs: &[MemAlnReg]) {
+pub fn dump_regs(bns: &BntSeq, tag: &str, regs: &[MemAlnReg]) {
     eprintln!("--- regs [{}] n={} ---", tag, regs.len());
     for (i, r) in regs.iter().enumerate() {
         let (rid, pos, rev) = region_to_pos(bns, r);

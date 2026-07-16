@@ -4,7 +4,8 @@
 //! Chains collinear seeds into candidate alignments, then filters by weight and overlap. The
 //! end-to-end byte-identity gate is the SE SAM concordance in phase 6.
 
-use std::collections::BTreeMap;
+
+mod kbtree;
 
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
@@ -148,7 +149,8 @@ pub fn build_chains_from_smems(
     let l_pac = bns.l_pac;
     let max_occ = i64::from(opt.max_occ);
     let mut chains: Vec<MemChain> = Vec::new();
-    let mut tree: BTreeMap<i64, usize> = BTreeMap::new();
+    // bwa keys chains by `pos` in a klib kbtree, whose exact shape is observable (see `kbtree`).
+    let mut tree = crate::kbtree::KbTree::new();
 
     // Pass 1: gather every sampled occurrence position (in the exact order the merge consumes them)
     // and each SMEM's sampled count. Each `get_sa` is a random-access LF-walk, so resolving them all
@@ -187,8 +189,11 @@ pub fn build_chains_from_smems(
             if rid < 0 {
                 continue;
             }
+            // Only this one chain is offered the seed: if it declines, bwa starts a new chain even
+            // though another chain might have accepted it.
+            let lower = tree.lower(rbeg);
             let mut to_add = true;
-            if let Some((_, &ci)) = tree.range(..=rbeg).next_back() {
+            if let Some(ci) = lower {
                 if test_and_merge(opt, l_pac, &mut chains[ci], &s, rid) {
                     to_add = false;
                 }
@@ -206,7 +211,12 @@ pub fn build_chains_from_smems(
                     frac_rep: 0.0,
                     seeds: vec![s],
                 });
-                tree.insert(rbeg, idx);
+                // bwa keys chains by `pos` in a kbtree, which *permits duplicates*: when several
+                // chains share a pos, `kb_intervalp`'s lower_bound returns the first one inserted
+                // (klib appends later duplicates after it). A plain map would overwrite, silently
+                // redirecting later seeds to the most recent chain instead, which changes which
+                // chain they merge into and can lose a chain entirely.
+                tree.put(rbeg, idx);
             }
         }
     }
@@ -215,11 +225,15 @@ pub fn build_chains_from_smems(
     for c in &mut chains {
         c.frac_rep = frac;
     }
-    // bwa-mem2 stores chains in a position-keyed kbtree and emits them via an in-order traversal,
-    // so `mem_chain_flt` receives them sorted by `pos` ascending. We build in seed-occurrence order,
-    // so re-sort to match; this ordering drives the (unstable) tie-break among equal-weight chains.
-    chains.sort_by_key(|c| c.pos);
-    chains
+    // bwa-mem2 stores chains in a position-keyed kbtree and emits them via an in-order traversal, so
+    // `mem_chain_flt` receives them by `pos` ascending -- and, within one pos, in kbtree *array*
+    // order rather than insertion order. Replay the tree instead of sorting: a stable sort by pos
+    // would keep insertion order for duplicates. This ordering drives the (unstable) tie-break among
+    // equal-weight chains in `mem_chain_flt`.
+    let order: Vec<usize> = tree.in_order();
+    debug_assert_eq!(order.len(), chains.len());
+    let mut slots: Vec<Option<MemChain>> = chains.into_iter().map(Some).collect();
+    order.into_iter().map(|i| slots[i].take().expect("each chain is inserted exactly once")).collect()
 }
 
 /// Insertion sort over `a`, moving an element left while it is strictly `lt` its predecessor.
@@ -275,7 +289,7 @@ fn ks_combsort_by<T>(a: &mut [T], lt: &impl Fn(&T, &T) -> bool) {
 /// depth-limited comb-sort fallback and a final insertion-sort pass). This is deliberately the
 /// exact same (unstable) permutation bwa-mem2 applies in `mem_chain_flt`, so equal-weight chains
 /// resolve identically to the oracle. `lt(x, y)` = `x < y`.
-fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
+pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
     let n = a.len();
     if n < 1 {
         return;
