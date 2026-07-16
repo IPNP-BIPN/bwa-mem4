@@ -464,7 +464,10 @@ pub fn ksw_local_fwd(
     }
 
     // 2nd-best score: best `b` entry whose column lies outside [te - w, te + w], w = ceil(score/max).
-    let mut score2 = 0i32;
+    // Starts at -1, not 0: ksw returns `g_defr = {0, -1, -1, -1, -1, -1, -1}` when nothing qualifies,
+    // and mem_matesw copies it straight into `csub`. The sign matters downstream -- mem_sam_pe caps
+    // MAPQ with `raw_mapq(score - csub, a)`, so csub = -1 yields score+1 where 0 yields score.
+    let mut score2 = -1i32;
     let mut te2 = -1i32;
     if gmax > 0 && !b.is_empty() {
         let w = (gmax + max_sc - 1) / max_sc;
@@ -525,8 +528,15 @@ pub fn ksw_align2(
     if score < minsc || qe < 0 {
         return r;
     }
+    // bwa does `revseq(r.qe + 1, query); revseq(r.te + 1, target);` -- both *in place* -- then
+    // re-inits the query profile at length `qe + 1` but calls the kernel with the **full** `tlen`.
+    // So the query really is truncated, while the target is not: only its first `te + 1` bases are
+    // reversed and the untouched tail still gets scanned. That matters, because the pass stops via
+    // KSW_XSTOP once it reaches `score`, and if the reversed prefix alone never gets there the tail
+    // can still reach it -- which sets qb/tb, and mem_matesw drops the rescue when qb < 0.
     let qrev: Vec<u8> = query[..=qe as usize].iter().rev().copied().collect();
-    let trev: Vec<u8> = target[..=te as usize].iter().rev().copied().collect();
+    let mut trev: Vec<u8> = target.to_vec();
+    trev[..=te as usize].reverse();
     let (rscore, rte, rqe, _, _) = ksw_local_fwd(
         &qrev,
         &trev,
