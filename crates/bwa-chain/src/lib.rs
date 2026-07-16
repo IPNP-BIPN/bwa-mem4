@@ -148,7 +148,12 @@ pub fn build_chains_from_smems(
     let l_pac = bns.l_pac;
     let max_occ = i64::from(opt.max_occ);
     let mut chains: Vec<MemChain> = Vec::new();
-    let mut tree: BTreeMap<i64, usize> = BTreeMap::new();
+    // bwa keys chains by `pos` in a klib kbtree, which *permits duplicates*; a plain pos-keyed map
+    // would overwrite and silently redirect later seeds to a different chain. Each pos maps to the
+    // chains at that pos in kbtree *array* order, which is not insertion order: `kb_putp` finds the
+    // first duplicate at index i and inserts the newcomer at i+1, so inserting A, B, C at one pos
+    // leaves [A, C, B].
+    let mut tree: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
 
     // Pass 1: gather every sampled occurrence position (in the exact order the merge consumes them)
     // and each SMEM's sampled count. Each `get_sa` is a random-access LF-walk, so resolving them all
@@ -187,8 +192,16 @@ pub fn build_chains_from_smems(
             if rid < 0 {
                 continue;
             }
+            // `kb_intervalp`'s lower: `__kb_getp_aux` lower_bounds `rbeg`, so an exact pos hit yields
+            // the *first* chain at that pos, and otherwise the *last array entry* below it. Only that
+            // one chain is offered the seed -- if it declines, bwa starts a new chain even though
+            // another chain might have accepted it.
+            let lower = match tree.get(&rbeg) {
+                Some(v) => v.first().copied(),
+                None => tree.range(..rbeg).next_back().and_then(|(_, v)| v.last().copied()),
+            };
             let mut to_add = true;
-            if let Some((_, &ci)) = tree.range(..=rbeg).next_back() {
+            if let Some(ci) = lower {
                 if test_and_merge(opt, l_pac, &mut chains[ci], &s, rid) {
                     to_add = false;
                 }
@@ -206,7 +219,14 @@ pub fn build_chains_from_smems(
                     frac_rep: 0.0,
                     seeds: vec![s],
                 });
-                tree.insert(rbeg, idx);
+                // bwa keys chains by `pos` in a kbtree, which *permits duplicates*: when several
+                // chains share a pos, `kb_intervalp`'s lower_bound returns the first one inserted
+                // (klib appends later duplicates after it). A plain map would overwrite, silently
+                // redirecting later seeds to the most recent chain instead, which changes which
+                // chain they merge into and can lose a chain entirely.
+                tree.entry(rbeg)
+                    .and_modify(|v| v.insert(1, idx))
+                    .or_insert_with(|| vec![idx]);
             }
         }
     }
@@ -215,11 +235,15 @@ pub fn build_chains_from_smems(
     for c in &mut chains {
         c.frac_rep = frac;
     }
-    // bwa-mem2 stores chains in a position-keyed kbtree and emits them via an in-order traversal,
-    // so `mem_chain_flt` receives them sorted by `pos` ascending. We build in seed-occurrence order,
-    // so re-sort to match; this ordering drives the (unstable) tie-break among equal-weight chains.
-    chains.sort_by_key(|c| c.pos);
-    chains
+    // bwa-mem2 stores chains in a position-keyed kbtree and emits them via an in-order traversal, so
+    // `mem_chain_flt` receives them by `pos` ascending -- and, within one pos, in kbtree *array*
+    // order rather than insertion order. Replay the tree instead of sorting: a stable sort by pos
+    // would keep insertion order for duplicates. This ordering drives the (unstable) tie-break among
+    // equal-weight chains in `mem_chain_flt`.
+    let order: Vec<usize> = tree.into_values().flatten().collect();
+    debug_assert_eq!(order.len(), chains.len());
+    let mut slots: Vec<Option<MemChain>> = chains.into_iter().map(Some).collect();
+    order.into_iter().map(|i| slots[i].take().expect("each chain is inserted exactly once")).collect()
 }
 
 /// Insertion sort over `a`, moving an element left while it is strictly `lt` its predecessor.
