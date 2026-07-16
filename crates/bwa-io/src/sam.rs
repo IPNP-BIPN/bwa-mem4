@@ -27,6 +27,10 @@ pub fn write_header<W: Write>(
 }
 
 /// Write one unmapped SE record (FLAG 4). SEQ is emitted as sequenced; QUAL falls back to `*`.
+///
+/// The trailing `AS:i:0 XS:i:0` are not cosmetic: bwa builds an unmapped record from a zeroed
+/// `mem_aln_t` (`mem_reg2aln` with a null region), so its `score`/`sub` are 0 rather than negative,
+/// and `mem_aln2sam` emits both tags under `if (p->score >= 0)` / `if (p->sub >= 0)`.
 pub fn write_unmapped<W: Write>(
     w: &mut W,
     qname: &str,
@@ -41,7 +45,7 @@ pub fn write_unmapped<W: Write>(
         Some(q) if !q.is_empty() => w.write_all(q)?,
         _ => w.write_all(b"*")?,
     }
-    w.write_all(b"\n")?;
+    w.write_all(b"\tAS:i:0\tXS:i:0\n")?;
     Ok(())
 }
 
@@ -108,13 +112,13 @@ mod tests {
     fn unmapped_record_shape() {
         let mut buf = Vec::new();
         write_unmapped(&mut buf, "r1", b"ACGT", Some(b"IIII")).unwrap();
-        assert_eq!(&buf, b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n");
+        assert_eq!(&buf, b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tAS:i:0\tXS:i:0\n");
     }
 
     #[test]
     fn unmapped_missing_qual_is_star() {
         let mut buf = Vec::new();
         write_unmapped(&mut buf, "r1", b"ACGT", None).unwrap();
-        assert_eq!(&buf, b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\n");
+        assert_eq!(&buf, b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\tAS:i:0\tXS:i:0\n");
     }
 }
