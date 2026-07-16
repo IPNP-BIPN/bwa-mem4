@@ -135,8 +135,9 @@ fn fwd_local_sw_batch(
             // job's score ceiling fits u8, run 16 lanes; else the i16 kernel at 8 lanes. Mate-rescue
             // jobs (short reads, match ~1) fit u8.
             let bound = |j: &FwdJob| j.query.len().min(j.target.len()) as i32 * max_sc;
-            if jobs.iter().all(|j| bound(j) < 250) {
-                // SAFETY: neon detected; every H/E/F cell < 250 fits u8; standard mat.
+            // u8 also holds the argmax query column, so the query must be < 256 too.
+            if jobs.iter().all(|j| bound(j) < 250 && j.query.len() < 250) {
+                // SAFETY: neon detected; every H/E/F cell and query column < 250 fits u8; standard mat.
                 return unsafe {
                     fwd_local_sw_neon_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                 };
@@ -222,10 +223,10 @@ fn fwd_local_sw_scalar(
         let mut h_prev = vec![0i32; qmax * LANES];
         let mut h_cur = vec![0i32; qmax * LANES];
         let mut e = vec![0i32; qmax * LANES];
-        let mut hmax_col = vec![0i32; qmax * LANES];
         let mut rowmax = vec![0i32; tmax * LANES]; // per-row imax, for score2
         let mut gmax = [0i32; LANES];
         let mut te = [-1i32; LANES];
+        let mut qe = [0i32; LANES]; // argmax column at the best row
         let mut limit = [-1i32; LANES]; // last processed row (inclusive)
         let mut frozen = [false; LANES];
         for l in 0..n {
@@ -236,6 +237,7 @@ fn fwd_local_sw_scalar(
             let mut f = [0i32; LANES];
             let mut h_diag = [0i32; LANES];
             let mut imax = [0i32; LANES];
+            let mut imax_col = [0i32; LANES]; // min query column achieving this row's max
             for j in 0..qmax {
                 for l in 0..LANES {
                     let t = seq_t[i * LANES + l] as usize;
@@ -258,6 +260,7 @@ fn fwd_local_sw_scalar(
                     }
                     if h > imax[l] {
                         imax[l] = h;
+                        imax_col[l] = j as i32;
                     }
                     h_cur[idx] = h;
                     let mut en = e[idx] - e_del;
@@ -284,9 +287,7 @@ fn fwd_local_sw_scalar(
                 if imax[l] > gmax[l] {
                     gmax[l] = imax[l];
                     te[l] = i as i32;
-                    for j in 0..qmax {
-                        hmax_col[j * LANES + l] = h_cur[j * LANES + l];
-                    }
+                    qe[l] = imax_col[l];
                     if gmax[l] >= endsc[l] {
                         frozen[l] = true;
                         limit[l] = i as i32;
@@ -297,7 +298,7 @@ fn fwd_local_sw_scalar(
         }
 
         extract_group(
-            n, g, LANES, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
+            n, g, LANES, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
         );
     }
     out
@@ -305,37 +306,26 @@ fn fwd_local_sw_scalar(
 
 /// Shared per-lane output extraction (`qe`, `score2`/`te2`) from a group's filled DP state, exactly
 /// as [`ksw_local_fwd`]. Used by both the scalar and NEON DP paths so they cannot drift. `rowmax`
-/// (per-row imax) and `hmax_col` (H column at the best row) are SoA `[pos*LANES + lane]`.
+/// `rowmax` (per-row imax) is SoA `[row*lanes + lane]`; `qe` is the per-lane query end (the argmax
+/// column at the best row), tracked inline in the DP so no H column has to be copied.
 #[allow(clippy::too_many_arguments)]
 fn extract_group(
     n: usize,
     g: usize,
     lanes: usize,
-    qlen: &[usize],
     minsc: &[i32],
     max_sc: i32,
     gmax: &[i32],
     te: &[i32],
+    qe: &[i32],
     limit: &[i32],
     rowmax: &[i32],
-    hmax_col: &[i32],
     out: &mut [(i32, i32, i32, i32, i32)],
 ) {
     for l in 0..n {
         let g_ = gmax[l];
         let te_ = te[l];
-        // qe = smallest query column reaching the H max at the best target row (min index on tie).
-        let mut qe = -1i32;
-        if te_ >= 0 {
-            let mut mx = -1i32;
-            for j in 0..qlen[l] {
-                let v = hmax_col[j * lanes + l];
-                if v > mx {
-                    mx = v;
-                    qe = j as i32;
-                }
-            }
-        }
+        let qe = if te_ >= 0 { qe[l] } else { -1 };
         // score2: rebuild ksw_local_fwd's `b` list (row-maxes >= minsc, consecutive rows merged
         // keeping the higher AND advancing the column only on an update), then take the best entry
         // whose column lies outside [te - w, te + w].
@@ -439,10 +429,10 @@ unsafe fn fwd_local_sw_neon(
         let mut h_prev = vec![0i16; qmax * LANES];
         let mut h_cur = vec![0i16; qmax * LANES];
         let mut e = vec![0i16; qmax * LANES];
-        let mut hmax_col = vec![0i32; qmax * LANES];
         let mut rowmax = vec![0i32; tmax * LANES];
         let mut gmax = [0i32; LANES];
         let mut te = [-1i32; LANES];
+        let mut qe = [0i32; LANES];
         let mut limit = [-1i32; LANES];
         let mut frozen = [false; LANES];
         for l in 0..n {
@@ -459,6 +449,7 @@ unsafe fn fwd_local_sw_neon(
             let mut f_v = zero;
             let mut h_diag_v = zero;
             let mut imax_v = zero;
+            let mut imax_col_v = zero; // min query column achieving this row's max
             for j in 0..qmax {
                 let q_v = load_codes(&seq_q, j * LANES);
                 // Cell score: match/mismatch, then N override (-1), then padding override (very neg).
@@ -474,6 +465,9 @@ unsafe fn fwd_local_sw_neon(
                 h_v = vmaxq_s16(h_v, zero);
                 h_v = vmaxq_s16(h_v, e_v);
                 h_v = vmaxq_s16(h_v, f_v);
+                // Track the min column reaching a new row max (strict >, so ties keep the earlier j).
+                let gt = vcgtq_s16(h_v, imax_v);
+                imax_col_v = vbslq_s16(gt, vdupq_n_s16(j as i16), imax_col_v);
                 imax_v = vmaxq_s16(imax_v, h_v);
                 vst1q_s16(h_cur.as_mut_ptr().add(j * LANES), h_v);
 
@@ -486,7 +480,9 @@ unsafe fn fwd_local_sw_neon(
 
             // Per-row bookkeeping (scalar per lane).
             let mut imax_arr = [0i16; LANES];
+            let mut col_arr = [0i16; LANES];
             vst1q_s16(imax_arr.as_mut_ptr(), imax_v);
+            vst1q_s16(col_arr.as_mut_ptr(), imax_col_v);
             for l in 0..n {
                 if i >= tlen[l] || frozen[l] {
                     continue;
@@ -496,9 +492,7 @@ unsafe fn fwd_local_sw_neon(
                 if im > gmax[l] {
                     gmax[l] = im;
                     te[l] = i as i32;
-                    for j in 0..qmax {
-                        hmax_col[j * LANES + l] = h_cur[j * LANES + l] as i32;
-                    }
+                    qe[l] = col_arr[l] as i32;
                     if gmax[l] >= endsc[l] {
                         frozen[l] = true;
                         limit[l] = i as i32;
@@ -514,7 +508,7 @@ unsafe fn fwd_local_sw_neon(
         }
 
         extract_group(
-            n, g, LANES, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
+            n, g, LANES, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
         );
     }
     out
@@ -592,10 +586,10 @@ unsafe fn fwd_local_sw_neon_u8(
         let mut h_prev = vec![0u8; qmax * LANES16];
         let mut h_cur = vec![0u8; qmax * LANES16];
         let mut e = vec![0u8; qmax * LANES16];
-        let mut hmax_col = vec![0i32; qmax * LANES16];
         let mut rowmax = vec![0i32; tmax * LANES16];
         let mut gmax = [0i32; LANES16];
         let mut te = [-1i32; LANES16];
+        let mut qe = [0i32; LANES16];
         let mut limit = [-1i32; LANES16];
         let mut frozen = [false; LANES16];
         for l in 0..n {
@@ -607,6 +601,7 @@ unsafe fn fwd_local_sw_neon_u8(
             let mut f_v = zero;
             let mut h_diag_v = zero;
             let mut imax_v = zero;
+            let mut imax_col_v = zero; // min query column achieving this row's max
             for j in 0..qmax {
                 let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
                 // dsc = max(0, h_diag + score): saturating add/sub floor at 0, so no explicit max-0.
@@ -623,6 +618,9 @@ unsafe fn fwd_local_sw_neon_u8(
                 let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                 let mut h_v = vmaxq_u8(dsc, e_v);
                 h_v = vmaxq_u8(h_v, f_v);
+                // Track the min column reaching a new row max (strict >, so ties keep the earlier j).
+                let gt = vcgtq_u8(h_v, imax_v);
+                imax_col_v = vbslq_u8(gt, vdupq_n_u8(j as u8), imax_col_v);
                 imax_v = vmaxq_u8(imax_v, h_v);
                 vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h_v);
 
@@ -634,7 +632,9 @@ unsafe fn fwd_local_sw_neon_u8(
             }
 
             let mut imax_arr = [0u8; LANES16];
+            let mut col_arr = [0u8; LANES16];
             vst1q_u8(imax_arr.as_mut_ptr(), imax_v);
+            vst1q_u8(col_arr.as_mut_ptr(), imax_col_v);
             for l in 0..n {
                 if i >= tlen[l] || frozen[l] {
                     continue;
@@ -644,9 +644,7 @@ unsafe fn fwd_local_sw_neon_u8(
                 if im > gmax[l] {
                     gmax[l] = im;
                     te[l] = i as i32;
-                    for j in 0..qmax {
-                        hmax_col[j * LANES16 + l] = h_cur[j * LANES16 + l] as i32;
-                    }
+                    qe[l] = col_arr[l] as i32;
                     if gmax[l] >= endsc[l] {
                         frozen[l] = true;
                         limit[l] = i as i32;
@@ -661,7 +659,7 @@ unsafe fn fwd_local_sw_neon_u8(
         }
 
         extract_group(
-            n, g, LANES16, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
+            n, g, LANES16, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
         );
     }
     out
