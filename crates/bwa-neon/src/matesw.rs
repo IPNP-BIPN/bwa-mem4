@@ -113,6 +113,18 @@ const LANES: usize = 8;
 /// Query-column / target-row padding sentinel (`>= m`, so its cell score is forced very negative and
 /// the padded cells stay `0` — neutral to the real lanes).
 const PAD: u8 = 255;
+/// ksw's query-profile padding: `ksw_qinit` rounds the query up to a whole number of SIMD lanes and
+/// fills the tail with **score 0**, so those columns leave `h = h_diag` (they carry a diagonal) and
+/// still feed ksw's per-row max, hence `score2`. Distinct from [`PAD`], which marks cells past the
+/// padded profile that must stay dead.
+const ZPAD: u8 = 5;
+
+/// Length ksw pads a query of `qlen` out to. The lane count is bwa's kernel choice in `mem_matesw`
+/// (`l_ms * opt->a < 250 ? KSW_XBYTE : 0`), i.e. u8/16 lanes or i16/8 lanes -- not our SIMD width.
+fn ksw_padded_qlen(qlen: usize, max_sc: i32) -> usize {
+    let lanes = if qlen as i32 * max_sc < 250 { 16 } else { 8 };
+    qlen.div_ceil(lanes) * lanes
+}
 
 /// Batched forward local-SW pass: `out[i] = (score, te, qe, score2, te2)` for `jobs[i]`, each equal to
 /// [`ksw_local_fwd`]. Dispatches to the NEON i16 kernel where available, else the scalar lockstep.
@@ -195,7 +207,7 @@ fn fwd_local_sw_scalar(
 
     for (g, group) in jobs.chunks(LANES).enumerate() {
         let n = group.len();
-        let qmax = group.iter().map(|j| j.query.len()).max().unwrap_or(0);
+        let qmax = group.iter().map(|j| ksw_padded_qlen(j.query.len(), max_sc)).max().unwrap_or(0);
         let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
         if qmax == 0 || tmax == 0 {
             continue;
@@ -213,6 +225,9 @@ fn fwd_local_sw_scalar(
             endsc[l] = j.endsc;
             for (c, &b) in j.query.iter().enumerate() {
                 seq_q[c * LANES + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES + l] = ZPAD;
             }
             for (r, &b) in j.target.iter().enumerate() {
                 seq_t[r * LANES + l] = b;
@@ -242,8 +257,10 @@ fn fwd_local_sw_scalar(
                 for l in 0..LANES {
                     let t = seq_t[i * LANES + l] as usize;
                     let q = seq_q[j * LANES + l] as usize;
-                    let sc = if t >= m || q >= m {
-                        -30000
+                    let sc = if t >= m || q > ZPAD as usize {
+                        -30000 // past the padded profile (or a dead row): kill the cell
+                    } else if q == ZPAD as usize {
+                        0 // ksw profile padding: carries the diagonal
                     } else {
                         i32::from(mat[t * m + q])
                     };
@@ -394,6 +411,7 @@ unsafe fn fwd_local_sw_neon(
     let neg_v = vdupq_n_s16(-30000);
     let four_v = vdupq_n_s16(4);
     let m_v = vdupq_n_s16(m as i16);
+    let zpad_v = vdupq_n_s16(ZPAD as i16);
     let e_del_v = vdupq_n_s16(e_del as i16);
     let oe_del_v = vdupq_n_s16(oe_del as i16);
     let e_ins_v = vdupq_n_s16(e_ins as i16);
@@ -401,7 +419,7 @@ unsafe fn fwd_local_sw_neon(
 
     for (g, group) in jobs.chunks(LANES).enumerate() {
         let n = group.len();
-        let qmax = group.iter().map(|j| j.query.len()).max().unwrap_or(0);
+        let qmax = group.iter().map(|j| ksw_padded_qlen(j.query.len(), max_sc)).max().unwrap_or(0);
         let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
         if qmax == 0 || tmax == 0 {
             continue;
@@ -419,6 +437,9 @@ unsafe fn fwd_local_sw_neon(
             endsc[l] = j.endsc;
             for (c, &b) in j.query.iter().enumerate() {
                 seq_q[c * LANES + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES + l] = ZPAD;
             }
             for (r, &b) in j.target.iter().enumerate() {
                 seq_t[r * LANES + l] = b;
@@ -455,9 +476,11 @@ unsafe fn fwd_local_sw_neon(
                 // Cell score: match/mismatch, then N override (-1), then padding override (very neg).
                 let eq = vceqq_s16(t_v, q_v);
                 let n_mask = vorrq_u16(vceqq_s16(t_v, four_v), vceqq_s16(q_v, four_v));
-                let pad_mask = vorrq_u16(vcgeq_s16(t_v, m_v), vcgeq_s16(q_v, m_v));
+                let zpad_mask = vceqq_s16(q_v, zpad_v);
+                let pad_mask = vorrq_u16(vcgeq_s16(t_v, m_v), vcgtq_s16(q_v, zpad_v));
                 let mut sc = vbslq_s16(eq, mtch_v, mis_v);
                 sc = vbslq_s16(n_mask, n_v, sc);
+                sc = vbslq_s16(zpad_mask, zero, sc); // ksw profile padding scores 0
                 sc = vbslq_s16(pad_mask, neg_v, sc);
 
                 let e_v = vld1q_s16(e.as_ptr().add(j * LANES));
@@ -549,6 +572,7 @@ unsafe fn fwd_local_sw_neon_u8(
     let one_v = vdupq_n_u8(1); // N penalty
     let four_v = vdupq_n_u8(4);
     let m_v = vdupq_n_u8(m as u8);
+    let zpad_v = vdupq_n_u8(ZPAD);
     let e_del_v = vdupq_n_u8(e_del as u8);
     let oe_del_v = vdupq_n_u8(oe_del as u8);
     let e_ins_v = vdupq_n_u8(e_ins as u8);
@@ -556,7 +580,7 @@ unsafe fn fwd_local_sw_neon_u8(
 
     for (g, group) in jobs.chunks(LANES16).enumerate() {
         let n = group.len();
-        let qmax = group.iter().map(|j| j.query.len()).max().unwrap_or(0);
+        let qmax = group.iter().map(|j| ksw_padded_qlen(j.query.len(), max_sc)).max().unwrap_or(0);
         let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
         if qmax == 0 || tmax == 0 {
             continue;
@@ -577,6 +601,9 @@ unsafe fn fwd_local_sw_neon_u8(
             endsc[l] = j.endsc;
             for (c, &b) in j.query.iter().enumerate() {
                 seq_q[c * LANES16 + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES16 + l] = ZPAD;
             }
             for (r, &b) in j.target.iter().enumerate() {
                 seq_t[r * LANES16 + l] = b;
@@ -607,12 +634,14 @@ unsafe fn fwd_local_sw_neon_u8(
                 // dsc = max(0, h_diag + score): saturating add/sub floor at 0, so no explicit max-0.
                 let eq = vceqq_u8(t_v, q_v);
                 let n_mask = vorrq_u8(vceqq_u8(t_v, four_v), vceqq_u8(q_v, four_v));
-                let pad_mask = vorrq_u8(vcgeq_u8(t_v, m_v), vcgeq_u8(q_v, m_v));
+                let zpad_mask = vceqq_u8(q_v, zpad_v);
+                let pad_mask = vorrq_u8(vcgeq_u8(t_v, m_v), vcgtq_u8(q_v, zpad_v));
                 let add_match = vqaddq_u8(h_diag_v, mtch_v);
                 let sub_mis = vqsubq_u8(h_diag_v, mispen_v);
                 let sub_n = vqsubq_u8(h_diag_v, one_v);
                 let mut dsc = vbslq_u8(eq, add_match, sub_mis);
                 dsc = vbslq_u8(n_mask, sub_n, dsc);
+                dsc = vbslq_u8(zpad_mask, h_diag_v, dsc); // score 0: the diagonal passes through
                 dsc = vbslq_u8(pad_mask, zero, dsc);
 
                 let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
@@ -756,8 +785,10 @@ mod tests {
             let batched =
                 batched_ksw_align2(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
             for (i, j) in jobs.iter().enumerate() {
+                // Same kernel width mem_matesw would pick, since it changes the result.
+                let lanes = if j.query.len() as i32 * max_sc < 250 { 16 } else { 8 };
                 let want = ksw_align2(
-                    j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc,
+                    j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, lanes,
                 );
                 assert_eq!(batched[i], want, "job {i} (qlen {}, match {a})", j.query.len());
             }
