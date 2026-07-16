@@ -82,6 +82,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     if let Some(reads2) = args.reads2.clone() {
         run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, &mut out)?;
         out.flush()?;
+        bwa_gpu::dump_stats();
         return Ok(());
     }
 
@@ -118,6 +119,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         base_id += batch.len() as u64;
     }
     out.flush()?;
+    bwa_gpu::dump_stats();
     Ok(())
 }
 

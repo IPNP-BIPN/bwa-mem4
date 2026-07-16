@@ -17,6 +17,12 @@ mod backend;
 #[cfg(target_os = "macos")]
 pub use backend::MetalBackend;
 
+/// Print `BWA3_GPU_STATS` phase counters (no-op unless the env var is set, or off macOS).
+pub fn dump_stats() {
+    #[cfg(target_os = "macos")]
+    backend::stats::dump();
+}
+
 #[cfg(target_os = "macos")]
 mod metal_ctx {
     use metal::{ComputePipelineState, Device, Function, Library};
@@ -91,6 +97,7 @@ struct Params {
     int end_bonus; int zdrop;
     int njobs; int stride;            // stride = max_qlen + 1 (per-thread DP slice)
 };
+
 
 // One thread = one seed extension. DP arrays live in device memory, a `stride`-sized slice per
 // thread. Byte-identical to ksw_extend2: same recurrence, band shrink, z-drop and tie-breaks.
@@ -188,6 +195,7 @@ kernel void sw_extend(device const uchar* qbuf   [[buffer(0)]],
     o[4] = gscore;       // gscore
     o[5] = max_off;      // max_off
 }
+
 "#;
 
 /// Feasibility probe: square `data` on the GPU. Returns `false` if there is no Metal device.
@@ -327,5 +335,21 @@ mod backend_tests {
                 assert_eq!(*g, expected, "Metal diverged round {round} job {i}");
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod kernel_probe {
+    /// Guards the silent-fallback trap: if the MSL fails to compile, `pipeline()` returns `None`,
+    /// `extend_batch` quietly falls back to the scalar backend, and every byte-identity gate in this
+    /// crate passes *without the GPU ever running*. Assert the kernel actually built, so a broken
+    /// shader fails loudly here instead of masquerading as a green suite.
+    #[test]
+    fn sw_extend_pso_builds() {
+        let ctx = crate::metal_ctx::MetalCtx::get().expect("no Metal device");
+        assert!(
+            ctx.sw_extend.is_some(),
+            "sw_extend PSO failed to build -- MSL compile error; the gates would be vacuous"
+        );
     }
 }
