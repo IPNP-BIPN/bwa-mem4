@@ -109,34 +109,113 @@ fn cell_bound(j: &ExtendJob, max_sc: i32) -> i32 {
     j.h0 + (j.query.len().min(j.target.len()) as i32) * max_sc.max(0)
 }
 
-/// Ungapped diagonal fast path (nh13's `ungapped_analyze` HIT case, `bwamem.cpp`): when the whole
-/// query matches the target on the diagonal with **no** mismatch and no ambiguous base (and the
-/// target is at least as long, `h0 > 0`), the banded Smith-Waterman result is the closed form
-/// `score = gscore = h0 + n*a`, `qle = tle = gtle = n`, `max_off = 0` — so the DP is skipped
-/// entirely. Returns `None` (fall through to the kernel) for any mismatch/ambiguous/short-target
-/// case. This is byte-identical to [`bwa_extend::ksw_extend2`] for the jobs it accepts (gated by the
-/// property test), matching bwa-mem2's own output. `a` is the match score (`mat[0]`).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-#[inline]
-fn ungapped_hit(j: &ExtendJob, a: i32) -> Option<ExtendResult> {
+/// Ungapped diagonal fast path (nh13's `ungapped_analyze`, FP_STATUS_HIT; `bwamem.cpp`): when a
+/// seed extension stays on the diagonal with few enough mismatches, the ungapped alignment is
+/// *provably* optimal and the banded Smith-Waterman is skipped.
+///
+/// The proof: any gapped alternative sitting `B` off the diagonal needs at least `B` gaps, costing
+/// `B * (o_min + e_min)`, while its score is capped at `min(len1, len2) * a`. So it can only beat an
+/// ungapped walk carrying `X` mismatches while `X <= o_min / (a + b - e_min)` -- which is
+/// `6 / (1 + 4 - 1) = 1` for bwa's defaults, i.e. a single mismatch. `x_threshold` carries that
+/// bound; above it we fall through to the kernel (bwa-mem3-cpp instead narrows the band, which buys
+/// us nothing: our SIMD kernel walks every column under a mask, so a tighter band does not shorten
+/// the inner loop).
+///
+/// With no mismatch the walk is deterministic and collapses to `score = gscore = h0 + n*a`,
+/// `qle = tle = gtle = n`. With 1..=x_threshold mismatches it needs the scalar walk below, whose
+/// tie-break is `ksw_extend2`'s: `if (m > max)` is **strict**, so a row that only ties the running
+/// max leaves `max_i` alone and the extension reports `qle = 0`. (nh13's walk uses `>=` instead,
+/// mirroring bandedSWA's `maxRS`, which does move on ties -- each fork must mirror its own kernel.
+/// Ours is ksw_extend2-derived, and the property test below pins that.)
+///
+/// Z-drop has to be modelled too. ksw breaks the row loop once the score falls `zdrop` below the
+/// running max; on a diagonal `i - max_i == mj - max_j`, so its test collapses to `max - m > zdrop`.
+/// A mismatch-free walk never descends (`max == m`) and is immune, which is why the closed form
+/// needs no check -- but a mismatch drops the score by `b`, so a small `zdrop` would make ksw stop
+/// where this walk carries on. bwa's default zdrop is 100 against a mismatch penalty of 4, so this
+/// never fires in production; it fires under the property test's randomized zdrop, which is the
+/// point of testing it.
+///
+/// `tle == qle` because the walk never leaves the diagonal, and `max_off == 0` for the same reason.
+/// The `h0 > 0` guard preserves parity with the DP: at `h0 == 0` the `cur == 0` early-skip inhibits
+/// every update, leaving `max_sc = 0`, where the closed form would claim `n*a`.
+///
+/// Byte-identical to [`bwa_extend::ksw_extend2`] on the jobs it accepts (gated by the property test).
+/// `a` is the match score (`mat[0]`), `b` the mismatch penalty magnitude.
+fn ungapped_hit(j: &ExtendJob, a: i32, b: i32, x_threshold: i32, zdrop: i32) -> Option<ExtendResult> {
     let n = j.query.len();
-    if n == 0 || j.h0 <= 0 || j.target.len() < n {
+    if n == 0 || j.h0 <= 0 || j.target.len() < n || x_threshold < 0 {
         return None;
     }
+    // Walk the diagonal once, recording mismatch columns. Any ambiguous base bails: N scores -1
+    // rather than -b, which the walk below does not model.
+    let mut mis: u128 = 0;
+    let mut total_mis = 0i32;
     for k in 0..n {
         // SAFETY of indexing: target.len() >= n checked above.
         let (q, t) = (j.query[k], j.target[k]);
-        if q >= 4 || t >= 4 || q != t {
+        if q >= 4 || t >= 4 {
             return None;
         }
+        if q != t {
+            total_mis += 1;
+            if total_mis > x_threshold {
+                return None; // a gapped alignment could win: let the kernel decide
+            }
+            if k >= 128 {
+                return None; // past the mismatch bitmap (nh13's FP_N_MAX)
+            }
+            mis |= 1u128 << k;
+        }
     }
-    let score = j.h0 + n as i32 * a;
+    if total_mis == 0 {
+        let score = j.h0 + n as i32 * a;
+        return Some(ExtendResult {
+            score,
+            qle: n as i32,
+            tle: n as i32,
+            gtle: n as i32,
+            gscore: score,
+            max_off: 0,
+        });
+    }
+    if n > 128 {
+        return None; // bitmap holds only the first 128 columns
+    }
+    // 1..=x_threshold mismatches: the walk is cheap but no longer closed-form.
+    let (mut cur, mut max_sc, mut max_i) = (j.h0, j.h0, 0i32);
+    for k in 0..n {
+        if cur == 0 {
+            continue; // local SW: once the diagonal dies it stays dead (no e/f restart)
+        }
+        if mis >> k & 1 == 0 {
+            cur += a;
+        } else {
+            cur -= b;
+            if cur < 0 {
+                cur = 0;
+            }
+        }
+        if cur > max_sc {
+            max_sc = cur;
+            max_i = k as i32 + 1;
+        } else if zdrop > 0 && max_sc - cur > zdrop {
+            return None; // ksw would break the row loop here; this walk does not model that
+        }
+    }
+    if cur == 0 {
+        // The diagonal died. `gscore`/`gtle` then depend on cells this walk does not model (ksw
+        // breaks the row loop at `m == 0`, leaving max_ie on the last live row), so decline the HIT
+        // rather than report a field we cannot prove. nh13 returns gtle = N here and relies on the
+        // caller ignoring it when gscore <= 0; we would rather not ship a struct that lies.
+        return None;
+    }
     Some(ExtendResult {
-        score,
-        qle: n as i32,
-        tle: n as i32,
+        score: max_sc,
+        qle: max_i,
+        tle: max_i,
         gtle: n as i32,
-        gscore: score,
+        gscore: cur,
         max_off: 0,
     })
 }
@@ -168,6 +247,12 @@ fn simd_dispatch(
     }
 
     let a = mat[0] as i32; // match score for the uniform matrix
+    let b = -(mat[1] as i32); // mismatch penalty magnitude
+    // nh13's `fp_x_threshold`: how many mismatches an ungapped diagonal can carry and still be
+    // provably optimal (see `ungapped_hit`). 1 for bwa's defaults.
+    let (o_min, e_min) = (o_del.min(o_ins), e_del.min(e_ins));
+    let denom = a + b - e_min;
+    let x_threshold = if denom > 0 { o_min / denom } else { -1 };
 
     // Ungapped diagonal HIT fast path: a perfect-diagonal extension gets its result in closed form,
     // skipping banded SW. Common on clean reads, so this removes a large slice of DP work while
@@ -175,7 +260,7 @@ fn simd_dispatch(
     let mut out = vec![default_result(); jobs.len()];
     let mut rest: Vec<usize> = Vec::new();
     for (k, j) in jobs.iter().enumerate() {
-        match ungapped_hit(j, a) {
+        match ungapped_hit(j, a, b, x_threshold, zdrop) {
             Some(r) => out[k] = r,
             None => rest.push(k),
         }
