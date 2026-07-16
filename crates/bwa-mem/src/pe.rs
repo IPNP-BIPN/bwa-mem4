@@ -154,9 +154,13 @@ fn mem_matesw(
             let (rb, re, rid, refseq) = bns_fetch_seq(fm, bns, rb0, (rb0 + re0) >> 1, re0);
             if a.rid == rid && re - rb >= i64::from(opt.min_seed_len) {
                 let minsc = opt.min_seed_len * opt.a;
+                // bwa's `xtra`: KSW_XBYTE (the u8 kernel, 16 lanes) when the mate cannot overflow a
+                // byte, else i16 at 8 lanes. The width is part of the result, not just the speed:
+                // ksw pads the query profile out to a whole number of lanes.
+                let lanes = if l_ms as i32 * opt.a < 250 { 16 } else { 8 };
                 let aln = ksw_align2(
                     &seq, &refseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc,
-                    opt.a,
+                    opt.a, lanes,
                 );
                 if dump_pestat() {
                     eprintln!(
