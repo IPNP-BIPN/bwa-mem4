@@ -335,11 +335,67 @@ pub struct KswAlignResult {
     pub te2: i32,
 }
 
-/// One forward local-SW pass. Returns `(score, te, qe, score2, te2)`. `minsc` gates the
-/// suboptimal (`b`-array) tracking (`KSW_XSUBO`); `endsc` stops early once a column max reaches it
-/// (`KSW_XSTOP`, use `i32::MAX` to disable). `max_sc` is the maximum single-cell match score.
+/// The per-row output of one forward local-SW pass, before the (shared, scalar) `finish` stage that
+/// derives `qe`/`score2`/`te2`. Splitting the pass this way lets a SIMD backend reimplement only the
+/// DP recurrence (which is all that benefits from vectorization) while reusing [`local_fwd_finish`]
+/// verbatim, so the fiddly tie-break and suboptimal-tracking logic cannot drift from the scalar path.
+#[derive(Debug, Clone)]
+pub struct LocalFwdDp {
+    /// Best column-max score over the whole matrix (`gmax`), and its target row (`te`, `-1` if none).
+    pub gmax: i32,
+    pub te: i32,
+    /// The `H` row at `te` (length `qlen`; all zero if `te < 0`), for the `qe` argmax in `finish`.
+    pub hmax_col: Vec<i32>,
+    /// Per **processed** target row `i`, the row max `imax` (in row order; shorter than `tlen` iff the
+    /// `endsc` early-stop fired). `finish` rebuilds the `KSW_XSUBO` `b`-array from this.
+    pub row_imax: Vec<i32>,
+}
+
+/// A forward local-SW DP kernel (the vectorizable part of `ksw_local_fwd`). The scalar
+/// [`ScalarFwd`] is authoritative; a SIMD backend must return an identical [`LocalFwdDp`] for every
+/// input so that [`local_fwd_finish`] — and therefore the whole [`ksw_align2_with`] result — is
+/// byte-identical.
+pub trait LocalFwdKernel {
+    /// One forward pass. `endsc` stops early once `gmax` reaches it (`KSW_XSTOP`; `i32::MAX` disables).
+    #[allow(clippy::too_many_arguments)]
+    fn dp(
+        &self,
+        query: &[u8],
+        target: &[u8],
+        m: usize,
+        mat: &[i8],
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        endsc: i32,
+    ) -> LocalFwdDp;
+}
+
+/// The authoritative scalar forward DP.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScalarFwd;
+
+impl LocalFwdKernel for ScalarFwd {
+    fn dp(
+        &self,
+        query: &[u8],
+        target: &[u8],
+        m: usize,
+        mat: &[i8],
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        endsc: i32,
+    ) -> LocalFwdDp {
+        local_fwd_dp(query, target, m, mat, o_del, e_del, o_ins, e_ins, endsc)
+    }
+}
+
+/// Scalar forward local-SW DP (the reference). Records `gmax`/`te`/`hmax_col` and the per-row max.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn ksw_local_fwd(
+pub fn local_fwd_dp(
     query: &[u8],
     target: &[u8],
     m: usize,
@@ -348,10 +404,8 @@ fn ksw_local_fwd(
     e_del: i32,
     o_ins: i32,
     e_ins: i32,
-    minsc: i32,
     endsc: i32,
-    max_sc: i32,
-) -> (i32, i32, i32, i32, i32) {
+) -> LocalFwdDp {
     let qlen = query.len();
     let tlen = target.len();
     let oe_del = o_del + e_del;
@@ -363,8 +417,7 @@ fn ksw_local_fwd(
     let mut hmax_col = vec![0i32; qlen]; // H column at the best target end `te`
     let mut gmax = 0i32;
     let mut te = -1i32;
-    // Suboptimal tracker `b`: (column max score, column), consecutive columns merged (keep higher).
-    let mut b: Vec<(i32, i32)> = Vec::new();
+    let mut row_imax: Vec<i32> = Vec::with_capacity(tlen);
 
     for i in 0..tlen {
         let s_row = target[i] as usize * m;
@@ -404,16 +457,7 @@ fn ksw_local_fwd(
             f = fn_.max(0);
             h_diag = h_prev[j];
         }
-        if imax >= minsc {
-            match b.last() {
-                Some(&(_, col)) if col + 1 == i as i32 => {
-                    if b.last().unwrap().0 < imax {
-                        *b.last_mut().unwrap() = (imax, i as i32);
-                    }
-                }
-                _ => b.push((imax, i as i32)),
-            }
-        }
+        row_imax.push(imax);
         if imax > gmax {
             gmax = imax;
             te = i as i32;
@@ -425,11 +469,23 @@ fn ksw_local_fwd(
         std::mem::swap(&mut h_prev, &mut h_cur);
     }
 
+    LocalFwdDp {
+        gmax,
+        te,
+        hmax_col,
+        row_imax,
+    }
+}
+
+/// Derive `(score, te, qe, score2, te2)` from a [`LocalFwdDp`]. Shared, scalar, byte-identical across
+/// backends. `minsc` gates the `KSW_XSUBO` suboptimal (`b`-array) tracking; `max_sc` is the maximum
+/// single-cell match score (for the suboptimal-window width).
+pub fn local_fwd_finish(dp: &LocalFwdDp, minsc: i32, max_sc: i32) -> (i32, i32, i32, i32, i32) {
     // Query end: smallest query index reaching the column max at `te` (ksw picks min index on tie).
     let mut qe = -1i32;
-    if te >= 0 {
+    if dp.te >= 0 {
         let mut mx = -1i32;
-        for (j, &v) in hmax_col.iter().enumerate() {
+        for (j, &v) in dp.hmax_col.iter().enumerate() {
             if v > mx {
                 mx = v;
                 qe = j as i32;
@@ -437,12 +493,27 @@ fn ksw_local_fwd(
         }
     }
 
-    // 2nd-best score: best `b` entry whose column lies outside [te - w, te + w], w = ceil(score/max).
+    // Rebuild the suboptimal tracker `b`: (row max, row), consecutive rows merged (keep higher).
+    let mut b: Vec<(i32, i32)> = Vec::new();
+    for (i, &imax) in dp.row_imax.iter().enumerate() {
+        if imax >= minsc {
+            match b.last() {
+                Some(&(_, col)) if col + 1 == i as i32 => {
+                    if b.last().unwrap().0 < imax {
+                        *b.last_mut().unwrap() = (imax, i as i32);
+                    }
+                }
+                _ => b.push((imax, i as i32)),
+            }
+        }
+    }
+
+    // 2nd-best score: best `b` entry whose row lies outside [te - w, te + w], w = ceil(score/max).
     let mut score2 = 0i32;
     let mut te2 = -1i32;
-    if gmax > 0 && !b.is_empty() {
-        let w = (gmax + max_sc - 1) / max_sc;
-        let (low, high) = (te - w, te + w);
+    if dp.gmax > 0 && !b.is_empty() {
+        let w = (dp.gmax + max_sc - 1) / max_sc;
+        let (low, high) = (dp.te - w, dp.te + w);
         for &(bs, bc) in &b {
             if (bc < low || bc > high) && bs > score2 {
                 score2 = bs;
@@ -450,14 +521,17 @@ fn ksw_local_fwd(
             }
         }
     }
-    (gmax, te, qe, score2, te2)
+    (dp.gmax, dp.te, qe, score2, te2)
 }
 
 /// Local Smith-Waterman with affine gaps, returning best-alignment coords and the 2nd-best score.
-/// Faithful scalar port of `ksw_align2` (with `KSW_XSTART | KSW_XSUBO`). `max_sc` is the maximum
-/// single match score (`opt.a`), used for the suboptimal-window width.
+/// Faithful port of `ksw_align2` (with `KSW_XSTART | KSW_XSUBO`), generic over the forward DP kernel
+/// `k` so a SIMD backend reuses this exact two-pass wrapper (forward pass for score/ends, reversed-
+/// prefix pass for starts). `max_sc` is the maximum single match score (`opt.a`), used for the
+/// suboptimal-window width.
 #[allow(clippy::too_many_arguments)]
-pub fn ksw_align2(
+pub fn ksw_align2_with<K: LocalFwdKernel>(
+    k: &K,
     query: &[u8],
     target: &[u8],
     m: usize,
@@ -469,19 +543,8 @@ pub fn ksw_align2(
     minsc: i32,
     max_sc: i32,
 ) -> KswAlignResult {
-    let (score, te, qe, score2, te2) = ksw_local_fwd(
-        query,
-        target,
-        m,
-        mat,
-        o_del,
-        e_del,
-        o_ins,
-        e_ins,
-        minsc,
-        i32::MAX,
-        max_sc,
-    );
+    let fwd = k.dp(query, target, m, mat, o_del, e_del, o_ins, e_ins, i32::MAX);
+    let (score, te, qe, score2, te2) = local_fwd_finish(&fwd, minsc, max_sc);
     let mut r = KswAlignResult {
         score,
         qb: -1,
@@ -497,24 +560,33 @@ pub fn ksw_align2(
     }
     let qrev: Vec<u8> = query[..=qe as usize].iter().rev().copied().collect();
     let trev: Vec<u8> = target[..=te as usize].iter().rev().copied().collect();
-    let (rscore, rte, rqe, _, _) = ksw_local_fwd(
-        &qrev,
-        &trev,
-        m,
-        mat,
-        o_del,
-        e_del,
-        o_ins,
-        e_ins,
-        i32::MAX,
-        score,
-        max_sc,
-    );
+    let rev = k.dp(&qrev, &trev, m, mat, o_del, e_del, o_ins, e_ins, score);
+    let (rscore, rte, rqe, _, _) = local_fwd_finish(&rev, i32::MAX, max_sc);
     if score == rscore {
         r.tb = te - rte;
         r.qb = qe - rqe;
     }
     r
+}
+
+/// Scalar `ksw_align2` — the authoritative reference. Every SIMD `ksw_align2_with` result must match
+/// this exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn ksw_align2(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    minsc: i32,
+    max_sc: i32,
+) -> KswAlignResult {
+    ksw_align2_with(
+        &ScalarFwd, query, target, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc,
+    )
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use bwa_mem::{
     align_reads_batched, alt::mem_gen_alt, cigar_string, mem_approx_mapq_se, mem_mark_primary_se,
     mem_pestat, mem_sam_pe, mem_sort_dedup_patch, reg2aln, MemAlnReg,
 };
-use bwa_neon::NeonBackend;
+use bwa_neon::{NeonBackend, NeonFwd};
 
 #[derive(Args)]
 pub struct MemArgs {
@@ -80,7 +80,8 @@ impl Output {
                     .is_some_and(|e| e.eq_ignore_ascii_case("gz") || e.eq_ignore_ascii_case("bgz"));
                 let file = std::fs::File::create(p)?;
                 if bgzf {
-                    let sink: Box<dyn Write + Send> = Box::new(BufWriter::with_capacity(1 << 20, file));
+                    let sink: Box<dyn Write + Send> =
+                        Box::new(BufWriter::with_capacity(1 << 20, file));
                     let level = bgzf::CompressionLevel::new(6)
                         .map_err(|e| anyhow::anyhow!("bgzf compression level: {e}"))?;
                     let workers = std::num::NonZero::new(threads.max(1))
@@ -193,22 +194,23 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
 
     // Reader thread: open the FASTQ here and stream fixed-`-K` batches with their cumulative base id.
     let reads_path = args.reads.clone();
-    let read_batches = move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
-        let mut reader = FastqReader::from_path(&reads_path)?;
-        let mut base_id = 0u64;
-        loop {
-            let batch = reader.next_batch(k_batch)?;
-            if batch.is_empty() {
-                break;
+    let read_batches =
+        move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
+            let mut reader = FastqReader::from_path(&reads_path)?;
+            let mut base_id = 0u64;
+            loop {
+                let batch = reader.next_batch(k_batch)?;
+                if batch.is_empty() {
+                    break;
+                }
+                let n = batch.len() as u64;
+                if tx.send((batch, base_id)).is_err() {
+                    break;
+                }
+                base_id += n;
             }
-            let n = batch.len() as u64;
-            if tx.send((batch, base_id)).is_err() {
-                break;
-            }
-            base_id += n;
-        }
-        Ok(())
-    };
+            Ok(())
+        };
 
     // Main: seed -> chain -> BATCHED seed extension across the whole read batch (NEON backend),
     // mirroring bwa-mem2's mem_chain2aln_across_reads_V2. Chunked so extension parallelizes; each
@@ -304,9 +306,7 @@ impl Backend {
         match self {
             Backend::Cpu => align_reads_batched(fm, bns, opt, codes, &NeonBackend),
             #[cfg(target_os = "macos")]
-            Backend::Metal => {
-                align_reads_batched(fm, bns, opt, codes, &bwa_gpu::MetalBackend)
-            }
+            Backend::Metal => align_reads_batched(fm, bns, opt, codes, &bwa_gpu::MetalBackend),
         }
     }
 }
@@ -486,6 +486,7 @@ fn run_pe(
                     &mut p.a1,
                     &mut p.a2,
                     &mut buf,
+                    &NeonFwd,
                 )
                 .expect("write to Vec");
                 buf

@@ -8,7 +8,7 @@
 use std::io::{self, Write};
 
 use bwa_core::MemOpt;
-use bwa_extend::ksw_align2;
+use bwa_extend::{ksw_align2_with, LocalFwdKernel};
 use bwa_index::{BntSeq, FmIndex};
 
 use crate::alt::mem_gen_alt;
@@ -95,8 +95,11 @@ fn bns_fetch_seq(
 
 /// Smith-Waterman mate rescue: given an anchor region `a` for one read, try to align the mate `ms`
 /// (nt4) in each insert-consistent orientation not already satisfied, appending any hit to `ma`.
-/// Port of `mem_matesw` (non-MATE_SORT path). Returns the number of SW attempts that ran.
-fn mem_matesw(
+/// Port of `mem_matesw` (non-MATE_SORT path). Returns the number of SW attempts that ran. The local
+/// SW is routed through `k` (the forward-DP kernel), so the vectorized `NeonFwd` accelerates rescue
+/// while `ScalarFwd` stays available and byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn mem_matesw<K: LocalFwdKernel>(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
@@ -104,6 +107,7 @@ fn mem_matesw(
     a: &MemAlnReg,
     ms: &[u8],
     ma: &mut Vec<MemAlnReg>,
+    k: &K,
 ) -> i32 {
     let l_pac = bns.l_pac;
     let l_ms = ms.len() as i64;
@@ -153,9 +157,9 @@ fn mem_matesw(
             let (rb, re, rid, refseq) = bns_fetch_seq(fm, bns, rb0, (rb0 + re0) >> 1, re0);
             if a.rid == rid && re - rb >= i64::from(opt.min_seed_len) {
                 let minsc = opt.min_seed_len * opt.a;
-                let aln = ksw_align2(
-                    &seq, &refseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc,
-                    opt.a,
+                let aln = ksw_align2_with(
+                    k, &seq, &refseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins,
+                    minsc, opt.a,
                 );
                 if aln.score >= opt.min_seed_len && aln.qb >= 0 {
                     let qb = if is_rev {
@@ -746,7 +750,7 @@ fn mem_reg2sam(
 /// `a0`/`a1` are dedup'd region vectors; they are re-marked (`mem_mark_primary_se`) here. Returns
 /// the two reads' SAM records (read-1 lines, then read-2 lines).
 #[allow(clippy::too_many_arguments)]
-pub fn mem_sam_pe<W: Write>(
+pub fn mem_sam_pe<W: Write, K: LocalFwdKernel>(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
@@ -758,6 +762,7 @@ pub fn mem_sam_pe<W: Write>(
     a0: &mut Vec<MemAlnReg>,
     a1: &mut Vec<MemAlnReg>,
     w: &mut W,
+    k: &K,
 ) -> io::Result<()> {
     // Mate rescue (mem_matesw), before primary marking. Snapshot each read's near-best regions as
     // anchors, then SW-rescue the other read's mate in any missing insert-consistent orientation.
@@ -778,10 +783,10 @@ pub fn mem_sam_pe<W: Write>(
             .cloned()
             .collect();
         for anchor in b0.iter().take(cap) {
-            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1);
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1, k);
         }
         for anchor in b1.iter().take(cap) {
-            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0);
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0, k);
         }
     }
 
