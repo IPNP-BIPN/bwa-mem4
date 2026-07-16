@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 bwa-core = { workspace = true }
+bwa-chain = { path = "../bwa-chain" }
 bwa-io = { workspace = true }
 bwa-index = { workspace = true }
 bwa-mem = { workspace = true }

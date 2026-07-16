@@ -125,6 +125,7 @@ pub fn build_chains_from_smems(
     seqid: i32,
     mut smems: Vec<bwa_index::Smem>,
 ) -> Vec<MemChain> {
+    let t_total = chain_time::enabled().then(std::time::Instant::now);
     // Intra-read SMEM order: by (m, n) ascending (bwa's `intv_lt1`).
     smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
 
@@ -169,7 +170,13 @@ pub fn build_chains_from_smems(
         counts.push(count);
     }
     let mut rbegs = vec![0i64; positions.len()];
+    let t_sa = chain_time::enabled().then(std::time::Instant::now);
     fm.get_sa_batch(&positions, &mut rbegs);
+    if let Some(t) = t_sa {
+        use std::sync::atomic::Ordering::Relaxed;
+        chain_time::GET_SA_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        chain_time::GET_SA_N.fetch_add(positions.len() as u64, Relaxed);
+    }
 
     // Pass 2: merge, replaying the original per-occurrence logic with precomputed `rbeg` values
     // (same values, same order -> byte-identical chains).
@@ -233,7 +240,17 @@ pub fn build_chains_from_smems(
     let order: Vec<usize> = tree.in_order();
     debug_assert_eq!(order.len(), chains.len());
     let mut slots: Vec<Option<MemChain>> = chains.into_iter().map(Some).collect();
-    order.into_iter().map(|i| slots[i].take().expect("each chain is inserted exactly once")).collect()
+    let out = order
+        .into_iter()
+        .map(|i| slots[i].take().expect("each chain is inserted exactly once"))
+        .collect();
+    if let Some(t) = t_total {
+        chain_time::TOTAL_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    out
 }
 
 /// Insertion sort over `a`, moving an element left while it is strictly `lt` its predecessor.
@@ -548,6 +565,44 @@ mod tests {
             chains.len() >= 2,
             "expected >=2 chains, got {}",
             chains.len()
+        );
+    }
+}
+
+/// `BWA3_CHAIN_TIME=1` probe: how much of `build_chains_from_smems` is the inlined `get_sa_batch`
+/// SA walk. The genome-scale sampler attributes ~37.6% of work samples to this function as a leaf,
+/// but LTO inlines `get_sa_batch` into it, so sampling alone cannot separate the SA walk from the
+/// merge. This can.
+pub mod chain_time {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub static GET_SA_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GET_SA_N: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA3_CHAIN_TIME").is_some())
+    }
+
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (sa, tot, n) = (
+            GET_SA_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            TOTAL_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            GET_SA_N.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "[chain-time] build_chains_from_smems={:.3}s of which get_sa_batch={:.3}s ({:.0}%), \
+             {} SA lookups ({:.0} ns each)",
+            tot,
+            sa,
+            100.0 * sa / tot.max(1e-9),
+            n,
+            1e9 * sa / (n.max(1) as f64),
         );
     }
 }

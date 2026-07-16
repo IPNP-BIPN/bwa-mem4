@@ -192,6 +192,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     if let Some(reads2) = args.reads2.clone() {
         run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, out)?;
         bwa_gpu::dump_stats();
+        bwa_chain::chain_time::dump();
         return Ok(());
     }
 
@@ -244,6 +245,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
 
     run_pipeline(out, read_batches, process)?;
     bwa_gpu::dump_stats();
+    bwa_chain::chain_time::dump();
     Ok(())
 }
 

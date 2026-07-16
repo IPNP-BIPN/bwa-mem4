@@ -114,6 +114,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bgzf",
+ "bwa-chain",
  "bwa-core",
  "bwa-gpu",
  "bwa-index",
