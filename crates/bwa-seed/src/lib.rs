@@ -10,6 +10,9 @@
 use bwa_core::MemOpt;
 use bwa_index::{FmIndex, Smem};
 
+pub mod lisa_seed;
+pub use lisa_seed::collect_smems_lsa_zigzag;
+
 /// A seed: an exact match between the read and the reference (bwa-mem2's `mem_seed_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemSeed {
@@ -683,6 +686,30 @@ pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> 
     per_read
 }
 
+/// Hybrid seeding: **round 1 via the learned index** (`collect_smems_lsa_zigzag` — BWA-MEME's fast
+/// zigzag, ~2x the FM-index round-1 at genome scale because it jumps straight to each LEM instead of
+/// walking `cp_occ` per base), then **rounds 2/3 via the FM index** (the batched reseeding, which
+/// needs no ISA). Byte-identical to [`mem_collect_smem_batched`]: the LISA round-1 SMEM *set* is proven
+/// identical to the FM round-1 (`LearnedSa::bi_interval` == `FmIndex::backward_ext`), and chaining
+/// re-sorts SMEMs by `(m, n)`, so round-1 *order* is irrelevant. Selected only when RAM fits the
+/// learned index (see `bwa_core::sysram`); otherwise the caller uses [`mem_collect_smem_batched`].
+pub fn mem_collect_smem_hybrid(
+    fm: &FmIndex,
+    lsa: &bwa_index::lisa::LearnedSa,
+    reads: &[&[u8]],
+    opt: &MemOpt,
+) -> Vec<Vec<Smem>> {
+    let mut per_read: Vec<Vec<Smem>> = reads
+        .iter()
+        .map(|codes| collect_smems_lsa_zigzag(lsa, codes, opt.min_seed_len))
+        .collect();
+    smem_round_2_batched(fm, reads, opt, &mut per_read);
+    if opt.max_mem_intv > 0 {
+        bwt_seed_strategy_batched(fm, reads, opt.max_mem_intv, opt.min_seed_len + 1, &mut per_read);
+    }
+    per_read
+}
+
 /// Rounds 2 (midpoint re-seeding of long non-repetitive SMEMs) and 3 (interval-capped forward
 /// seeding), appended to the round-1 `smems` in place. Shared by the per-read and batched entry
 /// points so they stay identical.
@@ -833,6 +860,46 @@ mod tests {
     fn tiny() -> FmIndex {
         let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
         FmIndex::load(Path::new(prefix)).unwrap()
+    }
+
+    /// Hybrid seeding (LISA round-1 + FM rounds 2/3) must produce, per read, the same SMEM SET as the
+    /// full FM seeding — after chaining's `(m, n)` sort, the set is what determines the alignment, so
+    /// this is the seeding-level byte-identity gate for the hybrid path.
+    #[test]
+    fn hybrid_seeding_equals_fm() {
+        let fm = tiny();
+        let lsa = bwa_index::lisa::LearnedSa::build(fm.reference().to_vec(), 4096);
+        let opt = MemOpt::default();
+        let l_pac = fm.l_pac() as usize;
+        let mut state = 0xdead_beef_0042u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut reads: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..200 {
+            let len = 40 + (next() as usize % 120);
+            let start = next() as usize % (l_pac - len);
+            let mut r: Vec<u8> = (0..len).map(|i| fm.base((start + i) as i64)).collect();
+            for _ in 0..(next() % 4) {
+                let p = next() as usize % len;
+                r[p] = (next() % 4) as u8;
+            }
+            reads.push(r);
+        }
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        let fm_all = mem_collect_smem_batched(&fm, &refs, &opt);
+        let hy_all = mem_collect_smem_hybrid(&fm, &lsa, &refs, &opt);
+        let key = |v: &[Smem]| -> Vec<(u32, u32, i64, i64)> {
+            let mut k: Vec<_> = v.iter().map(|s| (s.m, s.n, s.k, s.s)).collect();
+            k.sort_unstable();
+            k
+        };
+        for (r, (f, h)) in fm_all.iter().zip(hy_all.iter()).enumerate() {
+            assert_eq!(key(f), key(h), "read {r} (len {})", reads[r].len());
+        }
     }
 
     /// Occurrences of `pat` in the binary reference (both strands, since .0123 is fwd++RC).
