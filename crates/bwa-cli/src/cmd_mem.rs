@@ -9,13 +9,14 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use rayon::prelude::*;
 
+use bwa_core::opt::flags;
 use bwa_core::{dna, MemOpt};
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
-    align_reads_batched, alt::mem_gen_alt, batch_mate_rescue, cigar_string, mem_approx_mapq_se,
-    mem_mark_primary_se, mem_pestat, mem_sam_pe, mem_sort_dedup_patch, reg2aln, MemAlnReg,
-    PairRescueData,
+    align_reads_batched, alt::mem_gen_alt, batch_mate_rescue, cigar::cigar_string_which,
+    cigar::MemAln, cigar_string, mem_approx_mapq_se, mem_mark_primary_se, mem_pestat, mem_sam_pe,
+    mem_sort_dedup_patch, reg2aln, MemAlnReg, PairRescueData,
 };
 use bwa_neon::NeonBackend;
 
@@ -323,66 +324,153 @@ fn finish_se(
     mem_mark_primary_se(opt, &mut regs, read_id);
     // After marking, regs[0] is the highest-scoring primary region.
     let xa = mem_gen_alt(fm, bns, opt, &regs, codes.len() as i32, codes);
-    let best = regs.first().filter(|r| r.score >= opt.t);
+
+    // `mem_reg2sam`: emit every region clearing -T that is not shadowed by a better overlapping one
+    // (`secondary < 0`). The first survivor is the primary; the others are chimeric hits, emitted as
+    // supplementary records whose MAPQ cannot exceed the primary's. Shadowed regions are never
+    // emitted here -- they surface in the primary's XA:Z tag instead (`mem_gen_alt`).
+    let mut alns: Vec<EmitAln> = Vec::new();
+    for (k, p) in regs.iter().enumerate() {
+        if p.score < opt.t || p.secondary >= 0 {
+            continue;
+        }
+        let aln = reg2aln(fm, bns, opt, codes.len() as i32, codes, p);
+        let mut mapq = mem_approx_mapq_se(opt, p);
+        if let Some(first) = alns.first() {
+            if !p.is_alt && mapq > first.mapq {
+                mapq = first.mapq;
+            }
+        }
+        alns.push(EmitAln { aln, mapq, is_alt: p.is_alt, xa: xa[k].clone() });
+    }
+
     let mut buf = Vec::new();
-    match best {
-        Some(r) => {
-            let aln = reg2aln(fm, bns, opt, codes.len() as i32, codes, r);
-            let mapq = mem_approx_mapq_se(opt, r);
-            let rname = &bns.contigs[aln.rid as usize].name;
-            let flag = if aln.is_rev { 16 } else { 0 };
-            let cigar = cigar_string(&aln.cigar);
-            let mut tags = format!(
-                "NM:i:{}\tMD:Z:{}\tAS:i:{}\tXS:i:{}",
-                aln.nm, aln.md, aln.score, aln.sub
-            );
-            if let Some(xa0) = &xa[0] {
-                tags.push_str("\tXA:Z:");
-                tags.push_str(xa0);
-            }
-            let pos = aln.pos + 1;
-            if aln.is_rev {
-                let seq = dna::revcomp_ascii(&rec.seq);
-                let qual = rec.qual.as_ref().map(|q| {
-                    let mut v = q.clone();
-                    v.reverse();
-                    v
-                });
-                sam::write_mapped_se(
-                    &mut buf,
-                    &rec.name,
-                    flag,
-                    rname,
-                    pos,
-                    mapq,
-                    &cigar,
-                    &seq,
-                    qual.as_deref(),
-                    &tags,
-                )
-                .expect("write to Vec");
-            } else {
-                sam::write_mapped_se(
-                    &mut buf,
-                    &rec.name,
-                    flag,
-                    rname,
-                    pos,
-                    mapq,
-                    &cigar,
-                    &rec.seq,
-                    rec.qual.as_deref(),
-                    &tags,
-                )
-                .expect("write to Vec");
-            }
-        }
-        None => {
-            sam::write_unmapped(&mut buf, &rec.name, &rec.seq, rec.qual.as_deref())
-                .expect("write to Vec");
-        }
+    if alns.is_empty() {
+        sam::write_unmapped(&mut buf, &rec.name, &rec.seq, rec.qual.as_deref())
+            .expect("write to Vec");
+        return buf;
+    }
+    for which in 0..alns.len() {
+        write_aln_se(&mut buf, bns, opt, rec, &alns, which);
     }
     buf
+}
+
+/// One emitted alignment plus the per-record state `mem_aln2sam` needs (`mem_aln_t` + its MAPQ,
+/// which we compute outside `reg2aln`).
+struct EmitAln {
+    aln: MemAln,
+    mapq: u32,
+    is_alt: bool,
+    xa: Option<String>,
+}
+
+/// `mem_aln2sam` for one of a read's alignments. `which` indexes `alns`: 0 is the primary, any other
+/// is a supplementary record (FLAG 0x800), which hard-clips and carries only its own slice of
+/// SEQ/QUAL so the read's bases are stored exactly once across the records.
+fn write_aln_se(
+    buf: &mut Vec<u8>,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    rec: &Record,
+    alns: &[EmitAln],
+    which: usize,
+) {
+    let e = &alns[which];
+    let aln = &e.aln;
+    let softclip = opt.flag & flags::SOFTCLIP != 0;
+    let clip_ends = which != 0 && !softclip && !e.is_alt && !aln.cigar.is_empty();
+
+    let mut flag = aln.flag;
+    if aln.is_rev {
+        flag |= 0x10;
+    }
+    if which != 0 {
+        flag |= if opt.flag & flags::NO_MULTI != 0 { 0x100 } else { 0x800 };
+    }
+
+    // Hard-clipped ends are not in this record's SEQ/QUAL. bwa reads the clip lengths off both
+    // cigar ends (which coincide for a 1-op cigar) and maps them onto the *forward* read.
+    let (mut qb, mut qe) = (0usize, rec.seq.len());
+    if clip_ends {
+        let (first, last) = (aln.cigar[0], aln.cigar[aln.cigar.len() - 1]);
+        let is_clip = |c: u32| (c & 0xf) == 3 || (c & 0xf) == 4;
+        let (flen, llen) = ((first >> 4) as usize, (last >> 4) as usize);
+        if aln.is_rev {
+            if is_clip(first) {
+                qe -= flen;
+            }
+            if is_clip(last) {
+                qb += llen;
+            }
+        } else {
+            if is_clip(first) {
+                qb += flen;
+            }
+            if is_clip(last) {
+                qe -= llen;
+            }
+        }
+    }
+
+    let mut tags = String::new();
+    if !aln.cigar.is_empty() {
+        tags.push_str(&format!("NM:i:{}\tMD:Z:{}", aln.nm, aln.md));
+    }
+    if aln.score >= 0 {
+        tags.push_str(&format!("\tAS:i:{}", aln.score));
+    }
+    if aln.sub >= 0 {
+        tags.push_str(&format!("\tXS:i:{}", aln.sub));
+    }
+    // SA:Z lists this read's *other* emitted alignments, with their raw (unconverted) CIGARs.
+    if alns.len() > 1 {
+        tags.push_str("\tSA:Z:");
+        for (i, o) in alns.iter().enumerate() {
+            if i == which {
+                continue;
+            }
+            tags.push_str(&format!(
+                "{},{},{},{},{},{};",
+                bns.contigs[o.aln.rid as usize].name,
+                o.aln.pos + 1,
+                if o.aln.is_rev { '-' } else { '+' },
+                cigar_string(&o.aln.cigar),
+                o.mapq,
+                o.aln.nm,
+            ));
+        }
+    }
+    if let Some(x) = &e.xa {
+        tags.push_str("\tXA:Z:");
+        tags.push_str(x);
+    }
+
+    let cigar = cigar_string_which(&aln.cigar, which, e.is_alt, softclip);
+    let rname = &bns.contigs[aln.rid as usize].name;
+    let (seq, qual) = if aln.is_rev {
+        let q = rec.qual.as_ref().map(|q| {
+            let mut v = q[qb..qe].to_vec();
+            v.reverse();
+            v
+        });
+        (dna::revcomp_ascii(&rec.seq[qb..qe]), q)
+    } else {
+        (rec.seq[qb..qe].to_vec(), rec.qual.as_ref().map(|q| q[qb..qe].to_vec()))
+    };
+    sam::write_mapped_se(
+        buf,
+        &rec.name,
+        flag,
+        rname,
+        aln.pos + 1,
+        e.mapq,
+        &cigar,
+        &seq,
+        qual.as_deref(),
+        &tags,
+    )
+    .expect("write to Vec");
 }
 
 /// Paired-end driver: per batch, align+dedup both ends of every pair, estimate insert sizes

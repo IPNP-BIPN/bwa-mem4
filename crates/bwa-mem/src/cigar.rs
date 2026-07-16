@@ -279,3 +279,23 @@ pub fn cigar_string(cigar: &[u32]) -> String {
     }
     s
 }
+
+/// `add_cigar`: like [`cigar_string`], but rewrites clip ops for the record being emitted. A
+/// supplementary record (`which != 0`) hard-clips what the primary soft-clips, so that the read's
+/// bases are stored exactly once; `-Y` (`flags::SOFTCLIP`) and ALT hits keep soft clips.
+pub fn cigar_string_which(cigar: &[u32], which: usize, is_alt: bool, softclip: bool) -> String {
+    if cigar.is_empty() {
+        return "*".to_string();
+    }
+    const OPS: [char; 5] = ['M', 'I', 'D', 'S', 'H'];
+    let mut s = String::new();
+    for &c in cigar {
+        let mut op = (c & 0xf) as usize;
+        if !softclip && !is_alt && (op == 3 || op == 4) {
+            op = if which != 0 { 4 } else { 3 };
+        }
+        s.push_str(&(c >> 4).to_string());
+        s.push(OPS[op]);
+    }
+    s
+}
