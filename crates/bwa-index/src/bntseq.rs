@@ -59,6 +59,29 @@ impl BntSeq {
         }
     }
 
+    /// Clamp a 2L-space reference window `[beg, end)` to the contig containing `mid`, mirroring the
+    /// clamp inside `bns_fetch_seq`. Returns `(beg, end, rid)`.
+    ///
+    /// This is what stops an extension from running off the end of a contig into whatever sequence
+    /// the packed reference happens to hold next: bwa resolves the seed's contig, then trims the
+    /// window to that contig's span (flipped onto the reverse strand when the seed is reverse). It
+    /// matters wherever a read reaches a contig edge, most visibly on the circular MT genome.
+    pub fn fetch_bounds(&self, beg: i64, end: i64, mid: i64) -> (i64, i64, i32) {
+        let (mid_f, is_rev) = self.depos(mid);
+        let rid = self.pos2rid(mid_f);
+        if rid < 0 {
+            return (beg, end, rid);
+        }
+        let c = &self.contigs[rid as usize];
+        let (mut far_beg, mut far_end) = (c.offset, c.offset + i64::from(c.len));
+        if is_rev {
+            let tmp = far_beg;
+            far_beg = (self.l_pac << 1) - far_end;
+            far_end = (self.l_pac << 1) - tmp;
+        }
+        (beg.max(far_beg), end.min(far_end), rid)
+    }
+
     /// Contig index containing forward position `pos_f`, or -1, mirroring `bns_pos2rid`.
     pub fn pos2rid(&self, pos_f: i64) -> i32 {
         if pos_f >= self.l_pac {
