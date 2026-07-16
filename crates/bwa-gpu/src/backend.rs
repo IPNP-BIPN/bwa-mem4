@@ -50,6 +50,43 @@ fn clamp_band(
     wl
 }
 
+/// `BWA3_GPU_STATS=1` phase counters. End-to-end wall time cannot tell a faster kernel from a slower
+/// pack, and those pull in opposite directions for a layout change -- so measure them apart. At `-t1`
+/// nothing else holds the queue, so `commit` -> `wait_until_completed` IS the GPU execution span.
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub static PACK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_NS: AtomicU64 = AtomicU64::new(0);
+    pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA3_GPU_STATS").is_some())
+    }
+
+    /// Print the accumulated counters to stderr. Called from the CLI at the end of a run.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (pack, gpu) = (
+            PACK_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            GPU_NS.load(Ordering::Relaxed) as f64 / 1e9,
+        );
+        eprintln!(
+            "[gpu-stats] calls={} jobs={} pack={:.3}s gpu_exec={:.3}s (pack is {:.0}% of the two)",
+            CALLS.load(Ordering::Relaxed),
+            JOBS.load(Ordering::Relaxed),
+            pack,
+            gpu,
+            100.0 * pack / (pack + gpu).max(1e-9),
+        );
+    }
+}
+
 fn is_uniform_dna(mat: &[i8], m: usize) -> bool {
     if m < 2 || mat.len() < m * m {
         return false;
@@ -132,6 +169,7 @@ impl SwBackend for MetalBackend {
             );
         }
         let ctx = ctx.unwrap();
+        let t_pack = std::time::Instant::now();
         let pso = match ctx.pipeline("sw_extend") {
             Some(p) => p,
             None => {
@@ -143,8 +181,16 @@ impl SwBackend for MetalBackend {
 
         let n = jobs.len();
         let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
+        let max_q = jobs.iter().map(|j| j.query.len()).max().unwrap_or(0);
+        let stride = (max_q + 1) as i32;
 
         // Pack the jobs into flat buffers: concatenated codes + per-job offset/length/h0/band.
+        // NB the AoS `[lane * stride + column]` layout here and in the kernel is deliberate, not an
+        // oversight: transposing it to the CPU kernel's `[column * lane]` SoA form was measured
+        // 2.2x SLOWER (see docs/optimization-roadmap.md). One GPU thread owns one alignment and
+        // walks its row contiguously, so a fetched cache line already serves that thread's next 32
+        // columns; SoA amortises the same line across lanes instead, for the same line count, and
+        // pays an ~800 KB stride between consecutive columns on top.
         let mut qbuf: Vec<u8> = Vec::new();
         let mut tbuf: Vec<u8> = Vec::new();
         let mut qoff = vec![0i32; n];
@@ -153,11 +199,10 @@ impl SwBackend for MetalBackend {
         let mut tlen = vec![0i32; n];
         let mut h0v = vec![0i32; n];
         let mut wv = vec![0i32; n];
-        let mut max_q = 0usize;
         for (k, j) in jobs.iter().enumerate() {
             qoff[k] = qbuf.len() as i32;
-            toff[k] = tbuf.len() as i32;
             qbuf.extend_from_slice(j.query);
+            toff[k] = tbuf.len() as i32;
             tbuf.extend_from_slice(j.target);
             qlen[k] = j.query.len() as i32;
             tlen[k] = j.target.len() as i32;
@@ -172,7 +217,6 @@ impl SwBackend for MetalBackend {
                 o_del,
                 e_del,
             );
-            max_q = max_q.max(j.query.len());
         }
         // Never hand a zero-length buffer to Metal.
         if qbuf.is_empty() {
@@ -181,7 +225,6 @@ impl SwBackend for MetalBackend {
         if tbuf.is_empty() {
             tbuf.push(0);
         }
-        let stride = (max_q + 1) as i32;
 
         let dev = &ctx.device;
         let shared = MTLResourceOptions::StorageModeShared;
@@ -220,6 +263,9 @@ impl SwBackend for MetalBackend {
             shared,
         );
 
+        let pack_ns = t_pack.elapsed().as_nanos() as u64;
+        let t_gpu = std::time::Instant::now();
+
         let cmd = ctx.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pso);
@@ -238,6 +284,14 @@ impl SwBackend for MetalBackend {
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
+
+        if stats::enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            stats::PACK_NS.fetch_add(pack_ns, Relaxed);
+            stats::GPU_NS.fetch_add(t_gpu.elapsed().as_nanos() as u64, Relaxed);
+            stats::JOBS.fetch_add(n as u64, Relaxed);
+            stats::CALLS.fetch_add(1, Relaxed);
+        }
 
         let raw = unsafe { std::slice::from_raw_parts(b_out.contents() as *const i32, n * 6) };
         (0..n)

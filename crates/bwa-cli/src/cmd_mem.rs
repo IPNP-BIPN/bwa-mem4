@@ -190,7 +190,9 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let backend = Backend::select(args.gpu);
 
     if let Some(reads2) = args.reads2.clone() {
-        return run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, out);
+        run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, out)?;
+        bwa_gpu::dump_stats();
+        return Ok(());
     }
 
     // Reader thread: open the FASTQ here and stream fixed-`-K` batches with their cumulative base id.
@@ -240,7 +242,9 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         buf
     };
 
-    run_pipeline(out, read_batches, process)
+    run_pipeline(out, read_batches, process)?;
+    bwa_gpu::dump_stats();
+    Ok(())
 }
 
 /// Seed + chain + batched extension for a whole read batch, returning each read's pre-dedup regions
