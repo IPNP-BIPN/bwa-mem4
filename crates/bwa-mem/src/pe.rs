@@ -546,7 +546,8 @@ fn cal_sub(opt: &MemOpt, r: &[MemAlnReg]) -> i32 {
         let e_min = r[j].qe.min(r[0].qe);
         if e_min > b_max {
             let min_l = (r[j].qe - r[j].qb).min(r[0].qe - r[0].qb);
-            if f64::from(e_min - b_max) >= f64::from(min_l) * f64::from(opt.mask_level) {
+            // f32: C computes `min_l * opt->mask_level` in single precision.
+            if (e_min - b_max) as f32 >= min_l as f32 * opt.mask_level {
                 break;
             }
         }
@@ -1059,7 +1060,7 @@ fn mem_reg2sam(
             continue; // !MEM_F_ALL: drop all secondaries
         }
         if p.secondary >= 0
-            && p.score < (a[p.secondary as usize].score as f32 * opt.drop_ratio) as i32
+            && (p.score as f32) < a[p.secondary as usize].score as f32 * opt.drop_ratio
         {
             continue;
         }
