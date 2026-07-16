@@ -54,6 +54,14 @@ impl MemAln {
     }
 }
 
+/// Env-gated (`BWA3_DUMP_BW`) trace of the band-width retry loop, in bwa's `-v 4` format so the two
+/// can be diffed directly. Cached: `reg2aln` runs per emitted alignment, so a `var_os` per call
+/// would show up in the profile.
+fn dump_bw() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA3_DUMP_BW").is_some())
+}
+
 /// Inferred band width, port of `infer_bw`.
 fn infer_bw(l1: i32, l2: i32, score: i32, a: i32, q: i32, r: i32) -> i32 {
     if l1 == l2 && l1 * a - score < (q + r - a) << 1 {
@@ -194,6 +202,9 @@ pub fn reg2aln(
         w2 = w2.min(reg.w);
     }
 
+    if dump_bw() {
+        eprintln!("* Band width: inferred={w2}, cmd_opt={}, alnreg={}", opt.w, reg.w);
+    }
     let mut i = 0;
     let mut last_sc = -(1 << 30);
     let (_score, mut cigar, nm, md) = loop {
@@ -208,6 +219,9 @@ pub fn reg2aln(
             re,
         )
         .expect("gen_cigar2");
+        if dump_bw() {
+            eprintln!("* Final alignment: w2={w2}, global_sc={sc}, local_sc={}", reg.truesc);
+        }
         if sc == last_sc || w2 == opt.w << 2 {
             break (sc, cg, nm_, md_);
         }

@@ -309,6 +309,12 @@ impl Backend {
     }
 }
 
+/// Env-gated (`BWA3_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
+fn dump_regs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA3_DUMP_REGS").is_some())
+}
+
 /// Deduplicate + primary-mark a read's batched regions, then format its SAM record. Pure (no shared
 /// state beyond the immutable index/options), so it is safe across rayon workers.
 fn finish_se(
@@ -320,13 +326,13 @@ fn finish_se(
     regs_pre: Vec<MemAlnReg>,
     read_id: u64,
 ) -> Vec<u8> {
-    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+    if dump_regs_enabled() {
         eprintln!("=== read {} ===", rec.name);
         bwa_mem::dump_regs(bns, "pre-dedup", &regs_pre);
     }
     let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs_pre);
     mem_mark_primary_se(opt, &mut regs, read_id);
-    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+    if dump_regs_enabled() {
         bwa_mem::dump_regs(bns, "post-dedup+mark", &regs);
     }
     // After marking, regs[0] is the highest-scoring primary region.
