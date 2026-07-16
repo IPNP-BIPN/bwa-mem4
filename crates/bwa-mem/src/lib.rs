@@ -303,6 +303,8 @@ pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec
             &preskip,
         );
     }
+    // Same compaction the batched path does, and for the same reason (the dedup's unstable sort).
+    regs.retain(|a| a.qe > a.qb);
     regs
 }
 
