@@ -261,7 +261,7 @@ pub fn align_read_dedup(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) 
 
 /// Env-gated (`BWA3_DUMP_REGS`) diagnostic: print every region with its query span, reference
 /// span, mapped position and scores. Used to compare our suboptimal-region set against the oracle.
-fn dump_regs(bns: &BntSeq, tag: &str, regs: &[MemAlnReg]) {
+pub fn dump_regs(bns: &BntSeq, tag: &str, regs: &[MemAlnReg]) {
     eprintln!("--- regs [{}] n={} ---", tag, regs.len());
     for (i, r) in regs.iter().enumerate() {
         let (rid, pos, rev) = region_to_pos(bns, r);

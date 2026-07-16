@@ -320,8 +320,15 @@ fn finish_se(
     regs_pre: Vec<MemAlnReg>,
     read_id: u64,
 ) -> Vec<u8> {
+    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+        eprintln!("=== read {} ===", rec.name);
+        bwa_mem::dump_regs(bns, "pre-dedup", &regs_pre);
+    }
     let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs_pre);
     mem_mark_primary_se(opt, &mut regs, read_id);
+    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+        bwa_mem::dump_regs(bns, "post-dedup+mark", &regs);
+    }
     // After marking, regs[0] is the highest-scoring primary region.
     let xa = mem_gen_alt(fm, bns, opt, &regs, codes.len() as i32, codes);
 
