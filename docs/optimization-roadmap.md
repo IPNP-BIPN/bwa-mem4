@@ -112,6 +112,59 @@ win.** The kernel is at the byte-identical ceiling on Apple Silicon.
 > **Lesson: this file talked a measured, merge-ready win out of existing for months on the strength
 > of a bad profile.** Prefer measuring to reasoning about percentages.
 
+### The `-t8` ceiling is the memory system, and it eats per-thread levers whole (2026-07-16)
+
+**This is the most important thing on this page.** Two independent levers were measured this session,
+and both have the *same shape*: a large win at `-t1` that is worth **zero** at `-t8`.
+
+| lever | `-t1` | `-t8` |
+|---|---|---|
+| GPU extension offload (`--gpu`) | **1.25x** | 1.07x |
+| Fully-sampled (flat) suffix array | **1.12x** | **1.00x** |
+
+The flat-SA experiment shows the mechanism directly. Per SA lookup:
+
+| | `-t1` | `-t8` | scales? |
+|---|---|---|---|
+| sampled SA (1-in-8, W=32 lockstep + prefetch) | 177 ns | **169 ns** | **yes** |
+| flat SA (one direct load, 49.6 GB) | 71 ns | **134 ns** | **no — 1.9x worse** |
+
+The sampled path is **latency**-bound and the lockstep window hides it, so 8 threads barely disturb
+it. The flat path is **TLB**-bound: 49.6 GB is ~3M 16 KB pages against a ~3000-entry TLB, so every
+lookup pays a page-table walk, and **`prfm` cannot help** because ARM drops a prefetch on a TLB miss
+rather than walking the tables (verified: adding a distance-32 software-pipelined prefetch to the
+flat path changed 71 ns -> 71 ns at `-t1` and 130 -> 134 ns at `-t8`, i.e. nothing).
+
+So at `-t8` the aligner is bound by a **shared** resource (DRAM + TLB + page walkers), and any lever
+that only reduces *per-thread* work stops paying once the threads contend. This explains, with one
+mechanism, three separate observations: the GPU's `-t1`-only win, the flat SA's `-t1`-only win, and
+why our ratio vs bwa-mem2 sags from ~2.6x at `-t1` to ~2.0x at `-t8`. **Quote `-t8`, always: a `-t1`
+number measures a machine nobody runs.**
+
+Two corollaries for anyone benchmarking here:
+- **29% of the 500k-read `-t8` benchmark is fixed index load** (1.04s of 3.59s; measured by aligning
+  a single read). It amortises away on real WGS, so the `-t8` *compute* ratio is better than this
+  benchmark shows, and any lever's share is correspondingly *understated* by it.
+- The `-t1` vs `-t8` gap is not noise or thermals. It is the signal.
+
+### Flat / denser suffix array: `-t1` +12%, `-t8` +0%. Not worth the RAM. (2026-07-16, measured)
+
+`get_sa` is the single largest cost at genome scale (**18.8%** of `-t1` wall, 21.3M lookups at
+177-193 ns; see `BWA3_CHAIN_TIME`), because the SA is sampled 1-in-8 and 7 lookups in 8 walk ~7 LF
+steps, each a DRAM miss. Densifying the SA removes the walk **by construction**.
+
+Measured with the real thing, not a model: the 49.6 GB flat i64 SA extracted during the LISA work
+(`work/genome.lisa_sa`) was wired into `get_sa_batch` behind an env var. **Byte-identical** (500k
+records `cmp`-clean; `sa[j] == get_sa(j)` confirmed at genome scale). `get_sa_batch` 3.775s -> 1.508s.
+End-to-end: **`-t1` 1.109/1.125/1.116x, `-t8` 1.002/1.000/1.000x.**
+
+**Verdict: do not build the Packed40 SA sidecar.** It would cost +27 GB of RAM (index ~20 GB -> ~47 GB,
+against bwa-mem2's ~16 GB) to buy ~2.6% at the operating point people actually use, and that ~2.6% is
+under this host's ~2.4% noise floor. Packed40 at 31 GB is only 1.6x fewer pages than the 49.6 GB
+spike, so it cannot escape the TLB wall that caused the collapse. The salvaged LISA pieces
+(`bwa_index::packed::Packed40`, `bwa_core::sysram`) stay unused — this was their last plausible
+customer.
+
 ### GPU line: at its ceiling, and the ceiling is 1.28x (2026-07-16, measured)
 
 Two results, both from a quiet host, `work/genome.fa`, 500k reads, interleaved, `BWA3_GPU_STATS`:
