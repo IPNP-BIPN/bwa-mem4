@@ -241,11 +241,47 @@ pub fn align_reads_batched<B: SwBackend>(
     // to per-read `collect_smems`).
     let refs: Vec<&[u8]> = reads.iter().map(|c| c.as_slice()).collect();
     let per_read_smems = mem_collect_smem_batched(fm, &refs, opt);
+    if std::env::var_os("BWA3_DUMP_SMEMS").is_some() {
+        for sm in &per_read_smems {
+            eprintln!("SMEM tot={}", sm.len());
+            for p in sm {
+                eprintln!("  smem q[{},{}) len={} s={} k={}", p.m, p.n + 1, p.n + 1 - p.m, p.s, p.k);
+            }
+        }
+    }
+    let dump_chains = std::env::var_os("BWA3_DUMP_CHAINS").is_some();
     let per_read_chains: Vec<Vec<MemChain>> = per_read_smems
         .into_iter()
         .zip(reads.iter())
         .map(|(smems, codes)| {
-            mem_chain_flt(opt, build_chains_from_smems(fm, bns, opt, codes, 0, smems))
+            let pre = build_chains_from_smems(fm, bns, opt, codes, 0, smems);
+            if dump_chains {
+                eprintln!("PRECHAIN nchains={}", pre.len());
+                for (ci, c) in pre.iter().enumerate() {
+                    eprintln!(
+                        "  prechain{ci} pos={} nseed={} w={} qbeg={} qend={}",
+                        c.pos,
+                        c.seeds.len(),
+                        bwa_chain::mem_chain_weight(c),
+                        c.seeds.first().map_or(0, |s| s.qbeg),
+                        c.seeds.last().map_or(0, |s| s.qbeg + s.len),
+                    );
+                }
+            }
+            let out = mem_chain_flt(opt, pre);
+            if dump_chains {
+                eprintln!("CHAIN nchains={}", out.len());
+                for (ci, c) in out.iter().enumerate() {
+                    eprintln!(
+                        "  chain{ci} pos={} nseed={} w={} kept={}",
+                        c.pos,
+                        c.seeds.len(),
+                        c.w,
+                        c.kept
+                    );
+                }
+            }
+            out
         })
         .collect();
 
