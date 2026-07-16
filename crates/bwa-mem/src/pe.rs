@@ -158,6 +158,13 @@ fn mem_matesw(
                     &seq, &refseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc,
                     opt.a,
                 );
+                if dump_pestat() {
+                    eprintln!(
+                        "[RESCUE] score={} score2={} qb={} qe={} tb={} te={} te2={} tlen={}",
+                        aln.score, aln.score2, aln.qb, aln.qe, aln.tb, aln.te, aln.te2,
+                        refseq.len()
+                    );
+                }
                 if aln.score >= opt.min_seed_len && aln.qb >= 0 {
                     let qb = if is_rev {
                         l_ms as i32 - (aln.qe + 1)
