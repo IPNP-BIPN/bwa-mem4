@@ -5,6 +5,7 @@
 //! Includes the `mem_patch_reg` region-merge branch (collinear regions re-aligned into one),
 //! which fires on split/long-indel alignments.
 
+use bwa_chain::ks_introsort_by;
 use bwa_core::MemOpt;
 use bwa_index::FmIndex;
 
@@ -98,8 +99,11 @@ pub fn mem_sort_dedup_patch(
     let mlr = f64::from(opt.mask_level_redun);
     let max_gap = i64::from(opt.max_chain_gap);
 
-    // Sort by END position on the reference.
-    a.sort_by_key(|r| r.re);
+    // Sort by END position on the reference (`alnreg_slt2`). bwa's `ks_introsort` is *unstable* and
+    // the key is `re` alone, so ties are both common and consequential: the redundancy test below
+    // drops `q` (the earlier entry) whenever the scores tie, meaning the order among equal-`re`
+    // regions decides which alignment survives. A stable sort silently picks a different one.
+    ks_introsort_by(&mut a, |x, y| x.re < y.re);
     for r in &mut a {
         r.n_comp = 1;
     }
@@ -156,12 +160,10 @@ pub fn mem_sort_dedup_patch(
     }
     a.retain(|r| r.qe > r.qb);
 
-    // Sort by score desc, then rb, then qb; drop identical hits.
-    a.sort_by(|x, y| {
-        y.score
-            .cmp(&x.score)
-            .then(x.rb.cmp(&y.rb))
-            .then(x.qb.cmp(&y.qb))
+    // Sort by score desc, then rb, then qb (`alnreg_slt`), again with bwa's unstable introsort.
+    ks_introsort_by(&mut a, |x, y| {
+        x.score > y.score
+            || (x.score == y.score && (x.rb < y.rb || (x.rb == y.rb && x.qb < y.qb)))
     });
     for i in 1..a.len() {
         if a[i].score == a[i - 1].score && a[i].rb == a[i - 1].rb && a[i].qb == a[i - 1].qb {
@@ -219,12 +221,12 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
             n_pri += 1;
         }
     }
-    // Sort by (score desc, is_alt asc, hash asc) — `alnreg_hlt`.
-    a.sort_by(|x, y| {
-        y.score
-            .cmp(&x.score)
-            .then(x.is_alt.cmp(&y.is_alt))
-            .then(x.hash.cmp(&y.hash))
+    // Sort by (score desc, is_alt asc, hash asc) — `alnreg_hlt`, unstable as in bwa.
+    ks_introsort_by(a, |x, y| {
+        x.score > y.score
+            || (x.score == y.score
+                && (!x.is_alt && y.is_alt
+                    || (x.is_alt == y.is_alt && x.hash < y.hash)))
     });
     mark_primary_core(opt, a);
     // No ALT contigs: `secondary_all` mirrors `secondary` (the C's else-branch when n_pri == n).
