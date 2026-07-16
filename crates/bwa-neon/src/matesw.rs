@@ -203,7 +203,8 @@ fn fwd_local_sw_scalar(
 ) -> Vec<(i32, i32, i32, i32, i32)> {
     let oe_del = o_del + e_del;
     let oe_ins = o_ins + e_ins;
-    let mut out = vec![(0i32, -1i32, -1i32, 0i32, -1i32); jobs.len()];
+    // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
 
     for (g, group) in jobs.chunks(LANES).enumerate() {
         let n = group.len();
@@ -346,7 +347,7 @@ fn extract_group(
         // score2: rebuild ksw_local_fwd's `b` list (row-maxes >= minsc, consecutive rows merged
         // keeping the higher AND advancing the column only on an update), then take the best entry
         // whose column lies outside [te - w, te + w].
-        let mut score2 = 0i32;
+        let mut score2 = -1i32;
         let mut te2 = -1i32;
         let mut b: Vec<(i32, i32)> = Vec::new();
         if limit[l] >= 0 {
@@ -401,7 +402,8 @@ unsafe fn fwd_local_sw_neon(
     let oe_ins = o_ins + e_ins;
     let mtch = mat[0] as i16;
     let mis = mat[1] as i16;
-    let mut out = vec![(0i32, -1i32, -1i32, 0i32, -1i32); jobs.len()];
+    // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
 
     // Broadcast constants.
     let zero = vdupq_n_s16(0);
@@ -564,7 +566,8 @@ unsafe fn fwd_local_sw_neon_u8(
     let oe_ins = o_ins + e_ins;
     let mtch = mat[0] as u8; // match bonus (>= 0)
     let mispen = (-mat[1]) as u8; // mismatch penalty b (mat[1] = -b)
-    let mut out = vec![(0i32, -1i32, -1i32, 0i32, -1i32); jobs.len()];
+    // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
 
     let zero = vdupq_n_u8(0);
     let mtch_v = vdupq_n_u8(mtch);
