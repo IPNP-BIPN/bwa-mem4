@@ -14,81 +14,17 @@
 //! bidirectional interval and the SMEM "zigzag" driver that reproduce bwa-mem2's seeds byte-for-byte
 //! build on top of it. See [[perf-phase9-levers]] / the LISA branch plan.
 
+use crate::packed::Packed40;
 use crate::rmi::Rmi;
 use crate::sais::suffix_array_with_sentinel;
 use std::cmp::Ordering;
-use rayon::prelude::*;
 
-/// Bases packed into one learned key (BWA-MEME uses 32: a 64-bit 2-bit-packed key).
-pub const K: usize = 32;
-
-/// Suffix-array positions packed at **5 bytes each** instead of `i64` (8): a genome-scale SA has
-/// `2L+1` entries (6.2G for hg38), and a position fits in 34 bits (`2*3.1G < 2^34`), so 40 bits is
-/// ample. This drops the SA from 49.6 GB to 31 GB — the single biggest RAM item in the learned index.
-/// Little-endian; only the low 5 bytes are stored.
-#[derive(Clone)]
-pub struct PackedSa {
-    data: Vec<u8>,
-    len: usize,
-}
-
-impl PackedSa {
-    const W: usize = 5;
-    const MAX: u64 = 1 << (8 * Self::W); // positions must be < 2^40
-
-    /// Pack a suffix array. Consumes nothing, but callers should drop the `i64` array right after to
-    /// bound peak memory (packed + original briefly coexist).
-    pub fn from_slice(sa: &[i64]) -> Self {
-        let len = sa.len();
-        let mut data = vec![0u8; len * Self::W];
-        for (i, &v) in sa.iter().enumerate() {
-            debug_assert!((v as u64) < Self::MAX, "SA position {v} exceeds 40 bits");
-            let le = (v as u64).to_le_bytes();
-            data[i * Self::W..i * Self::W + Self::W].copy_from_slice(&le[..Self::W]);
-        }
-        PackedSa { data, len }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// The suffix-array value at `row` (a reference position).
-    #[inline]
-    pub fn get(&self, row: usize) -> i64 {
-        let o = row * Self::W;
-        let mut b = [0u8; 8];
-        b[..Self::W].copy_from_slice(&self.data[o..o + Self::W]);
-        u64::from_le_bytes(b) as i64
-    }
-
-    /// `partition_point` over rows `[lo, hi)`: the count of leading rows where `pred(get(row))` holds
-    /// (the predicate must be monotone true→false over the range), matching `slice::partition_point`.
-    #[inline]
-    pub fn partition_point_in<P: Fn(i64) -> bool>(&self, lo: usize, hi: usize, pred: P) -> usize {
-        let (mut a, mut b) = (lo, hi);
-        while a < b {
-            let mid = a + (b - a) / 2;
-            if pred(self.get(mid)) {
-                a = mid + 1;
-            } else {
-                b = mid;
-            }
-        }
-        a - lo
-    }
-
-    /// Materialize rows `[lo, hi)` as positions.
-    pub fn range_vec(&self, lo: usize, hi: usize) -> Vec<i64> {
-        (lo..hi).map(|i| self.get(i)).collect()
-    }
-}
+/// Bases packed into one learned key. 20 (40 bits, one `Packed40` element) is selective enough at
+/// genome scale — 4^20 ≫ 6.2G positions, so almost no two suffixes share a key, keeping the co-located
+/// comparison a single memory access — while halving the key RAM vs a 32-base `u64` (49.6 GB → 31 GB).
+/// K only affects *speed* (key selectivity + RMI hint precision); the search result is always corrected
+/// against the reference, so any K stays byte-identical.
+pub const K: usize = 20;
 
 /// A suffix array over a binary reference (`0..=3` codes) plus a learned index over the first-`K`
 /// bases of each suffix.
@@ -99,10 +35,10 @@ pub struct LearnedSa {
     ref_seq: Vec<u8>,
     /// Suffix array (5-byte packed): length `ref_seq.len() + 1`, `sa[0] = ref_seq.len()` (the
     /// sentinel/empty suffix), `sa[1..]` the suffixes in lexicographic order.
-    sa: PackedSa,
-    /// `keys[i]` = first `K` bases of the suffix at `sa[i]`, 2-bit packed, most-significant base
-    /// first (so key order == suffix order), zero-padded past the reference end.
-    keys: Vec<u64>,
+    sa: Packed40,
+    /// `keys[i]` = first `K` bases of the suffix at `sa[i]` (5-byte packed, 40 bits), most-significant
+    /// base first (so key order == suffix order), zero-padded past the reference end.
+    keys: Packed40,
     rmi: Rmi,
 }
 
@@ -206,15 +142,12 @@ impl LearnedSa {
     /// trains the RMI over them.
     pub fn from_sa(ref_seq: Vec<u8>, sa: Vec<i64>, n_leaves: usize) -> Self {
         debug_assert_eq!(sa.len(), ref_seq.len() + 1, "sa must include the sentinel row");
-        // Pack the SA to 5 bytes, then drop the i64 array before computing keys, so the peak is
-        // `packed + i64` briefly then `packed + keys`, never all three (bounds a genome build to ~80 GB
-        // instead of ~130 GB).
-        let packed = PackedSa::from_slice(&sa);
+        // Pack the SA to 5 bytes and drop the i64 array; then compute the keys **directly** into a
+        // 5-byte packed array (no intermediate `Vec<u64>`), so the peak is `packed_sa + packed_keys`
+        // (~62 GB at genome scale) rather than three full copies.
+        let packed = Packed40::from_slice(&sa);
         drop(sa);
-        let keys: Vec<u64> = (0..packed.len())
-            .into_par_iter()
-            .map(|i| kmer_key(&ref_seq, packed.get(i)))
-            .collect();
+        let keys = Packed40::from_fn(packed.len(), |i| kmer_key(&ref_seq, packed.get(i) as i64));
         let rmi = Rmi::build(&keys, n_leaves);
         LearnedSa {
             ref_seq,
@@ -234,7 +167,7 @@ impl LearnedSa {
     /// byte-identical to the FM path.
     #[inline]
     pub fn sa_at(&self, row: usize) -> i64 {
-        self.sa.get(row)
+        self.sa.get(row) as i64
     }
 
     pub fn is_empty(&self) -> bool {
@@ -275,7 +208,7 @@ impl LearnedSa {
     fn cmp_key(&self, i: usize, pkey: u64, pattern: &[u8]) -> Ordering {
         let l = pattern.len().min(K);
         let shift = 2 * (K - l) as u32; // keep only the top `l` bases of each key
-        match (self.keys[i] >> shift).cmp(&(pkey >> shift)) {
+        match (self.keys.get(i) >> shift).cmp(&(pkey >> shift)) {
             Ordering::Equal => self.cmp_pattern(i, pattern),
             other => other,
         }
@@ -434,7 +367,7 @@ impl LearnedSa {
     /// Reference positions where `pattern` occurs exactly (the `sa` values of [`Self::exact_interval`]).
     pub fn occurrences(&self, pattern: &[u8]) -> Vec<i64> {
         let (lo, hi) = self.exact_interval(pattern);
-        let mut v: Vec<i64> = self.sa.range_vec(lo, hi);
+        let mut v: Vec<i64> = self.sa.range_i64(lo, hi);
         v.sort_unstable();
         v
     }
@@ -443,26 +376,6 @@ impl LearnedSa {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn packed_sa_roundtrip_and_partition() {
-        // Round-trip every value, then check partition_point_in matches slice::partition_point.
-        let sa: Vec<i64> = vec![0, 5, 5, 9, 12, 12, 100, 1_000_000, (1i64 << 34) - 1];
-        let p = PackedSa::from_slice(&sa);
-        assert_eq!(p.len(), sa.len());
-        for (i, &v) in sa.iter().enumerate() {
-            assert_eq!(p.get(i), v, "row {i}");
-        }
-        assert_eq!(p.range_vec(1, 4), vec![5, 5, 9]);
-        // partition_point over the sorted array, on a few thresholds and sub-ranges.
-        for thr in [-1i64, 0, 5, 6, 12, 13, 1_000_000, i64::MAX] {
-            for &(lo, hi) in &[(0usize, sa.len()), (1, 6), (3, 8), (0, 1)] {
-                let want = sa[lo..hi].partition_point(|&x| x < thr);
-                let got = p.partition_point_in(lo, hi, |x| x < thr);
-                assert_eq!(got, want, "thr={thr} range=({lo},{hi})");
-            }
-        }
-    }
 
     /// Brute-force: every start position where `pattern` matches `ref_seq`.
     fn brute(ref_seq: &[u8], pattern: &[u8]) -> Vec<i64> {

@@ -71,7 +71,7 @@ impl Rmi {
     /// Build an RMI over `keys`, which **must be sorted ascending**. `n_leaves` is the number of
     /// second-level models (clamped to `[1, keys.len()]`); a few thousand leaves per million keys is
     /// a good default. Empty input yields an index that always reports position 0.
-    pub fn build(keys: &[u64], n_leaves: usize) -> Self {
+    pub fn build(keys: &crate::packed::Packed40, n_leaves: usize) -> Self {
         let n = keys.len();
         if n == 0 {
             return Rmi {
@@ -82,15 +82,16 @@ impl Rmi {
                 n_leaves: 1,
             };
         }
-        debug_assert!(keys.windows(2).all(|w| w[0] <= w[1]), "keys must be sorted");
+        debug_assert!(keys.is_sorted(), "keys must be sorted");
         let n_leaves = n_leaves.clamp(1, n);
 
         // Root model maps key -> leaf index, trained on (key_i -> leaf_target = i * n_leaves / n).
         // Accumulate the least-squares sums directly (no n-length target array) with x0 = keys[0].
-        let x0r = keys[0] as f64;
+        let x0r = keys.get(0) as f64;
         let (mut sx, mut sy, mut sxx, mut sxy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         let scale = n_leaves as f64 / n as f64;
-        for (i, &k) in keys.iter().enumerate() {
+        for i in 0..n {
+            let k = keys.get(i);
             let x = k as f64 - x0r;
             let y = i as f64 * scale;
             sx += x;
@@ -112,12 +113,12 @@ impl Rmi {
         let mut leaves = vec![LinearModel::default(); n_leaves];
         let mut i = 0usize;
         while i < n {
-            let li = leaf_of(keys[i]);
-            let x0 = keys[i] as f64;
+            let li = leaf_of(keys.get(i));
+            let x0 = keys.get(i) as f64;
             let (mut lsx, mut lsy, mut lsxx, mut lsxy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             let mut j = i;
-            while j < n && leaf_of(keys[j]) == li {
-                let x = keys[j] as f64 - x0;
+            while j < n && leaf_of(keys.get(j)) == li {
+                let x = keys.get(j) as f64 - x0;
                 let y = j as f64;
                 lsx += x;
                 lsy += y;
@@ -132,7 +133,8 @@ impl Rmi {
         // Per-leaf error bound: the max over the leaf's keys of |round(predict) - actual position|.
         // Guarantees the true position lies in [pred - err, pred + err].
         let mut leaf_err = vec![0u32; n_leaves];
-        for (i, &k) in keys.iter().enumerate() {
+        for i in 0..n {
+            let k = keys.get(i);
             let li = leaf_of(k);
             let pred = leaves[li].predict(k);
             let pred_i = pred.round().max(0.0) as i64;
@@ -164,7 +166,7 @@ impl Rmi {
     /// `keys` must be the same slice the index was built over. Identical result to a binary search;
     /// only faster, via the model prediction plus a bounded last-mile binary search.
     #[inline]
-    pub fn lower_bound(&self, keys: &[u64], key: u64) -> usize {
+    pub fn lower_bound(&self, keys: &crate::packed::Packed40, key: u64) -> usize {
         debug_assert_eq!(keys.len(), self.n);
         if self.n == 0 {
             return 0;
@@ -175,16 +177,22 @@ impl Rmi {
         // partition point. Clamp to [0, n] and binary-search inside.
         let lo = pos.saturating_sub(err as usize + 1);
         let hi = (pos + err as usize + 2).min(self.n);
-        lo + keys[lo..hi].partition_point(|&k| k < key)
+        lo + keys.partition_point_in(lo, hi, |k| k < key)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packed::Packed40;
 
     fn ref_lower_bound(keys: &[u64], key: u64) -> usize {
         keys.partition_point(|&k| k < key)
+    }
+
+    /// Pack u64 keys (all `< 2^40` here) for the RMI.
+    fn pk(keys: &[u64]) -> Packed40 {
+        Packed40::from_slice(&keys.iter().map(|&k| k as i64).collect::<Vec<_>>())
     }
 
     #[test]
@@ -200,28 +208,30 @@ mod tests {
             }
         }
         keys.sort_unstable();
-        let rmi = Rmi::build(&keys, 2048);
+        let pkeys = pk(&keys);
+        let rmi = Rmi::build(&pkeys, 2048);
         // Probe every stored key, plus values just below/above and outside the range.
         for &k in &keys {
-            assert_eq!(rmi.lower_bound(&keys, k), ref_lower_bound(&keys, k), "key={k}");
+            assert_eq!(rmi.lower_bound(&pkeys, k), ref_lower_bound(&keys, k), "key={k}");
             assert_eq!(
-                rmi.lower_bound(&keys, k.wrapping_sub(1)),
+                rmi.lower_bound(&pkeys, k.wrapping_sub(1)),
                 ref_lower_bound(&keys, k.wrapping_sub(1))
             );
-            assert_eq!(rmi.lower_bound(&keys, k + 1), ref_lower_bound(&keys, k + 1));
+            assert_eq!(rmi.lower_bound(&pkeys, k + 1), ref_lower_bound(&keys, k + 1));
         }
-        assert_eq!(rmi.lower_bound(&keys, 0), 0);
-        assert_eq!(rmi.lower_bound(&keys, u64::MAX), keys.len());
+        assert_eq!(rmi.lower_bound(&pkeys, 0), 0);
+        assert_eq!(rmi.lower_bound(&pkeys, u64::MAX), keys.len());
     }
 
     #[test]
     fn matches_binary_search_linear_keys() {
         // Perfectly linear keys: the model is exact, err should be ~0 but lower_bound still correct.
         let keys: Vec<u64> = (0..20_000u64).map(|i| i * 4).collect();
-        let rmi = Rmi::build(&keys, 512);
+        let pkeys = pk(&keys);
+        let rmi = Rmi::build(&pkeys, 512);
         for probe in [0u64, 1, 3, 4, 79_996, 79_999, 80_000, u64::MAX] {
             assert_eq!(
-                rmi.lower_bound(&keys, probe),
+                rmi.lower_bound(&pkeys, probe),
                 ref_lower_bound(&keys, probe),
                 "probe={probe}"
             );
@@ -230,17 +240,19 @@ mod tests {
 
     #[test]
     fn edge_cases() {
-        assert_eq!(Rmi::build(&[], 8).lower_bound(&[], 42), 0);
+        assert_eq!(Rmi::build(&pk(&[]), 8).lower_bound(&pk(&[]), 42), 0);
         let one = [7u64];
-        let rmi = Rmi::build(&one, 8);
-        assert_eq!(rmi.lower_bound(&one, 6), 0);
-        assert_eq!(rmi.lower_bound(&one, 7), 0);
-        assert_eq!(rmi.lower_bound(&one, 8), 1);
+        let pone = pk(&one);
+        let rmi = Rmi::build(&pone, 8);
+        assert_eq!(rmi.lower_bound(&pone, 6), 0);
+        assert_eq!(rmi.lower_bound(&pone, 7), 0);
+        assert_eq!(rmi.lower_bound(&pone, 8), 1);
         // All-equal keys (degenerate slope).
         let flat = vec![3u64; 1000];
-        let rmi = Rmi::build(&flat, 64);
-        assert_eq!(rmi.lower_bound(&flat, 3), 0);
-        assert_eq!(rmi.lower_bound(&flat, 4), 1000);
-        assert_eq!(rmi.lower_bound(&flat, 2), 0);
+        let pflat = pk(&flat);
+        let rmi = Rmi::build(&pflat, 64);
+        assert_eq!(rmi.lower_bound(&pflat, 3), 0);
+        assert_eq!(rmi.lower_bound(&pflat, 4), 1000);
+        assert_eq!(rmi.lower_bound(&pflat, 2), 0);
     }
 }
