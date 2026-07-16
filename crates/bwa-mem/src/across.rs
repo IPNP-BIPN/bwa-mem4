@@ -502,6 +502,14 @@ pub fn align_reads_batched<B: SwBackend>(
         }
     }
 
+    // Drop the purged regions before returning, as bwa-mem2 does between the discard pass and
+    // `mem_sort_dedup_patch`. Not cosmetic: the dedup sorts by `re` with an *unstable* introsort, so
+    // leaving purged entries in would change the array it partitions and hence the order of
+    // equal-`re` regions -- which is exactly what decides who survives a score tie.
+    for r in regs.iter_mut() {
+        r.retain(|a| a.qe > a.qb);
+    }
+
     regs
 }
 

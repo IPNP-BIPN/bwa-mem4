@@ -129,16 +129,17 @@ pub fn ksw_extend2(
             h1 = h;
             mj = if row_max > h { mj } else { j };
             row_max = if row_max > h { row_max } else { h };
-            // bwa-mem2's vectorized bandedSWA (and nh13's fork, both byte-identical to bwa-mem2)
-            // open gaps from the just-computed cell score H = max(M, E, F), not from M. On real
-            // seed extensions H == M at the alignment so results match; this is the exact recurrence
-            // of `MAIN_CODE16_CORE`, kept here as the scalar source of truth for the SIMD backends.
-            let mut t = h - oe_del;
+            // Gaps open from M (the diagonal score), not from H = max(M, E, F). Both `ksw_extend2`
+            // and the vectorized `bandedSWA` do this: MAIN_CODE16 subtracts oe_ins/oe_del from
+            // `m11`, not `h11`. Using H instead only agrees while H == M, which holds on ordinary
+            // extensions but not inside satellite repeats, where it silently turns a local extension
+            // into a to-end one (wrong gscore => wrong qe/re, and a lost supplementary record).
+            let mut t = big_m - oe_del;
             t = t.max(0);
             e -= e_del;
             e = if e > t { e } else { t };
             eh_e[ju] = e;
-            let mut t = h - oe_ins;
+            let mut t = big_m - oe_ins;
             t = t.max(0);
             f -= e_ins;
             f = if f > t { f } else { t };

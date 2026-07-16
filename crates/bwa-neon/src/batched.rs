@@ -409,11 +409,12 @@ pub fn batched_extend_scalar(
                         mj[l] = j;
                         row_max[l] = h;
                     }
-                    // Gaps open from H (= max(M, E, F)), matching bandedSWA / `ksw_extend2`.
-                    let t = (h - oe_del).max(0);
+                    // Gaps open from M, not H: bandedSWA's MAIN_CODE16 subtracts oe_ins/oe_del
+                    // from `m11`, and `ksw_extend2` from `M`.
+                    let t = (big_m - oe_del).max(0);
                     e = (e - e_del).max(t);
                     eh_e[base + ju] = e;
-                    let t = (h - oe_ins).max(0);
+                    let t = (big_m - oe_ins).max(0);
                     f[l] = (f[l] - e_ins).max(t);
                 }
             }
@@ -714,8 +715,7 @@ macro_rules! define_sw_kernel {
                         let bigm_pre = $sub($add(m_v, sbt_pos), sbt_neg);
                         let bigm_v = $bsl($ceqz(m_v), zero_v, bigm_pre);
 
-                        // A = max(M, E) is independent of the loop-carried f; splitting it out lets
-                        // the f-recurrence below skip the f→h→f dependency (see the `f` update).
+                        // A = max(M, E) is only needed to build h; gaps open from M (see below).
                         let a_v = $max(bigm_v, e_v);
                         let h_v = $max(a_v, f_v);
                         h1_v = $bsl(band, h_v, h1_v);
@@ -725,19 +725,15 @@ macro_rules! define_sw_kernel {
                         rowmax_v = $bsl(upd, h_v, rowmax_v);
                         mj_v = $bsl(upd, $dup(j as $elem), mj_v);
 
-                        // e = max(e - e_del, max(h - oe_del, 0)); gaps open from H (bandedSWA).
-                        let t1 = $max($sub(h_v, oe_del_v), zero_v);
+                        // e = max(e - e_del, max(M - oe_del, 0)); bandedSWA's MAIN_CODE16 opens the
+                        // gap from `m11`, not `h11`.
+                        let t1 = $max($sub(bigm_v, oe_del_v), zero_v);
                         let e_new = $max($sub(e_v, e_del_v), t1);
                         $sts(eh_e.as_mut_ptr().add(jrow), $bsl(band, e_new, e_v));
 
-                        // f = max(f - e_ins, max(h - oe_ins, 0)), reformulated to shorten the
-                        // loop-carried critical path. Since h = max(A, f) with A = max(M,E) independent
-                        // of the carried f, and oe_ins >= e_ins makes the (f - oe_ins) term dominated by
-                        // (f - e_ins), the recurrence is exactly f_new = max(f - e_ins, max(A - oe_ins, 0)).
-                        // The C = max(A - oe_ins, 0) term is off the carried path, so the carried chain is
-                        // just sub+max (~2 ops) instead of f→h→f (~4). Byte-identical (proven under both
-                        // u8-saturating and i16-signed arithmetic); gated by avx2_verify / neon_verify.
-                        let c_v = $max($sub(a_v, oe_ins_v), zero_v);
+                        // f = max(f - e_ins, max(M - oe_ins, 0)). M does not depend on the carried f,
+                        // so the carried chain is just sub+max (~2 ops) with no f->h->f dependency.
+                        let c_v = $max($sub(bigm_v, oe_ins_v), zero_v);
                         let f_new = $max($sub(f_v, e_ins_v), c_v);
                         f_v = $bsl(band, f_new, f_v);
                     }
