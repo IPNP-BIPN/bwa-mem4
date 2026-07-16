@@ -130,10 +130,29 @@ The flat-SA experiment shows the mechanism directly. Per SA lookup:
 | flat SA (one direct load, 49.6 GB) | 71 ns | **134 ns** | **no — 1.9x worse** |
 
 The sampled path is **latency**-bound and the lockstep window hides it, so 8 threads barely disturb
-it. The flat path is **TLB**-bound: 49.6 GB is ~3M 16 KB pages against a ~3000-entry TLB, so every
-lookup pays a page-table walk, and **`prfm` cannot help** because ARM drops a prefetch on a TLB miss
-rather than walking the tables (verified: adding a distance-32 software-pipelined prefetch to the
-flat path changed 71 ns -> 71 ns at `-t1` and 130 -> 134 ns at `-t8`, i.e. nothing).
+it. The flat path degrades ~1.9x under contention.
+
+> **RETRACTION (2026-07-16, same session).** An earlier version of this section claimed the flat path
+> was *TLB-bound* and that **"`prfm` cannot help because ARM drops a prefetch on a TLB miss rather
+> than walking the tables"**. **That claim was not supported and is withdrawn.** It was inferred from
+> a null result (adding a prefetch changed 71 -> 71 ns), and a null result does not establish a
+> mechanism. Direct measurement (`bench/uarch/`) shows the honest picture:
+>
+> | access pattern, 16 GB span | 1 thread | 8 threads |
+> |---|---|---|
+> | independent random gathers (MLP exploited) | **3.5 ns** | **4.3 ns** |
+> | serial dependent pointer chase (no MLP) | ~108 ns | ~128 ns |
+>
+> With a proper warm-up, an explicit `prfm` adds only **1.02-1.08x** over the no-prefetch loop. That
+> does **not** mean the prefetch is dropped: it means it is **redundant**, because the out-of-order
+> engine already extracts the ~28 concurrent misses the core supports. The experiment cannot
+> distinguish "dropped" from "unnecessary", so no mechanism claim is made either way.
+>
+> **Two of this session's own microbenchmark results were cold-start artifacts** and are also
+> withdrawn: apparent prefetch speedups of 13.89x and 20.15x vanished to ~1.02x once a warm-up pass
+> ran before timing. The un-prefetched arm always ran first on a freshly faulted mapping and was
+> charged every one-off cost (frequency ramp, page-table population, compressor settling). **Warm up
+> before timing, and interleave the arms — including in a 60-line C microbenchmark.**
 
 So at `-t8` the aligner is bound by a **shared** resource (DRAM + TLB + page walkers), and any lever
 that only reduces *per-thread* work stops paying once the threads contend. This explains, with one

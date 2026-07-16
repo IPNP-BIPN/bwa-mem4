@@ -51,3 +51,32 @@ reach, peaking at **7.2x** (128 KB of data: 0.8 ns packed vs 5.8 ns paged).
    wall documented in `docs/optimization-roadmap.md`.
 3. **Widening the TLB's reach is not available to us** (probe 1), so the only lever left is making the
    random accesses *local* rather than making the TLB bigger.
+
+## `mlp_probe.c` — what the memory system actually delivers
+
+One shared 16 GB array, per-thread independent random index streams, warm + interleaved arms,
+min-of-3. **Measured, M4 Max:**
+
+| | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| independent random gathers | **3.5 ns** | 3.7 | 3.8 | **4.3 ns** |
+| explicit `prfm` speedup over the above | 1.08x | 0.99x | 1.02x | 1.02x |
+
+**The memory system is not the wall.** It serves a random access into a *shared* 16 GB array every
+**4.3 ns with 8 threads running** — only 1.2x worse than single-threaded. The ~100/3.5 ≈ 28 ratio
+against serial-chase latency is the core's memory-level parallelism, matching Lemire's independent
+M4 figure (~28 lanes).
+
+`prfm` adds ~nothing here. That is **not** evidence it is dropped — it means it is **redundant**,
+because the out-of-order engine already extracts the MLP. Do not infer a mechanism from it.
+
+### ⚠️ The trap this probe was built to catch
+
+The first version of this probe reported prefetch speedups of **13.89x** and **20.15x**. Both were
+**cold-start artifacts**: the un-prefetched arm always ran first on a freshly faulted mapping and
+absorbed every one-off cost (frequency ramp, page-table population, memory-compressor settling).
+With a warm-up pass before timing, the same code reports **1.02x**.
+
+**Warm up before timing. Interleave the arms. Yes, even in a 60-line C microbenchmark.** This error
+was made twice in one session, by the same person who had just written the interleaving rule into
+`docs/perf-levers.md`.
