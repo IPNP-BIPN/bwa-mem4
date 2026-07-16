@@ -10,3 +10,7 @@ repository.workspace = true
 [dependencies]
 bwa-core = { workspace = true }
 bwa-index = { workspace = true }
+
+[dev-dependencies]
+needletail = { workspace = true }
+bwa-neon = { workspace = true }
