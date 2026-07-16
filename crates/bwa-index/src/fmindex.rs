@@ -64,16 +64,6 @@ fn rd_i64(d: &[u8], p: &mut usize) -> i64 {
     *p += 8;
     v
 }
-fn rd_u64(d: &[u8], p: &mut usize) -> u64 {
-    let v = u64::from_le_bytes(d[*p..*p + 8].try_into().unwrap());
-    *p += 8;
-    v
-}
-fn rd_u32(d: &[u8], p: &mut usize) -> u32 {
-    let v = u32::from_le_bytes(d[*p..*p + 4].try_into().unwrap());
-    *p += 4;
-    v
-}
 
 impl FmIndex {
     /// Load `<prefix>.bwt.2bit.64` and `<prefix>.0123`.

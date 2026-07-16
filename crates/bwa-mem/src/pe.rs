@@ -239,7 +239,6 @@ struct RescueCall {
     l_ms: i64,
     rid: i32,
     is_alt: bool,
-    rb: i64,
 }
 
 /// Collect the orientations that would run mate rescue for anchor `a` against mate `ms`, reading the
@@ -314,7 +313,6 @@ fn matesw_collect(
         l_ms,
         rid: a.rid,
         is_alt: a.is_alt,
-        rb: a.rb,
     })
 }
 
