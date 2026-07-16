@@ -129,13 +129,20 @@ fn fwd_local_sw_batch(
 ) -> Vec<(i32, i32, i32, i32, i32)> {
     #[cfg(target_arch = "aarch64")]
     {
-        // i16 kernel is exact while every cell fits i16. Mate-rescue scores are small; guard anyway.
         if std::arch::is_aarch64_feature_detected!("neon") && mat_is_standard(m, mat) {
-            let safe = jobs.iter().all(|j| {
-                j.query.len() < 30000 && j.target.len() < 30000 && j.query.len() as i32 * max_sc < 30000
-            });
-            if safe {
-                // SAFETY: neon detected; i16 range guaranteed by `safe`; mat is the standard form.
+            // Max reachable score per job = min(len) * match. Only the SCORE cells (H/E/F) live in the
+            // SIMD vector; positions/te/qe are scalar i32, so window length is unconstrained. If every
+            // job's score ceiling fits u8, run 16 lanes; else the i16 kernel at 8 lanes. Mate-rescue
+            // jobs (short reads, match ~1) fit u8.
+            let bound = |j: &FwdJob| j.query.len().min(j.target.len()) as i32 * max_sc;
+            if jobs.iter().all(|j| bound(j) < 250) {
+                // SAFETY: neon detected; every H/E/F cell < 250 fits u8; standard mat.
+                return unsafe {
+                    fwd_local_sw_neon_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                };
+            }
+            if jobs.iter().all(|j| bound(j) < 30000 && j.target.len() < 30000) {
+                // SAFETY: neon detected; i16 range guaranteed; standard mat.
                 return unsafe {
                     fwd_local_sw_neon(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                 };
@@ -290,7 +297,7 @@ fn fwd_local_sw_scalar(
         }
 
         extract_group(
-            n, g, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
+            n, g, LANES, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
         );
     }
     out
@@ -303,12 +310,13 @@ fn fwd_local_sw_scalar(
 fn extract_group(
     n: usize,
     g: usize,
-    qlen: &[usize; LANES],
-    minsc: &[i32; LANES],
+    lanes: usize,
+    qlen: &[usize],
+    minsc: &[i32],
     max_sc: i32,
-    gmax: &[i32; LANES],
-    te: &[i32; LANES],
-    limit: &[i32; LANES],
+    gmax: &[i32],
+    te: &[i32],
+    limit: &[i32],
     rowmax: &[i32],
     hmax_col: &[i32],
     out: &mut [(i32, i32, i32, i32, i32)],
@@ -321,7 +329,7 @@ fn extract_group(
         if te_ >= 0 {
             let mut mx = -1i32;
             for j in 0..qlen[l] {
-                let v = hmax_col[j * LANES + l];
+                let v = hmax_col[j * lanes + l];
                 if v > mx {
                     mx = v;
                     qe = j as i32;
@@ -336,7 +344,7 @@ fn extract_group(
         let mut b: Vec<(i32, i32)> = Vec::new();
         if limit[l] >= 0 {
             for i in 0..=limit[l] {
-                let im = rowmax[i as usize * LANES + l];
+                let im = rowmax[i as usize * lanes + l];
                 if im >= minsc[l] {
                     match b.last() {
                         Some(&(_, col)) if col + 1 == i => {
@@ -359,7 +367,7 @@ fn extract_group(
                 }
             }
         }
-        out[g * LANES + l] = (g_, te_, qe, score2, te2);
+        out[g * lanes + l] = (g_, te_, qe, score2, te2);
     }
 }
 
@@ -506,7 +514,154 @@ unsafe fn fwd_local_sw_neon(
         }
 
         extract_group(
-            n, g, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
+            n, g, LANES, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
+        );
+    }
+    out
+}
+
+/// Lanes for the u8 kernel: one NEON `uint8x16`, twice the i16 width.
+const LANES16: usize = 16;
+
+/// NEON u8x16 forward local-SW: same control flow as [`fwd_local_sw_neon`] but 16 lanes. Local
+/// alignment keeps every H/E/F non-negative, so **saturating** u8 arithmetic (`vqadd`/`vqsub`)
+/// realizes `max(0, .)` directly with no bias/shift: the caller guarantees each job's score ceiling
+/// `min(len)*match` fits u8. Positions (`te`/`qe`/`rowmax`) stay scalar i32, so window length is
+/// unconstrained. Byte-identical to the scalar path (validated by `matesw_equals_scalar`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fwd_local_sw_neon_u8(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    use std::arch::aarch64::*;
+
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    let mtch = mat[0] as u8; // match bonus (>= 0)
+    let mispen = (-mat[1]) as u8; // mismatch penalty b (mat[1] = -b)
+    let mut out = vec![(0i32, -1i32, -1i32, 0i32, -1i32); jobs.len()];
+
+    let zero = vdupq_n_u8(0);
+    let mtch_v = vdupq_n_u8(mtch);
+    let mispen_v = vdupq_n_u8(mispen);
+    let one_v = vdupq_n_u8(1); // N penalty
+    let four_v = vdupq_n_u8(4);
+    let m_v = vdupq_n_u8(m as u8);
+    let e_del_v = vdupq_n_u8(e_del as u8);
+    let oe_del_v = vdupq_n_u8(oe_del as u8);
+    let e_ins_v = vdupq_n_u8(e_ins as u8);
+    let oe_ins_v = vdupq_n_u8(oe_ins as u8);
+
+    for (g, group) in jobs.chunks(LANES16).enumerate() {
+        let n = group.len();
+        let qmax = group.iter().map(|j| j.query.len()).max().unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        let mut seq_q = vec![PAD; qmax * LANES16];
+        let mut seq_t = vec![PAD; tmax * LANES16];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES16],
+            [0usize; LANES16],
+            [i32::MAX; LANES16],
+            [i32::MAX; LANES16],
+        );
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES16 + l] = b;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES16 + l] = b;
+            }
+        }
+
+        let mut h_prev = vec![0u8; qmax * LANES16];
+        let mut h_cur = vec![0u8; qmax * LANES16];
+        let mut e = vec![0u8; qmax * LANES16];
+        let mut hmax_col = vec![0i32; qmax * LANES16];
+        let mut rowmax = vec![0i32; tmax * LANES16];
+        let mut gmax = [0i32; LANES16];
+        let mut te = [-1i32; LANES16];
+        let mut limit = [-1i32; LANES16];
+        let mut frozen = [false; LANES16];
+        for l in 0..n {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+
+        for i in 0..tmax {
+            let t_v = vld1q_u8(seq_t.as_ptr().add(i * LANES16));
+            let mut f_v = zero;
+            let mut h_diag_v = zero;
+            let mut imax_v = zero;
+            for j in 0..qmax {
+                let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
+                // dsc = max(0, h_diag + score): saturating add/sub floor at 0, so no explicit max-0.
+                let eq = vceqq_u8(t_v, q_v);
+                let n_mask = vorrq_u8(vceqq_u8(t_v, four_v), vceqq_u8(q_v, four_v));
+                let pad_mask = vorrq_u8(vcgeq_u8(t_v, m_v), vcgeq_u8(q_v, m_v));
+                let add_match = vqaddq_u8(h_diag_v, mtch_v);
+                let sub_mis = vqsubq_u8(h_diag_v, mispen_v);
+                let sub_n = vqsubq_u8(h_diag_v, one_v);
+                let mut dsc = vbslq_u8(eq, add_match, sub_mis);
+                dsc = vbslq_u8(n_mask, sub_n, dsc);
+                dsc = vbslq_u8(pad_mask, zero, dsc);
+
+                let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
+                let mut h_v = vmaxq_u8(dsc, e_v);
+                h_v = vmaxq_u8(h_v, f_v);
+                imax_v = vmaxq_u8(imax_v, h_v);
+                vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h_v);
+
+                // e = max(max(0,e-e_del), max(0,h-oe_del)) = max(0, e-e_del, h-oe_del).
+                let en = vmaxq_u8(vqsubq_u8(e_v, e_del_v), vqsubq_u8(h_v, oe_del_v));
+                vst1q_u8(e.as_mut_ptr().add(j * LANES16), en);
+                f_v = vmaxq_u8(vqsubq_u8(f_v, e_ins_v), vqsubq_u8(h_v, oe_ins_v));
+                h_diag_v = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
+            }
+
+            let mut imax_arr = [0u8; LANES16];
+            vst1q_u8(imax_arr.as_mut_ptr(), imax_v);
+            for l in 0..n {
+                if i >= tlen[l] || frozen[l] {
+                    continue;
+                }
+                let im = imax_arr[l] as i32;
+                rowmax[i * LANES16 + l] = im;
+                if im > gmax[l] {
+                    gmax[l] = im;
+                    te[l] = i as i32;
+                    for j in 0..qmax {
+                        hmax_col[j * LANES16 + l] = h_cur[j * LANES16 + l] as i32;
+                    }
+                    if gmax[l] >= endsc[l] {
+                        frozen[l] = true;
+                        limit[l] = i as i32;
+                    }
+                }
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+
+            if (0..n).all(|l| frozen[l] || i + 1 >= tlen[l]) {
+                break;
+            }
+        }
+
+        extract_group(
+            n, g, LANES16, &qlen, &minsc, max_sc, &gmax, &te, &limit, &rowmax, &hmax_col, &mut out,
         );
     }
     out
@@ -541,9 +696,7 @@ mod tests {
     /// every field. This is the byte-identity gate for the NEON kernels.
     #[test]
     fn matesw_equals_scalar() {
-        let mat = scmat(1, 4);
         let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
-        let (minsc, max_sc) = (19, 1);
 
         let mut state = 0x1234_5678_9abc_def1u64;
         let mut next = move || {
@@ -597,13 +750,19 @@ mod tests {
             })
             .collect();
 
-        let batched =
-            batched_ksw_align2(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
-        for (i, j) in jobs.iter().enumerate() {
-            let want = ksw_align2(
-                j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc,
-            );
-            assert_eq!(batched[i], want, "job {i} (qlen {})", j.query.len());
+        // (match, mismatch, minsc): match=1 -> scores fit u8 (16-lane kernel); match=10 -> scores
+        // exceed 250 (8-lane i16 kernel). Cover both, both against per-job ksw_align2.
+        for &(a, b, minsc) in &[(1i8, 4i8, 19i32), (10, 40, 190)] {
+            let mat = scmat(a, b);
+            let max_sc = a as i32;
+            let batched =
+                batched_ksw_align2(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
+            for (i, j) in jobs.iter().enumerate() {
+                let want = ksw_align2(
+                    j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc,
+                );
+                assert_eq!(batched[i], want, "job {i} (qlen {}, match {a})", j.query.len());
+            }
         }
     }
 }
