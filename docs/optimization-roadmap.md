@@ -219,6 +219,25 @@ Z-drop cell, and band width match bwa-mem2 exactly — any deviation is both a c
 wasted SW. Highest ROI, zero risk.
 
 ## Do NOT
+- **Try to engage Apple's DMP** (the pointer-chasing prefetcher). It is built for exactly our shape of
+  problem -- Apple's patent (US 9,886,385) names "pointer chasing" with "poor locality"; Augury
+  (IEEE S&P'22) measures **3-8x** on array-of-pointers traversal, vanishing on DMP-less Icestorm
+  cores; GoFetch (USENIX Sec'24 §4.4) shows it even walks page tables and fills the TLB itself. **It
+  still cannot help an FM-index.** The DMP dereferences 64-bit values *stored* in a filled L1 line
+  whose bits [55:32] match that line's own address. Our LF walk **computes** its next address
+  (`sp = count[b] + occ`: popcount + add) and `cp_occ` holds counts and bitvectors, not addresses.
+  There is no array of pointers to dereference, and no fix short of storing real 64-bit VAs -- which
+  doubles an array whose +27 GB variant already measured **+0% at -t8**. Also: P-core only, L2 only,
+  64 KiB max distance, a ~128-entry history filter that prefetches each pointer once, and **M4 was
+  never tested** by either paper.
+- **Try to disable/tune the prefetchers from the aligner.** The chicken bits are real
+  (`HID5[44]`/`[45]` = disable HW prefetcher load/store, `HID11[30]` = disable DMP; verbatim in
+  m1n1's `src/cpu_regs.h`) but they are **EL1** registers. Userspace cannot write them and macOS
+  exposes no interface.
+- **Assume anything about `PRFM` on a TLB miss.** The ARM ARM (DDI 0487A.a §C2.2 p.C2-138)
+  permits treating any prefetch as a NOP *and* explicitly permits it affecting "caches and
+  translation lookaside buffers". It mandates neither, and no source documents Apple's choice.
+  Measure, do not reason -- and see the retraction above for what happens when you don't.
 - Switch to striped/lazy-F/prefix-scan (wrong toolbox for inter-sequence).
 - Adopt Block Aligner / adaptive banding / strobemer seeding (heuristic → breaks byte-identity).
 - Chase AMX/SME/wider lanes (MAC-only, no max-plus; 16-lane NEON is the hard ceiling).
