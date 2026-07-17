@@ -219,6 +219,31 @@ Z-drop cell, and band width match bwa-mem2 exactly — any deviation is both a c
 wasted SW. Highest ROI, zero risk.
 
 ## Do NOT
+- **Build a STAR-style "exact prefix table + binary search over a flat SA" seeder. Measured dead
+  (2026-07-17), and the number that kills it is cheap to re-derive.** STAR replaces BWA-MEME's
+  learned RMI with an exact table (`genomeSAindexNbases 14`: *"length (bases) of the SA pre-indexing
+  string ... allow faster searches"*), which looks like a simpler way to reach LISA's design. The
+  model that motivates it: resolving a 32-mer costs FM ~32 dependent rounds (one per base) but STAR
+  only 1 table lookup + ~2*log2(23) probes, since the mean SA range after 14 bases is 23 rows.
+  **The mean is a lie.** Queries come FROM the genome, so a K-mer occurring t times is t times
+  likelier to be hit: the distribution a real read sees is **occurrence-weighted**, and repeats
+  dominate it. Measured over 200k real 14-mers (`examples/star_vs_fm.rs`):
+
+  | | rows | probes |
+  |---|---|---|
+  | table average | 23.1 | 9.1 |
+  | **occurrence-weighted mean** | **9638.4** | **26.5** |
+  | median | 67 | |
+  | p90 / p99 | 2985 / 192334 | |
+  | max | 2891724 | 42.9 |
+
+  At 26.5 probes x 2 dependent accesses each (read `sa[mid]`, then the reference at that position),
+  STAR-style needs **~53 dependent rounds against FM's ~32**. It is ~1.7x *worse*, not 3x better.
+  The arms were verified to agree exactly (200000/200000 identical SA intervals), so this is the idea
+  losing, not the implementation.
+  **Corollary, and it vindicates BWA-MEME's design:** the RMI is not over-engineering of STAR's table.
+  A table returns a *range*; the RMI predicts a *position within* the range plus a short last-mile.
+  That is precisely the fix for the repeat-weighted range, and an exact table cannot do it.
 - **Prefetch the SA arrays in `get_sa_batch`. Built it, measured 0%, reverted (2026-07-17).**
   `sa_ms_byte` and `sa_ls_word` are separate arrays, so every SA read costs two cache lines and two
   TLB entries, and `prefetch_cp` never touched them: the read fires in the same round the walk lands
