@@ -218,6 +218,31 @@ transaction-bound.
 Z-drop cell, and band width match bwa-mem2 exactly — any deviation is both a correctness bug and
 wasted SW. Highest ROI, zero risk.
 
+### MLP: we run at ~6 lanes of the ~28 the core offers, and widening the lockstep does not fix it (2026-07-17)
+
+Measured with `BWA3_TRAFFIC=1`, which counts the 128-byte lines the FM index actually pulls (`-t1`,
+500k reads, genome): **1,075,478,506 lines x 128 B = 137.7 GB in 19.19s = 7.2 GB/s**.
+
+**That is ~20% of what ONE core can pull** (36.7 GB/s random 128B reads, `bench/uarch/`), and ~2.5%
+of the 16-core fabric ceiling (293.4 GB/s). **We are not bandwidth-bound.** Any lever that reduces
+memory *traffic* -- denser `cp_occ`, co-located SA arrays, u16 count deltas -- gives back bandwidth
+we are not using. Do not build them.
+
+We are **latency**-bound. At ~108 ns per random access, 1.075e9 lines is ~118 s of raw latency
+compressed into 19.19 s, i.e. **~6 lanes of memory-level parallelism** against the ~28 an M4 P-core
+sustains (Lemire, independently). That 4.5x gap is the real headroom, and it is **not** the lockstep
+width: sweeping `BWA3_LOCKSTEP_N` on the *genome* index is flat and non-monotonic (N=8/16/24/32/48/64
+-> `-t8` 3.75/3.71/3.81/3.80/3.70/3.61 s, all within ~5%, with 24 and 32 *worse* than 16). Three
+hypotheses died here, all mine:
+- "reduce the shared footprint" -- refuted by the 20%-of-fabric measurement above;
+- "N=16 is the knee because 16 slots x a 5.9 KB `prev[]` = 95 KB blows the 128 KB L1d" -- wrong,
+  `prev` *allocates* `max_len + 2` entries but only *touches* `num_prev` of them. Allocated is not
+  touched;
+- "the knee was tuned on the region index, so the genome optimum is higher" -- the sweep is flat.
+
+What remains unexplained: why 6 lanes and not 28. Closing it needs PMU counters macOS does not expose
+to userspace. **Do not spend more on MLP without them.**
+
 ## Do NOT
 - **Port Zhang's BWT-region binning. Measured dead (2026-07-17) before building it.** Zhang et al.
   (CCGrid'13 §IV) bin occurrence computations by BWT region so a round's accesses land in a window

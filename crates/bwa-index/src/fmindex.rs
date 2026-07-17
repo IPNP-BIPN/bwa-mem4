@@ -210,6 +210,13 @@ impl FmIndex {
         // the block index and re-indexing per base as `get_occ` would. Values are identical.
         let sp = smem.k;
         let ep = smem.k + smem.s;
+        if traffic::enabled() {
+            // Two 64B blocks share one 128B line, and for a small interval sp>>6 == ep>>6, so calls
+            // are a bad proxy for traffic. Count distinct LINES.
+            let (l1, l2) = ((sp >> 6) >> 1, (ep >> 6) >> 1);
+            traffic::EXT_LINES.fetch_add(if l1 == l2 { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+            traffic::EXT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let blk_sp = &self.cp_occ[(sp >> 6) as usize];
         let blk_ep = &self.cp_occ[(ep >> 6) as usize];
         let msk_sp = self.one_hot_mask[(sp & 63) as usize];
@@ -247,6 +254,10 @@ impl FmIndex {
         let mut offset = 0i64;
         let mut sp = pos;
         loop {
+            if traffic::enabled() {
+                // One line per step (one_hot and get_occ hit the same 64B block).
+                traffic::SA_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let occ_id = (sp >> 6) as usize;
             let y = 63 - (sp & 63);
             let oh = self.cp_occ[occ_id].one_hot;
@@ -334,6 +345,9 @@ impl FmIndex {
                     let spi = sp[j];
                     let occ_id = (spi >> 6) as usize;
                     let y = 63 - (spi & 63);
+                    if traffic::enabled() {
+                        traffic::SA_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let oh = self.cp_occ[occ_id].one_hot;
                     let b = if (oh[0] >> y) & 1 == 1 {
                         0
@@ -430,5 +444,39 @@ mod tests {
             let naive = bref.windows(len).filter(|w| *w == pat).count() as i64;
             assert_eq!(sm.s, naive, "occurrence mismatch for pattern at {start}");
         }
+    }
+}
+
+
+/// `BWA3_TRAFFIC=1`: count the 128-byte cache lines the FM index actually pulls, so the aligner's
+/// DRAM bandwidth can be compared against the fabric ceiling (~293 GB/s random on M4 Max). Atomics
+/// on the hot path: use at `-t1` and read the counts, not the wall clock.
+pub mod traffic {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    pub static EXT_LINES: AtomicU64 = AtomicU64::new(0);
+    pub static EXT_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static SA_LINES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA3_TRAFFIC").is_some())
+    }
+
+    pub fn dump(wall_s: f64) {
+        if !enabled() { return; }
+        let (el, ec, sl) = (
+            EXT_LINES.load(Ordering::Relaxed),
+            EXT_CALLS.load(Ordering::Relaxed),
+            SA_LINES.load(Ordering::Relaxed),
+        );
+        let total = el + sl;
+        eprintln!(
+            "[traffic] backward_ext: {ec} calls -> {el} lines ({:.2} lines/call)\n\
+             [traffic] get_sa walk : {sl} lines\n\
+             [traffic] TOTAL {} lines x 128 B = {:.1} GB in {:.2}s = {:.1} GB/s (1 thread)",
+            el as f64 / ec.max(1) as f64, total, total as f64 * 128.0 / 1e9, wall_s,
+            total as f64 * 128.0 / 1e9 / wall_s.max(1e-9),
+        );
     }
 }

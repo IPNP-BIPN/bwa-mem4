@@ -14,5 +14,5 @@ pub mod sais;
 
 pub use bntseq::{Amb, BntSeq, Contig};
 pub use build::build_index;
-pub use fmindex::{FmIndex, Smem};
+pub use fmindex::{traffic, FmIndex, Smem};
 pub use lisa::LearnedSa;

@@ -29,6 +29,22 @@ pub struct MemSeed {
 /// Collect all round-1 SMEMs of `codes` (2-bit encoded read, N = 4) with the given seed length and
 /// minimum interval size. Mirrors `getSMEMsAllPosOneThread` (repeatedly calling the one-position
 /// routine, advancing the start to `next_x`).
+
+/// Lockstep width: how many independent FM walks are kept in flight, so each slot's `cp_occ`
+/// prefetch has a full cycle to land before the block is used. **This is the aligner's
+/// memory-level-parallelism knob**: N slots means at most N outstanding DRAM misses per core.
+///
+/// The default 16 was tuned on `work/region.fa`, whose BWT is cache-resident -- i.e. on an index
+/// with no DRAM latency to hide, where extra slots are pure overhead and the knee necessarily lands
+/// low. `BWA3_LOCKSTEP_N` re-sweeps it on a real index. Scheduling only: every slot walks its own
+/// read deterministically, so N cannot change a result.
+fn lockstep_width() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BWA3_LOCKSTEP_N").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(16)
+    })
+}
+
 pub fn collect_smems(fm: &FmIndex, codes: &[u8], min_seed_len: i32, min_intv: i64) -> Vec<Smem> {
     let mut out = Vec::new();
     let mut scratch: Vec<Smem> = vec![Smem::default(); codes.len() + 2];
@@ -58,7 +74,7 @@ pub fn collect_smems_batched(
     /// Lockstep width: independent walks kept in flight so each slot's prefetch has a full cycle to
     /// land before the block is used. 16 measured ~2.8% faster than 8 on a genome-scale index (M4 Max,
     /// SE); 24 ties it and 32 regresses, so 16 is the knee. Shared by all three batched seeding rounds.
-    const N: usize = 16;
+    let n_lock = lockstep_width();
 
     let counts = fm.counts();
     let mut output: Vec<Vec<Smem>> = (0..reads.len()).map(|_| Vec::new()).collect();
@@ -67,9 +83,9 @@ pub fn collect_smems_batched(
     }
     let max_len = reads.iter().map(|r| r.len()).max().unwrap_or(0);
 
-    let mut slots: Vec<Option<LsSlot>> = Vec::with_capacity(N);
+    let mut slots: Vec<Option<LsSlot>> = Vec::with_capacity(n_lock);
     let mut next_read = 0usize;
-    for _ in 0..N {
+    for _ in 0..n_lock {
         if next_read < reads.len() {
             slots.push(Some(LsSlot::new(next_read, 0, min_intv, false, max_len)));
             next_read += 1;
@@ -618,14 +634,14 @@ fn bwt_seed_strategy_batched(
     min_seed_len: i32,
     out: &mut [Vec<Smem>],
 ) {
-    const N: usize = 16;
+    let n_lock = lockstep_width();
     if reads.is_empty() {
         return;
     }
     let counts = fm.counts();
-    let mut slots: Vec<Option<BwtSeedSlot>> = Vec::with_capacity(N);
+    let mut slots: Vec<Option<BwtSeedSlot>> = Vec::with_capacity(n_lock);
     let mut next_read = 0usize;
-    for _ in 0..N {
+    for _ in 0..n_lock {
         if next_read < reads.len() {
             slots.push(Some(BwtSeedSlot::new(next_read)));
             next_read += 1;
@@ -755,7 +771,7 @@ struct ReseedJob {
 /// its block is used. Each job's SMEMs are appended to its read in job order, identical to running
 /// [`smem_round_2`] per read.
 fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &mut [Vec<Smem>]) {
-    const N: usize = 16;
+    let n_lock = lockstep_width();
     let split_len = (opt.min_seed_len as f32 * opt.split_factor + 0.499) as i32;
 
     // Enumerate the re-seed jobs, preserving per-read append order (round-1 SMEM index ascending).
@@ -783,9 +799,9 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
     // Each job's output, filled as it completes; appended in job order at the end.
     let mut results: Vec<Vec<Smem>> = (0..jobs.len()).map(|_| Vec::new()).collect();
 
-    let mut slots: Vec<Option<(usize, LsSlot)>> = Vec::with_capacity(N);
+    let mut slots: Vec<Option<(usize, LsSlot)>> = Vec::with_capacity(n_lock);
     let mut next_job = 0usize;
-    for _ in 0..N {
+    for _ in 0..n_lock {
         if next_job < jobs.len() {
             let j = &jobs[next_job];
             slots.push(Some((

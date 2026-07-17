@@ -152,6 +152,7 @@ fn run_pipeline<B: Send>(
 }
 
 pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
+    let t_run = std::time::Instant::now();
     let opt = MemOpt::default();
     let n_threads = args.threads.max(1) as usize;
     // Fixed-size rayon pool. Output order and global read ids are independent of thread count, so
@@ -193,6 +194,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, out)?;
         bwa_gpu::dump_stats();
         bwa_chain::chain_time::dump();
+        bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
         return Ok(());
     }
 
@@ -246,6 +248,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     run_pipeline(out, read_batches, process)?;
     bwa_gpu::dump_stats();
     bwa_chain::chain_time::dump();
+    bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
     Ok(())
 }
 
