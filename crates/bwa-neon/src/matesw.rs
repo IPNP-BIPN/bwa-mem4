@@ -37,6 +37,36 @@ struct FwdJob<'a> {
 /// prefixes of the qualifying jobs to recover the start coordinates. Both passes go through
 /// [`fwd_local_sw_batch`], the single point the NEON kernel plugs into.
 #[allow(clippy::too_many_arguments)]
+/// `BWA3_MATESW_TIME=1`: cells, jobs and wall for the rescue kernel, so its throughput can be
+/// compared against the ISA's ceiling. The note calling this kernel "memory-bandwidth-bound"
+/// predates the finding that this aligner uses ~20% of one core's DRAM bandwidth, and its rails are
+/// only `qmax * LANES` bytes -- L1-resident. Measure before believing it.
+pub mod cells {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    pub static CELLS: AtomicU64 = AtomicU64::new(0);
+    pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    pub static NS: AtomicU64 = AtomicU64::new(0);
+    pub static QLEN: AtomicU64 = AtomicU64::new(0);
+    pub static TLEN: AtomicU64 = AtomicU64::new(0);
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA3_MATESW_TIME").is_some())
+    }
+    pub fn dump() {
+        if !enabled() { return; }
+        let (c, j, ns) = (CELLS.load(Ordering::Relaxed), JOBS.load(Ordering::Relaxed), NS.load(Ordering::Relaxed));
+        let s = ns as f64 / 1e9;
+        eprintln!(
+            "[matesw] {j} jobs, {c} DP cells in {s:.2}s CPU -> {:.2} Gcell/s/thread\n\
+             [matesw] ISA ceiling: 16 u8 lanes x ~3.5 GHz = ~56 Gcell/s if 1 cell/lane/cycle",
+            c as f64 / s.max(1e-9) / 1e9);
+        let (q, t) = (QLEN.load(Ordering::Relaxed), TLEN.load(Ordering::Relaxed));
+        eprintln!("[matesw] mean query = {:.0} bp, mean target window = {:.0} bp -> {:.0} cells/job",
+                  q as f64 / j.max(1) as f64, t as f64 / j.max(1) as f64, c as f64 / j.max(1) as f64);
+    }
+}
+
 pub fn batched_ksw_align2(
     jobs: &[KswJob],
     m: usize,
@@ -48,6 +78,17 @@ pub fn batched_ksw_align2(
     minsc: i32,
     max_sc: i32,
 ) -> Vec<KswAlignResult> {
+    let t_cells = cells::enabled().then(std::time::Instant::now);
+    if t_cells.is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The DP is query x target per job; that is the work the kernel must actually do.
+        let c: u64 = jobs.iter().map(|j| (j.query.len() * j.target.len()) as u64).sum();
+        cells::CELLS.fetch_add(c, Relaxed);
+        cells::JOBS.fetch_add(jobs.len() as u64, Relaxed);
+        // 207k cells per job means a huge target window; record the dimensions to see which side it is.
+        cells::QLEN.fetch_add(jobs.iter().map(|j| j.query.len() as u64).sum::<u64>(), Relaxed);
+        cells::TLEN.fetch_add(jobs.iter().map(|j| j.target.len() as u64).sum::<u64>(), Relaxed);
+    }
     // Forward pass over all jobs.
     let fwd: Vec<FwdJob> = jobs
         .iter()
@@ -103,6 +144,9 @@ pub fn batched_ksw_align2(
             out[i].tb = out[i].te - rte;
             out[i].qb = out[i].qe - rqe;
         }
+    }
+    if let Some(t) = t_cells {
+        cells::NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     out
 }

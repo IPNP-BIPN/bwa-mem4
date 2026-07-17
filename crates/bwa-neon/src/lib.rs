@@ -27,7 +27,7 @@
 use bwa_extend::{ksw_extend2, ExtendJob, ExtendResult, SwBackend};
 
 mod batched;
-mod matesw;
+pub mod matesw;
 
 pub use matesw::{batched_ksw_align2, KswJob};
 

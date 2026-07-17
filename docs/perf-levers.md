@@ -159,6 +159,33 @@ kernel is "memory-bandwidth-bound".** That note predates the finding that the al
 single core's bandwidth, and it is the same class of claim that has been wrong every time this
 session.
 
+### Why the rescue kernel cannot be optimised much: the cell count IS the algorithm
+
+`BWA3_MATESW_TIME=1` counts the rescue's DP cells. Real GIAB, 500k pairs, `-t1`:
+
+```
+1,838,008 jobs, 381,032,465,824 DP cells in 67.8s CPU -> 5.6 Gcell/s/thread
+mean query = 148 bp, mean target window = 1401 bp -> 207,307 cells/job
+```
+
+**381 BILLION cells.** The target window is bwa's insert-size interval `[pes.low, pes.high]` ~= 1401
+bp: we do a full 148 x 1401 local Smith-Waterman per anchor, 1.84M times. For scale, SE extension is
+~22 G cells -- **the rescue does ~17x the DP work of the entire extension stage**. That, not kernel
+quality, is why it is 47% of PE.
+
+**So the kernel is not the lever.** We already run the *same* cell count 1.26x faster than bwa-mem2
+(12.87s vs 16.19s, both measured directly). Going meaningfully faster means doing **fewer cells**, and
+the cell count is bwa's algorithm. Changing it changes the output.
+
+The obvious escape does not work either: an ungapped prefilter like the extension's `ungapped_hit`
+would have to scan 148 bases across 1401 window positions = **207k comparisons, exactly the cell count
+it claims to avoid**. The mate's position in the window is unknown, so there is nothing to band and
+nothing to prune.
+
+Same wall as seeding, in a different place: **byte-identity fixes the work, and we already execute it
+better than the reference.** The only way past it is a different rescue (seed the mate instead of
+full-window SW, which is what hash-seeded aligners do) -- i.e. a different aligner.
+
 ## Thread sweep: there is no single "x vs bwa-mem2", there is a decaying curve
 
 Same config (`.gz` -> file, `-K` 10M, 500k reads, genome index, PGO build, both tools at the same

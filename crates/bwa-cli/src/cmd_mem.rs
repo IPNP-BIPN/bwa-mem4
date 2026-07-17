@@ -193,6 +193,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     if let Some(reads2) = args.reads2.clone() {
         run_pe(&fm, &bns, &opt, &args.reads, &reads2, k_batch, backend, out)?;
         bwa_gpu::dump_stats();
+        bwa_neon::matesw::cells::dump();
         bwa_chain::chain_time::dump();
         bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
         return Ok(());
