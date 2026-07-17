@@ -78,6 +78,46 @@ disabled. This mistake was made three times in a row here: first claiming the pi
 had no pipeline, then measuring the pipeline itself at `-K` 100M where it cannot act.
 
 
+## ⚠️ The numbers above are wgsim. Real data is lower, and PE is much lower.
+
+Everything above uses `work/r1_500k.fq` = **wgsim-simulated** reads. The I/O config was realistic;
+the *data* was not. Re-measured on **real GIAB HG002** (500k pairs, genome index, `-t8`, warm,
+min-of-2, same everything else):
+
+| | wgsim (quoted above) | **real GIAB** |
+|---|---|---|
+| SE `-t8` | 2.83-2.85x | **2.61x** |
+| PE `-t8` | 2.43-2.47x | **1.90x** |
+
+**Quote the GIAB numbers.** The old `work/giab/bench.log` (SE 2.54-2.66x / PE 2.02-2.04x on 4M pairs)
+was right all along.
+
+**Why wgsim flatters PE so much: mate rescue never fires.** Measured directly with bwa-mem2's `-S -P`
+(skip pairing + rescue), its PE-specific work is **0.49 us/read on wgsim** and **15.37 us/read on
+GIAB — 31x more**. wgsim pairs are unique-locus and align cleanly, so the rescue path is dead code
+on that data. **Benchmarking PE on simulated reads measures a pipeline with half of it asleep.**
+
+This is the third benchmark in this repo that structurally hid what it claimed to measure:
+`work/region.fa` hid seeding (the roadmap said SW was 85%; it is 4%), `-K` 100M on 500k reads hid the
+reader/writer pipeline (worth +8-9%), and wgsim hides mate rescue. **Check what your benchmark
+disables before trusting it.**
+
+### The one lever this exposes: mate rescue is 64% of our PE compute
+
+On real GIAB, pairing + mate rescue is **12.09 of our 18.85 us/read of PE compute = 64%**, against
+**15.37 of 35.41 = 43%** for bwa-mem2. We are **1.27x faster** at it than they are, and it *still*
+dominates us more -- because we optimised everything around it away. Amdahl: the part you do not
+touch becomes the whole.
+
+| if mate rescue got | PE compute | PE ratio |
+|---|---|---|
+| 1.5x faster | 18.9 -> 14.8 us/read | 1.90 -> **2.39x** |
+| 2.0x faster | 18.9 -> 12.8 us/read | 1.90 -> **2.77x** |
+
+Caveat on the arithmetic: bwa-mem2's share is measured **directly** (`-S -P`); ours is **decomposed**
+(`PE - 2 x SE`), which assumes seeding+extending a read costs the same in SE and PE. Exposing our own
+`-S`/`-P` would make it a like-for-like measurement.
+
 ## Thread sweep: there is no single "x vs bwa-mem2", there is a decaying curve
 
 Same config (`.gz` -> file, `-K` 10M, 500k reads, genome index, PGO build, both tools at the same
