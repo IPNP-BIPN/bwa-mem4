@@ -21,7 +21,7 @@
 > **SW extension is ~22% of `-t1` wall (~24% of compute) at genome scale, not 85% and not 40-43%.**
 > Seeding + `get_sa` + chaining are the other ~78%. This matches the profile recorded in
 > `lisa-learned-index-dead-end` (seeding ~69%, extension ~31%) and not this document's. It is also
-> the *expected* result: `5af30cd`, `05f4458` and `0980a03` all removed DP work, and the ungapped
+> the *expected* result: `5af30cd`, `06b0225` and `7be53c2` all removed DP work, and the ungapped
 > fast path now answers most diagonals in closed form.
 >
 > **Consequences.** Every kernel lever below is capped by Amdahl at `1/(1-0.22) = 1.28x`, not the
@@ -103,7 +103,7 @@ win.** The kernel is at the byte-identical ceiling on Apple Silicon.
 > improve, so the realistic overall gain is ~2%."
 >
 > Both premises are false. Seeding is **~78%** of genome-scale runtime, not 15%, and extension is
-> ~22%, not 85% — so PGO applies to the *large* share, not the small one. And `feat/pgo` (`58e7006`)
+> ~22%, not 85% — so PGO applies to the *large* share, not the small one. And `feat/pgo` (`26e58e1`)
 > **measured SE +3.1% / PE +4.5%**, parity clean, with a complete 3-stage `cargo-pgo` harness in
 > `scripts/pgo.sh`. The "version friction" caveat is also stale: `cargo-pgo` is installed and the
 > script pins `PATH=/opt/homebrew/opt/llvm/bin` itself. (`llvm-bolt` genuinely is absent, so BOLT
@@ -209,7 +209,7 @@ columns `njobs*4` ≈ 800 KB apart, destroying page/TLB locality. The CPU kernel
 there the lanes *are* the vector and cannot walk independently; a GPU thread can, and does. The
 memory-transaction-amplification hypothesis is therefore **refuted**: the kernel was never
 transaction-bound.
-| 2 | ✅ **Shorten the carried chain** (Suzuki-Kasahara idea, our-layout form) — **DONE, ~8%, byte-identical** | The column-carried recurrence was `f→h→f_new` (~4 ops). Since `h=max(A,f)` with `A=max(M,E)` independent of the carry and `oe_ins≥e_ins`, it's exactly `f_new=max(f-e_ins, max(A-oe_ins,0))` — the `C=max(A-oe_ins,0)` term is off-path, so the carried chain is 2 ops (sub,max). No anti-diagonal rewrite, no extra registers, byte-identical. | **~8% on kernel** (measured; ~6% end-to-end) | **Identical (proven u8+i16, gated)** | Low (done: `05f4458`) |
+| 2 | ✅ **Shorten the carried chain** (Suzuki-Kasahara idea, our-layout form) — **DONE, ~8%, byte-identical** | The column-carried recurrence was `f→h→f_new` (~4 ops). Since `h=max(A,f)` with `A=max(M,E)` independent of the carry and `oe_ins≥e_ins`, it's exactly `f_new=max(f-e_ins, max(A-oe_ins,0))` — the `C=max(A-oe_ins,0)` term is off-path, so the carried chain is 2 ops (sub,max). No anti-diagonal rewrite, no extra registers, byte-identical. | **~8% on kernel** (measured; ~6% end-to-end) | **Identical (proven u8+i16, gated)** | Low (done: `06b0225`) |
 | 3 | **Ungapped-first / skip-DP** (minibwa q-mer prefilter) | Most 150bp extensions are gapless. Cheap ungapped score first; full gap-affine DP only when a gap could improve. minibwa: q=7, run SW only if max q-mer count ≥ 10. | Removes a slice of the 85% | Exact only if the skip provably can't change the winner (else a validated divergence) | Low-medium |
 | 4 | **WFA for hard extensions** (hybrid) | O(n·s): ~10x fewer cells for low-error reads (2-6x vs KSW2). Keep SIMD banded DP for tiny bands, dispatch WFA only for wide bands. | High for the hard subset | Risky: WFA's M>X>D>I CIGAR tie-break ≠ bwa's; needs canonicalization | High (spike) |
 | 5 | **Micro-opts** | `vmax` over `cmp+bsl`; plain `vadd` where diffs permit (vs `vqadd` lat 3); horizontal reductions out of the inner loop; register-tile the band, cut `eh_h`/`eh_e` traffic; LTO + `target-cpu=apple-m1` + PGO (escape-branch layout). | 5-15% each | Identical | Low |

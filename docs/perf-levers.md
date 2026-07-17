@@ -45,3 +45,34 @@ median-of-3 hides this; an interleaved A/B does not.
 PGO is a build process, not a source change, so nothing lands in `main` that makes `cargo build
 --release` faster: **ship the `scripts/pgo.sh` output**, and it stacks multiplicatively on later
 levers. BOLT skipped (no LLVM+BOLT on this host).
+
+
+## Real-world speed vs bwa-mem2 2.3 (2026-07-17, post-rebase `main`)
+
+Genome index, 500k reads, `-t8`, quiet host, every binary pre-warmed, interleaved x3, PGO build.
+
+| config | SE | PE |
+|---|---|---|
+| plain FASTQ -> `/dev/null`, `-K` 100M | 2.75-2.79x | 2.37-2.44x |
+| `.gz` -> file, `-K` 100M (**one batch**, pipeline inert) | 2.60-2.63x | 2.27-2.37x |
+| **`.gz` -> file, `-K` 10M (7.5 batches, pipeline live)** | **2.83-2.85x** | **2.43-2.47x** |
+| **`.gz` -> `.sam.gz`** (vs `bwa-mem2 \| bgzip -@8`) | **2.81x** | — |
+
+**~2.85x SE / ~2.45x PE at `-t8` under conditions a user actually runs**, and that is *better* than
+the artificial plain-in/`/dev/null`-out benchmark.
+
+### ⚠️ Measurement trap: count your batches before concluding anything about I/O
+
+`-K 100000000` on 500k x 150bp reads = 75M bases = **0.8 batches**. The reader/writer pipeline
+(`run_pipeline`, `69394ba`) overlaps batch N+1's read and batch N-1's write with batch N's compute --
+**with a single batch it has nothing to overlap and is structurally inert**. Measured at `-K 10M`
+(7.5 batches) the pipeline is worth **+8-9%**: our SE `-t8` goes 3.68s -> 3.35s while bwa-mem2 does
+not move (9.6 -> 9.5s), so it is our overlap delivering, not the baseline degrading. It more than
+pays for the gzip decode and the file write combined.
+
+The production default (`chunk_size * threads` = 80M) yields thousands of batches on a real WGS run,
+so it is fine; the 500k benchmark is simply too small to produce more than one. **Any benchmark that
+touches I/O must report its batch count**, or it measures a configuration with half the work
+disabled. This mistake was made three times in a row here: first claiming the pipeline "was missing"
+(it was in PR #1, unfetched), then measuring gzip decode and SAM write at "~0 cost" on a binary that
+had no pipeline, then measuring the pipeline itself at `-K` 100M where it cannot act.
