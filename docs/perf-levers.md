@@ -76,3 +76,30 @@ touches I/O must report its batch count**, or it measures a configuration with h
 disabled. This mistake was made three times in a row here: first claiming the pipeline "was missing"
 (it was in PR #1, unfetched), then measuring gzip decode and SAM write at "~0 cost" on a binary that
 had no pipeline, then measuring the pipeline itself at `-K` 100M where it cannot act.
+
+
+## Thread sweep: there is no single "x vs bwa-mem2", there is a decaying curve
+
+Same config (`.gz` -> file, `-K` 10M, 500k reads, genome index, PGO build, both tools at the same
+`-t`, min of 2), M4 Max = **12 P-cores + 4 E-cores**:
+
+| `-t` | bwa-mem2 | ours | ratio | our scaling |
+|---|---|---|---|---|
+| 1 | 53.97s | 16.44s | **3.28x** | 1.00x |
+| 4 | 15.63s | 5.20s | 3.00x | 3.16x |
+| 8 | 9.28s | 3.30s | 2.81x | 4.98x |
+| **12** | 7.16s | **2.87s** | 2.49x | 5.72x |
+| 16 | 6.98s | 2.84s | 2.45x | 5.78x |
+
+**Quote the thread count with the ratio, always.** 3.28x and 2.45x are the same binary on the same
+data.
+
+**Why it decays: bwa-mem2 scales better than we do.** 53.97/6.98 = **7.73x** on 16 threads against
+our **5.79x**. That is the shared memory system, and it is the direct cost of being faster per
+thread: we do the same memory work in less time, so we reach the shared ceiling sooner. Every
+per-thread win we land makes the `-t` curve decay a little more steeply. It is not a regression, it
+is what winning per-thread looks like against a memory wall.
+
+**`-t12` is the knee.** The 4 E-cores buy ~1% (2.87 -> 2.84s). Note the pipeline spends **2 extra
+threads** (reader + writer) on top of `-t`, so `-t16` asks for 18 threads on a 16-core part; `-t12`
+(= the P-core count) leaves room for them.
