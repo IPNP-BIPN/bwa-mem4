@@ -588,7 +588,13 @@ fn run_pe(
         // the SIMD lanes. Byte-identical to the per-pair rescue in `mem_sam_pe` (which is then told to
         // skip it). `BWA3_SCALAR_RESCUE` keeps the per-pair path for A/B verification.
         let scalar_rescue = std::env::var_os("BWA3_SCALAR_RESCUE").is_some();
-        if !scalar_rescue {
+        // `BWA3_NO_RESCUE=1` skips mate rescue entirely, the analogue of bwa-mem2's `-S`. It is a
+        // MEASUREMENT gate, not a lever: it changes the output by design, exactly as `-S` does. It
+        // exists so our rescue cost can be measured DIRECTLY and compared like-for-like against
+        // `bwa-mem2 -S`, instead of decomposed as `PE - 2 x SE` (which assumes a read costs the same
+        // to seed and extend in SE as in PE -- unverified).
+        let no_rescue = std::env::var_os("BWA3_NO_RESCUE").is_some();
+        if !scalar_rescue && !no_rescue {
             let mut rd: Vec<PairRescueData> = prepared
                 .iter_mut()
                 .map(|p| PairRescueData {
@@ -625,7 +631,9 @@ fn run_pe(
                     &quals,
                     &mut p.a1,
                     &mut p.a2,
-                    !scalar_rescue,
+                    // rescue_done: true when nothing further should rescue -- either the batched
+                    // pass already did it, or BWA3_NO_RESCUE suppressed it outright.
+                    !scalar_rescue || no_rescue,
                     &mut buf,
                 )
                 .expect("write to Vec");

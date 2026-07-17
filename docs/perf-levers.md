@@ -118,6 +118,47 @@ Caveat on the arithmetic: bwa-mem2's share is measured **directly** (`-S -P`); o
 (`PE - 2 x SE`), which assumes seeding+extending a read costs the same in SE and PE. Exposing our own
 `-S`/`-P` would make it a like-for-like measurement.
 
+## PE profile on real GIAB: mate rescue is 47%, and it looks nothing like SE
+
+`BWA3_NO_RESCUE=1` skips mate rescue entirely -- the analogue of `bwa-mem2 -S`. It is a
+**measurement gate, not a lever**: it changes the output by design (63,102 records differ on real
+GIAB; on wgsim it barely moves, which is the whole point). It exists so our rescue cost can be
+measured **directly** rather than decomposed as `PE - 2 x SE`.
+
+Measured directly on both sides (real GIAB, 500k pairs, genome index, `-t8`, warm, min-of-2):
+
+| | full PE | rescue off | rescue cost |
+|---|---|---|---|
+| bwa-mem2 | 38.71s | 22.52s (`-S`) | **16.19s** |
+| ours | 22.93s | 10.06s | **12.87s** |
+
+**We are 1.26x faster at mate rescue than bwa-mem2** (the decomposition said 1.27x -- the two methods
+agree), and it is still **56% of our PE wall** against **42% of theirs**. Amdahl: we optimised
+everything around it away, so the part we did not touch became the whole.
+
+Sampler agrees (PE, real GIAB, `-t8`, leaf frames in our binary):
+
+| frame | share |
+|---|---|
+| **`matesw`** | **47.3%** |
+| `batched_extend` (SW extension) | 14.7% |
+| `primary::mem_sort_dedup_patch` | **11.0%** |
+| `get_sa` | 4.8% |
+| `backward_ext` + `LsSlot` + `mem_collect_smem` (seeding) | ~8% |
+
+**The PE profile is not the SE profile.** In SE, seeding is ~78% and the SW kernel ~4%. In PE, seeding
+collapses to ~8% and mate rescue is half the run. Three sessions of seeding work (`get_sa` batching,
+the lockstep, the LUT experiments) touch **~13% of PE**. And `mem_sort_dedup_patch` at 11% is larger
+than `get_sa` here and has never been looked at.
+
+**Sizing the lever** (on the direct wall, which includes the ~1.08s index load): rescue at 1.5x takes
+PE 22.93 -> 18.7s = **1.90 -> 2.07x**; at 2x, -> 16.5s = **2.35x**.
+
+**Before optimising it, re-verify the claim in `mate-rescue-vectorized-and-scaling` that the rescue
+kernel is "memory-bandwidth-bound".** That note predates the finding that the aligner uses ~20% of a
+single core's bandwidth, and it is the same class of claim that has been wrong every time this
+session.
+
 ## Thread sweep: there is no single "x vs bwa-mem2", there is a decaying curve
 
 Same config (`.gz` -> file, `-K` 10M, 500k reads, genome index, PGO build, both tools at the same
