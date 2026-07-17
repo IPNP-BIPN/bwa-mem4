@@ -240,8 +240,29 @@ hypotheses died here, all mine:
   touched;
 - "the knee was tuned on the region index, so the genome optimum is higher" -- the sweep is flat.
 
-What remains unexplained: why 6 lanes and not 28. Closing it needs PMU counters macOS does not expose
-to userspace. **Do not spend more on MLP without them.**
+> **RETRACTION (same day): the "~6 lanes" above is not a measurement, it is arithmetic on two
+> assumptions I never checked**, and both are false.
+> 1. *"every line is a DRAM miss."* Every forward walk starts from `counts[a]` (4 values) and
+>    extends, so the first ~8 steps of **every read** sweep a working set of 4^8 = 65k positions =
+>    1024 blocks = **64 KB. L1-resident.** A large share of those 1.075e9 lines are hits.
+> 2. *"all 19.19 s is memory."* It is not; the walk also does real work.
+>
+> The reference point was wrong too: `bwt_binning`'s 1.9 ns/`backward_ext` at N=4096 is 4096 lines =
+> 512 KB, which **fits L2** -- that was a cache hit, not a DRAM access. The DRAM-bound figure is its
+> N=16.7M row: **8.3 ns**. Our real walk runs ~14 ns/call (562M calls in seeding's ~7.9 s), so the gap
+> to a saturated random walk is **~1.7x, not 4.5x** -- and part of that 1.7x is genuine work the
+> synthetic does not do (the state machine, `prev[]` writes, the emit test). Realistic headroom is
+> therefore **well under 1.7x on 41% of runtime = <20% end-to-end**, not a 4.5x MLP hole.
+>
+> **And "macOS does not expose the PMU" is also wrong.** `kperf.framework` is present, `dlopen`
+> succeeds, `kpc_get_counter_count` returns 2, and `kpc_force_all_ctrs_set` resolves -- it returns
+> -1 only because it **needs root** (this is the API SysBumps used to map the Apple TLB). So the PMU
+> is a `sudo` away, not unavailable. Note `kpc_force_all_ctrs_set(1)` takes **exclusive, system-wide**
+> control of the counters.
+>
+> What is actually unexplained: the ~1.7x between our walk and a saturated random one. It is worth
+> measuring only with the PMU (cache-miss rate on `cp_occ`), and only if <20% is worth a root-level
+> tool.
 
 ## Do NOT
 - **Port Zhang's BWT-region binning. Measured dead (2026-07-17) before building it.** Zhang et al.
