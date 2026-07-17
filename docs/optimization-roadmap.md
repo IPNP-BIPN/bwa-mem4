@@ -219,6 +219,18 @@ Z-drop cell, and band width match bwa-mem2 exactly — any deviation is both a c
 wasted SW. Highest ROI, zero risk.
 
 ## Do NOT
+- **Prefetch the SA arrays in `get_sa_batch`. Built it, measured 0%, reverted (2026-07-17).**
+  `sa_ms_byte` and `sa_ls_word` are separate arrays, so every SA read costs two cache lines and two
+  TLB entries, and `prefetch_cp` never touched them: the read fires in the same round the walk lands
+  on a sampled row. Restructured the lockstep to prefetch both lines and defer the read one full
+  round. Byte-identical (SE 500k + PE 1M `cmp`-clean; `get_sa_batch == get_sa` on 2M genome
+  positions). **139 -> 138 ns/lookup.** The 32 concurrently-walking slots already give the
+  out-of-order engine everything it needs; see `bench/uarch/mlp_probe.c`, where an explicit `prfm`
+  adds 1.02x over a plain loop for exactly this reason. **Fourth lever killed by this mechanism**
+  (LISA, flat SA, the 10-mer cache, this).
+  BWA-MEME co-locates position+key in one 5-byte record instead, making it a single access; that is a
+  real layout advantage, but interleaving ours costs ~0.8s of load time to rewrite 3.9 GB against a
+  1.04s load, and the measurement above says the second access is free anyway.
 - **Port minibwa's 10-mer cache. Built it, measured 0%, reverted (2026-07-17).** Li & Homer
   (arXiv:2606.15357 §2.5) precompute the ds-intervals of all 10-mers "to reduce the number calls to
   BackStep()" and measure *"10% faster to find (19,1)-SMEMs"*. **Their own sentence says "on real

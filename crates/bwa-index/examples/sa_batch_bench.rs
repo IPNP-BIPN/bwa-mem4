@@ -50,6 +50,22 @@ fn main() {
                  if chunk == TOTAL { "ALL".to_string() } else { chunk.to_string() },
                  secs, ns, base / ns);
     }
+    // get_sa_batch has no unit test, and it carries a lockstep walk plus a deferred-read pipeline.
+    // Gate it against the per-position reference on real genome-scale positions.
+    let mut batched = vec![0i64; TOTAL];
+    fm.get_sa_batch(&positions, &mut batched);
+    let mut bad = 0usize;
+    for (i, &p) in positions.iter().enumerate() {
+        if batched[i] != fm.get_sa(p) {
+            if bad < 3 {
+                eprintln!("  MISMATCH at pos {p}: batch={} vs get_sa={}", batched[i], fm.get_sa(p));
+            }
+            bad += 1;
+        }
+    }
+    assert_eq!(bad, 0, "get_sa_batch disagrees with get_sa on {bad}/{TOTAL} positions");
+    println!("\nget_sa_batch == per-position get_sa on {TOTAL} genome positions: OK");
+
     // Prove the arms agree: same values regardless of chunking (byte-identity of the lever).
     let mut ref_out = vec![0i64; TOTAL];
     fm.get_sa_batch(&positions, &mut ref_out);
