@@ -219,6 +219,30 @@ Z-drop cell, and band width match bwa-mem2 exactly — any deviation is both a c
 wasted SW. Highest ROI, zero risk.
 
 ## Do NOT
+- **Port Zhang's BWT-region binning. Measured dead (2026-07-17) before building it.** Zhang et al.
+  (CCGrid'13 §IV) bin occurrence computations by BWT region so a round's accesses land in a window
+  whose pages fit the TLB, reporting 1.43-1.54x single-thread / **1.21-1.36x multithreaded** -- which
+  made it the one lever that looked like it survived thread contention, since it cuts shared
+  page-walk traffic instead of hiding per-thread latency.
+  `examples/bwt_binning.rs` measures the mechanism directly (both arms lockstep W=16 + prefetch, arm
+  B paying its counting sort, warm, interleaved, min-of-3):
+
+  | batch N | acc/bin (2^24) | random | binned | speedup |
+  |---|---|---|---|---|
+  | 4 096 | 11 | 1.9 ns | 2.8 ns | **0.69x** |
+  | 65 536 | 177 | 3.1 ns | 3.1 ns | 1.00x |
+  | 1 048 576 | 2 834 | 7.8 ns | 7.7 ns | 1.01x |
+  | 16 777 216 | 45 344 | 8.3 ns | 7.0 ns | **1.18x** |
+
+  **The knee is at ~16.7M** -- exactly Zhang's batch, which is not a coincidence: binning needs page
+  REUSE, and a 2^24-row bin is 1024 pages, so you need tens of thousands of accesses per bin before a
+  page is touched twice. Dead twice over: (a) **infeasible** -- our slots carry a 3.6 KB `prev[]`, so
+  16.7M of them is ~60 GB *per thread*, and in the reachable range (N <= 1M) binning returns exactly
+  1.00-1.01x; (b) **capped** -- even at N=16.7M, 1.18x on seeding's ~41% is **+6.7% end-to-end**, not
+  Zhang's 1.21-1.36x.
+  Why the gap to their paper: `random` costs **1.9 ns/backward_ext at N=4096**. A random access into
+  5.8 GB amortised to 1.9 ns is our W=16 lockstep + prefetch doing its job; binning cannot improve on
+  1.9 ns, it can only add sort cost. Their baseline was neither lockstepped nor prefetched.
 - **Build a STAR-style "exact prefix table + binary search over a flat SA" seeder. Measured dead
   (2026-07-17), and the number that kills it is cheap to re-derive.** STAR replaces BWA-MEME's
   learned RMI with an exact table (`genomeSAindexNbases 14`: *"length (bases) of the SA pre-indexing
