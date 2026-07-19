@@ -417,6 +417,11 @@ const U8_SCORE_LIMIT: i32 = 250;
 
 /// Score ceiling under which the 8-lane i16 kernel is exact, with headroom left for
 /// [`DEAD_CELL_SCORE`] at the other end of the range. Jobs above this fall back to the scalar path.
+///
+/// Gated on aarch64 because its only reader is the NEON dispatch below. Without the gate an
+/// x86_64 build sees an unused constant, which is only a warning locally but a hard error under
+/// CI's `-D warnings`.
+#[cfg(target_arch = "aarch64")]
 const I16_SCORE_LIMIT: i32 = 30_000;
 
 /// Length ksw pads a query of `qlen` out to. The lane count is bwa's kernel choice in `mem_matesw`
@@ -526,6 +531,9 @@ fn fwd_local_sw_batch(
 /// `true` when the NEON kernels' three-constant shortcut is exact for this matrix. A `false` is not
 /// an error: the caller simply keeps the scalar path, which reads `mat` cell by cell and therefore
 /// handles arbitrary matrices.
+///
+/// Gated on aarch64: its only caller is the NEON dispatch, so elsewhere it is dead code.
+#[cfg(target_arch = "aarch64")]
 fn mat_is_standard(m: usize, mat: &[i8]) -> bool {
     if m != 5 {
         return false;
@@ -1145,6 +1153,9 @@ unsafe fn fwd_local_sw_neon(
 /// Lanes for the u8 kernel: one NEON `uint8x16`, twice the i16 width. Fixed by the register width,
 /// not tunable: every load, store and array below is sized `* LANES16`, and it is also the `lanes`
 /// stride [`extract_group`] must be told about.
+///
+/// Gated on aarch64 for the same reason as [`I16_SCORE_LIMIT`]: only the NEON kernels read it.
+#[cfg(target_arch = "aarch64")]
 const LANES16: usize = 16;
 
 /// NEON u8x16 forward local-SW: same control flow as [`fwd_local_sw_neon`] but 16 lanes. Local
