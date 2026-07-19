@@ -97,6 +97,32 @@ jobs:
             done
           done
 
+      # The `-A 2` cases fail here while passing locally against the arm64 (sse2neon) oracle, and
+      # the step above proves the x86 oracle is self-consistent. So the two ORACLES disagree with
+      # each other under non-default scoring, and our output matches the arm64 one. This prints the
+      # actual differing records so the nature of the disagreement can be read rather than guessed.
+      - name: Diagnostic - how do the two oracles differ under -A 2?
+        continue-on-error: true
+        run: |
+          set +e
+          bwa-mem2 mem -t2 -K 10000000 -A 2 testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
+            | grep -v '^@' > /tmp/oracle_x86.sam
+          ./target/release/bwa-mem3 mem -t2 -K 10000000 -A 2 testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
+            | grep -v '^@' > /tmp/ours.sam
+          echo "records: oracle=$(wc -l < /tmp/oracle_x86.sam) ours=$(wc -l < /tmp/ours.sam)"
+          echo "differing records: $(paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | wc -l)"
+          echo "--- which FIELDS differ (column numbers, 1=QNAME 2=FLAG 3=RNAME 4=POS 5=MAPQ 6=CIGAR 12+=tags):"
+          paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' \
+            | head -2000 | awk -F'\001' '{split($1,a,"\t"); split($2,b,"\t");
+                for (i=1;i<=length(a);i++) if (a[i]!=b[i]) print i}' | sort -n | uniq -c
+          echo "--- first 3 differing records, oracle then ours:"
+          paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | head -3 \
+            | while IFS= read -r line; do
+                echo "  ORACLE: $(printf '%s' "$line" | cut -d$'\001' -f1 | cut -f1-9)"
+                echo "  OURS  : $(printf '%s' "$line" | cut -d$'\001' -f2 | cut -f1-9)"
+                echo
+              done
+
       - name: Option parity vs bwa-mem2 (49 cases)
         env:
           IDX: testdata/tiny/tiny.fa
