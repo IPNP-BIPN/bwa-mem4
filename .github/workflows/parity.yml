@@ -24,6 +24,12 @@ env:
   # Pinned deliberately. bwa-mem2 is the oracle, so an upstream release must be an explicit,
   # reviewed bump here rather than something that silently turns CI red one morning.
   BWA_MEM2_VERSION: "2.3"
+  # Pinned by CONTENT, not by the binary's self-reported version. The v2.3 release tarball ships a
+  # binary that still prints "2.2.1": upstream bumped the tag without bumping the version string.
+  # Asserting on that string is therefore worthless, while the checksum pins the exact bytes we
+  # validated against. (Behaviour is unaffected either way: the only change in v2.3 is a memory
+  # reallocation fix in the seeding kernel, no alignment output change.)
+  BWA_MEM2_SHA256: "112f3a3ebf3f8c2377f52d61446ead392c4a98ecf89e7629617d3ed16f4e73cb"
 
 jobs:
   option-parity:
@@ -48,13 +54,15 @@ jobs:
           V="${BWA_MEM2_VERSION}"
           curl -fsSL -o bwa-mem2.tar.bz2 \
             "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${V}/bwa-mem2-${V}_x64-linux.tar.bz2"
+          echo "${BWA_MEM2_SHA256}  bwa-mem2.tar.bz2" | sha256sum -c -
           tar xjf bwa-mem2.tar.bz2
           echo "$PWD/bwa-mem2-${V}_x64-linux" >> "$GITHUB_PATH"
 
-      - name: Confirm the oracle runs and is the pinned version
+      - name: Confirm the oracle runs
         run: |
+          # Informational only: this prints "2.2.1" from the v2.3 tarball (see BWA_MEM2_SHA256).
+          # The checksum above is what actually pins the oracle.
           bwa-mem2 version
-          test "$(bwa-mem2 version 2>&1 | head -1)" = "${BWA_MEM2_VERSION}"
 
       - name: Build
         run: cargo build --release
