@@ -39,7 +39,10 @@ const LCG_MULTIPLIER: u64 = 6364136223846793005;
 /// Increment of the acceptance gates' LCG. See [`LCG_MULTIPLIER`].
 const LCG_INCREMENT: u64 = 1442695040888963407;
 
-pub use sw::{ksw_align2, ksw_extend2, ksw_global2, ksw_local_fwd, ExtendResult, KswAlignResult};
+pub use sw::{
+    ksw_align2, ksw_extend2, ksw_global2, ksw_local_fwd, ExtendResult, KswAlignResult,
+    SuboptimalTracker,
+};
 
 /// A banded Smith-Waterman seed-extension backend.
 ///

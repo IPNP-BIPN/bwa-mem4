@@ -75,7 +75,7 @@
 //! diagonal surface (gaps open straight from `H`) and no seed score to start from. A `_v` suffix
 //! always means "the vector register holding one of these per lane".
 
-use bwa_extend::KswAlignResult;
+use bwa_extend::{KswAlignResult, SuboptimalTracker};
 
 /// One mate-rescue local-SW job: align `query` against `target` (both `0..=4` codes).
 ///
