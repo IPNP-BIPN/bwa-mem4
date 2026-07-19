@@ -35,7 +35,7 @@ jobs:
           - os: macos-13
             target_id: macos-x86_64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@master
