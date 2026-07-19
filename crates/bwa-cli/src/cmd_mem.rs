@@ -1238,6 +1238,11 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
             out,
             pes0,
         )?;
+        // `bwa-gpu` is a macos-only dependency (see this crate's Cargo.toml), so the call itself
+        // has to be gated: on Linux the crate is not linked at all and an ungated call fails to
+        // resolve. `dump_stats` is internally a no-op without Metal, which is why this was easy to
+        // miss on a Mac.
+        #[cfg(target_os = "macos")]
         bwa_gpu::dump_stats();
         bwa_neon::matesw::cells::dump();
         bwa_chain::chain_time::dump();
@@ -1321,6 +1326,8 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     };
 
     run_pipeline(out, read_batches, process)?;
+    // Gated for the same reason as the SE path above: macos-only dependency.
+    #[cfg(target_os = "macos")]
     bwa_gpu::dump_stats();
     bwa_chain::chain_time::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
