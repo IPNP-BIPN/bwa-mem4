@@ -9,3 +9,6 @@ repository.workspace = true
 
 [dependencies]
 bwa-extend = { workspace = true }
+
+[lints]
+workspace = true

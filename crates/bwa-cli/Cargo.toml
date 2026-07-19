@@ -26,3 +26,6 @@ bgzf = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 bwa-gpu = { workspace = true }
+
+[lints]
+workspace = true

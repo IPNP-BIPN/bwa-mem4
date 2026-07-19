@@ -866,8 +866,8 @@ pub fn batch_mate_rescue(
         };
         // `b0`/`b1`: this pair's read-1 and read-2 anchors (bwa's `b[0]`/`b[1]`). Cloned, not
         // borrowed, because the arrays they came from are about to be mutated by rescue.
-        let b0 = near_best(&p.a0);
-        let b1 = near_best(&p.a1);
+        let b0 = near_best(p.a0);
+        let b1 = near_best(p.a1);
         max_rounds = max_rounds.max(b0.len()).max(b1.len());
         anchors.push([b0, b1]);
     }
@@ -1531,7 +1531,7 @@ pub(crate) fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
     }
     // bwa's `"MIDSH"[c]`. Op 3 is bwa's internal soft-clip marker in this table (SAM's own numbering
     // puts N at 3), so both 3 and 4 are clip ops here and both become H on a supplementary.
-    const OPS: [u8; 5] = [b'M', b'I', b'D', b'S', b'H'];
+    const OPS: [u8; 5] = *b"MIDSH";
     for &c in cigar {
         let mut op = (c & 0xf) as usize;
         // The C writes `c = which? 4 : 3`, i.e. it also rewrites 4 back to 3 on the primary. Our
@@ -1744,7 +1744,7 @@ fn mem_aln2sam(
         // "ACGTN" and "TGCAN"; indexing `REV_BASE` in reverse order performs the complement,
         // since `REV_BASE[c]` is the complement base of `FWD_BASE[c]`. `c.min(4)` guards nt4 codes above 4 (bwa indexes unguarded).
         if !p.is_rev {
-            const FWD_BASE: [u8; 5] = [b'A', b'C', b'G', b'T', b'N'];
+            const FWD_BASE: [u8; 5] = *b"ACGTN";
             for &c in &seq[qb..qe] {
                 out.push(FWD_BASE[c.min(4) as usize]);
             }
@@ -1754,7 +1754,7 @@ fn mem_aln2sam(
                 _ => out.push(b'*'),
             }
         } else {
-            const REV_BASE: [u8; 5] = [b'T', b'G', b'C', b'A', b'N'];
+            const REV_BASE: [u8; 5] = *b"TGCAN";
             for &c in seq[qb..qe].iter().rev() {
                 out.push(REV_BASE[c.min(4) as usize]);
             }

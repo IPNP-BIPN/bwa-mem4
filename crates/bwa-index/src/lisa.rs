@@ -823,7 +823,7 @@ mod tests {
             // both the key-only and the fall-through-to-reference comparison paths get exercised.
             for _ in 0..300 {
                 let mlen = 1 + (lcg(&mut seed) as usize % 40);
-                let pattern: Vec<u8> = if lcg(&mut seed) % 2 == 0 && len > mlen {
+                let pattern: Vec<u8> = if lcg(&mut seed).is_multiple_of(2) && len > mlen {
                     let s = lcg(&mut seed) as usize % (len - mlen);
                     ref_seq[s..s + mlen].to_vec()
                 } else {
@@ -946,7 +946,7 @@ mod tests {
             let lsa = LearnedSa::build(ref_seq.clone(), 256);
             for _ in 0..200 {
                 let mlen = 1 + (lcg(&mut seed) as usize % 50);
-                let pat: Vec<u8> = if lcg(&mut seed) % 2 == 0 && len > mlen {
+                let pat: Vec<u8> = if lcg(&mut seed).is_multiple_of(2) && len > mlen {
                     let s = lcg(&mut seed) as usize % (len - mlen);
                     ref_seq[s..s + mlen].to_vec()
                 } else {

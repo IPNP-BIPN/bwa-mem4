@@ -8,10 +8,12 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 M3="${1:-./target/release/bwa-mem3}"
-M2=bwa-mem2
-IDX=work/region.fa
-R1=work/r1_50k.fq
-R2=work/r2_50k.fq
+# Overridable so CI can point at the committed testdata/tiny fixture and generated reads. Locally
+# they default to the scratch inputs under work/, which is gitignored.
+M2="${M2:-bwa-mem2}"
+IDX="${IDX:-work/region.fa}"
+R1="${R1:-work/r1_50k.fq}"
+R2="${R2:-work/r2_50k.fq}"
 # small, fast inputs; fall back to the 500k set if the 50k one was cleaned away
 [ -f "$R1" ] || { R1=work/r1_500k.fq; R2=work/r2_500k.fq; }
 TMP=$(mktemp -d)

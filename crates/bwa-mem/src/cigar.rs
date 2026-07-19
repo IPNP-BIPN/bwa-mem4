@@ -406,9 +406,9 @@ pub(crate) fn gen_cigar2(
     // Captures `is_forward_strand`; used for both mismatch letters and deleted-base runs.
     let base_char = |code: u8| -> char {
         let alphabet = if is_forward_strand {
-            [b'A', b'C', b'G', b'T', b'N']
+            *b"ACGTN"
         } else {
-            [b'T', b'G', b'C', b'A', b'N']
+            *b"TGCAN"
         };
         // `.min(4)`: pac codes above 3 (ambiguous bases) all collapse onto N.
         alphabet[code.min(4) as usize] as char

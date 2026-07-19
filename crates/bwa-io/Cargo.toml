@@ -10,3 +10,6 @@ repository.workspace = true
 [dependencies]
 bwa-core = { workspace = true }
 needletail = { workspace = true }
+
+[lints]
+workspace = true

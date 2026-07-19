@@ -1158,7 +1158,7 @@ mod tests {
                 codes[p] = (lcg(&mut seed) % 4) as u8;
             }
             // Occasional N.
-            if lcg(&mut seed) % 5 == 0 {
+            if lcg(&mut seed).is_multiple_of(5) {
                 let p = lcg(&mut seed) as usize % rlen;
                 codes[p] = 4;
             }

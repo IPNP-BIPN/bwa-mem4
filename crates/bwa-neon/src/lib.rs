@@ -450,7 +450,7 @@ mod tests {
                                 // Target offset to corrupt; the base there is bumped by 1..=3
                                 // modulo 4, which is guaranteed to change it to a different base.
                                 let p = (next() as usize) % t.len();
-                                t[p] = ((t[p] + 1 + (next() % 3) as u8) % 4) as u8;
+                                t[p] = (t[p] + 1 + (next() % 3) as u8) % 4;
                             }
                         }
                         t.extend((0..extra).map(|_| (next() % 4) as u8));

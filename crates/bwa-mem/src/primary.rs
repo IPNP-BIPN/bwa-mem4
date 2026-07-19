@@ -614,8 +614,7 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     // `band_width_trace_enabled` in
     // cigar.rs this is not cached, but it runs once per read rather than once per emitted
     // alignment, so the `var_os` cost is tolerable.
-    if std::env::var_os("BWA3_DUMP_PRESORT")
-        .map_or(false, |v| v.to_string_lossy() == id.to_string())
+    if std::env::var_os("BWA3_DUMP_PRESORT").is_some_and(|v| v.to_string_lossy() == id.to_string())
     {
         eprintln!("PRESORT id={id} n={}", a.len());
         for (i, r) in a.iter().enumerate() {
