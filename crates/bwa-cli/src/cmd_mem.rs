@@ -417,11 +417,6 @@ pub struct MemArgs {
     /// compressed in parallel on `-t` worker threads (readable by samtools/bgzip/tabix).
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
-    // Not a bwa option. Long-only so it can never collide with a future bwa short flag.
-    /// Route seed extension through the Metal GPU backend (macOS only; opt-in, byte-identical to the
-    /// CPU path). Ignored on other platforms.
-    #[arg(long)]
-    pub gpu: bool,
     // Long-only, because `-h` is bwa's XA-hits option. bwa itself has no help flag: any
     // unrecognised option falls through to `return 1` and prints usage (`fastmap.cpp:795`).
     /// Print help.
@@ -1215,11 +1210,6 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         &command_line,
     )?;
 
-    // Seed-extension backend, decided once for the process from `--gpu` plus what the machine
-    // actually has. `Copy`, so it is handed to every worker for free. Both backends are
-    // byte-identical, so this cannot change the output.
-    let backend = Backend::select(args.gpu);
-
     // ================= Dispatch: paired-end leaves here, single-end continues below =================
     //
     // Paired-end when a second file is given, or when `-p` says the one file is interleaved.
@@ -1234,16 +1224,9 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
             &args.reads,
             reads2.as_deref(),
             k_batch,
-            backend,
             out,
             pes0,
         )?;
-        // `bwa-gpu` is a macos-only dependency (see this crate's Cargo.toml), so the call itself
-        // has to be gated: on Linux the crate is not linked at all and an ungated call fails to
-        // resolve. `dump_stats` is internally a no-op without Metal, which is why this was easy to
-        // miss on a Mac.
-        #[cfg(target_os = "macos")]
-        bwa_gpu::dump_stats();
         bwa_neon::matesw::cells::dump();
         bwa_chain::chain_time::dump();
         bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
@@ -1294,7 +1277,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
             .map(|rec| rec.seq.iter().map(|&base| dna::nt4(base)).collect())
             .collect();
         // Per-read candidate alignments BEFORE dedup and primary marking, also parallel to `batch`.
-        let regs_all = batched_regs(&fm, &bns, &opt, &all_codes, backend);
+        let regs_all = batched_regs(&fm, &bns, &opt, &all_codes);
         // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
         // `into_par_iter` yields the owned `Vec<MemAlnReg>`, dropping a per-read Vec allocation+copy.
         // One entry per read: that read's finished SAM records (possibly several, possibly one
@@ -1326,9 +1309,6 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     };
 
     run_pipeline(out, read_batches, process)?;
-    // Gated for the same reason as the SE path above: macos-only dependency.
-    #[cfg(target_os = "macos")]
-    bwa_gpu::dump_stats();
     bwa_chain::chain_time::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
     Ok(())
@@ -1356,7 +1336,6 @@ fn batched_regs(
     bns: &BntSeq,
     opt: &MemOpt,
     codes: &[Vec<u8>],
-    backend: Backend,
 ) -> Vec<Vec<MemAlnReg>> {
     // One chunk per worker, so every thread gets a slice big enough to fill the SIMD lanes.
     // Size of the rayon pool, i.e. effectively `-t`. Clamped so the division below cannot divide
@@ -1367,79 +1346,8 @@ fn batched_regs(
     let reads_per_chunk = codes.len().div_ceil(worker_count).max(1);
     codes
         .par_chunks(reads_per_chunk)
-        .flat_map(|chunk| backend.align(fm, bns, opt, chunk))
+        .flat_map(|chunk| align_reads_batched(fm, bns, opt, chunk, &NeonBackend))
         .collect()
-}
-
-/// Seed-extension backend chosen at startup. `Metal` only exists on macOS with a GPU; everywhere
-/// else `--gpu` degrades to the SIMD CPU backend. The choice is per-process, so byte-identity of the
-/// output is unaffected either way (both are byte-identical to the oracle).
-#[derive(Clone, Copy)]
-enum Backend {
-    /// The SIMD CPU kernel (`bwa_neon::NeonBackend`). The default, and the fallback whenever
-    /// `--gpu` cannot be honoured.
-    Cpu,
-    /// The Metal compute kernel. Only compiled on macOS, and only selected when `--gpu` was given
-    /// AND a Metal device was found at startup.
-    #[cfg(target_os = "macos")]
-    Metal,
-}
-
-impl Backend {
-    /// Pick the backend once, at startup, and say on stderr what was picked.
-    ///
-    /// # Parameters
-    ///
-    /// - `want_gpu`: the `--gpu` flag. `false` short-circuits to `Cpu` without probing for a device.
-    ///
-    /// # Returns
-    ///
-    /// `Metal` only on macOS with an available device; `Cpu` otherwise. Asking for a GPU that is
-    /// not there warns and degrades rather than failing: the two backends produce identical bytes,
-    /// so the fallback costs speed and nothing else.
-    fn select(want_gpu: bool) -> Self {
-        if !want_gpu {
-            return Backend::Cpu;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if bwa_gpu::metal_available() {
-                eprintln!("[bwa-mem3] seed extension: Metal GPU backend");
-                return Backend::Metal;
-            }
-            eprintln!("[bwa-mem3] --gpu requested but no Metal device; using CPU backend");
-            Backend::Cpu
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            eprintln!("[bwa-mem3] --gpu is macOS-only; using CPU backend");
-            Backend::Cpu
-        }
-    }
-
-    /// Run seed extension for one chunk of reads on the selected backend.
-    ///
-    /// # Parameters
-    ///
-    /// Same contract as [`batched_regs`]: `fm`/`bns`/`opt` are the shared immutable inputs, and
-    /// `codes` is this chunk's nt4-coded reads. `self` is `Copy`, so this consumes only the tag.
-    ///
-    /// # Returns
-    ///
-    /// One pre-dedup region list per read of `codes`, in order. Both arms are byte-identical.
-    fn align(
-        self,
-        fm: &FmIndex,
-        bns: &BntSeq,
-        opt: &MemOpt,
-        codes: &[Vec<u8>],
-    ) -> Vec<Vec<MemAlnReg>> {
-        match self {
-            Backend::Cpu => align_reads_batched(fm, bns, opt, codes, &NeonBackend),
-            #[cfg(target_os = "macos")]
-            Backend::Metal => align_reads_batched(fm, bns, opt, codes, &bwa_gpu::MetalBackend),
-        }
-    }
 }
 
 /// Env-gated (`BWA3_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
@@ -1877,7 +1785,6 @@ fn run_pe(
     // `None` under `-p`: both mates come interleaved from `reads1`.
     reads2: Option<&std::path::Path>,
     k_batch: usize,
-    backend: Backend,
     out: Output,
     // `-I`: user-supplied insert-size distribution. When present bwa copies it per batch and never
     // calls `mem_pestat` (`bwamem.cpp`: `if (pes0) memcpy(...) else mem_pestat(...)`).
@@ -1948,7 +1855,7 @@ fn run_pe(
             })
             .collect();
         // Pre-dedup regions, in the same interleaved order as `all_codes`.
-        let regs_all = batched_regs(fm, bns, opt, &all_codes, backend);
+        let regs_all = batched_regs(fm, bns, opt, &all_codes);
 
         // ---- De-interleave: pair up each mate's owned codes + regions by sequential moves (no
         //      content copy), so the parallel prep can consume them instead of cloning

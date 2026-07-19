@@ -7,7 +7,7 @@
 //!
 //! The aligner finds short exact matches ("seeds") in the reference, then *extends* each seed
 //! outwards with the banded Smith-Waterman below to turn it into a full alignment. This file is the
-//! scalar, portable, authoritative version of that step. `bwa-neon` and `bwa-gpu` reimplement the
+//! scalar, portable, authoritative version of that step. `bwa-neon` reimplements the
 //! same arithmetic on SIMD lanes and on the GPU, and are accepted only if they return the identical
 //! integers.
 //!
