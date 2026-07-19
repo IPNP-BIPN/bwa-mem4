@@ -37,8 +37,19 @@ with an explanation next to them:
 
 ## A caveat on the word "identical"
 
-bwa-mem2 is not platform-independent under a non-default match score, and this took a dedicated
-investigation to establish. Sweeping `-A` over one read:
+bwa-mem2 does not agree with itself across platforms under a non-default match score. Measured on
+8000 simulated reads at `-A 2`, upstream's x86_64 binary against the arm64 build (Homebrew, SSE
+translated through sse2neon), with our output matching the arm64 one exactly:
+
+| | records |
+|---|---|
+| Identical | 7795 / 8000 |
+| Differ in `XS` only | 194 |
+| Differ in `POS`/`CIGAR`/`AS` | 11 |
+
+On those 11, **our score is never lower** than the x86 build's: strictly higher on 5, equal on 6.
+The x86 build soft-clips where we align through. And sweeping `-A` over one read shows the x86
+build breaking a scaling law the algorithm mandates:
 
 | `-A` | 1 | 2 | 3 | 4 | 5 | 6 |
 |---|---|---|---|---|---|---|
@@ -46,15 +57,14 @@ investigation to establish. Sweeping `-A` over one read:
 | bwa-mem2 x86_64 | 49 | **86** | 147 | 196 | 245 | 294 |
 | bwa-mem2 arm64, and bwa-mem3 | 49 | **98** | 147 | 196 | 245 | 294 |
 
-`update_a` multiplies every scoring parameter by `A`, so the whole DP surface is an exact scaled
-copy and every score must scale by exactly `A`. A different suboptimal candidate would deviate at
-every `A`; a single-point deviation at `A = 2` is a kernel artifact. The mechanism is at
-`bwamem.cpp:2302`, where the choice between the 8-bit and 16-bit SIMD kernels is made on
+`update_a` multiplies every scoring parameter by `A`, so the DP surface at `-A k` is an exact
+scaled copy of the one at `-A 1` and every score must scale by exactly `k`. A different suboptimal
+candidate would deviate at every `A`; a lone deviation at `A = 2` is a kernel artifact. The
+mechanism is at `bwamem.cpp:2302`, where the 8-bit versus 16-bit SIMD kernel is chosen on
 `h0 + min(len1, len2) * opt->a`, a threshold that moves with `-A`.
 
-Only the `XS` tag is affected, on a few reads. `AS`, `POS`, `MAPQ`, `CIGAR`, `NM` and `MD` agree.
 **At default scoring the two builds agree exactly**, so the 30x results above are unaffected.
-Parity here is stated against the arm64 build, which is the one that stays linear.
+Parity here is stated against the arm64 build, which is the side that stays consistent.
 
 ## Verification
 
