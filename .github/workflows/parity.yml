@@ -111,28 +111,28 @@ jobs:
             | grep -v '^@' > /tmp/ours.sam
           echo "records: oracle=$(wc -l < /tmp/oracle_x86.sam) ours=$(wc -l < /tmp/ours.sam)"
           echo "differing records: $(paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | wc -l)"
-          # Print the TAG columns (12 onward). The previous version cut to fields 1-9, which is
-          # precisely where the two agree, so it showed identical lines and proved nothing.
-          echo "--- first 4 differing records: fields 1-9 then the tags"
-          paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | head -4 \
-            | while IFS= read -r line; do
-                O=$(printf '%s' "$line" | cut -d$'\001' -f1)
-                U=$(printf '%s' "$line" | cut -d$'\001' -f2)
-                echo "  core oracle: $(printf '%s' "$O" | cut -f1-9)"
-                echo "  core ours  : $(printf '%s' "$U" | cut -f1-9)"
-                echo "  tags oracle: $(printf '%s' "$O" | cut -f12-)"
-                echo "  tags ours  : $(printf '%s' "$U" | cut -f12-)"
-                echo "  seq equal? $([ "$(printf '%s' "$O" | cut -f10)" = "$(printf '%s' "$U" | cut -f10)" ] && echo yes || echo NO)"
-                echo
-              done
-          # Which tag names carry a different value. `length(array)` is gawk-only and Ubuntu ships
-          # mawk, which is why the previous field-index loop printed nothing at all.
-          echo "--- differing tag names, counted over the whole file:"
-          paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' \
-            | awk -F'\001' '{
-                n=split($1,a,"\t"); m=split($2,b,"\t");
-                for (i=12;i<=n && i<=m;i++) { split(a[i],x,":"); if (a[i]!=b[i]) print x[1] }
-              }' | sort | uniq -c | sort -rn
+          # Byte-level ground truth. Earlier attempts at this used paste/awk and produced a
+          # self-contradictory report (identical-looking tags, yet every record counted as
+          # differing), which is the signature of a line-alignment bug in the comparison itself
+          # rather than a real difference. cmp answers without interpretation.
+          echo "--- md5 of each"
+          md5sum /tmp/oracle_x86.sam /tmp/ours.sam
+          echo "--- wc"
+          wc -lc /tmp/oracle_x86.sam /tmp/ours.sam
+          echo "--- cmp (first differing byte):"
+          cmp /tmp/oracle_x86.sam /tmp/ours.sam || true
+          echo "--- diff, first 6 lines:"
+          diff /tmp/oracle_x86.sam /tmp/ours.sam | head -6 || true
+
+      - name: Upload both SAMs for offline inspection
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oracle-vs-ours-A2
+          path: |
+            /tmp/oracle_x86.sam
+            /tmp/ours.sam
+          retention-days: 5
 
       - name: Option parity vs bwa-mem2 (49 cases)
         env:
