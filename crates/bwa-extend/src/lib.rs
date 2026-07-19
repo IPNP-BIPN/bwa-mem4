@@ -1,7 +1,7 @@
 //! Seed extension via banded Smith-Waterman.
 //!
 //! The scalar seed-extension kernel (`sw::ksw_extend2`) is the bit-identity source of truth;
-//! NEON/Metal backends must reproduce its integer results.
+//! The vectorised backends must reproduce its integer results exactly.
 //!
 //! # What this crate is for
 //!
@@ -39,12 +39,15 @@ const LCG_MULTIPLIER: u64 = 6364136223846793005;
 /// Increment of the acceptance gates' LCG. See [`LCG_MULTIPLIER`].
 const LCG_INCREMENT: u64 = 1442695040888963407;
 
-pub use sw::{ksw_align2, ksw_extend2, ksw_global2, ksw_local_fwd, ExtendResult, KswAlignResult};
+pub use sw::{
+    ksw_align2, ksw_extend2, ksw_global2, ksw_local_fwd, ExtendResult, KswAlignResult,
+    SuboptimalTracker,
+};
 
 /// A banded Smith-Waterman seed-extension backend.
 ///
 /// The scalar backend ([`ScalarBackend`], delegating to [`ksw_extend2`]) is authoritative; SIMD
-/// (NEON) and GPU (Metal) backends must return **integer-identical** [`ExtendResult`]s to it for
+/// (NEON on aarch64, AVX2 on x86_64) must return **integer-identical** [`ExtendResult`]s to it for
 /// every input, so byte-identity of the SAM output is preserved. Use
 /// [`assert_backend_matches_scalar`] as the acceptance gate when adding a backend.
 ///
@@ -201,7 +204,7 @@ impl SwBackend for ScalarBackend {
 
 /// Acceptance gate for any non-scalar [`SwBackend`]: assert `backend.extend` returns exactly the
 /// same [`ExtendResult`] as [`ksw_extend2`] over a deterministic sweep of random DNA seed
-/// extensions. Panics on the first mismatch. NEON (phase 9a) and Metal (phase 9b) backends must
+/// extensions. Panics on the first mismatch. Every vectorised backend must
 /// pass this.
 ///
 /// # What this actually guarantees
@@ -225,7 +228,8 @@ impl SwBackend for ScalarBackend {
 /// `H == M` at almost every cell that ends up on the optimal path. A backend that opened gaps from
 /// `H = max(M, E, F)` instead of from `M` therefore passed all 2000 cases while being wrong.
 ///
-/// That is exactly what had happened: the Metal shader in `bwa-gpu` computed its E/F floor from
+/// That is exactly what had happened: a Metal shader backend (since removed, see the README)
+/// computed its E/F floor from
 /// `h - oe_del` / `h - oe_ins` where `ksw_extend2` (`ksw.cpp:493`, `498`) and bwa-mem2's vectorized
 /// `bandedSWA` (`MAIN_CODE16`, `bandedSWA.cpp:327-342`, subtracting from `m11`) both use `M`.
 /// Adding the `(a, b, o_del, e_del, o_ins, e_ins)` sweep below surfaced it immediately.
@@ -238,7 +242,7 @@ impl SwBackend for ScalarBackend {
 /// Two limits worth stating honestly, so nobody over-reads a green run:
 /// * Sequences are uniform random DNA with `qlen`/`tlen <= 60`. Real reads are longer and contain
 ///   satellite repeats, which is the other regime where H-vs-M diverges. Callers with a GPU/SIMD
-///   backend should also run a read-sized gate (see `bwa-gpu`'s `metal_matches_scalar_read_sized`).
+///   backend should also run a read-sized gate, not just short synthetic sequences.
 /// * A backend that silently falls back to scalar passes vacuously. Backends must assert
 ///   separately that their real kernel was actually built and taken.
 ///
@@ -449,7 +453,9 @@ pub fn assert_backend_batch_matches_scalar<B: SwBackend>(backend: &B) {
                 (0..tlen).map(|_| (next_random() % 4) as u8).collect()
             })
             .collect();
-        let h0s: Vec<i32> = (0..batch_size).map(|_| 1 + (next_random() % 20) as i32).collect();
+        let h0s: Vec<i32> = (0..batch_size)
+            .map(|_| 1 + (next_random() % 20) as i32)
+            .collect();
 
         // The batch handed to the backend: job k borrows queries[k]/targets[k] and carries h0s[k].
         let jobs: Vec<ExtendJob> = (0..batch_size)
@@ -497,7 +503,7 @@ mod tests {
 
     #[test]
     fn scalar_backend_matches_kernel() {
-        // The harness itself must pass for the authoritative backend (and becomes the NEON/Metal
+        // The harness itself must pass for the authoritative backend (and becomes the NEON/AVX2
         // acceptance gate). ScalarBackend delegates, so this also self-checks the harness runs.
         assert_backend_matches_scalar(&ScalarBackend);
         assert_backend_batch_matches_scalar(&ScalarBackend);

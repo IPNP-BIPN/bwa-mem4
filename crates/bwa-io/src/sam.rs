@@ -127,8 +127,8 @@ pub fn write_header<W: Write>(
     // True when the `-H` block already contains at least one line-initial `@SQ\t`, i.e. the user
     // brought their own reference dictionary; the C's `n_SQ != 0`. Suppresses OUR `@SQ` loop only,
     // never the user's lines, which are written unchanged further down.
-    let user_supplied_sq = hdr_lines
-        .is_some_and(|block| block.split('\n').any(|line| line.starts_with("@SQ\t")));
+    let user_supplied_sq =
+        hdr_lines.is_some_and(|block| block.split('\n').any(|line| line.starts_with("@SQ\t")));
     if !user_supplied_sq {
         for sq in sqs {
             writeln!(w, "@SQ\tSN:{}\tLN:{}", sq.name, sq.len)?;
@@ -340,7 +340,10 @@ mod tests {
         )
         .unwrap();
         let s2 = String::from_utf8(buf2).unwrap();
-        assert!(!s2.contains("SN:chr1"), "generated @SQ should be suppressed: {s2}");
+        assert!(
+            !s2.contains("SN:chr1"),
+            "generated @SQ should be suppressed: {s2}"
+        );
         assert!(s2.contains("SN:other"));
     }
 
@@ -348,13 +351,19 @@ mod tests {
     fn unmapped_record_shape() {
         let mut buf = Vec::new();
         write_unmapped(&mut buf, "r1", b"ACGT", Some(b"IIII"), None).unwrap();
-        assert_eq!(&buf, b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tAS:i:0\tXS:i:0\n");
+        assert_eq!(
+            &buf,
+            b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tAS:i:0\tXS:i:0\n"
+        );
     }
 
     #[test]
     fn unmapped_missing_qual_is_star() {
         let mut buf = Vec::new();
         write_unmapped(&mut buf, "r1", b"ACGT", None, None).unwrap();
-        assert_eq!(&buf, b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\tAS:i:0\tXS:i:0\n");
+        assert_eq!(
+            &buf,
+            b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\tAS:i:0\tXS:i:0\n"
+        );
     }
 }

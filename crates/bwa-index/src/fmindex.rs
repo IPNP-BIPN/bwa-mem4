@@ -377,8 +377,14 @@ impl FmIndex {
             // Same two checkpoint blocks as the AArch64 arm; `_MM_HINT_T0` = fetch into L1.
             let base = self.cp_occ.as_ptr();
             unsafe {
-                _mm_prefetch(base.add((sp >> CP_SHIFT) as usize) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(base.add((ep >> CP_SHIFT) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(
+                    base.add((sp >> CP_SHIFT) as usize) as *const i8,
+                    _MM_HINT_T0,
+                );
+                _mm_prefetch(
+                    base.add((ep >> CP_SHIFT) as usize) as *const i8,
+                    _MM_HINT_T0,
+                );
             }
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -492,7 +498,10 @@ impl FmIndex {
             // 128-byte LINE indices for the two blocks: block index >> 1, since two 64-byte
             // checkpoints share one line.
             let (l1, l2) = ((sp >> CP_SHIFT) >> 1, (ep >> CP_SHIFT) >> 1);
-            traffic::EXT_LINES.fetch_add(if l1 == l2 { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+            traffic::EXT_LINES.fetch_add(
+                if l1 == l2 { 1 } else { 2 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
             traffic::EXT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // The two checkpoint blocks (often the same one for a narrow interval) and the two
@@ -650,7 +659,10 @@ impl FmIndex {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch(self.cp_occ.as_ptr().add((pos >> CP_SHIFT) as usize) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(
+                self.cp_occ.as_ptr().add((pos >> CP_SHIFT) as usize) as *const i8,
+                _MM_HINT_T0,
+            );
         }
         // No portable prefetch intrinsic: discard the row to silence the unused warning.
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -903,7 +915,6 @@ mod tests {
     }
 }
 
-
 /// `BWA3_TRAFFIC=1`: count the 128-byte cache lines the FM index actually pulls, so the aligner's
 /// DRAM bandwidth can be compared against the fabric ceiling (~293 GB/s random on M4 Max). Atomics
 /// on the hot path: use at `-t1` and read the counts, not the wall clock.
@@ -939,7 +950,9 @@ pub mod traffic {
     ///   by the caller. Used only as the divisor for the GB/s figure, and clamped away from zero.
     ///   The derived rate is per-process, so it is only meaningful for a single-threaded run.
     pub fn dump(wall_s: f64) {
-        if !enabled() { return; }
+        if !enabled() {
+            return;
+        }
         // Snapshot the three counters: ext lines, ext calls, sa-walk lines.
         let (el, ec, sl) = (
             EXT_LINES.load(Ordering::Relaxed),
@@ -952,7 +965,10 @@ pub mod traffic {
             "[traffic] backward_ext: {ec} calls -> {el} lines ({:.2} lines/call)\n\
              [traffic] get_sa walk : {sl} lines\n\
              [traffic] TOTAL {} lines x 128 B = {:.1} GB in {:.2}s = {:.1} GB/s (1 thread)",
-            el as f64 / ec.max(1) as f64, total, total as f64 * 128.0 / 1e9, wall_s,
+            el as f64 / ec.max(1) as f64,
+            total,
+            total as f64 * 128.0 / 1e9,
+            wall_s,
             total as f64 * 128.0 / 1e9 / wall_s.max(1e-9),
         );
     }

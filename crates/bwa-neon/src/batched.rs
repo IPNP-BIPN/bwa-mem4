@@ -433,24 +433,24 @@ fn simd_dispatch(
 
     let a = mat[0] as i32; // match score for the uniform matrix
     let b = -(mat[1] as i32); // mismatch penalty magnitude
-    // How many mismatches an ungapped diagonal can carry and still be provably optimal (see
-    // `ungapped_hit`). The cheapest gapped alternative costs at least `o_min + e_min` and can at
-    // best convert every one of the `X` mismatches into a match, gaining `X * (a + b)`. So the
-    // ungapped walk is safe only while it wins *strictly*: `X * (a + b) < o_min + e_min`. The
-    // largest such X is `(o_min + e_min - 1) / (a + b)` in integer arithmetic.
-    //
-    // Strictness is not pedantry. On an exact tie the gapped path scores the same, and
-    // `ksw_extend2` breaks ties with `if (m > max)` -- whichever cell is reached first keeps the
-    // max -- so the DP can return the gapped CIGAR while this fast path returns the ungapped one.
-    // `-B 2 -E 3` is such a case: 3*(1+2) == 6+3.
-    //
-    // This used to read `o_min / (a + b - e_min)`, which coincides with the correct bound at bwa's
-    // defaults (6/4 = 1, and (6+1-1)/5 = 1) and is too permissive everywhere else: at `-B 3` it
-    // allowed X = 2, but 2*(1+3) = 8 > 6+1, so a single deletion beats that diagonal and the fast
-    // path returned an ungapped alignment where bwa-mem2 emits `4M1D146M`. Defaults are unchanged,
-    // so this costs no fast-path coverage on a stock run.
-    // Cheapest gap the scoring scheme allows: whichever of insertion/deletion opens and extends
-    // more cheaply. Using the minimum is what makes the bound conservative for both gap kinds.
+                              // How many mismatches an ungapped diagonal can carry and still be provably optimal (see
+                              // `ungapped_hit`). The cheapest gapped alternative costs at least `o_min + e_min` and can at
+                              // best convert every one of the `X` mismatches into a match, gaining `X * (a + b)`. So the
+                              // ungapped walk is safe only while it wins *strictly*: `X * (a + b) < o_min + e_min`. The
+                              // largest such X is `(o_min + e_min - 1) / (a + b)` in integer arithmetic.
+                              //
+                              // Strictness is not pedantry. On an exact tie the gapped path scores the same, and
+                              // `ksw_extend2` breaks ties with `if (m > max)` -- whichever cell is reached first keeps the
+                              // max -- so the DP can return the gapped CIGAR while this fast path returns the ungapped one.
+                              // `-B 2 -E 3` is such a case: 3*(1+2) == 6+3.
+                              //
+                              // This used to read `o_min / (a + b - e_min)`, which coincides with the correct bound at bwa's
+                              // defaults (6/4 = 1, and (6+1-1)/5 = 1) and is too permissive everywhere else: at `-B 3` it
+                              // allowed X = 2, but 2*(1+3) = 8 > 6+1, so a single deletion beats that diagonal and the fast
+                              // path returned an ungapped alignment where bwa-mem2 emits `4M1D146M`. Defaults are unchanged,
+                              // so this costs no fast-path coverage on a stock run.
+                              // Cheapest gap the scoring scheme allows: whichever of insertion/deletion opens and extends
+                              // more cheaply. Using the minimum is what makes the bound conservative for both gap kinds.
     let (o_min, e_min) = (o_del.min(o_ins), e_del.min(e_ins));
     // Score swing from turning one mismatch into a match: `+a` gained, `+b` no longer lost. Zero or
     // negative only for a degenerate matrix, which disables the fast path via `x_threshold = -1`.
@@ -594,14 +594,20 @@ fn dispatch_bins(
     };
     run_bin(&u8_idx, &|bin| unsafe {
         // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
-        sw_kernel_u8(bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop)
+        sw_kernel_u8(
+            bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        )
     });
     run_bin(&i16_idx, &|bin| unsafe {
         // SAFETY: neon available; MAX_SEQ_LEN16 bounds keep all values inside i16.
-        sw_kernel_i16(bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop)
+        sw_kernel_i16(
+            bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        )
     });
     run_bin(&sc_idx, &|bin| {
-        batched_extend_scalar(bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop)
+        batched_extend_scalar(
+            bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        )
     });
     out
 }
@@ -1330,11 +1336,11 @@ macro_rules! define_sw_kernel {
                         let sbt_neg = $bsl(is_n, npen_mag_v, $bsl(is_eq, zero_v, mm_mag_v));
 
                         let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
-                        // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
-                        // deletion state ENTERING cell (i, j), so it is indexed (i, j) here and in
-                        // the scalar path. Same convention as the C ("eh[j] = { H(i-1,j-1), E(i,j) }",
-                        // `ksw.cpp:479`); labelling it E(i-1, j) would make the two paths look like
-                        // they hold different values when they hold the same one.
+                                                                     // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
+                                                                     // deletion state ENTERING cell (i, j), so it is indexed (i, j) here and in
+                                                                     // the scalar path. Same convention as the C ("eh[j] = { H(i-1,j-1), E(i,j) }",
+                                                                     // `ksw.cpp:479`); labelling it E(i-1, j) would make the two paths look like
+                                                                     // they hold different values when they hold the same one.
                         let e_v = $lds(eh_e.as_ptr().add(col_base)); // E(i, j)
 
                         // eh_h[j] <- h1 (old) for in-band lanes; out-of-band keep old m_v.
@@ -2039,7 +2045,8 @@ mod neon_verify {
                         h0s[i],
                     );
                     assert_eq!(
-                        *g, expected,
+                        *g,
+                        expected,
                         "NEON {} diverged round {round} job {i} (batch {batch}) qlen={} tlen={}",
                         if big { "i16" } else { "u8" },
                         queries[i].len(),

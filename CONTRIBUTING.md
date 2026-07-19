@@ -9,25 +9,27 @@ started on the NEON backend, but it applies to any contributor. The project docs
 A **from-scratch native Rust reimplementation of bwa-mem2** (indexer included), whose acceptance
 target is **byte-identical output** to the patched bwa-mem2 2.3 oracle: both the index files and the
 SAM. No FFI, no linking the C++; every stage is reimplemented (indexer, FM-index, seeding, chaining,
-banded Smith-Waterman, SE + PE, tags). GPU/SIMD acceleration is deliberately last, so correctness is
-locked first.
+banded Smith-Waterman, SE + PE, tags). SIMD acceleration came after correctness was locked, and a
+GPU backend was tried and removed (see the README: the SW kernel is ~4% of whole-genome runtime).
 
 The oracle is the **patched** Homebrew build: bwa-mem2 `v2.3` at rev `7aa5ff6c` + `fastmap.patch` +
 `bandedSWA.cpp.patch`, built with sse2neon on arm64. All parity claims are against that exact binary.
 
 ## Current status (parity)
 
-Measured on 5000 wgsim read pairs over chr20:2,000,000-4,000,000, `-t1 -K 10000000`:
+Measured on a real 32.9x human WGS (GIAB HG002, 2x150), not simulated reads:
 
-- **Single-end: 5000/5000 SAM lines byte-identical (100%).**
-- **Paired-end: 9999/10000 records byte-identical.** The single residual is a cosmetic `XS` tag
-  (MAPQ unaffected); root cause documented in `DIVERGENCES.md`.
-- **Index: `cmp`-identical** to `bwa-mem2 index` on tiny + chr20 + full chr1 (our own SA-IS, now
-  in-place at ~16 bytes/base so the full 3.1 Gbp genome projects to ~100 GB).
-- **Multithreading (rayon) is byte-identical to `-t1`** at fixed `-K` (only the `@PG` line differs).
+- **Single-end: byte-identical on 353,517,767 records.**
+- **Paired-end: byte-identical on 707,312,349 records.**
+- **Index: `cmp`-identical** to `bwa-mem2 index`, all five files.
+- **Multithreading is byte-identical to `-t1`** at fixed `-K` (only the `@PG` line differs).
+- Speed: SE 2.62x, PE 1.85x at `-t8` on an Apple M4 Max. The ratio decays as `-t` rises, so always
+  quote the thread count.
 
-The hard part (bit-exact seeding, chaining tie-breaks, MAPQ, PE stats) is done. See `DIVERGENCES.md`
-for the diagnostic method: we build a **bit-identical instrumented oracle** and diff internal state.
+Reproduce with `scripts/giab30x_pe.sh`. Simulated reads are NOT sufficient evidence: a wgsim gate
+once scored 5000/5000 while real reads diverged, because the missing pass only mattered inside
+tandem repeats. See `DIVERGENCES.md` for the diagnostic method: we build a **bit-identical
+instrumented oracle** and diff internal state.
 
 ## Architecture
 
@@ -46,7 +48,6 @@ Cargo workspace, one crate per stage (mirrors bwa-mem2):
 | `bwa-sam` | **empty.** Reserved for the above and never filled in; it holds no code and nothing depends on it |
 | `bwa-cli` | the `bwa-mem3` binary (`index` + `mem`) |
 | `bwa-diff` | field-level SAM concordance (`sam-diff`) |
-| `bwa-gpu` | Metal backend for the SW kernel |
 
 For the end-to-end picture (one read's journey, a glossary of every abbreviation, and the rules for
 not breaking parity), read [ARCHITECTURE.md](ARCHITECTURE.md) first.

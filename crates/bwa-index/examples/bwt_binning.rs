@@ -84,7 +84,14 @@ fn pass(fm: &FmIndex, pos: &[i64], c: &[i64; 5]) -> i64 {
             // Synthetic single-row interval anchored at BWT row `p`: `s = 1` means it spans one row,
             // so the extension reads exactly the checkpoint blocks around `p`. `rid`/`m`/`n` are the
             // read id and query span, unused here and left 0.
-            let s = Smem { rid: 0, m: 0, n: 0, k: p, l: c[0], s: 1 };
+            let s = Smem {
+                rid: 0,
+                m: 0,
+                n: 0,
+                k: p,
+                l: c[0],
+                s: 1,
+            };
             // The extending base is derived from `p` itself (`p & 3`, so 0..3 = A/C/G/T) rather than
             // drawn separately: it keeps the pass deterministic and identical between arms, since
             // the base travels with the row through the sort.
@@ -116,19 +123,29 @@ fn bin_sort(pos: &[i64], shift: u32, nbins: usize) -> Vec<i64> {
     // Histogram, offset by one slot: after the two loops below `cnt[b]` is the index in `out` where
     // bin `b` begins (the classic counting-sort prefix-sum layout, which is why it has nbins+1 slots).
     let mut cnt = vec![0u32; nbins + 1];
-    for &p in pos { cnt[(p >> shift) as usize + 1] += 1; }
+    for &p in pos {
+        cnt[(p >> shift) as usize + 1] += 1;
+    }
     // Prefix sum: turns per-bin counts into per-bin start offsets.
-    for i in 0..nbins { cnt[i + 1] += cnt[i]; }
+    for i in 0..nbins {
+        cnt[i + 1] += cnt[i];
+    }
     // Scatter destination. During the loop `cnt[b]` is the write cursor for bin `b` and advances as
     // rows are placed, so on exit it has been consumed up to the start of bin b+1.
     let mut out = vec![0i64; pos.len()];
-    for &p in pos { let b = (p >> shift) as usize; out[cnt[b] as usize] = p; cnt[b] += 1; }
+    for &p in pos {
+        let b = (p >> shift) as usize;
+        out[cnt[b] as usize] = p;
+        cnt[b] += 1;
+    }
     out
 }
 
 fn main() {
     // argv[1]: index prefix (path the index side-files sit next to). No default; operator-supplied.
-    let prefix = std::env::args().nth(1).expect("usage: bwt_binning <index prefix>");
+    let prefix = std::env::args()
+        .nth(1)
+        .expect("usage: bwt_binning <index prefix>");
     let fm = FmIndex::load(std::path::Path::new(&prefix)).expect("load index");
     // C array: c[a] = count of reference bases lexicographically below base `a`, c[4] = total.
     // Passed through to `pass` purely to supply a well-formed `l` field.
@@ -140,8 +157,11 @@ fn main() {
     // 64 BWT rows, hence `(n >> 6) + 1` blocks of 64 B. Reported so the reader can see how the bin
     // widths below compare with the TLB's reach.
     let cp_bytes = ((n >> 6) + 1) as f64 * 64.0;
-    println!("cp_occ spans {:.1} GB = {:.0}k pages of 16 KB (L2 dTLB holds ~3072)\n",
-             cp_bytes / 1073741824.0, cp_bytes / 16384.0 / 1000.0);
+    println!(
+        "cp_occ spans {:.1} GB = {:.0}k pages of 16 KB (L2 dTLB holds ~3072)\n",
+        cp_bytes / 1073741824.0,
+        cp_bytes / 16384.0 / 1000.0
+    );
 
     // 2^12 .. 2^24: from roughly our lockstep window scale up to Zhang's own batch size (2^24
     // computations), so the sweep brackets the published result rather than sampling one point.
@@ -159,14 +179,20 @@ fn main() {
         let mut st = 0x243F6A8885A308D3u64;
         // The workload: `nq` BWT ROW indices drawn uniformly from 0..n. Not reference positions.
         // Generated outside every timed region.
-        let pos: Vec<i64> = (0..nq).map(|_| {
-            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
-            (st % (n as u64)) as i64
-        }).collect();
+        let pos: Vec<i64> = (0..nq)
+            .map(|_| {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                (st % (n as u64)) as i64
+            })
+            .collect();
 
         println!("--- batch N = {nq} ---");
-        println!("  {:>8} {:>7} {:>9} {:>10} {:>11} {:>11} {:>8}",
-                 "bin rows", "bins", "pages/bin", "acc/bin", "random(ns)", "binned(ns)", "speedup");
+        println!(
+            "  {:>8} {:>7} {:>9} {:>10} {:>11} {:>11} {:>8}",
+            "bin rows", "bins", "pages/bin", "acc/bin", "random(ns)", "binned(ns)", "speedup"
+        );
         // Bin widths 2^20 / 2^24 / 2^28 rows = 1 MB / 16 MB / 256 MB of cp_occ: respectively well
         // inside the TLB's reach, around it, and hopelessly past it. Three points is enough to see
         // whether the trend has a knee at all.
@@ -194,7 +220,10 @@ fn main() {
             // (bin order) must be equal, which is the proof that the sort is a pure permutation.
             let w1 = pass(&fm, &pos, &c);
             let w2 = pass(&fm, &binned, &c);
-            assert_eq!(w1, w2, "binning changed the result -- the arms are not equivalent");
+            assert_eq!(
+                w1, w2,
+                "binning changed the result -- the arms are not equivalent"
+            );
 
             // Best of 3, not mean: we want the least-disturbed run. A mean is dragged around by
             // whatever else the OS scheduled, and the question here is about the hardware, not the
@@ -206,20 +235,30 @@ fn main() {
             for _ in 0..3 {
                 // Arm A timed region: `nq` extensions in random row order, nothing else.
                 // `a` is the checksum; `r` is the arm's cost amortized to ns per single extension.
-                let t = Instant::now(); let a = pass(&fm, &pos, &c);
+                let t = Instant::now();
+                let a = pass(&fm, &pos, &c);
                 let r = t.elapsed().as_secs_f64() * 1e9 / nq as f64;
                 // Arm B timed region: the counting sort PLUS the same `nq` extensions. The sort is
                 // deliberately inside the timer, since a real implementation could not avoid it.
                 let t = Instant::now();
-                let bs = bin_sort(&pos, shift, nbins);   // arm B pays its own sort, every rep
+                let bs = bin_sort(&pos, shift, nbins); // arm B pays its own sort, every rep
                 let b2 = pass(&fm, &bs, &c);
                 let b = t.elapsed().as_secs_f64() * 1e9 / nq as f64;
                 // Same multiset extended both ways must give the same order-independent checksum.
                 assert_eq!(a, b2);
-                best_r = best_r.min(r); best_b = best_b.min(b);
+                best_r = best_r.min(r);
+                best_b = best_b.min(b);
             }
-            println!("  {:>8} {:>7} {:>9.0} {:>10.2} {:>11.1} {:>11.1} {:>7.2}x",
-                     format!("2^{shift}"), nbins, pages_per_bin, acc_per_bin, best_r, best_b, best_r / best_b);
+            println!(
+                "  {:>8} {:>7} {:>9.0} {:>10.2} {:>11.1} {:>11.1} {:>7.2}x",
+                format!("2^{shift}"),
+                nbins,
+                pages_per_bin,
+                acc_per_bin,
+                best_r,
+                best_b,
+                best_r / best_b
+            );
         }
         println!();
     }

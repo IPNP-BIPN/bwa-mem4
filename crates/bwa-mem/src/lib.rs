@@ -196,12 +196,14 @@ pub(crate) fn cal_max_gap(opt: &MemOpt, qlen: i32) -> i32 {
     // Longest DELETION (bases missing from the read) whose affine penalty is still repaid by the
     // `qlen * a` this extension could earn. May be negative before the `.max(1)` floor below when
     // `qlen` is small enough that even opening a gap costs more than the whole extension is worth.
-    let max_deletion_len =
-        ((f64::from(qlen) * match_score - f64::from(opt.o_del)) / f64::from(opt.e_del) + 1.0) as i32;
+    let max_deletion_len = ((f64::from(qlen) * match_score - f64::from(opt.o_del))
+        / f64::from(opt.e_del)
+        + 1.0) as i32;
     // Same quantity for an INSERTION (extra bases in the read), which may use different open/extend
     // penalties, hence the separate computation rather than reusing the deletion answer.
-    let max_insertion_len =
-        ((f64::from(qlen) * match_score - f64::from(opt.o_ins)) / f64::from(opt.e_ins) + 1.0) as i32;
+    let max_insertion_len = ((f64::from(qlen) * match_score - f64::from(opt.o_ins))
+        / f64::from(opt.e_ins)
+        + 1.0) as i32;
     // Whichever gap kind can stretch furthest decides the window; floored at 1 so a window is never
     // empty even when neither gap kind pays for itself.
     let max_gap = max_deletion_len.max(max_insertion_len).max(1);
@@ -350,7 +352,17 @@ pub fn mem_chain2aln(
     chain: &MemChain,
     out: &mut Vec<MemAlnReg>,
 ) {
-    mem_chain2aln_meta(fm, bns, opt, codes, 0, chain, out, &mut Vec::new(), &mut Vec::new());
+    mem_chain2aln_meta(
+        fm,
+        bns,
+        opt,
+        codes,
+        0,
+        chain,
+        out,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
 }
 
 /// `mem_chain2aln`, additionally recording each emitted region's [`RegMeta`] so the caller can run
@@ -426,8 +438,7 @@ pub(crate) fn mem_chain2aln_meta(
         // could touch.
         let rightmost_needed = seed.rbeg
             + i64::from(seed.len)
-            + (i64::from(unaligned_suffix_len)
-                + i64::from(cal_max_gap(opt, unaligned_suffix_len)));
+            + (i64::from(unaligned_suffix_len) + i64::from(cal_max_gap(opt, unaligned_suffix_len)));
         rmax0 = rmax0.min(leftmost_needed);
         rmax1 = rmax1.max(rightmost_needed);
     }
@@ -718,7 +729,15 @@ pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec
     let mut preskip = Vec::new();
     for (chain_idx, chain) in chains.iter().enumerate() {
         mem_chain2aln_meta(
-            fm, bns, opt, codes, chain_idx, chain, &mut regs, &mut meta, &mut preskip,
+            fm,
+            bns,
+            opt,
+            codes,
+            chain_idx,
+            chain,
+            &mut regs,
+            &mut meta,
+            &mut preskip,
         );
     }
     // bwa-mem2 purges covered seeds only once every chain of the read has been extended, so this

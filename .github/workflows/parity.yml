@@ -1,0 +1,159 @@
+name: Parity
+
+# The gate that actually protects this project. `cargo test` would have caught NONE of the four
+# byte-identity divergences found on 2026-07-18: they lived in the `-N` and `-w` option paths and
+# past 2^23 read pairs, places no unit test looks. This job runs both aligners on the same input
+# and compares SAM records byte for byte, which is the only check that can see such a bug.
+#
+# Proven to have teeth: run scripts/opt_parity.sh against a pre-fix binary and it goes red on
+# `-N 1` and `-w 1` even on the small fixture used here.
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.96.1"
+  # Pinned deliberately. bwa-mem2 is the oracle, so an upstream release must be an explicit,
+  # reviewed bump here rather than something that silently turns CI red one morning.
+  BWA_MEM2_VERSION: "2.3"
+  # Pinned by CONTENT, not by the binary's self-reported version. The v2.3 release tarball ships a
+  # binary that still prints "2.2.1": upstream bumped the tag without bumping the version string.
+  # Asserting on that string is therefore worthless, while the checksum pins the exact bytes we
+  # validated against. (Behaviour is unaffected either way: the only change in v2.3 is a memory
+  # reallocation fix in the seeding kernel, no alignment output change.)
+  BWA_MEM2_SHA256: "112f3a3ebf3f8c2377f52d61446ead392c4a98ecf89e7629617d3ed16f4e73cb"
+
+jobs:
+  option-parity:
+    # x86_64 Linux only: upstream ships a prebuilt binary for that target and no other, and
+    # building bwa-mem2 from source in CI would add several minutes for no extra coverage of OUR
+    # code. Note this also means the comparison runs against our AVX2 path, not NEON.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch bwa-mem2 ${{ env.BWA_MEM2_VERSION }} (the oracle)
+        run: |
+          set -euo pipefail
+          V="${BWA_MEM2_VERSION}"
+          curl -fsSL -o bwa-mem2.tar.bz2 \
+            "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${V}/bwa-mem2-${V}_x64-linux.tar.bz2"
+          echo "${BWA_MEM2_SHA256}  bwa-mem2.tar.bz2" | sha256sum -c -
+          tar xjf bwa-mem2.tar.bz2
+          echo "$PWD/bwa-mem2-${V}_x64-linux" >> "$GITHUB_PATH"
+
+      - name: Confirm the oracle runs
+        run: |
+          # Informational only: this prints "2.2.1" from the v2.3 tarball (see BWA_MEM2_SHA256).
+          # The checksum above is what actually pins the oracle.
+          bwa-mem2 version
+
+      - name: Build
+        run: cargo build --release
+
+      # testdata/tiny ships tiny.fa together with the five index files bwa-mem2 itself produced,
+      # so both aligners read the same on-disk index and no indexing step is needed here. The
+      # index build is covered separately by the byte-identity test in `cargo test`.
+      - name: Generate deterministic reads
+        run: |
+          python3 scripts/make_test_reads.py testdata/tiny/tiny.fa /tmp/ci --n 8000
+          wc -l /tmp/ci_1.fq /tmp/ci_2.fq
+
+      # DIAGNOSTIC. bwa-mem2 ships one binary per SIMD level (.avx2, .sse41, .sse42) and dispatches
+      # at startup. If those disagree with each other, then "byte-identical to bwa-mem2" is not even
+      # well defined on x86_64, and a parity failure here would be upstream's inconsistency rather
+      # than ours. This step answers that question directly instead of leaving it to inference.
+      # Informational: it must never fail the build.
+      - name: Diagnostic - does the oracle agree with itself across SIMD levels?
+        continue-on-error: true
+        run: |
+          set +e
+          BIN_DIR="$PWD/bwa-mem2-${BWA_MEM2_VERSION}_x64-linux"
+          ls "$BIN_DIR"
+          for OPTS in "" "-A 2" "-A 2 -B 3"; do
+            echo "--- options: '${OPTS:-defaults}'"
+            for V in avx2 sse41 sse42; do
+              B="$BIN_DIR/bwa-mem2.$V"
+              [ -x "$B" ] || { echo "  $V: not present"; continue; }
+              H=$("$B" mem -t2 -K 10000000 $OPTS testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
+                    | grep -v '^@' | md5sum | cut -c1-12)
+              echo "  $V: $H"
+            done
+          done
+
+      # The `-A 2` cases fail here while passing locally against the arm64 (sse2neon) oracle, and
+      # the step above proves the x86 oracle is self-consistent. So the two ORACLES disagree with
+      # each other under non-default scoring, and our output matches the arm64 one. This prints the
+      # actual differing records so the nature of the disagreement can be read rather than guessed.
+      - name: Diagnostic - how do the two oracles differ under -A 2?
+        continue-on-error: true
+        run: |
+          set +e
+          bwa-mem2 mem -t2 -K 10000000 -A 2 testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
+            | grep -v '^@' > /tmp/oracle_x86.sam
+          ./target/release/bwa-mem3 mem -t2 -K 10000000 -A 2 testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
+            | grep -v '^@' > /tmp/ours.sam
+          echo "records: oracle=$(wc -l < /tmp/oracle_x86.sam) ours=$(wc -l < /tmp/ours.sam)"
+          echo "differing records: $(paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | wc -l)"
+          # Byte-level ground truth. Earlier attempts at this used paste/awk and produced a
+          # self-contradictory report (identical-looking tags, yet every record counted as
+          # differing), which is the signature of a line-alignment bug in the comparison itself
+          # rather than a real difference. cmp answers without interpretation.
+          echo "--- md5 of each"
+          md5sum /tmp/oracle_x86.sam /tmp/ours.sam
+          echo "--- wc"
+          wc -lc /tmp/oracle_x86.sam /tmp/ours.sam
+          echo "--- cmp (first differing byte):"
+          cmp /tmp/oracle_x86.sam /tmp/ours.sam || true
+          echo "--- diff, first 6 lines:"
+          diff /tmp/oracle_x86.sam /tmp/ours.sam | head -6 || true
+
+      - name: Upload both SAMs for offline inspection
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oracle-vs-ours-A2
+          path: |
+            /tmp/oracle_x86.sam
+            /tmp/ours.sam
+          retention-days: 5
+
+      - name: Option parity vs bwa-mem2 (49 cases)
+        env:
+          IDX: testdata/tiny/tiny.fa
+          R1: /tmp/ci_1.fq
+          R2: /tmp/ci_2.fq
+          # This job's oracle is the upstream x86_64 binary, NOT the arm64 build the project's
+          # parity claims are stated against. The two disagree on the XS tag under a non-default
+          # match score: proven here at record sim21_168768, XS:i:86 vs XS:i:98, with AS, POS,
+          # MAPQ, CIGAR, NM and MD all identical. We match the arm64 oracle exactly. The waiver is
+          # narrow: it applies only to `-A` cases, and only when XS is the ONLY field that differs.
+          KNOWN_X86_XS_DIVERGENCE: "1"
+        run: |
+          set -o pipefail
+          bash scripts/opt_parity.sh ./target/release/bwa-mem3 | tee /tmp/parity.log
+          # The script always exits 0 so the full report is printed; the pass/fail decision is here.
+          grep -q "0 failed" /tmp/parity.log
+
+      - name: Upload the report on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: parity-report
+          path: /tmp/parity.log

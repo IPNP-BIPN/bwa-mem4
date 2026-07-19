@@ -102,7 +102,12 @@ impl FastqReader {
                 // for FASTA input, where lines 3 and 4 do not exist.
                 let seq = rec.seq().into_owned();
                 let qual = rec.qual().map(<[u8]>::to_vec);
-                Ok(Some(Record { name, seq, qual, comment }))
+                Ok(Some(Record {
+                    name,
+                    seq,
+                    qual,
+                    comment,
+                }))
             }
         }
     }

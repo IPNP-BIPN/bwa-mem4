@@ -11,3 +11,6 @@ repository.workspace = true
 bwa-core = { workspace = true }
 rayon = { workspace = true }
 memmap2 = { workspace = true }
+
+[lints]
+workspace = true

@@ -406,9 +406,9 @@ pub(crate) fn gen_cigar2(
     // Captures `is_forward_strand`; used for both mismatch letters and deleted-base runs.
     let base_char = |code: u8| -> char {
         let alphabet = if is_forward_strand {
-            [b'A', b'C', b'G', b'T', b'N']
+            *b"ACGTN"
         } else {
-            [b'T', b'G', b'C', b'A', b'N']
+            *b"TGCAN"
         };
         // `.min(4)`: pac codes above 3 (ambiguous bases) all collapse onto N.
         alphabet[code.min(4) as usize] as char
@@ -560,7 +560,10 @@ pub fn reg2aln(
     }
 
     if band_width_trace_enabled() {
-        eprintln!("* Band width: inferred={w2}, cmd_opt={}, alnreg={}", opt.w, reg.w);
+        eprintln!(
+            "* Band width: inferred={w2}, cmd_opt={}, alnreg={}",
+            opt.w, reg.w
+        );
     }
 
     // -------------------------------------------------------------------------------------
@@ -610,7 +613,10 @@ pub fn reg2aln(
         // can hold.
         .expect("gen_cigar2");
         if band_width_trace_enabled() {
-            eprintln!("* Final alignment: w2={w2}, global_sc={sc}, local_sc={}", reg.truesc);
+            eprintln!(
+                "* Final alignment: w2={w2}, global_sc={sc}, local_sc={}",
+                reg.truesc
+            );
         }
         // Early exits (bwamem.cpp:1763). `sc == last_sc` means doubling the band bought nothing, so
         // the score gap is genuine rather than a banding artifact; `w2 == opt.w << 2` means we are

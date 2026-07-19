@@ -99,7 +99,10 @@ mod tests {
         // On the CI/dev host this must return a sane figure (>= 1 GB, < 100 TB).
         if let Some(total_bytes) = total_ram_bytes() {
             assert!(total_bytes >= 1 << 30, "implausibly small: {total_bytes}");
-            assert!(total_bytes < (100u64 << 40), "implausibly large: {total_bytes}");
+            assert!(
+                total_bytes < (100u64 << 40),
+                "implausibly large: {total_bytes}"
+            );
         }
         // A 1 TB index never fits a normal host; a 1 GB index fits any host with detectable RAM.
         assert!(!learned_index_fits(1000.0));

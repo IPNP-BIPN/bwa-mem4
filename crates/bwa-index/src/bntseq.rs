@@ -203,8 +203,7 @@ impl BntSeq {
         let contig = &self.contigs[rid as usize];
         // The seed's contig span as a half-open interval, currently in FORWARD space:
         // `[offset, offset + len)`.
-        let (mut far_beg, mut far_end) =
-            (contig.offset, contig.offset + i64::from(contig.len));
+        let (mut far_beg, mut far_end) = (contig.offset, contig.offset + i64::from(contig.len));
         if is_rev {
             // Save the forward start before overwriting `far_beg`, because the mirrored END is
             // computed from it: reflection swaps the two endpoints.

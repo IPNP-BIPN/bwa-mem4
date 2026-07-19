@@ -54,7 +54,9 @@ const QLEN: usize = 32;
 const W: usize = 16; // lockstep width, same as our production seeding
 
 /// Timer start, wrapped only so the timed regions below read uniformly.
-fn now() -> Instant { Instant::now() }
+fn now() -> Instant {
+    Instant::now()
+}
 
 /// Extend `s` by base `a` on the RIGHT. Our `backward_ext` only goes left, but the index is
 /// bidirectional (FMD): swapping `k` and `l` puts the interval on the reverse-complement strand,
@@ -80,11 +82,35 @@ fn fwd_ext(fm: &FmIndex, s: Smem, a: usize) -> Smem {
     e
 }
 
+/// Prefetch one cache line for load, portably.
+///
+/// The whole point of this benchmark is measuring what prefetching buys, so this cannot be a no-op
+/// on either architecture. `prfm pldl1keep` (AArch64) and `_mm_prefetch(_MM_HINT_T0)` (x86_64) are
+/// the same request: fetch into L1 and keep it. Anything else is a no-op so the example still
+/// builds, it just stops measuring what it claims to.
+///
+/// # Safety
+/// `p` must be a valid address to read from. A prefetch of a bad address is architecturally
+/// harmless, but forming the pointer is not.
+#[inline(always)]
+unsafe fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    #[cfg(target_arch = "x86_64")]
+    std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     // argv[1]: index prefix. argv[2]: path to the flat suffix array dump described in the header.
-    let prefix = args.next().expect("usage: star_vs_fm <index prefix> <flat sa>");
-    let sa_path = args.next().expect("usage: star_vs_fm <index prefix> <flat sa>");
+    let prefix = args
+        .next()
+        .expect("usage: star_vs_fm <index prefix> <flat sa>");
+    let sa_path = args
+        .next()
+        .expect("usage: star_vs_fm <index prefix> <flat sa>");
     let fm = FmIndex::load(std::path::Path::new(&prefix)).expect("load index");
     // The FMD reference as one base per byte, values 0..=3 for A/C/G/T and >= 4 for N. Indexed by
     // reference POSITION (forward strand then reverse complement). Arm B reads it to compare
@@ -123,17 +149,32 @@ fn main() {
     // lexicographic order of the d-mer (so index = the d-mer read as a base-4 number). Grows x4 per
     // level and ends at 4^K entries.
     let mut level: Vec<Smem> = (0..4)
-        .map(|a| Smem { rid: 0, m: 0, n: 0, k: c[a], l: c[3 - a], s: c[a + 1] - c[a] })
+        .map(|a| Smem {
+            rid: 0,
+            m: 0,
+            n: 0,
+            k: c[a],
+            l: c[3 - a],
+            s: c[a + 1] - c[a],
+        })
         .collect();
     for d in 1..K {
         // Next frontier, built by appending each of the 4 bases to every node, in base order, which
         // is what preserves the base-4 index property stated above.
         let mut next = Vec::with_capacity(level.len() * 4);
         for node in &level {
-            for a in 0..4 { next.push(fwd_ext(&fm, *node, a)); }
+            for a in 0..4 {
+                next.push(fwd_ext(&fm, *node, a));
+            }
         }
         level = next;
-        eprint!("\r  building {}-mer table: depth {}/{} ({} nodes)   ", K, d + 1, K, level.len());
+        eprint!(
+            "\r  building {}-mer table: depth {}/{} ({} nodes)   ",
+            K,
+            d + 1,
+            K,
+            level.len()
+        );
     }
     eprintln!();
     // The finished prefix table, indexed by the K-mer as a base-4 number. Each entry is
@@ -144,8 +185,13 @@ fn main() {
     // it is the statistic the header warns against: it is dominated by the many rare K-mers, whereas
     // a real query hits an occurrence-weighted range (measured a few blocks below).
     let mean_s: f64 = table.iter().map(|e| e.1 as f64).sum::<f64>() / table.len() as f64;
-    println!("built 4^{K} = {} entries in {:.1}s; mean SA range = {:.1} rows -> ~{:.1} probes/search",
-             table.len(), t.elapsed().as_secs_f64(), mean_s, 2.0 * mean_s.log2());
+    println!(
+        "built 4^{K} = {} entries in {:.1}s; mean SA range = {:.1} rows -> ~{:.1} probes/search",
+        table.len(),
+        t.elapsed().as_secs_f64(),
+        mean_s,
+        2.0 * mean_s.log2()
+    );
 
     // Queries: real 32-mers taken from random genome positions (so every one exists).
     // Synthetic random 32-mers would almost all be absent, and an absent key ends both searches early
@@ -162,7 +208,9 @@ fn main() {
     // The query set: NQ genuine QLEN-mers cut from the reference, each guaranteed N-free.
     let mut queries: Vec<[u8; QLEN]> = Vec::with_capacity(NQ);
     while queries.len() < NQ {
-        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
         // Candidate start, a reference POSITION. The modulus reserves QLEN+1 bases of headroom so
         // the whole k-mer lies inside the reference.
         let p = (st % (n as u64 - QLEN as u64 - 1)) as usize;
@@ -171,10 +219,15 @@ fn main() {
         let mut ok = true;
         for i in 0..QLEN {
             let b = refseq[p + i];
-            if b >= 4 { ok = false; break; }
+            if b >= 4 {
+                ok = false;
+                break;
+            }
             q[i] = b;
         }
-        if ok { queries.push(q); }
+        if ok {
+            queries.push(q);
+        }
     }
     println!("{NQ} real {QLEN}-mers from the genome\n");
 
@@ -186,11 +239,16 @@ fn main() {
     // bases, i.e. how wide arm B's binary search starts. `idx` is the K-mer packed as a base-4
     // number, 2 bits per base, matching the table's construction order. Sorted ascending in place so
     // the percentile picks below are valid.
-    let mut ranges: Vec<i64> = queries.iter().map(|q| {
-        let mut idx = 0usize;
-        for b in 0..K { idx = (idx << 2) | q[b] as usize; }
-        table[idx].1
-    }).collect();
+    let mut ranges: Vec<i64> = queries
+        .iter()
+        .map(|q| {
+            let mut idx = 0usize;
+            for b in 0..K {
+                idx = (idx << 2) | q[b] as usize;
+            }
+            table[idx].1
+        })
+        .collect();
     ranges.sort_unstable();
     // Percentile picker over the sorted `ranges`: `f` in 0.0..=1.0 (0.5 = median), returns the range
     // size in rows at that quantile. Nearest-rank, no interpolation, which is fine at NQ = 200k.
@@ -200,19 +258,32 @@ fn main() {
     // `2 * log2(range)` probe-count model.
     let wmean: f64 = ranges.iter().map(|&r| r as f64).sum::<f64>() / ranges.len() as f64;
     println!("SA range actually hit by a read (occurrence-weighted over {NQ} real {K}-mers):");
-    println!("  table average : {:>12.1} rows  -> {:>5.1} probes", mean_s, 2.0 * mean_s.log2());
-    println!("  weighted mean : {:>12.1} rows  -> {:>5.1} probes", wmean, 2.0 * wmean.max(1.0).log2());
+    println!(
+        "  table average : {:>12.1} rows  -> {:>5.1} probes",
+        mean_s,
+        2.0 * mean_s.log2()
+    );
+    println!(
+        "  weighted mean : {:>12.1} rows  -> {:>5.1} probes",
+        wmean,
+        2.0 * wmean.max(1.0).log2()
+    );
     println!("  median        : {:>12} rows", pick(0.5));
     println!("  p90 / p99     : {:>12} / {} rows", pick(0.90), pick(0.99));
-    println!("  max           : {:>12} rows  -> {:.1} probes", ranges[ranges.len()-1],
-             2.0 * (ranges[ranges.len()-1].max(1) as f64).log2());
+    println!(
+        "  max           : {:>12} rows  -> {:.1} probes",
+        ranges[ranges.len() - 1],
+        2.0 * (ranges[ranges.len() - 1].max(1) as f64).log2()
+    );
     println!();
     // Everything above is cheap and is the part worth having; the timing below needs the flat SA
     // (49.6 GB) resident alongside the table (4.3 GB) and the index, and on a host that cannot hold
     // that it measures swap, not algorithms. Opt in explicitly rather than silently reporting garbage.
     if std::env::var_os("STAR_VS_FM_TIME").is_none() {
-        println!("(timing skipped: the flat SA + table + index need ~70 GB and this host thrashes.\n \
-                  set STAR_VS_FM_TIME=1 to run it anyway)");
+        println!(
+            "(timing skipped: the flat SA + table + index need ~70 GB and this host thrashes.\n \
+                  set STAR_VS_FM_TIME=1 to run it anyway)"
+        );
         return;
     }
 
@@ -230,14 +301,29 @@ fn main() {
         // The lockstep window's live state: one bi-interval per query in this chunk, all seeded from
         // the query's FIRST base. Invariant at the top of the `j` loop: every `s[i]` is the
         // bi-interval of `chunk[i][0..j]`, so all slots are at the same depth (that is the lockstep).
-        let mut s: Vec<Smem> = chunk.iter()
-            .map(|q| { let a = q[0] as usize; Smem { rid: 0, m: 0, n: 0, k: c[a], l: c[3-a], s: c[a+1]-c[a] } })
+        let mut s: Vec<Smem> = chunk
+            .iter()
+            .map(|q| {
+                let a = q[0] as usize;
+                Smem {
+                    rid: 0,
+                    m: 0,
+                    n: 0,
+                    k: c[a],
+                    l: c[3 - a],
+                    s: c[a + 1] - c[a],
+                }
+            })
             .collect();
         for j in 1..QLEN {
             // Prefetch on `l`, not `k`: `fwd_ext` swaps the two before calling `backward_ext`, so the
             // blocks the next round actually touches are those under the reverse-strand start.
-            for x in &s { fm.prefetch_occ(x.l, x.l + x.s); }
-            for (i, x) in s.iter_mut().enumerate() { *x = fwd_ext(&fm, *x, chunk[i][j] as usize); }
+            for x in &s {
+                fm.prefetch_occ(x.l, x.l + x.s);
+            }
+            for (i, x) in s.iter_mut().enumerate() {
+                *x = fwd_ext(&fm, *x, chunk[i][j] as usize);
+            }
         }
         out_a.extend_from_slice(&s);
     }
@@ -259,12 +345,16 @@ fn main() {
         // Half-open SA ROW range per slot. Initially the K-mer's range straight from the table; after
         // the two bound passes, `lo[i]` is the first row matching the full QLEN-mer and `hi[i]` is
         // one past the last. Fixed W-sized arrays so they live in registers/stack, never the heap.
-        let mut lo = [0i64; W]; let mut hi = [0i64; W];
+        let mut lo = [0i64; W];
+        let mut hi = [0i64; W];
         for i in 0..m {
             let mut idx = 0usize;
-            for b in 0..K { idx = (idx << 2) | chunk[i][b] as usize; }
+            for b in 0..K {
+                idx = (idx << 2) | chunk[i][b] as usize;
+            }
             let (k, s) = table[idx];
-            lo[i] = k; hi[i] = k + s;
+            lo[i] = k;
+            hi[i] = k + s;
         }
         // Two lockstep binary searches (lower then upper bound) over the remaining QLEN-K bases.
         // Two passes rather than one because the answer is a RANGE: the SA rows matching the full
@@ -290,10 +380,17 @@ fn main() {
                 // which is why every consumer re-tests `l[i] < h[i]`.
                 let mut mid = [0i64; W];
                 for i in 0..m {
-                    if l[i] < h[i] { mid[i] = (l[i] + h[i]) / 2; any = true;
-                        unsafe { std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) sa.as_ptr().add(mid[i] as usize), options(nostack, readonly, preserves_flags)); } }
+                    if l[i] < h[i] {
+                        mid[i] = (l[i] + h[i]) / 2;
+                        any = true;
+                        unsafe {
+                            prefetch(sa.as_ptr().add(mid[i] as usize) as *const u8);
+                        }
+                    }
                 }
-                if !any { break; }
+                if !any {
+                    break;
+                }
                 // Second, DEPENDENT access: `sa[mid]` had to arrive before the reference address is
                 // known. This is the pessimistic (non-co-located) variant from the header: 2 rounds
                 // per probe. BWA-MEME's 13-byte pos+key record collapses it to 1, at 81 GB.
@@ -301,12 +398,20 @@ fn main() {
                 // row-space to position-space conversion; everything after it indexes `refseq`.
                 let mut pos = [0i64; W];
                 for i in 0..m {
-                    if l[i] < h[i] { pos[i] = sa[mid[i] as usize];
+                    if l[i] < h[i] {
+                        pos[i] = sa[mid[i] as usize];
                         let r = (pos[i] + K as i64) as usize;
-                        if r < refseq.len() { unsafe { std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) refseq.as_ptr().add(r), options(nostack, readonly, preserves_flags)); } } }
+                        if r < refseq.len() {
+                            unsafe {
+                                prefetch(refseq.as_ptr().add(r));
+                            }
+                        }
+                    }
                 }
                 for i in 0..m {
-                    if l[i] >= h[i] { continue; }
+                    if l[i] >= h[i] {
+                        continue;
+                    }
                     // Compare the reference suffix at sa[mid] against the query beyond the table's K bases.
                     // Only bases K..QLEN are compared: rows in this range already agree on the first K
                     // by construction of the table.
@@ -320,18 +425,41 @@ fn main() {
                         // `rp`: reference POSITION of the b-th base of the probed suffix.
                         // `rb`: that base, 0..=3, or the sentinel 4 when the suffix runs off the end.
                         let rp = pos[i] + b as i64;
-                        let rb = if (rp as usize) < refseq.len() { refseq[rp as usize] } else { 4 };
-                        if rb != chunk[i][b] { less = rb < chunk[i][b]; break; }
-                        if b == QLEN - 1 { less = bound == 1; } // ties go left for lower, right for upper
+                        let rb = if (rp as usize) < refseq.len() {
+                            refseq[rp as usize]
+                        } else {
+                            4
+                        };
+                        if rb != chunk[i][b] {
+                            less = rb < chunk[i][b];
+                            break;
+                        }
+                        if b == QLEN - 1 {
+                            less = bound == 1;
+                        } // ties go left for lower, right for upper
                     }
-                    if less { l[i] = mid[i] + 1; } else { h[i] = mid[i]; }
+                    if less {
+                        l[i] = mid[i] + 1;
+                    } else {
+                        h[i] = mid[i];
+                    }
                 }
             }
             // On convergence `l[i] == h[i]` is the boundary row. Pass 0 writes it back as the new
             // `lo` (first matching row), pass 1 as the new `hi` (one past the last).
-            if bound == 0 { for i in 0..m { lo[i] = l[i]; } } else { for i in 0..m { hi[i] = l[i]; } }
+            if bound == 0 {
+                for i in 0..m {
+                    lo[i] = l[i];
+                }
+            } else {
+                for i in 0..m {
+                    hi[i] = l[i];
+                }
+            }
         }
-        for i in 0..m { out_b.push((lo[i], hi[i] - lo[i])); }
+        for i in 0..m {
+            out_b.push((lo[i], hi[i] - lo[i]));
+        }
     }
     // Arm B total wall time in SECONDS for all NQ queries. The timed region covers the table lookups,
     // both binary-search passes and the suffix comparisons. It excludes building the table, which is
@@ -345,15 +473,37 @@ fn main() {
     let mut bad = 0;
     for i in 0..NQ {
         if out_a[i].k != out_b[i].0 || out_a[i].s != out_b[i].1 {
-            if bad < 3 { eprintln!("  MISMATCH q{i}: FM (k={}, s={}) vs STAR (k={}, s={})",
-                                   out_a[i].k, out_a[i].s, out_b[i].0, out_b[i].1); }
+            if bad < 3 {
+                eprintln!(
+                    "  MISMATCH q{i}: FM (k={}, s={}) vs STAR (k={}, s={})",
+                    out_a[i].k, out_a[i].s, out_b[i].0, out_b[i].1
+                );
+            }
             bad += 1;
         }
     }
     println!("{:<34} {:>9} {:>14}", "", "wall(s)", "ns/query");
-    println!("{:<34} {:>9.3} {:>14.0}", "A: FM fwd extension (lockstep W=16)", ta, ta * 1e9 / NQ as f64);
-    println!("{:<34} {:>9.3} {:>14.0}", "B: STAR table + binary search", tb, tb * 1e9 / NQ as f64);
+    println!(
+        "{:<34} {:>9.3} {:>14.0}",
+        "A: FM fwd extension (lockstep W=16)",
+        ta,
+        ta * 1e9 / NQ as f64
+    );
+    println!(
+        "{:<34} {:>9.3} {:>14.0}",
+        "B: STAR table + binary search",
+        tb,
+        tb * 1e9 / NQ as f64
+    );
     println!("\nB vs A: {:.2}x", ta / tb);
-    println!("agreement: {} / {} queries {}", NQ - bad, NQ,
-             if bad == 0 { "IDENTICAL" } else { "*** MISMATCHED -- arm B is wrong, the timing is meaningless ***" });
+    println!(
+        "agreement: {} / {} queries {}",
+        NQ - bad,
+        NQ,
+        if bad == 0 {
+            "IDENTICAL"
+        } else {
+            "*** MISMATCHED -- arm B is wrong, the timing is meaningless ***"
+        }
+    );
 }

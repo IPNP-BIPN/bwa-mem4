@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Matches rust-toolchain.toml. Cargo.toml declares rust-version = "1.96" as the MSRV.
+  RUST_TOOLCHAIN: "1.96.1"
+
+jobs:
+  build-test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 exercises the AVX2 kernels, which no developer machine here runs: this repo is
+          # developed on Apple Silicon, so without a Linux runner the AVX2 path ships untested.
+          - os: ubuntu-22.04
+            target_id: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target_id: linux-aarch64
+          # macOS is where the NEON kernels are compiled and where development happens.
+          - os: macos-14
+            target_id: macos-arm64
+          # macos-15-intel, not macos-13: the macOS 13 runners are being retired and jobs sit
+          # queued indefinitely rather than failing, which looks like a hang. This is the label
+          # COMBINE-lab/salmon uses for Intel macOS.
+          - os: macos-15-intel
+            target_id: macos-x86_64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # `-D warnings` is meaningful because Cargo.toml carries an explicit allow-list of the lints
+      # the tree does not yet satisfy. A NEW lint of any other kind fails the build.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --workspace --release
+
+      # Includes the index byte-identity test, which rebuilds the index for testdata/tiny and
+      # compares all five files against the bwa-mem2 output committed alongside it.
+      - name: Test (release)
+        run: cargo test --workspace --release

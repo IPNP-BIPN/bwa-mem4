@@ -35,7 +35,9 @@ use std::time::Instant;
 fn main() {
     // argv[1]: the index PREFIX, i.e. the path the index side-files sit next to (typically the FASTA
     // path itself). Supplied by the operator on the command line; no default, we abort if absent.
-    let prefix = std::env::args().nth(1).expect("usage: sa_batch_bench <index prefix>");
+    let prefix = std::env::args()
+        .nth(1)
+        .expect("usage: sa_batch_bench <index prefix>");
     // The loaded FM index. `load` mmaps `<prefix>.bwt.2bit.64` (BWT + checkpointed occurrence table
     // + the 1-in-8 sampled suffix array) and `<prefix>.0123` (the 2-bit forward+RC reference).
     // Owned for the whole run; every timed call below borrows it.
@@ -64,7 +66,9 @@ fn main() {
     // once, outside every timed region, and reused verbatim by every chunk size.
     let positions: Vec<i64> = (0..TOTAL)
         .map(|_| {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             (s % (n as u64)) as i64
         })
         .collect();
@@ -79,7 +83,10 @@ fn main() {
     // to reach its sustained clock, while costing a tenth of one sweep row. The result is discarded.
     fm.get_sa_batch(&positions[..200_000], &mut out[..200_000]);
 
-    println!("\n{:<12} {:>12} {:>14} {:>10}", "chunk", "wall(s)", "ns/lookup", "vs 42");
+    println!(
+        "\n{:<12} {:>12} {:>14} {:>10}",
+        "chunk", "wall(s)", "ns/lookup", "vs 42"
+    );
     // ns/lookup of the chunk=42 row, i.e. the production caller's cost. Set on the first iteration
     // and read by every later one as the denominator of the `vs 42` column. The 0.0 initializer is
     // never observed, because 42 is the first element of the sweep array below.
@@ -104,10 +111,20 @@ fn main() {
         // the ~28 ns dependent-miss floor.
         let secs = t.elapsed().as_secs_f64();
         let ns = secs * 1e9 / TOTAL as f64;
-        if chunk == 42 { base = ns; }
-        println!("{:<12} {:>12.3} {:>14.1} {:>9.2}x",
-                 if chunk == TOTAL { "ALL".to_string() } else { chunk.to_string() },
-                 secs, ns, base / ns);
+        if chunk == 42 {
+            base = ns;
+        }
+        println!(
+            "{:<12} {:>12.3} {:>14.1} {:>9.2}x",
+            if chunk == TOTAL {
+                "ALL".to_string()
+            } else {
+                chunk.to_string()
+            },
+            secs,
+            ns,
+            base / ns
+        );
     }
     // get_sa_batch has no unit test, and it carries a lockstep walk plus a deferred-read pipeline.
     // Gate it against the per-position reference on real genome-scale positions.
@@ -120,12 +137,19 @@ fn main() {
     for (i, &p) in positions.iter().enumerate() {
         if batched[i] != fm.get_sa(p) {
             if bad < 3 {
-                eprintln!("  MISMATCH at pos {p}: batch={} vs get_sa={}", batched[i], fm.get_sa(p));
+                eprintln!(
+                    "  MISMATCH at pos {p}: batch={} vs get_sa={}",
+                    batched[i],
+                    fm.get_sa(p)
+                );
             }
             bad += 1;
         }
     }
-    assert_eq!(bad, 0, "get_sa_batch disagrees with get_sa on {bad}/{TOTAL} positions");
+    assert_eq!(
+        bad, 0,
+        "get_sa_batch disagrees with get_sa on {bad}/{TOTAL} positions"
+    );
     println!("\nget_sa_batch == per-position get_sa on {TOTAL} genome positions: OK");
 
     // Prove the arms agree: same values regardless of chunking (byte-identity of the lever).
@@ -144,6 +168,9 @@ fn main() {
         let hi = (c + 42).min(TOTAL);
         fm.get_sa_batch(&positions[c..hi], &mut chunked[c..hi]);
     }
-    assert_eq!(ref_out, chunked, "chunking changed a value -- the lever is NOT byte-identical");
+    assert_eq!(
+        ref_out, chunked,
+        "chunking changed a value -- the lever is NOT byte-identical"
+    );
     println!("\nvalues identical across chunk sizes: OK ({TOTAL} lookups)");
 }

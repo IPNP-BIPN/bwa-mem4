@@ -161,7 +161,11 @@ impl KbTree {
     /// A tree for which `lower` always yields `None` and `in_order` an empty vector.
     pub(crate) fn new() -> Self {
         KbTree {
-            nodes: vec![Node { is_internal: false, keys: Vec::new(), ptrs: Vec::new() }],
+            nodes: vec![Node {
+                is_internal: false,
+                keys: Vec::new(),
+                ptrs: Vec::new(),
+            }],
             root: 0,
         }
     }
@@ -255,7 +259,11 @@ impl KbTree {
         };
         // Node id of the fresh right-hand sibling, allocated at the end of the arena.
         let z = self.nodes.len();
-        self.nodes.push(Node { is_internal: z_internal, keys: z_keys, ptrs: z_ptrs });
+        self.nodes.push(Node {
+            is_internal: z_internal,
+            keys: z_keys,
+            ptrs: z_ptrs,
+        });
         let parent = &mut self.nodes[x];
         parent.ptrs.insert(i + 1, z);
         parent.keys.insert(i, median);

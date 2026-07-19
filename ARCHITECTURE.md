@@ -173,7 +173,7 @@ formulation subtracts from `h` (`ksw.cpp:168`). So the rescue SW really does ope
 here, and "fixing" it would change rescue scores and break byte-identity. Each kernel mirrors its
 own original, and neither convention is the right one.
 
-Section 6 tells the rest of this story: this exact distinction was violated in the Metal shader and
+Section 6 tells the rest of this story: this exact distinction was violated in a GPU shader backend and
 the acceptance gate was structurally unable to see it.
 
 ### The general shape
@@ -489,7 +489,6 @@ table (nothing depends on something listed above it, except `bwa-cli` which depe
 | `bwa-chain` | Greedy seed chaining, chain weighting and filtering; the ported klib `kbtree` and the ported unstable `ks_introsort` (used repo-wide) | `bwa-core`, `bwa-index`, `bwa-seed` |
 | `bwa-extend` | The scalar Smith-Waterman kernels: `ksw_extend2` (banded local extension), `ksw_global2` (banded global, for CIGARs), `ksw_align2` / `ksw_local_fwd` (mate rescue). Defines the `SwBackend` trait and the two acceptance harnesses that every accelerated backend must pass | nothing |
 | `bwa-neon` | Vectorized backends, NEON on AArch64 and AVX2 on x86_64. `batched.rs` bins jobs by provable score bound into u8 (16/32 lane) and i16 (8/16 lane) kernels with a scalar fallback, plus an ungapped fast path; `matesw.rs` does the same for mate-rescue local SW. Note the single-alignment `extend` deliberately delegates to scalar: one alignment has no lanes to fill | `bwa-extend` |
-| `bwa-gpu` | Metal (Apple GPU) `SwBackend`, macOS only. Optional, off by default | `bwa-extend`, `metal` |
 | `bwa-mem` | The alignment core and pipeline glue: extension driver (`lib.rs`, `across.rs`), dedup / primary marking / MAPQ (`primary.rs`), CIGAR / NM / MD (`cigar.rs`), all paired-end logic (`pe.rs`), `XA` generation (`alt.rs`) | `bwa-core`, `bwa-index`, `bwa-seed`, `bwa-chain`, `bwa-extend`, `bwa-neon` |
 | `bwa-cli` | The `bwa-mem3` binary: `index` and `mem` subcommands, option parsing and validation (`cmd_mem.rs`, 1484 lines, half of it per-option documentation), the threaded read/process/write pipeline | most of the above, `clap`, `rayon`, `bgzf`, `mimalloc` |
 | `bwa-diff` | The `sam-diff` binary: field-level SAM concordance reporting, so a divergence reads as "37 records differ in XA" rather than as a byte offset. Deliberately lossy (five fields, primaries only, order-insensitive), so a clean report is **not** proof of parity | `serde`, `serde_json` |
@@ -687,11 +686,11 @@ backend acceptance gate originally pinned scoring to bwa's defaults, `(a,b) = (1
 so the E/F recurrence's gap-open source is nearly unobservable. A backend opening gaps from
 `H = max(M, E, F)` instead of from `M` therefore passed all 2000 cases while being wrong.
 
-That is exactly what had happened. The Metal shader in `bwa-gpu` kept `h - oe_del` after the CPU
+That is exactly what had happened. A Metal shader backend (since removed) kept `h - oe_del` after the CPU
 paths were corrected, and nothing caught it, because the gate was *structurally incapable* of
 generating a case that could distinguish the two. Widening the sweep over
 `(a, b, o_del, e_del, o_ins, e_ins)` exposed it immediately. The corrected shader now carries a
-comment at `crates/bwa-gpu/src/lib.rs:225` headed "THE BUG THAT LIVED HERE", telling the story at
+comment headed "THE BUG THAT LIVED HERE", which went with it, told the story at
 the site, so nobody simplifies those two lines back.
 
 Note the shape of the failure: the gate was not weak, it was *blind on an axis*. A gate can run
@@ -781,13 +780,11 @@ are worth knowing: sequences are uniform random DNA at most 60 bases, whereas re
 and contain satellite repeats, which is the other regime where the H-versus-M distinction bites. And
 both gates draw bases with `next() % 4`, so code 4 (`N`) never appears and the ambiguity row of the
 scoring matrix is never exercised, even though real reads do contain `N`. A GPU or SIMD backend
-should therefore also run a read-sized gate; `bwa-neon` and `bwa-gpu` each have one
+should therefore also run a read-sized gate; `bwa-neon` has one
 (`neon_batch_matches_scalar_read_sized`, `metal_matches_scalar_read_sized`).
 
 Backends additionally guard against passing *vacuously*, which is a real hazard here because every
 accelerated path falls back to scalar when it cannot run:
-- `bwa-gpu`'s `kernel_probe::sw_extend_pso_builds` asserts the Metal pipeline actually compiles. The
-  shader is a runtime-compiled string literal, so `cargo build` checks nothing: a syntax error in it
   would make every byte-identity gate in that crate pass without the GPU ever running.
 - `bwa-neon`'s `neon_verify` and `avx2_verify` modules call the SIMD kernels **directly**, bypassing
   runtime feature detection. The AVX2 one exists because Rosetta reports

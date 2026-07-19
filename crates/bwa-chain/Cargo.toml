@@ -11,3 +11,6 @@ repository.workspace = true
 bwa-core = { workspace = true }
 bwa-index = { workspace = true }
 bwa-seed = { workspace = true }
+
+[lints]
+workspace = true
