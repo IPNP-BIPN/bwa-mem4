@@ -111,17 +111,28 @@ jobs:
             | grep -v '^@' > /tmp/ours.sam
           echo "records: oracle=$(wc -l < /tmp/oracle_x86.sam) ours=$(wc -l < /tmp/ours.sam)"
           echo "differing records: $(paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | wc -l)"
-          echo "--- which FIELDS differ (column numbers, 1=QNAME 2=FLAG 3=RNAME 4=POS 5=MAPQ 6=CIGAR 12+=tags):"
-          paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' \
-            | head -2000 | awk -F'\001' '{split($1,a,"\t"); split($2,b,"\t");
-                for (i=1;i<=length(a);i++) if (a[i]!=b[i]) print i}' | sort -n | uniq -c
-          echo "--- first 3 differing records, oracle then ours:"
-          paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | head -3 \
+          # Print the TAG columns (12 onward). The previous version cut to fields 1-9, which is
+          # precisely where the two agree, so it showed identical lines and proved nothing.
+          echo "--- first 4 differing records: fields 1-9 then the tags"
+          paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | head -4 \
             | while IFS= read -r line; do
-                echo "  ORACLE: $(printf '%s' "$line" | cut -d$'\001' -f1 | cut -f1-9)"
-                echo "  OURS  : $(printf '%s' "$line" | cut -d$'\001' -f2 | cut -f1-9)"
+                O=$(printf '%s' "$line" | cut -d$'\001' -f1)
+                U=$(printf '%s' "$line" | cut -d$'\001' -f2)
+                echo "  core oracle: $(printf '%s' "$O" | cut -f1-9)"
+                echo "  core ours  : $(printf '%s' "$U" | cut -f1-9)"
+                echo "  tags oracle: $(printf '%s' "$O" | cut -f12-)"
+                echo "  tags ours  : $(printf '%s' "$U" | cut -f12-)"
+                echo "  seq equal? $([ "$(printf '%s' "$O" | cut -f10)" = "$(printf '%s' "$U" | cut -f10)" ] && echo yes || echo NO)"
                 echo
               done
+          # Which tag names carry a different value. `length(array)` is gawk-only and Ubuntu ships
+          # mawk, which is why the previous field-index loop printed nothing at all.
+          echo "--- differing tag names, counted over the whole file:"
+          paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' \
+            | awk -F'\001' '{
+                n=split($1,a,"\t"); m=split($2,b,"\t");
+                for (i=12;i<=n && i<=m;i++) { split(a[i],x,":"); if (a[i]!=b[i]) print x[1] }
+              }' | sort | uniq -c | sort -rn
 
       - name: Option parity vs bwa-mem2 (49 cases)
         env:
