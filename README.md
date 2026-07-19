@@ -26,11 +26,15 @@ Workspace Cargo de crates `bwa-*` (une par étage du pipeline). Binaire : `bwa-m
 | `bwa-seed` | Seeding SMEM (FM-index) |
 | `bwa-chain` | Chaînage des graines |
 | `bwa-extend` | Extension Smith-Waterman bandée (scalaire ; trait `SwBackend`) |
-| `bwa-sam` | Marquage primaire, MAPQ, CIGAR, tags |
-| `bwa-mem` | Glue du pipeline (SE + PE) |
+| `bwa-neon` | Kernels SW vectorisés NEON (batchés, et rescue de mate) |
+| `bwa-mem` | Cœur de l'alignement : extension, dedup, marquage primaire, MAPQ, CIGAR, tags, PE |
+| `bwa-sam` | **Vide.** Réservée puis jamais remplie ; le travail est dans `bwa-mem` et `bwa-io` |
 | `bwa-cli` | Binaire `bwa-mem3` |
 | `bwa-diff` | Concordance SAM (`sam-diff`) |
 | `bwa-gpu` | Backend GPU Metal du SW (phase finale) |
+
+Pour une vue d'ensemble détaillée (le parcours d'un read de bout en bout, un glossaire de tous les
+sigles, et comment travailler sur ce code sans casser la parité), voir [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Développement
 
