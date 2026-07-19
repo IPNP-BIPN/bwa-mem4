@@ -41,10 +41,20 @@ Cargo workspace, one crate per stage (mirrors bwa-mem2):
 | `bwa-seed` | SMEM collection + 3-round reseeding |
 | `bwa-chain` | chaining, `mem_chain_flt` (incl. the ported unstable `ks_introsort`) |
 | **`bwa-extend`** | **banded Smith-Waterman (`ksw_extend2`), the `SwBackend` trait, z-drop** |
-| `bwa-sam` / `bwa-mem` | primary marking, MAPQ, CIGAR, tags, PE (`mem_pestat`/`mem_matesw`/`mem_pair`), pipeline glue |
+| `bwa-neon` | NEON SIMD SW kernels: batched cross-read extension, and the mate-rescue kernel |
+| `bwa-mem` | primary marking, MAPQ, CIGAR, tags, PE (`mem_pestat`/`mem_matesw`/`mem_pair`), pipeline glue |
+| `bwa-sam` | **empty.** Reserved for the above and never filled in; it holds no code and nothing depends on it |
 | `bwa-cli` | the `bwa-mem3` binary (`index` + `mem`) |
 | `bwa-diff` | field-level SAM concordance (`sam-diff`) |
-| `bwa-gpu` | placeholder for the Metal backend (phase 9b) |
+| `bwa-gpu` | Metal backend for the SW kernel |
+
+For the end-to-end picture (one read's journey, a glossary of every abbreviation, and the rules for
+not breaking parity), read [ARCHITECTURE.md](ARCHITECTURE.md) first.
+
+**Before ANY differential run, `cargo build --release`.** `cargo test --release` does not relink
+`target/release/bwa-mem3`, because nothing in the test tree depends on the bin target. A comparison
+run against a stale binary silently measures the old code, which has already cost real debugging
+time here: a verified fix appeared to change nothing.
 
 ## Where the NEON work plugs in (phase 9a)
 
