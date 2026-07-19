@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@master
@@ -75,6 +75,28 @@ jobs:
           python3 scripts/make_test_reads.py testdata/tiny/tiny.fa /tmp/ci --n 8000
           wc -l /tmp/ci_1.fq /tmp/ci_2.fq
 
+      # DIAGNOSTIC. bwa-mem2 ships one binary per SIMD level (.avx2, .sse41, .sse42) and dispatches
+      # at startup. If those disagree with each other, then "byte-identical to bwa-mem2" is not even
+      # well defined on x86_64, and a parity failure here would be upstream's inconsistency rather
+      # than ours. This step answers that question directly instead of leaving it to inference.
+      # Informational: it must never fail the build.
+      - name: Diagnostic - does the oracle agree with itself across SIMD levels?
+        continue-on-error: true
+        run: |
+          set +e
+          BIN_DIR="$PWD/bwa-mem2-${BWA_MEM2_VERSION}_x64-linux"
+          ls "$BIN_DIR"
+          for OPTS in "" "-A 2" "-A 2 -B 3"; do
+            echo "--- options: '${OPTS:-defaults}'"
+            for V in avx2 sse41 sse42; do
+              B="$BIN_DIR/bwa-mem2.$V"
+              [ -x "$B" ] || { echo "  $V: not present"; continue; }
+              H=$("$B" mem -t2 -K 10000000 $OPTS testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
+                    | grep -v '^@' | md5sum | cut -c1-12)
+              echo "  $V: $H"
+            done
+          done
+
       - name: Option parity vs bwa-mem2 (49 cases)
         env:
           IDX: testdata/tiny/tiny.fa
@@ -88,7 +110,7 @@ jobs:
 
       - name: Upload the report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: parity-report
           path: /tmp/parity.log

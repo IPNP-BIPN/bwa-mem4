@@ -857,57 +857,18 @@ fn extract_group(
         let best_te = te[l];
         // No alignment found at all (te still -1) means there is no query end to report either.
         let best_qe = if best_te >= 0 { qe[l] } else { -1 };
-        // score2: rebuild ksw_local_fwd's `b` list (row-maxes >= minsc, consecutive rows merged
-        // keeping the higher AND advancing the column only on an update), then take the best entry
-        // whose column lies outside [te - w, te + w].
-        let mut score2 = -1i32;
-        let mut te2 = -1i32;
-        // ksw's `b` array: surviving `(row max score, target row)` candidates in increasing row
-        // order, runs of consecutive rows already merged. Never longer than the number of rows.
-        let mut b: Vec<(i32, i32)> = Vec::new();
+        // score2: feed this lane's row maxima to ksw's `b` tracker, then take the best candidate
+        // outside the exclusion window around `te`. The tracker is shared with the scalar
+        // `ksw_local_fwd` precisely so the merge rule and the window cannot drift between them.
+        let mut b = SuboptimalTracker::new();
         if limit[l] >= 0 {
             for i in 0..=limit[l] {
-                // Best H anywhere in target row `i` for this lane.
-                let row_max = rowmax[i as usize * lanes + l];
-                if row_max >= minsc[l] {
-                    match b.last() {
-                        // Row `i` directly follows the last entry's row: same alignment drifting, so
-                        // merge rather than append. bwa keeps the higher score AND moves the stored
-                        // row to `i` in the same step (`ksw.cpp:201`), which is why the row is only
-                        // advanced inside the `<` branch. Advancing it unconditionally would look
-                        // harmless and would change which entries the window below excludes.
-                        // `col` is the last entry's stored *row*, despite the name kept from the C.
-                        Some(&(_, col)) if col + 1 == i => {
-                            if b.last().unwrap().0 < row_max {
-                                *b.last_mut().unwrap() = (row_max, i);
-                            }
-                        }
-                        // A gap in rows: a genuinely separate candidate (`ksw.cpp:195-200`).
-                        _ => b.push((row_max, i)),
-                    }
-                }
+                // Best H anywhere in target row `i` for this lane. Rows past `limit[l]` were never
+                // processed by this lane, so they are not offered as candidates.
+                b.push_row(i, rowmax[i as usize * lanes + l], minsc[l]);
             }
         }
-        if best_score > 0 && !b.is_empty() {
-            // ceil(score / max_sc) = the fewest columns an alignment scoring `score` can span, since
-            // no cell contributes more than `max_sc`. Any candidate whose row lies within that many
-            // rows of `te` could be the same alignment ending early or late, so it is excluded from
-            // the 2nd-best search rather than counted as a rival (`ksw.cpp:221-222`).
-            let exclusion_half_width = (best_score + max_sc - 1) / max_sc;
-            // Inclusive band of target rows around `te` treated as "the same alignment"; candidates
-            // inside it are ignored. May go negative or past the last row, which is harmless.
-            let (low, high) = (
-                best_te - exclusion_half_width,
-                best_te + exclusion_half_width,
-            );
-            // `cand_score` is a surviving row max in score units and `cand_te` its target row.
-            for &(cand_score, cand_te) in &b {
-                if (cand_te < low || cand_te > high) && cand_score > score2 {
-                    score2 = cand_score;
-                    te2 = cand_te;
-                }
-            }
-        }
+        let (score2, te2) = b.finish(best_score, best_te, max_sc);
         out[group_idx * lanes + l] = (best_score, best_te, best_qe, score2, te2);
     }
 }

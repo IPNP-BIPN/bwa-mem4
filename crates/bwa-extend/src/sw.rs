@@ -742,6 +742,84 @@ pub struct KswAlignResult {
     pub te2: i32,
 }
 
+/// ksw's suboptimal-alignment tracker: the `b` array of `KSW_XSUBO` plus the exclusion-window scan
+/// that turns it into `(score2, te2)`.
+///
+/// This exists as a shared type because the same logic is needed twice, from two crates: once by the
+/// scalar [`ksw_local_fwd`] below, and once per lane by the batched NEON kernels in `bwa-neon`, which
+/// derive `score2` from an SoA row-max buffer instead of a running scalar. Both must agree to the
+/// byte, and the two rules that make that non-obvious (the merge advances the stored row only when
+/// the score improves; `score2` defaults to `-1` rather than `0`) had already been duplicated once.
+/// Keeping one copy is the point of the type.
+///
+/// Callers push row maxima in increasing row order and then call [`Self::finish`]. Rows a lane never
+/// processed (an `endsc` early stop) are simply not pushed.
+#[derive(Debug, Default, Clone)]
+pub struct SuboptimalTracker {
+    /// Surviving `(row max score, target row)` candidates in increasing row order, runs of
+    /// consecutive rows already merged. Never longer than the number of rows.
+    b: Vec<(i32, i32)>,
+}
+
+impl SuboptimalTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record target row `row`'s maximum H. Below `minsc` the row is not a candidate at all
+    /// (`KSW_XSUBO`); pass `minsc = i32::MAX` to suppress tracking, as the reverse pass does.
+    ///
+    /// Adjacent rows are *merged* (keep the higher) rather than appended, so one alignment's plateau
+    /// across several target end positions counts once instead of dominating the array
+    /// (`ksw.cpp:194-202`).
+    pub fn push_row(&mut self, row: i32, row_max: i32, minsc: i32) {
+        if row_max < minsc {
+            return;
+        }
+        match self.b.last() {
+            // Row `row` directly follows the last entry's row: same alignment drifting, so merge
+            // rather than append. bwa keeps the higher score AND moves the stored row in the same
+            // step (`ksw.cpp:201`), which is why the row is only advanced inside the `<` branch.
+            // Advancing it unconditionally would look harmless and would change which entries the
+            // exclusion window below rejects.
+            Some(&(_, last_row)) if last_row + 1 == row => {
+                if self.b.last().unwrap().0 < row_max {
+                    *self.b.last_mut().unwrap() = (row_max, row);
+                }
+            }
+            // A gap in rows: a genuinely separate candidate (`ksw.cpp:195-200`).
+            _ => self.b.push((row_max, row)),
+        }
+    }
+
+    /// Best candidate lying outside the exclusion window around `te`, as `(score2, te2)`.
+    ///
+    /// Both are `-1` when nothing qualifies, **not** `0`: ksw returns
+    /// `g_defr = {0, -1, -1, -1, -1, -1, -1}` in that case and `mem_matesw` copies it straight into
+    /// `csub`. The sign is observable downstream, since `mem_sam_pe` caps MAPQ with
+    /// `raw_mapq(score - csub, a)`, so `csub = -1` yields `score + 1` where `0` yields `score`.
+    pub fn finish(&self, gmax: i32, te: i32, max_sc: i32) -> (i32, i32) {
+        let mut score2 = -1i32;
+        let mut te2 = -1i32;
+        if gmax > 0 && !self.b.is_empty() {
+            // ceil(gmax / max_sc): the fewest columns an alignment scoring `gmax` can span, since no
+            // single cell contributes more than `max_sc`. Any candidate whose row lies within that
+            // many rows of `te` could be the same alignment ending slightly early or late, so it is
+            // excluded rather than counted as a rival (`ksw.cpp:221-227`). The band may run negative
+            // or past the last row, which is harmless.
+            let exclusion_half_width = (gmax + max_sc - 1) / max_sc;
+            let (low, high) = (te - exclusion_half_width, te + exclusion_half_width);
+            for &(cand_score, cand_te) in &self.b {
+                if (cand_te < low || cand_te > high) && cand_score > score2 {
+                    score2 = cand_score;
+                    te2 = cand_te;
+                }
+            }
+        }
+        (score2, te2)
+    }
+}
+
 /// Forward local-SW pass returning `(score, te, qe, score2, te2)` (no start coords). This is the
 /// per-lane semantics a batched/vectorized mate-rescue kernel must reproduce: [`ksw_align2`] is just
 /// this forward pass plus a second, reversed forward pass to recover `qb`/`tb` (`KSW_XSTART`).
@@ -847,8 +925,9 @@ pub fn ksw_local_fwd(
                                          // recovered after the loop.
     let mut gmax = 0i32;
     let mut te = -1i32;
-    // Suboptimal tracker `b`: (column max score, column), consecutive columns merged (keep higher).
-    let mut b: Vec<(i32, i32)> = Vec::new();
+    // Suboptimal tracker: row maxima >= `minsc`, consecutive rows merged. Shared with the batched
+    // NEON kernels so the merge rule and the exclusion window cannot drift between the two.
+    let mut b = SuboptimalTracker::new();
 
     // ===========================================================================================
     // Main DP. Reminder: H = best score ending at this cell, E = with a deletion (gap in query)
@@ -919,19 +998,9 @@ pub fn ksw_local_fwd(
             f = f_new.max(0);
             h_diag = h_prev[j];
         }
-        // Record this row's max in the suboptimal tracker. Adjacent rows are *merged* (keep the
-        // higher) rather than appended, so one alignment's plateau across several target end
-        // positions counts once instead of dominating the `b` array (`ksw.cpp:194-202`).
-        if imax >= minsc {
-            match b.last() {
-                Some(&(_, col)) if col + 1 == i as i32 => {
-                    if b.last().unwrap().0 < imax {
-                        *b.last_mut().unwrap() = (imax, i as i32);
-                    }
-                }
-                _ => b.push((imax, i as i32)),
-            }
-        }
+        // Record this row's max in the suboptimal tracker (see `SuboptimalTracker::push_row` for the
+        // merge rule this encodes).
+        b.push_row(i as i32, imax, minsc);
         // Strict `>`: the first target row attaining the maximum wins, later ties do not displace it.
         // Snapshot the whole H row, because `qe` is recovered later by re-scanning the winning row
         // (the C keeps the same snapshot in its `Hmax` vector, `ksw.cpp:203-208`).
@@ -969,26 +1038,8 @@ pub fn ksw_local_fwd(
         }
     }
 
-    // 2nd-best score: best `b` entry whose column lies outside [te - w, te + w], w = ceil(score/max).
-    // Starts at -1, not 0: ksw returns `g_defr = {0, -1, -1, -1, -1, -1, -1}` when nothing qualifies,
-    // and mem_matesw copies it straight into `csub`. The sign matters downstream -- mem_sam_pe caps
-    // MAPQ with `raw_mapq(score - csub, a)`, so csub = -1 yields score+1 where 0 yields score.
-    let mut score2 = -1i32;
-    let mut te2 = -1i32;
-    if gmax > 0 && !b.is_empty() {
-        // ceil(gmax / max_sc): the minimum number of columns an alignment scoring `gmax` must span,
-        // since no single cell can contribute more than `max_sc`. Any row max whose target end lies
-        // within that many positions of `te` could be the same alignment ending slightly early or
-        // late, so it is excluded rather than counted as a rival (`ksw.cpp:221-227`).
-        let exclusion_half_width = (gmax + max_sc - 1) / max_sc;
-        let (low, high) = (te - exclusion_half_width, te + exclusion_half_width);
-        for &(cand_score, cand_te) in &b {
-            if (cand_te < low || cand_te > high) && cand_score > score2 {
-                score2 = cand_score;
-                te2 = cand_te;
-            }
-        }
-    }
+    // 2nd-best score: best `b` entry whose row lies outside the exclusion window around `te`.
+    let (score2, te2) = b.finish(gmax, te, max_sc);
     (gmax, te, qe, score2, te2)
 }
 

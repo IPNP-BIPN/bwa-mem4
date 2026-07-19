@@ -29,14 +29,13 @@ jobs:
             target_id: linux-x86_64
           - os: ubuntu-24.04-arm
             target_id: linux-aarch64
-          # macOS is where the NEON kernels and the Metal backend are compiled. bwa-gpu is a
-          # target_os = "macos" dependency, so it is simply absent from the Linux builds.
+          # macOS is where the NEON kernels are compiled and where development happens.
           - os: macos-14
             target_id: macos-arm64
           - os: macos-13
             target_id: macos-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@master
