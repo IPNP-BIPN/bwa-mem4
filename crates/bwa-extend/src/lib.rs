@@ -449,7 +449,9 @@ pub fn assert_backend_batch_matches_scalar<B: SwBackend>(backend: &B) {
                 (0..tlen).map(|_| (next_random() % 4) as u8).collect()
             })
             .collect();
-        let h0s: Vec<i32> = (0..batch_size).map(|_| 1 + (next_random() % 20) as i32).collect();
+        let h0s: Vec<i32> = (0..batch_size)
+            .map(|_| 1 + (next_random() % 20) as i32)
+            .collect();
 
         // The batch handed to the backend: job k borrows queries[k]/targets[k] and carries h0s[k].
         let jobs: Vec<ExtendJob> = (0..batch_size)

@@ -116,9 +116,10 @@ mod metal_ctx {
                 // Look the kernel up by its MSL name and link it into a pipeline state object once.
                 // `None` here (missing function, or linking failure) is not fatal: it leaves
                 // `sw_extend: None` and every batch falls back to the scalar backend.
-                let sw_extend = library.get_function("sw_extend", None).ok().and_then(|f| {
-                    device.new_compute_pipeline_state_with_function(&f).ok()
-                });
+                let sw_extend = library
+                    .get_function("sw_extend", None)
+                    .ok()
+                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok());
                 Some(MetalCtx {
                     device,
                     queue,

@@ -588,7 +588,14 @@ pub fn align_reads_batched<B: SwBackend>(
         for sm in &per_read_smems {
             eprintln!("SMEM tot={}", sm.len());
             for p in sm {
-                eprintln!("  smem q[{},{}) len={} s={} k={}", p.m, p.n + 1, p.n + 1 - p.m, p.s, p.k);
+                eprintln!(
+                    "  smem q[{},{}) len={} s={} k={}",
+                    p.m,
+                    p.n + 1,
+                    p.n + 1 - p.m,
+                    p.s,
+                    p.k
+                );
             }
         }
     }
@@ -858,7 +865,11 @@ pub fn align_reads_batched<B: SwBackend>(
                     // Keep the slot, skip the DP: the discard pass would purge this seed anyway
                     // (its container is a longer same-diagonal seed, extended earlier).
                     reg_chain[r].push(ci);
-                    reg_meta[r].push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+                    reg_meta[r].push(RegMeta {
+                        chain: ci as u32,
+                        pos: pos as u32,
+                        seed: si as u32,
+                    });
                     reg_preskip[r].push(true);
                     // A placeholder region, born purged. Bounds are `-1` (the discard pass's
                     // tombstone) rather than `H0_SENTINEL`, so the seedcov pass skips it, the
@@ -994,7 +1005,11 @@ pub fn align_reads_batched<B: SwBackend>(
                 // Push metadata and region together, in lockstep, so the four per-read vectors stay
                 // index-aligned. `discard_contained` relies on that alignment.
                 reg_chain[r].push(ci);
-                reg_meta[r].push(RegMeta { chain: ci as u32, pos: pos as u32, seed: si as u32 });
+                reg_meta[r].push(RegMeta {
+                    chain: ci as u32,
+                    pos: pos as u32,
+                    seed: si as u32,
+                });
                 reg_preskip[r].push(false);
                 regs[r].push(reg);
             }
@@ -1360,8 +1375,8 @@ mod tests {
         let mut reads: Vec<Vec<u8>> = Vec::new();
         for _ in 0..400 {
             let len = 60 + (next() % 120) as i64; // 60..180
-            // Reference offset the read is copied from. `.max(1)` keeps the modulus positive on a
-            // reference barely longer than the read.
+                                                  // Reference offset the read is copied from. `.max(1)` keeps the modulus positive on a
+                                                  // reference barely longer than the read.
             let start = (next() as i64) % (l_ref - len - 1).max(1);
             // The read under construction: an exact copy of the reference slice, perturbed below.
             let mut r: Vec<u8> = (0..len).map(|i| fm.base(start + i)).collect();

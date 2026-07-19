@@ -143,7 +143,11 @@ fn kmer_key(ref_seq: &[u8], pos: i64) -> u64 {
         // `2*K` bits wide and keys are directly comparable as integers.
         // `idx` is an absolute reference position: the `r`-th base of the suffix starting at `p`.
         let idx = p + r;
-        let c = if idx < len { (ref_seq[idx] & 3) as u64 } else { 0 };
+        let c = if idx < len {
+            (ref_seq[idx] & 3) as u64
+        } else {
+            0
+        };
         key = (key << 2) | c;
     }
     key
@@ -298,7 +302,11 @@ impl LearnedSa {
     ///   `debug_assert`ed: a wrong SA silently produces wrong intervals.
     /// * `n_leaves`: RMI leaf count, forwarded to [`Rmi::build`].
     pub fn from_sa(ref_seq: Vec<u8>, sa: Vec<i64>, n_leaves: usize) -> Self {
-        debug_assert_eq!(sa.len(), ref_seq.len() + 1, "sa must include the sentinel row");
+        debug_assert_eq!(
+            sa.len(),
+            ref_seq.len() + 1,
+            "sa must include the sentinel row"
+        );
         // Pack the SA to 5 bytes and drop the i64 array; then compute the keys **directly** into a
         // 5-byte packed array (no intermediate `Vec<u64>`), so the peak is `packed_sa + packed_keys`
         // (~62 GB at genome scale) rather than three full copies.
@@ -466,11 +474,14 @@ impl LearnedSa {
         // over the sorted rows (Less..., then Equal..., then Greater...), which is what
         // `seeded_partition_point` requires:
         // lower bound: first row whose suffix is NOT < pattern.
-        let lo = seeded_partition_point(n, hint, |i| self.cmp_key(i, pkey, pattern) == Ordering::Less);
+        let lo = seeded_partition_point(n, hint, |i| {
+            self.cmp_key(i, pkey, pattern) == Ordering::Less
+        });
         // upper bound: first row whose suffix is > pattern (prefix comparison). Note `!= Greater`
         // keeps both Less and Equal on the true side, so `hi` lands just past the Equal block.
-        let hi =
-            seeded_partition_point(n, hint, |i| self.cmp_key(i, pkey, pattern) != Ordering::Greater);
+        let hi = seeded_partition_point(n, hint, |i| {
+            self.cmp_key(i, pkey, pattern) != Ordering::Greater
+        });
         (lo, hi)
     }
 
@@ -553,7 +564,7 @@ impl LearnedSa {
                 // character in column `depth` of that suffix.
                 let idx = p as usize + depth;
                 match self.ref_seq.get(idx) {
-                    None => true,          // shorter suffix: sorts before any character
+                    None => true, // shorter suffix: sorts before any character
                     Some(&ch) => ch < c,
                 }
             });
@@ -605,8 +616,9 @@ impl LearnedSa {
         // ROW where the full pattern would be inserted. Not necessarily an occurrence: when the
         // pattern is absent this is simply where it would go, which is exactly what the LCP trick
         // below needs.
-        let lo_full =
-            seeded_partition_point(n, hint, |i| self.cmp_key(i, pkey, pattern) == Ordering::Less);
+        let lo_full = seeded_partition_point(n, hint, |i| {
+            self.cmp_key(i, pkey, pattern) == Ordering::Less
+        });
         let ref_len = self.ref_seq.len();
         // Longest common prefix of `pattern` and the suffix at `row`, bounded by both the pattern
         // length and the reference end. Plain byte loop: it runs at most twice per `lem` call, so
@@ -617,7 +629,8 @@ impl LearnedSa {
             let start = self.sa.get(row) as usize;
             // Bases matched so far; on exit it is the LCP length.
             let mut l = 0usize;
-            while l < pattern.len() && start + l < ref_len && self.ref_seq[start + l] == pattern[l] {
+            while l < pattern.len() && start + l < ref_len && self.ref_seq[start + l] == pattern[l]
+            {
                 l += 1;
             }
             l
@@ -647,7 +660,9 @@ impl LearnedSa {
         let lo = if best == pattern.len() {
             lo_full
         } else {
-            seeded_partition_point(n, lo_full, |i| self.cmp_key(i, bkey, best_pat) == Ordering::Less)
+            seeded_partition_point(n, lo_full, |i| {
+                self.cmp_key(i, bkey, best_pat) == Ordering::Less
+            })
         };
         let hi = seeded_partition_point(n, lo_full, |i| {
             self.cmp_key(i, bkey, best_pat) != Ordering::Greater
@@ -787,7 +802,9 @@ mod tests {
     /// The top 31 bits of the new state (`>> 33`), because an LCG's low bits have short periods.
     /// Callers reduce it modulo the range they want.
     fn lcg(seed: &mut u64) -> u64 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *seed >> 33
     }
 
@@ -798,9 +815,7 @@ mod tests {
         for trial in 0..12 {
             let len = 200 + (lcg(&mut seed) as usize % 2000);
             let alpha = if trial % 3 == 0 { 2 } else { 4 }; // sometimes only {A,C} -> many repeats
-            let ref_seq: Vec<u8> = (0..len)
-                .map(|_| (lcg(&mut seed) % alpha) as u8)
-                .collect();
+            let ref_seq: Vec<u8> = (0..len).map(|_| (lcg(&mut seed) % alpha) as u8).collect();
             let lsa = LearnedSa::build(ref_seq.clone(), 256);
 
             // Probe patterns: random substrings of the reference (guaranteed to occur) of varied
@@ -866,7 +881,11 @@ mod tests {
 
             let (lo, hi) = lsa.exact_interval(pat);
             assert_eq!(sm.k, lo as i64, "k mismatch, pattern@{start} len {mlen}");
-            assert_eq!(sm.s, (hi - lo) as i64, "s mismatch, pattern@{start} len {mlen}");
+            assert_eq!(
+                sm.s,
+                (hi - lo) as i64,
+                "s mismatch, pattern@{start} len {mlen}"
+            );
 
             let rc = revcomp(pat);
             let (rlo, rhi) = lsa.exact_interval(&rc);

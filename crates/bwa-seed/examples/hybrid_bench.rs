@@ -93,12 +93,18 @@ fn main() {
     let (prefix, reads_path, sa_path) = (&a[1], a[2].as_str(), a[3].as_str());
     // Batch size in READS (env NREADS, default 50_000). Sets how much work each timed call does;
     // both arms always get the identical batch, so it does not bias the ratio.
-    let nreads: usize = std::env::var("NREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(50_000);
+    let nreads: usize = std::env::var("NREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
     // Number of leaves in the learned suffix-array model (env LEAVES, default 2^22 = 4.19M). This is
     // the hybrid arm's accuracy/memory knob: more leaves means a tighter predicted position range,
     // so a shorter last-mile scan, but more RAM and a longer build. It affects the hybrid arm's
     // SPEED only; the SMEMs it returns must be identical either way, which the diff check verifies.
-    let leaves: usize = std::env::var("LEAVES").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 22);
+    let leaves: usize = std::env::var("LEAVES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1 << 22);
     // Alignment parameters at their BWA-MEM defaults. Only the seeding-related fields matter here
     // (minimum seed length, re-seed ratio); both arms are handed the same struct.
     let opt = MemOpt::default();
@@ -124,7 +130,10 @@ fn main() {
     // The learned suffix-array model that replaces FM round 1 in the hybrid arm. Consumes `refseq`
     // and `sa`, which is why both are unavailable afterwards.
     let lsa = LearnedSa::from_sa(refseq, sa, leaves);
-    eprintln!("LearnedSa (packed) built in {:.0}s", tb.elapsed().as_secs_f64());
+    eprintln!(
+        "LearnedSa (packed) built in {:.0}s",
+        tb.elapsed().as_secs_f64()
+    );
 
     // Timing harness. `label` is the printed row name; `f` is the arm under test, taken as a `&dyn
     // Fn` so both arms share one code path and neither gets inlined differently from the other.
@@ -174,11 +183,16 @@ fn main() {
         .zip(&hy_smems)
         .filter(|(f, h)| key(f) != key(h))
         .count();
-    eprintln!("SMEM-set diffs (FM vs hybrid): {diffs} / {} reads", reads.len());
+    eprintln!(
+        "SMEM-set diffs (FM vs hybrid): {diffs} / {} reads",
+        reads.len()
+    );
 
     // Median seconds per full-batch seeding pass for each arm. FM is timed first; there is no
     // interleaving, so slow host drift over the run would bias the hybrid arm.
-    let t_fm = time("FM   seeding", &|| bwa_seed::mem_collect_smem_batched(&fm, &refs, &opt));
+    let t_fm = time("FM   seeding", &|| {
+        bwa_seed::mem_collect_smem_batched(&fm, &refs, &opt)
+    });
     let t_hy = time("hybrid seeding", &|| {
         bwa_seed::mem_collect_smem_hybrid(&fm, &lsa, &refs, &opt)
     });

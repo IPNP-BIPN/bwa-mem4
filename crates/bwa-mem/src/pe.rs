@@ -858,7 +858,11 @@ pub fn batch_mate_rescue(
             // at `max_matesw`; taking `anchor_cap` during the filter is the same set because the
             // vector is
             // already sorted score-descending, so the near-best regions are a prefix.
-            regs.iter().filter(|r| r.score >= best - pen).take(anchor_cap).cloned().collect()
+            regs.iter()
+                .filter(|r| r.score >= best - pen)
+                .take(anchor_cap)
+                .cloned()
+                .collect()
         };
         // `b0`/`b1`: this pair's read-1 and read-2 anchors (bwa's `b[0]`/`b[1]`). Cloned, not
         // borrowed, because the arrays they came from are about to be mutated by rescue.
@@ -888,7 +892,9 @@ pub fn batch_mate_rescue(
                 } else {
                     (p.seq0, p.a0)
                 };
-                if let Some(call) = matesw_collect(fm, bns, opt, pes, &anchor_list[round], ms, target) {
+                if let Some(call) =
+                    matesw_collect(fm, bns, opt, pes, &anchor_list[round], ms, target)
+                {
                     calls.push((pi, dir, call));
                 }
             }
@@ -917,8 +923,15 @@ pub fn batch_mate_rescue(
         // tests; it has not been re-derived here.
         // `alns`: one result per job, index-aligned with `jobs`.
         let alns = batched_ksw_align2(
-            &jobs, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins,
-            opt.min_seed_len * opt.a, opt.a,
+            &jobs,
+            5,
+            &opt.mat,
+            opt.o_del,
+            opt.e_del,
+            opt.o_ins,
+            opt.e_ins,
+            opt.min_seed_len * opt.a,
+            opt.a,
         );
         for (idx, (pi, dir, call)) in calls.iter().enumerate() {
             let (start, count) = spans[idx];
@@ -1202,9 +1215,7 @@ pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4
     // ---- step 3: fail any orientation dwarfed by the dominant one ----
     let max_dir_count = insert_sizes.iter().map(Vec::len).max().unwrap_or(0);
     for d in 0..4 {
-        if !pes[d].failed
-            && (insert_sizes[d].len() as f64) < max_dir_count as f64 * MIN_DIR_RATIO
-        {
+        if !pes[d].failed && (insert_sizes[d].len() as f64) < max_dir_count as f64 * MIN_DIR_RATIO {
             pes[d].failed = true;
         }
     }
@@ -1999,7 +2010,10 @@ pub fn mem_sam_pe<W: Write>(
             let Some(best) = regs.first().map(|r| r.score) else {
                 return Vec::new();
             };
-            regs.iter().filter(|r| r.score >= best - pen).cloned().collect()
+            regs.iter()
+                .filter(|r| r.score >= best - pen)
+                .cloned()
+                .collect()
         };
         // `b0`/`b1`: each end's anchors (bwa's `b[0]`/`b[1]`), snapshotted BEFORE any rescue so a
         // region added by rescue can never itself become an anchor.

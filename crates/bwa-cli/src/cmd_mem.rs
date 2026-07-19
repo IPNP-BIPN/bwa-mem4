@@ -725,7 +725,11 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
         // same getopt branch (`fastmap.cpp:719-723`), so they can never drift apart.
         opt.mapq_coef_len = f64::from(v);
         // bwa: `mapQ_coef_fac = len > 0 ? log(len) : 0`, stored in an int (so truncated).
-        opt.mapq_coef_fac = if v > 0 { f64::from(v).ln().trunc() } else { 0.0 };
+        opt.mapq_coef_fac = if v > 0 {
+            f64::from(v).ln().trunc()
+        } else {
+            0.0
+        };
     }
 
     // ---- Scoring scalars. `a` is the match reward, `b` the mismatch penalty (positive
@@ -1087,8 +1091,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Currently EMPTY: every option this port accepts is now honoured. The machinery is kept
     // because it is the place to re-add an entry the moment a new flag is parsed ahead of being
     // implemented.
-    let unimplemented: &[(bool, &str, &str)] = &[
-    ];
+    let unimplemented: &[(bool, &str, &str)] = &[];
     if let Some((_, flag, what)) = unimplemented.iter().find(|(given, _, _)| *given) {
         anyhow::bail!(
             "{flag} is not implemented yet ({what}). bwa-mem3 parses it for CLI compatibility but \
@@ -1174,7 +1177,8 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         // Installs the parsed ID process-wide as a side effect, and returns the header line.
         // The escape-expanded `@RG` line; the ID it also installed is what every record's `RG:Z:`
         // tag will carry, so this call must happen before any record is written.
-        let rg_header_line = bwa_core::rg::set_rg(rg_arg).map_err(|e| anyhow::anyhow!("-R: {e}"))?;
+        let rg_header_line =
+            bwa_core::rg::set_rg(rg_arg).map_err(|e| anyhow::anyhow!("-R: {e}"))?;
         hdr_parts.push(rg_header_line);
     }
     // The extra header block as one newline-joined string, or `None` for "no extra lines" (which is
@@ -1247,28 +1251,29 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Owned copy of the input path, moved into the reader closure (which outlives `args`).
     let reads_path = args.reads.clone();
     // `tx` is the bounded reader -> main channel; sending blocks once BATCH_READAHEAD batches queue.
-    let read_batches = move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
-        // Opened INSIDE the closure so the reader itself never crosses a thread boundary.
-        let mut reader = FastqReader::from_path(&reads_path)?;
-        // Number of reads emitted in all previous batches, i.e. the global 0-based id of this
-        // batch's first read. Invariant at the top of each turn: it equals the total length of every
-        // batch already sent. Must stay global across batches, since downstream tie-breaks hash it.
-        let mut base_id = 0u64;
-        loop {
-            // Up to `k_batch` INPUT BASES worth of reads; empty only at end of file.
-            let batch = reader.next_batch(k_batch)?;
-            if batch.is_empty() {
-                break;
+    let read_batches =
+        move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
+            // Opened INSIDE the closure so the reader itself never crosses a thread boundary.
+            let mut reader = FastqReader::from_path(&reads_path)?;
+            // Number of reads emitted in all previous batches, i.e. the global 0-based id of this
+            // batch's first read. Invariant at the top of each turn: it equals the total length of every
+            // batch already sent. Must stay global across batches, since downstream tie-breaks hash it.
+            let mut base_id = 0u64;
+            loop {
+                // Up to `k_batch` INPUT BASES worth of reads; empty only at end of file.
+                let batch = reader.next_batch(k_batch)?;
+                if batch.is_empty() {
+                    break;
+                }
+                // Read count, saved before the move so `base_id` can advance after the send.
+                let n = batch.len() as u64;
+                if tx.send((batch, base_id)).is_err() {
+                    break;
+                }
+                base_id += n;
             }
-            // Read count, saved before the move so `base_id` can advance after the send.
-            let n = batch.len() as u64;
-            if tx.send((batch, base_id)).is_err() {
-                break;
-            }
-            base_id += n;
-        }
-        Ok(())
-    };
+            Ok(())
+        };
 
     // Main: seed -> chain -> BATCHED seed extension across the whole read batch (NEON backend),
     // mirroring bwa-mem2's mem_chain2aln_across_reads_V2. Chunked so extension parallelizes; each
@@ -1425,9 +1430,7 @@ impl Backend {
         match self {
             Backend::Cpu => align_reads_batched(fm, bns, opt, codes, &NeonBackend),
             #[cfg(target_os = "macos")]
-            Backend::Metal => {
-                align_reads_batched(fm, bns, opt, codes, &bwa_gpu::MetalBackend)
-            }
+            Backend::Metal => align_reads_batched(fm, bns, opt, codes, &bwa_gpu::MetalBackend),
         }
     }
 }
@@ -1926,8 +1929,14 @@ fn run_pe(
             .iter()
             .flat_map(|(rec1, rec2)| {
                 [
-                    rec1.seq.iter().map(|&base| dna::nt4(base)).collect::<Vec<u8>>(),
-                    rec2.seq.iter().map(|&base| dna::nt4(base)).collect::<Vec<u8>>(),
+                    rec1.seq
+                        .iter()
+                        .map(|&base| dna::nt4(base))
+                        .collect::<Vec<u8>>(),
+                    rec2.seq
+                        .iter()
+                        .map(|&base| dna::nt4(base))
+                        .collect::<Vec<u8>>(),
                 ]
             })
             .collect();
@@ -1962,22 +1971,24 @@ fn run_pe(
         let mut prepared: Vec<PrepPair> = batch
             .par_iter()
             .zip(paired.into_par_iter())
-            .map(|((rec1, rec2), ((codes1, codes2), (regs_pre1, regs_pre2)))| {
-                let regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
-                let regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
-                PrepPair {
-                    codes1,
-                    codes2,
-                    regs1,
-                    regs2,
-                    name1: rec1.name.clone(),
-                    name2: rec2.name.clone(),
-                    qual1: rec1.qual.clone(),
-                    qual2: rec2.qual.clone(),
-                    comment1: rec1.comment.clone(),
-                    comment2: rec2.comment.clone(),
-                }
-            })
+            .map(
+                |((rec1, rec2), ((codes1, codes2), (regs_pre1, regs_pre2)))| {
+                    let regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
+                    let regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
+                    PrepPair {
+                        codes1,
+                        codes2,
+                        regs1,
+                        regs2,
+                        name1: rec1.name.clone(),
+                        name2: rec2.name.clone(),
+                        qual1: rec1.qual.clone(),
+                        qual2: rec2.qual.clone(),
+                        comment1: rec1.comment.clone(),
+                        comment2: rec2.comment.clone(),
+                    }
+                },
+            )
             .collect();
 
         // ---- Insert-size distribution, estimated once over the WHOLE batch. This is why batch
@@ -2011,8 +2022,8 @@ fn run_pe(
         // `-S` (MEM_F_NO_RESCUE) is the user-facing form of the same gate.
         // Presence-only, like the gate above; the documented spelling is `BWA3_NO_RESCUE=1` but any
         // value works. Default off. True here means NO rescue happens anywhere, batched or per-pair.
-        let no_rescue = std::env::var_os("BWA3_NO_RESCUE").is_some()
-            || opt.flag & flags::NO_RESCUE != 0;
+        let no_rescue =
+            std::env::var_os("BWA3_NO_RESCUE").is_some() || opt.flag & flags::NO_RESCUE != 0;
         if !scalar_rescue && !no_rescue {
             // One rescue job per pair: each mate's codes plus a MUTABLE borrow of its region list,
             // which the rescue appends newly found alignments to. Borrowing `prepared` mutably is

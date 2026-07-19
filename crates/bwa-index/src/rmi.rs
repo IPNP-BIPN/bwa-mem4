@@ -55,7 +55,6 @@ struct LinearModel {
 }
 
 impl LinearModel {
-
     /// Least-squares fit from precomputed sums over points `(x_i - x0, y_i)`: `n` points, `sx=Σx`,
     /// `sy=Σy`, `sxx=Σx²`, `sxy=Σxy`, with `x0` the origin folded back in. Equivalent to a textbook
     /// least-squares fit over the materialized points (it is the same closed form), but it lets the
@@ -445,12 +444,19 @@ mod tests {
         let rmi = Rmi::build(&pkeys, 2048);
         // Probe every stored key, plus values just below/above and outside the range.
         for &k in &keys {
-            assert_eq!(rmi.lower_bound(&pkeys, k), ref_lower_bound(&keys, k), "key={k}");
+            assert_eq!(
+                rmi.lower_bound(&pkeys, k),
+                ref_lower_bound(&keys, k),
+                "key={k}"
+            );
             assert_eq!(
                 rmi.lower_bound(&pkeys, k.wrapping_sub(1)),
                 ref_lower_bound(&keys, k.wrapping_sub(1))
             );
-            assert_eq!(rmi.lower_bound(&pkeys, k + 1), ref_lower_bound(&keys, k + 1));
+            assert_eq!(
+                rmi.lower_bound(&pkeys, k + 1),
+                ref_lower_bound(&keys, k + 1)
+            );
         }
         assert_eq!(rmi.lower_bound(&pkeys, 0), 0);
         assert_eq!(rmi.lower_bound(&pkeys, u64::MAX), keys.len());

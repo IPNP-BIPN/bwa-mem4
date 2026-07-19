@@ -64,7 +64,6 @@
 //!    klib's unstable sort, present only so equal-weight ties break exactly as bwa's do.
 //! 6. [`kbtree`]: the hand-ported B-tree, for the same tie-break reason.
 
-
 mod kbtree;
 
 use bwa_core::MemOpt;
@@ -574,7 +573,11 @@ pub fn build_chains_from_resolved(
     let mut slots: Vec<Option<MemChain>> = chains.into_iter().map(Some).collect();
     let out = order
         .into_iter()
-        .map(|i| slots[i].take().expect("each chain is inserted exactly once"))
+        .map(|i| {
+            slots[i]
+                .take()
+                .expect("each chain is inserted exactly once")
+        })
         .collect();
     if let Some(t) = t_total {
         chain_time::TOTAL_NS.fetch_add(

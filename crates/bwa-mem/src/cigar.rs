@@ -560,7 +560,10 @@ pub fn reg2aln(
     }
 
     if band_width_trace_enabled() {
-        eprintln!("* Band width: inferred={w2}, cmd_opt={}, alnreg={}", opt.w, reg.w);
+        eprintln!(
+            "* Band width: inferred={w2}, cmd_opt={}, alnreg={}",
+            opt.w, reg.w
+        );
     }
 
     // -------------------------------------------------------------------------------------
@@ -610,7 +613,10 @@ pub fn reg2aln(
         // can hold.
         .expect("gen_cigar2");
         if band_width_trace_enabled() {
-            eprintln!("* Final alignment: w2={w2}, global_sc={sc}, local_sc={}", reg.truesc);
+            eprintln!(
+                "* Final alignment: w2={w2}, global_sc={sc}, local_sc={}",
+                reg.truesc
+            );
         }
         // Early exits (bwamem.cpp:1763). `sc == last_sc` means doubling the band bought nothing, so
         // the score gap is genuine rather than a banding artifact; `w2 == opt.w << 2` means we are

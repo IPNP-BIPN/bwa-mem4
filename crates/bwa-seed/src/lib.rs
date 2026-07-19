@@ -182,7 +182,11 @@ fn lockstep_width() -> usize {
     // Parse `BWA3_LOCKSTEP_N`; anything missing, unparseable, or `0` falls back to the default (a
     // width of 0 would mean no slots at all and the driver would never run).
     *N.get_or_init(|| {
-        std::env::var("BWA3_LOCKSTEP_N").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(DEFAULT_LOCKSTEP_WIDTH)
+        std::env::var("BWA3_LOCKSTEP_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_LOCKSTEP_WIDTH)
     })
 }
 
@@ -1213,7 +1217,13 @@ pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> 
         smem_round_2_batched(fm, reads, opt, &mut per_read);
     }
     if opt.max_mem_intv > 0 {
-        bwt_seed_strategy_batched(fm, reads, opt.max_mem_intv, opt.min_seed_len + 1, &mut per_read);
+        bwt_seed_strategy_batched(
+            fm,
+            reads,
+            opt.max_mem_intv,
+            opt.min_seed_len + 1,
+            &mut per_read,
+        );
     }
     per_read
 }
@@ -1249,7 +1259,13 @@ pub fn mem_collect_smem_hybrid(
         .collect();
     smem_round_2_batched(fm, reads, opt, &mut per_read);
     if opt.max_mem_intv > 0 {
-        bwt_seed_strategy_batched(fm, reads, opt.max_mem_intv, opt.min_seed_len + 1, &mut per_read);
+        bwt_seed_strategy_batched(
+            fm,
+            reads,
+            opt.max_mem_intv,
+            opt.min_seed_len + 1,
+            &mut per_read,
+        );
     }
     per_read
 }
@@ -1711,7 +1727,8 @@ mod tests {
         for (r, read) in reads.iter().enumerate() {
             let per_read = mem_collect_smem(&fm, read, &opt);
             assert_eq!(
-                batched[r], per_read,
+                batched[r],
+                per_read,
                 "batched full != per-read at read {r} (len {})",
                 read.len()
             );

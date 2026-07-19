@@ -333,16 +333,16 @@ pub fn ksw_extend2(
         while j < end {
             let ju = j as usize;
             let big_m = eh_h[ju]; // H(i-1, j-1)
-            // E(i, j): the best score reaching cell (i, j) with a gap open in the query. It was
-            // computed while row i-1 was being walked, which is why it is already in the array, but
-            // the cell it belongs to is (i, j), not (i-1, j). The C states the same convention:
-            // "At the beginning of the loop: eh[j] = { H(i-1,j-1), E(i,j) }" (`ksw.cpp:479`).
+                                  // E(i, j): the best score reaching cell (i, j) with a gap open in the query. It was
+                                  // computed while row i-1 was being walked, which is why it is already in the array, but
+                                  // the cell it belongs to is (i, j), not (i-1, j). The C states the same convention:
+                                  // "At the beginning of the loop: eh[j] = { H(i-1,j-1), E(i,j) }" (`ksw.cpp:479`).
             let mut e = eh_e[ju]; // E(i, j)
             eh_h[ju] = h1; // H(i, j-1) for next row
-            // M(i,j) = H(i-1,j-1) + s(t[i], q[j]), but only if the diagonal predecessor was actually
-            // reachable. H == 0 is the "no alignment here" sentinel, so a zero diagonal must NOT be
-            // extended by a (possibly positive) substitution score; it stays 0. This single test is
-            // what makes the surface local (`ksw.cpp:487`).
+                           // M(i,j) = H(i-1,j-1) + s(t[i], q[j]), but only if the diagonal predecessor was actually
+                           // reachable. H == 0 is the "no alignment here" sentinel, so a zero diagonal must NOT be
+                           // extended by a (possibly positive) substitution score; it stays 0. This single test is
+                           // what makes the surface local (`ksw.cpp:487`).
             let big_m = if big_m != 0 {
                 big_m + i32::from(q[ju])
             } else {
@@ -353,9 +353,9 @@ pub fn ksw_extend2(
             let mut h = if big_m > e { big_m } else { e };
             h = if h > f { h } else { f };
             h1 = h; // becomes H(i, j) for the next column
-            // Row max with a **strict** `>` on the incumbent, i.e. ties go to the *later* column.
-            // The C is `mj = m > h? mj : j` (`ksw.cpp:491`), so on `row_max == h` it takes `j`.
-            // Flipping this tie-break silently shifts qle/tle on repeat-rich reads.
+                    // Row max with a **strict** `>` on the incumbent, i.e. ties go to the *later* column.
+                    // The C is `mj = m > h? mj : j` (`ksw.cpp:491`), so on `row_max == h` it takes `j`.
+                    // Flipping this tie-break silently shifts qle/tle on repeat-rich reads.
             mj = if row_max > h { mj } else { j };
             row_max = if row_max > h { row_max } else { h };
             // Gaps open from M (the diagonal score), not from H = max(M, E, F). Both `ksw_extend2`
@@ -431,19 +431,13 @@ pub fn ksw_extend2(
         // Scans right from `beg`; on exit it is the leftmost column of this row that is still
         // reachable (or `end` if none is), which becomes row i+1's `beg`.
         let mut first_live = beg;
-        while first_live < end
-            && eh_h[first_live as usize] == 0
-            && eh_e[first_live as usize] == 0
-        {
+        while first_live < end && eh_h[first_live as usize] == 0 && eh_e[first_live as usize] == 0 {
             first_live += 1;
         }
         beg = first_live;
         // Scans left from `end`; on exit it is the rightmost reachable column of this row.
         let mut last_live = end;
-        while last_live >= beg
-            && eh_h[last_live as usize] == 0
-            && eh_e[last_live as usize] == 0
-        {
+        while last_live >= beg && eh_h[last_live as usize] == 0 && eh_e[last_live as usize] == 0 {
             last_live -= 1;
         }
         // `last_live + 2`, not `+ 1`: `last_live` is the last live column, the next one is what it
@@ -847,10 +841,10 @@ pub fn ksw_local_fwd(
     let mut h_cur = vec![0i32; qlen]; // H(i, .)
     let mut e = vec![0i32; qlen]; // E(i, j), persists across target rows
     let mut hmax_col = vec![0i32; qlen]; // H column at the best target end `te`
-    // Running best cell over the whole matrix so far: `gmax` is its score (starts at 0, the local
-    // floor, so an all-negative comparison ends with 0) and `te` the target row that attained it
-    // (-1 = never). `hmax_col` above is the snapshot of that row's H values, kept so `qe` can be
-    // recovered after the loop.
+                                         // Running best cell over the whole matrix so far: `gmax` is its score (starts at 0, the local
+                                         // floor, so an all-negative comparison ends with 0) and `te` the target row that attained it
+                                         // (-1 = never). `hmax_col` above is the snapshot of that row's H values, kept so `qe` can be
+                                         // recovered after the loop.
     let mut gmax = 0i32;
     let mut te = -1i32;
     // Suboptimal tracker `b`: (column max score, column), consecutive columns merged (keep higher).
@@ -868,8 +862,8 @@ pub fn ksw_local_fwd(
         // only, so there is no F array.
         let mut f = 0i32;
         let mut h_diag = 0i32; // H(i-1, -1) = 0
-        // Best H seen in this row so far (the C's per-row `imax`), floored at 0. At the end of the
-        // row it is the row maximum, which is what feeds `gmax` and the suboptimal `b` array.
+                               // Best H seen in this row so far (the C's per-row `imax`), floored at 0. At the end of the
+                               // row it is the row maximum, which is what feeds `gmax` and the suboptimal `b` array.
         let mut imax = 0i32;
         for j in 0..qlen {
             // s(target[i], query[j]), the substitution score for this cell.

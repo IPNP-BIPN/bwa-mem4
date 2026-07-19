@@ -446,8 +446,7 @@ pub fn mem_sort_dedup_patch(
     // ---- Pass 3: re-sort by score and drop exact coordinate duplicates ------------------------
     // Sort by score desc, then rb, then qb (`alnreg_slt`), again with bwa's unstable introsort.
     ks_introsort_by(&mut a, |x, y| {
-        x.score > y.score
-            || (x.score == y.score && (x.rb < y.rb || (x.rb == y.rb && x.qb < y.qb)))
+        x.score > y.score || (x.score == y.score && (x.rb < y.rb || (x.rb == y.rb && x.qb < y.qb)))
     });
     // Exact-duplicate removal (`bwamem.cpp:343`). After the score sort, identical regions are
     // adjacent, so a single linear pass comparing each entry to its predecessor suffices. Note the
@@ -615,7 +614,9 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     // `band_width_trace_enabled` in
     // cigar.rs this is not cached, but it runs once per read rather than once per emitted
     // alignment, so the `var_os` cost is tolerable.
-    if std::env::var_os("BWA3_DUMP_PRESORT").map_or(false, |v| v.to_string_lossy() == id.to_string()) {
+    if std::env::var_os("BWA3_DUMP_PRESORT")
+        .map_or(false, |v| v.to_string_lossy() == id.to_string())
+    {
         eprintln!("PRESORT id={id} n={}", a.len());
         for (i, r) in a.iter().enumerate() {
             eprintln!(
@@ -636,8 +637,7 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     ks_introsort_by(a, |x, y| {
         x.score > y.score
             || (x.score == y.score
-                && (!x.is_alt && y.is_alt
-                    || (x.is_alt == y.is_alt && x.hash < y.hash)))
+                && (!x.is_alt && y.is_alt || (x.is_alt == y.is_alt && x.hash < y.hash)))
     });
     mark_primary_core(opt, a);
     // No ALT contigs: `secondary_all` mirrors `secondary` (the C's else-branch when n_pri == n).

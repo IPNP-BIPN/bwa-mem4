@@ -160,18 +160,28 @@ pub mod cells {
     /// [`enabled`]. Takes no parameters and reads the statics above with `Relaxed` ordering: the
     /// counts are diagnostics, so a slightly stale read from another thread is acceptable.
     pub fn dump() {
-        if !enabled() { return; }
-        let (cells, jobs, elapsed_ns) = (CELLS.load(Ordering::Relaxed), JOBS.load(Ordering::Relaxed), NS.load(Ordering::Relaxed));
+        if !enabled() {
+            return;
+        }
+        let (cells, jobs, elapsed_ns) = (
+            CELLS.load(Ordering::Relaxed),
+            JOBS.load(Ordering::Relaxed),
+            NS.load(Ordering::Relaxed),
+        );
         let seconds = elapsed_ns as f64 / 1e9;
         eprintln!(
             "[matesw] {jobs} jobs, {cells} DP cells in {seconds:.2}s CPU -> {:.2} Gcell/s/thread\n\
              [matesw] ISA ceiling: 16 u8 lanes x ~3.5 GHz = ~56 Gcell/s if 1 cell/lane/cycle",
-            cells as f64 / seconds.max(1e-9) / 1e9);
-        let (query_bases, target_bases) = (QLEN.load(Ordering::Relaxed), TLEN.load(Ordering::Relaxed));
-        eprintln!("[matesw] mean query = {:.0} bp, mean target window = {:.0} bp -> {:.0} cells/job",
-                  query_bases as f64 / jobs.max(1) as f64,
-                  target_bases as f64 / jobs.max(1) as f64,
-                  cells as f64 / jobs.max(1) as f64);
+            cells as f64 / seconds.max(1e-9) / 1e9
+        );
+        let (query_bases, target_bases) =
+            (QLEN.load(Ordering::Relaxed), TLEN.load(Ordering::Relaxed));
+        eprintln!(
+            "[matesw] mean query = {:.0} bp, mean target window = {:.0} bp -> {:.0} cells/job",
+            query_bases as f64 / jobs.max(1) as f64,
+            target_bases as f64 / jobs.max(1) as f64,
+            cells as f64 / jobs.max(1) as f64
+        );
     }
 }
 
@@ -236,12 +246,21 @@ pub fn batched_ksw_align2(
     if timer.is_some() {
         use std::sync::atomic::Ordering::Relaxed;
         // The DP is query x target per job; that is the work the kernel must actually do.
-        let cell_count: u64 = jobs.iter().map(|j| (j.query.len() * j.target.len()) as u64).sum();
+        let cell_count: u64 = jobs
+            .iter()
+            .map(|j| (j.query.len() * j.target.len()) as u64)
+            .sum();
         cells::CELLS.fetch_add(cell_count, Relaxed);
         cells::JOBS.fetch_add(jobs.len() as u64, Relaxed);
         // 207k cells per job means a huge target window; record the dimensions to see which side it is.
-        cells::QLEN.fetch_add(jobs.iter().map(|j| j.query.len() as u64).sum::<u64>(), Relaxed);
-        cells::TLEN.fetch_add(jobs.iter().map(|j| j.target.len() as u64).sum::<u64>(), Relaxed);
+        cells::QLEN.fetch_add(
+            jobs.iter().map(|j| j.query.len() as u64).sum::<u64>(),
+            Relaxed,
+        );
+        cells::TLEN.fetch_add(
+            jobs.iter().map(|j| j.target.len() as u64).sum::<u64>(),
+            Relaxed,
+        );
     }
     // ---- Pass 1: forward over all jobs. Finds the score and where each alignment ENDS. ----
     // Same sequences as `jobs`, with the pass-specific stop conditions attached: collect `score2`
@@ -474,10 +493,9 @@ fn fwd_local_sw_batch(
             // mismatches and gaps, so `min(len) * max_sc` is a hard ceiling on every H/E/F cell.
             let score_ceiling = |j: &FwdJob| j.query.len().min(j.target.len()) as i32 * max_sc;
             // u8 also holds the argmax query column, so the query must be < 256 too.
-            if jobs
-                .iter()
-                .all(|j| score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize)
-            {
+            if jobs.iter().all(|j| {
+                score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
+            }) {
                 // SAFETY: neon detected; every H/E/F cell and query column < 250 fits u8; standard mat.
                 return unsafe {
                     fwd_local_sw_neon_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
@@ -571,7 +589,11 @@ fn fwd_local_sw_scalar(
         // The DP rectangle for the whole group: `qmax` padded query columns and `tmax` target rows,
         // both the max over the group's lanes so all lanes can share one pair of loops. A lane
         // shorter than the max wastes the difference, which is why the caller length-sorts.
-        let qmax = group.iter().map(|j| ksw_padded_qlen(j.query.len(), max_sc)).max().unwrap_or(0);
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
         let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
         if qmax == 0 || tmax == 0 {
             continue;
@@ -588,8 +610,12 @@ fn fwd_local_sw_scalar(
         // bases, used to tell a lane's own rectangle from the group's; `minsc`/`endsc` are that
         // job's cutoffs in score units. Dead lanes keep `0` lengths and `i32::MAX` cutoffs, so they
         // are excluded by the `i >= tlen[l]` test and can never trip `endsc`.
-        let (mut qlen, mut tlen, mut minsc, mut endsc) =
-            ([0usize; LANES], [0usize; LANES], [i32::MAX; LANES], [i32::MAX; LANES]);
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES],
+            [0usize; LANES],
+            [i32::MAX; LANES],
+            [i32::MAX; LANES],
+        );
         for (l, j) in group.iter().enumerate() {
             qlen[l] = j.query.len();
             tlen[l] = j.target.len();
@@ -626,18 +652,18 @@ fn fwd_local_sw_scalar(
         // row maxima far enough from `te` (`ksw.cpp:194-202`), so the row maxima cannot be reduced
         // on the fly.
         let mut rowmax = vec![0i32; tmax * LANES]; // per-row imax, for score2
-        // Best H seen in any row so far, per lane, and where it was: `te` the target row (`-1` until
-        // some cell beats 0, which is what "no alignment" looks like), `qe` the padded query column
-        // in that row. `qe` starts at 0 rather than -1 because it is only ever read when `te >= 0`.
+                                                   // Best H seen in any row so far, per lane, and where it was: `te` the target row (`-1` until
+                                                   // some cell beats 0, which is what "no alignment" looks like), `qe` the padded query column
+                                                   // in that row. `qe` starts at 0 rather than -1 because it is only ever read when `te >= 0`.
         let mut gmax = [0i32; LANES];
         let mut te = [-1i32; LANES];
         let mut qe = [0i32; LANES]; // argmax column at the best row
-        // `limit` is where the C's row loop stopped: it truncates the `score2` candidate list to the
-        // rows actually visited. Without it, an early-stopped lane would contribute row maxima that
-        // bwa never computed.
+                                    // `limit` is where the C's row loop stopped: it truncates the `score2` candidate list to the
+                                    // rows actually visited. Without it, an early-stopped lane would contribute row maxima that
+                                    // bwa never computed.
         let mut limit = [-1i32; LANES]; // last processed row (inclusive)
-        // A lane that hit `endsc` stops updating (bwa `break`s out of the row loop, `ksw.cpp:207`);
-        // lanes cannot break individually, so it goes idle while its neighbours finish.
+                                        // A lane that hit `endsc` stops updating (bwa `break`s out of the row loop, `ksw.cpp:207`);
+                                        // lanes cannot break individually, so it goes idle while its neighbours finish.
         let mut frozen = [false; LANES];
         for l in 0..n_lanes {
             limit[l] = tlen[l] as i32 - 1;
@@ -660,8 +686,8 @@ fn fwd_local_sw_scalar(
             let mut h_diag = [0i32; LANES];
             let mut imax = [0i32; LANES];
             let mut imax_col = [0i32; LANES]; // min query column achieving this row's max
-            // Query columns. Note this runs over the *padded* qmax, so the ZPAD columns are real
-            // work that has to happen, not a rounding artifact (see `ksw_padded_qlen`).
+                                              // Query columns. Note this runs over the *padded* qmax, so the ZPAD columns are real
+                                              // work that has to happen, not a rounding artifact (see `ksw_padded_qlen`).
             for j in 0..qmax {
                 for l in 0..LANES {
                     // This lane's target base at row `i` and query base at column `j`: a code in
@@ -939,7 +965,11 @@ unsafe fn fwd_local_sw_neon(
     // Group setup is identical to `fwd_local_sw_scalar`; see there for what each variable holds.
     for (group_idx, group) in jobs.chunks(LANES).enumerate() {
         let n_lanes = group.len();
-        let qmax = group.iter().map(|j| ksw_padded_qlen(j.query.len(), max_sc)).max().unwrap_or(0);
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
         let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
         if qmax == 0 || tmax == 0 {
             continue;
@@ -948,8 +978,12 @@ unsafe fn fwd_local_sw_neon(
         // SoA sequences (u8, padded) + per-lane bounds/params.
         let mut seq_q = vec![PAD; qmax * LANES];
         let mut seq_t = vec![PAD; tmax * LANES];
-        let (mut qlen, mut tlen, mut minsc, mut endsc) =
-            ([0usize; LANES], [0usize; LANES], [i32::MAX; LANES], [i32::MAX; LANES]);
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES],
+            [0usize; LANES],
+            [i32::MAX; LANES],
+            [i32::MAX; LANES],
+        );
         for (l, j) in group.iter().enumerate() {
             qlen[l] = j.query.len();
             tlen[l] = j.target.len();
@@ -1163,7 +1197,7 @@ unsafe fn fwd_local_sw_neon_u8(
     let oe_ins = o_ins + e_ins;
     let mtch = mat[0] as u8; // match bonus (>= 0)
     let mispen = (-mat[1]) as u8; // mismatch penalty b (mat[1] = -b)
-    // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
+                                  // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
     let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
 
     // Broadcast constants, one scalar replicated across all 16 lanes. Note the scores are stored as
@@ -1184,7 +1218,11 @@ unsafe fn fwd_local_sw_neon_u8(
     // Group setup is identical to `fwd_local_sw_scalar` at 16 lanes; see there for each variable.
     for (group_idx, group) in jobs.chunks(LANES16).enumerate() {
         let n_lanes = group.len();
-        let qmax = group.iter().map(|j| ksw_padded_qlen(j.query.len(), max_sc)).max().unwrap_or(0);
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
         let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
         if qmax == 0 || tmax == 0 {
             continue;
@@ -1270,8 +1308,8 @@ unsafe fn fwd_local_sw_neon_u8(
                 let mut diag_v = vbslq_u8(eq, add_match, sub_mis);
                 diag_v = vbslq_u8(n_mask, sub_n, diag_v);
                 diag_v = vbslq_u8(zpad_mask, h_diag_v, diag_v); // score 0: diagonal passes through
-                // Dead padding: force 0 outright. In the i16 kernel this is a `DEAD_CELL_SCORE`
-                // that the `max(0, .)` then clamps; here 0 is written directly, same result.
+                                                                // Dead padding: force 0 outright. In the i16 kernel this is a `DEAD_CELL_SCORE`
+                                                                // that the `max(0, .)` then clamps; here 0 is written directly, same result.
                 diag_v = vbslq_u8(pad_mask, zero, diag_v);
 
                 // Lane `l` = E(i, j) for job `l`, the deletion carry left by the previous row.
@@ -1451,11 +1489,20 @@ mod tests {
                 batched_ksw_align2(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
             for (i, j) in jobs.iter().enumerate() {
                 // Same kernel width mem_matesw would pick, since it changes the result.
-                let lanes = if j.query.len() as i32 * max_sc < 250 { 16 } else { 8 };
+                let lanes = if j.query.len() as i32 * max_sc < 250 {
+                    16
+                } else {
+                    8
+                };
                 let want = ksw_align2(
                     j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, lanes,
                 );
-                assert_eq!(batched[i], want, "job {i} (qlen {}, match {a})", j.query.len());
+                assert_eq!(
+                    batched[i],
+                    want,
+                    "job {i} (qlen {}, match {a})",
+                    j.query.len()
+                );
             }
         }
     }

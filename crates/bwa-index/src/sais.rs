@@ -1050,8 +1050,8 @@ mod tests {
             check_inplace(&s);
         }
         check_inplace(&vec![2u8; 4096]); // all identical -> maximal recursion depth
-        // Period-3 string "012012...": every LMS substring is one of a handful, so names collide
-        // heavily and the recursion goes deep with a tiny alphabet at each level.
+                                         // Period-3 string "012012...": every LMS substring is one of a handful, so names collide
+                                         // heavily and the recursion goes deep with a tiny alphabet at each level.
         let periodic: Vec<u8> = (0..8192).map(|i| (i % 3) as u8).collect();
         check_inplace(&periodic);
     }

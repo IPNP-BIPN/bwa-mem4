@@ -360,7 +360,12 @@ fn backward_lem(lsa: &LearnedSa, codes: &[u8], pivot: usize, min_intv: i64) -> u
 /// # Returns
 /// `(length_in_bases, lo, hi)` where `lo`/`hi` are half-open suffix-array ROW indices in
 /// `0..=lsa.len()`, not reference positions. Length 0 means no qualifying match.
-fn forward_lem(lsa: &LearnedSa, codes: &[u8], pivot: usize, min_intv: i64) -> (usize, usize, usize) {
+fn forward_lem(
+    lsa: &LearnedSa,
+    codes: &[u8],
+    pivot: usize,
+    min_intv: i64,
+) -> (usize, usize, usize) {
     // Exclusive READ offset where the searchable stretch ends: the first `N` at or after the pivot,
     // else the read end. No match may span an ambiguous base.
     let end = codes[pivot..]
@@ -489,7 +494,11 @@ pub fn collect_smems_lsa_zigzag(lsa: &LearnedSa, codes: &[u8], min_seed_len: i32
     let mut pivot = 0usize;
     while pivot < l_seq {
         if codes[pivot] >= 4 {
-            pivot = if l_seq - pivot < min_seed_len { l_seq } else { pivot + 1 };
+            pivot = if l_seq - pivot < min_seed_len {
+                l_seq
+            } else {
+                pivot + 1
+            };
             continue;
         }
         // Does anything extensible sit to the LEFT of this pivot? Only if the pivot is not at offset
@@ -730,7 +739,13 @@ pub fn mem_collect_smem_lsa_12(lsa: &LearnedSa, codes: &[u8], opt: &MemOpt) -> V
 pub fn mem_collect_smem_lsa_fast(lsa: &LearnedSa, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
     let mut smems = mem_collect_smem_lsa_12(lsa, codes, opt);
     if opt.max_mem_intv > 0 {
-        bwt_seed_strategy_lsa_fast(lsa, codes, opt.max_mem_intv, opt.min_seed_len + 1, &mut smems);
+        bwt_seed_strategy_lsa_fast(
+            lsa,
+            codes,
+            opt.max_mem_intv,
+            opt.min_seed_len + 1,
+            &mut smems,
+        );
     }
     smems
 }
@@ -760,7 +775,15 @@ pub fn collect_smems_lsa(
     // READ offset of the pivot; advanced by whatever `smems_from_pos_lsa` reports as `next_x`.
     let mut x = 0usize;
     while x < codes.len() {
-        x = smems_from_pos_lsa(lsa, codes, x, min_seed_len, min_intv, &mut scratch, &mut out);
+        x = smems_from_pos_lsa(
+            lsa,
+            codes,
+            x,
+            min_seed_len,
+            min_intv,
+            &mut scratch,
+            &mut out,
+        );
     }
     out
 }
@@ -867,7 +890,15 @@ fn smem_round_2_lsa(lsa: &LearnedSa, codes: &[u8], opt: &MemOpt, smems: &mut Vec
         }
         // Midpoint READ offset of the parent SMEM: the reseed pivot.
         let x = ((end + start) >> 1) as usize;
-        smems_from_pos_lsa(lsa, codes, x, opt.min_seed_len, p.s + 1, &mut scratch, smems);
+        smems_from_pos_lsa(
+            lsa,
+            codes,
+            x,
+            opt.min_seed_len,
+            p.s + 1,
+            &mut scratch,
+            smems,
+        );
     }
 }
 
@@ -886,7 +917,13 @@ pub fn mem_collect_smem_lsa(lsa: &LearnedSa, codes: &[u8], opt: &MemOpt) -> Vec<
     let mut smems = collect_smems_lsa(lsa, codes, opt.min_seed_len, 1);
     smem_round_2_lsa(lsa, codes, opt, &mut smems);
     if opt.max_mem_intv > 0 {
-        bwt_seed_strategy_lsa(lsa, codes, opt.max_mem_intv, opt.min_seed_len + 1, &mut smems);
+        bwt_seed_strategy_lsa(
+            lsa,
+            codes,
+            opt.max_mem_intv,
+            opt.min_seed_len + 1,
+            &mut smems,
+        );
     }
     smems
 }
@@ -914,7 +951,11 @@ pub fn seeds_from_smem_lsa(lsa: &LearnedSa, smem: &Smem, max_occ: i32) -> Vec<Me
     let max_occ = i64::from(max_occ);
     // Stride in SA ROWS between sampled occurrences. For a repetitive SMEM this spreads the `max_occ`
     // samples across the whole interval instead of taking the first `max_occ` rows; 1 otherwise.
-    let step = if smem.s > max_occ { smem.s / max_occ } else { 1 };
+    let step = if smem.s > max_occ {
+        smem.s / max_occ
+    } else {
+        1
+    };
     let mut seeds = Vec::new();
     // Number of seeds emitted so far, capped at max_occ.
     let mut c = 0i64;
@@ -996,10 +1037,11 @@ mod tests {
                 .iter()
                 .map(|s| (s.m, s.n, s.k, s.s))
                 .collect();
-            let mut lsa_set: Vec<(u32, u32, i64, i64)> = collect_smems_lsa_zigzag(&lsa, &codes, msl)
-                .iter()
-                .map(|s| (s.m, s.n, s.k, s.s))
-                .collect();
+            let mut lsa_set: Vec<(u32, u32, i64, i64)> =
+                collect_smems_lsa_zigzag(&lsa, &codes, msl)
+                    .iter()
+                    .map(|s| (s.m, s.n, s.k, s.s))
+                    .collect();
             fm_set.sort_unstable();
             fm_set.dedup();
             lsa_set.sort_unstable();
@@ -1067,11 +1109,18 @@ mod tests {
                 exact += 1;
             } else {
                 // Set intersection size (binary search is valid: `seeds_set` returned sorted vecs).
-                let inter = fm_seeds.iter().filter(|x| lsa_seeds.binary_search(x).is_ok()).count();
+                let inter = fm_seeds
+                    .iter()
+                    .filter(|x| lsa_seeds.binary_search(x).is_ok())
+                    .count();
                 // Union size by inclusion-exclusion, and the Jaccard index in [0, 1]. Two empty
                 // seed sets count as perfect agreement rather than 0/0.
                 let uni = fm_seeds.len() + lsa_seeds.len() - inter;
-                let jac = if uni == 0 { 1.0 } else { inter as f64 / uni as f64 };
+                let jac = if uni == 0 {
+                    1.0
+                } else {
+                    inter as f64 / uni as f64
+                };
                 if jac < worst_jac {
                     worst_jac = jac;
                 }

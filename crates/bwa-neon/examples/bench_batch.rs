@@ -90,7 +90,7 @@ fn main() {
             40 + (next() % 110) as usize
         }; // 40..150
         let tlen = qlen + (next() % 40) as usize; // a bit longer than the query
-        // The read side: uniform random 2-bit base codes 0..=3 (this generator never emits 4/N).
+                                                  // The read side: uniform random 2-bit base codes 0..=3 (this generator never emits 4/N).
         let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
         // Target = query with ~3% substitutions and occasional indels, padded to tlen.
         let mut t: Vec<u8> = Vec::with_capacity(tlen);

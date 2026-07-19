@@ -299,7 +299,7 @@ mod tests {
             let mut h0s: Vec<i32> = Vec::new();
             for _ in 0..batch_size {
                 let qlen = 60 + (next() % 200) as usize; // up to ~260
-                // The read side: uniform random 2-bit base codes 0..=3 (never 4/N here).
+                                                         // The read side: uniform random 2-bit base codes 0..=3 (never 4/N here).
                 let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
                 // Reference window, 0..=59 bases longer than the query so gaps have room.
                 let tlen = qlen + (next() % 60) as usize;
