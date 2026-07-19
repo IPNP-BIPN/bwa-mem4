@@ -32,7 +32,10 @@ jobs:
           # macOS is where the NEON kernels are compiled and where development happens.
           - os: macos-14
             target_id: macos-arm64
-          - os: macos-13
+          # macos-15-intel, not macos-13: the macOS 13 runners are being retired and jobs sit
+          # queued indefinitely rather than failing, which looks like a hang. This is the label
+          # COMBINE-lab/salmon uses for Intel macOS.
+          - os: macos-15-intel
             target_id: macos-x86_64
     steps:
       - uses: actions/checkout@v7
