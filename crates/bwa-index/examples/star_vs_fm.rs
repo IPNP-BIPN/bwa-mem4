@@ -82,6 +82,26 @@ fn fwd_ext(fm: &FmIndex, s: Smem, a: usize) -> Smem {
     e
 }
 
+/// Prefetch one cache line for load, portably.
+///
+/// The whole point of this benchmark is measuring what prefetching buys, so this cannot be a no-op
+/// on either architecture. `prfm pldl1keep` (AArch64) and `_mm_prefetch(_MM_HINT_T0)` (x86_64) are
+/// the same request: fetch into L1 and keep it. Anything else is a no-op so the example still
+/// builds, it just stops measuring what it claims to.
+///
+/// # Safety
+/// `p` must be a valid address to read from. A prefetch of a bad address is architecturally
+/// harmless, but forming the pointer is not.
+#[inline(always)]
+unsafe fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    #[cfg(target_arch = "x86_64")]
+    std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     // argv[1]: index prefix. argv[2]: path to the flat suffix array dump described in the header.
@@ -364,7 +384,7 @@ fn main() {
                         mid[i] = (l[i] + h[i]) / 2;
                         any = true;
                         unsafe {
-                            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) sa.as_ptr().add(mid[i] as usize), options(nostack, readonly, preserves_flags));
+                            prefetch(sa.as_ptr().add(mid[i] as usize) as *const u8);
                         }
                     }
                 }
@@ -383,7 +403,7 @@ fn main() {
                         let r = (pos[i] + K as i64) as usize;
                         if r < refseq.len() {
                             unsafe {
-                                std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) refseq.as_ptr().add(r), options(nostack, readonly, preserves_flags));
+                                prefetch(refseq.as_ptr().add(r));
                             }
                         }
                     }
