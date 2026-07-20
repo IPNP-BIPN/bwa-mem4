@@ -43,7 +43,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     // Variant payload: the one FASTA path to index. Run once per reference, minutes and tens of GB.
-    /// Build the FMD index from a FASTA reference (phase 1; not yet implemented).
+    /// Build the FMD index from a FASTA reference. Output is byte-identical to `bwa-mem2 index`.
     Index(cmd_index::IndexArgs),
     // Variant payload: the whole `mem` option surface (~35 flags plus 2-3 positionals). This is the
     // variant every production run takes.

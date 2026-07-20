@@ -49,6 +49,10 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use rayon::prelude::*;
+use rust_htslib::bam;
+// The raw htslib C bindings, re-exported by rust-htslib (so this is not an extra dependency). Used
+// only by `HtsWriter`, which needs an ordering its safe `bam::Writer` cannot express; see there.
+use rust_htslib::htslib;
 
 use bwa_core::opt::flags;
 use bwa_core::{dna, MemOpt};
@@ -411,12 +415,21 @@ pub struct MemArgs {
     /// Optional mate reads (R2): triggers paired-end mode.
     pub reads2: Option<PathBuf>,
     // `-o FILE` -> `aux.fp = fopen(optarg, "w")` (`fastmap.cpp:674`). bwa accepts `-f` as an exact
-    // alias (same branch); this port does not, see the scope note above. The BGZF behaviour below
-    // is an addition, not a bwa feature: bwa always writes plain SAM.
+    // alias (same branch); this port does not, see the scope note above. The BGZF/BAM/CRAM
+    // behaviour below is an addition, not a bwa feature: bwa always writes plain SAM. The records
+    // are the same bytes in every case, since BAM and CRAM transcode the formatted SAM text.
     /// Write SAM to PATH instead of stdout. A `.gz`/`.bgz` suffix selects BGZF (block-gzip) output,
-    /// compressed in parallel on `-t` worker threads (readable by samtools/bgzip/tabix).
+    /// compressed in parallel on `-t` worker threads (readable by samtools/bgzip/tabix); `.bam` and
+    /// `.cram` select binary BAM/CRAM via htslib (`.cram` also needs `--reference`).
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
+    // Long-only and not a bwa flag: bwa has no CRAM output, so there is no short letter to match.
+    // Only CRAM reads it. It is the FASTA the CRAM decoder will need to reconstruct SEQ, so it must
+    // be the same sequences as the index prefix; htslib loads it through its `.fai`.
+    /// Reference FASTA for CRAM output (`-o out.cram`). A `.fai` beside it is used if present;
+    /// without one htslib scans the FASTA to index it in memory, which is slower but works.
+    #[arg(long = "reference", value_name = "FASTA")]
+    pub reference: Option<PathBuf>,
     // Long-only, because `-h` is bwa's XA-hits option. bwa itself has no help flag: any
     // unrecognised option falls through to `return 1` and prints usage (`fastmap.cpp:795`).
     /// Print help.
@@ -865,9 +878,17 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     Ok(opt)
 }
 
-/// The SAM output sink: plain (stdout or an uncompressed file) or parallel BGZF (block-gzip). Both
-/// expose `std::io::Write` so the formatting/writing paths stay generic; `finish` drains the BGZF
-/// worker pool and writes the EOF marker (surfacing errors the `Drop` path would swallow).
+/// The SAM output sink: plain (stdout or an uncompressed file), parallel BGZF (block-gzip), or a
+/// binary BAM/CRAM transcoder. All expose `std::io::Write` so the formatting/writing paths stay
+/// generic; `finish` drains the BGZF worker pool and writes the EOF marker (surfacing errors the
+/// `Drop` path would swallow), and closes the htslib file.
+///
+/// The binary variants deliberately do NOT have their own record formatter. Every record is still
+/// formatted as SAM text by exactly the code that feeds the `Plain` sink, and [`HtsTranscoder`]
+/// re-encodes that text. Byte-identity with bwa-mem2 is defined on the SAM bytes, so a second,
+/// independent formatting path into BAM would be a second thing to keep byte-identical, and one
+/// that no parity test covers. Transcoding makes BAM a lossless re-encoding of the bytes we already
+/// prove correct.
 enum Output {
     /// Uncompressed SAM: a `BufWriter` over stdout (no `-o`) or over the named file. This is the
     /// only variant bwa itself has. `finish` just flushes it.
@@ -876,6 +897,229 @@ enum Output {
     /// `-t` worker threads. `finish` must run: it drains those workers and writes the 28-byte EOF
     /// block that samtools requires of a complete BGZF file.
     Bgzf(Box<bgzf::MultithreadedWriter<Box<dyn Write + Send>>>),
+    /// Binary BAM, selected by a `.bam` suffix on `-o`. Boxed because a `bam::Writer` plus the
+    /// transcoder's line buffers dwarf the other variants' two pointers.
+    Bam(Box<HtsTranscoder>),
+    /// CRAM, selected by a `.cram` suffix on `-o`. Identical machinery to `Bam` (only the htslib
+    /// format flag and the mandatory `--reference` differ), which is why both hold the same type.
+    Cram(Box<HtsTranscoder>),
+}
+
+/// Streaming SAM-text -> BAM/CRAM transcoder.
+///
+/// It sits behind `impl Write for Output` because that is the shape the pipeline hands us: the
+/// writer thread ships whole batch buffers of SAM text (`run_pipeline`), each holding many records,
+/// and the header arrives as a separate direct write before the pipeline even starts. So this is a
+/// byte-stream state machine, not a record API:
+///
+/// 1. Bytes accumulate in `pending` until a `\n` completes a line. A batch buffer always ends on a
+///    record boundary today, but nothing in the pipeline's contract guarantees that, so a partial
+///    trailing line is carried across `write` calls rather than assumed away.
+/// 2. While no writer is open, lines starting with `@` are appended to `header_text`. A record line
+///    can never be mistaken for a header line: SAM restricts QNAME's first character to
+///    `[!-?A-~]`, which excludes `@` precisely so that this test is unambiguous.
+/// 3. The first non-`@` line closes the header: htslib parses `header_text`, the file is opened,
+///    and from then on every line goes through `bam::Record::from_sam`.
+///
+/// Opening lazily (step 3) is what lets the header be written verbatim, as one blob of the exact
+/// bytes `sam::write_header` produced, instead of being rebuilt tag by tag from `sqs` and risking a
+/// divergence from the SAM path.
+struct HtsTranscoder {
+    /// Where to open, kept because the open is deferred to the first record line.
+    path: PathBuf,
+    /// htslib's `hts_open` mode string: `wb` for BAM, `wc` for CRAM (`htslib/hts.h`). The only real
+    /// difference between the `Bam` and `Cram` variants.
+    mode: &'static std::ffi::CStr,
+    /// `--reference` FASTA, required for CRAM (which stores bases as differences against it) and
+    /// unused by BAM. Presence is checked in [`Output::open`], applied at file-open time.
+    reference: Option<PathBuf>,
+    /// htslib background compression threads, from `-t`.
+    threads: usize,
+    /// The `@` lines seen so far, newline-terminated, exactly as the SAM path emitted them. Becomes
+    /// the htslib header when the first record line arrives.
+    header_text: Vec<u8>,
+    /// Bytes after the last `\n` of the previous `write` call: the incomplete tail of a line.
+    pending: Vec<u8>,
+    /// The open file, `None` until the header is complete.
+    writer: Option<HtsWriter>,
+}
+
+impl HtsTranscoder {
+    /// Feed one complete line, without its trailing `\n`. Header lines are buffered; the first
+    /// record line opens the file, and every record line is parsed and written.
+    fn consume_line(&mut self, line: &[u8]) -> anyhow::Result<()> {
+        // Defensive: our formatter never emits a blank line, but a blank one would make `from_sam`
+        // fail with an opaque parse error rather than being harmlessly skipped.
+        if line.is_empty() {
+            return Ok(());
+        }
+        if self.writer.is_none() && line[0] == b'@' {
+            self.header_text.extend_from_slice(line);
+            self.header_text.push(b'\n');
+            return Ok(());
+        }
+        let writer = self.open_writer()?;
+        // `from_sam` is htslib's own `sam_parse1`, i.e. the same parser samtools uses when it reads
+        // our SAM file back. That equivalence is the point: whatever samtools would make of the
+        // text, the BAM/CRAM holds.
+        let rec = bam::Record::from_sam(&writer.header, line)?;
+        writer.write(&rec)?;
+        Ok(())
+    }
+
+    /// The writer, opening the file on first use now that `header_text` is complete.
+    fn open_writer(&mut self) -> anyhow::Result<&mut HtsWriter> {
+        if self.writer.is_none() {
+            self.writer = Some(HtsWriter::open(
+                &self.path,
+                self.mode,
+                self.reference.as_deref(),
+                self.threads,
+                &self.header_text,
+            )?);
+        }
+        // The `expect` is unreachable: the branch above either filled `writer` or returned an error.
+        Ok(self.writer.as_mut().expect("writer just opened"))
+    }
+
+    /// Flush and close. Consumes the transcoder.
+    fn finish(mut self) -> anyhow::Result<()> {
+        // A trailing byte run with no `\n` cannot be completed by anything now, so it is a whole
+        // final line by definition. Our formatter always newline-terminates, so this is normally
+        // empty; feeding it is still better than silently dropping a record.
+        let tail = std::mem::take(&mut self.pending);
+        if !tail.is_empty() {
+            self.consume_line(&tail)?;
+        }
+        // A run that produced no records at all still owes the caller a valid, header-only file.
+        self.open_writer()?;
+        // `close` is where htslib finalizes: BAM's 28-byte EOF block, CRAM's end-of-file container.
+        // Taken out of the option so the `Drop` below finds nothing left to close.
+        self.writer.take().expect("writer just opened").close()
+    }
+}
+
+/// An open htslib output file: `hts_open` + `sam_hdr_write` + `sam_write1` + `hts_close`.
+///
+/// This is deliberately NOT `rust_htslib::bam::Writer`, and the reason is CRAM. `Writer::new` writes
+/// the header inside the constructor, so the earliest a caller can call `Writer::set_reference` is
+/// AFTER `sam_hdr_write`, and that is too late: `cram_write_SAM_hdr`
+/// (`htslib/cram/cram_io.c`, the "Fix M5 strings" block) walks the @SQ lines, finds neither an `M5`
+/// tag nor a loaded reference, and permanently flips the file descriptor to `embed_ref=2`
+/// (auto-generate an embedded reference). Every later container then calls
+/// `cram_generate_reference`, which fails on our read-ordered (not coordinate-sorted) output with
+/// "Cannot build reference with unsorted data" and falls back to non-reference CRAM. That still
+/// round-trips correctly, but it throws away the entire point of CRAM: measured on 50k pairs, 5.0 MB
+/// non-ref versus 1.0 MB with the external reference. Adding `M5` to our @SQ lines would also
+/// prevent the flip, but the SAM text is the parity oracle and may not gain a tag.
+///
+/// So the sequence below is `hts_open` -> `hts_set_fai_filename` -> `sam_hdr_write`, which is exactly
+/// what `samtools view -T ref.fa -C` does (`sam_view.c` sets the reference before writing the
+/// header). Everything else still comes from rust-htslib: the header parse (`HeaderView`) and the
+/// SAM-to-record parse (`Record::from_sam`) are its types, and we only borrow their raw pointers.
+struct HtsWriter {
+    /// The htslib file. Non-null for the whole life of the value; nulled by `close` so that `Drop`
+    /// does not double-close.
+    fp: *mut htslib::htsFile,
+    /// The parsed header. Owned here because `sam_write1` needs it on every record (it maps RNAME
+    /// to a numeric tid) and `Record::from_sam` needs it to parse one.
+    header: bam::HeaderView,
+}
+
+// SAFETY: `htsFile` is not shared, only moved: the sink is created on the main thread and handed to
+// the writer thread, which is then the only thread that touches it. This is the same reasoning (and
+// the same guarantee) as rust-htslib's own `unsafe impl Send for Writer`.
+unsafe impl Send for HtsWriter {}
+
+impl HtsWriter {
+    /// Open `path` for writing in `mode`, install `reference` if given, then write `header_text`
+    /// verbatim as the file header. The order of those three steps is load-bearing; see the type
+    /// docs.
+    fn open(
+        path: &Path,
+        mode: &'static std::ffi::CStr,
+        reference: Option<&Path>,
+        threads: usize,
+        header_text: &[u8],
+    ) -> anyhow::Result<Self> {
+        // Paths cross the FFI boundary as NUL-terminated bytes; an embedded NUL is the one thing a
+        // Rust path can hold that a C string cannot.
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| anyhow::anyhow!("-o {}: path contains a NUL byte", path.display()))?;
+        // SAFETY: both pointers are valid NUL-terminated C strings that outlive the call, and
+        // htslib copies what it needs from them.
+        let fp = unsafe { htslib::hts_open(cpath.as_ptr(), mode.as_ptr()) };
+        if fp.is_null() {
+            anyhow::bail!("-o {}: htslib could not open the file", path.display());
+        }
+        // From here on every early return must not leak `fp`, so the guard is built immediately and
+        // its `Drop` owns the close. `header` is a placeholder only until `sam_hdr_write` below;
+        // parsing it here (rather than after) is what lets that be true.
+        let this = HtsWriter {
+            fp,
+            header: bam::HeaderView::from_bytes(header_text),
+        };
+        if let Some(reference) = reference {
+            let cref = std::ffi::CString::new(reference.as_os_str().as_encoded_bytes())
+                .map_err(|_| anyhow::anyhow!("--reference: path contains a NUL byte"))?;
+            // SAFETY: `this.fp` is a live htsFile and `cref` outlives the call. htslib accepts
+            // either the FASTA or its `.fai` here (`refs_load_fai` strips the suffix); we pass the
+            // FASTA, as `samtools -T` does, so that a missing `.fai` is merely slow (htslib scans
+            // the FASTA to build the index in memory) rather than fatal.
+            if unsafe { htslib::hts_set_fai_filename(this.fp, cref.as_ptr()) } != 0 {
+                anyhow::bail!(
+                    "--reference {}: htslib could not load it as a CRAM reference",
+                    reference.display()
+                );
+            }
+        }
+        // htslib's own background compressor, sized like the BGZF variant's worker pool. Purely a
+        // throughput knob: it changes block boundaries, never the decoded records.
+        // SAFETY: live htsFile, and a positive thread count is what htslib documents.
+        if unsafe { htslib::hts_set_threads(this.fp, threads.max(1) as std::os::raw::c_int) } != 0 {
+            anyhow::bail!("htslib rejected {} compression threads", threads.max(1));
+        }
+        // SAFETY: live htsFile and a header parsed by htslib itself. `sam_hdr_write` only reads the
+        // header, hence the const pointer.
+        if unsafe { htslib::sam_hdr_write(this.fp, this.header.inner_ptr()) } < 0 {
+            anyhow::bail!("-o {}: writing the header failed", path.display());
+        }
+        Ok(this)
+    }
+
+    /// Write one record. The header must be the one it was parsed against: `sam_write1` reads the
+    /// record's numeric `tid`, which only means anything relative to that header's @SQ order.
+    fn write(&mut self, rec: &bam::Record) -> anyhow::Result<()> {
+        // SAFETY: all three pointers are live, and htslib only reads the header and the record.
+        if unsafe { htslib::sam_write1(self.fp, self.header.inner_ptr(), rec.inner()) } < 0 {
+            anyhow::bail!("writing a BAM/CRAM record failed");
+        }
+        Ok(())
+    }
+
+    /// Finalize and close, surfacing the error `Drop` would have to swallow. `hts_close` is where
+    /// the last block is compressed and flushed, so this is the call that reports a full disk.
+    fn close(mut self) -> anyhow::Result<()> {
+        // Nulled first so the `Drop` that runs at the end of this function sees nothing to do.
+        let fp = std::mem::replace(&mut self.fp, std::ptr::null_mut());
+        // SAFETY: `fp` is live and is not used again (the field is now null).
+        if unsafe { htslib::hts_close(fp) } != 0 {
+            anyhow::bail!("closing the BAM/CRAM file failed (output may be truncated)");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HtsWriter {
+    fn drop(&mut self) {
+        // Only reached on an error path, since `finish` closes explicitly. The file still has to be
+        // closed, but there is no one left to report to, so the return value is discarded here (and
+        // ONLY here).
+        if !self.fp.is_null() {
+            // SAFETY: non-null means still open, and nothing touches `fp` after this.
+            unsafe { htslib::hts_close(self.fp) };
+        }
+    }
 }
 
 /// BGZF deflate level. The `bgzf` crate accepts 0-12; 6 is zlib's traditional default and is what
@@ -893,6 +1137,34 @@ impl Write for Output {
         match self {
             Output::Plain(w) => w.write(buf),
             Output::Bgzf(w) => w.write(buf),
+            // Both binary variants consume the whole buffer or fail: a partial count would leave the
+            // transcoder's line state and the caller's cursor disagreeing about what was consumed.
+            Output::Bam(t) | Output::Cram(t) => {
+                // Split on `\n`, carrying an unterminated tail into `pending` for the next call.
+                // `rest` shrinks to the not-yet-dispatched remainder of `buf`.
+                let mut rest = buf;
+                while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
+                    let (line, after) = rest.split_at(nl);
+                    let res = if t.pending.is_empty() {
+                        // Whole line inside this buffer: pass the slice straight through, no copy.
+                        t.consume_line(line)
+                    } else {
+                        // The line began in an earlier `write`. Taking `pending` out first both
+                        // ends the borrow of `self` and leaves the field empty for the next line.
+                        let mut joined = std::mem::take(&mut t.pending);
+                        joined.extend_from_slice(line);
+                        let res = t.consume_line(&joined);
+                        // Reuse the allocation, now emptied, as the next partial-line buffer.
+                        joined.clear();
+                        t.pending = joined;
+                        res
+                    };
+                    res.map_err(io::Error::other)?;
+                    rest = &after[1..]; // skip the `\n` itself
+                }
+                t.pending.extend_from_slice(rest);
+                Ok(buf.len())
+            }
         }
     }
     #[inline]
@@ -900,30 +1172,72 @@ impl Write for Output {
         match self {
             Output::Plain(w) => w.flush(),
             Output::Bgzf(w) => w.flush(),
+            // htslib buffers internally and offers no flush short of closing the file, which
+            // `finish` does. Nothing here can be forced out, so this is honestly a no-op.
+            Output::Bam(_) | Output::Cram(_) => Ok(()),
         }
     }
 }
 
 impl Output {
     /// Open the output sink. `None` writes uncompressed SAM to stdout; a path with a `.gz`/`.bgz`
-    /// suffix writes BGZF compressed in parallel on `threads` workers; any other path writes an
-    /// uncompressed file.
+    /// suffix writes BGZF compressed in parallel on `threads` workers; `.bam`/`.cram` write binary
+    /// BAM/CRAM through htslib; any other path writes an uncompressed file.
     ///
     /// # Parameters
     ///
     /// - `path`: the `-o` argument, or `None` for stdout. An existing file is truncated.
     /// - `threads`: BGZF compression workers, from `-t`. Clamped to >= 1, and ignored entirely for
     ///   the plain variants. It affects only throughput: BGZF block boundaries and therefore the
-    ///   decompressed bytes are the same at any worker count.
+    ///   decompressed bytes are the same at any worker count. The same value is handed to htslib's
+    ///   background compressor for `.bam`/`.cram`.
+    /// - `reference`: the `--reference` FASTA. Required for `.cram` and ignored otherwise.
     ///
     /// # Returns
     ///
-    /// The opened sink. Errors if the file cannot be created, or if the compile-time compression
-    /// level is somehow out of the `bgzf` crate's accepted range.
-    fn open(path: Option<&Path>, threads: usize) -> anyhow::Result<Self> {
+    /// The opened sink. Errors if the file cannot be created, if `.cram` was asked for without a
+    /// `--reference`, or if the compile-time compression level is somehow out of the `bgzf` crate's
+    /// accepted range. Note the binary variants do not touch the filesystem here: htslib opens the
+    /// file only once the header text has streamed through (see [`HtsTranscoder`]).
+    fn open(path: Option<&Path>, threads: usize, reference: Option<&Path>) -> anyhow::Result<Self> {
         match path {
             None => Ok(Output::Plain(Box::new(BufWriter::new(std::io::stdout())))),
             Some(path) => {
+                // Binary formats first, by the same case-insensitive suffix rule as `.gz` below, and
+                // before the `File::create` further down: htslib must be the one to open the file.
+                let ext_is = |want: &str| {
+                    path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
+                };
+                if ext_is("bam") || ext_is("cram") {
+                    let want_cram = ext_is("cram");
+                    // Refused up front rather than at the first record: CRAM stores SEQ as a diff
+                    // against the reference, so without one there is nothing to write.
+                    if want_cram && reference.is_none() {
+                        anyhow::bail!(
+                            "-o {}: CRAM output needs the reference FASTA, pass --reference <FASTA> \
+                             (the same one you indexed; its .fai must exist)",
+                            path.display()
+                        );
+                    }
+                    let transcoder = Box::new(HtsTranscoder {
+                        path: path.to_path_buf(),
+                        // htslib's write modes: `w` plus `b` for BAM or `c` for CRAM.
+                        mode: if want_cram { c"wc" } else { c"wb" },
+                        // Kept for BAM too, harmlessly: htslib ignores a reference for BAM, and
+                        // dropping it here would make the two variants differ for no reason.
+                        reference: reference.map(Path::to_path_buf),
+                        threads,
+                        header_text: Vec::new(),
+                        pending: Vec::new(),
+                        writer: None,
+                    });
+                    return Ok(if want_cram {
+                        Output::Cram(transcoder)
+                    } else {
+                        Output::Bam(transcoder)
+                    });
+                }
                 // Whether the caller asked for BGZF, decided purely from the suffix (case-insensitive
                 // `.gz`/`.bgz`), as bgzip and samtools do. There is no explicit flag for it.
                 let want_bgzf = path.extension().is_some_and(|ext| {
@@ -954,13 +1268,16 @@ impl Output {
         }
     }
 
-    /// Flush and finalize (BGZF: drain workers + write the EOF marker). Consumes the sink.
+    /// Flush and finalize (BGZF: drain workers + write the EOF marker; BAM/CRAM: write any
+    /// unterminated final line, then close the htslib file, which is what emits BAM's EOF block or
+    /// CRAM's end-of-file container). Consumes the sink.
     fn finish(self) -> anyhow::Result<()> {
         match self {
             Output::Plain(mut w) => w.flush()?,
             Output::Bgzf(mut w) => {
                 w.finish()?;
             }
+            Output::Bam(t) | Output::Cram(t) => t.finish()?,
         }
         Ok(())
     }
@@ -1127,7 +1444,18 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Both are loaded once, live for the whole run, and are shared immutably with every worker.
     // Together they are several GB for a human genome (memory-mapped where possible).
     let fm = FmIndex::load(&args.index_prefix)?;
-    let bns = BntSeq::load(&args.index_prefix)?;
+    let mut bns = BntSeq::load(&args.index_prefix)?;
+    // `-j`: clear the ALT flags the loader just read from `<prefix>.alt`, so every contig counts as
+    // primary assembly. Done here, after loading, exactly as `fastmap.cpp:907` does it.
+    if args.ignore_alt {
+        bns.ignore_alt();
+    }
+    // bwa prints this at load time (`bwa.cpp:419`). Kept behind the same verbosity gate as bwa's
+    // other progress chatter: it goes to stderr and never touches the SAM bytes.
+    if args.verbose.unwrap_or(3) >= 3 && bns.n_alt() > 0 {
+        eprintln!("[M::main_mem] read {} ALT contigs", bns.n_alt());
+    }
+    let bns = bns;
     // One `@SQ` line per contig, in index order. That order comes from the FASTA and must be
     // preserved: downstream tools treat @SQ order as the coordinate sort order.
     //
@@ -1142,6 +1470,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         .map(|contig| SqRecord {
             name: contig.name.clone(),
             len: i64::from(contig.len),
+            is_alt: contig.is_alt,
         })
         .collect();
 
@@ -1195,7 +1524,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // ================= Open the sink and write the header =================
     // The sink. Written to directly for the header here, then MOVED into the pipeline's writer
     // thread, which is the only thread that touches it afterwards.
-    let mut out = Output::open(args.output.as_deref(), n_threads)?;
+    let mut out = Output::open(args.output.as_deref(), n_threads, args.reference.as_deref())?;
     // The raw command line, verbatim, for `@PG CL:`.
     // Single-space joined, so a quoted argument containing spaces is not re-quoted; that matches
     // what bwa writes.
@@ -1403,6 +1732,9 @@ fn finish_se(
     // `mem_mark_primary_se` with `secondary` (-1 = unshadowed, else the index of the shadower).
     // After marking, `regs[0]` is the highest-scoring primary.
     let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs_pre);
+    // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after the dedup and
+    // before any primary marking reads it.
+    bwa_mem::stamp_is_alt(bns, &mut regs);
     mem_mark_primary_se(opt, &mut regs, read_id);
     if dump_regs_enabled() {
         bwa_mem::dump_regs(bns, "post-dedup+mark", &regs);
@@ -1702,6 +2034,14 @@ fn write_aln_se(
             ));
         }
     }
+    // `pa:f` (`bwamem.cpp:1714`): how much better this primary-assembly hit scored than the ALT hit
+    // that shadows it. Emitted for a non-secondary record whenever `alt_sc` was set, INDEPENDENTLY
+    // of whether an `SA:Z` was printed just above, and always before `XA:Z`. `alt_sc` is 0 unless
+    // the index has ALT contigs, so this is dead weight on an index without a `.alt` file.
+    if !emit.secondary && aln.alt_sc > 0 {
+        tags.push_str("\tpa:f:");
+        tags.push_str(&bwa_mem::cigar::format_pa(aln.score, aln.alt_sc));
+    }
     if let Some(xa_string) = &emit.xa {
         tags.push_str("\tXA:Z:");
         tags.push_str(xa_string);
@@ -1887,8 +2227,11 @@ fn run_pe(
             .zip(paired.into_par_iter())
             .map(
                 |((rec1, rec2), ((codes1, codes2), (regs_pre1, regs_pre2)))| {
-                    let regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
-                    let regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
+                    let mut regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
+                    let mut regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
+                    // `bwamem.cpp:1161`, applied to both mates of the pair.
+                    bwa_mem::stamp_is_alt(bns, &mut regs1);
+                    bwa_mem::stamp_is_alt(bns, &mut regs2);
                     PrepPair {
                         codes1,
                         codes2,
@@ -2032,4 +2375,73 @@ struct PrepPair {
     /// `-C`: the FASTQ comment of each mate, appended at the end of its record.
     comment1: Option<String>,
     comment2: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two SAM records against a one-contig header, as the aligner would have formatted them.
+    const HEADER: &str = "@SQ\tSN:chr1\tLN:100\n@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:0\tCL:test\n";
+    const RECORDS: &str = "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\tNM:i:0\n\
+                           r2\t16\tchr1\t7\t60\t4M\t*\t0\t0\tTTTT\tIIII\tNM:i:1\n";
+
+    /// The BAM sink must reassemble records that a `write` boundary splits mid-line. The pipeline
+    /// happens to hand it whole records today, so this is the only thing that pins the `pending`
+    /// carry-over: feed the same bytes one byte at a time and the BAM must be the same file as
+    /// feeding them in one call.
+    #[test]
+    fn bam_transcoder_reassembles_split_lines() {
+        let dir = std::env::temp_dir();
+        let whole = dir.join(format!("bwa3_bam_whole_{}.bam", std::process::id()));
+        let split = dir.join(format!("bwa3_bam_split_{}.bam", std::process::id()));
+        let text = format!("{HEADER}{RECORDS}");
+
+        let mut out = Output::open(Some(&whole), 1, None).unwrap();
+        out.write_all(text.as_bytes()).unwrap();
+        out.finish().unwrap();
+
+        let mut out = Output::open(Some(&split), 1, None).unwrap();
+        for byte in text.as_bytes() {
+            out.write_all(&[*byte]).unwrap();
+        }
+        out.finish().unwrap();
+
+        let a = std::fs::read(&whole).unwrap();
+        let b = std::fs::read(&split).unwrap();
+        let _ = std::fs::remove_file(&whole);
+        let _ = std::fs::remove_file(&split);
+        assert_eq!(a, b, "byte-split writes must produce the same BAM");
+        // Non-trivial output: the BGZF magic plus more than an empty file's EOF block.
+        assert!(a.starts_with(&[0x1f, 0x8b]) && a.len() > 100);
+    }
+
+    /// A run that aligns nothing still owes the caller a valid, header-only BAM: the file is opened
+    /// lazily on the first record, so `finish` has to force it.
+    #[test]
+    fn bam_header_only_still_produces_a_file() {
+        let path = std::env::temp_dir().join(format!("bwa3_bam_hdr_{}.bam", std::process::id()));
+        let mut out = Output::open(Some(&path), 1, None).unwrap();
+        out.write_all(HEADER.as_bytes()).unwrap();
+        out.finish().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // BGZF magic, and long enough to hold the header block plus the 28-byte EOF block that
+        // makes samtools consider the file complete rather than truncated.
+        assert!(bytes.starts_with(&[0x1f, 0x8b]), "not a BGZF file");
+        assert!(bytes.len() > 28, "no header block written");
+    }
+
+    /// CRAM without `--reference` must fail at option-parsing time, not halfway through a run.
+    #[test]
+    fn cram_without_reference_is_rejected() {
+        let path = std::env::temp_dir().join("bwa3_never_created.cram");
+        // `Output` is not `Debug`, so the error is pulled out by hand rather than via `unwrap_err`.
+        let err = match Output::open(Some(&path), 1, None) {
+            Ok(_) => panic!("CRAM without --reference must not open"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("--reference"), "unexpected message: {err}");
+        assert!(!path.exists(), "the file must not have been created");
+    }
 }

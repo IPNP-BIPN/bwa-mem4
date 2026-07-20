@@ -258,7 +258,7 @@ pub fn mem_gen_alt(
             xa_bytes.push(if aln.is_rev { b'-' } else { b'+' });
             xa_bytes.extend_from_slice((aln.pos + 1).to_string().as_bytes());
             xa_bytes.push(b',');
-            crate::pe::add_cigar(&aln.cigar, 0, &mut xa_bytes);
+            crate::pe::add_cigar(&aln.cigar, false, &mut xa_bytes);
             xa_bytes.push(b',');
             xa_bytes.extend_from_slice(aln.nm.to_string().as_bytes());
             xa_bytes.push(b';');
@@ -303,6 +303,7 @@ mod tests {
             w: 0,
             frac_rep: 0.0,
             is_alt: false,
+            alt_sc: 0,
             hash: 0,
             n_comp: 1,
         }

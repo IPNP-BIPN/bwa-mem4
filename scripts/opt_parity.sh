@@ -19,12 +19,19 @@ R2="${R2:-work/r2_50k.fq}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# `-p` reads both mates from ONE file, mates adjacent. Built here rather than committed so it can
+# never drift from $R1/$R2: any difference between this file and the two-file cases would be an
+# artifact of the fixture, not of the aligner.
+IL="$TMP/interleaved.fq"
+paste -d'\n' <(paste - - - - <"$R1") <(paste - - - - <"$R2") | tr '\t' '\n' > "$IL"
+
 pass=0; fail=0; failed_opts=()
 
-# $1 = label, $2 = "se"|"pe", rest = option words
+# $1 = label, $2 = "se"|"pe"|"pi", rest = option words
 # Modes `se!`/`pe!` mean "the caller supplies -t and -K itself". Needed because clap rejects a
 # repeated flag where bwa's getopt silently lets the last one win, so testing -t or -K by appending
 # a second copy would fail on the CLI layer and tell us nothing about the aligner.
+# Mode `pi` is paired-end from the single interleaved file, i.e. what `-p` consumes.
 check() {
   local label="$1" mode="$2"; shift 2
   # `${base[@]+"${base[@]}"}` at the call sites, not a bare `"${base[@]}"`: macOS ships bash 3.2,
@@ -33,7 +40,9 @@ check() {
   # a missing directory.
   local base=(-t2 -K 10000000)
   case "$mode" in *'!') base=(); mode="${mode%!}";; esac
-  local reads=("$R1"); [ "$mode" = pe ] && reads=("$R1" "$R2")
+  local reads=("$R1")
+  [ "$mode" = pe ] && reads=("$R1" "$R2")
+  [ "$mode" = pi ] && reads=("$IL")
   $M2 mem ${base[@]+"${base[@]}"} "$@" "$IDX" "${reads[@]}" 2>/dev/null | grep -v '^@PG' > "$TMP/a.sam"
   local rc2=$?
   $M3 mem ${base[@]+"${base[@]}"} "$@" "$IDX" "${reads[@]}" 2>/dev/null | grep -v '^@PG' > "$TMP/b.sam"
@@ -84,6 +93,64 @@ check() {
     printf '  %-28s %-3s [FAIL] %s recs mem2 / %s mem3, %s differing records\n' "$label" "$mode" "$l2" "$l3" "$d"
     fail=$((fail+1)); failed_opts+=("$label")
   fi
+}
+
+# `-o` writes the SAM to a file instead of stdout. Compared against the oracle like any other
+# option, except that neither side's output arrives on a pipe.
+check_o() {
+  local label="-o file" mode="pe"
+  local base=(-t2 -K 10000000)
+  $M2 mem "${base[@]}" -o "$TMP/o_a.sam" "$IDX" "$R1" "$R2" 2>/dev/null
+  $M3 mem "${base[@]}" -o "$TMP/o_b.sam" "$IDX" "$R1" "$R2" 2>/dev/null
+  local rc3=$?
+  if [ $rc3 -ne 0 ]; then
+    printf '  %-28s %-3s [FAIL] mem3 exited non-zero\n' "$label" "$mode"; fail=$((fail+1)); failed_opts+=("$label"); return
+  fi
+  grep -v '^@PG' "$TMP/o_a.sam" > "$TMP/o_a2.sam"
+  grep -v '^@PG' "$TMP/o_b.sam" > "$TMP/o_b2.sam"
+  if cmp -s "$TMP/o_a2.sam" "$TMP/o_b2.sam"; then
+    printf '  %-28s %-3s [PASS]\n' "$label" "$mode"; pass=$((pass+1))
+  else
+    printf '  %-28s %-3s [FAIL] -o output differs from the oracle\n' "$label" "$mode"
+    fail=$((fail+1)); failed_opts+=("$label")
+  fi
+}
+
+# BGZF output (`-o out.gz`) is OURS, not bwa-mem2's, so there is no oracle to compare against and
+# this is a round-trip check instead: decompressing it must reproduce the plain `-o` bytes exactly,
+# and samtools must accept it. `@PG` is stripped on both sides because its `CL:` records the output
+# filename, which necessarily differs between the two runs. Getting that wrong makes this test
+# look broken when it is fine; it has already happened once.
+check_bgzf() {
+  local label="-o file.gz (bgzf)" mode="pe"
+  local base=(-t2 -K 10000000)
+  # Fail, do not skip. `bgzip` lives in the `tabix` package, not in `samtools`, and a missing tool
+  # silently turning this case into a no-op is exactly how an output path stops being covered.
+  for tool in bgzip samtools; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      printf '  %-28s %-3s [FAIL] %s not installed (apt: samtools tabix / brew: samtools htslib)\n' "$label" "$mode" "$tool"
+      fail=$((fail+1)); failed_opts+=("$label"); return
+    fi
+  done
+  $M3 mem "${base[@]}" -o "$TMP/z.sam"    "$IDX" "$R1" "$R2" 2>/dev/null
+  $M3 mem "${base[@]}" -o "$TMP/z.sam.gz" "$IDX" "$R1" "$R2" 2>/dev/null
+  if ! bgzip -d -c "$TMP/z.sam.gz" > "$TMP/z_rt.sam" 2>/dev/null; then
+    printf '  %-28s %-3s [FAIL] bgzip could not decompress it\n' "$label" "$mode"
+    fail=$((fail+1)); failed_opts+=("$label"); return
+  fi
+  grep -v '^@PG' "$TMP/z.sam"    > "$TMP/z2.sam"
+  grep -v '^@PG' "$TMP/z_rt.sam" > "$TMP/z_rt2.sam"
+  if ! cmp -s "$TMP/z2.sam" "$TMP/z_rt2.sam"; then
+    printf '  %-28s %-3s [FAIL] round-trip differs from plain -o\n' "$label" "$mode"
+    fail=$((fail+1)); failed_opts+=("$label"); return
+  fi
+  # A valid BGZF file is more than a gzip stream: samtools needs the BC extra field and the EOF
+  # block, and `gzip -d` would happily accept a file that samtools rejects.
+  if ! samtools view -H "$TMP/z.sam.gz" >/dev/null 2>&1; then
+    printf '  %-28s %-3s [FAIL] samtools rejects the BGZF file\n' "$label" "$mode"
+    fail=$((fail+1)); failed_opts+=("$label"); return
+  fi
+  printf '  %-28s %-3s [PASS]\n' "$label" "$mode"; pass=$((pass+1))
 }
 
 echo "=== baseline (no options) ==="
@@ -153,6 +220,27 @@ check "-H hdr"  se -H '@CO\textra header line'
 # test degenerates to `0 < 0`, so only the C's `prev = a->score` (not -1) accepts at round 0.
 check "-w 1"    se -w 1
 check "-w 0"    se -w 0
+
+# `-p` and the output sinks were the last accepted options with no differential coverage at all,
+# found while auditing for the 3.0.0 release. `-p` is a whole input path of its own (one file, mates
+# adjacent, de-interleaved internally), not a scalar knob, so "it parses" proved nothing about it.
+# The output-shaping flags above are all tested SINGLE-END, and single-end never reaches the paired
+# emission branch or `mem_reg2sam`'s pairing fallback. Running `-a` paired-end for the first time,
+# on 2026-07-20, immediately found a real byte-parity bug: we emitted XA:Z where bwa emits none,
+# because `-a` (MEM_F_ALL) suppresses XA entirely and both PE emitters generated it unconditionally.
+# Same shape as `-N` and `-p` before it: the failure sits wherever the gate does not run.
+echo "=== output-shaping flags, paired-end ==="
+check "-a (pe)"  pe -a
+check "-M (pe)"  pe -M
+check "-Y (pe)"  pe -Y
+check "-5 (pe)"  pe -5
+check "-q (pe)"  pe -q
+check "-a -Y (pe)" pe -a -Y
+
+echo "=== input and output paths ==="
+check "-p (interleaved)" pi -p
+check_o
+check_bgzf
 
 echo ""
 echo "RESULT: $pass passed, $fail failed"

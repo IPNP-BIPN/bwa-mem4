@@ -5,18 +5,19 @@ use std::time::Instant;
 
 use clap::Args;
 
-// `bwa-mem3 index`'s option set: one positional and nothing else.
+// `bwa-mem3 index`'s option set: one positional plus `-p`, matching `bwa-mem2 index`.
 //
 // `//` rather than `///`: clap can surface an args struct's doc comment in the subcommand's help,
 // and the `index` help text must stay exactly as it is. The per-field `///` below is the intended
 // help string.
 #[derive(Args)]
 pub struct IndexArgs {
-    // The only argument. bwa-mem2's `index` accepts `-p prefix` to place the output elsewhere; this
-    // port does not, so the side files are always written next to the FASTA and the FASTA path
-    // doubles as the index prefix passed to `mem`.
     /// FASTA reference to index.
     pub fasta: PathBuf,
+    /// Index file prefix [same as the FASTA path]. The five side files become `<prefix>.pac`,
+    /// `.ann`, `.amb`, `.bwt.2bit.64` and `.0123`, and `<prefix>` is what `mem` is then given.
+    #[arg(short = 'p')]
+    pub prefix: Option<PathBuf>,
 }
 
 /// Build the index and report elapsed time on stderr.
@@ -42,7 +43,10 @@ pub struct IndexArgs {
 pub fn run(args: IndexArgs) -> anyhow::Result<()> {
     // Wall-clock origin for the one stderr progress line below. Not used for anything else.
     let t0 = Instant::now();
-    bwa_index::build_index(&args.fasta)?;
+    // Defaulting the prefix to the FASTA path is bwa's behaviour, not just a convenience: it is
+    // why a bare path can be passed to both `index` and `mem`.
+    let prefix = args.prefix.clone().unwrap_or_else(|| args.fasta.clone());
+    bwa_index::build_index_with_prefix(&args.fasta, &prefix)?;
     eprintln!(
         "[bwa-mem3 index] built index for {} in {:.3}s",
         args.fasta.display(),

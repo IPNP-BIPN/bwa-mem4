@@ -492,11 +492,10 @@ table (nothing depends on something listed above it, except `bwa-cli` which depe
 | `bwa-mem` | The alignment core and pipeline glue: extension driver (`lib.rs`, `across.rs`), dedup / primary marking / MAPQ (`primary.rs`), CIGAR / NM / MD (`cigar.rs`), all paired-end logic (`pe.rs`), `XA` generation (`alt.rs`) | `bwa-core`, `bwa-index`, `bwa-seed`, `bwa-chain`, `bwa-extend`, `bwa-neon` |
 | `bwa-cli` | The `bwa-mem3` binary: `index` and `mem` subcommands, option parsing and validation (`cmd_mem.rs`, 1484 lines, half of it per-option documentation), the threaded read/process/write pipeline | most of the above, `clap`, `rayon`, `bgzf`, `mimalloc` |
 | `bwa-diff` | The `sam-diff` binary: field-level SAM concordance reporting, so a divergence reads as "37 records differ in XA" rather than as a byte offset. Deliberately lossy (five fields, primaries only, order-insensitive), so a clean report is **not** proof of parity | `serde`, `serde_json` |
-| `bwa-sam` | **Empty placeholder.** Reserved early for primary marking / MAPQ / CIGAR / tags; that work ended up next to the code it needs. Its own module doc now points at the real locations. Nothing depends on it | nothing |
 
-Two notes on the tables in older docs: the crate tables in `README.md` and `CONTRIBUTING.md`
-predate the current layout. They still attribute primary marking, MAPQ and CIGAR to `bwa-sam`
-(they live in `bwa-mem`) and do not list `bwa-neon`. Trust this table and the source.
+`bwa-sam` was an empty placeholder crate, reserved early for primary marking / MAPQ / CIGAR / tags
+before that work ended up next to the code it needs. It was removed for 3.0.0: it held no code and
+nothing depended on it, and shipping an empty crate in a release is noise in every `cargo tree`.
 
 **Dead ends kept in tree.** `bwa-index/src/lisa.rs`, `rmi.rs` and `bwa-seed/src/lisa_seed.rs` are a
 byte-identical implementation of BWA-MEME's learned-index seeding. Per the project's own notes it
@@ -535,8 +534,15 @@ Terms and short variable names you will hit constantly, with what they *mean*.
 - **ALT contig.** An *alternate* contig: a second representation of a locus that is genuinely
   polymorphic in the population, shipped alongside the primary assembly. A hit on one is not real
   evidence of ambiguity, so it is suppressed from primary consideration and does not dilute a
-  primary hit's MAPQ. This repo's reference has none, and the ALT-specific branches of
-  `mem_mark_primary_se` are explicitly not ported (`primary.rs:399`).
+  primary hit's MAPQ. Which contigs are ALT comes from an optional `<prefix>.alt` file listing
+  their names, read at load time (never from the index itself, so the same index behaves
+  differently depending on whether that file sits next to it). The ALT-specific branches ARE
+  ported: `BntSeq::apply_alt` reads the file, `mem_mark_primary_se` runs its `n_pri < n` branch
+  (re-sorting so the primary assembly forms a prefix and re-marking within it), an ALT contig's
+  `@SQ` line carries `AH:*`, a shadowed primary hit gets a `pa:f` tag, and the paired branch emits
+  the best ALT hit as a supplementary record. `mem -j` clears every flag, making the run behave as
+  though no `.alt` existed. The committed fixtures have no ALT contigs, so `scripts/alt_parity.sh`
+  (manual, real GRCh38 analysis set) is what actually exercises all of this.
 
 ### The index
 

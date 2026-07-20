@@ -48,6 +48,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Needed by the BGZF case in opt_parity.sh: `bgzip` ships in `tabix`, not in `samtools`.
+      # The harness FAILS rather than skips when they are absent, deliberately: a silent skip is
+      # how an output path stops being tested without anyone noticing.
+      - name: Install samtools and bgzip
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends samtools tabix
+          samtools --version | head -1
+          bgzip --version | head -1
+
       - name: Fetch bwa-mem2 ${{ env.BWA_MEM2_VERSION }} (the oracle)
         run: |
           set -euo pipefail
@@ -134,7 +144,7 @@ jobs:
             /tmp/ours.sam
           retention-days: 5
 
-      - name: Option parity vs bwa-mem2 (49 cases)
+      - name: Option parity vs bwa-mem2 (58 cases)
         env:
           IDX: testdata/tiny/tiny.fa
           R1: /tmp/ci_1.fq

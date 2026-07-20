@@ -895,6 +895,8 @@ pub fn align_reads_batched<B: SwBackend>(
                         w: opt.w,
                         frac_rep: chain.frac_rep,
                         is_alt: chain.is_alt,
+                        // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
+                        alt_sc: 0,
                         hash: 0,
                         n_comp: 1,
                     });
@@ -926,6 +928,8 @@ pub fn align_reads_batched<B: SwBackend>(
                     w: opt.w,
                     frac_rep: chain.frac_rep,
                     is_alt: chain.is_alt,
+                    // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
+                    alt_sc: 0,
                     hash: 0,
                     n_comp: 1,
                 };

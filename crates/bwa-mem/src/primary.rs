@@ -56,7 +56,7 @@
 
 use bwa_chain::ks_introsort_by;
 use bwa_core::MemOpt;
-use bwa_index::FmIndex;
+use bwa_index::{BntSeq, FmIndex};
 
 use crate::cigar::gen_cigar2;
 use crate::MemAlnReg;
@@ -558,6 +558,33 @@ fn mark_primary_core(opt: &MemOpt, a: &mut [MemAlnReg]) {
     }
 }
 
+/// Stamp `is_alt` on every region from its OWN contig, immediately after the dedup pass. Port of
+/// the loop at `bwamem.cpp:1161-1170`.
+///
+/// This looks redundant with the flag the chain already carries (`bwamem.cpp:948`) and is not.
+/// Extension moves a region's boundaries, `mem_sort_dedup_patch` merges regions together, and the
+/// surviving region's `rid` is therefore not guaranteed to be the `rid` of the chain that seeded
+/// it. The C stamps again, from the region, and so must we.
+///
+/// Deliberately NOT folded into [`mem_sort_dedup_patch`]: mate rescue also calls that function, and
+/// there the C copies the flag from the ANCHOR (`b.is_alt = a->is_alt`, `bwamem_pair.cpp:218`)
+/// rather than reading it from the rescued region's own contig. Stamping inside the dedup would
+/// overwrite that with a different answer whenever a rescued mate lands on a contig of the other
+/// kind.
+///
+/// # Parameters
+///
+/// - `bns`: the contig table, the only place `is_alt` lives.
+/// - `regs`: one read's regions, post-dedup. Mutated in place. Regions with `rid < 0` are left
+///   alone, matching the C's `p->rid >= 0` guard.
+pub fn stamp_is_alt(bns: &BntSeq, regs: &mut [MemAlnReg]) {
+    for r in regs.iter_mut() {
+        if r.rid >= 0 && bns.contigs[r.rid as usize].is_alt {
+            r.is_alt = true;
+        }
+    }
+}
+
 /// Mark primary/secondary regions and set `sub`/`sub_n`. Port of `mem_mark_primary_se`
 /// (`bwamem.cpp:1420`) for the primary-assembly (non-ALT) case.
 ///
@@ -568,12 +595,12 @@ fn mark_primary_core(opt: &MemOpt, a: &mut [MemAlnReg]) {
 /// Returns `n_pri`, the number of non-ALT regions. Callers use it to decide whether the ALT
 /// re-ranking machinery is needed.
 ///
-/// Scope limit: the C branches at `bwamem.cpp:1440` on `n_pri < n` and, when ALT contigs are
-/// present, runs a second sort (`mem_ars_hash2`), rebuilds `secondary_all` through a rank
-/// permutation, sets `secondary = INT_MAX` on ALT hits and re-runs the core over just the primary
-/// prefix. None of that is ported: this function only implements the `else` branch at
-/// `bwamem.cpp:1458`. It is correct exactly when the index has no ALT contigs. The C's `alt_sc`
-/// bookkeeping (`bwamem.cpp:1437`) is likewise absent, since it is only read in the ALT path.
+/// Both branches at `bwamem.cpp:1440` are implemented. When the index has ALT contigs and at least
+/// one region landed on one (`n_pri < n`), the function re-sorts with `alnreg_hlt2` so the
+/// primary-assembly hits form the prefix `0..n_pri`, rebuilds `secondary_all` through a rank
+/// permutation, sets `secondary = INT_MAX` on the ALT hits, and re-runs the core over that prefix
+/// alone. Without ALT contigs `n_pri == n` and only the cheap `else` branch runs, so an index with
+/// no `.alt` file pays nothing for any of this.
 ///
 /// # Parameters
 ///
@@ -639,10 +666,73 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
                 && (!x.is_alt && y.is_alt || (x.is_alt == y.is_alt && x.hash < y.hash)))
     });
     mark_primary_core(opt, a);
-    // No ALT contigs: `secondary_all` mirrors `secondary` (the C's else-branch when n_pri == n).
-    // `mem_gen_alt`/the PE swap read `secondary_all` separately from `secondary`.
-    for r in a.iter_mut() {
-        r.secondary_all = r.secondary;
+    let n = a.len();
+    // First-round bookkeeping (`bwamem.cpp:1433-1439`), done BEFORE any re-ranking:
+    //   - `secondary_all` temporarily holds this region's rank in the first round. It is not the
+    //     final value; the ALT branch below rewrites it through that rank. Overloading one field
+    //     for two meanings is the C's design, kept because the permutation below depends on it.
+    //   - `alt_sc` records the score of the ALT region shadowing a primary-assembly one, which is
+    //     the numerator's partner in the `pa:f` tag.
+    for i in 0..n {
+        a[i].secondary_all = i as i32;
+        let sec = a[i].secondary;
+        if !a[i].is_alt && sec >= 0 && a[sec as usize].is_alt {
+            a[i].alt_sc = a[sec as usize].score;
+        }
+    }
+    if n_pri < n as i32 {
+        // ---- There is at least one ALT hit. Rank the primary-assembly hits on their own -------
+        // Re-sort with ALT-ness as the FIRST key (`alnreg_hlt2`, `bwamem.cpp:158`) rather than the
+        // third, so that every non-ALT region moves ahead of every ALT one and the primary
+        // assembly occupies the prefix `0..n_pri`. Skipped when n_pri == 0, exactly as the C skips
+        // it: with no primary-assembly hit there is no prefix to isolate, and re-sorting would
+        // reorder the ALT hits for nothing.
+        if n_pri > 0 {
+            ks_introsort_by(a, |x, y| {
+                (!x.is_alt && y.is_alt)
+                    || (x.is_alt == y.is_alt
+                        && (x.score > y.score || (x.score == y.score && x.hash < y.hash)))
+            });
+        }
+        // `z[first_round_rank] = index_after_the_re-sort`. Built from `secondary_all`, which each
+        // region carried through the sort, so it inverts the permutation the sort just applied.
+        let mut z = vec![0i32; n];
+        for i in 0..n {
+            z[a[i].secondary_all as usize] = i as i32;
+        }
+        // `secondary` still points at FIRST-ROUND indices, so it has to be mapped through `z` to
+        // stay meaningful. `secondary_all` keeps the full ranking (ALT hits included), which is
+        // what `mem_gen_alt` and the PE primary/secondary swap read; `secondary` is then reserved
+        // for the primary-assembly-only ranking recomputed just below.
+        for i in 0..n {
+            if a[i].secondary >= 0 {
+                a[i].secondary_all = z[a[i].secondary as usize];
+                // An ALT hit is excluded from the primary-assembly ranking altogether. INT_MAX,
+                // not -1: -1 means "unshadowed primary" and would promote the ALT hit instead.
+                if a[i].is_alt {
+                    a[i].secondary = i32::MAX;
+                }
+            } else {
+                a[i].secondary_all = -1;
+            }
+        }
+        if n_pri > 0 {
+            // Re-run the marking over the primary-assembly prefix ONLY, so that `sub` (and hence
+            // MAPQ) reflects competition within the primary assembly and is not diluted by an ALT
+            // representation of the same locus. `sub_n` is deliberately NOT reset here: the C
+            // resets only `sub` and `secondary` (`bwamem.cpp:1455`).
+            for r in a[..n_pri as usize].iter_mut() {
+                r.sub = 0;
+                r.secondary = -1;
+            }
+            mark_primary_core(opt, &mut a[..n_pri as usize]);
+        }
+    } else {
+        // No ALT contigs: `secondary_all` mirrors `secondary` (the C's else-branch at
+        // `bwamem.cpp:1458`). `mem_gen_alt`/the PE swap read `secondary_all` separately.
+        for r in a.iter_mut() {
+            r.secondary_all = r.secondary;
+        }
     }
     n_pri
 }
@@ -792,6 +882,7 @@ mod tests {
             w: 0,
             frac_rep: 0.0,
             is_alt: false,
+            alt_sc: 0,
             hash: 0,
             n_comp: 0,
         }

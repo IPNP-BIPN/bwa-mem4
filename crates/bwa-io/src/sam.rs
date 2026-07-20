@@ -71,6 +71,11 @@ pub struct SqRecord {
     /// Contig length in BASES, written as `LN:<len>`. Signed because the index stores 64-bit signed
     /// offsets; always positive in practice. Read only by [`write_header`].
     pub len: i64,
+    /// Whether this is an ALT contig, which appends `\tAH:*` to its `@SQ` line (`bwa.cpp:538`).
+    /// `AH:*` is the SAM spec's way of saying "this sequence is an alternate locus, and the primary
+    /// locus it corresponds to is not named here". Only ever true when the index has a `.alt` file
+    /// and `-j` was not given.
+    pub is_alt: bool,
 }
 
 /// Write the SAM header. bwa-mem2 emits NO `@HD` line; it starts with `@SQ` (one per contig), then
@@ -131,7 +136,13 @@ pub fn write_header<W: Write>(
         hdr_lines.is_some_and(|block| block.split('\n').any(|line| line.starts_with("@SQ\t")));
     if !user_supplied_sq {
         for sq in sqs {
-            writeln!(w, "@SQ\tSN:{}\tLN:{}", sq.name, sq.len)?;
+            // `bwa.cpp:538` writes the AH tag as a SUFFIX on the same line, so an ALT contig's line
+            // ends `...\tAH:*\n` and a normal one ends `...\n`.
+            if sq.is_alt {
+                writeln!(w, "@SQ\tSN:{}\tLN:{}\tAH:*", sq.name, sq.len)?;
+            } else {
+                writeln!(w, "@SQ\tSN:{}\tLN:{}", sq.name, sq.len)?;
+            }
         }
     }
     // ---- The -H insertions with the -R @RG line already appended, verbatim ----
@@ -285,6 +296,7 @@ mod tests {
         let sqs = vec![SqRecord {
             name: "20:2000000-2200000".into(),
             len: 200_001,
+            is_alt: false,
         }];
         write_header(
             &mut buf,
@@ -302,6 +314,41 @@ mod tests {
         assert!(s.contains("\n@PG\tID:bwa-mem3\t"));
     }
 
+    /// An ALT contig's `@SQ` line carries the `AH:*` suffix and a normal one does not
+    /// (`bwa.cpp:538`). Guards the one line of output that a `.alt` file changes in the header.
+    #[test]
+    fn alt_contig_sq_line_carries_ah() {
+        let mut buf = Vec::new();
+        let sqs = vec![
+            SqRecord {
+                name: "chr1".into(),
+                len: 100,
+                is_alt: false,
+            },
+            SqRecord {
+                name: "chr1_KI270762v1_alt".into(),
+                len: 50,
+                is_alt: true,
+            },
+        ];
+        write_header(
+            &mut buf,
+            &sqs,
+            None,
+            "bwa-mem3",
+            "bwa-mem3",
+            "0.0.0",
+            "bwa-mem3 mem x",
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("@SQ\tSN:chr1\tLN:100\n"), "{s}");
+        assert!(
+            s.contains("@SQ\tSN:chr1_KI270762v1_alt\tLN:50\tAH:*\n"),
+            "{s}"
+        );
+    }
+
     /// `-R`/`-H` land between the generated `@SQ` lines and `@PG`, in that order
     /// (`bwa_print_sam_hdr`), and user-supplied `@SQ` lines suppress the generated ones.
     #[test]
@@ -309,6 +356,7 @@ mod tests {
         let sqs = vec![SqRecord {
             name: "chr1".into(),
             len: 100,
+            is_alt: false,
         }];
         let mut buf = Vec::new();
         write_header(

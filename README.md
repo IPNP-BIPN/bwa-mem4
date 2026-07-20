@@ -13,7 +13,9 @@ Not "equivalent alignments". The same bytes.
 | Index | byte-identical, all five files |
 | Single-end | byte-identical on **353,517,767** records |
 | Paired-end | byte-identical on **707,312,349** records |
+| ALT contigs | byte-identical on the real GRCh38 analysis set, 261 ALT contigs |
 | Speed | SE **2.62x**, PE **1.85x** vs bwa-mem2 at `-t8` |
+| Output | SAM, BGZF-compressed SAM, BAM, CRAM |
 
 Measured on a real 32.9x human WGS (GIAB HG002, 2x150), not simulated reads and not a sampled
 subset. Both aligners read the same on-disk index. Reproduce with `scripts/giab30x_pe.sh`.
@@ -75,17 +77,23 @@ bash scripts/check.sh          # fmt, clippy, unit tests
 ```
 
 ```sh
-# Byte-for-byte SAM comparison against bwa-mem2 across 49 option combinations.
+# Byte-for-byte SAM comparison against bwa-mem2 across 58 option combinations.
 python3 scripts/make_test_reads.py testdata/tiny/tiny.fa /tmp/ci --n 8000
 IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \
   bash scripts/opt_parity.sh ./target/release/bwa-mem3
 ```
 
 ```sh
+bash scripts/alt_parity.sh     # ALT contigs: real GRCh38 analysis set + the real bwakit .alt
 bash scripts/giab30x_pe.sh     # the real thing: a full 30x WGS, several hours
 ```
 
-Both of the first two run in CI on every push. The third is manual.
+```sh
+bash scripts/upstream_repros.sh   # open bwa-mem2 crash issues, run against both aligners
+```
+
+The first two run in CI on every push. The rest are manual: the ALT fixture is 3.2 GB and its
+index build peaks near 80 GB of RAM, and the 30x WGS takes hours.
 
 **A passing gate proves nothing until you have watched it fail on a bug you know is there.** Every
 byte-identity bug found in this project so far has lived exactly where the gate was not looking:
@@ -111,7 +119,6 @@ A Cargo workspace, one crate per pipeline stage. The binary is `bwa-mem3` (`inde
 | `bwa-mem` | Extension, dedup, primary marking, MAPQ, CIGAR, tags, paired-end |
 | `bwa-cli` | The `bwa-mem3` binary |
 | `bwa-diff` | Field-level SAM concordance (`sam-diff`) |
-| `bwa-sam` | Empty. Reserved and never filled in; nothing depends on it |
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is the guide for someone who knows neither this code nor
 bioinformatics: one read's journey from FASTQ to SAM line, a glossary of every abbreviation, and
@@ -126,6 +133,25 @@ against the scalar reference. The Metal shader had shipped a real bug (it opened
 instead of `M`) precisely because that proof was too weak. It is in the git history if the profile
 ever changes.
 
+## Output formats
+
+`-o` picks the format from the suffix: plain SAM, `.gz`/`.bgz` for BGZF-compressed SAM (compressed
+in parallel on `-t` threads), `.bam`, or `.cram` (which also needs `--reference`). Omitting `-o`
+writes SAM to stdout, which is all bwa-mem2 itself can do.
+
+BAM and CRAM are produced by TRANSCODING the SAM text through htslib, not by a second formatter.
+That is deliberate: byte-identity is defined on the SAM bytes, so the binary formats have to be a
+lossless re-encoding of exactly those bytes. On 100,000 records the BAM decodes back to records
+byte-identical to the SAM path. CRAM does not, and cannot: htslib discards `NM`/`MD` and
+regenerates them from the reference, which reorders the optional tags. With the tags sorted the
+records are identical, and `samtools view -C -T` on our own BAM produces the same order.
+
+| | bytes | ratio |
+|---|---|---|
+| SAM | 44,957,730 | 1x |
+| BAM | 8,203,307 | 5.5x |
+| CRAM | 1,187,099 | 37.9x |
+
 ## Building
 
 ```sh
@@ -134,7 +160,26 @@ cargo build --release
 
 Rust 1.96. macOS and Linux, on both x86_64 and aarch64.
 
+## Upstream bugs
+
+bwa-mem2's behaviour is reproduced byte for byte, and that includes its bugs. Several open upstream
+issues are therefore **deliberately not fixed here**, because fixing them would break the
+acceptance criterion: [#293](https://github.com/bwa-mem2/bwa-mem2/issues/293) (`-R` can produce a
+technically invalid BAM), [#278](https://github.com/bwa-mem2/bwa-mem2/issues/278) (`MQ` tags absent
+where bwa emits them), [#260](https://github.com/bwa-mem2/bwa-mem2/issues/260) (MAPQ of
+supplementary alignments).
+
+Crashes are the exception: a run that aborts produces no output, so there is nothing to be
+identical to. `scripts/upstream_repros.sh` runs three of them against both aligners.
+[#269](https://github.com/bwa-mem2/bwa-mem2/issues/269) reproduces exactly, on the 345 read pairs
+attached to that issue: bwa-mem2 2.3 dies with `assert failed for seqPair size` and emits nothing,
+while we align all 345 pairs.
+
+[#297](https://github.com/bwa-mem2/bwa-mem2/issues/297), the x86-vs-arm64 disagreement described
+above, was filed from this project.
+
 ## Licence
 
-MIT. This is a derivative work of [bwa-mem2](https://github.com/bwa-mem2/bwa-mem2)
-(Copyright 2019 Intel Corporation, Heng Li), which is also MIT licensed.
+MIT, in [LICENSE](LICENSE). This is a derivative work of
+[bwa-mem2](https://github.com/bwa-mem2/bwa-mem2) (Copyright 2019 Intel Corporation, Heng Li), which
+is also MIT licensed; its copyright notice is retained in full in that file.

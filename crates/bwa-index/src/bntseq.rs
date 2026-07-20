@@ -65,6 +65,18 @@ pub struct Contig {
     pub len: i32,
     /// Number of ambiguous-base RUNS inside this contig (not the number of ambiguous bases).
     pub n_ambs: i32,
+    /// Whether this contig is an ALT (alternate haplotype) contig, i.e. whether its name appears in
+    /// `<prefix>.alt` (`bntseq.cpp:218`). Not stored in `.ann`: it comes from a separate file that
+    /// the INDEXER never writes and the LOADER reads if present, so two runs over the same index
+    /// can disagree on it depending only on whether that file exists.
+    ///
+    /// An ALT contig is a second representation of a region that already exists in the primary
+    /// assembly (a divergent HLA haplotype, say). A read from that region therefore has a genuine
+    /// hit in both places, and reporting the ALT hit as primary would move the read off the
+    /// coordinate system every downstream tool expects. So ALT hits are ranked below primary ones
+    /// and kept out of primary consideration, which is what the `n_pri` machinery in
+    /// `mem_mark_primary_se` implements.
+    pub is_alt: bool,
 }
 
 /// An ambiguous-base run (from `.amb`), the C's `bntamb1_t`. Also called a "hole".
@@ -118,7 +130,69 @@ impl BntSeq {
         let amb = std::fs::read_to_string(sibling(prefix, "amb"))?;
         let mut bns = parse_ann(&ann)?;
         parse_amb(&amb, &mut bns)?;
+        // `<prefix>.alt` is OPTIONAL (`bntseq.cpp:200` opens it and carries on if the open fails),
+        // so its absence is not an error and leaves every contig non-ALT.
+        let alt_path = sibling(prefix, "alt");
+        if let Ok(alt) = std::fs::read_to_string(&alt_path) {
+            bns.apply_alt(&alt);
+        }
         Ok(bns)
+    }
+
+    /// Mark every contig named in a `.alt` file as ALT. Port of the `.alt` block of `bns_restore`
+    /// (`bntseq.cpp:200-224`).
+    ///
+    /// The file is bwa's own format, not SAM, despite looking like it: each line's FIRST
+    /// tab-separated field is a contig name, and the rest of the line is ignored. Lines whose first
+    /// field starts with `@` are skipped, which is how the SAM headers in bwakit's shipped `.alt`
+    /// are tolerated. A name that matches no contig is silently ignored (the C's `kh_get` miss),
+    /// so a `.alt` from a different assembly quietly marks nothing rather than failing.
+    ///
+    /// The C reads the file character by character and treats `\t`, `\n` and `\r` all as field
+    /// terminators, then skips to the next `\n`. That means a lone `\r` (old Mac line endings)
+    /// terminates a name but does NOT end the line, so the rest is skipped as a comment either way.
+    /// Splitting on ASCII whitespace here would differ: it would also split on spaces, and a contig
+    /// name containing a space cannot exist (`.ann` stores the name up to the first space), so the
+    /// two agree on every name that can actually match.
+    fn apply_alt(&mut self, alt: &str) {
+        // Name -> index, built once. The C builds the same hash over `bns->anns[i].name`.
+        let by_name: std::collections::HashMap<&str, usize> = self
+            .contigs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.as_str(), i))
+            .collect();
+        // Collected first, then applied: `by_name` borrows the contig names, so the marking cannot
+        // run inside the same loop.
+        let mut hits = Vec::new();
+        for line in alt.split(['\n', '\r']) {
+            // First field only. `split('\t').next()` on a line with no tab yields the whole line,
+            // which is what the C's character loop does when the line ends before any tab.
+            let name = line.split('\t').next().unwrap_or("");
+            if name.is_empty() || name.starts_with('@') {
+                continue;
+            }
+            if let Some(&i) = by_name.get(name) {
+                hits.push(i);
+            }
+        }
+        for i in hits {
+            self.contigs[i].is_alt = true;
+        }
+    }
+
+    /// Clear every contig's ALT flag, for `mem -j` ("treat ALT contigs as part of the primary
+    /// assembly"). Port of `fastmap.cpp:907`, which likewise clears the flags AFTER the index is
+    /// loaded rather than skipping the file: same result, and it keeps the one parse path.
+    pub fn ignore_alt(&mut self) {
+        for c in self.contigs.iter_mut() {
+            c.is_alt = false;
+        }
+    }
+
+    /// Number of ALT contigs, i.e. what bwa reports as `* Read N ALT contigs` (`bwa.cpp:419`).
+    pub fn n_alt(&self) -> usize {
+        self.contigs.iter().filter(|c| c.is_alt).count()
     }
 
     /// Map a 2L-space position to `(forward_pos, is_rev)`, mirroring `bns_depos`.
@@ -418,6 +492,8 @@ fn parse_ann(text: &str) -> Result<BntSeq> {
             offset,
             len,
             n_ambs,
+            // `.ann` does not record it. Set later by `apply_alt` from the optional `.alt` file.
+            is_alt: false,
         });
     }
 

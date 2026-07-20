@@ -23,6 +23,7 @@ mimalloc = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 bgzf = { workspace = true }
+rust-htslib = { workspace = true }
 
 [lints]
 workspace = true

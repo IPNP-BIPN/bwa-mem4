@@ -3,7 +3,13 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.0"
+# 3.0.0 for the FIRST release, not 0.1.0. The number tracks what this reimplements: bwa-mem2 is
+# the 2, and this is the generation after it. A 0.x would also misdescribe the maturity, since the
+# acceptance criterion has been byte-identity against a real 30x WGS from the start.
+#
+# This version string is not decorative: it is emitted as `@PG VN:` on every SAM/BAM/CRAM file
+# produced, so it is the only record a downstream consumer has of which binary made their data.
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
@@ -41,7 +47,6 @@ bwa-index = { path = "crates/bwa-index" }
 bwa-seed = { path = "crates/bwa-seed" }
 bwa-chain = { path = "crates/bwa-chain" }
 bwa-extend = { path = "crates/bwa-extend" }
-bwa-sam = { path = "crates/bwa-sam" }
 bwa-mem = { path = "crates/bwa-mem" }
 bwa-diff = { path = "crates/bwa-diff" }
 bwa-neon = { path = "crates/bwa-neon" }
@@ -57,6 +62,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 mimalloc = { version = "0.1", default-features = false }
+# BAM/CRAM output. `hts-sys` compiles the vendored htslib C sources with the system toolchain, so
+# there is no runtime dependency on a brew/apt htslib. `default-features = false` drops bzip2, lzma
+# and curl: we only ever WRITE local files, and htslib's own writers never pick those codecs (BAM is
+# BGZF/deflate; CRAM defaults to gzip + rANS), so dropping them costs nothing and removes three C
+# libraries from the build. Reading a third-party CRAM that used them is out of scope here.
+rust-htslib = { version = "1", default-features = false }
 
 # Release profile tuned for reproducible builds: a single codegen unit removes parallel-codegen
 # nondeterminism; fat LTO is a pure optimization (deterministic under a fixed toolchain, changes no

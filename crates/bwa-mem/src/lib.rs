@@ -77,7 +77,7 @@ pub mod primary;
 pub use across::align_reads_batched;
 pub use cigar::{cigar_string, reg2aln, MemAln};
 pub use pe::{batch_mate_rescue, mem_pestat, mem_sam_pe, PairRescueData, PeStat};
-pub use primary::{mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch};
+pub use primary::{mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch, stamp_is_alt};
 
 /// Sentinel for uninitialized region bounds (bwa's `H0_`, `macro.h:44`: `#define H0_ -99`).
 ///
@@ -149,6 +149,12 @@ pub struct MemAlnReg {
     pub frac_rep: f32,
     /// Whether the region sits on an ALT contig, which suppresses it from primary consideration.
     pub is_alt: bool,
+    /// Score of the ALT region that shadows this one, when a PRIMARY-assembly region is shadowed
+    /// by an ALT one (`bwamem.cpp:1437`); 0 otherwise. Written during the FIRST marking round,
+    /// before the ALT re-ranking permutes the array, and read once at emission to produce the
+    /// `pa:f` tag (`bwamem.cpp:1714`, printed as `score / alt_sc`). Stays 0 on an index with no
+    /// ALT contigs, which is why `pa:f` never appears without a `.alt` file.
+    pub alt_sc: i32,
     /// Per-region hash used purely as a deterministic tie-break when two regions compare equal
     /// during primary marking, so that ordering does not depend on sort stability. Derived from
     /// the read id, hence the `read_id` parameter threaded through `align_read_se`.
@@ -535,6 +541,8 @@ pub(crate) fn mem_chain2aln_meta(
                 w: opt.w,
                 frac_rep: chain.frac_rep,
                 is_alt: chain.is_alt,
+                // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
+                alt_sc: 0,
                 hash: 0,
                 n_comp: 1,
             });
@@ -563,6 +571,8 @@ pub(crate) fn mem_chain2aln_meta(
             w: opt.w,
             frac_rep: chain.frac_rep,
             is_alt: chain.is_alt,
+            // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
+            alt_sc: 0,
             hash: 0,
             n_comp: 1,
         };
@@ -782,7 +792,9 @@ pub fn align_read_dedup(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) 
     if std::env::var_os("BWA3_DUMP_REGS").is_some() {
         dump_regs(bns, "pre-dedup", &regs);
     }
-    let deduped = mem_sort_dedup_patch(fm, opt, codes, regs);
+    let mut deduped = mem_sort_dedup_patch(fm, opt, codes, regs);
+    // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after the dedup.
+    crate::primary::stamp_is_alt(bns, &mut deduped);
     if std::env::var_os("BWA3_DUMP_REGS").is_some() {
         dump_regs(bns, "post-dedup", &deduped);
     }
@@ -837,6 +849,7 @@ pub fn align_read_se(
 ) -> Vec<MemAlnReg> {
     let regs = align_read(fm, bns, opt, codes);
     let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs);
+    crate::primary::stamp_is_alt(bns, &mut regs);
     mem_mark_primary_se(opt, &mut regs, read_id);
     regs
 }

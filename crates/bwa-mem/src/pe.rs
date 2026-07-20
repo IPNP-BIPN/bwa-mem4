@@ -487,6 +487,8 @@ fn mem_matesw(
                         w: 0,
                         frac_rep: 0.0,
                         is_alt: a.is_alt,
+                        // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
+                        alt_sc: 0,
                         hash: 0,
                         n_comp: 0,
                     };
@@ -768,6 +770,8 @@ fn matesw_apply(
                     w: 0,
                     frac_rep: 0.0,
                     is_alt: call.is_alt,
+                    // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
+                    alt_sc: 0,
                     hash: 0,
                     n_comp: 0,
                 };
@@ -1510,10 +1514,16 @@ fn get_rlen(cigar: &[u32]) -> i64 {
     rlen
 }
 
-/// Append a CIGAR string, converting soft-clips to hard-clips for supplementary alignments
-/// (`which != 0`). Port of `add_cigar` (`bwamem.cpp:1579-1591`), for the non-ALT case with neither
-/// `-Y` (MEM_F_SOFTCLIP) nor an ALT hit, where the C's guard `!(opt->flag&MEM_F_SOFTCLIP) &&
-/// !p->is_alt` is always true.
+/// Append a CIGAR string, converting soft-clips to hard-clips when `hard_clip` says to. Port of
+/// `add_cigar` (`bwamem.cpp:1579-1591`).
+///
+/// The C's condition is `p->n_cigar && which && !(opt->flag&MEM_F_SOFTCLIP) && !p->is_alt`, i.e.
+/// THREE things beyond being supplementary. It is passed in rather than derived from `which` here
+/// because two of the three are invisible at this level: `-Y` lives in the options and `is_alt` on
+/// the alignment, and the `MC:Z` caller needs the MATE's `is_alt` with the CURRENT record's
+/// `which`. Deriving it from `which` alone was wrong for an ALT supplementary, which must keep its
+/// SOFT clips: it is a parallel representation of the whole read, not a fragment of a split
+/// alignment, so the primary's SEQ is not the rest of it.
 ///
 /// PARAMETERS: `cigar` is bwa-packed (`len << 4 | op`). `which` is the alignment's index within its
 /// read's list; index 0 is the primary and everything after it is supplementary. An EMPTY `cigar`
@@ -1524,7 +1534,7 @@ fn get_rlen(cigar: &[u32]) -> i64 {
 /// WHY hard-clip: SAM requires that only one record per read carry the full SEQ. bwa keeps SEQ on
 /// the primary (soft-clipped) and hard-clips the supplementaries, whose SEQ is then trimmed to
 /// match by the caller.
-pub(crate) fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
+pub(crate) fn add_cigar(cigar: &[u32], hard_clip: bool, out: &mut Vec<u8>) {
     if cigar.is_empty() {
         out.push(b'*');
         return;
@@ -1539,7 +1549,7 @@ pub(crate) fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
         // here is already 4. That holds: `cigar.rs` builds clips exclusively as `len << 4 | 3`
         // (the two `insert`/`push` sites around `crates/bwa-mem/src/cigar.rs:416`), so op 4 never
         // enters a CIGAR before this point.
-        if (op == 3 || op == 4) && which != 0 {
+        if (op == 3 || op == 4) && hard_clip {
             op = 4; // hard-clip on supplementary
         }
         out.extend_from_slice((c >> 4).to_string().as_bytes());
@@ -1576,6 +1586,10 @@ fn mem_aln2sam(
     list: &[MemAln],
     which: usize,
     m: Option<&MemAln>,
+    // `-Y` (MEM_F_SOFTCLIP): keep soft clips on supplementary records instead of hard-clipping
+    // them. Passed in rather than read from `MemOpt` because this function takes no options struct
+    // by design; it is a formatter, and every other decision was already made by the caller.
+    softclip: bool,
     out: &mut Vec<u8>,
 ) {
     // `p`: the alignment being printed, and `m` the mate's, both private copies (bwa's `ptmp`/
@@ -1647,7 +1661,7 @@ fn mem_aln2sam(
         out.push(b'\t');
         out.extend_from_slice(p.mapq.to_string().as_bytes());
         out.push(b'\t');
-        add_cigar(&p.cigar, which, out);
+        add_cigar(&p.cigar, which != 0 && !softclip && !p.is_alt, out);
     } else {
         out.extend_from_slice(b"*\t0\t0\t*");
     }
@@ -1713,9 +1727,10 @@ fn mem_aln2sam(
         let (mut qb, mut qe) = (0usize, seq.len());
         // Hard-clip trimming for supplementary alignments: `add_cigar` turned this record's clips
         // into H, and H means the bases are ABSENT from SEQ, so the emitted range must be narrowed
-        // to match or the record is self-inconsistent. `which != 0` is the same supplementary test
-        // `add_cigar` uses, which is why the two must be kept in step.
-        if !p.cigar.is_empty() && which != 0 {
+        // to match or the record is self-inconsistent. This condition is EXACTLY `add_cigar`'s
+        // (`bwamem.cpp:1655` repeats the same four terms), and the two must be kept in step: trim
+        // without hard-clipping and the record claims bases it does not carry.
+        if !p.cigar.is_empty() && which != 0 && !softclip && !p.is_alt {
             // Opcodes of the CIGAR's two outermost ops; 3 (S) or 4 (H) means that end is clipped.
             let first = p.cigar[0] & 0xf;
             let last = p.cigar[p.cigar.len() - 1] & 0xf;
@@ -1784,7 +1799,7 @@ fn mem_aln2sam(
     if let Some(mate) = m.as_ref() {
         if !mate.cigar.is_empty() {
             out.extend_from_slice(b"\tMC:Z:");
-            add_cigar(&mate.cigar, which, out);
+            add_cigar(&mate.cigar, which != 0 && !softclip && !mate.is_alt, out);
         }
     }
     // AS/XS are gated on `>= 0`, not on `> 0`, which is why an unmapped record (built from a zeroed
@@ -1826,7 +1841,7 @@ fn mem_aln2sam(
                 out.push(b',');
                 out.push(if r.is_rev { b'-' } else { b'+' });
                 out.push(b',');
-                add_cigar(&r.cigar, 0, out);
+                add_cigar(&r.cigar, false, out);
                 out.push(b',');
                 out.extend_from_slice(r.mapq.to_string().as_bytes());
                 out.push(b',');
@@ -1835,7 +1850,14 @@ fn mem_aln2sam(
             }
         }
     }
-    // XA:Z (alternate hits), after SA/pa per mem_aln2sam. `pa` needs ALT contigs, so never emitted.
+    // `pa:f` (`bwamem.cpp:1714`): emitted for a non-secondary record whenever `alt_sc` was set,
+    // independently of whether an `SA:Z` was printed, and always before `XA:Z`. `alt_sc` is 0
+    // unless the index has ALT contigs.
+    if p.flag & 0x100 == 0 && p.alt_sc > 0 {
+        out.extend_from_slice(b"\tpa:f:");
+        out.extend_from_slice(crate::cigar::format_pa(p.score, p.alt_sc).as_bytes());
+    }
+    // XA:Z (alternate hits), after SA/pa per mem_aln2sam.
     if let Some(xa) = &p.xa {
         out.extend_from_slice(b"\tXA:Z:");
         out.extend_from_slice(xa.as_bytes());
@@ -1875,13 +1897,28 @@ fn mem_reg2sam(
     m: Option<&MemAln>,
     out: &mut Vec<u8>,
 ) {
+    // `-Y`, read once here and threaded into every `mem_aln2sam` call below.
+    let softclip = opt.flag & bwa_core::opt::flags::SOFTCLIP != 0;
     // Shadowed hits are not emitted here; they surface as the primary's XA:Z, which this path used
     // to omit entirely (~1% of PE records carried no XA where bwa emits one).
     // XA is generated over the WHOLE region vector and indexed by `k`, so a region that is dropped
     // below still contributes to the surviving primary's XA:Z list. That is the point: shadowed
     // hits are reported as alternates, not as records.
     // `xa[k]`: the XA:Z string region `k` should carry, or `None`. Index-parallel with `a`.
-    let xa = mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq);
+    //
+    // `-a` (MEM_F_ALL) suppresses XA entirely: the C guards the call with
+    // `if (!(opt->flag & MEM_F_ALL)) XA = mem_gen_alt(...)` and leaves `XA` null otherwise
+    // (`bwamem.cpp:1521`). The two are alternatives: `-a` emits every shadowed region as its own
+    // record, so repeating those placements inside a tag would duplicate them. Generating it
+    // unconditionally was a byte-parity bug on `-a`, which the option harness never saw because it
+    // only ever ran `-a` single-end, where this path is not reached with shadowed regions present.
+    // `-a` (MEM_F_ALL): emit every alignment, including the shadowed ones, and emit no XA.
+    let all = opt.flag & bwa_core::opt::flags::ALL != 0;
+    let xa = if all {
+        vec![None; a.len()]
+    } else {
+        mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq)
+    };
     // ---- step 1: turn the surviving regions into records ----
     // `emitted` is bwa's `aa`, the records to emit; `n_emitted` is its `l`, the count accepted so
     // far, and is what makes "everything after the first" supplementary. It is a separate counter
@@ -1893,16 +1930,23 @@ fn mem_reg2sam(
         if p.score < opt.t {
             continue;
         }
-        if p.secondary >= 0 {
-            continue; // !MEM_F_ALL: drop all secondaries
+        // `bwamem.cpp:1541`. A secondary is dropped unless `-a` asked for every alignment, and an
+        // ALT secondary is dropped even then: under `-a` the ALT hits are already reported as the
+        // supplementary record the paired branch emits, so repeating them here would duplicate
+        // them.
+        if p.secondary >= 0 && (p.is_alt || !all) {
+            continue;
         }
-        // Dead under the unconditional `continue` above, which subsumes it: the C's guard is
-        // `p->secondary >= 0 && (p->is_alt || !(opt->flag&MEM_F_ALL))`, so without `-a` every
-        // secondary is already gone and this drop-ratio test only ever fires under `-a`. Kept in
-        // place so the port stays line-alignable with `bwamem.cpp:1541`, and so that adding `-a`
-        // support later is a matter of relaxing the guard above rather than re-deriving this. Note
-        // the f32: `opt->drop_ratio` is a C `float`.
+        // `bwamem.cpp:1543`. Drop a secondary that scores too far below the primary shadowing it.
+        //
+        // `p.secondary < i32::MAX` is NOT redundant, and leaving it out is a panic rather than a
+        // wrong byte: `mem_mark_primary_se`'s ALT branch parks ALT hits at `secondary = INT_MAX`
+        // as a sentinel, and indexing `a[INT_MAX]` would be out of bounds. The C guards the same
+        // way and for the same reason.
+        //
+        // f32 throughout: `opt->drop_ratio` is a C `float`.
         if p.secondary >= 0
+            && p.secondary < i32::MAX
             && (p.score as f32) < a[p.secondary as usize].score as f32 * opt.drop_ratio
         {
             continue;
@@ -1937,10 +1981,21 @@ fn mem_reg2sam(
         // A zeroed alignment: rid -1, no CIGAR, MAPQ 0, score 0. Printed as the read's only record.
         let mut unmapped = MemAln::unmapped();
         unmapped.flag |= extra_flag;
-        mem_aln2sam(bns, name, seq, qual, comment, &[unmapped], 0, m, out);
+        mem_aln2sam(
+            bns,
+            name,
+            seq,
+            qual,
+            comment,
+            &[unmapped],
+            0,
+            m,
+            softclip,
+            out,
+        );
     } else {
         for k in 0..emitted.len() {
-            mem_aln2sam(bns, name, seq, qual, comment, &emitted, k, m, out);
+            mem_aln2sam(bns, name, seq, qual, comment, &emitted, k, m, softclip, out);
         }
     }
 }
@@ -2183,12 +2238,27 @@ pub fn mem_sam_pe<W: Write>(
                 // Per-region XA:Z strings for each end, index-parallel with `a0`/`a1`. Generated
                 // AFTER the inversion above, which is the whole reason the inversion exists: only
                 // then does `xa0[z[0]]` hold the shadow group's alternates.
-                let xa0 = mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]);
-                let xa1 = mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]);
+                //
+                // `-a` (MEM_F_ALL) suppresses XA ENTIRELY on this path: the C is
+                // `if (!(opt->flag & MEM_F_ALL)) XA[i] = mem_gen_alt(...); else XA[0] = XA[1] = 0;`
+                // (`bwamem_pair.cpp:484`). The two are alternatives, not complements: `-a` already
+                // emits every shadowed region as its own record, so listing those same placements
+                // again inside a tag would duplicate them. Generating XA here regardless was a real
+                // byte-parity bug, invisible because `-a` was only ever exercised single-end.
+                // `-Y`, needed by every `mem_aln2sam` call in this branch.
+                let softclip = opt.flag & bwa_core::opt::flags::SOFTCLIP != 0;
+                let all = opt.flag & bwa_core::opt::flags::ALL != 0;
+                let (xa0, xa1) = if all {
+                    (vec![None; a0.len()], vec![None; a1.len()])
+                } else {
+                    (
+                        mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]),
+                        mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]),
+                    )
+                };
 
-                // Exactly ONE record per end on this path (bwa's `n_aa[i]` stays 1 without ALT
-                // hits), which is why each `mem_aln2sam` call below passes a single-element slice
-                // and `which = 0`: no supplementary, no hard clipping, no SA:Z.
+                // One record per end WITHOUT ALT contigs (bwa's `n_aa[i]` stays 1), two when the end
+                // also has a reportable ALT hit: see the `n_pri < n` block after `h0`/`h1` below.
                 //
                 // 0x40 = first in pair, 0x80 = second (bwa writes `0x40 << i`).
                 //
@@ -2214,30 +2284,74 @@ pub fn mem_sam_pe<W: Write>(
                     h.xa = xa1[z[1]].clone();
                     h
                 };
+                // ---- The ALT hit, if this end has one worth reporting (`bwamem_pair.cpp:496`) --
+                // The paired record above is a primary-assembly hit. When the end ALSO hits an ALT
+                // contig, bwa emits that as a second, SUPPLEMENTARY record (0x800) so the ALT
+                // placement is not lost, while the pairing and the coordinate system stay anchored
+                // on the primary assembly.
+                //
+                // Only ONE candidate is ever considered: `a[n_pri]`, the first region after the
+                // primary-assembly prefix, i.e. the best-scoring ALT hit. It is dropped unless it
+                // clears `-T`, is unshadowed, and really is ALT. Nothing is emitted at all when the
+                // index has no ALT contigs, since then `n_pri == a.len()`.
+                let alt_extra = |a: &[MemAlnReg],
+                                 n_pri: usize,
+                                 xa: &[Option<String>],
+                                 seq: &[u8],
+                                 flag_bit: u32|
+                 -> Option<MemAln> {
+                    if n_pri >= a.len() {
+                        return None;
+                    }
+                    let p = &a[n_pri];
+                    if p.score < opt.t || p.secondary >= 0 || !p.is_alt {
+                        return None;
+                    }
+                    let mut g = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
+                    g.flag |= 0x800 | flag_bit | extra_flag;
+                    g.xa = xa[n_pri].clone();
+                    Some(g)
+                };
+                // bwa's `aa[i]`: every record emitted for this end, primary first. Its LENGTH is
+                // what makes the difference downstream, because `mem_aln2sam` uses it to decide
+                // whether an `SA:Z` is owed and how to clip.
+                let mut aa0 = vec![h0.clone()];
+                aa0.extend(alt_extra(a0, n_pri0, &xa0, seqs[0], 0x40));
+                let mut aa1 = vec![h1.clone()];
+                aa1.extend(alt_extra(a1, n_pri1, &xa1, seqs[1], 0x80));
+
+                // The MATE handed to the other end's records is `h`, the paired primary record,
+                // never the ALT supplementary one (the C passes `&h[1]` and `&h[0]`).
                 let mut buf0 = Vec::new();
-                mem_aln2sam(
-                    bns,
-                    &names[0],
-                    seqs[0],
-                    quals[0],
-                    comments[0],
-                    std::slice::from_ref(&h0),
-                    0,
-                    Some(&h1),
-                    &mut buf0,
-                );
+                for which in 0..aa0.len() {
+                    mem_aln2sam(
+                        bns,
+                        &names[0],
+                        seqs[0],
+                        quals[0],
+                        comments[0],
+                        &aa0,
+                        which,
+                        Some(&h1),
+                        softclip,
+                        &mut buf0,
+                    );
+                }
                 let mut buf1 = Vec::new();
-                mem_aln2sam(
-                    bns,
-                    &names[1],
-                    seqs[1],
-                    quals[1],
-                    comments[1],
-                    std::slice::from_ref(&h1),
-                    0,
-                    Some(&h0),
-                    &mut buf1,
-                );
+                for which in 0..aa1.len() {
+                    mem_aln2sam(
+                        bns,
+                        &names[1],
+                        seqs[1],
+                        quals[1],
+                        comments[1],
+                        &aa1,
+                        which,
+                        Some(&h0),
+                        softclip,
+                        &mut buf1,
+                    );
+                }
                 w.write_all(&buf0)?;
                 w.write_all(&buf1)?;
                 return Ok(());

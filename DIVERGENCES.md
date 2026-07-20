@@ -4,9 +4,19 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## Acceptees (par conception)
 
-- **`@PG`** : notre sortie emet `ID:bwa-mem3 PN:bwa-mem3 VN:<ver> CL:<notre argv>`, l'oracle emet
-  `bwa-mem2`. Exclu du gate d'octet-identite (on compare `@SQ` + lignes d'alignement). Decision finale
-  (spoof eventuel de `@PG`) reportee en fin de projet.
+- **`@PG` : DECIDE (3.0.0). Nous emettons notre propre identite, definitivement.** Notre sortie
+  emet `ID:bwa-mem3 PN:bwa-mem3 VN:<ver> CL:<notre argv>`, l'oracle emet `bwa-mem2`. Exclu du gate
+  d'octet-identite (on compare `@SQ` + les lignes d'alignement).
+
+  L'option alternative etait de se faire passer pour `bwa-mem2` dans le `@PG`, ce qui aurait rendu
+  la sortie octet-identique **y compris l'en-tete**. Rejete : le `@PG` est le seul endroit d'un BAM
+  qui enregistre quel binaire a produit les donnees, et c'est precisement ce que lisent les audits
+  de provenance et les pipelines de reproductibilite. Usurper ce champ rendrait tout BAM produit
+  ici intracable, pour gagner une ligne d'en-tete que le gate exclut de toute facon. Un aligneur
+  qui ment sur sa propre identite est un probleme, pas une fonctionnalite.
+
+  Consequence assumee : `diff` brut entre une sortie bwa-mem2 et une sortie bwa-mem3 montrera
+  toujours cette ligne. Tous les scripts du depot filtrent `^@PG` pour cette raison.
 
 ## Résolu (phase 8, via oracle instrumenté)
 
@@ -35,6 +45,23 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   Vérifié sans régression, `-t8` == `-t1` byte-identique (hors `@PG`).
 
 ## En cours (résidu)
+
+- **`-a` + contigs ALT : RESOLU.** Le residu de 23 enregistrements secondaires manquants sur
+  200 026 est corrige. Cause racine : `mem_reg2sam` jetait **tous** les secondaires sans condition
+  (`if p.secondary >= 0 { continue }`), alors que le C ne les jette que si `p->is_alt ||
+  !(opt->flag&MEM_F_ALL)` (`bwamem.cpp:1541`). Le commentaire en place annoncait lui-meme que le
+  support de `-a` restait a faire sur ce chemin.
+
+  Ce n'etait donc **pas** un bug ALT : c'etait `-a` non supporte dans le chemin `no_pairing` du
+  paired-end. Les contigs ALT n'ont fait que produire des reads qui empruntent ce chemin (mate non
+  mappe) avec des regions secondaires, ce qu'aucun jeu de test precedent ne faisait.
+
+  Le test de la drop-ratio a aussi recu la borne `p->secondary < INT_MAX` du C, qui n'est pas
+  cosmetique : la branche ALT de `mem_mark_primary_se` gare les hits ALT a `secondary = INT_MAX`,
+  et indexer `a[INT_MAX]` est un panic, pas un octet faux.
+
+  Verifie : reproduction reduite a 4 paires (31 enregistrements de chaque cote), puis GRCh38 complet
+  100 000 paires, **les trois cas byte-identiques** : defauts 200 003, `-j` 200 000, `-a` 200 026.
 
 - **1 enregistrement PE (`XS` cosmétique).** `_f3e` mate-2 : oracle `XS:i:33`, nous `44` ; MAPQ=60,
   FLAG/POS/CIGAR/AS/MC identiques. La chaîne sous-optimale est au **même locus** (`rb=3189858`)
