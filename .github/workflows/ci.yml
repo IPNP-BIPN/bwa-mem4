@@ -1,9 +1,13 @@
 name: CI
 
+# A commit on a PR branch used to trigger this workflow TWICE, once for the push and once for the
+# pull_request, running an identical matrix both times. Restricting `push` to the long-lived
+# branches removes that duplication with no loss of coverage: a PR still runs everything, once.
 on:
   push:
     branches:
-      - "**"
+      - main
+      - dev
   pull_request:
   workflow_dispatch:
 
@@ -22,27 +26,50 @@ env:
   RUST_TOOLCHAIN: "1.96.1"
 
 jobs:
+  # Picks which targets to build, because macOS runners bill at 10x on a private repo and that
+  # multiplier, not their duration, is the whole cost. Measured on one run of the old matrix:
+  # macos-15-intel 2.9 min -> 29 billed, macos-14 1.5 min -> 15 billed, the two Linux jobs 2.2 min
+  # -> 2 billed. So 96% of the bill came from two jobs that were not even the slowest.
+  #
+  # ISA coverage does NOT depend on macOS: ubuntu-24.04-arm compiles and runs the NEON kernels, and
+  # ubuntu-22.04 the AVX2 ones, so both SIMD paths are exercised on every pull request. What the
+  # macOS runners add is the OS itself (Apple's linker, its libc, the vendored htslib build), which
+  # is worth checking before code reaches a long-lived branch rather than on every intermediate
+  # commit of every topic branch.
+  setup:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        run: |
+          set -euo pipefail
+          LINUX='{"os":"ubuntu-22.04","target_id":"linux-x86_64"},{"os":"ubuntu-24.04-arm","target_id":"linux-aarch64"}'
+          # macos-15-intel, not macos-13: the macOS 13 runners are retired and jobs sit queued
+          # indefinitely rather than failing, which reads as a hang. This is the label
+          # COMBINE-lab/salmon uses for Intel macOS.
+          # CI tests on the NEWEST macOS, which is the opposite of what release.yml builds on and
+          # deliberately so: here we want to learn early that the current OS broke something, while
+          # the release wants the oldest floor it can offer users. macos-26 is arm64; its Intel
+          # sibling is macos-26-intel.
+          MACOS='{"os":"macos-26","target_id":"macos-arm64"},{"os":"macos-26-intel","target_id":"macos-x86_64"}'
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "matrix=[$LINUX,$MACOS]" >> "$GITHUB_OUTPUT"
+            echo "full matrix (push to a long-lived branch, or manual run)"
+          else
+            echo "matrix=[$LINUX]" >> "$GITHUB_OUTPUT"
+            echo "linux-only matrix (pull request); macOS runs when this lands on dev"
+          fi
+
   build-test:
+    needs: setup
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # x86_64 exercises the AVX2 kernels, which no developer machine here runs: this repo is
-          # developed on Apple Silicon, so without a Linux runner the AVX2 path ships untested.
-          - os: ubuntu-22.04
-            target_id: linux-x86_64
-          - os: ubuntu-24.04-arm
-            target_id: linux-aarch64
-          # macOS is where the NEON kernels are compiled and where development happens.
-          - os: macos-14
-            target_id: macos-arm64
-          # macos-15-intel, not macos-13: the macOS 13 runners are being retired and jobs sit
-          # queued indefinitely rather than failing, which looks like a hang. This is the label
-          # COMBINE-lab/salmon uses for Intel macOS.
-          - os: macos-15-intel
-            target_id: macos-x86_64
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
 

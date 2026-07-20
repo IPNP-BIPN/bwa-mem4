@@ -91,10 +91,19 @@ jobs:
             target_id: linux-x86_64
           - os: ubuntu-24.04-arm
             target_id: linux-aarch64
+          # DELIBERATELY NOT macos-26, the newest label. For a binary we hand to other people,
+          # newer is worse: the build host sets the floor. `hts-sys` compiles vendored htslib with
+          # `cc`, and `cc` with no explicit target takes the host's default deployment version, so
+          # building on macOS 26 could stamp a minimum of 26 onto the artifact and lock out every
+          # user below it. Same lesson as `-C target-cpu=native`: build for the audience, not for
+          # the machine. Measured on the v3.0.0 artifacts: arm64 minos 11.0, x86_64 minos 10.12.
+          # The newest macOS is worth TESTING on, which is ci.yml's job, not this one's.
           - os: macos-14
             target_id: macos-arm64
+            deployment_target: "11.0"
           - os: macos-15-intel
             target_id: macos-x86_64
+            deployment_target: "10.12"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -109,7 +118,25 @@ jobs:
       # ship bytes that nobody can reproduce from a clean tree. Correctness over the few minutes.
 
       - name: Build
+        env:
+          # Pinned rather than inherited, so the floor is a decision instead of a side effect of
+          # whichever runner image happens to be current. It reaches the vendored htslib C build
+          # too, which is the part that would otherwise silently follow the host.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
         run: cargo build --release --locked
+
+      # Guards the promise above. Without this, swapping a runner label months from now would
+      # raise the minimum macOS on published binaries and nobody would notice until a user on an
+      # older machine reported "bad CPU type" or a dyld failure.
+      - name: The binary still runs on old macOS
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          set -euo pipefail
+          WANT="${{ matrix.deployment_target }}"
+          GOT=$(otool -l target/release/bwa-mem3 \
+                | awk '/LC_BUILD_VERSION/{f=1} /LC_VERSION_MIN_MACOSX/{f=1} f&&/minos|version/{print $2; exit}')
+          echo "minimum macOS: $GOT (expected $WANT)"
+          [ "$GOT" = "$WANT" ] || { echo "::error::built binary demands macOS $GOT, expected $WANT"; exit 1; }
 
       - name: The binary reports the tagged version
         run: |
