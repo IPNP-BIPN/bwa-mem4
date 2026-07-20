@@ -46,6 +46,30 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## En cours (résidu)
 
+- **`-a` + contigs ALT, à l'échelle du génome : 23 enregistrements manquants sur 200 026
+  (0,011 %).** Trouvé par `scripts/alt_parity.sh` sur le vrai GRCh38 (456 contigs, 261 `_alt`) avec
+  le `.alt` officiel de bwakit, 100 000 paires simulées.
+
+  Périmètre exactement délimité par trois expériences :
+  - **défauts et `-j` : byte-identiques** sur ce même jeu (200 003 et 200 000 enregistrements). Donc
+    le portage ALT est bon sur le chemin que tout le monde emprunte.
+  - **`-a` sur un GRCh38 SANS ALT** (`work/genome.fa`, mêmes reads) : **byte-identique**, 40 000
+    enregistrements. Donc ce n'est pas un bug de `-a`, ni un bug d'échelle.
+  - **`-a` sur le mini-fixture ALT** : byte-identique. Donc il faut les deux : ALT *et* l'échelle.
+
+  Nature : ce sont des enregistrements **secondaires** (FLAG 0x100) que bwa-mem2 émet et que nous
+  n'émettons pas, sur des contigs ordinaires (chr6 x14, chr9 x6, chr5, chr2, chr10), tous dans des
+  régions répétitives. Exemple `sim57492_1119652087` : bwa émet 16 enregistrements, nous 2. Notre
+  primaire est identique (`chr6:59562319 125M25S`), ce sont les alternatives qui manquent.
+
+  Pistes déjà **écartées** : le filtre de chaînes porte bien le terme `is_alt` du C
+  (`bwamem.cpp:573` -> `bwa-chain/src/lib.rs:904`) ; la suppression de `XA` sous `-a` est corrigée
+  et vérifiée séparément ; `mem_reg2sam` applique bien `secondary >= 0 && (is_alt || !all)`.
+  Reste à instrumenter l'oracle pour comparer les jeux de régions avant `mem_reg2sam`.
+
+  Impact : nul par défaut (les secondaires ne sont pas émis sans `-a`), nul sans `.alt`, nul sous
+  `-j`. Non bloquant pour la 3.0.0, mais **à documenter dans les notes de version**.
+
 - **1 enregistrement PE (`XS` cosmétique).** `_f3e` mate-2 : oracle `XS:i:33`, nous `44` ; MAPQ=60,
   FLAG/POS/CIGAR/AS/MC identiques. La chaîne sous-optimale est au **même locus** (`rb=3189858`)
   mais avec une **composition de seeds différente** (`seedcov` oracle 50 vs nous 20) sur un locus
