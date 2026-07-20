@@ -3,12 +3,21 @@ name: CI
 # A commit on a PR branch used to trigger this workflow TWICE, once for the push and once for the
 # pull_request, running an identical matrix both times. Restricting `push` to the long-lived
 # branches removes that duplication with no loss of coverage: a PR still runs everything, once.
+#
+# The weekly run exists because `main` is otherwise a blind spot. It only builds when something is
+# pushed to it, and it only receives fixes at release time, so an infrastructure break can sit
+# there unseen for weeks. That is not hypothetical: `main` spent an afternoon red from a SIGILL
+# that had already been fixed on `dev`, and nothing said so. On a schedule this workflow builds
+# `main`, not the default branch, because `dev` is already covered by every pull request.
+# Cadence and slot follow FelixKrueger/TrimGalore.
 on:
   push:
     branches:
       - main
       - dev
   pull_request:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -26,52 +35,37 @@ env:
   RUST_TOOLCHAIN: "1.96.1"
 
 jobs:
-  # Picks which targets to build, because macOS runners bill at 10x on a private repo and that
-  # multiplier, not their duration, is the whole cost. Measured on one run of the old matrix:
-  # macos-15-intel 2.9 min -> 29 billed, macos-14 1.5 min -> 15 billed, the two Linux jobs 2.2 min
-  # -> 2 billed. So 96% of the bill came from two jobs that were not even the slowest.
-  #
-  # ISA coverage does NOT depend on macOS: ubuntu-24.04-arm compiles and runs the NEON kernels, and
-  # ubuntu-22.04 the AVX2 ones, so both SIMD paths are exercised on every pull request. What the
-  # macOS runners add is the OS itself (Apple's linker, its libc, the vendored htslib build), which
-  # is worth checking before code reaches a long-lived branch rather than on every intermediate
-  # commit of every topic branch.
-  setup:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.pick.outputs.matrix }}
-    steps:
-      - id: pick
-        run: |
-          set -euo pipefail
-          LINUX='{"os":"ubuntu-22.04","target_id":"linux-x86_64"},{"os":"ubuntu-24.04-arm","target_id":"linux-aarch64"}'
-          # macos-15-intel, not macos-13: the macOS 13 runners are retired and jobs sit queued
-          # indefinitely rather than failing, which reads as a hang. This is the label
-          # COMBINE-lab/salmon uses for Intel macOS.
-          # CI tests on the NEWEST macOS, which is the opposite of what release.yml builds on and
-          # deliberately so: here we want to learn early that the current OS broke something, while
-          # the release wants the oldest floor it can offer users. macos-26 is arm64; its Intel
-          # sibling is macos-26-intel.
-          MACOS='{"os":"macos-26","target_id":"macos-arm64"},{"os":"macos-26-intel","target_id":"macos-x86_64"}'
-          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "matrix=[$LINUX,$MACOS]" >> "$GITHUB_OUTPUT"
-            echo "full matrix (push to a long-lived branch, or manual run)"
-          else
-            echo "matrix=[$LINUX]" >> "$GITHUB_OUTPUT"
-            echo "linux-only matrix (pull request); macOS runs when this lands on dev"
-          fi
-
   build-test:
-    needs: setup
+    # Every event builds all four targets. The matrix was briefly trimmed on pull requests to cut
+    # the bill while the repository was private, where macOS runners bill at roughly 10x. The repo
+    # is public now and standard runners are free, so that trade no longer buys anything and the
+    # coverage is worth more than the queue time.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
+        include:
+          # x86_64 exercises the AVX2 kernels, aarch64 the NEON ones; both SIMD paths are therefore
+          # covered on Linux alone. macOS adds the operating system: Apple's linker, its libc, and
+          # the vendored htslib C build.
+          - os: ubuntu-22.04
+            target_id: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target_id: linux-aarch64
+          # The NEWEST macOS on purpose, the opposite of what release.yml builds on. Here the goal
+          # is to learn early that the current OS broke something; there it is to give users the
+          # widest floor. macos-26 is arm64, macos-26-intel its x86_64 sibling.
+          - os: macos-26
+            target_id: macos-arm64
+          - os: macos-26-intel
+            target_id: macos-x86_64
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Scheduled runs target `main`; every other event uses its own ref. `main` is the branch
+          # nothing else watches.
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@master
