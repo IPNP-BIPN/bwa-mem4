@@ -2197,9 +2197,8 @@ pub fn mem_sam_pe<W: Write>(
                 let xa0 = mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]);
                 let xa1 = mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]);
 
-                // Exactly ONE record per end on this path (bwa's `n_aa[i]` stays 1 without ALT
-                // hits), which is why each `mem_aln2sam` call below passes a single-element slice
-                // and `which = 0`: no supplementary, no hard clipping, no SA:Z.
+                // One record per end WITHOUT ALT contigs (bwa's `n_aa[i]` stays 1), two when the end
+                // also has a reportable ALT hit: see the `n_pri < n` block after `h0`/`h1` below.
                 //
                 // 0x40 = first in pair, 0x80 = second (bwa writes `0x40 << i`).
                 //
@@ -2225,30 +2224,72 @@ pub fn mem_sam_pe<W: Write>(
                     h.xa = xa1[z[1]].clone();
                     h
                 };
+                // ---- The ALT hit, if this end has one worth reporting (`bwamem_pair.cpp:496`) --
+                // The paired record above is a primary-assembly hit. When the end ALSO hits an ALT
+                // contig, bwa emits that as a second, SUPPLEMENTARY record (0x800) so the ALT
+                // placement is not lost, while the pairing and the coordinate system stay anchored
+                // on the primary assembly.
+                //
+                // Only ONE candidate is ever considered: `a[n_pri]`, the first region after the
+                // primary-assembly prefix, i.e. the best-scoring ALT hit. It is dropped unless it
+                // clears `-T`, is unshadowed, and really is ALT. Nothing is emitted at all when the
+                // index has no ALT contigs, since then `n_pri == a.len()`.
+                let alt_extra = |a: &[MemAlnReg],
+                                 n_pri: usize,
+                                 xa: &[Option<String>],
+                                 seq: &[u8],
+                                 flag_bit: u32|
+                 -> Option<MemAln> {
+                    if n_pri >= a.len() {
+                        return None;
+                    }
+                    let p = &a[n_pri];
+                    if p.score < opt.t || p.secondary >= 0 || !p.is_alt {
+                        return None;
+                    }
+                    let mut g = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
+                    g.flag |= 0x800 | flag_bit | extra_flag;
+                    g.xa = xa[n_pri].clone();
+                    Some(g)
+                };
+                // bwa's `aa[i]`: every record emitted for this end, primary first. Its LENGTH is
+                // what makes the difference downstream, because `mem_aln2sam` uses it to decide
+                // whether an `SA:Z` is owed and how to clip.
+                let mut aa0 = vec![h0.clone()];
+                aa0.extend(alt_extra(a0, n_pri0, &xa0, seqs[0], 0x40));
+                let mut aa1 = vec![h1.clone()];
+                aa1.extend(alt_extra(a1, n_pri1, &xa1, seqs[1], 0x80));
+
+                // The MATE handed to the other end's records is `h`, the paired primary record,
+                // never the ALT supplementary one (the C passes `&h[1]` and `&h[0]`).
                 let mut buf0 = Vec::new();
-                mem_aln2sam(
-                    bns,
-                    &names[0],
-                    seqs[0],
-                    quals[0],
-                    comments[0],
-                    std::slice::from_ref(&h0),
-                    0,
-                    Some(&h1),
-                    &mut buf0,
-                );
+                for which in 0..aa0.len() {
+                    mem_aln2sam(
+                        bns,
+                        &names[0],
+                        seqs[0],
+                        quals[0],
+                        comments[0],
+                        &aa0,
+                        which,
+                        Some(&h1),
+                        &mut buf0,
+                    );
+                }
                 let mut buf1 = Vec::new();
-                mem_aln2sam(
-                    bns,
-                    &names[1],
-                    seqs[1],
-                    quals[1],
-                    comments[1],
-                    std::slice::from_ref(&h1),
-                    0,
-                    Some(&h0),
-                    &mut buf1,
-                );
+                for which in 0..aa1.len() {
+                    mem_aln2sam(
+                        bns,
+                        &names[1],
+                        seqs[1],
+                        quals[1],
+                        comments[1],
+                        &aa1,
+                        which,
+                        Some(&h0),
+                        &mut buf1,
+                    );
+                }
                 w.write_all(&buf0)?;
                 w.write_all(&buf1)?;
                 return Ok(());
