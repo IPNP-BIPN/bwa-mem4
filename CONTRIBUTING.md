@@ -41,6 +41,15 @@ started on the NEON backend, but it applies to any contributor. The project docs
   otherwise, and that check is not bureaucratic: the version is stamped into `@PG VN:` on every
   SAM/BAM/CRAM the binary writes, so a mismatch mislabels other people's data.
 
+**CI and the release build on deliberately different macOS runners, in opposite directions.** CI
+uses the newest (`macos-26`, `macos-26-intel`) because the point there is to learn early that the
+current OS broke something. The release uses older ones (`macos-14`, `macos-15-intel`) because the
+build host sets the FLOOR: `hts-sys` compiles vendored htslib with `cc`, which without an explicit
+target adopts the host's deployment version, so building on macOS 26 would stamp a minimum of 26
+onto the artifact and lock out every user below it. `MACOSX_DEPLOYMENT_TARGET` is pinned per target
+and then verified on the built binary with `otool`, so a future runner swap cannot silently raise
+the floor. Measured on v3.0.0: arm64 requires macOS 11.0, x86_64 requires 10.12.
+
 Release artifacts are built with an empty `RUSTFLAGS`, overriding `.cargo/config.toml`'s
 `-C target-cpu=native`. A binary built with `native` runs only on CPUs at least as capable as the
 build machine's, so publishing one would ship `SIGILL` to every user with an older processor.
