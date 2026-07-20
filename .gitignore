@@ -14,3 +14,9 @@
 # Committed fixtures live under testdata/ and crates/*/tests/golden/ and are NOT ignored.
 
 .DS_Store
+
+# Editor/backup leftovers. One of these (`crates/bwa-chain/src/lib.rs.bak`) had been committed and
+# was only noticed while auditing the tree before making the repository public.
+*.bak
+*.orig
+*~
