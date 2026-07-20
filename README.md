@@ -152,13 +152,30 @@ records are identical, and `samtools view -C -T` on our own BAM produces the sam
 | BAM | 8,203,307 | 5.5x |
 | CRAM | 1,187,099 | 37.9x |
 
+## Installing
+
+Prebuilt binaries for Linux and macOS, x86_64 and arm64, are attached to each
+[release](https://github.com/IPNP-BIPN/bwa-mem3-rs/releases), with a `SHA256SUMS` file:
+
+```sh
+tar xzf bwa-mem3-v3.0.0-linux-x86_64.tar.gz
+./bwa-mem3-v3.0.0-linux-x86_64/bwa-mem3 --version
+```
+
+Every published binary is required to rebuild the committed `testdata/tiny` index byte-identically
+on its own platform before the release is allowed to appear, so the artifact itself is checked and
+not merely the source it was built from.
+
 ## Building
 
 ```sh
 cargo build --release
 ```
 
-Rust 1.96. macOS and Linux, on both x86_64 and aarch64.
+Rust 1.96. macOS and Linux, on both x86_64 and aarch64. No system packages are needed: htslib is
+vendored and built from source by `hts-sys`.
+
+Contributions go to the `dev` branch; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Upstream bugs
 
