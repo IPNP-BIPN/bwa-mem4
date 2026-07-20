@@ -46,29 +46,22 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## En cours (résidu)
 
-- **`-a` + contigs ALT, à l'échelle du génome : 23 enregistrements manquants sur 200 026
-  (0,011 %).** Trouvé par `scripts/alt_parity.sh` sur le vrai GRCh38 (456 contigs, 261 `_alt`) avec
-  le `.alt` officiel de bwakit, 100 000 paires simulées.
+- **`-a` + contigs ALT : RESOLU.** Le residu de 23 enregistrements secondaires manquants sur
+  200 026 est corrige. Cause racine : `mem_reg2sam` jetait **tous** les secondaires sans condition
+  (`if p.secondary >= 0 { continue }`), alors que le C ne les jette que si `p->is_alt ||
+  !(opt->flag&MEM_F_ALL)` (`bwamem.cpp:1541`). Le commentaire en place annoncait lui-meme que le
+  support de `-a` restait a faire sur ce chemin.
 
-  Périmètre exactement délimité par trois expériences :
-  - **défauts et `-j` : byte-identiques** sur ce même jeu (200 003 et 200 000 enregistrements). Donc
-    le portage ALT est bon sur le chemin que tout le monde emprunte.
-  - **`-a` sur un GRCh38 SANS ALT** (`work/genome.fa`, mêmes reads) : **byte-identique**, 40 000
-    enregistrements. Donc ce n'est pas un bug de `-a`, ni un bug d'échelle.
-  - **`-a` sur le mini-fixture ALT** : byte-identique. Donc il faut les deux : ALT *et* l'échelle.
+  Ce n'etait donc **pas** un bug ALT : c'etait `-a` non supporte dans le chemin `no_pairing` du
+  paired-end. Les contigs ALT n'ont fait que produire des reads qui empruntent ce chemin (mate non
+  mappe) avec des regions secondaires, ce qu'aucun jeu de test precedent ne faisait.
 
-  Nature : ce sont des enregistrements **secondaires** (FLAG 0x100) que bwa-mem2 émet et que nous
-  n'émettons pas, sur des contigs ordinaires (chr6 x14, chr9 x6, chr5, chr2, chr10), tous dans des
-  régions répétitives. Exemple `sim57492_1119652087` : bwa émet 16 enregistrements, nous 2. Notre
-  primaire est identique (`chr6:59562319 125M25S`), ce sont les alternatives qui manquent.
+  Le test de la drop-ratio a aussi recu la borne `p->secondary < INT_MAX` du C, qui n'est pas
+  cosmetique : la branche ALT de `mem_mark_primary_se` gare les hits ALT a `secondary = INT_MAX`,
+  et indexer `a[INT_MAX]` est un panic, pas un octet faux.
 
-  Pistes déjà **écartées** : le filtre de chaînes porte bien le terme `is_alt` du C
-  (`bwamem.cpp:573` -> `bwa-chain/src/lib.rs:904`) ; la suppression de `XA` sous `-a` est corrigée
-  et vérifiée séparément ; `mem_reg2sam` applique bien `secondary >= 0 && (is_alt || !all)`.
-  Reste à instrumenter l'oracle pour comparer les jeux de régions avant `mem_reg2sam`.
-
-  Impact : nul par défaut (les secondaires ne sont pas émis sans `-a`), nul sans `.alt`, nul sous
-  `-j`. Non bloquant pour la 3.0.0, mais **à documenter dans les notes de version**.
+  Verifie : reproduction reduite a 4 paires (31 enregistrements de chaque cote), puis GRCh38 complet
+  100 000 paires, **les trois cas byte-identiques** : defauts 200 003, `-j` 200 000, `-a` 200 026.
 
 - **1 enregistrement PE (`XS` cosmétique).** `_f3e` mate-2 : oracle `XS:i:33`, nous `44` ; MAPQ=60,
   FLAG/POS/CIGAR/AS/MC identiques. La chaîne sous-optimale est au **même locus** (`rb=3189858`)

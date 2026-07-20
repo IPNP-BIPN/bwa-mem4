@@ -1912,7 +1912,9 @@ fn mem_reg2sam(
     // record, so repeating those placements inside a tag would duplicate them. Generating it
     // unconditionally was a byte-parity bug on `-a`, which the option harness never saw because it
     // only ever ran `-a` single-end, where this path is not reached with shadowed regions present.
-    let xa = if opt.flag & bwa_core::opt::flags::ALL != 0 {
+    // `-a` (MEM_F_ALL): emit every alignment, including the shadowed ones, and emit no XA.
+    let all = opt.flag & bwa_core::opt::flags::ALL != 0;
+    let xa = if all {
         vec![None; a.len()]
     } else {
         mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq)
@@ -1928,16 +1930,23 @@ fn mem_reg2sam(
         if p.score < opt.t {
             continue;
         }
-        if p.secondary >= 0 {
-            continue; // !MEM_F_ALL: drop all secondaries
+        // `bwamem.cpp:1541`. A secondary is dropped unless `-a` asked for every alignment, and an
+        // ALT secondary is dropped even then: under `-a` the ALT hits are already reported as the
+        // supplementary record the paired branch emits, so repeating them here would duplicate
+        // them.
+        if p.secondary >= 0 && (p.is_alt || !all) {
+            continue;
         }
-        // Dead under the unconditional `continue` above, which subsumes it: the C's guard is
-        // `p->secondary >= 0 && (p->is_alt || !(opt->flag&MEM_F_ALL))`, so without `-a` every
-        // secondary is already gone and this drop-ratio test only ever fires under `-a`. Kept in
-        // place so the port stays line-alignable with `bwamem.cpp:1541`, and so that adding `-a`
-        // support later is a matter of relaxing the guard above rather than re-deriving this. Note
-        // the f32: `opt->drop_ratio` is a C `float`.
+        // `bwamem.cpp:1543`. Drop a secondary that scores too far below the primary shadowing it.
+        //
+        // `p.secondary < i32::MAX` is NOT redundant, and leaving it out is a panic rather than a
+        // wrong byte: `mem_mark_primary_se`'s ALT branch parks ALT hits at `secondary = INT_MAX`
+        // as a sentinel, and indexing `a[INT_MAX]` would be out of bounds. The C guards the same
+        // way and for the same reason.
+        //
+        // f32 throughout: `opt->drop_ratio` is a C `float`.
         if p.secondary >= 0
+            && p.secondary < i32::MAX
             && (p.score as f32) < a[p.secondary as usize].score as f32 * opt.drop_ratio
         {
             continue;
