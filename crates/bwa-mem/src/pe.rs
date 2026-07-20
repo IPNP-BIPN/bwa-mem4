@@ -1514,10 +1514,16 @@ fn get_rlen(cigar: &[u32]) -> i64 {
     rlen
 }
 
-/// Append a CIGAR string, converting soft-clips to hard-clips for supplementary alignments
-/// (`which != 0`). Port of `add_cigar` (`bwamem.cpp:1579-1591`), for the non-ALT case with neither
-/// `-Y` (MEM_F_SOFTCLIP) nor an ALT hit, where the C's guard `!(opt->flag&MEM_F_SOFTCLIP) &&
-/// !p->is_alt` is always true.
+/// Append a CIGAR string, converting soft-clips to hard-clips when `hard_clip` says to. Port of
+/// `add_cigar` (`bwamem.cpp:1579-1591`).
+///
+/// The C's condition is `p->n_cigar && which && !(opt->flag&MEM_F_SOFTCLIP) && !p->is_alt`, i.e.
+/// THREE things beyond being supplementary. It is passed in rather than derived from `which` here
+/// because two of the three are invisible at this level: `-Y` lives in the options and `is_alt` on
+/// the alignment, and the `MC:Z` caller needs the MATE's `is_alt` with the CURRENT record's
+/// `which`. Deriving it from `which` alone was wrong for an ALT supplementary, which must keep its
+/// SOFT clips: it is a parallel representation of the whole read, not a fragment of a split
+/// alignment, so the primary's SEQ is not the rest of it.
 ///
 /// PARAMETERS: `cigar` is bwa-packed (`len << 4 | op`). `which` is the alignment's index within its
 /// read's list; index 0 is the primary and everything after it is supplementary. An EMPTY `cigar`
@@ -1528,7 +1534,7 @@ fn get_rlen(cigar: &[u32]) -> i64 {
 /// WHY hard-clip: SAM requires that only one record per read carry the full SEQ. bwa keeps SEQ on
 /// the primary (soft-clipped) and hard-clips the supplementaries, whose SEQ is then trimmed to
 /// match by the caller.
-pub(crate) fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
+pub(crate) fn add_cigar(cigar: &[u32], hard_clip: bool, out: &mut Vec<u8>) {
     if cigar.is_empty() {
         out.push(b'*');
         return;
@@ -1543,7 +1549,7 @@ pub(crate) fn add_cigar(cigar: &[u32], which: usize, out: &mut Vec<u8>) {
         // here is already 4. That holds: `cigar.rs` builds clips exclusively as `len << 4 | 3`
         // (the two `insert`/`push` sites around `crates/bwa-mem/src/cigar.rs:416`), so op 4 never
         // enters a CIGAR before this point.
-        if (op == 3 || op == 4) && which != 0 {
+        if (op == 3 || op == 4) && hard_clip {
             op = 4; // hard-clip on supplementary
         }
         out.extend_from_slice((c >> 4).to_string().as_bytes());
@@ -1580,6 +1586,10 @@ fn mem_aln2sam(
     list: &[MemAln],
     which: usize,
     m: Option<&MemAln>,
+    // `-Y` (MEM_F_SOFTCLIP): keep soft clips on supplementary records instead of hard-clipping
+    // them. Passed in rather than read from `MemOpt` because this function takes no options struct
+    // by design; it is a formatter, and every other decision was already made by the caller.
+    softclip: bool,
     out: &mut Vec<u8>,
 ) {
     // `p`: the alignment being printed, and `m` the mate's, both private copies (bwa's `ptmp`/
@@ -1651,7 +1661,7 @@ fn mem_aln2sam(
         out.push(b'\t');
         out.extend_from_slice(p.mapq.to_string().as_bytes());
         out.push(b'\t');
-        add_cigar(&p.cigar, which, out);
+        add_cigar(&p.cigar, which != 0 && !softclip && !p.is_alt, out);
     } else {
         out.extend_from_slice(b"*\t0\t0\t*");
     }
@@ -1717,9 +1727,10 @@ fn mem_aln2sam(
         let (mut qb, mut qe) = (0usize, seq.len());
         // Hard-clip trimming for supplementary alignments: `add_cigar` turned this record's clips
         // into H, and H means the bases are ABSENT from SEQ, so the emitted range must be narrowed
-        // to match or the record is self-inconsistent. `which != 0` is the same supplementary test
-        // `add_cigar` uses, which is why the two must be kept in step.
-        if !p.cigar.is_empty() && which != 0 {
+        // to match or the record is self-inconsistent. This condition is EXACTLY `add_cigar`'s
+        // (`bwamem.cpp:1655` repeats the same four terms), and the two must be kept in step: trim
+        // without hard-clipping and the record claims bases it does not carry.
+        if !p.cigar.is_empty() && which != 0 && !softclip && !p.is_alt {
             // Opcodes of the CIGAR's two outermost ops; 3 (S) or 4 (H) means that end is clipped.
             let first = p.cigar[0] & 0xf;
             let last = p.cigar[p.cigar.len() - 1] & 0xf;
@@ -1788,7 +1799,7 @@ fn mem_aln2sam(
     if let Some(mate) = m.as_ref() {
         if !mate.cigar.is_empty() {
             out.extend_from_slice(b"\tMC:Z:");
-            add_cigar(&mate.cigar, which, out);
+            add_cigar(&mate.cigar, which != 0 && !softclip && !mate.is_alt, out);
         }
     }
     // AS/XS are gated on `>= 0`, not on `> 0`, which is why an unmapped record (built from a zeroed
@@ -1830,7 +1841,7 @@ fn mem_aln2sam(
                 out.push(b',');
                 out.push(if r.is_rev { b'-' } else { b'+' });
                 out.push(b',');
-                add_cigar(&r.cigar, 0, out);
+                add_cigar(&r.cigar, false, out);
                 out.push(b',');
                 out.extend_from_slice(r.mapq.to_string().as_bytes());
                 out.push(b',');
@@ -1886,13 +1897,26 @@ fn mem_reg2sam(
     m: Option<&MemAln>,
     out: &mut Vec<u8>,
 ) {
+    // `-Y`, read once here and threaded into every `mem_aln2sam` call below.
+    let softclip = opt.flag & bwa_core::opt::flags::SOFTCLIP != 0;
     // Shadowed hits are not emitted here; they surface as the primary's XA:Z, which this path used
     // to omit entirely (~1% of PE records carried no XA where bwa emits one).
     // XA is generated over the WHOLE region vector and indexed by `k`, so a region that is dropped
     // below still contributes to the surviving primary's XA:Z list. That is the point: shadowed
     // hits are reported as alternates, not as records.
     // `xa[k]`: the XA:Z string region `k` should carry, or `None`. Index-parallel with `a`.
-    let xa = mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq);
+    //
+    // `-a` (MEM_F_ALL) suppresses XA entirely: the C guards the call with
+    // `if (!(opt->flag & MEM_F_ALL)) XA = mem_gen_alt(...)` and leaves `XA` null otherwise
+    // (`bwamem.cpp:1521`). The two are alternatives: `-a` emits every shadowed region as its own
+    // record, so repeating those placements inside a tag would duplicate them. Generating it
+    // unconditionally was a byte-parity bug on `-a`, which the option harness never saw because it
+    // only ever ran `-a` single-end, where this path is not reached with shadowed regions present.
+    let xa = if opt.flag & bwa_core::opt::flags::ALL != 0 {
+        vec![None; a.len()]
+    } else {
+        mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq)
+    };
     // ---- step 1: turn the surviving regions into records ----
     // `emitted` is bwa's `aa`, the records to emit; `n_emitted` is its `l`, the count accepted so
     // far, and is what makes "everything after the first" supplementary. It is a separate counter
@@ -1948,10 +1972,21 @@ fn mem_reg2sam(
         // A zeroed alignment: rid -1, no CIGAR, MAPQ 0, score 0. Printed as the read's only record.
         let mut unmapped = MemAln::unmapped();
         unmapped.flag |= extra_flag;
-        mem_aln2sam(bns, name, seq, qual, comment, &[unmapped], 0, m, out);
+        mem_aln2sam(
+            bns,
+            name,
+            seq,
+            qual,
+            comment,
+            &[unmapped],
+            0,
+            m,
+            softclip,
+            out,
+        );
     } else {
         for k in 0..emitted.len() {
-            mem_aln2sam(bns, name, seq, qual, comment, &emitted, k, m, out);
+            mem_aln2sam(bns, name, seq, qual, comment, &emitted, k, m, softclip, out);
         }
     }
 }
@@ -2194,8 +2229,24 @@ pub fn mem_sam_pe<W: Write>(
                 // Per-region XA:Z strings for each end, index-parallel with `a0`/`a1`. Generated
                 // AFTER the inversion above, which is the whole reason the inversion exists: only
                 // then does `xa0[z[0]]` hold the shadow group's alternates.
-                let xa0 = mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]);
-                let xa1 = mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]);
+                //
+                // `-a` (MEM_F_ALL) suppresses XA ENTIRELY on this path: the C is
+                // `if (!(opt->flag & MEM_F_ALL)) XA[i] = mem_gen_alt(...); else XA[0] = XA[1] = 0;`
+                // (`bwamem_pair.cpp:484`). The two are alternatives, not complements: `-a` already
+                // emits every shadowed region as its own record, so listing those same placements
+                // again inside a tag would duplicate them. Generating XA here regardless was a real
+                // byte-parity bug, invisible because `-a` was only ever exercised single-end.
+                // `-Y`, needed by every `mem_aln2sam` call in this branch.
+                let softclip = opt.flag & bwa_core::opt::flags::SOFTCLIP != 0;
+                let all = opt.flag & bwa_core::opt::flags::ALL != 0;
+                let (xa0, xa1) = if all {
+                    (vec![None; a0.len()], vec![None; a1.len()])
+                } else {
+                    (
+                        mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]),
+                        mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]),
+                    )
+                };
 
                 // One record per end WITHOUT ALT contigs (bwa's `n_aa[i]` stays 1), two when the end
                 // also has a reportable ALT hit: see the `n_pri < n` block after `h0`/`h1` below.
@@ -2273,6 +2324,7 @@ pub fn mem_sam_pe<W: Write>(
                         &aa0,
                         which,
                         Some(&h1),
+                        softclip,
                         &mut buf0,
                     );
                 }
@@ -2287,6 +2339,7 @@ pub fn mem_sam_pe<W: Write>(
                         &aa1,
                         which,
                         Some(&h0),
+                        softclip,
                         &mut buf1,
                     );
                 }

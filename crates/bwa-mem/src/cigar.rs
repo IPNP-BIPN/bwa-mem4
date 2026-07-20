@@ -144,6 +144,12 @@ pub struct MemAln {
     /// `mem_alnreg_t::alt_sc` carried through (`bwamem.cpp:1802`): the score of the ALT region
     /// shadowing this primary-assembly one, or 0. Only used to decide whether to emit `pa:f`.
     pub alt_sc: i32,
+    /// `mem_alnreg_t::is_alt` carried through (`bwamem.cpp:1802`). Read at emission for exactly one
+    /// decision: a supplementary record on an ALT contig keeps its SOFT clips where an ordinary
+    /// supplementary would have them turned into hard clips (`bwamem.cpp:1655`). The reason is that
+    /// an ALT record is a parallel representation of the same read rather than a piece of a split
+    /// alignment, so the primary's SEQ is not "the other half" of it.
+    pub is_alt: bool,
     /// Alternate hits (`XA:Z:`), pre-formatted `rname,±pos,cigar,NM;`... or `None`. Set by the
     /// caller via `mem_gen_alt`; `reg2aln` leaves it `None`.
     pub xa: Option<String>,
@@ -207,6 +213,7 @@ impl MemAln {
             score: 0,
             sub: 0,
             alt_sc: 0,
+            is_alt: false,
             xa: None,
         }
     }
@@ -775,6 +782,7 @@ pub fn reg2aln(
         // (`mem_mark_primary_se`) and `csub` from within the same chain.
         sub: reg.sub.max(reg.csub),
         alt_sc: reg.alt_sc,
+        is_alt: reg.is_alt,
         // Filled in by the caller from `mem_gen_alt`; `reg2aln` never produces XA itself, because
         // XA generation calls back into `reg2aln` and would recurse.
         xa: None,

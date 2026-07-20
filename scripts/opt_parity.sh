@@ -224,6 +224,19 @@ check "-w 0"    se -w 0
 # `-p` and the output sinks were the last accepted options with no differential coverage at all,
 # found while auditing for the 3.0.0 release. `-p` is a whole input path of its own (one file, mates
 # adjacent, de-interleaved internally), not a scalar knob, so "it parses" proved nothing about it.
+# The output-shaping flags above are all tested SINGLE-END, and single-end never reaches the paired
+# emission branch or `mem_reg2sam`'s pairing fallback. Running `-a` paired-end for the first time,
+# on 2026-07-20, immediately found a real byte-parity bug: we emitted XA:Z where bwa emits none,
+# because `-a` (MEM_F_ALL) suppresses XA entirely and both PE emitters generated it unconditionally.
+# Same shape as `-N` and `-p` before it: the failure sits wherever the gate does not run.
+echo "=== output-shaping flags, paired-end ==="
+check "-a (pe)"  pe -a
+check "-M (pe)"  pe -M
+check "-Y (pe)"  pe -Y
+check "-5 (pe)"  pe -5
+check "-q (pe)"  pe -q
+check "-a -Y (pe)" pe -a -Y
+
 echo "=== input and output paths ==="
 check "-p (interleaved)" pi -p
 check_o

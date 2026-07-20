@@ -144,7 +144,7 @@ jobs:
             /tmp/ours.sam
           retention-days: 5
 
-      - name: Option parity vs bwa-mem2 (52 cases)
+      - name: Option parity vs bwa-mem2 (58 cases)
         env:
           IDX: testdata/tiny/tiny.fa
           R1: /tmp/ci_1.fq

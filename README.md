@@ -75,7 +75,7 @@ bash scripts/check.sh          # fmt, clippy, unit tests
 ```
 
 ```sh
-# Byte-for-byte SAM comparison against bwa-mem2 across 52 option combinations.
+# Byte-for-byte SAM comparison against bwa-mem2 across 58 option combinations.
 python3 scripts/make_test_reads.py testdata/tiny/tiny.fa /tmp/ci --n 8000
 IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \
   bash scripts/opt_parity.sh ./target/release/bwa-mem3
