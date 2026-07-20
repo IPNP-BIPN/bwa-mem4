@@ -10,8 +10,20 @@ started on the NEON backend, but it applies to any contributor. The project docs
   line: it only ever advances by merging `dev`, so anything on `main` has been through CI and, for
   a release, through the manual gates below.
 - Work happens on a topic branch off `dev` (`feat/...`, `fix/...`, `perf/...`, `ci/...`), and lands
-  in `dev` by PR. Both CI workflows (build/test and the parity gate) run on every branch and every
-  PR, so a red gate is visible before review, not after merge.
+  in `dev` by PR. Both CI workflows run on every PR, so a red gate is visible before review rather
+  than after merge.
+- **What runs where, and why.** A pull request builds and tests on Linux x86_64 and Linux arm64,
+  plus the full 58-case parity gate. A push to `dev` or `main` additionally builds on macOS arm64
+  and macOS x86_64. Nothing runs twice: `push` is limited to the long-lived branches, so a commit
+  on a PR branch no longer triggers an identical second run.
+
+  This is a cost decision, and the reason is a billing multiplier rather than a slow job. On a
+  private repository GitHub bills macOS runners at 10x: measured here, macos-15-intel took 2.9
+  minutes and was charged 29, macos-14 took 1.5 and was charged 15, while the two Linux jobs
+  together took 2.2 and were charged 2. Two jobs that were not the slowest accounted for 96% of the
+  bill. Neither SIMD path loses coverage, because `ubuntu-24.04-arm` compiles and runs the NEON
+  kernels and `ubuntu-22.04` the AVX2 ones. What macOS adds is the operating system itself, checked
+  before code reaches a long-lived branch and again on every release.
 - A **release** is one act: push an annotated `vX.Y.Z` tag on `dev`. Everything else is automatic.
   `.github/workflows/release.yml` then, in this order: refuses to start unless the tag matches the
   workspace version, builds the four supported targets, proves each binary rebuilds the committed

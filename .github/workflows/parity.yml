@@ -8,10 +8,13 @@ name: Parity
 # Proven to have teeth: run scripts/opt_parity.sh against a pre-fix binary and it goes red on
 # `-N 1` and `-w 1` even on the small fixture used here.
 
+# Same de-duplication as ci.yml: a PR branch used to run this twice per commit. This job is
+# ubuntu-only and cheap, but there is no reason to pay for it twice either.
 on:
   push:
     branches:
-      - "**"
+      - main
+      - dev
   pull_request:
   workflow_dispatch:
 
