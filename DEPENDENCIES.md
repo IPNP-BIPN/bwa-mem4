@@ -12,6 +12,7 @@ Versions exactes gelees dans `Cargo.lock` (pin de record). Justifications :
 | `rayon` | parallelisme (phase 8, differe) | MIT/Apache-2.0 |
 | `serde`, `serde_json` | rapport de concordance JSON (`sam-diff`) | MIT/Apache-2.0 |
 | `sha2` | shasum de determinisme dans le harnais | MIT/Apache-2.0 |
+| `rust-htslib` | sortie BAM/CRAM (`mem -o out.bam` / `out.cram`) | MIT |
 
 Dev-only (jamais dans le binaire livre) : `noodles-*` (validation SAM/BAM cote test), `rust-bio` /
 `block-aligner` (bootstrap de seeding/SW).
