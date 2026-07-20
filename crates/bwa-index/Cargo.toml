@@ -1,11 +1,20 @@
 [package]
-name = "bwa-index"
+name = "bwa-mem3-index"
+description = "FM-index construction and loading for bwa-mem3, producing index files byte-identical to bwa-mem2 index."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
+categories = ["science"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+
+# The package is renamed for crates.io, but the LIBRARY keeps its original name: targets in
+# this same package (examples/star_vs_fm.rs, examples/sa_batch_bench.rs, examples/bwt_binning.rs, tests/index_byte_identity.rs) refer to it as `bwa_index`.
+[lib]
+name = "bwa_index"
 
 [dependencies]
 bwa-core = { workspace = true }

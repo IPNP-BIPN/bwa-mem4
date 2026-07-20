@@ -1,11 +1,20 @@
 [package]
-name = "bwa-neon"
+name = "bwa-mem3-neon"
+description = "Vectorised Smith-Waterman kernels for bwa-mem3: NEON on aarch64, AVX2 on x86_64, dispatched at runtime."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
+categories = ["science"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+
+# The package is renamed for crates.io, but the LIBRARY keeps its original name: targets in
+# this same package (examples/bench_batch.rs) refer to it as `bwa_neon`.
+[lib]
+name = "bwa_neon"
 
 [dependencies]
 bwa-extend = { workspace = true }

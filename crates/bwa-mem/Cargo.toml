@@ -1,5 +1,9 @@
 [package]
-name = "bwa-mem"
+name = "bwa-mem3-mem"
+description = "Alignment core for bwa-mem3: extension, dedup, primary marking, MAPQ, CIGAR, tags and paired-end."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
+categories = ["science"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

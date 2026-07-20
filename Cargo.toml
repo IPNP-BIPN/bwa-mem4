@@ -41,15 +41,15 @@ field_reassign_with_default = "allow"
 
 [workspace.dependencies]
 # --- internal crates (path-only; Cargo.lock is the pin of record) ---
-bwa-core = { path = "crates/bwa-core" }
-bwa-io = { path = "crates/bwa-io" }
-bwa-index = { path = "crates/bwa-index" }
-bwa-seed = { path = "crates/bwa-seed" }
-bwa-chain = { path = "crates/bwa-chain" }
-bwa-extend = { path = "crates/bwa-extend" }
-bwa-mem = { path = "crates/bwa-mem" }
-bwa-diff = { path = "crates/bwa-diff" }
-bwa-neon = { path = "crates/bwa-neon" }
+bwa-core = { package = "bwa-mem3-core", path = "crates/bwa-core", version = "3.0.0" }
+bwa-io = { package = "bwa-mem3-io", path = "crates/bwa-io", version = "3.0.0" }
+bwa-index = { package = "bwa-mem3-index", path = "crates/bwa-index", version = "3.0.0" }
+bwa-seed = { package = "bwa-mem3-seed", path = "crates/bwa-seed", version = "3.0.0" }
+bwa-chain = { package = "bwa-mem3-chain", path = "crates/bwa-chain", version = "3.0.0" }
+bwa-extend = { package = "bwa-mem3-extend", path = "crates/bwa-extend", version = "3.0.0" }
+bwa-mem = { package = "bwa-mem3-mem", path = "crates/bwa-mem", version = "3.0.0" }
+bwa-diff = { package = "bwa-mem3-diff", path = "crates/bwa-diff", version = "3.0.0" }
+bwa-neon = { package = "bwa-mem3-neon", path = "crates/bwa-neon", version = "3.0.0" }
 # --- external ---
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

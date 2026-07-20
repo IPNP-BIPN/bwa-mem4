@@ -1,5 +1,9 @@
 [package]
-name = "bwa-cli"
+name = "bwa-mem3"
+description = "A native Rust reimplementation of the bwa-mem2 short-read aligner, indexer included, whose acceptance criterion is byte-identical output: the same index files and the same SAM bytes."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "bwa", "sam"]
+categories = ["science", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 bwa-core = { workspace = true }
-bwa-chain = { path = "../bwa-chain" }
+bwa-chain = { workspace = true }
 bwa-io = { workspace = true }
 bwa-index = { workspace = true }
 bwa-mem = { workspace = true }

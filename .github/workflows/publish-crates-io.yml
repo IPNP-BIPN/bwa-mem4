@@ -1,0 +1,110 @@
+name: Publish to crates.io
+
+# Runs after a successful Release, the way COMBINE-lab/oarfish chains its publish.
+#
+# Publishing to crates.io is PERMANENT. A version can be yanked but never deleted, and a name is
+# reserved forever. So this workflow refuses to guess: it publishes only after the Release workflow
+# has already proven, on all four targets, that the binaries rebuild the committed index byte for
+# byte. If that gate did not pass, nothing reaches the registry.
+#
+# The workspace publishes as ten crates, all under our own `bwa-mem3` prefix. The libraries are
+# NOT called `bwa-core`, `bwa-mem` and so on, even though those names are free: `bwa-mem` in
+# particular is the name of Heng Li's algorithm, and taking it here would deny it to the upstream
+# ecosystem forever. The Rust-facing library names are unchanged, so no source file cares.
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Package and verify every crate without uploading anything"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Never two publishes at once, and never cancel one in flight: a half-published workspace leaves
+# the registry with crates whose dependencies do not exist yet.
+concurrency:
+  group: publish-crates-io
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.96.1"
+  # Same reasoning as the other workflows: `-C target-cpu=native` from .cargo/config.toml is a
+  # SIGILL hazard on cloud VMs and buys nothing, since the SIMD kernels dispatch at runtime.
+  RUSTFLAGS: ""
+
+jobs:
+  publish:
+    # Only after a Release that actually succeeded. A manual run is allowed for dry runs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          # Dependency order, computed once and written down rather than rediscovered: a crate
+          # cannot be published before everything it depends on is already on the registry.
+          CRATES="bwa-mem3-core bwa-mem3-index bwa-mem3-extend bwa-mem3-neon bwa-mem3-seed \
+                  bwa-mem3-chain bwa-mem3-io bwa-mem3-mem bwa-mem3 bwa-mem3-diff"
+
+          if [ "$DRY" = "true" ]; then
+            echo "DRY RUN: packaging only, nothing is uploaded"
+            # `--no-verify` because the later crates cannot build against registry versions that do
+            # not exist yet. This still catches the errors a dry run can catch: missing metadata,
+            # files outside the package, a bad readme path.
+            for c in $CRATES; do
+              echo "::group::package $c"
+              cargo package -p "$c" --no-verify --allow-dirty
+              echo "::endgroup::"
+            done
+            exit 0
+          fi
+
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          for c in $CRATES; do
+            VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+            # Idempotent: re-running after a partial failure must not abort on the crates that
+            # already made it, or the workspace stays half-published.
+            if curl -fsSL "https://crates.io/api/v1/crates/$c/$VERSION" >/dev/null 2>&1; then
+              echo "$c $VERSION is already on crates.io, skipping"
+              continue
+            fi
+            echo "::group::publish $c"
+            cargo publish -p "$c"
+            echo "::endgroup::"
+            # crates.io indexes asynchronously; the next crate cannot resolve this one until it is
+            # visible. Poll rather than sleeping a fixed guess.
+            for i in $(seq 1 60); do
+              if curl -fsSL "https://crates.io/api/v1/crates/$c/$VERSION" >/dev/null 2>&1; then
+                echo "$c $VERSION is indexed"; break
+              fi
+              [ "$i" = "60" ] && { echo "::error::$c never appeared in the index"; exit 1; }
+              sleep 10
+            done
+          done
+          echo "all crates published at $(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"

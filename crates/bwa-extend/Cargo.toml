@@ -1,5 +1,9 @@
 [package]
-name = "bwa-extend"
+name = "bwa-mem3-extend"
+description = "Scalar reference Smith-Waterman and the SwBackend acceptance harness for bwa-mem3."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
+categories = ["science"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

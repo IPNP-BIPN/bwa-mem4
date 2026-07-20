@@ -1,5 +1,9 @@
 [package]
-name = "bwa-diff"
+name = "bwa-mem3-diff"
+description = "Field-level SAM concordance reporting (sam-diff) for bwa-mem3."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
+categories = ["science"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +14,11 @@ repository.workspace = true
 [[bin]]
 name = "sam-diff"
 path = "src/bin/sam_diff.rs"
+
+# The package is `bwa-mem3-diff` on crates.io, but the LIBRARY keeps its original name so the
+# `sam-diff` binary in this same package, which refers to it as `bwa_diff`, still resolves.
+[lib]
+name = "bwa_diff"
 
 [dependencies]
 serde = { workspace = true }

@@ -55,6 +55,19 @@ Release artifacts are built with an empty `RUSTFLAGS`, overriding `.cargo/config
 build machine's, so publishing one would ship `SIGILL` to every user with an older processor.
 Nothing is lost: the SIMD kernels are chosen at runtime, not by `-C target-cpu`.
 
+**crates.io.** The workspace publishes as ten crates, all under the `bwa-mem3` prefix:
+`cargo install bwa-mem3` gets the binary, and the libraries are `bwa-mem3-core`, `bwa-mem3-index`
+and so on. The unprefixed names (`bwa-core`, `bwa-mem`, ...) were free and deliberately not taken:
+`bwa-mem` is the name of Heng Li's algorithm, and claiming it would deny it to the upstream
+ecosystem permanently. The crates.io package names differ from the Rust library names, which are
+unchanged, so no source file refers to the new names.
+
+Publishing runs from `.github/workflows/publish-crates-io.yml` after a successful Release, and
+needs a `CARGO_REGISTRY_TOKEN` repository secret. It is idempotent (a crate already at that version
+is skipped) and it waits for each crate to be indexed before publishing the next, because a
+dependent cannot resolve a dependency the registry has not surfaced yet. `workflow_dispatch` offers
+a dry run that packages everything and uploads nothing.
+
 Before tagging, run the two manual gates that CI cannot: `scripts/alt_parity.sh` (ALT contigs,
 needs the 3.2 GB GRCh38 analysis set) and, for anything touching the aligner, `scripts/giab30x_pe.sh`.
 
