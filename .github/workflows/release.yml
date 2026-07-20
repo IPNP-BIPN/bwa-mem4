@@ -1,0 +1,220 @@
+name: Release
+
+# Publishes a GitHub Release with prebuilt binaries when a `v*` tag is pushed, the way
+# COMBINE-lab/salmon and FelixKrueger/Bismark ship theirs. Without this, "release" means "clone it
+# and compile it", which is honest but narrows the audience to people who already have a Rust
+# toolchain.
+#
+# The trigger is a tag push, which is a deliberate human act. Nothing here publishes on its own.
+#
+# THE GATE THAT MATTERS: every artifact is made to rebuild the committed `testdata/tiny` index and
+# is compared byte for byte against it before anything is uploaded. That checks the BINARY WE ARE
+# ABOUT TO PUBLISH, not the source it came from, which is a different claim: a broken toolchain, a
+# wrong target flag or a bad vendored htslib build would all pass `cargo test` on a developer
+# machine and still ship a binary that produces different bytes. A release that cannot reproduce
+# the fixture never reaches the Releases page.
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets a release be rebuilt without moving the tag, e.g. after fixing the workflow itself.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v3.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.96.1"
+
+jobs:
+  # Cheap and first: refuse to build anything if the tag and Cargo.toml disagree. That mismatch is
+  # not cosmetic here, because the version string is emitted as `@PG VN:` into every SAM/BAM/CRAM
+  # file the binary produces. Shipping v3.0.1 that stamps VN:3.0.0 into user data would be a
+  # provenance bug, and this project shipped VN:0.0.0 for its entire pre-release life precisely
+  # because nothing checked.
+  check-version:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Tag must match the workspace version
+        id: v
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          # The workspace version, read from the manifest rather than from a built binary so this
+          # job stays seconds long.
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG workspace version=$VERSION"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag '$TAG' does not match Cargo.toml version '$VERSION' (expected tag 'v$VERSION')"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Same four runner labels as ci.yml, and for the same reasons documented there: macos-13 is
+      # retired and queues forever rather than failing, so Intel macOS is macos-15-intel.
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target_id: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target_id: linux-aarch64
+          - os: macos-14
+            target_id: macos-arm64
+          - os: macos-15-intel
+            target_id: macos-x86_64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      # No rust-cache here on purpose. A release build is rare, and a stale cache entry is a way to
+      # ship bytes that nobody can reproduce from a clean tree. Correctness over the few minutes.
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: The binary reports the tagged version
+        run: |
+          set -euo pipefail
+          # `mem` with no arguments prints usage and exits non-zero, so ask via --version on the
+          # top-level command instead. This catches a mismatch that check-version cannot: the
+          # manifest could be right while the build picked up something else entirely.
+          ./target/release/bwa-mem3 --version
+          ./target/release/bwa-mem3 --version | grep -q "${{ needs.check-version.outputs.version }}"
+
+      # The real gate. testdata/tiny ships the five index files bwa-mem2 itself produced, so
+      # rebuilding them with the freshly built binary and comparing byte for byte proves this
+      # artifact reproduces the reference indexer on this platform.
+      - name: Artifact rebuilds the committed index byte-identically
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/relcheck
+          cp testdata/tiny/tiny.fa /tmp/relcheck/tiny.fa
+          ./target/release/bwa-mem3 index /tmp/relcheck/tiny.fa
+          for ext in pac ann amb bwt.2bit.64 0123; do
+            if cmp -s "/tmp/relcheck/tiny.fa.$ext" "testdata/tiny/tiny.fa.$ext"; then
+              echo "  .$ext identical"
+            else
+              echo "::error::.$ext differs from the committed fixture on ${{ matrix.target_id }}"
+              exit 1
+            fi
+          done
+
+      # Alignment smoke test: the index gate above never runs the aligner. This does, and asserts
+      # the output is a well-formed non-empty SAM rather than merely a zero exit code.
+      - name: Artifact aligns
+        run: |
+          set -euo pipefail
+          python3 scripts/make_test_reads.py testdata/tiny/tiny.fa /tmp/relcheck/r --n 500
+          ./target/release/bwa-mem3 mem -t2 -K 10000000 testdata/tiny/tiny.fa \
+            /tmp/relcheck/r_1.fq /tmp/relcheck/r_2.fq > /tmp/relcheck/out.sam
+          RECORDS=$(grep -vc '^@' /tmp/relcheck/out.sam)
+          echo "records: $RECORDS"
+          # 500 pairs in, so 1000 records out. An exact count, not a "> 0": a truncated run would
+          # pass the loose test and ship.
+          [ "$RECORDS" -eq 1000 ]
+          grep -q '^@SQ' /tmp/relcheck/out.sam
+
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          NAME="bwa-mem3-${{ needs.check-version.outputs.tag }}-${{ matrix.target_id }}"
+          mkdir -p "dist/$NAME"
+          cp target/release/bwa-mem3 "dist/$NAME/"
+          # LICENSE travels with the binary: this is a derivative work of bwa-mem2 and the MIT terms
+          # require the notice to accompany every distributed copy, source or not.
+          cp LICENSE README.md "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          # shasum on macOS, sha256sum on Linux; both print "<hash>  <file>".
+          ( cd dist && (sha256sum "$NAME.tar.gz" 2>/dev/null || shasum -a 256 "$NAME.tar.gz") > "$NAME.tar.gz.sha256" )
+          cat "dist/$NAME.tar.gz.sha256"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 7
+
+  publish:
+    needs: [check-version, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          set -euo pipefail
+          ls -l dist
+          cat dist/*.sha256 > dist/SHA256SUMS
+          rm -f dist/*.tar.gz.sha256
+          cat dist/SHA256SUMS
+          # Four targets, so four archives. Publishing a release that silently lost one is worse
+          # than publishing none: users on that platform get a 404 with no explanation.
+          COUNT=$(ls dist/*.tar.gz | wc -l)
+          [ "$COUNT" -eq 4 ] || { echo "::error::expected 4 archives, found $COUNT"; exit 1; }
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The tag's own annotation is the release notes: it is written at tag time, by a human,
+          # and already states what was verified. Falling back to auto-generated notes when the tag
+          # is lightweight and carries no message.
+          NOTES=$(git tag -l --format='%(contents)' "$TAG")
+          if [ -n "$NOTES" ]; then
+            printf '%s\n' "$NOTES" > /tmp/notes.md
+            NOTES_ARG=(--notes-file /tmp/notes.md)
+          else
+            NOTES_ARG=(--generate-notes)
+          fi
+          # `--verify-tag`: never invent a tag. If the tag is not on the remote, that is a mistake
+          # to surface rather than paper over.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists, replacing its assets"
+            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+              --title "bwa-mem3 $TAG" --verify-tag "${NOTES_ARG[@]}"
+          fi
+          gh release view "$TAG"

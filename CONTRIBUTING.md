@@ -4,6 +4,26 @@ Welcome, and thanks for collaborating. This note is written mainly for **@nh13 (
 started on the NEON backend, but it applies to any contributor. The project docs (`ROADMAP.md`,
 `DIVERGENCES.md`, `DEPENDENCIES.md`) are in French; this file is in English.
 
+## Branches and releases
+
+- **`dev` is the default branch and the target for every pull request.** `main` is the released
+  line: it only ever advances by merging `dev`, so anything on `main` has been through CI and, for
+  a release, through the manual gates below.
+- Work happens on a topic branch off `dev` (`feat/...`, `fix/...`, `perf/...`, `ci/...`), and lands
+  in `dev` by PR. Both CI workflows (build/test and the parity gate) run on every branch and every
+  PR, so a red gate is visible before review, not after merge.
+- A **release** is: merge `dev` into `main`, then push an annotated `vX.Y.Z` tag on `main`. The tag
+  push triggers `.github/workflows/release.yml`, which builds the four supported targets, proves
+  each binary rebuilds the committed `testdata/tiny` index byte-identically, and publishes a GitHub
+  Release. The tag's own annotation becomes the release notes, so write it as if users will read
+  it, because they will.
+- The tag must match the workspace version in `Cargo.toml`. The release workflow refuses to build
+  otherwise, and that check is not bureaucratic: the version is stamped into `@PG VN:` on every
+  SAM/BAM/CRAM the binary writes, so a mismatch mislabels other people's data.
+
+Before tagging, run the two manual gates that CI cannot: `scripts/alt_parity.sh` (ALT contigs,
+needs the 3.2 GB GRCh38 analysis set) and, for anything touching the aligner, `scripts/giab30x_pe.sh`.
+
 ## What this is
 
 A **from-scratch native Rust reimplementation of bwa-mem2** (indexer included), whose acceptance
