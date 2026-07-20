@@ -538,7 +538,9 @@ pub fn build_chains_from_resolved(
                     pos: rbeg,
                     w: 0,
                     kept: 0,
-                    is_alt: false,
+                    // `tmp.is_alt = !!bns->anns[rid].is_alt` (`bwamem.cpp:948`). `rid >= 0` here:
+                    // the negative case was discarded above.
+                    is_alt: bns.contigs[rid as usize].is_alt,
                     first: -1,
                     frac_rep: 0.0,
                     seeds: vec![seed],

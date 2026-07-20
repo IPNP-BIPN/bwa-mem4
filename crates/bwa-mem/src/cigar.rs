@@ -141,9 +141,51 @@ pub struct MemAln {
     pub score: i32,
     /// Suboptimal score (`XS:i`), `max(sub, csub)`. `-1` suppresses the tag (secondary hits).
     pub sub: i32,
+    /// `mem_alnreg_t::alt_sc` carried through (`bwamem.cpp:1802`): the score of the ALT region
+    /// shadowing this primary-assembly one, or 0. Only used to decide whether to emit `pa:f`.
+    pub alt_sc: i32,
     /// Alternate hits (`XA:Z:`), pre-formatted `rname,±pos,cigar,NM;`... or `None`. Set by the
     /// caller via `mem_gen_alt`; `reg2aln` leaves it `None`.
     pub xa: Option<String>,
+}
+
+/// Format the `pa:f` payload the way C's `printf("%.3f", (double)score / alt_sc)` does
+/// (`bwamem.cpp:1715`).
+///
+/// NOT `format!("{:.3}", x)`. The two disagree on exact ties: glibc rounds a tie to the nearest
+/// EVEN last digit (the default IEEE rounding mode), while Rust's formatter rounds a tie AWAY from
+/// zero. The values here are ratios of two small integers, so ties are not hypothetical: any
+/// `alt_sc` that is a power of two produces one. `score = 1, alt_sc = 16` gives exactly 0.0625,
+/// which glibc prints as `0.062` and Rust's formatter as `0.063`. One byte, one failed parity gate.
+///
+/// Scaling by 1000 before rounding is safe for precisely the values that can tie: a tie requires
+/// the ratio to be a dyadic rational, and multiplying a dyadic rational by 1000 is exact in
+/// binary floating point. Non-tying values are unaffected by which rule is used.
+///
+/// # Parameters
+///
+/// - `score`: the region's alignment score, the numerator.
+/// - `alt_sc`: the shadowing ALT region's score, the denominator. Callers must have checked it is
+///   greater than zero, matching the C's `if (p->alt_sc > 0)` guard.
+///
+/// # Returns
+///
+/// The ratio as a decimal string with exactly three fractional digits, e.g. `"0.062"`.
+pub fn format_pa(score: i32, alt_sc: i32) -> String {
+    let scaled = f64::from(score) / f64::from(alt_sc) * 1000.0;
+    let floor = scaled.floor();
+    let frac = scaled - floor;
+    let thousandths = if frac > 0.5 {
+        floor + 1.0
+    } else if frac < 0.5 {
+        floor
+    } else if (floor as i64) % 2 == 0 {
+        // Exact tie: round to even, as glibc does.
+        floor
+    } else {
+        floor + 1.0
+    } as i64;
+    format!("{}.{:03}", thousandths / 1000, (thousandths % 1000).abs())
 }
 
 impl MemAln {
@@ -164,6 +206,7 @@ impl MemAln {
             // `AS:i:0 XS:i:0`. Signalling "absent" with -1 silently drops both tags.
             score: 0,
             sub: 0,
+            alt_sc: 0,
             xa: None,
         }
     }
@@ -731,6 +774,7 @@ pub fn reg2aln(
         // XS:i is the better of the two suboptimal estimates: `sub` from overlapping regions
         // (`mem_mark_primary_se`) and `csub` from within the same chain.
         sub: reg.sub.max(reg.csub),
+        alt_sc: reg.alt_sc,
         // Filled in by the caller from `mem_gen_alt`; `reg2aln` never produces XA itself, because
         // XA generation calls back into `reg2aln` and would recurse.
         xa: None,

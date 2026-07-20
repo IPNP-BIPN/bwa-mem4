@@ -165,6 +165,24 @@ struct AmbRec {
 /// `Ok(())` once all five files are written and flushed. `Err` if the FASTA cannot be read, if it
 /// parsed to zero contigs, or if any output file cannot be created or written.
 pub fn build_index(fasta: &Path) -> Result<()> {
+    build_index_with_prefix(fasta, fasta)
+}
+
+/// Build the index from `fasta` but name the output files after `prefix`, for `index -p`.
+///
+/// bwa-mem2's `index -p prefix` does exactly this: the five side files become `<prefix>.pac`,
+/// `<prefix>.ann` and so on, and `<prefix>` is then what `mem` is given. The default is `prefix ==
+/// fasta`, which is why every path in this project doubles as both the FASTA and the index prefix.
+///
+/// The CONTENTS are unaffected: the `.ann` records contig names taken from the FASTA, never the
+/// file's own path, so an index built with `-p` is byte-identical to one built without it.
+///
+/// # Parameters
+///
+/// - `fasta`: the reference to read.
+/// - `prefix`: the path the five output files are named after. Its directory must exist and be
+///   writable; nothing here creates it.
+pub fn build_index_with_prefix(fasta: &Path, prefix: &Path) -> Result<()> {
     let contigs = read_fasta(fasta)?;
     if contigs.is_empty() {
         return Err(Error::Other("empty FASTA".into()));
@@ -258,11 +276,11 @@ pub fn build_index(fasta: &Path) -> Result<()> {
     drop(contigs);
 
     // 2. Write .pac (2-bit packed forward reference).
-    write_pac(&sibling(fasta, "pac"), &forward)?;
+    write_pac(&sibling(prefix, "pac"), &forward)?;
 
     // 3. Write .ann and .amb.
-    write_ann(&sibling(fasta, "ann"), l_pac, n_seqs, &anns)?;
-    write_amb(&sibling(fasta, "amb"), l_pac, n_seqs, &ambs)?;
+    write_ann(&sibling(prefix, "ann"), l_pac, n_seqs, &anns)?;
+    write_amb(&sibling(prefix, "amb"), l_pac, n_seqs, &ambs)?;
 
     // 4. Build the forward++reverse-complement binary reference and write .0123. The RC half is
     //    filled in parallel: bref[L + i] = complement(forward[L - 1 - i]).
@@ -297,10 +315,10 @@ pub fn build_index(fasta: &Path) -> Result<()> {
     });
     // `forward` is now captured in bref; free it before the suffix array (~3 GB at genome scale).
     drop(forward);
-    File::create(sibling(fasta, "0123")).and_then(|f| BufWriter::new(f).write_all(&bref))?;
+    File::create(sibling(prefix, "0123")).and_then(|f| BufWriter::new(f).write_all(&bref))?;
 
     // 5. Build and write the FM-index (.bwt.2bit.64).
-    write_fm_index(&sibling(fasta, "bwt.2bit.64"), &bref)?;
+    write_fm_index(&sibling(prefix, "bwt.2bit.64"), &bref)?;
 
     Ok(())
 }

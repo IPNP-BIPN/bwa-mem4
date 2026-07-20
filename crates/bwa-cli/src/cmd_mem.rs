@@ -1127,7 +1127,18 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Both are loaded once, live for the whole run, and are shared immutably with every worker.
     // Together they are several GB for a human genome (memory-mapped where possible).
     let fm = FmIndex::load(&args.index_prefix)?;
-    let bns = BntSeq::load(&args.index_prefix)?;
+    let mut bns = BntSeq::load(&args.index_prefix)?;
+    // `-j`: clear the ALT flags the loader just read from `<prefix>.alt`, so every contig counts as
+    // primary assembly. Done here, after loading, exactly as `fastmap.cpp:907` does it.
+    if args.ignore_alt {
+        bns.ignore_alt();
+    }
+    // bwa prints this at load time (`bwa.cpp:419`). Kept behind the same verbosity gate as bwa's
+    // other progress chatter: it goes to stderr and never touches the SAM bytes.
+    if args.verbose.unwrap_or(3) >= 3 && bns.n_alt() > 0 {
+        eprintln!("[M::main_mem] read {} ALT contigs", bns.n_alt());
+    }
+    let bns = bns;
     // One `@SQ` line per contig, in index order. That order comes from the FASTA and must be
     // preserved: downstream tools treat @SQ order as the coordinate sort order.
     //
@@ -1142,6 +1153,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         .map(|contig| SqRecord {
             name: contig.name.clone(),
             len: i64::from(contig.len),
+            is_alt: contig.is_alt,
         })
         .collect();
 
@@ -1403,6 +1415,9 @@ fn finish_se(
     // `mem_mark_primary_se` with `secondary` (-1 = unshadowed, else the index of the shadower).
     // After marking, `regs[0]` is the highest-scoring primary.
     let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs_pre);
+    // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after the dedup and
+    // before any primary marking reads it.
+    bwa_mem::stamp_is_alt(bns, &mut regs);
     mem_mark_primary_se(opt, &mut regs, read_id);
     if dump_regs_enabled() {
         bwa_mem::dump_regs(bns, "post-dedup+mark", &regs);
@@ -1702,6 +1717,14 @@ fn write_aln_se(
             ));
         }
     }
+    // `pa:f` (`bwamem.cpp:1714`): how much better this primary-assembly hit scored than the ALT hit
+    // that shadows it. Emitted for a non-secondary record whenever `alt_sc` was set, INDEPENDENTLY
+    // of whether an `SA:Z` was printed just above, and always before `XA:Z`. `alt_sc` is 0 unless
+    // the index has ALT contigs, so this is dead weight on an index without a `.alt` file.
+    if !emit.secondary && aln.alt_sc > 0 {
+        tags.push_str("\tpa:f:");
+        tags.push_str(&bwa_mem::cigar::format_pa(aln.score, aln.alt_sc));
+    }
     if let Some(xa_string) = &emit.xa {
         tags.push_str("\tXA:Z:");
         tags.push_str(xa_string);
@@ -1887,8 +1910,11 @@ fn run_pe(
             .zip(paired.into_par_iter())
             .map(
                 |((rec1, rec2), ((codes1, codes2), (regs_pre1, regs_pre2)))| {
-                    let regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
-                    let regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
+                    let mut regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
+                    let mut regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
+                    // `bwamem.cpp:1161`, applied to both mates of the pair.
+                    bwa_mem::stamp_is_alt(bns, &mut regs1);
+                    bwa_mem::stamp_is_alt(bns, &mut regs2);
                     PrepPair {
                         codes1,
                         codes2,

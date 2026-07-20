@@ -303,6 +303,7 @@ mod tests {
             w: 0,
             frac_rep: 0.0,
             is_alt: false,
+            alt_sc: 0,
             hash: 0,
             n_comp: 1,
         }

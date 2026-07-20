@@ -487,6 +487,8 @@ fn mem_matesw(
                         w: 0,
                         frac_rep: 0.0,
                         is_alt: a.is_alt,
+                        // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
+                        alt_sc: 0,
                         hash: 0,
                         n_comp: 0,
                     };
@@ -768,6 +770,8 @@ fn matesw_apply(
                     w: 0,
                     frac_rep: 0.0,
                     is_alt: call.is_alt,
+                    // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
+                    alt_sc: 0,
                     hash: 0,
                     n_comp: 0,
                 };
@@ -1835,7 +1839,14 @@ fn mem_aln2sam(
             }
         }
     }
-    // XA:Z (alternate hits), after SA/pa per mem_aln2sam. `pa` needs ALT contigs, so never emitted.
+    // `pa:f` (`bwamem.cpp:1714`): emitted for a non-secondary record whenever `alt_sc` was set,
+    // independently of whether an `SA:Z` was printed, and always before `XA:Z`. `alt_sc` is 0
+    // unless the index has ALT contigs.
+    if p.flag & 0x100 == 0 && p.alt_sc > 0 {
+        out.extend_from_slice(b"\tpa:f:");
+        out.extend_from_slice(crate::cigar::format_pa(p.score, p.alt_sc).as_bytes());
+    }
+    // XA:Z (alternate hits), after SA/pa per mem_aln2sam.
     if let Some(xa) = &p.xa {
         out.extend_from_slice(b"\tXA:Z:");
         out.extend_from_slice(xa.as_bytes());
