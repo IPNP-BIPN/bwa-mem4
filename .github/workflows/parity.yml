@@ -20,6 +20,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # See ci.yml: `-C target-cpu=native` from .cargo/config.toml is a SIGILL hazard on cloud VMs and
+  # buys nothing here, since the SIMD kernels dispatch at runtime.
+  RUSTFLAGS: ""
   RUST_TOOLCHAIN: "1.96.1"
   # Pinned deliberately. bwa-mem2 is the oracle, so an upstream release must be an explicit,
   # reviewed bump here rather than something that silently turns CI red one morning.

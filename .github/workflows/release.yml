@@ -32,6 +32,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.96.1"
+  # THE MOST IMPORTANT LINE IN THIS FILE. It overrides `.cargo/config.toml`'s
+  # `-C target-cpu=native` (an env RUSTFLAGS replaces the config value outright).
+  #
+  # A binary built with `native` runs only on CPUs at least as capable as the runner's, so
+  # publishing one would ship SIGILL to every user with an older processor, with no diagnostic
+  # beyond "Illegal instruction". Release artifacts are built at the default baseline instead.
+  #
+  # Nothing is lost: the SIMD kernels are not selected by `-C target-cpu`. They are
+  # `#[target_feature]` functions chosen at RUNTIME (`bwa-neon/src/batched.rs:146-165`), so a
+  # baseline build still runs AVX2 where AVX2 exists.
+  RUSTFLAGS: ""
 
 jobs:
   # Cheap and first: refuse to build anything if the tag and Cargo.toml disagree. That mismatch is
@@ -166,8 +177,47 @@ jobs:
             dist/*.sha256
           retention-days: 7
 
-  publish:
+  # `main` is the released line: it advances only when a release happens, and only after all four
+  # artifacts have proven they rebuild the committed index byte-identically. Ordering it BEFORE
+  # publish is deliberate: if promotion fails (say `main` has diverged), no Release appears
+  # pointing at a commit `main` does not contain.
+  promote:
     needs: [check-version, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history: a fast-forward check needs the ancestry, and a shallow clone does not
+          # have it.
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Fast-forward main to the tagged commit
+        env:
+          TAG: ${{ needs.check-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          TARGET=$(git rev-parse "$TAG^{commit}")
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" = "$TARGET" ]; then
+            echo "main is already at $TARGET, nothing to promote"
+            exit 0
+          fi
+          # Refuse anything but a fast-forward. If `main` carries commits the tag does not contain,
+          # that is a real divergence to look at by hand, not something to resolve automatically in
+          # a release job: the wrong resolution silently publishes a tree nobody reviewed.
+          if ! git merge-base --is-ancestor origin/main "$TARGET"; then
+            echo "::error::main is not an ancestor of $TAG. Reconcile them by hand; refusing to force."
+            exit 1
+          fi
+          git push origin "$TARGET:refs/heads/main"
+          echo "main fast-forwarded to $TAG ($TARGET)"
+
+  publish:
+    needs: [check-version, build, promote]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:

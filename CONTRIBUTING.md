@@ -12,14 +12,27 @@ started on the NEON backend, but it applies to any contributor. The project docs
 - Work happens on a topic branch off `dev` (`feat/...`, `fix/...`, `perf/...`, `ci/...`), and lands
   in `dev` by PR. Both CI workflows (build/test and the parity gate) run on every branch and every
   PR, so a red gate is visible before review, not after merge.
-- A **release** is: merge `dev` into `main`, then push an annotated `vX.Y.Z` tag on `main`. The tag
-  push triggers `.github/workflows/release.yml`, which builds the four supported targets, proves
-  each binary rebuilds the committed `testdata/tiny` index byte-identically, and publishes a GitHub
-  Release. The tag's own annotation becomes the release notes, so write it as if users will read
-  it, because they will.
+- A **release** is one act: push an annotated `vX.Y.Z` tag on `dev`. Everything else is automatic.
+  `.github/workflows/release.yml` then, in this order: refuses to start unless the tag matches the
+  workspace version, builds the four supported targets, proves each binary rebuilds the committed
+  `testdata/tiny` index byte-identically and aligns 500 pairs into exactly 1000 records,
+  **fast-forwards `main` to the tagged commit**, and only then publishes the GitHub Release.
+
+  The promotion is ordered before publishing on purpose: if `main` cannot be fast-forwarded, no
+  Release appears pointing at a commit `main` does not contain. And it is a fast-forward only. If
+  `main` has diverged, the job stops and asks for a human, because resolving that automatically
+  inside a release job is how an unreviewed tree gets published.
+
+  The tag's own annotation becomes the release notes, so write it as if users will read it, because
+  they will.
 - The tag must match the workspace version in `Cargo.toml`. The release workflow refuses to build
   otherwise, and that check is not bureaucratic: the version is stamped into `@PG VN:` on every
   SAM/BAM/CRAM the binary writes, so a mismatch mislabels other people's data.
+
+Release artifacts are built with an empty `RUSTFLAGS`, overriding `.cargo/config.toml`'s
+`-C target-cpu=native`. A binary built with `native` runs only on CPUs at least as capable as the
+build machine's, so publishing one would ship `SIGILL` to every user with an older processor.
+Nothing is lost: the SIMD kernels are chosen at runtime, not by `-C target-cpu`.
 
 Before tagging, run the two manual gates that CI cannot: `scripts/alt_parity.sh` (ALT contigs,
 needs the 3.2 GB GRCh38 analysis set) and, for anything touching the aligner, `scripts/giab30x_pe.sh`.

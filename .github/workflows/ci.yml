@@ -12,6 +12,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Overrides `.cargo/config.toml`'s `-C target-cpu=native` (an env RUSTFLAGS replaces the config
+  # value entirely). On cloud VMs LLVM's host detection can name a CPU whose features the
+  # hypervisor masks off, and the compiler then emits instructions the host refuses: this crashed
+  # clippy-driver with SIGILL on ubuntu-22.04 while the identical tree passed elsewhere. The SIMD
+  # kernels are dispatched at runtime, not by target-cpu, so nothing is lost.
+  RUSTFLAGS: ""
   # Matches rust-toolchain.toml. Cargo.toml declares rust-version = "1.96" as the MSRV.
   RUST_TOOLCHAIN: "1.96.1"
 

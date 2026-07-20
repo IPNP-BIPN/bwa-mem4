@@ -1,5 +1,20 @@
-# Tune codegen for the build machine's CPU (Apple Silicon NEON). This changes only instruction
-# selection/scheduling, never output bytes, so index/SAM byte-identity is preserved; it is resolved
-# per build machine, so the binary stays correct wherever it is compiled.
+# Tune codegen for the build machine's CPU. This changes only instruction selection/scheduling,
+# never output bytes, so index/SAM byte-identity is preserved.
+#
+# IT IS FOR LOCAL BUILDS ONLY, and CI and the release workflow both override it with an empty
+# RUSTFLAGS. Two reasons, one of which is a real hazard:
+#
+#   1. A binary built with `native` runs only on CPUs at least as capable as the build machine's.
+#      Publishing one would ship SIGILL to every user with an older processor. Release artifacts
+#      are therefore built at the default baseline.
+#   2. On cloud VMs, LLVM's host detection can name a CPU model whose feature set the hypervisor
+#      has actually masked off, and the compiler then emits instructions the host refuses. That is
+#      not theoretical here: it crashed clippy-driver with SIGILL on a GitHub ubuntu-22.04 runner,
+#      intermittently, while the identical tree passed on other runners.
+#
+# Nothing is lost by dropping it. The SIMD kernels are NOT selected by `-C target-cpu`: they are
+# `#[target_feature]` functions chosen at RUNTIME by `is_x86_feature_detected!("avx2")` /
+# `is_aarch64_feature_detected!("neon")` (`bwa-neon/src/batched.rs:146-165`), so a baseline build
+# still runs AVX2 on a machine that has it and falls back correctly on one that does not.
 [build]
 rustflags = ["-C", "target-cpu=native"]
