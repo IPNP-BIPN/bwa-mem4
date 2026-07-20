@@ -82,10 +82,16 @@ IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \
 ```
 
 ```sh
+bash scripts/alt_parity.sh     # ALT contigs: real GRCh38 analysis set + the real bwakit .alt
 bash scripts/giab30x_pe.sh     # the real thing: a full 30x WGS, several hours
 ```
 
-Both of the first two run in CI on every push. The third is manual.
+```sh
+bash scripts/upstream_repros.sh   # open bwa-mem2 crash issues, run against both aligners
+```
+
+The first two run in CI on every push. The rest are manual: the ALT fixture is 3.2 GB and its
+index build peaks near 80 GB of RAM, and the 30x WGS takes hours.
 
 **A passing gate proves nothing until you have watched it fail on a bug you know is there.** Every
 byte-identity bug found in this project so far has lived exactly where the gate was not looking:
@@ -134,7 +140,26 @@ cargo build --release
 
 Rust 1.96. macOS and Linux, on both x86_64 and aarch64.
 
+## Upstream bugs
+
+bwa-mem2's behaviour is reproduced byte for byte, and that includes its bugs. Several open upstream
+issues are therefore **deliberately not fixed here**, because fixing them would break the
+acceptance criterion: [#293](https://github.com/bwa-mem2/bwa-mem2/issues/293) (`-R` can produce a
+technically invalid BAM), [#278](https://github.com/bwa-mem2/bwa-mem2/issues/278) (`MQ` tags absent
+where bwa emits them), [#260](https://github.com/bwa-mem2/bwa-mem2/issues/260) (MAPQ of
+supplementary alignments).
+
+Crashes are the exception: a run that aborts produces no output, so there is nothing to be
+identical to. `scripts/upstream_repros.sh` runs three of them against both aligners.
+[#269](https://github.com/bwa-mem2/bwa-mem2/issues/269) reproduces exactly, on the 345 read pairs
+attached to that issue: bwa-mem2 2.3 dies with `assert failed for seqPair size` and emits nothing,
+while we align all 345 pairs.
+
+[#297](https://github.com/bwa-mem2/bwa-mem2/issues/297), the x86-vs-arm64 disagreement described
+above, was filed from this project.
+
 ## Licence
 
-MIT. This is a derivative work of [bwa-mem2](https://github.com/bwa-mem2/bwa-mem2)
-(Copyright 2019 Intel Corporation, Heng Li), which is also MIT licensed.
+MIT, in [LICENSE](LICENSE). This is a derivative work of
+[bwa-mem2](https://github.com/bwa-mem2/bwa-mem2) (Copyright 2019 Intel Corporation, Heng Li), which
+is also MIT licensed; its copyright notice is retained in full in that file.

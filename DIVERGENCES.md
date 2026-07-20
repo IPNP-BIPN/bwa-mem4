@@ -4,9 +4,19 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## Acceptees (par conception)
 
-- **`@PG`** : notre sortie emet `ID:bwa-mem3 PN:bwa-mem3 VN:<ver> CL:<notre argv>`, l'oracle emet
-  `bwa-mem2`. Exclu du gate d'octet-identite (on compare `@SQ` + lignes d'alignement). Decision finale
-  (spoof eventuel de `@PG`) reportee en fin de projet.
+- **`@PG` : DECIDE (3.0.0). Nous emettons notre propre identite, definitivement.** Notre sortie
+  emet `ID:bwa-mem3 PN:bwa-mem3 VN:<ver> CL:<notre argv>`, l'oracle emet `bwa-mem2`. Exclu du gate
+  d'octet-identite (on compare `@SQ` + les lignes d'alignement).
+
+  L'option alternative etait de se faire passer pour `bwa-mem2` dans le `@PG`, ce qui aurait rendu
+  la sortie octet-identique **y compris l'en-tete**. Rejete : le `@PG` est le seul endroit d'un BAM
+  qui enregistre quel binaire a produit les donnees, et c'est precisement ce que lisent les audits
+  de provenance et les pipelines de reproductibilite. Usurper ce champ rendrait tout BAM produit
+  ici intracable, pour gagner une ligne d'en-tete que le gate exclut de toute facon. Un aligneur
+  qui ment sur sa propre identite est un probleme, pas une fonctionnalite.
+
+  Consequence assumee : `diff` brut entre une sortie bwa-mem2 et une sortie bwa-mem3 montrera
+  toujours cette ligne. Tous les scripts du depot filtrent `^@PG` pour cette raison.
 
 ## Résolu (phase 8, via oracle instrumenté)
 

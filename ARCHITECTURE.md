@@ -535,8 +535,15 @@ Terms and short variable names you will hit constantly, with what they *mean*.
 - **ALT contig.** An *alternate* contig: a second representation of a locus that is genuinely
   polymorphic in the population, shipped alongside the primary assembly. A hit on one is not real
   evidence of ambiguity, so it is suppressed from primary consideration and does not dilute a
-  primary hit's MAPQ. This repo's reference has none, and the ALT-specific branches of
-  `mem_mark_primary_se` are explicitly not ported (`primary.rs:399`).
+  primary hit's MAPQ. Which contigs are ALT comes from an optional `<prefix>.alt` file listing
+  their names, read at load time (never from the index itself, so the same index behaves
+  differently depending on whether that file sits next to it). The ALT-specific branches ARE
+  ported: `BntSeq::apply_alt` reads the file, `mem_mark_primary_se` runs its `n_pri < n` branch
+  (re-sorting so the primary assembly forms a prefix and re-marking within it), an ALT contig's
+  `@SQ` line carries `AH:*`, a shadowed primary hit gets a `pa:f` tag, and the paired branch emits
+  the best ALT hit as a supplementary record. `mem -j` clears every flag, making the run behave as
+  though no `.alt` existed. The committed fixtures have no ALT contigs, so `scripts/alt_parity.sh`
+  (manual, real GRCh38 analysis set) is what actually exercises all of this.
 
 ### The index
 
