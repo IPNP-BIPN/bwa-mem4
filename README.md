@@ -13,7 +13,9 @@ Not "equivalent alignments". The same bytes.
 | Index | byte-identical, all five files |
 | Single-end | byte-identical on **353,517,767** records |
 | Paired-end | byte-identical on **707,312,349** records |
+| ALT contigs | byte-identical on the real GRCh38 analysis set, 261 ALT contigs |
 | Speed | SE **2.62x**, PE **1.85x** vs bwa-mem2 at `-t8` |
+| Output | SAM, BGZF-compressed SAM, BAM, CRAM |
 
 Measured on a real 32.9x human WGS (GIAB HG002, 2x150), not simulated reads and not a sampled
 subset. Both aligners read the same on-disk index. Reproduce with `scripts/giab30x_pe.sh`.
@@ -117,7 +119,6 @@ A Cargo workspace, one crate per pipeline stage. The binary is `bwa-mem3` (`inde
 | `bwa-mem` | Extension, dedup, primary marking, MAPQ, CIGAR, tags, paired-end |
 | `bwa-cli` | The `bwa-mem3` binary |
 | `bwa-diff` | Field-level SAM concordance (`sam-diff`) |
-| `bwa-sam` | Empty. Reserved and never filled in; nothing depends on it |
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is the guide for someone who knows neither this code nor
 bioinformatics: one read's journey from FASTQ to SAM line, a glossary of every abbreviation, and
@@ -131,6 +132,25 @@ SW-offload backend at a few percent, and each one adds a byte-identity surface t
 against the scalar reference. The Metal shader had shipped a real bug (it opened gaps from `H`
 instead of `M`) precisely because that proof was too weak. It is in the git history if the profile
 ever changes.
+
+## Output formats
+
+`-o` picks the format from the suffix: plain SAM, `.gz`/`.bgz` for BGZF-compressed SAM (compressed
+in parallel on `-t` threads), `.bam`, or `.cram` (which also needs `--reference`). Omitting `-o`
+writes SAM to stdout, which is all bwa-mem2 itself can do.
+
+BAM and CRAM are produced by TRANSCODING the SAM text through htslib, not by a second formatter.
+That is deliberate: byte-identity is defined on the SAM bytes, so the binary formats have to be a
+lossless re-encoding of exactly those bytes. On 100,000 records the BAM decodes back to records
+byte-identical to the SAM path. CRAM does not, and cannot: htslib discards `NM`/`MD` and
+regenerates them from the reference, which reorders the optional tags. With the tags sorted the
+records are identical, and `samtools view -C -T` on our own BAM produces the same order.
+
+| | bytes | ratio |
+|---|---|---|
+| SAM | 44,957,730 | 1x |
+| BAM | 8,203,307 | 5.5x |
+| CRAM | 1,187,099 | 37.9x |
 
 ## Building
 

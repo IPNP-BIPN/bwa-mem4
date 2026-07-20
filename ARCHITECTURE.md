@@ -492,11 +492,10 @@ table (nothing depends on something listed above it, except `bwa-cli` which depe
 | `bwa-mem` | The alignment core and pipeline glue: extension driver (`lib.rs`, `across.rs`), dedup / primary marking / MAPQ (`primary.rs`), CIGAR / NM / MD (`cigar.rs`), all paired-end logic (`pe.rs`), `XA` generation (`alt.rs`) | `bwa-core`, `bwa-index`, `bwa-seed`, `bwa-chain`, `bwa-extend`, `bwa-neon` |
 | `bwa-cli` | The `bwa-mem3` binary: `index` and `mem` subcommands, option parsing and validation (`cmd_mem.rs`, 1484 lines, half of it per-option documentation), the threaded read/process/write pipeline | most of the above, `clap`, `rayon`, `bgzf`, `mimalloc` |
 | `bwa-diff` | The `sam-diff` binary: field-level SAM concordance reporting, so a divergence reads as "37 records differ in XA" rather than as a byte offset. Deliberately lossy (five fields, primaries only, order-insensitive), so a clean report is **not** proof of parity | `serde`, `serde_json` |
-| `bwa-sam` | **Empty placeholder.** Reserved early for primary marking / MAPQ / CIGAR / tags; that work ended up next to the code it needs. Its own module doc now points at the real locations. Nothing depends on it | nothing |
 
-Two notes on the tables in older docs: the crate tables in `README.md` and `CONTRIBUTING.md`
-predate the current layout. They still attribute primary marking, MAPQ and CIGAR to `bwa-sam`
-(they live in `bwa-mem`) and do not list `bwa-neon`. Trust this table and the source.
+`bwa-sam` was an empty placeholder crate, reserved early for primary marking / MAPQ / CIGAR / tags
+before that work ended up next to the code it needs. It was removed for 3.0.0: it held no code and
+nothing depended on it, and shipping an empty crate in a release is noise in every `cargo tree`.
 
 **Dead ends kept in tree.** `bwa-index/src/lisa.rs`, `rmi.rs` and `bwa-seed/src/lisa_seed.rs` are a
 byte-identical implementation of BWA-MEME's learned-index seeding. Per the project's own notes it

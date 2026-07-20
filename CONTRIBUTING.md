@@ -45,7 +45,6 @@ Cargo workspace, one crate per stage (mirrors bwa-mem2):
 | **`bwa-extend`** | **banded Smith-Waterman (`ksw_extend2`), the `SwBackend` trait, z-drop** |
 | `bwa-neon` | NEON SIMD SW kernels: batched cross-read extension, and the mate-rescue kernel |
 | `bwa-mem` | primary marking, MAPQ, CIGAR, tags, PE (`mem_pestat`/`mem_matesw`/`mem_pair`), pipeline glue |
-| `bwa-sam` | **empty.** Reserved for the above and never filled in; it holds no code and nothing depends on it |
 | `bwa-cli` | the `bwa-mem3` binary (`index` + `mem`) |
 | `bwa-diff` | field-level SAM concordance (`sam-diff`) |
 

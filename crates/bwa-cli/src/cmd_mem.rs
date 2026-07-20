@@ -426,7 +426,8 @@ pub struct MemArgs {
     // Long-only and not a bwa flag: bwa has no CRAM output, so there is no short letter to match.
     // Only CRAM reads it. It is the FASTA the CRAM decoder will need to reconstruct SEQ, so it must
     // be the same sequences as the index prefix; htslib loads it through its `.fai`.
-    /// Reference FASTA for CRAM output (`-o out.cram`). Its `.fai` index must exist beside it.
+    /// Reference FASTA for CRAM output (`-o out.cram`). A `.fai` beside it is used if present;
+    /// without one htslib scans the FASTA to index it in memory, which is slower but works.
     #[arg(long = "reference", value_name = "FASTA")]
     pub reference: Option<PathBuf>,
     // Long-only, because `-h` is bwa's XA-hits option. bwa itself has no help flag: any

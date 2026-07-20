@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-chain"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "bwa-core",
  "bwa-index",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-cli"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "bgzf",
@@ -162,14 +162,14 @@ dependencies = [
 
 [[package]]
 name = "bwa-core"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "bwa-diff"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -177,11 +177,11 @@ dependencies = [
 
 [[package]]
 name = "bwa-extend"
-version = "0.0.0"
+version = "3.0.0"
 
 [[package]]
 name = "bwa-index"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "bwa-core",
  "memmap2",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-io"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "bwa-core",
  "needletail",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "bwa-chain",
  "bwa-core",
@@ -210,18 +210,14 @@ dependencies = [
 
 [[package]]
 name = "bwa-neon"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "bwa-extend",
 ]
 
 [[package]]
-name = "bwa-sam"
-version = "0.0.0"
-
-[[package]]
 name = "bwa-seed"
-version = "0.0.0"
+version = "3.0.0"
 dependencies = [
  "bwa-core",
  "bwa-index",
