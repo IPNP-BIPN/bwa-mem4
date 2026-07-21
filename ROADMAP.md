@@ -78,14 +78,35 @@ Trois faits pour la suite de la campagne :
   vs bwa-mem2 a `-t1` (1,51x -> 2,4x) mais le fork nous repasse devant a `-t8`. Piste : le
   `batch_mate_rescue` et son parallelisme (goulot d'Amdahl deja identifie). PE tres stable
   (bwa-mem2 +/-0,2 %), donc le 0,88x n'est pas du bruit.
-- **Concordance du fork (a verifier avant d'affirmer).** Sur 4M reads le fork emet 17 enregistrements
-  de moins que bwa-mem2 (SE 4025128 vs 4025145 ; PE 8052420 vs 8052438), au-dela du tag `HN`. Nous
-  sommes octet-identiques sur la totalite. A reduire a un cas reproductible avant toute affirmation
-  publique : ce peut etre notre facon de l'invoquer.
+- **Concordance du fork (a verifier avant d'affirmer).** Sur 4M reads le fork emet moins
+  d'enregistrements que bwa-mem2 : **17 de moins en SE** (4025128 vs 4025145) et **18 de moins en PE**
+  (8052420 vs 8052438), au-dela du tag `HN`. Nous sommes octet-identiques sur la totalite. A reduire a
+  un cas reproductible avant toute affirmation publique : ce peut etre notre facon de l'invoquer.
 
 **Decision phase B** : elle a lieu, et sa cible est le PE, pas le seeding `-t1`. Le regime cible
 (`-t8` end-to-end) nous donne l'avantage en SE mais un deficit reel en PE et en RAM ; l'ancien chiffre
 `-t1` qui la motivait est retire.
+
+### Phase A, levier RAM : pic 19,2 -> 11,2 Go (deux commits, octet-identiques)
+
+**Le deficit RAM est ferme, on est passe de 0,57x a ~egalite avec le fork.** Deux changements qui se
+composent, aucun ne suffit seul, chacun garde l'index octet-identique a bwa-mem2 (les fichiers ne
+changent pas sur disque, on change ce qu'on charge) :
+
+1. **Reference depuis `.pac` (2-bit) au lieu du mmap `.0123` (1 octet/base)** (`413e313`). Deballe une
+   base a la volee (shift-and-mask ; la moitie reverse-complement est reconstruite, pas stockee). En
+   theorie -6,2 Go, **en pratique 0 sur le pic** : le pic n'etait pas la reference.
+2. **BWT lu par `read()` dans les buffers alignes, au lieu de mmap+copie** (`79c7a32`). Le mmap+copie
+   tenait le BWT en double (pages mappees **plus** copie) le temps du memcpy, ~20 Go transitoires : le
+   vrai plafond, mesure. `read()` laisse la source dans le page cache du noyau (hors RSS), donc le pic
+   n'est plus que les buffers destination. C'est ce commit qui deplace le pic, et il ne le fait que
+   parce que le `.pac` a deja retire la reference (sinon `.0123` resterait a ~16 Go).
+
+Mesure (index genome, `/usr/bin/time -l`) : **pic 19218 -> 11206 Mo, -8 Go**. Contre le fork a 10952 Mo,
+on passe de **0,57x a 0,977x** (il garde ~2,3 %, sa compression SA, qu'on ne peut pas porter sans
+casser l'octet-identite de l'index). Parite tenue : 21 tests d'index (chaque tableau charge passe par
+`get_sa`/`backward_ext`), oracle SE 5000, PE `cmp`-clean sur 201266 enregistrements genome reels.
+Impact vitesse du `read()` vs mmap : a mesurer (le mmap avait ete choisi pour un chargement rapide).
 
 ### Historique phase 7-8 (traine PE)
 
