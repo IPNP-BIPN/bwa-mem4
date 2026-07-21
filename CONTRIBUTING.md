@@ -55,6 +55,18 @@ Release artifacts are built with an empty `RUSTFLAGS`, overriding `.cargo/config
 build machine's, so publishing one would ship `SIGILL` to every user with an older processor.
 Nothing is lost: the SIMD kernels are chosen at runtime, not by `-C target-cpu`.
 
+**Release notes must not @-mention strangers.** Every SAM header tag starts with `@`, and GitHub
+renders `@PG` in a release body as a mention of the user `pg`. That pulled an unrelated person onto
+the v3.0.0 release as a participant. The publish step now wraps bare `@XX` tokens in backticks
+before creating the release, and warns if any survive. Write tags with the tags quoted anyway.
+
+**The release workflow also runs on pull requests**, building all four targets and publishing
+nothing, the way COMBINE-lab/salmon and oarfish do it. It matters here more than usual: that
+workflow is the only place the artifact byte-identity gate runs, so without a PR trigger a broken
+release path would be discovered while tagging, which is the worst possible moment. Manual runs
+take a `dry_run` switch (as FelixKrueger's repos do) that builds and validates while touching
+neither `main` nor the Releases page.
+
 **crates.io.** The workspace publishes as ten crates, all under the `bwa-mem3` prefix:
 `cargo install bwa-mem3` gets the binary, and the libraries are `bwa-mem3-core`, `bwa-mem3-index`
 and so on. The unprefixed names (`bwa-core`, `bwa-mem`, ...) were free and deliberately not taken:
