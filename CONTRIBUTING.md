@@ -36,7 +36,19 @@ started on the NEON backend, but it applies to any contributor. The project docs
   inside a release job is how an unreviewed tree gets published.
 
   The tag's own annotation becomes the release notes, so write it as if users will read it, because
-  they will.
+  they will. The workflow appends the download table itself, so the annotation carries only the part
+  a workflow cannot know. Follow COMBINE-lab/salmon's shape, which is the reason this project's
+  releases are laid out the way they are:
+
+  - a title and a one-paragraph summary saying what KIND of release it is, and explicitly what is
+    NOT affected (output? index rebuild? which platforms?);
+  - one `##` section per change, named `Fix:` / `Change:` / `Improvement:` with the issue or PR
+    number, explaining the ROOT CAUSE rather than the symptom, with the measurements that justify
+    it and the C line numbers where upstream behaviour is at stake;
+  - an `## Upgrading` section: is it drop-in, does anything about the output or the command line
+    behave differently, and how to opt out;
+  - anything deliberately NOT done, stated plainly. A release note that only lists wins is a
+    marketing document.
 - The tag must match the workspace version in `Cargo.toml`. The release workflow refuses to build
   otherwise, and that check is not bureaucratic: the version is stamped into `@PG VN:` on every
   SAM/BAM/CRAM the binary writes, so a mismatch mislabels other people's data.

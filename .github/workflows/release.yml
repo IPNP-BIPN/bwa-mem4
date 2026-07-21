@@ -297,6 +297,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.check-version.outputs.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           SANITISE: |
             import re, sys
             sys.stdout.write(re.sub(r'(^|[^`\w])@([A-Z]{2})\b', r'\1`@\2`', sys.stdin.read(), flags=re.M))
@@ -318,10 +319,39 @@ jobs:
             if grep -qE '(^|[^`])@[A-Za-z]{2}' /tmp/notes.md; then
               echo "::warning::release notes still contain a bare @mention after sanitising"
             fi
-            NOTES_ARG=(--notes-file /tmp/notes.md)
           else
-            NOTES_ARG=(--generate-notes)
+            git tag -l --format='%(contents)' "$TAG" > /tmp/notes.md
+            echo "::warning::lightweight tag, no annotation: the release will carry only the download section"
           fi
+
+          # Append the download section, the way COMBINE-lab/salmon's releases end. The NARRATIVE
+          # half stays hand-written in the tag annotation, because "what changed and why" is not
+          # something a workflow can know; only the mechanical half is generated, so it cannot drift
+          # from the artifacts actually attached.
+          {
+            printf '\n---\n\n## Download bwa-mem3 %s\n\n' "${TAG#v}"
+            printf 'Every binary below was required to rebuild the committed `testdata/tiny` index\n'
+            printf 'byte-identically **on its own platform**, and to align 500 pairs into exactly 1000\n'
+            printf 'records, before this release was allowed to appear. The artifact is checked, not just\n'
+            printf 'the source it came from.\n\n'
+            printf '| File | Platform |\n|---|---|\n'
+            base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+            for t in "linux-x86_64:Linux x86_64" \
+                     "linux-aarch64:Linux arm64" \
+                     "macos-arm64:Apple Silicon macOS (11.0+)" \
+                     "macos-x86_64:Intel macOS (10.12+)"; do
+              id="${t%%:*}"; label="${t#*:}"
+              f="bwa-mem3-${TAG}-${id}.tar.gz"
+              [ -f "dist/$f" ] || continue
+              printf '| [%s](%s/%s) | %s |\n' "$f" "$base" "$f" "$label"
+            done
+            printf '| [SHA256SUMS](%s/SHA256SUMS) | checksums for all four |\n\n' "$base"
+            printf '```sh\ntar xzf bwa-mem3-%s-linux-x86_64.tar.gz\n' "$TAG"
+            printf './bwa-mem3-%s-linux-x86_64/bwa-mem3 --version\n```\n\n' "$TAG"
+            printf 'Or build from source: `cargo build --release`, Rust %s, no system packages\n' "${RUST_TOOLCHAIN%.*}"
+            printf 'needed (htslib is vendored).\n'
+          } >> /tmp/notes.md
+          NOTES_ARG=(--notes-file /tmp/notes.md)
           # `--verify-tag`: never invent a tag. If the tag is not on the remote, that is a mistake
           # to surface rather than paper over.
           if gh release view "$TAG" >/dev/null 2>&1; then
