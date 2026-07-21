@@ -516,6 +516,26 @@ fn fwd_local_sw_batch(
             }
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && mat_is_standard(m, mat) {
+            // Same score-ceiling test as the aarch64 arm above, verbatim: the threshold is bwa's
+            // (`bwamem_pair.cpp:208`), not a property of the register we happen to run on, so it does
+            // not change when the vector gets twice as wide. See `ksw_padded_qlen` for why deriving
+            // any of this from the SIMD width would alter the output.
+            let score_ceiling = |j: &FwdJob| j.query.len().min(j.target.len()) as i32 * max_sc;
+            if jobs.iter().all(|j| {
+                score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
+            }) {
+                // SAFETY: avx2 detected; every H/E/F cell and query column < 250 fits u8; standard mat.
+                return unsafe {
+                    fwd_local_sw_avx2_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                };
+            }
+            // No i16 AVX2 kernel exists yet, so a batch that overflows u8 falls through to the
+            // scalar lockstep below rather than to a wider vector path.
+        }
+    }
     fwd_local_sw_scalar(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
 }
 
@@ -532,8 +552,9 @@ fn fwd_local_sw_batch(
 /// an error: the caller simply keeps the scalar path, which reads `mat` cell by cell and therefore
 /// handles arbitrary matrices.
 ///
-/// Gated on aarch64: its only caller is the NEON dispatch, so elsewhere it is dead code.
-#[cfg(target_arch = "aarch64")]
+/// Gated on aarch64/x86_64: its only callers are the NEON and AVX2 dispatches, so elsewhere it is
+/// dead code and `-D warnings` would reject it.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn mat_is_standard(m: usize, mat: &[i8]) -> bool {
     if m != 5 {
         return false;
@@ -1352,6 +1373,404 @@ unsafe fn fwd_local_sw_neon_u8(
         );
     }
     out
+}
+
+/// Lanes for the AVX2 u8 kernel: one `__m256i`, twice the NEON u8 width. Fixed by the register, not
+/// tunable: every load, store and per-lane array below is sized `* LANES32`, and it is the `lanes`
+/// stride [`extract_group`] must be told about.
+///
+/// Widening the group from 16 to 32 jobs is observable only as extra padded work: `qmax`/`tmax` are
+/// maxima over a bigger chunk, and the surplus columns/rows are [`PAD`] and therefore dead. It does
+/// not move any threshold, because every threshold in this file is bwa's rather than the hardware's.
+#[cfg(target_arch = "x86_64")]
+const LANES32: usize = 32;
+
+/// AVX2 `u8x32` forward local-SW: [`fwd_local_sw_neon_u8`] transliterated to `__m256i`, so x86_64
+/// stops falling back to [`fwd_local_sw_scalar`] (measured at 2.22x the CPU of the vector path on a
+/// whole paired-end run). Scope is u8 only; an i16 batch still takes the scalar path.
+///
+/// The transliteration is mechanical because every operation this kernel needs is element-wise, and
+/// AVX2's element-wise byte ops behave exactly like NEON's despite the 128-bit-lane split that
+/// afflicts its *shuffles*. Two operations have no direct AVX2 spelling and are emulated below with
+/// the same trick `crate::batched`'s AVX2 kernels use:
+///
+/// - **unsigned compare**: AVX2 has only *signed* `_mm256_cmpgt_epi8`, which reads any score above
+///   127 as negative. `cge_epu8(a, b)` is recovered as `max_epu8(a, b) == a`, and `cgt_epu8(a, b)`
+///   as `!cge_epu8(b, a)`. Both are exact for all 256 byte values, including the ties that
+///   `vcgtq_u8` must reject (the strict `>` on the row argmax is what keeps `qe` at the *smallest*
+///   attaining column, `ksw.cpp:216-218`).
+/// - **bit-select**: NEON `vbslq_u8(mask, a, b)` is `mask ? a : b`; `_mm256_blendv_epi8(a, b, mask)`
+///   is `mask ? b : a`, i.e. the operands are the other way round.
+///
+/// No cross-lane reduction is needed anywhere: the row accumulators are spilled to arrays and read
+/// per lane, exactly as the NEON kernel does, so `vmaxvq_u8` never appears and neither does the
+/// `_mm256_extracti128_si256` dance it would require.
+///
+/// # Parameters
+/// As [`fwd_local_sw_batch`], with the same unchecked preconditions as [`fwd_local_sw_neon_u8`]:
+/// `mat_is_standard(m, mat)`, every job's score ceiling `min(qlen, tlen) * max_sc` under
+/// [`U8_SCORE_LIMIT`], and every query shorter than [`U8_SCORE_LIMIT`] bases.
+///
+/// # Returns
+/// As [`fwd_local_sw_batch`], and byte-identical to [`fwd_local_sw_scalar`] on the same input
+/// (`avx2_verify::avx2_matesw_u8_matches_scalar`).
+///
+/// # Safety
+/// Caller must have confirmed AVX2 is available. Loads and stores use unchecked pointer offsets
+/// bounded by `qmax`/`tmax`, which are derived from the same buffers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fwd_local_sw_avx2_u8(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    use std::arch::x86_64::*;
+
+    // --- the three NEON primitives AVX2 does not spell directly -------------------------------
+    // `a >= b`, unsigned, as an all-ones/all-zero byte mask. `max_epu8` is a true unsigned max, so
+    // `max(a,b) == a` is exactly `a >= b`; the signed `cmpgt_epi8` would misread scores above 127.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn cge_epu8(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_cmpeq_epi8(_mm256_max_epu8(a, b), a)
+    }
+    // `a > b`, unsigned: the complement of `b >= a`. `set1_epi8(-1)` is 0xFF per byte, i.e. an
+    // all-ones vector, so the xor is a mask negation and not an arithmetic negation.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn cgt_epu8(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_xor_si256(cge_epu8(b, a), _mm256_set1_epi8(-1))
+    }
+    // NEON `vbslq_u8(mask, a, b)` = `mask ? a : b`. `_mm256_blendv_epi8(a, b, mask)` = `mask ? b : a`,
+    // hence the swapped operands; only the top bit of each mask byte is consulted, which the
+    // all-ones masks above satisfy.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn bsl(mask: __m256i, a: __m256i, b: __m256i) -> __m256i {
+        _mm256_blendv_epi8(b, a, mask)
+    }
+
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    let mtch = mat[0] as u8; // match bonus (>= 0)
+    let mispen = (-mat[1]) as u8; // mismatch penalty b (mat[1] = -b)
+                                  // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
+
+    // Broadcast constants, scores held as *magnitudes* (subtracted, not added) so the whole kernel
+    // stays unsigned; see the NEON u8 kernel's header for why that is what makes u8 viable.
+    let zero = _mm256_setzero_si256();
+    let mtch_v = _mm256_set1_epi8(mtch as i8);
+    let mispen_v = _mm256_set1_epi8(mispen as i8);
+    let one_v = _mm256_set1_epi8(1); // N penalty
+    let four_v = _mm256_set1_epi8(4);
+    let m_v = _mm256_set1_epi8(m as i8);
+    let zpad_v = _mm256_set1_epi8(ZPAD as i8);
+    let e_del_v = _mm256_set1_epi8(e_del as i8);
+    let oe_del_v = _mm256_set1_epi8(oe_del as i8);
+    let e_ins_v = _mm256_set1_epi8(e_ins as i8);
+    let oe_ins_v = _mm256_set1_epi8(oe_ins as i8);
+
+    // Group setup is identical to `fwd_local_sw_scalar` at 32 lanes; see there for each variable.
+    for (group_idx, group) in jobs.chunks(LANES32).enumerate() {
+        let n_lanes = group.len();
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        let mut seq_q = vec![PAD; qmax * LANES32];
+        let mut seq_t = vec![PAD; tmax * LANES32];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES32],
+            [0usize; LANES32],
+            [i32::MAX; LANES32],
+            [i32::MAX; LANES32],
+        );
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES32 + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES32 + l] = ZPAD;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES32 + l] = b;
+            }
+        }
+
+        // Same DP state as the scalar path, narrowed to u8 so a column of all 32 lanes is one
+        // `_mm256_loadu_si256`. Legal only because local SW keeps every value in `[0, ceiling]` and
+        // the caller proved the ceiling is under 250.
+        let mut h_prev = vec![0u8; qmax * LANES32];
+        let mut h_cur = vec![0u8; qmax * LANES32];
+        let mut e = vec![0u8; qmax * LANES32];
+        let mut rowmax = vec![0i32; tmax * LANES32];
+        let mut gmax = [0i32; LANES32];
+        let mut te = [-1i32; LANES32];
+        let mut qe = [0i32; LANES32];
+        let mut limit = [-1i32; LANES32];
+        let mut frozen = [false; LANES32];
+        for l in 0..n_lanes {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+
+        // =====================================================================================
+        // Main DP, one target row per iteration. Structurally identical to `fwd_local_sw_neon_u8`,
+        // at 32 lanes, with saturating u8 arithmetic supplying the `max(0, .)` clamps.
+        // =====================================================================================
+        for i in 0..tmax {
+            // Lane `l` = target base at row `i` of job `l`.
+            let t_v = _mm256_loadu_si256(seq_t.as_ptr().add(i * LANES32) as *const __m256i);
+            // Row accumulators, one lane per job, same invariant as the scalar version at the top of
+            // column `j`: F(i, j), H(i-1, j-1), max H(i, 0..j), and its smallest attaining column.
+            let mut f_v = zero;
+            let mut h_diag_v = zero;
+            let mut imax_v = zero;
+            let mut imax_col_v = zero; // min query column achieving this row's max
+            for j in 0..qmax {
+                // Lane `l` = query base at column `j` of job `l`.
+                let q_v = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
+                // Masks, all-ones per lane where they apply: `eq` the bases match, `n_mask` either is
+                // N, `zpad_mask` the query column is ksw profile padding, `pad_mask` the cell is past
+                // a real position (dead row, or query past the padded profile).
+                let eq = _mm256_cmpeq_epi8(t_v, q_v);
+                let n_mask = _mm256_or_si256(
+                    _mm256_cmpeq_epi8(t_v, four_v),
+                    _mm256_cmpeq_epi8(q_v, four_v),
+                );
+                let zpad_mask = _mm256_cmpeq_epi8(q_v, zpad_v);
+                let pad_mask = _mm256_or_si256(cge_epu8(t_v, m_v), cgt_epu8(q_v, zpad_v));
+                // Each of the four cases is applied straight to `h_diag` as a saturating add or sub,
+                // never as a signed score that is then added: a mismatch at h_diag = 2 with penalty 4
+                // saturates to 0, which is `max(0, h_diag - 4)`, whereas a wrapping sub gives 254.
+                let add_match = _mm256_adds_epu8(h_diag_v, mtch_v);
+                let sub_mis = _mm256_subs_epu8(h_diag_v, mispen_v);
+                // N scores -1 in bwa's matrix, not -b, hence a separate constant from `mispen_v`.
+                let sub_n = _mm256_subs_epu8(h_diag_v, one_v);
+                // Lane `l` = max(0, H(i-1, j-1) + S) for job `l` once the four selects resolve which
+                // case this cell is.
+                let mut diag_v = bsl(eq, add_match, sub_mis);
+                diag_v = bsl(n_mask, sub_n, diag_v);
+                diag_v = bsl(zpad_mask, h_diag_v, diag_v); // score 0: diagonal passes through
+                                                           // Dead padding: force 0 outright, as in the NEON u8 kernel.
+                diag_v = bsl(pad_mask, zero, diag_v);
+
+                // Lane `l` = E(i, j) for job `l`, the deletion carry left by the previous row.
+                let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES32) as *const __m256i);
+                // No explicit `max(0, .)` on H: `diag_v`, `e_v` and `f_v` are already >= 0 by
+                // saturation, so the two maxes are the whole H recurrence.
+                let mut h_v = _mm256_max_epu8(diag_v, e_v);
+                h_v = _mm256_max_epu8(h_v, f_v);
+                // Strict unsigned `>`, so a tie keeps the earlier `j`. This is the one place the
+                // signed `_mm256_cmpgt_epi8` would silently differ from NEON, for any score or column
+                // index above 127; `cgt_epu8` is why the caller's 250-base query cap still holds.
+                let is_new_row_max = cgt_epu8(h_v, imax_v);
+                imax_col_v = bsl(is_new_row_max, _mm256_set1_epi8(j as i8), imax_col_v);
+                imax_v = _mm256_max_epu8(imax_v, h_v);
+                _mm256_storeu_si256(h_cur.as_mut_ptr().add(j * LANES32) as *mut __m256i, h_v);
+
+                // e = max(0, e-e_del, h-oe_del); both saturating subs supply their own clamp.
+                let e_new = _mm256_max_epu8(
+                    _mm256_subs_epu8(e_v, e_del_v),
+                    _mm256_subs_epu8(h_v, oe_del_v),
+                );
+                _mm256_storeu_si256(e.as_mut_ptr().add(j * LANES32) as *mut __m256i, e_new);
+                // Same for F, the row's serial carry.
+                f_v = _mm256_max_epu8(
+                    _mm256_subs_epu8(f_v, e_ins_v),
+                    _mm256_subs_epu8(h_v, oe_ins_v),
+                );
+                h_diag_v = _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES32) as *const __m256i);
+            }
+
+            // Spill the two row accumulators so lanes can be read individually: `imax_arr[l]` is job
+            // `l`'s max H in row `i`, `col_arr[l]` the padded query column where it occurred.
+            let mut imax_arr = [0u8; LANES32];
+            let mut col_arr = [0u8; LANES32];
+            _mm256_storeu_si256(imax_arr.as_mut_ptr() as *mut __m256i, imax_v);
+            _mm256_storeu_si256(col_arr.as_mut_ptr() as *mut __m256i, imax_col_v);
+            for l in 0..n_lanes {
+                if i >= tlen[l] || frozen[l] {
+                    continue;
+                }
+                // Job `l`'s best H anywhere in target row `i`, widened out of the lane.
+                let row_max = imax_arr[l] as i32;
+                rowmax[i * LANES32 + l] = row_max;
+                if row_max > gmax[l] {
+                    gmax[l] = row_max;
+                    te[l] = i as i32;
+                    qe[l] = col_arr[l] as i32;
+                    if gmax[l] >= endsc[l] {
+                        frozen[l] = true;
+                        limit[l] = i as i32;
+                    }
+                }
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+
+            // Early exit once every live lane is either frozen or out of target: purely a speed win,
+            // as in the NEON kernels. See the longer note in `fwd_local_sw_neon`.
+            if (0..n_lanes).all(|l| frozen[l] || i + 1 >= tlen[l]) {
+                break;
+            }
+        }
+
+        extract_group(
+            n_lanes, group_idx, LANES32, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
+        );
+    }
+    out
+}
+
+/// Force-run verification of the AVX2 mate-rescue kernel against `fwd_local_sw_scalar`, byte-for-byte.
+///
+/// On x86_64 the AVX2 path only *runs* when `is_x86_feature_detected!("avx2")`, which Rosetta reports
+/// as `false` even though it *executes* AVX2 instructions. So this test calls the kernel directly,
+/// bypassing detection, which is how the port is validated on this Apple-Silicon host via
+/// `cargo test --target x86_64-apple-darwin`. On a native x86 runner (which has AVX2) it validates the
+/// real dispatched path too. Requires an AVX2-capable executor.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx2_verify {
+    use super::*;
+
+    /// bwa 5x5 score matrix: match `a`, mismatch `-b`, N row/col `-1`. A copy of `tests::scmat`
+    /// rather than a reference to it: sibling test modules cannot see each other's private items,
+    /// and widening that one's visibility for a five-line helper is not worth it.
+    fn scmat(a: i8, b: i8) -> Vec<i8> {
+        let mut mat = vec![0i8; 25];
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { a } else { -b };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+        mat
+    }
+
+    /// Compare the 32-lane AVX2 u8 kernel against the 8-lane scalar lockstep on randomized
+    /// mate-rescue-shaped jobs. Deliberately a *direct* kernel-vs-kernel comparison rather than a
+    /// round trip through `batched_ksw_align2`: that would go through the dispatch, which Rosetta
+    /// routes to the scalar path, and the test would pass without ever executing an AVX2 instruction.
+    ///
+    /// The differing group widths (32 vs 8) are part of what is being tested: a wider chunk raises
+    /// `qmax`/`tmax` for the whole group, and every extra column and row must be provably inert.
+    #[test]
+    fn avx2_matesw_u8_matches_scalar() {
+        // bwa's stock gap penalties as positive magnitudes: open 6, extend 1, same for both sides.
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+
+        // Fixed-seed LCG so a failure is reproducible; `next()` yields the top 31 bits of the state,
+        // the low bits of an LCG being the poorly distributed ones. Same generator and same job shape
+        // as `tests::matesw_equals_scalar`, which is the NEON gate.
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+
+        let mut qbufs: Vec<Vec<u8>> = Vec::new();
+        let mut tbufs: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..2000 {
+            let qlen = 5 + (next() % 146) as usize; // 5..=150 (varied lens exercise padding)
+            let tlen = qlen + (next() % 500) as usize; // window >= query
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            // 1 or 2 planted copies of the query; two copies is what gives `score2` something to find.
+            let copies = 1 + (next() % 2);
+            if next() % 5 != 0 {
+                for _ in 0..copies {
+                    if tlen > qlen {
+                        let at = (next() as usize) % (tlen - qlen + 1);
+                        for k in 0..qlen {
+                            t[at + k] = q[k];
+                        }
+                    }
+                }
+                // 0 to 3 substitutions so the alignment is not a perfect match and mismatch scoring
+                // is exercised.
+                for _ in 0..(next() % 4) {
+                    let p = (next() as usize) % qlen;
+                    q[p] = (next() % 4) as u8;
+                }
+            }
+            // Inject N bases (code 4) sometimes, in query and/or target.
+            if next() % 4 == 0 {
+                q[(next() as usize) % qlen] = 4;
+            }
+            if next() % 4 == 0 {
+                t[(next() as usize) % tlen] = 4;
+            }
+            qbufs.push(q);
+            tbufs.push(t);
+        }
+
+        // Both scoring configurations the NEON gate uses. Only the first fits u8, which is the whole
+        // scope of this kernel; the second is kept as a *negative* check that the dispatch, not the
+        // kernel, is what excludes it -- so it is compared through `fwd_local_sw_batch` instead.
+        for &(a, b, minsc) in &[(1i8, 4i8, 19i32), (10, 40, 190)] {
+            let mat = scmat(a, b);
+            let max_sc = a as i32;
+            let jobs: Vec<FwdJob> = qbufs
+                .iter()
+                .zip(tbufs.iter())
+                .map(|(q, t)| FwdJob {
+                    query: q.as_slice(),
+                    target: t.as_slice(),
+                    minsc,
+                    // Exercise the `endsc` freeze on half the jobs: without it `frozen`/`limit` (and
+                    // therefore the `score2` row-scan truncation) are never driven at 32 lanes.
+                    endsc: if t.len() % 2 == 0 { i32::MAX } else { 30 },
+                })
+                .collect();
+            let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+
+            let fits_u8 = jobs.iter().all(|j| {
+                (j.query.len().min(j.target.len()) as i32 * max_sc) < U8_SCORE_LIMIT
+                    && j.query.len() < U8_SCORE_LIMIT as usize
+            });
+            let got = if fits_u8 {
+                // SAFETY: the u8 preconditions were just checked. AVX2 availability is *assumed*, not
+                // detected: under Rosetta detection lies (see this module's header).
+                unsafe { fwd_local_sw_avx2_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) }
+            } else {
+                fwd_local_sw_batch(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+            };
+            for i in 0..jobs.len() {
+                assert_eq!(
+                    got[i],
+                    want[i],
+                    "job {i} (qlen {}, match {a}, u8 {fits_u8})",
+                    jobs[i].query.len()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
