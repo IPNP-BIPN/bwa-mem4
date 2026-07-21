@@ -23,6 +23,14 @@ subset. Both aligners read the same on-disk index. Reproduce with `scripts/giab3
 Speed is on an Apple M4 Max. The ratio is not constant across thread counts: it decays as `-t`
 rises, so quote it with the thread count attached.
 
+On Apple Silicon the worker pool is capped at the Performance-core count, because the Efficiency
+cores measurably do not help. Measured on an M4 Max (12 P + 4 E), 500k pairs against GRCh38, three
+repetitions: `-t16` and `-t12` finish in the same wall time (6.1 s, the difference inside the
+spread) while `-t16` burns 8% more CPU. Driven onto E cores deliberately, the same work takes 5.75x
+longer, so rayon's even split leaves their chunk straggling while everything else waits. The cap
+applies to the pool only: `-t` still sets the default `-K`, so the output is unchanged, verified
+byte-identical to the oracle with and without it. `BWA3_NO_PCORE_CAP=1` disables it.
+
 ## Why byte-identity is the hard part
 
 Reproducing an aligner's *results* is not especially difficult. Reproducing its *bytes* means

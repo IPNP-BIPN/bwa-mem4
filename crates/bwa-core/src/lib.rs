@@ -13,6 +13,7 @@
 //! - [`error`]: the shared error type.
 //! - [`sysram`]: host RAM detection, used only by the learned-index auto-select.
 
+pub mod cpu;
 pub mod dna;
 pub mod error;
 pub mod opt;

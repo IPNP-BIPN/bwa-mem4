@@ -1421,10 +1421,43 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let opt = build_opt(&args)?;
     // `-t` clamped to >= 1, as a usize for the pool builders. Same value as `opt.n_threads`.
     let n_threads = args.threads.max(1) as usize;
+
+    // Worker count for the POOL ONLY, capped to the Performance cores on Apple Silicon.
+    //
+    // READ THIS BEFORE MOVING THE CAP ANYWHERE ELSE. It must not touch `args.threads` or
+    // `opt.n_threads`, because `-K` defaults to `opt.chunk_size * args.threads` a few lines below
+    // (bwa's `aux.task_size = opt->chunk_size * opt->n_threads`, fastmap.cpp:964). Capping the
+    // thread count itself would therefore shrink the default batch, move the batch boundaries, and
+    // change the paired-end output, since the insert-size model is re-estimated per batch. A
+    // "threading only" change would then silently break byte-identity. The pool size, by contrast,
+    // is invisible in the output: order and global read ids do not depend on it.
+    //
+    // Why cap at all: on an M4 Max (12 P + 4 E) the four E cores measurably buy nothing (`-t16`
+    // 6.10 s wall against `-t12` 6.17 s, inside the spread of three repetitions) while costing 10%
+    // more CPU, because rayon splits work evenly and an E core here is several times slower, so its
+    // chunk straggles. See `bwa_core::cpu` for the measurements. macOS offers no way to forbid a
+    // core -- affinity is a no-op on arm64 and QoS is only a hint -- so not creating the extra
+    // workers is the only lever that works.
+    //
+    // `BWA3_NO_PCORE_CAP=1` disables it, which is how the effect above stays measurable.
+    let pool_threads = match bwa_core::cpu::performance_core_count() {
+        Some(p) if n_threads > p && std::env::var_os("BWA3_NO_PCORE_CAP").is_none() => {
+            // `-v` default is 3 (bwa's `bwa_verbose`), so this prints unless the user quietened it.
+            if args.verbose.unwrap_or(3) >= 3 {
+                eprintln!(
+                    "[M::main_mem] -t {n_threads} exceeds the {p} performance cores; running {p} \
+                     workers. The efficiency cores add no measurable throughput and cost ~8% more \
+                     CPU. Set BWA3_NO_PCORE_CAP=1 to use all {n_threads}."
+                );
+            }
+            p
+        }
+        _ => n_threads,
+    };
     // Fixed-size rayon pool. Output order and global read ids are independent of thread count, so
     // byte-identity holds at any `-t` once `-K` fixes the batch boundaries.
     rayon::ThreadPoolBuilder::new()
-        .num_threads(n_threads)
+        .num_threads(pool_threads)
         .build_global()
         .ok();
     // Batch size in INPUT BASES, not reads. Default `chunk_size * -t` (10M per thread), mirroring
