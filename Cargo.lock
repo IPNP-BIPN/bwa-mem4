@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "anyhow",
  "bgzf",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-chain"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bwa-mem3-core",
  "bwa-mem3-index",
@@ -162,14 +162,14 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-core"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "bwa-mem3-diff"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -177,11 +177,11 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-extend"
-version = "3.0.0"
+version = "3.0.1"
 
 [[package]]
 name = "bwa-mem3-index"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bwa-mem3-core",
  "memmap2",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-io"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bwa-mem3-core",
  "needletail",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-mem"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bwa-mem3-chain",
  "bwa-mem3-core",
@@ -210,14 +210,14 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem3-neon"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bwa-mem3-extend",
 ]
 
 [[package]]
 name = "bwa-mem3-seed"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bwa-mem3-core",
  "bwa-mem3-index",
