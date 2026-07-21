@@ -149,9 +149,40 @@ pub struct FmIndex {
     /// which is what makes `occ` a half-open, exclusive count. Rebuilt at load rather than read
     /// from the file, exactly as `load_index` does (`FMI_search.cpp:386-393`).
     one_hot_mask: [u64; 64],
-    /// The `.0123` reference (forward++reverse-complement, one byte/base, 2L bytes), memory-mapped:
-    /// the 6.2 GB file is not copied into RAM at load, and its pages are shared via the OS page cache.
-    reference: Mmap,
+    /// The `.pac` reference (forward strand only, 2 bits/base, ~L/4 bytes), memory-mapped. This is
+    /// the 4x-smaller archival packing; the aligner used to load the 4x-larger one-byte-per-base
+    /// `.0123` (2L bytes, ~6.2 GB for hg38) on the hot path and mmap kept those pages resident. We
+    /// unpack from `.pac` in [`unpack_pac_base`] instead: a shift-and-mask per base, and the
+    /// reverse-complement half is reconstructed rather than stored, so nothing keeps 6.2 GB
+    /// resident. `.0123` is still written by the indexer and still on disk (the index stays
+    /// byte-identical to bwa-mem2), it is simply not loaded.
+    pac: Mmap,
+}
+
+/// Unpack the reference base at 2L-space position `pos` from the 2-bit-packed, forward-only `.pac`.
+///
+/// The old `.0123` stored `forward ++ reverse_complement(forward)` as one byte per base (2L bytes);
+/// `.pac` stores only the forward strand at 2 bits per base. So the forward half `[0, L)` is a
+/// direct unpack, and the reverse-complement half `[L, 2L)` is reconstructed exactly the way the
+/// indexer built `.0123`: a position `p >= L` maps to forward coordinate `2L - 1 - p` (`bns_depos`)
+/// with the base complemented, which for the 2-bit codes (A=0,C=1,G=2,T=3) is `3 - b`.
+///
+/// `pac` is the whole mapped file including its one or two trailer bytes; those are never indexed,
+/// because a valid `pos` gives `fwd_idx < L` and therefore `fwd_idx >> 2` stays inside the payload.
+#[inline]
+pub(crate) fn unpack_pac_base(pac: &[u8], l_pac: i64, pos: i64) -> u8 {
+    let (fwd_idx, rc) = if pos < l_pac {
+        (pos, false)
+    } else {
+        (2 * l_pac - 1 - pos, true)
+    };
+    // bwa-mem2's `_get_pac`: base i lives in byte `i>>2`, most-significant pair first, 2 bits wide.
+    let b = (pac[(fwd_idx >> 2) as usize] >> ((3 - (fwd_idx & 3)) << 1)) & 3;
+    if rc {
+        3 - b
+    } else {
+        b
+    }
 }
 
 /// Build the path `<prefix>.<ext>`, the naming convention every index file follows.
@@ -321,12 +352,15 @@ impl FmIndex {
             one_hot_mask[i] = (one_hot_mask[i - 1] >> 1) | msb_only;
         }
 
-        // ---- The binary reference, memory-mapped ----------------------------------------------
-        // Memory-map `.0123` instead of reading it: no 6.2 GB copy, pages shared via the page cache.
-        let ref_file = std::fs::File::open(sibling(prefix, "0123"))?;
+        // ---- The reference, memory-mapped from the 2-bit `.pac` -------------------------------
+        // `.pac` (forward only, 2 bits/base, ~L/4 bytes) rather than `.0123` (forward++RC, one
+        // byte/base, 2L bytes): the same reference bases, unpacked on demand in `base`, at ~1/8th
+        // the resident footprint. `.0123` is still on disk (index byte-identity is unchanged), just
+        // not mapped.
+        let pac_file = std::fs::File::open(sibling(prefix, "pac"))?;
         // SAFETY: the index files are not mutated while a run holds them open; a concurrent external
         // truncation is out of scope (same assumption as bwa-mem2's mmap'd index).
-        let reference = unsafe { Mmap::map(&ref_file)? };
+        let pac = unsafe { Mmap::map(&pac_file)? };
 
         Ok(FmIndex {
             ref_seq_len,
@@ -336,7 +370,7 @@ impl FmIndex {
             sa_ls_word,
             sentinel_index,
             one_hot_mask,
-            reference,
+            pac,
         })
     }
 
@@ -814,7 +848,7 @@ impl FmIndex {
     /// build time, so 4 never appears in `.0123`.
     #[inline]
     pub fn base(&self, pos: i64) -> u8 {
-        self.reference[pos as usize]
+        unpack_pac_base(&self.pac, self.l_pac(), pos)
     }
 
     /// The loaded cumulative base counts (already `+1`, as bwa-mem2's `load_index`).
@@ -828,15 +862,16 @@ impl FmIndex {
         self.count
     }
 
-    /// The `.0123` binary reference (forward ++ reverse-complement, 2L bytes).
+    /// The whole reference as one byte per base (forward ++ reverse-complement, 2L bytes),
+    /// materialized from `.pac`.
     ///
     /// # Returns
-    /// The whole mapped file as one byte-per-base slice, indexed by 2L-space POSITION. Borrowed
-    /// from the mmap, so touching a page may fault it in; the length is `2 * l_pac`, one less than
-    /// `ref_seq_len`. Used by extension code that needs a run of bases rather than single lookups.
-    #[inline]
-    pub fn reference(&self) -> &[u8] {
-        &self.reference[..]
+    /// An owned `2 * l_pac`-byte vector, position `p` holding [`base`]`(p)`. This ALLOCATES the full
+    /// 2L bytes (~6.2 GB on hg38), which is exactly the footprint the switch to `.pac` exists to
+    /// avoid, so it is for tests and offline tooling only. The hot alignment path reads single bases
+    /// through [`base`] and never calls this.
+    pub fn reference(&self) -> Vec<u8> {
+        (0..2 * self.l_pac()).map(|p| self.base(p)).collect()
     }
 
     /// Length of the forward reference `L` (`ref_seq_len` is `2L + 1`).
@@ -866,18 +901,42 @@ mod tests {
         FmIndex::load(Path::new(prefix)).unwrap()
     }
 
+    /// The 2-bit `.pac` (forward only) must reproduce the one-byte-per-base `.0123` (forward ++
+    /// reverse-complement) for EVERY 2L-space position, or dropping the `.0123` mmap to save its
+    /// 6.2 GB would corrupt every reference base the aligner reads. `.0123` is the ground truth
+    /// here because it is the file the code trusted before this change; the test reads it raw so it
+    /// does not depend on the very method it is validating.
+    #[test]
+    fn unpack_pac_reproduces_0123() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let pac = std::fs::read(format!("{prefix}.pac")).unwrap();
+        let ref0123 = std::fs::read(format!("{prefix}.0123")).unwrap();
+        let two_l = ref0123.len() as i64;
+        let l_pac = two_l / 2;
+        assert_eq!(two_l % 2, 0, "the .0123 reference must be 2L bytes");
+        for pos in 0..two_l {
+            assert_eq!(
+                unpack_pac_base(&pac, l_pac, pos),
+                ref0123[pos as usize],
+                "pac unpack disagrees with .0123 at 2L-space position {pos} (l_pac={l_pac})"
+            );
+        }
+    }
+
     /// Every row's `get_sa` matches an independently computed suffix array, and the map from rows
     /// to positions is a bijection. The permutation half catches errors the value comparison could
     /// mask, e.g. an off-by-one that maps two rows to one position.
     #[test]
     fn get_sa_matches_sais_and_is_permutation() {
         let fm = tiny();
+        // The 2L reference, materialized once from `.pac` for this test.
+        let reference = fm.reference();
         // `two_l` is the reference LENGTH in bases (2L); `n` the BWT ROW count (2L + 1).
-        let two_l = fm.reference.len();
+        let two_l = reference.len();
         let n = fm.ref_seq_len;
         assert_eq!(n, two_l as i64 + 1);
         // Ground truth from the SA-IS builder: `sa[row]` is the reference position for that row.
-        let sa = suffix_array_with_sentinel(&fm.reference);
+        let sa = suffix_array_with_sentinel(&reference);
         // Which reference positions have been produced already, for the bijection check.
         let mut seen = vec![false; two_l + 1];
         for i in 0..n {
@@ -896,7 +955,7 @@ mod tests {
     fn backward_search_counts_match_naive() {
         let fm = tiny();
         // The 2L reference as bytes; both the pattern source and the brute-force haystack.
-        let bref = &fm.reference;
+        let bref = fm.reference();
         // Arbitrary (start position, length) probes spread across the reference and across
         // lengths, chosen only to exercise a few different intervals.
         for &(start, len) in &[(100usize, 20usize), (5000, 15), (123, 31), (77_777, 25)] {

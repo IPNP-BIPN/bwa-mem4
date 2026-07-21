@@ -1596,13 +1596,16 @@ mod tests {
         let smems = collect_smems(&fm, &read, 19, 1);
         assert!(!smems.is_empty(), "no SMEMs found");
 
+        // Materialize the 2L reference once; `reference()` now allocates, so it must not be called
+        // per SMEM inside the loop.
+        let reference = fm.reference();
         // Each SMEM's read substring occurs exactly `s` times in the reference.
         for sm in &smems {
             // The read substring this SMEM's interval stands for (`m`/`n` are inclusive READ offsets).
             let sub = &read[sm.m as usize..=sm.n as usize];
             assert_eq!(
                 sm.s,
-                naive_occ(fm.reference(), sub),
+                naive_occ(&reference, sub),
                 "SMEM interval size wrong"
             );
             assert!((sm.n - sm.m + 1) as i32 >= 19);
@@ -1637,7 +1640,7 @@ mod tests {
         };
         // Length of the whole 2L text in bases (`2 * l_pac`): slices may straddle into the RC half,
         // which is fine here since only batched-vs-per-read agreement is being checked.
-        let reflen = fm.reference().len() as i64;
+        let reflen = 2 * fm.l_pac(); // 2L, without materializing the reference
         let mut reads: Vec<Vec<u8>> = Vec::new();
         for _ in 0..60 {
             // Read flavour: 0 = exact reference slice, 1/2 = random, 3 = random with an injected `N`.
@@ -1693,7 +1696,7 @@ mod tests {
             state >> 33
         };
         // Length of the whole 2L text in bases (`2 * l_pac`).
-        let reflen = fm.reference().len() as i64;
+        let reflen = 2 * fm.l_pac(); // 2L, without materializing the reference
         let mut reads: Vec<Vec<u8>> = Vec::new();
         for _ in 0..80 {
             // Read flavour: 0 = random (shallow SMEMs), 1..=4 = exact reference slice, and 3/4 also
@@ -1743,10 +1746,12 @@ mod tests {
         let start = 123_456i64.min(fm.l_pac() - 60);
         let read: Vec<u8> = (0..60).map(|i| fm.base(start + i as i64)).collect();
         let smems = collect_smems(&fm, &read, 19, 1);
+        // Materialize the 2L reference once; `reference()` now allocates.
+        let reference = fm.reference();
         for sm in &smems {
             // The read substring this SMEM's interval stands for.
             let sub = &read[sm.m as usize..=sm.n as usize];
-            assert_eq!(sm.s, naive_occ(fm.reference(), sub));
+            assert_eq!(sm.s, naive_occ(&reference, sub));
         }
     }
 }
