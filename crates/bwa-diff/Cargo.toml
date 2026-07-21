@@ -1,5 +1,5 @@
 [package]
-name = "bwa-mem-oxide-diff"
+name = "bwa-mem4-diff"
 description = "Field-level SAM concordance reporting (sam-diff) for bwa-mem4."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]

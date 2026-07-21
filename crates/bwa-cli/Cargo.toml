@@ -1,5 +1,5 @@
 [package]
-name = "bwa-mem-oxide"
+name = "bwa-mem4"
 description = "A native Rust reimplementation of the bwa-mem2 short-read aligner, indexer included, whose acceptance criterion is byte-identical output: the same index files and the same SAM bytes."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa", "sam"]

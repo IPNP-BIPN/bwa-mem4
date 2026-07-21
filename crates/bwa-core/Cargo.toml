@@ -1,5 +1,5 @@
 [package]
-name = "bwa-mem-oxide-core"
+name = "bwa-mem4-core"
 description = "Core types, alignment options and scoring matrix for bwa-mem4, a byte-identical Rust reimplementation of bwa-mem2."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
