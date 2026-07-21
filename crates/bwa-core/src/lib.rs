@@ -1,4 +1,4 @@
-//! Types, constants and alignment options shared across bwa-mem4-rs.
+//! Types, constants and alignment options shared across bwa-mem4.
 //!
 //! Everything here mirrors bwa-mem2 data structures so downstream crates can reason directly
 //! against the reference source in `reference/bwa-mem2`.

@@ -123,7 +123,7 @@ jobs:
           set +e
           bwa-mem2 mem -t2 -K 10000000 -A 2 testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
             | grep -v '^@' > /tmp/oracle_x86.sam
-          ./target/release/bwa-mem3 mem -t2 -K 10000000 -A 2 testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
+          ./target/release/bwa-mem4 mem -t2 -K 10000000 -A 2 testdata/tiny/tiny.fa /tmp/ci_1.fq 2>/dev/null \
             | grep -v '^@' > /tmp/ours.sam
           echo "records: oracle=$(wc -l < /tmp/oracle_x86.sam) ours=$(wc -l < /tmp/ours.sam)"
           echo "differing records: $(paste -d'\001' /tmp/oracle_x86.sam /tmp/ours.sam | awk -F'\001' '$1!=$2' | wc -l)"
@@ -163,7 +163,7 @@ jobs:
           KNOWN_X86_XS_DIVERGENCE: "1"
         run: |
           set -o pipefail
-          bash scripts/opt_parity.sh ./target/release/bwa-mem3 | tee /tmp/parity.log
+          bash scripts/opt_parity.sh ./target/release/bwa-mem4 | tee /tmp/parity.log
           # The script always exits 0 so the full report is printed; the pass/fail decision is here.
           grep -q "0 failed" /tmp/parity.log
 

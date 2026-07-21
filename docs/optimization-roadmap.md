@@ -1,4 +1,4 @@
-# CPU optimization roadmap (bwa-mem4-rs)
+# CPU optimization roadmap (bwa-mem4)
 
 > ## ⚠️ 2026-07-16: this document's central premise is WRONG. Read this box first.
 >

@@ -23,7 +23,7 @@ Dev-only (jamais dans le binaire livre) : `noodles-*` (validation SAM/BAM cote t
   depuis sa PR `bwa-mem2/bwa-mem2#288` (fermee) et son fork `fg-labs/bwa-mem3` (licence MIT, comme
   bwa-mem2). Optimisations : `kswv` NEON natif (~7 %), blendv `vbslq` dans `bandedSWA` (~4 %),
   tuning Apple Silicon (P/E-core, cache L2, alignement 128 o, QoS, `Accelerate.framework`), build
-  `arch=arm64` + PGO. Collaboration via fork/PR sur `IPNP-BIPN/bwa-mem4-rs` (acces lecture accorde a
+  `arch=arm64` + PGO. Collaboration via fork/PR sur `IPNP-BIPN/bwa-mem4` (acces lecture accorde a
   @nh13). Reimplementation en Rust natif (pas de copie de code C++) ; on s'inspire de l'algorithmique
   NEON, le SW scalaire restant la source de verite octet-identique.
   **Livre (phase 9a terminee)** : kernel `bandedSWA` NEON **int16x8** en Rust natif

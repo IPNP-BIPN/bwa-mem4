@@ -187,7 +187,7 @@ regress `oracle_diff.sh`. New behavior is test-first (TDD); accelerated backends
 
 ## Workflow
 
-You have **read + fork** access. Fork `IPNP-BIPN/bwa-mem4-rs`, push a branch to your fork, and open a
+You have **read + fork** access. Fork `IPNP-BIPN/bwa-mem4`, push a branch to your fork, and open a
 PR against `main`. One topic per branch, commit often. Please end commit messages with a
 `Co-Authored-By:` line if you pair, and avoid em-dashes in prose (a house style rule). Licensing
 follows bwa-mem2 (MIT); ports of your NEON code keep their attribution.

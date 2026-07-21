@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-/// Errors produced across bwa-mem4-rs crates.
+/// Errors produced across bwa-mem4 crates.
 ///
 /// Deliberately coarse. These are the failure modes a user can act on (bad index, bad FASTQ, disk),
 /// not a taxonomy of internal states. Programmer errors stay panics: the aligner's invariants are

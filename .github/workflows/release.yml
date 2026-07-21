@@ -155,7 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           WANT="${{ matrix.deployment_target }}"
-          GOT=$(otool -l target/release/bwa-mem3 \
+          GOT=$(otool -l target/release/bwa-mem4 \
                 | awk '/LC_BUILD_VERSION/{f=1} /LC_VERSION_MIN_MACOSX/{f=1} f&&/minos|version/{print $2; exit}')
           echo "minimum macOS: $GOT (expected $WANT)"
           [ "$GOT" = "$WANT" ] || { echo "::error::built binary demands macOS $GOT, expected $WANT"; exit 1; }
@@ -166,8 +166,8 @@ jobs:
           # `mem` with no arguments prints usage and exits non-zero, so ask via --version on the
           # top-level command instead. This catches a mismatch that check-version cannot: the
           # manifest could be right while the build picked up something else entirely.
-          ./target/release/bwa-mem3 --version
-          ./target/release/bwa-mem3 --version | grep -q "${{ needs.check-version.outputs.version }}"
+          ./target/release/bwa-mem4 --version
+          ./target/release/bwa-mem4 --version | grep -q "${{ needs.check-version.outputs.version }}"
 
       # The real gate. testdata/tiny ships the five index files bwa-mem2 itself produced, so
       # rebuilding them with the freshly built binary and comparing byte for byte proves this
@@ -177,7 +177,7 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/relcheck
           cp testdata/tiny/tiny.fa /tmp/relcheck/tiny.fa
-          ./target/release/bwa-mem3 index /tmp/relcheck/tiny.fa
+          ./target/release/bwa-mem4 index /tmp/relcheck/tiny.fa
           for ext in pac ann amb bwt.2bit.64 0123; do
             if cmp -s "/tmp/relcheck/tiny.fa.$ext" "testdata/tiny/tiny.fa.$ext"; then
               echo "  .$ext identical"
@@ -193,7 +193,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/make_test_reads.py testdata/tiny/tiny.fa /tmp/relcheck/r --n 500
-          ./target/release/bwa-mem3 mem -t2 -K 10000000 testdata/tiny/tiny.fa \
+          ./target/release/bwa-mem4 mem -t2 -K 10000000 testdata/tiny/tiny.fa \
             /tmp/relcheck/r_1.fq /tmp/relcheck/r_2.fq > /tmp/relcheck/out.sam
           RECORDS=$(grep -vc '^@' /tmp/relcheck/out.sam)
           echo "records: $RECORDS"
@@ -206,9 +206,9 @@ jobs:
         id: pkg
         run: |
           set -euo pipefail
-          NAME="bwa-mem3-${{ needs.check-version.outputs.tag }}-${{ matrix.target_id }}"
+          NAME="bwa-mem4-${{ needs.check-version.outputs.tag }}-${{ matrix.target_id }}"
           mkdir -p "dist/$NAME"
-          cp target/release/bwa-mem3 "dist/$NAME/"
+          cp target/release/bwa-mem4 "dist/$NAME/"
           # LICENSE travels with the binary: this is a derivative work of bwa-mem2 and the MIT terms
           # require the notice to accompany every distributed copy, source or not.
           cp LICENSE README.md "dist/$NAME/"
@@ -329,7 +329,7 @@ jobs:
           # something a workflow can know; only the mechanical half is generated, so it cannot drift
           # from the artifacts actually attached.
           {
-            printf '\n---\n\n## Download bwa-mem3 %s\n\n' "${TAG#v}"
+            printf '\n---\n\n## Download bwa-mem4 %s\n\n' "${TAG#v}"
             printf 'Every binary below was required to rebuild the committed `testdata/tiny` index\n'
             printf 'byte-identically **on its own platform**, and to align 500 pairs into exactly 1000\n'
             printf 'records, before this release was allowed to appear. The artifact is checked, not just\n'
@@ -341,13 +341,13 @@ jobs:
                      "macos-arm64:Apple Silicon macOS (11.0+)" \
                      "macos-x86_64:Intel macOS (10.12+)"; do
               id="${t%%:*}"; label="${t#*:}"
-              f="bwa-mem3-${TAG}-${id}.tar.gz"
+              f="bwa-mem4-${TAG}-${id}.tar.gz"
               [ -f "dist/$f" ] || continue
               printf '| [%s](%s/%s) | %s |\n' "$f" "$base" "$f" "$label"
             done
             printf '| [SHA256SUMS](%s/SHA256SUMS) | checksums for all four |\n\n' "$base"
-            printf '```sh\ntar xzf bwa-mem3-%s-linux-x86_64.tar.gz\n' "$TAG"
-            printf './bwa-mem3-%s-linux-x86_64/bwa-mem3 --version\n```\n\n' "$TAG"
+            printf '```sh\ntar xzf bwa-mem4-%s-linux-x86_64.tar.gz\n' "$TAG"
+            printf './bwa-mem4-%s-linux-x86_64/bwa-mem4 --version\n```\n\n' "$TAG"
             printf 'Or build from source: `cargo build --release`, Rust %s, no system packages\n' "${RUST_TOOLCHAIN%.*}"
             printf 'needed (htslib is vendored).\n'
           } >> /tmp/notes.md
@@ -359,6 +359,6 @@ jobs:
             gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
           else
             gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
-              --title "bwa-mem3 $TAG" --verify-tag "${NOTES_ARG[@]}"
+              --title "bwa-mem4 $TAG" --verify-tag "${NOTES_ARG[@]}"
           fi
           gh release view "$TAG"

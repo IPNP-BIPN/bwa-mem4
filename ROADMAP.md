@@ -100,7 +100,7 @@ depuis le fork de Nils Homer (`fg-labs/bwa-mem3`, ~2x plus rapide) et sa PR #288
 
 **Gate** : sortie octet-identique au backend scalaire (property test + `oracle_diff.sh`) **et**
 speedup mesure (`/usr/bin/time`). A faire sur une branche partagee avec @nh13 (acces lecture +
-fork/PR accordes sur `IPNP-BIPN/bwa-mem4-rs`). Voir `DEPENDENCIES.md` pour la provenance.
+fork/PR accordes sur `IPNP-BIPN/bwa-mem4`). Voir `DEPENDENCIES.md` pour la provenance.
 
 **Avancement** :
 - **Fondations** (fait) : API `extend_batch` sur `SwBackend` (batch inter-sequences comme
@@ -145,7 +145,7 @@ phase 9e). Ils ne sont pas la mesure courante et le fork n'a pas ete re-mesure d
 | Binaire | vs bwa-mem2 (mediane, ratio) |
 |---|---|
 | `bwa-mem2` 2.3 (sse2neon, oracle) | 1,00x |
-| **bwa-mem4-rs (nous)** | **~2,2x** |
+| **bwa-mem4 (nous)** | **~2,2x** |
 | `fg-labs/bwa-mem3` (fork @nh13, natif) | ~2,65x |
 
 (Ratios ; les temps absolus derivent avec le thermique. Depart de la phase perf : nous 1,48x, ~15,9 s.)

@@ -7,7 +7,7 @@ name: Publish to crates.io
 # has already proven, on all four targets, that the binaries rebuild the committed index byte for
 # byte. If that gate did not pass, nothing reaches the registry.
 #
-# The workspace publishes as ten crates, all under our own `bwa-mem3` prefix. The libraries are
+# The workspace publishes as ten crates, all under our own `bwa-mem4` prefix. The libraries are
 # NOT called `bwa-core`, `bwa-mem` and so on, even though those names are free: `bwa-mem` in
 # particular is the name of Heng Li's algorithm, and taking it here would deny it to the upstream
 # ecosystem forever. The Rust-facing library names are unchanged, so no source file cares.
@@ -87,8 +87,8 @@ jobs:
           set -euo pipefail
           # Dependency order, computed once and written down rather than rediscovered: a crate
           # cannot be published before everything it depends on is already on the registry.
-          CRATES="bwa-mem3-core bwa-mem3-index bwa-mem3-extend bwa-mem3-neon bwa-mem3-seed \
-                  bwa-mem3-chain bwa-mem3-io bwa-mem3-mem bwa-mem3 bwa-mem3-diff"
+          CRATES="bwa-mem4-core bwa-mem4-index bwa-mem4-extend bwa-mem4-neon bwa-mem4-seed \
+                  bwa-mem4-chain bwa-mem4-io bwa-mem4-mem bwa-mem4 bwa-mem4-diff"
 
           if [ "$DRY" = "true" ]; then
             echo "DRY RUN: packaging only, nothing is uploaded"
