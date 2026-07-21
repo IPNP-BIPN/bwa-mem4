@@ -14,17 +14,28 @@ name: Release
 # machine and still ship a binary that produces different bytes. A release that cannot reproduce
 # the fixture never reaches the Releases page.
 
+# `pull_request` builds everything and publishes nothing, which is how COMBINE-lab/salmon and
+# COMBINE-lab/oarfish run theirs. It matters here more than usual: this workflow is the ONLY place
+# the artifact byte-identity gate runs, so without it a broken release path is discovered while
+# tagging, which is the worst possible moment.
 on:
   push:
     tags:
       - "v*"
+  pull_request:
   # Lets a release be rebuilt without moving the tag, e.g. after fixing the workflow itself.
+  # `dry_run` follows FelixKrueger/Bismark and TrimGalore: build, test and validate everything
+  # while touching neither `main` nor the Releases page.
   workflow_dispatch:
     inputs:
       tag:
         description: "Existing tag to build and publish (e.g. v3.0.0)"
         required: true
         type: string
+      dry_run:
+        description: "Build and validate without promoting main or creating a release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -56,26 +67,37 @@ jobs:
     outputs:
       tag: ${{ steps.v.outputs.tag }}
       version: ${{ steps.v.outputs.version }}
+      publishing: ${{ steps.v.outputs.publishing }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'pull_request' && github.ref || (inputs.tag || github.ref) }}
 
-      - name: Tag must match the workspace version
+      - name: Decide what this run is, and check the tag against the version
         id: v
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag || github.ref_name }}"
-          # The workspace version, read from the manifest rather than from a built binary so this
-          # job stays seconds long.
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG workspace version=$VERSION"
-          if [ "$TAG" != "v$VERSION" ]; then
-            echo "::error::tag '$TAG' does not match Cargo.toml version '$VERSION' (expected tag 'v$VERSION')"
-            exit 1
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # No tag exists on a pull request. Build under the version the manifest claims, name the
+            # artifacts accordingly, and publish nothing. The point is to exercise the path.
+            TAG="v$VERSION"; PUBLISHING=false
+            echo "pull request: building v$VERSION, publishing nothing"
+          else
+            TAG="${{ inputs.tag || github.ref_name }}"
+            PUBLISHING=true
+            [ "${{ inputs.dry_run }}" = "true" ] && PUBLISHING=false
+            echo "tag=$TAG workspace version=$VERSION publishing=$PUBLISHING"
+            # Not cosmetic: the version is stamped into `@PG VN:` on every file the binary writes,
+            # so a mismatch mislabels other people's data.
+            if [ "$TAG" != "v$VERSION" ]; then
+              echo "::error::tag '$TAG' does not match Cargo.toml version '$VERSION' (expected tag 'v$VERSION')"
+              exit 1
+            fi
           fi
+          echo "tag=$TAG"               >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"       >> "$GITHUB_OUTPUT"
+          echo "publishing=$PUBLISHING" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check-version
@@ -107,7 +129,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'pull_request' && github.ref || (inputs.tag || github.ref) }}
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@master
@@ -210,6 +232,7 @@ jobs:
   # pointing at a commit `main` does not contain.
   promote:
     needs: [check-version, build]
+    if: needs.check-version.outputs.publishing == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
@@ -245,6 +268,7 @@ jobs:
 
   publish:
     needs: [check-version, build, promote]
+    if: needs.check-version.outputs.publishing == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
@@ -273,6 +297,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.check-version.outputs.tag }}
+          SANITISE: |
+            import re, sys
+            sys.stdout.write(re.sub(r'(^|[^`\w])@([A-Z]{2})\b', r'\1`@\2`', sys.stdin.read(), flags=re.M))
         run: |
           set -euo pipefail
           # The tag's own annotation is the release notes: it is written at tag time, by a human,
@@ -280,7 +307,17 @@ jobs:
           # is lightweight and carries no message.
           NOTES=$(git tag -l --format='%(contents)' "$TAG")
           if [ -n "$NOTES" ]; then
-            printf '%s\n' "$NOTES" > /tmp/notes.md
+            # Every SAM header tag starts with '@', and GitHub renders '@PG' in a release body as a
+            # mention of the user 'pg'. That pulled an unrelated person onto the v3.0.0 release as a
+            # participant. Wrap bare '@XX' tokens in backticks so they render as code instead. The
+            # negative lookbehind-ish guard (`[^\x60]`) leaves already-quoted tags alone rather than
+            # double-quoting them.
+            # python3, not sed: BSD sed has no `\b`, so a sed one-liner cannot be tested on the
+            # macOS machines this project is developed on, and an untestable sanitiser is worthless.
+            printf '%s\n' "$NOTES" | python3 -c "$SANITISE" > /tmp/notes.md
+            if grep -qE '(^|[^`])@[A-Za-z]{2}' /tmp/notes.md; then
+              echo "::warning::release notes still contain a bare @mention after sanitising"
+            fi
             NOTES_ARG=(--notes-file /tmp/notes.md)
           else
             NOTES_ARG=(--generate-notes)
