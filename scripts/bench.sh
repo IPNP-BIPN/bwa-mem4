@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Reproducible perf harness: median-of-3 wall-clock + peak RSS for a given binary on the
-# canonical perf workload (région 2 Mbp index, 500k reads), single-threaded (-t1).
+# Reproducible perf harness: median-of-3 wall-clock + peak RSS for a given binary on 500k reads,
+# single-threaded (-t1), against the GENOME index by default.
 #
 # Usage: scripts/bench.sh <binary> [se|pe] [reps]
 #   scripts/bench.sh target/release/bwa-mem4 se 3
+#   IDX=work/hs38a.fa scripts/bench.sh target/release/bwa-mem4 se 3
 # Prints: "<mode> median_wall_s=<x> peak_rss_mb=<y>" plus the raw per-rep numbers.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,7 +13,18 @@ BIN="${1:?usage: bench.sh <binary> [se|pe] [reps]}"
 MODE="${2:-se}"
 REPS="${3:-3}"
 K="${K:-100000000}"
-IDX="work/region.fa"
+# The genome index, NOT work/region.fa: region's 2 Mbp BWT is cache-resident, so seeding (~78% of
+# the real profile) nearly disappears and extension's share inflates 4-20x. This repo carried a
+# "SW extension is ~85% of cycles" figure in its docs for months on the strength of a
+# region-measured profile, and aimed years of kernel work at 4% of the real runtime. Choosing the
+# small index has to be an act, not a default.
+IDX="${IDX:-work/genome.fa}"
+if [ "$IDX" = "work/region.fa" ] && [ "${ALLOW_REGION:-0}" != "1" ]; then
+  echo "refusing to benchmark on work/region.fa (cache-resident BWT hides seeding)." >&2
+  echo "set ALLOW_REGION=1 if that is genuinely what you want." >&2
+  exit 1
+fi
+[ -f "$IDX.ann" ] || { echo "missing index $IDX (set IDX=)" >&2; exit 1; }
 
 case "$MODE" in
   se) READS=(work/r1_500k.fq) ;;
