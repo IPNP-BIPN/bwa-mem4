@@ -1,5 +1,9 @@
 [package]
-name = "bwa-chain"
+name = "bwa-mem3-chain"
+description = "Seed chaining for bwa-mem3, including faithful ports of klib's kbtree and unstable introsort."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
+categories = ["science"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

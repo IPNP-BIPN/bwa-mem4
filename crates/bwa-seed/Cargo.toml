@@ -1,11 +1,20 @@
 [package]
-name = "bwa-seed"
+name = "bwa-mem3-seed"
+description = "SMEM seeding over the FM-index for bwa-mem3."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
+categories = ["science"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+
+# The package is renamed for crates.io, but the LIBRARY keeps its original name: targets in
+# this same package (examples/hybrid_bench.rs) refer to it as `bwa_seed`.
+[lib]
+name = "bwa_seed"
 
 [dependencies]
 bwa-core = { workspace = true }
