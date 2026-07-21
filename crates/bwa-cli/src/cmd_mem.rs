@@ -1329,6 +1329,11 @@ fn run_pipeline<B: Send>(
     out: Output,
     read_batches: impl FnOnce(std::sync::mpsc::SyncSender<(B, u64)>) -> anyhow::Result<()> + Send,
     process: impl Fn(B, u64) -> Vec<u8>,
+    // `-v`, so the batch count obeys the same quiet switch as bwa's own progress lines. It is a
+    // measurement instrument (see `crates/bwa-cli/tests/batch_count.rs`), so it is on by default.
+    verbose: i32,
+    // `-K` in bases, echoed next to the count so a log records the setting that produced it.
+    k_batch: usize,
 ) -> anyhow::Result<()> {
     std::thread::scope(|scope| -> anyhow::Result<()> {
         // ---- Channels. A couple of batches read-ahead / write-behind is enough to hide I/O
@@ -1359,7 +1364,9 @@ fn run_pipeline<B: Send>(
         // Invariant at the top of each turn: every batch with a smaller `base_id` has already been
         // processed and its bytes handed to the writer, so appending this batch's bytes preserves
         // input order.
+        let mut n_batches = 0usize;
         for (batch, base_id) in batch_rx {
+            n_batches += 1;
             // This batch's complete SAM text, all records concatenated in read order.
             let buf = process(batch, base_id);
             if sam_tx.send(buf).is_err() {
@@ -1367,6 +1374,12 @@ fn run_pipeline<B: Send>(
             }
         }
         drop(sam_tx);
+        // Reported because it is the one number that says whether this pipeline did anything: the
+        // overlap is batch N+1's read and N-1's write against N's compute, so at a single batch it
+        // is structurally inert and the run is not measuring the shipped configuration.
+        if verbose >= 3 {
+            eprintln!("[M::main_mem] processed {n_batches} batches (-K {k_batch})");
+        }
 
         reader.join().expect("reader thread panicked")?;
         writer.join().expect("writer thread panicked")?;
@@ -1600,6 +1613,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
             k_batch,
             out,
             pes0,
+            args.verbose.unwrap_or(3),
         )?;
         bwa_neon::matesw::cells::dump();
         bwa_chain::chain_time::dump();
@@ -1682,7 +1696,13 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         buf
     };
 
-    run_pipeline(out, read_batches, process)?;
+    run_pipeline(
+        out,
+        read_batches,
+        process,
+        args.verbose.unwrap_or(3),
+        k_batch,
+    )?;
     bwa_chain::chain_time::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
     Ok(())
@@ -2174,6 +2194,9 @@ fn run_pe(
     // `-I`: user-supplied insert-size distribution. When present bwa copies it per batch and never
     // calls `mem_pestat` (`bwamem.cpp`: `if (pes0) memcpy(...) else mem_pestat(...)`).
     pes0: Option<[PeStat; 4]>,
+    // `-v`, forwarded to `run_pipeline` for the batch-count line. `run_pe` has no `MemArgs` of its
+    // own, so verbosity has to be threaded in from the caller.
+    verbose: i32,
 ) -> anyhow::Result<()> {
     // Reader thread: open the mate files here and stream fixed-`-K` pair batches with the cumulative
     // pair id (global across batches for the `hash` tie-break, matching bwa-mem2's `(n_processed>>1)+i`).
@@ -2394,7 +2417,7 @@ fn run_pe(
         buf
     };
 
-    run_pipeline(out, read_batches, process)
+    run_pipeline(out, read_batches, process, verbose, k_batch)
 }
 
 /// Read pairs handed to one parallel mate-rescue task, derived from the batch rather than fixed.
