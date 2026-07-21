@@ -106,7 +106,28 @@ Mesure (index genome, `/usr/bin/time -l`) : **pic 19218 -> 11206 Mo, -8 Go**. Co
 on passe de **0,57x a 0,977x** (il garde ~2,3 %, sa compression SA, qu'on ne peut pas porter sans
 casser l'octet-identite de l'index). Parite tenue : 21 tests d'index (chaque tableau charge passe par
 `get_sa`/`backward_ext`), oracle SE 5000, PE `cmp`-clean sur 201266 enregistrements genome reels.
-Impact vitesse du `read()` vs mmap : a mesurer (le mmap avait ete choisi pour un chargement rapide).
+Impact vitesse du `read()` : **nul** (SE 4M `-t8` 28,54 s, le chargement est amorti sur 60 batches).
+
+### Phase B, le deficit PE = le kernel de sauvetage de mate
+
+**Decompose (t8, 500k paires, genome, PGO, mediane-3 ; `-S` isole le rescue) :**
+
+| | full | `-S` (sans rescue) | cout rescue |
+|---|---|---|---|
+| **mem4** | 18,97 s | **8,33 s** | **10,64 s** |
+| **fork** | 18,38 s | 11,03 s | **7,35 s** |
+
+**Tout ce qui n'est pas le rescue, on gagne 1,32x** (8,33 vs 11,03), comme en SE. **Le rescue, on perd
+1,45x** (10,64 vs 7,35) : ce deficit de 3,3 s efface notre avance de 2,7 s et fait tout le retard PE.
+Le rescue est 56 % de notre temps PE.
+
+**Ca renverse la these « le sauvetage vectorise est le gros gain PE ».** C'est un gain vs le rescue
+SCALAIRE de bwa-mem2, mais le fork le vectorise AUSSI (base bwa-mem2 + kswv de nh13) et 1,45x plus
+vite. **Le rescue est LE levier PE, seul.** Point important : les negatifs « fast-paths du kernel
+epuises » portaient sur le kernel d'EXTENSION (bandedSWA/ksw_extend2) ; le rescue est un kernel
+DIFFERENT (local-SW inter-sequences, `crates/bwa-neon/src/matesw.rs`), jamais audite contre celui du
+fork. Les deux sont NEON 16 voies. Prochaine etape : comparer notre `batched_ksw_align2` au kswv du
+fork ligne a ligne. Gate d'octet-identite du rescue : `matesw_equals_scalar` + oracle PE.
 
 ### Historique phase 7-8 (traine PE)
 
