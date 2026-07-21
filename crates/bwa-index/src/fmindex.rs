@@ -51,6 +51,7 @@
 //! 6. [`FmIndex::get_sa_batch`] and [`FmIndex::prefetch_occ`]: latency hiding only, no new logic.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use bwa_core::Result;
@@ -249,24 +250,29 @@ impl FmIndex {
     /// index files open for its whole lifetime. `Err` only for I/O failures (missing file,
     /// permission, `mmap` refusal); a truncated file panics instead.
     pub fn load(prefix: &Path) -> Result<Self> {
-        // Memory-map the BWT and bulk-copy each array out in one memcpy: the `cp_occ` blocks need
-        // 64-byte alignment the file doesn't provide, so they can't be borrowed in place, but the
-        // copy is a single `memcpy` (from page-cached pages) instead of ~800M element-wise reads.
-        // ---- Header: ref_seq_len, then count[5] ----------------------------------------------
-        let bwt_file = std::fs::File::open(sibling(prefix, "bwt.2bit.64"))?;
-        // SAFETY: index files are not mutated while a run holds them open (same as bwa-mem2's mmap).
-        let bwt_map = unsafe { Mmap::map(&bwt_file)? };
-        // Whole-file view, and the running BYTE offset that walks the format front to back.
-        let bytes: &[u8] = &bwt_map;
+        // Load the BWT with plain reads straight into aligned buffers, NOT mmap + copy. mmap would
+        // fault the whole ~10 GB file into OUR resident set while we copy it out, so peak RSS
+        // transiently holds the mapped file AND the copy at once. That transient, not the `.0123`
+        // pages, is what set our 19.2 GB peak (measured: dropping the 6.2 GB `.0123` mmap moved the
+        // peak by 0). `read` leaves the source in the kernel page cache, which does not count toward
+        // our RSS, so the peak is just the destination arrays. It is still one bulk memcpy (page
+        // cache -> aligned buffer) per array, so load stays fast; `cp_occ`'s 64-byte alignment,
+        // which the file's offset-48 layout denies an in-place mmap, is satisfied because the
+        // destination `Vec<CpOcc>` is freshly allocated and therefore aligned.
+        let mut bwt_file = std::fs::File::open(sibling(prefix, "bwt.2bit.64"))?;
+
+        // ---- Header: ref_seq_len, then count[5] (six i64, little-endian, 48 bytes) -----------
+        let mut header = [0u8; 48];
+        bwt_file.read_exact(&mut header)?;
         let mut cursor = 0usize;
         // First header field: the BWT ROW count, 2L + 1 (2L reference bases plus the sentinel row).
         // Every later size in the file is derived from it, so it is read before anything else.
-        let ref_seq_len = rd_i64(bytes, &mut cursor);
+        let ref_seq_len = rd_i64(&header, &mut cursor);
         // `count[c]`: rows whose suffix starts with a base < c. Index 4 is the total (all rows).
         // Read as written by the builder, i.e. WITHOUT the sentinel adjustment applied below.
         let mut count = [0i64; 5];
         for c in &mut count {
-            *c = rd_i64(bytes, &mut cursor);
+            *c = rd_i64(&header, &mut cursor);
         }
         for c in &mut count {
             // `for(ii = 0; ii < 5; ii++) count[ii] = count[ii] + 1;` (`FMI_search.cpp:423-426`).
@@ -285,53 +291,45 @@ impl FmIndex {
         let cp_size = ((ref_seq_len >> CP_SHIFT) + 1) as usize;
         let sa_size = ((ref_seq_len >> SA_SHIFT) + 1) as usize;
 
-        // SAFETY of the three copies below: each source range is in-bounds in the mapped file (its
-        // length is exactly `header + cp_size*64 + sa_size*(1+4) + 8`), the destination `Vec` is
-        // freshly allocated with matching capacity, `CpOcc`/`i8`/`u32` are all plain-old-data with no
-        // padding-sensitive invariants, and `set_len` is reached only after the bytes are written.
+        // SAFETY of the three reads below: each destination `Vec` is freshly allocated with the
+        // matching capacity, so the `from_raw_parts_mut` slice covers exactly the reserved bytes;
+        // `read_exact` writes every one of them before `set_len` publishes the elements; and
+        // `CpOcc`/`i8`/`u32` are all plain-old-data with no padding-sensitive invariants. The file
+        // is read sequentially, header then cp_occ then the two SA arrays then the sentinel, exactly
+        // the on-disk order, so no seeking is needed.
         // ---- Payload: checkpoints, then the two sampled-SA arrays, then the sentinel row ------
         // Destination for the checkpoints, allocated 64-byte aligned by `CpOcc`'s `align(64)`.
         // `cp_bytes` is the BYTE length of that array in the file: cp_size * 64.
         let mut cp_occ = Vec::<CpOcc>::with_capacity(cp_size);
         let cp_bytes = cp_size * std::mem::size_of::<CpOcc>();
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes[cursor..].as_ptr(),
-                cp_occ.as_mut_ptr() as *mut u8,
-                cp_bytes,
-            );
+            let dst = std::slice::from_raw_parts_mut(cp_occ.as_mut_ptr() as *mut u8, cp_bytes);
+            bwt_file.read_exact(dst)?;
             cp_occ.set_len(cp_size);
         }
-        cursor += cp_bytes;
 
         // High byte of each sampled SA entry, one byte per element, so element count == byte count.
         let mut sa_ms_byte = Vec::<i8>::with_capacity(sa_size);
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes[cursor..].as_ptr(),
-                sa_ms_byte.as_mut_ptr() as *mut u8,
-                sa_size,
-            );
+            let dst = std::slice::from_raw_parts_mut(sa_ms_byte.as_mut_ptr() as *mut u8, sa_size);
+            bwt_file.read_exact(dst)?;
             sa_ms_byte.set_len(sa_size);
         }
-        cursor += sa_size;
 
         // Low 32 bits of each sampled SA entry; `ls_bytes` is its BYTE length (4 per element).
         let mut sa_ls_word = Vec::<u32>::with_capacity(sa_size);
         let ls_bytes = sa_size * 4;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes[cursor..].as_ptr(),
-                sa_ls_word.as_mut_ptr() as *mut u8,
-                ls_bytes,
-            );
+            let dst = std::slice::from_raw_parts_mut(sa_ls_word.as_mut_ptr() as *mut u8, ls_bytes);
+            bwt_file.read_exact(dst)?;
             sa_ls_word.set_len(sa_size);
         }
-        cursor += ls_bytes;
 
         // Trailing header field: the one BWT ROW (not a reference position) whose suffix is the
         // whole text, i.e. the row with `sa[row] == 0`. Only `backward_ext` reads it.
-        let sentinel_index = rd_i64(bytes, &mut cursor);
+        let mut sentinel_buf = [0u8; 8];
+        bwt_file.read_exact(&mut sentinel_buf)?;
+        let sentinel_index = i64::from_le_bytes(sentinel_buf);
 
         // `one_hot_mask[y]` = the top `y` bits set. Built by the C's exact recurrence
         // (`FMI_search.cpp:386-393`): start from the MSB alone, then each step shifts the previous
