@@ -18,6 +18,17 @@
 //! `THREAD_AFFINITY_POLICY` is a no-op on arm64, and a QoS class is a preference the scheduler may
 //! ignore once there are more runnable threads than P cores. Capping the worker count is the only
 //! lever that actually keeps work off them.
+//!
+//! **QoS on top of the cap was tried and measured at zero**, so it is deliberately not implemented.
+//! Setting `QOS_CLASS_USER_INITIATED` or `QOS_CLASS_USER_INTERACTIVE` on each rayon worker via
+//! `pthread_set_qos_class_self_np`, at `-t12` on the same 500k-pair workload, five interleaved
+//! pairs: 6.18 s default against 6.12 s interactive, a 1% difference inside the 0.36 s spread of
+//! each condition, with the last two pairs identical to the hundredth. Interleaving mattered, since
+//! the runs drift upward with heat (5.97 s to 6.33 s across the series) and a sequential A-then-B
+//! comparison would have manufactured a result. The reading is that once the pool is capped, the
+//! twelve workers already land on the twelve P cores and there is nothing left for a scheduling
+//! hint to fix. This is the "QoS hints for performance cores" item from `fg-labs/bwa-mem3`'s tuning
+//! list; it is spent.
 
 /// Number of Performance cores, or `None` when the question does not apply or cannot be answered.
 ///
