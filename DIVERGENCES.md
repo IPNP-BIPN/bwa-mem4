@@ -4,7 +4,7 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## Acceptees (par conception)
 
-- **`@PG` : DECIDE (3.0.0). Nous emettons notre propre identite, definitivement.** Notre sortie
+- **`@PG` : DECIDE (4.0.0). Nous emettons notre propre identite, definitivement.** Notre sortie
   emet `ID:bwa-mem4 PN:bwa-mem4 VN:<ver> CL:<notre argv>`, l'oracle emet `bwa-mem2`. Exclu du gate
   d'octet-identite (on compare `@SQ` + les lignes d'alignement).
 

@@ -494,7 +494,7 @@ table (nothing depends on something listed above it, except `bwa-cli` which depe
 | `bwa-diff` | The `sam-diff` binary: field-level SAM concordance reporting, so a divergence reads as "37 records differ in XA" rather than as a byte offset. Deliberately lossy (five fields, primaries only, order-insensitive), so a clean report is **not** proof of parity | `serde`, `serde_json` |
 
 `bwa-sam` was an empty placeholder crate, reserved early for primary marking / MAPQ / CIGAR / tags
-before that work ended up next to the code it needs. It was removed for 3.0.0: it held no code and
+before that work ended up next to the code it needs. It was removed for 4.0.0: it held no code and
 nothing depended on it, and shipping an empty crate in a release is noise in every `cargo tree`.
 
 **Dead ends kept in tree.** `bwa-index/src/lisa.rs`, `rmi.rs` and `bwa-seed/src/lisa_seed.rs` are a

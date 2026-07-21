@@ -3,7 +3,7 @@
 Une phase = une branche. Commits frequents ; PR vers `dev`, `dev` promu sur `main` a la release.
 Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.3 patche (oracle).
 
-**Version courante : 3.0.0.** Les phases 0 a 9 sont terminees. Ce document reste le journal des
+**Version courante : 4.0.0.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
 mesures : chaque phase garde son resultat, y compris les negatifs, pour ne pas re-instruire deux fois
 la meme idee.
 
@@ -21,10 +21,10 @@ la meme idee.
 | 9a | `phase9a-neon` | backend NEON du SW derriere `SwBackend` (optim. de @nh13, PR #288) | fait |
 | 9b | `phase9b-gpu` | backend Metal du SW | **abandonnee**, backend retire (voir plus bas) |
 | 9c-9e | | recurrence bandedSWA, prefetch de seeding, vague perf | fait |
-| 10 | | ALT contigs, BAM/CRAM, CI, packaging, release 3.0.0 | fait |
+| 10 | | ALT contigs, BAM/CRAM, CI, packaging, release 4.0.0 | fait |
 | 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | a faire |
 
-## Statut (3.0.0)
+## Statut (4.0.0)
 
 Parite mesuree sur un **WGS humain reel 32,9x** (GIAB HG002, 2x150), genome entier, pas un
 sous-echantillon, les deux aligneurs lisant le meme index sur disque (`scripts/giab30x_pe.sh`) :

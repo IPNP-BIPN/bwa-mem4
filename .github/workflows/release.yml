@@ -29,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish (e.g. v3.0.0)"
+        description: "Existing tag to build and publish (e.g. v4.0.0)"
         required: true
         type: string
       dry_run:
@@ -58,7 +58,7 @@ env:
 jobs:
   # Cheap and first: refuse to build anything if the tag and Cargo.toml disagree. That mismatch is
   # not cosmetic here, because the version string is emitted as `@PG VN:` into every SAM/BAM/CRAM
-  # file the binary produces. Shipping v3.0.1 that stamps VN:3.0.0 into user data would be a
+  # file the binary produces. Shipping v4.0.1 that stamps VN:4.0.0 into user data would be a
   # provenance bug, and this project shipped VN:0.0.0 for its entire pre-release life precisely
   # because nothing checked.
   check-version:
@@ -118,7 +118,7 @@ jobs:
           # `cc`, and `cc` with no explicit target takes the host's default deployment version, so
           # building on macOS 26 could stamp a minimum of 26 onto the artifact and lock out every
           # user below it. Same lesson as `-C target-cpu=native`: build for the audience, not for
-          # the machine. Measured on the v3.0.0 artifacts: arm64 minos 11.0, x86_64 minos 10.12.
+          # the machine. Measured on the v3.0.0 artifacts (deleted in the rename): arm64 minos 11.0, x86_64 minos 10.12.
           # The newest macOS is worth TESTING on, which is ci.yml's job, not this one's.
           - os: macos-14
             target_id: macos-arm64

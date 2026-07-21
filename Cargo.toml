@@ -3,9 +3,10 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-# 3.0.0 for the FIRST release, not 0.1.0. The number tracks what this reimplements: bwa-mem2 is
-# the 2, and this is the generation after it. A 0.x would also misdescribe the maturity, since the
-# acceptance criterion has been byte-identity against a real 30x WGS from the start.
+# A major number, not 0.1.0, from the very first release. The number tracks the name: the binary is
+# `bwa-mem4`, so the version is 4.x, exactly as the first releases were 3.x while it was called
+# `bwa-mem3`. A 0.x would also misdescribe the maturity, since the acceptance criterion has been
+# byte-identity against a real 30x WGS from the start.
 #
 # This version string is not decorative: it is emitted as `@PG VN:` on every SAM/BAM/CRAM file
 # produced, so it is the only record a downstream consumer has of which binary made their data.

@@ -222,7 +222,7 @@ check "-w 1"    se -w 1
 check "-w 0"    se -w 0
 
 # `-p` and the output sinks were the last accepted options with no differential coverage at all,
-# found while auditing for the 3.0.0 release. `-p` is a whole input path of its own (one file, mates
+# found while auditing for the 4.0.0 release. `-p` is a whole input path of its own (one file, mates
 # adjacent, de-interleaved internally), not a scalar knob, so "it parses" proved nothing about it.
 # The output-shaping flags above are all tested SINGLE-END, and single-end never reaches the paired
 # emission branch or `mem_reg2sam`'s pairing fallback. Running `-a` paired-end for the first time,

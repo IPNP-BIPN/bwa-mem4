@@ -65,7 +65,8 @@ build host sets the FLOOR: `hts-sys` compiles vendored htslib with `cc`, which w
 target adopts the host's deployment version, so building on macOS 26 would stamp a minimum of 26
 onto the artifact and lock out every user below it. `MACOSX_DEPLOYMENT_TARGET` is pinned per target
 and then verified on the built binary with `otool`, so a future runner swap cannot silently raise
-the floor. Measured on v3.0.0: arm64 requires macOS 11.0, x86_64 requires 10.12.
+the floor. Measured on the v3.0.0 artifacts (that release was deleted in the rename): arm64
+requires macOS 11.0, x86_64 requires 10.12.
 
 Release artifacts are built with an empty `RUSTFLAGS`, overriding `.cargo/config.toml`'s
 `-C target-cpu=native`. A binary built with `native` runs only on CPUs at least as capable as the

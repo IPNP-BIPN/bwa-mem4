@@ -166,8 +166,8 @@ Prebuilt binaries for Linux and macOS, x86_64 and arm64, are attached to each
 [release](https://github.com/IPNP-BIPN/bwa-mem4/releases), with a `SHA256SUMS` file:
 
 ```sh
-tar xzf bwa-mem4-v3.0.0-linux-x86_64.tar.gz
-./bwa-mem4-v3.0.0-linux-x86_64/bwa-mem4 --version
+tar xzf bwa-mem4-v4.0.0-linux-x86_64.tar.gz
+./bwa-mem4-v4.0.0-linux-x86_64/bwa-mem4 --version
 ```
 
 Every published binary is required to rebuild the committed `testdata/tiny` index byte-identically
