@@ -8,6 +8,9 @@ cd "$(dirname "$0")/.."
 
 M2=bwa-mem2
 M3=./target/release/bwa-mem4
+# @nh13's C++ fork. Same index format (it is a bwa-mem2 derivative), and it appends an HN:i tag to
+# every record that neither of the other two emits, which the record filter below strips.
+FORK="${FORK:-reference/bwa-mem3-cpp/bwa-mem3.arm64}"
 IDX=work/genome.fa
 R1=work/giab30x/HG002_30x_R1.fastq.gz
 R2=work/giab30x/HG002_30x_R2.fastq.gz
@@ -16,7 +19,7 @@ T="${T:-8}"
 SEREPS="${SEREPS:-2}"
 PEREPS="${PEREPS:-1}"
 
-for f in "$R1" "$R2" "$IDX.bwt.2bit.64"; do [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }; done
+for f in "$R1" "$R2" "$IDX.bwt.2bit.64" "$FORK"; do [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }; done
 
 TS=$(date +%Y%m%d_%H%M%S)
 OUT="work/giab30x/bench_$TS"; mkdir -p "$OUT"
@@ -29,8 +32,12 @@ say() { echo "$@" | tee -a "$LOG"; }
 run() {
   local of="$1"; shift
   local cmd="$*"
-  /usr/bin/time -p bash -c "$cmd 2>'$of.err' | grep -v '^@' | tee >(wc -l >'$of.n') | md5 >'$of.md5'" 2>"$of.time"
-  local real; real=$(awk '/^real/{print $2}' "$of.time")
+  # `time -l` rather than `-p`: it gives peak RSS as well as wall time, and RAM is an objective of
+  # this comparison, not a footnote. The `sed` strips the fork's per-record HN:i tag, on all three
+  # arms so the pipelines stay symmetric (it is a no-op for bwa-mem2 and for us).
+  /usr/bin/time -l bash -c "$cmd 2>'$of.err' | grep -v '^@' | sed 's/\tHN:i:[0-9]*//' | tee >(wc -l >'$of.n') | md5 >'$of.md5'" 2>"$of.time"
+  local real; real=$(awk '/ real /{print $1}' "$of.time" | head -1)
+  awk '/maximum resident set size/{printf "%d\n", $1/1048576}' "$of.time" > "$of.rss"
   # A real 30x SE/PE run is >>60s; anything faster means the aligner errored out.
   if awk "BEGIN{exit !($real < 30)}"; then
     echo "ABORT: $(basename "$of") returned in ${real}s (aligner failed). stderr tail:" >&2
@@ -54,9 +61,10 @@ say ""
 say "==== SE  -t$T  x$SEREPS ===="
 for i in $(seq 1 "$SEREPS"); do
   a=$(run "$OUT/m2_se_$i" $M2 mem -t"$T" -K $K "$IDX" "$R1") || { say "  [ABORT] SE mem2 rep$i failed fast (see $OUT/m2_se_$i.err)"; exit 1; }
-  b=$(run "$OUT/m3_se_$i" $M3 mem -t"$T" -K $K "$IDX" "$R1") || { say "  [ABORT] SE mem3 rep$i failed fast (see $OUT/m3_se_$i.err)"; exit 1; }
+  f=$(run "$OUT/fk_se_$i" $FORK mem -t"$T" -K $K "$IDX" "$R1") || { say "  [ABORT] SE fork rep$i failed fast (see $OUT/fk_se_$i.err)"; exit 1; }
+  b=$(run "$OUT/m3_se_$i" $M3 mem -t"$T" -K $K "$IDX" "$R1") || { say "  [ABORT] SE mem4 rep$i failed fast (see $OUT/m3_se_$i.err)"; exit 1; }
   sp=$(echo "scale=3; $a/$b" | bc)
-  say "  rep$i  mem2=${a}s  mem3=${b}s  speedup=${sp}x"
+  say "  rep$i  mem2=${a}s/$(cat "$OUT/m2_se_$i.rss")MB  fork=${f}s/$(cat "$OUT/fk_se_$i.rss")MB  mem4=${b}s/$(cat "$OUT/m3_se_$i.rss")MB  vs-mem2=${sp}x  vs-fork=$(echo "scale=3; $f/$b" | bc)x"
 done
 # identity from rep1
 if diff -q "$OUT/m2_se_1.md5" "$OUT/m3_se_1.md5" >/dev/null && diff -q "$OUT/m2_se_1.n" "$OUT/m3_se_1.n" >/dev/null; then
@@ -70,9 +78,10 @@ say ""
 say "==== PE  -t$T  x$PEREPS ===="
 for i in $(seq 1 "$PEREPS"); do
   a=$(run "$OUT/m2_pe_$i" $M2 mem -t"$T" -K $K "$IDX" "$R1" "$R2") || { say "  [ABORT] PE mem2 rep$i failed fast (see $OUT/m2_pe_$i.err)"; exit 1; }
-  b=$(run "$OUT/m3_pe_$i" $M3 mem -t"$T" -K $K "$IDX" "$R1" "$R2") || { say "  [ABORT] PE mem3 rep$i failed fast (see $OUT/m3_pe_$i.err)"; exit 1; }
+  f=$(run "$OUT/fk_pe_$i" $FORK mem -t"$T" -K $K "$IDX" "$R1" "$R2") || { say "  [ABORT] PE fork rep$i failed fast (see $OUT/fk_pe_$i.err)"; exit 1; }
+  b=$(run "$OUT/m3_pe_$i" $M3 mem -t"$T" -K $K "$IDX" "$R1" "$R2") || { say "  [ABORT] PE mem4 rep$i failed fast (see $OUT/m3_pe_$i.err)"; exit 1; }
   sp=$(echo "scale=3; $a/$b" | bc)
-  say "  rep$i  mem2=${a}s  mem3=${b}s  speedup=${sp}x"
+  say "  rep$i  mem2=${a}s/$(cat "$OUT/m2_pe_$i.rss")MB  fork=${f}s/$(cat "$OUT/fk_pe_$i.rss")MB  mem4=${b}s/$(cat "$OUT/m3_pe_$i.rss")MB  vs-mem2=${sp}x  vs-fork=$(echo "scale=3; $f/$b" | bc)x"
 done
 if diff -q "$OUT/m2_pe_1.md5" "$OUT/m3_pe_1.md5" >/dev/null && diff -q "$OUT/m2_pe_1.n" "$OUT/m3_pe_1.n" >/dev/null; then
   say "  [PASS] PE BYTE-IDENTICAL: $(cat "$OUT/m2_pe_1.n") records, md5=$(cat "$OUT/m2_pe_1.md5")"
