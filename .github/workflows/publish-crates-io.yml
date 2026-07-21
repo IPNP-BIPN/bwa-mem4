@@ -41,10 +41,19 @@ env:
 
 jobs:
   publish:
-    # Only after a Release that actually succeeded. A manual run is allowed for dry runs.
+    # Only after a Release that succeeded AND came from a tag push.
+    #
+    # The tag test is not belt-and-braces, it is the whole guard. `release.yml` also runs on
+    # pull_request (so the artifact byte-identity gate is exercised before tagging), and
+    # `workflow_run` fires on ANY completion of that workflow, branch and PR runs included. Without
+    # this condition a green PR would publish to crates.io, permanently, from unmerged code. It was
+    # caught because publishing failed for an unrelated reason; it would not have been caught
+    # otherwise. For a tag push `head_branch` carries the tag name, hence the `v` prefix test.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
@@ -56,6 +65,19 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      # Independent of the `if` above, because a condition on event metadata and a fact about the
+      # commit are different claims. This one reads the repository.
+      - name: The checked-out commit must be a released tag
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          git fetch --tags --quiet
+          if ! git tag --points-at HEAD | grep -qE '^v[0-9]'; then
+            echo "::error::HEAD carries no v* tag; refusing to publish from an untagged commit"
+            exit 1
+          fi
+          echo "publishing from $(git tag --points-at HEAD | grep -E '^v[0-9]' | head -1)"
 
       - name: Publish in dependency order
         env:

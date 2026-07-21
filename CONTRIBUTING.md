@@ -49,6 +49,11 @@ started on the NEON backend, but it applies to any contributor. The project docs
     behave differently, and how to opt out;
   - anything deliberately NOT done, stated plainly. A release note that only lists wins is a
     marketing document.
+  - a `## Credits` section naming who did what, per change rather than as a lump. Ideas count:
+    where a change came from someone else's fork, PR or review, say so and link it, even when none
+    of their code was merged. `git log <prev>..<tag> --format='%an'` and the `Co-Authored-By:`
+    trailers are the starting point, not the answer, because they miss the person whose refused PR
+    identified the trap the merged version avoids.
 - The tag must match the workspace version in `Cargo.toml`. The release workflow refuses to build
   otherwise, and that check is not bureaucratic: the version is stamped into `@PG VN:` on every
   SAM/BAM/CRAM the binary writes, so a mismatch mislabels other people's data.
