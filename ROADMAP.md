@@ -50,6 +50,43 @@ pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
 (upstream `bwa-mem2#297`, ouvert depuis ce projet).
 
+## Phase 0 de la campagne perf : mesure de reference contre le fork
+
+Trois bras entrelaces dans la meme passe (`scripts/fork_bench.sh`), index genome, binaire PGO,
+4M reads/paires GIAB HG002, `-t8`, `-K` 10M (60 batches SE / 119 PE), mediane de 3, chaque binaire
+prechauffe. Le tag `HN:i` que le fork ajoute a chaque enregistrement est retire sur les trois bras.
+
+| | bwa-mem2 2.3 | `fg-labs/bwa-mem3` | bwa-mem4 | nous vs fork |
+|---|---|---|---|---|
+| SE temps | 78,25 s (1,00x) | 37,75 s (2,07x) | **29,98 s (2,61x)** | **1,26x, on gagne** |
+| PE temps | 288,56 s (1,00x) | **136,45 s (2,11x)** | 155,00 s (1,86x) | **0,88x, on perd** |
+| pic RSS | 16 797 Mo | **11 034 Mo** | 19 218 Mo | **0,57x, on perd** |
+
+**Verdict : on bat le fork en SE (1,26x), on le perd en PE (il est 1,14x plus rapide), et on perd
+nettement en RAM des deux cotes (1,75x son pic).** Le « 1,29x derriere » cite jusqu'ici etait un
+artefact de regime : `-t1`, align-only, region 2 Mbp au BWT cache-resident. Log :
+`work/forkbench/20260721_222522` (SE) et `.../20260721_223530` (PE).
+
+Trois faits pour la suite de la campagne :
+- **RAM (le levier le plus clair).** Le fork annonce `SA compression enabled with xfactor: 8` : il
+  compresse le tableau de suffixes echantillonne, nous non. Cela explique vraisemblablement l'essentiel
+  des 5,8 Go qu'il gagne sur bwa-mem2. C'est une technique nommee, pas une micro-optim a deviner. NB
+  nos pages `.0123` sont file-backed (mmap), les siennes probablement anonymes : le pic RSS reste la
+  bonne mesure de « ca tient sur la machine » mais les deux chiffres ne reagissent pas pareil sous
+  pression.
+- **PE (l'ecart de vitesse a fermer).** Notre sauvetage de mate vectorise est notre plus gros gain
+  vs bwa-mem2 a `-t1` (1,51x -> 2,4x) mais le fork nous repasse devant a `-t8`. Piste : le
+  `batch_mate_rescue` et son parallelisme (goulot d'Amdahl deja identifie). PE tres stable
+  (bwa-mem2 +/-0,2 %), donc le 0,88x n'est pas du bruit.
+- **Concordance du fork (a verifier avant d'affirmer).** Sur 4M reads le fork emet 17 enregistrements
+  de moins que bwa-mem2 (SE 4025128 vs 4025145 ; PE 8052420 vs 8052438), au-dela du tag `HN`. Nous
+  sommes octet-identiques sur la totalite. A reduire a un cas reproductible avant toute affirmation
+  publique : ce peut etre notre facon de l'invoquer.
+
+**Decision phase B** : elle a lieu, et sa cible est le PE, pas le seeding `-t1`. Le regime cible
+(`-t8` end-to-end) nous donne l'avantage en SE mais un deficit reel en PE et en RAM ; l'ancien chiffre
+`-t1` qui la motivait est retire.
+
 ### Historique phase 7-8 (traine PE)
 
 Traine resorbee via oracle instrumente bit-identique : (1) ordre des chaines **par position** +
