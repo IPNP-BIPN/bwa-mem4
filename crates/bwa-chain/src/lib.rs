@@ -393,7 +393,7 @@ pub fn build_chains_from_smems(
     let counts = sa_positions_for_read(opt, &mut smems, &mut positions);
     // Output buffer for the resolved 2L-space REFERENCE positions, one per row, same index.
     let mut rbegs = vec![0i64; positions.len()];
-    // `Some(start instant)` only under `BWA3_CHAIN_TIME=1`; `None` (and zero cost) otherwise.
+    // `Some(start instant)` only under `BWA4_CHAIN_TIME=1`; `None` (and zero cost) otherwise.
     let t_sa = chain_time::enabled().then(std::time::Instant::now);
     fm.get_sa_batch(&positions, &mut rbegs);
     if let Some(t) = t_sa {
@@ -1088,7 +1088,7 @@ mod tests {
     }
 }
 
-/// `BWA3_CHAIN_TIME=1` probe: how much of `build_chains_from_smems` is the inlined `get_sa_batch`
+/// `BWA4_CHAIN_TIME=1` probe: how much of `build_chains_from_smems` is the inlined `get_sa_batch`
 /// SA walk. The genome-scale sampler attributes ~37.6% of work samples to this function as a leaf,
 /// but LTO inlines `get_sa_batch` into it, so sampling alone cannot separate the SA walk from the
 /// merge. This can.
@@ -1105,14 +1105,14 @@ pub mod chain_time {
     /// `GET_SA_NS / TOTAL_NS` is the fraction attributable to the index rather than the merge.
     pub static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
-    /// Whether `BWA3_CHAIN_TIME` is set in the environment. Read once and cached, so toggling the
+    /// Whether `BWA4_CHAIN_TIME` is set in the environment. Read once and cached, so toggling the
     /// variable mid-process has no effect and the disabled path costs one atomic load.
     ///
     /// # Returns
     /// True if the probe should record timings.
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BWA3_CHAIN_TIME").is_some())
+        *ON.get_or_init(|| std::env::var_os("BWA4_CHAIN_TIME").is_some())
     }
 
     /// Print the accumulated counters to stderr, once, at the end of a run. A no-op unless

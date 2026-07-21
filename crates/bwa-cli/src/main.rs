@@ -1,4 +1,4 @@
-//! `bwa-mem3` command-line entry point.
+//! `bwa-mem4` command-line entry point.
 //!
 //! Two subcommands, mirroring the two things you do with a read aligner: `index` prepares a
 //! reference genome once, `mem` aligns reads against it. Both are drop-in compatible with their
@@ -21,11 +21,11 @@ mod cmd_mem;
 // on `cmd_index::IndexArgs` or `cmd_mem::MemArgs`.
 //
 // Deliberately a `//` comment, not `///`: clap derives `long_about` from a struct's doc comment, so
-// a `///` here would appear in `bwa-mem3 --help`. The `about` string in the attribute below is the
+// a `///` here would appear in `bwa-mem4 --help`. The `about` string in the attribute below is the
 // only help text this struct should contribute.
 #[derive(Parser)]
 #[command(
-    name = "bwa-mem3",
+    name = "bwa-mem4",
     version,
     about = "Native Rust reimplementation of bwa-mem2"
 )]

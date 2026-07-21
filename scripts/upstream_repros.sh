@@ -11,13 +11,13 @@
 # identical to, and surviving where upstream dies costs nothing in parity. That is the only class
 # of upstream issue this script covers.
 #
-# Usage: scripts/upstream_repros.sh [path-to-bwa-mem3]
+# Usage: scripts/upstream_repros.sh [path-to-bwa-mem4]
 #   GENOME=work/genome.fa   a GRCh38 index, needed by the #269 case only (that case is skipped
 #                           when it is absent; it downloads 10 KB of reads from the issue thread)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-M3="${1:-./target/release/bwa-mem3}"
+M3="${1:-./target/release/bwa-mem4}"
 M2="${M2:-bwa-mem2}"
 GENOME="${GENOME:-work/genome.fa}"
 TMP=$(mktemp -d)
@@ -50,7 +50,7 @@ PY
 "$M2" mem -t1 "$TMP/coding.fa" "$TMP/c1.fq" "$TMP/c2.fq" >"$TMP/c_m2.sam" 2>/dev/null
 echo "  bwa-mem2: rc=$? records=$(grep -vc '^@' "$TMP/c_m2.sam" 2>/dev/null)"
 "$M3" mem -t1 "$TMP/coding.fa" "$TMP/c1.fq" "$TMP/c2.fq" >"$TMP/c_m3.sam" 2>/dev/null
-echo "  bwa-mem3: rc=$? records=$(grep -vc '^@' "$TMP/c_m3.sam" 2>/dev/null)"
+echo "  bwa-mem4: rc=$? records=$(grep -vc '^@' "$TMP/c_m3.sam" 2>/dev/null)"
 if cmp -s <(grep -v '^@PG' "$TMP/c_m2.sam") <(grep -v '^@PG' "$TMP/c_m3.sam"); then
   echo "  -> byte-identical."
 else
@@ -92,7 +92,7 @@ PY
 mkdir -p "$TMP/i2" "$TMP/i3"
 cp "$TMP/tx.fa" "$TMP/i2/tx.fa"; cp "$TMP/tx.fa" "$TMP/i3/tx.fa"
 "$M2" index "$TMP/i2/tx.fa" >/dev/null 2>&1; echo "  bwa-mem2 index: rc=$?"
-"$M3" index "$TMP/i3/tx.fa" >/dev/null 2>&1; echo "  bwa-mem3 index: rc=$?"
+"$M3" index "$TMP/i3/tx.fa" >/dev/null 2>&1; echo "  bwa-mem4 index: rc=$?"
 ok=1
 for e in pac ann amb bwt.2bit.64 0123; do
   if cmp -s "$TMP/i2/tx.fa.$e" "$TMP/i3/tx.fa.$e"; then echo "    .$e identical"; else echo "    .$e DIFFERS"; ok=0; fi
@@ -115,7 +115,7 @@ else
   echo "  bwa-mem2: rc=$? records=$(grep -vc '^@' "$TMP/m2.sam" 2>/dev/null)"
   grep -m2 -iE 'assert|Unexpected' "$TMP/m2.err" | sed 's/^/    /'
   "$M3" mem -t2 -K 10000000 "$GENOME" "$TMP/R1.fq.gz" "$TMP/R2.fq.gz" >"$TMP/m3.sam" 2>"$TMP/m3.err"
-  echo "  bwa-mem3: rc=$? records=$(grep -vc '^@' "$TMP/m3.sam" 2>/dev/null)"
+  echo "  bwa-mem4: rc=$? records=$(grep -vc '^@' "$TMP/m3.sam" 2>/dev/null)"
   echo "    unmapped: $(grep -v '^@' "$TMP/m3.sam" | awk '{if (int($2/4)%2) n++} END{print n+0}')"
   echo "  -> upstream aborts and emits nothing; we align every pair. No parity cost: there is no"
   echo "     upstream output to be identical to."

@@ -3,11 +3,11 @@
 # alignment records byte-for-byte (@PG legitimately differs: it carries each tool's name/command).
 # An option that is parsed but not acted upon shows up here as a FAIL, which is the point.
 #
-# Usage: scripts/opt_parity.sh [path-to-bwa-mem3]
+# Usage: scripts/opt_parity.sh [path-to-bwa-mem4]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-M3="${1:-./target/release/bwa-mem3}"
+M3="${1:-./target/release/bwa-mem4}"
 # Overridable so CI can point at the committed testdata/tiny fixture and generated reads. Locally
 # they default to the scratch inputs under work/, which is gitignored.
 M2="${M2:-bwa-mem2}"

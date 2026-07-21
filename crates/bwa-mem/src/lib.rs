@@ -789,19 +789,19 @@ pub fn align_read_dedup(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) 
     // Raw regions before dedup, dumped first so a divergence can be attributed to extension rather
     // than to the dedup pass.
     let regs = align_read(fm, bns, opt, codes);
-    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+    if std::env::var_os("BWA4_DUMP_REGS").is_some() {
         dump_regs(bns, "pre-dedup", &regs);
     }
     let mut deduped = mem_sort_dedup_patch(fm, opt, codes, regs);
     // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after the dedup.
     crate::primary::stamp_is_alt(bns, &mut deduped);
-    if std::env::var_os("BWA3_DUMP_REGS").is_some() {
+    if std::env::var_os("BWA4_DUMP_REGS").is_some() {
         dump_regs(bns, "post-dedup", &deduped);
     }
     deduped
 }
 
-/// Env-gated (`BWA3_DUMP_REGS`) diagnostic: print every region with its query span, reference
+/// Env-gated (`BWA4_DUMP_REGS`) diagnostic: print every region with its query span, reference
 /// span, mapped position and scores. Used to compare our suboptimal-region set against the oracle.
 ///
 /// # Parameters

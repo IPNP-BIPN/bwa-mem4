@@ -266,7 +266,7 @@ impl InterleavedFastqReader {
             let Some(mate2) = self.inner.next_record()? else {
                 return Err(Error::Fastq(format!(
                     "-p: interleaved input ended on an unpaired read ('{}'). bwa would realign it \
-                     single-end (bseq_classify); bwa-mem3 refuses rather than mis-pair it.",
+                     single-end (bseq_classify); bwa-mem4 refuses rather than mis-pair it.",
                     mate1.name
                 )));
             };
@@ -274,7 +274,7 @@ impl InterleavedFastqReader {
             if mate1.name != mate2.name {
                 return Err(Error::Fastq(format!(
                     "-p: consecutive reads '{}' and '{}' are not mates. bwa would split these into \
-                     a single-end pass (bseq_classify); bwa-mem3 refuses rather than mis-pair them.",
+                     a single-end pass (bseq_classify); bwa-mem4 refuses rather than mis-pair them.",
                     mate1.name, mate2.name
                 )));
             }

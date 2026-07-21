@@ -219,20 +219,20 @@ impl MemAln {
     }
 }
 
-/// Env-gated (`BWA3_DUMP_BW`) trace of the band-width retry loop, in bwa's `-v 4` format so the two
+/// Env-gated (`BWA4_DUMP_BW`) trace of the band-width retry loop, in bwa's `-v 4` format so the two
 /// can be diffed directly. Cached: `reg2aln` runs per emitted alignment, so a `var_os` per call
 /// would show up in the profile.
 ///
 /// # Returns
 ///
-/// `true` when the environment variable `BWA3_DUMP_BW` was set at the time of the *first* call.
+/// `true` when the environment variable `BWA4_DUMP_BW` was set at the time of the *first* call.
 /// The value is frozen from then on: setting or clearing the variable later in the process has no
 /// effect. Read only by [`reg2aln`], purely to decide whether to `eprintln!` a trace line.
 fn band_width_trace_enabled() -> bool {
     // Process-wide latch holding the one-time answer, so the env lookup happens at most once for
     // the whole run rather than once per emitted alignment.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("BWA3_DUMP_BW").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("BWA4_DUMP_BW").is_some())
 }
 
 /// Inferred band width, port of `infer_bw` (`bwamem.cpp:1811`).

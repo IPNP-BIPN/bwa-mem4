@@ -1,6 +1,6 @@
 [package]
-name = "bwa-mem3-chain"
-description = "Seed chaining for bwa-mem3, including faithful ports of klib's kbtree and unstable introsort."
+name = "bwa-mem-oxide-chain"
+description = "Seed chaining for bwa-mem4, including faithful ports of klib's kbtree and unstable introsort."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
 categories = ["science"]

@@ -134,17 +134,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "bwa-mem3"
-version = "3.0.1"
+name = "bwa-mem-oxide"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "bgzf",
- "bwa-mem3-chain",
- "bwa-mem3-core",
- "bwa-mem3-index",
- "bwa-mem3-io",
- "bwa-mem3-mem",
- "bwa-mem3-neon",
+ "bwa-mem-oxide-chain",
+ "bwa-mem-oxide-core",
+ "bwa-mem-oxide-index",
+ "bwa-mem-oxide-io",
+ "bwa-mem-oxide-mem",
+ "bwa-mem-oxide-neon",
  "clap",
  "mimalloc",
  "rayon",
@@ -152,76 +152,76 @@ dependencies = [
 ]
 
 [[package]]
-name = "bwa-mem3-chain"
-version = "3.0.1"
+name = "bwa-mem-oxide-chain"
+version = "4.0.0"
 dependencies = [
- "bwa-mem3-core",
- "bwa-mem3-index",
- "bwa-mem3-seed",
+ "bwa-mem-oxide-core",
+ "bwa-mem-oxide-index",
+ "bwa-mem-oxide-seed",
 ]
 
 [[package]]
-name = "bwa-mem3-core"
-version = "3.0.1"
+name = "bwa-mem-oxide-core"
+version = "4.0.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
-name = "bwa-mem3-diff"
-version = "3.0.1"
+name = "bwa-mem-oxide-diff"
+version = "4.0.0"
 dependencies = [
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "bwa-mem3-extend"
-version = "3.0.1"
+name = "bwa-mem-oxide-extend"
+version = "4.0.0"
 
 [[package]]
-name = "bwa-mem3-index"
-version = "3.0.1"
+name = "bwa-mem-oxide-index"
+version = "4.0.0"
 dependencies = [
- "bwa-mem3-core",
+ "bwa-mem-oxide-core",
  "memmap2",
  "rayon",
 ]
 
 [[package]]
-name = "bwa-mem3-io"
-version = "3.0.1"
+name = "bwa-mem-oxide-io"
+version = "4.0.0"
 dependencies = [
- "bwa-mem3-core",
+ "bwa-mem-oxide-core",
  "needletail",
 ]
 
 [[package]]
-name = "bwa-mem3-mem"
-version = "3.0.1"
+name = "bwa-mem-oxide-mem"
+version = "4.0.0"
 dependencies = [
- "bwa-mem3-chain",
- "bwa-mem3-core",
- "bwa-mem3-extend",
- "bwa-mem3-index",
- "bwa-mem3-neon",
- "bwa-mem3-seed",
+ "bwa-mem-oxide-chain",
+ "bwa-mem-oxide-core",
+ "bwa-mem-oxide-extend",
+ "bwa-mem-oxide-index",
+ "bwa-mem-oxide-neon",
+ "bwa-mem-oxide-seed",
 ]
 
 [[package]]
-name = "bwa-mem3-neon"
-version = "3.0.1"
+name = "bwa-mem-oxide-neon"
+version = "4.0.0"
 dependencies = [
- "bwa-mem3-extend",
+ "bwa-mem-oxide-extend",
 ]
 
 [[package]]
-name = "bwa-mem3-seed"
-version = "3.0.1"
+name = "bwa-mem-oxide-seed"
+version = "4.0.0"
 dependencies = [
- "bwa-mem3-core",
- "bwa-mem3-index",
- "bwa-mem3-neon",
+ "bwa-mem-oxide-core",
+ "bwa-mem-oxide-index",
+ "bwa-mem-oxide-neon",
  "needletail",
 ]
 

@@ -1,11 +1,11 @@
-//! `bwa-mem3 index` subcommand: build the FMD index (byte-identical to `bwa-mem2 index`).
+//! `bwa-mem4 index` subcommand: build the FMD index (byte-identical to `bwa-mem2 index`).
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Args;
 
-// `bwa-mem3 index`'s option set: one positional plus `-p`, matching `bwa-mem2 index`.
+// `bwa-mem4 index`'s option set: one positional plus `-p`, matching `bwa-mem2 index`.
 //
 // `//` rather than `///`: clap can surface an args struct's doc comment in the subcommand's help,
 // and the `index` help text must stay exactly as it is. The per-field `///` below is the intended
@@ -48,7 +48,7 @@ pub fn run(args: IndexArgs) -> anyhow::Result<()> {
     let prefix = args.prefix.clone().unwrap_or_else(|| args.fasta.clone());
     bwa_index::build_index_with_prefix(&args.fasta, &prefix)?;
     eprintln!(
-        "[bwa-mem3 index] built index for {} in {:.3}s",
+        "[bwa-mem4 index] built index for {} in {:.3}s",
         args.fasta.display(),
         t0.elapsed().as_secs_f64()
     );

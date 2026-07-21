@@ -1,4 +1,4 @@
-# bwa-mem3-rs
+# bwa-mem4-rs
 
 A native Rust reimplementation of the short-read aligner
 [bwa-mem2](https://github.com/bwa-mem2/bwa-mem2), indexer included, whose acceptance criterion is
@@ -29,7 +29,7 @@ repetitions: `-t16` and `-t12` finish in the same wall time (6.1 s, the differen
 spread) while `-t16` burns 8% more CPU. Driven onto E cores deliberately, the same work takes 5.75x
 longer, so rayon's even split leaves their chunk straggling while everything else waits. The cap
 applies to the pool only: `-t` still sets the default `-K`, so the output is unchanged, verified
-byte-identical to the oracle with and without it. `BWA3_NO_PCORE_CAP=1` disables it.
+byte-identical to the oracle with and without it. `BWA4_NO_PCORE_CAP=1` disables it.
 
 ## Why byte-identity is the hard part
 
@@ -65,7 +65,7 @@ build breaking a scaling law the algorithm mandates:
 |---|---|---|---|---|---|---|
 | linear expectation | 49 | **98** | 147 | 196 | 245 | 294 |
 | bwa-mem2 x86_64 | 49 | **86** | 147 | 196 | 245 | 294 |
-| bwa-mem2 arm64, and bwa-mem3 | 49 | **98** | 147 | 196 | 245 | 294 |
+| bwa-mem2 arm64, and bwa-mem4 | 49 | **98** | 147 | 196 | 245 | 294 |
 
 `update_a` multiplies every scoring parameter by `A`, so the DP surface at `-A k` is an exact
 scaled copy of the one at `-A 1` and every score must scale by exactly `k`. A different suboptimal
@@ -88,7 +88,7 @@ bash scripts/check.sh          # fmt, clippy, unit tests
 # Byte-for-byte SAM comparison against bwa-mem2 across 58 option combinations.
 python3 scripts/make_test_reads.py testdata/tiny/tiny.fa /tmp/ci --n 8000
 IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \
-  bash scripts/opt_parity.sh ./target/release/bwa-mem3
+  bash scripts/opt_parity.sh ./target/release/bwa-mem4
 ```
 
 ```sh
@@ -108,12 +108,12 @@ byte-identity bug found in this project so far has lived exactly where the gate 
 past 2^23 read pairs, under an untested option, or with non-default scoring. The option harness is
 verified to go red on a pre-fix binary before being trusted.
 
-Note that `cargo test` does **not** relink `target/release/bwa-mem3`, so always
+Note that `cargo test` does **not** relink `target/release/bwa-mem4`, so always
 `cargo build --release` before any differential run, or you will silently measure the old binary.
 
 ## Layout
 
-A Cargo workspace, one crate per pipeline stage. The binary is `bwa-mem3` (`index`, `mem`).
+A Cargo workspace, one crate per pipeline stage. The binary is `bwa-mem4` (`index`, `mem`).
 
 | Crate | Responsibility |
 |---|---|
@@ -125,7 +125,7 @@ A Cargo workspace, one crate per pipeline stage. The binary is `bwa-mem3` (`inde
 | `bwa-extend` | Scalar reference Smith-Waterman, and the `SwBackend` acceptance harness |
 | `bwa-neon` | Vectorised SW kernels: NEON on aarch64, AVX2 on x86_64 |
 | `bwa-mem` | Extension, dedup, primary marking, MAPQ, CIGAR, tags, paired-end |
-| `bwa-cli` | The `bwa-mem3` binary |
+| `bwa-cli` | The `bwa-mem4` binary |
 | `bwa-diff` | Field-level SAM concordance (`sam-diff`) |
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is the guide for someone who knows neither this code nor
@@ -163,11 +163,11 @@ records are identical, and `samtools view -C -T` on our own BAM produces the sam
 ## Installing
 
 Prebuilt binaries for Linux and macOS, x86_64 and arm64, are attached to each
-[release](https://github.com/IPNP-BIPN/bwa-mem3-rs/releases), with a `SHA256SUMS` file:
+[release](https://github.com/IPNP-BIPN/bwa-mem4-rs/releases), with a `SHA256SUMS` file:
 
 ```sh
-tar xzf bwa-mem3-v3.0.0-linux-x86_64.tar.gz
-./bwa-mem3-v3.0.0-linux-x86_64/bwa-mem3 --version
+tar xzf bwa-mem4-v3.0.0-linux-x86_64.tar.gz
+./bwa-mem4-v3.0.0-linux-x86_64/bwa-mem4 --version
 ```
 
 Every published binary is required to rebuild the committed `testdata/tiny` index byte-identically

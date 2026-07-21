@@ -15,7 +15,7 @@ W=work8
 mkdir -p "$W"
 
 cargo build --release --quiet
-OURS=target/release/bwa-mem3
+OURS=target/release/bwa-mem4
 
 echo "[extract] $REGION"
 samtools faidx "$REF" "$REGION" > "$W/ref.fa"

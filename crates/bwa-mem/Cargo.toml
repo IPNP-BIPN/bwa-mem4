@@ -1,6 +1,6 @@
 [package]
-name = "bwa-mem3-mem"
-description = "Alignment core for bwa-mem3: extension, dedup, primary marking, MAPQ, CIGAR, tags and paired-end."
+name = "bwa-mem-oxide-mem"
+description = "Alignment core for bwa-mem4: extension, dedup, primary marking, MAPQ, CIGAR, tags and paired-end."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
 categories = ["science"]

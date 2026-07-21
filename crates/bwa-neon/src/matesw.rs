@@ -124,7 +124,7 @@ struct FwdJob<'a> {
     endsc: i32,
 }
 
-/// `BWA3_MATESW_TIME=1`: cells, jobs and wall for the rescue kernel, so its throughput can be
+/// `BWA4_MATESW_TIME=1`: cells, jobs and wall for the rescue kernel, so its throughput can be
 /// compared against the ISA's ceiling. The note calling this kernel "memory-bandwidth-bound"
 /// predates the finding that this aligner uses ~20% of one core's DRAM bandwidth, and its rails are
 /// only `qmax * LANES` bytes -- L1-resident. Measure before believing it.
@@ -147,14 +147,14 @@ pub mod cells {
     /// Summed target lengths in bases over all counted jobs; `TLEN / JOBS` is the mean rescue window,
     /// the number that revealed the window (not the read) is what makes rescue expensive.
     pub static TLEN: AtomicU64 = AtomicU64::new(0);
-    /// Whether `BWA3_MATESW_TIME` is set in the environment. Read once and cached, so setting the
+    /// Whether `BWA4_MATESW_TIME` is set in the environment. Read once and cached, so setting the
     /// variable after the first call has no effect and the hot path pays only an atomic load.
     ///
     /// # Returns
     /// `true` if the counters above should be accumulated.
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BWA3_MATESW_TIME").is_some())
+        *ON.get_or_init(|| std::env::var_os("BWA4_MATESW_TIME").is_some())
     }
     /// Print the accumulated counters to stderr, once, at the end of a run. No-op unless
     /// [`enabled`]. Takes no parameters and reads the statics above with `Relaxed` ordering: the
@@ -240,7 +240,7 @@ pub fn batched_ksw_align2(
     minsc: i32,
     max_sc: i32,
 ) -> Vec<KswAlignResult> {
-    // `Some(start instant)` only when BWA3_MATESW_TIME is set; `None` disables all accounting so the
+    // `Some(start instant)` only when BWA4_MATESW_TIME is set; `None` disables all accounting so the
     // stock path pays one cached bool load and nothing else.
     let timer = cells::enabled().then(std::time::Instant::now);
     if timer.is_some() {

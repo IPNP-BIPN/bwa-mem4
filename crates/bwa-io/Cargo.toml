@@ -1,6 +1,6 @@
 [package]
-name = "bwa-mem3-io"
-description = "FASTA/FASTQ input and hand-formatted SAM output for bwa-mem3, byte-controlled to match bwa-mem2 exactly."
+name = "bwa-mem-oxide-io"
+description = "FASTA/FASTQ input and hand-formatted SAM output for bwa-mem4, byte-controlled to match bwa-mem2 exactly."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
 categories = ["science"]

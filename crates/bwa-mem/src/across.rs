@@ -120,7 +120,7 @@ const ALPHABET_SIZE: usize = 5;
 /// within the band, and the `seedlen0` guard cannot fire because the container is longer -- so the
 /// discard pass would purge this seed anyway. nh13's test is a conservative subset of the purge.
 ///
-/// `BWA3_NO_SKIP_CONTAINED` opts out. Cached: the two extension paths (batched
+/// `BWA4_NO_SKIP_CONTAINED` opts out. Cached: the two extension paths (batched
 /// [`align_reads_batched`] and per-read `mem_chain2aln`) must agree, so they share this one decision.
 ///
 /// # Parameters
@@ -130,7 +130,7 @@ const ALPHABET_SIZE: usize = 5;
 /// # Returns
 ///
 /// True when the skip is enabled (the default: the variable is absent), false when
-/// `BWA3_NO_SKIP_CONTAINED` is set to anything at all, including the empty string. The answer is
+/// `BWA4_NO_SKIP_CONTAINED` is set to anything at all, including the empty string. The answer is
 /// decided on the first call and frozen for the life of the process, so setting the variable from
 /// inside the program after alignment has begun has no effect.
 pub(crate) fn skip_contained_enabled() -> bool {
@@ -138,7 +138,7 @@ pub(crate) fn skip_contained_enabled() -> bool {
     // the first caller from any worker thread wins and every later caller observes that same answer;
     // a per-call `var_os` would also take a lock inside libstd on each seed.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("BWA3_NO_SKIP_CONTAINED").is_none())
+    *ENABLED.get_or_init(|| std::env::var_os("BWA4_NO_SKIP_CONTAINED").is_none())
 }
 
 /// True when seed `si` of `seeds` may have its banded-SW skipped: it is strictly contained, on the
@@ -584,7 +584,7 @@ pub fn align_reads_batched<B: SwBackend>(
     // One vector of round-1 SMEMs per read, parallel to `reads`. At this point each SMEM carries an
     // SA *interval* (`k`, `s`), not yet resolved reference positions.
     let per_read_smems = mem_collect_smem_batched(fm, &refs, opt);
-    if std::env::var_os("BWA3_DUMP_SMEMS").is_some() {
+    if std::env::var_os("BWA4_DUMP_SMEMS").is_some() {
         for sm in &per_read_smems {
             eprintln!("SMEM tot={}", sm.len());
             for p in sm {
@@ -601,7 +601,7 @@ pub fn align_reads_batched<B: SwBackend>(
     }
     // Debug gate for the two chain dumps below, hoisted out of the per-read loop so the environment
     // is read once rather than once per read. Off in any normal run.
-    let dump_chains = std::env::var_os("BWA3_DUMP_CHAINS").is_some();
+    let dump_chains = std::env::var_os("BWA4_DUMP_CHAINS").is_some();
 
     // Resolve EVERY read's SA occurrences in ONE lockstep pass instead of one ~42-position call per
     // read. `get_sa_batch`'s W=32 window needs a long run of independent walks to keep the core's
@@ -611,13 +611,13 @@ pub fn align_reads_batched<B: SwBackend>(
     //
     // Byte-identical by construction: `sa_positions_for_read` touches no FM index, `get_sa_batch` is
     // result-identical at any chunk size, and each read's slice keeps its own positions in their own
-    // order. BWA3_SA_PER_READ=1 restores the per-read calls for A/B.
+    // order. BWA4_SA_PER_READ=1 restores the per-read calls for A/B.
     // Rebound as `mut` because `sa_positions_for_read` filters and re-orders each read's SMEMs in
     // place while it enumerates their SA positions. Same data, no copy.
     let mut per_read_smems: Vec<Vec<bwa_index::Smem>> = per_read_smems;
     // Whether SA resolution runs as one batch for the whole read batch (the default and the fast
     // path) or falls back to per-read calls. A/B switch only: both produce identical positions.
-    let batched_sa = std::env::var_os("BWA3_SA_PER_READ").is_none();
+    let batched_sa = std::env::var_os("BWA4_SA_PER_READ").is_none();
     // `all_positions`: every read's SA-interval offsets concatenated, in read order then SMEM order,
     // ready for one lockstep `get_sa_batch`. `per_read_counts`: per read, how many positions each of
     // its SMEMs contributed, which is what lets the chain builder re-split the flat result. Both are
@@ -642,7 +642,7 @@ pub fn align_reads_batched<B: SwBackend>(
         // Start instant for the optional `get_sa` profiling counters, or `None` when profiling is
         // off, in which case no clock is read at all.
         let sa_timer = bwa_chain::chain_time::enabled().then(std::time::Instant::now);
-        if std::env::var_os("BWA3_SA_SORT").is_some() {
+        if std::env::var_os("BWA4_SA_SORT").is_some() {
             // SPIKE (Zhang et al., CCGrid 2013 "Optimizing BWT-Based Sequence Alignment on Multicore
             // Architectures", §IV): resolve the SA lookups in ASCENDING POSITION order so that
             // consecutive walks land in nearby cp_occ pages, amortising page walks over many lookups
@@ -655,7 +655,7 @@ pub fn align_reads_batched<B: SwBackend>(
             // to 2^26 = 67.1M SA lookups per batch fit while the position keeps the high 38 bits.
             // The split is checked by the assert below, not assumed: raising it shrinks the position
             // field and would silently truncate coordinates on a large genome, lowering it caps the
-            // batch size. Only the `BWA3_SA_SORT` spike path uses this; it does not affect output.
+            // batch size. Only the `BWA4_SA_SORT` spike path uses this; it does not affect output.
             const IDX_BITS: u32 = 26;
             assert!(
                 all_positions.len() < (1 << IDX_BITS) && fm.ref_seq_len < (1 << (64 - IDX_BITS)),
@@ -1113,7 +1113,7 @@ pub fn align_reads_batched<B: SwBackend>(
     regs
 }
 
-/// Whether bwa-mem2's post-extension discard pass runs (`BWA3_NO_DISCARD` opts out).
+/// Whether bwa-mem2's post-extension discard pass runs (`BWA4_NO_DISCARD` opts out).
 ///
 /// Cached in a `OnceLock` for the same reason as [`skip_contained_enabled`]: the batched and
 /// per-read extension paths must make the identical decision, and re-reading the environment per
@@ -1128,12 +1128,12 @@ pub fn align_reads_batched<B: SwBackend>(
 /// # Returns
 ///
 /// True when the discard pass should run (the default: the variable is absent), false when
-/// `BWA3_NO_DISCARD` is set to any value, including the empty string. Frozen after the first call.
+/// `BWA4_NO_DISCARD` is set to any value, including the empty string. Frozen after the first call.
 pub(crate) fn discard_enabled() -> bool {
     // Process-wide memo of the environment decision; see `skip_contained_enabled` for why this is a
     // `OnceLock` rather than a per-call `var_os`.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("BWA3_NO_DISCARD").is_none())
+    *ENABLED.get_or_init(|| std::env::var_os("BWA4_NO_DISCARD").is_none())
 }
 
 /// Run one side (left or right) of all pending extensions through `MAX_BAND_TRY` band-doubling

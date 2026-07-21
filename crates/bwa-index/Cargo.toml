@@ -1,6 +1,6 @@
 [package]
-name = "bwa-mem3-index"
-description = "FM-index construction and loading for bwa-mem3, producing index files byte-identical to bwa-mem2 index."
+name = "bwa-mem-oxide-index"
+description = "FM-index construction and loading for bwa-mem4, producing index files byte-identical to bwa-mem2 index."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
 categories = ["science"]

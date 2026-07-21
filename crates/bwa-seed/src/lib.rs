@@ -149,7 +149,7 @@ const AMBIGUOUS_BASE: u8 = 4;
 /// interval. Changing this constant, or the code order, breaks every strand relationship in the file.
 const MAX_BASE: usize = 3;
 
-/// Default lockstep width when `BWA3_LOCKSTEP_N` is unset: how many independent FM walks are kept in
+/// Default lockstep width when `BWA4_LOCKSTEP_N` is unset: how many independent FM walks are kept in
 /// flight per lockstep driver, i.e. the ceiling on outstanding DRAM misses per core. Units: slots.
 /// Any value `>= 1` is correct; 16 is the measured knee (8 is ~2.8% slower, 24 ties, 32 regresses).
 /// Changing it changes only speed and peak scratch memory (each slot owns a `prev` buffer sized to
@@ -168,7 +168,7 @@ const SPLIT_LEN_ROUNDING: f32 = 0.499;
 ///
 /// The default 16 was tuned on `work/region.fa`, whose BWT is cache-resident -- i.e. on an index
 /// with no DRAM latency to hide, where extra slots are pure overhead and the knee necessarily lands
-/// low. `BWA3_LOCKSTEP_N` re-sweeps it on a real index. Scheduling only: every slot walks its own
+/// low. `BWA4_LOCKSTEP_N` re-sweeps it on a real index. Scheduling only: every slot walks its own
 /// read deterministically, so N cannot change a result.
 ///
 /// # Returns
@@ -179,10 +179,10 @@ fn lockstep_width() -> usize {
     // every thread and every batch: a mid-run change would not corrupt results (scheduling only) but
     // would make benchmarks meaningless.
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    // Parse `BWA3_LOCKSTEP_N`; anything missing, unparseable, or `0` falls back to the default (a
+    // Parse `BWA4_LOCKSTEP_N`; anything missing, unparseable, or `0` falls back to the default (a
     // width of 0 would mean no slots at all and the driver would never run).
     *N.get_or_init(|| {
-        std::env::var("BWA3_LOCKSTEP_N")
+        std::env::var("BWA4_LOCKSTEP_N")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
@@ -1208,8 +1208,8 @@ pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> 
     // Rounds 2 and 3 both run in lockstep across the batch so their data-dependent `cp_occ` loads
     // overlap — the same latency-hiding trick as round 1. Order per read is preserved (round 1,
     // then round 2, then round 3), so this is identical to the per-read path.
-    // `BWA3_SEED_R2_SERIAL` forces the old per-read round 2, for regression/parity verification.
-    if std::env::var_os("BWA3_SEED_R2_SERIAL").is_some() {
+    // `BWA4_SEED_R2_SERIAL` forces the old per-read round 2, for regression/parity verification.
+    if std::env::var_os("BWA4_SEED_R2_SERIAL").is_some() {
         for (r, codes) in reads.iter().enumerate() {
             smem_round_2(fm, codes, opt, &mut per_read[r]);
         }

@@ -13,7 +13,7 @@
 # the same spirit as giab30x_pe.sh: run it before tagging a release, not on every push.
 #
 # Usage:
-#   scripts/alt_parity.sh [path-to-bwa-mem3]
+#   scripts/alt_parity.sh [path-to-bwa-mem4]
 #
 # Inputs, all overridable:
 #   REF=work/hs38a.fa       GRCh38 analysis set INCLUDING the _alt contigs
@@ -31,7 +31,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-M3="${1:-./target/release/bwa-mem3}"
+M3="${1:-./target/release/bwa-mem4}"
 M2="${M2:-bwa-mem2}"
 REF="${REF:-work/hs38a.fa}"
 ALT="${ALT:-work/hs38DH.fa.alt}"

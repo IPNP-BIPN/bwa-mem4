@@ -84,8 +84,8 @@ release path would be discovered while tagging, which is the worst possible mome
 take a `dry_run` switch (as FelixKrueger's repos do) that builds and validates while touching
 neither `main` nor the Releases page.
 
-**crates.io.** The workspace publishes as ten crates, all under the `bwa-mem3` prefix:
-`cargo install bwa-mem3` gets the binary, and the libraries are `bwa-mem3-core`, `bwa-mem3-index`
+**crates.io.** The workspace publishes as ten crates, all under the `bwa-mem4` prefix:
+`cargo install bwa-mem4` gets the binary, and the libraries are `bwa-mem4-core`, `bwa-mem4-index`
 and so on. The unprefixed names (`bwa-core`, `bwa-mem`, ...) were free and deliberately not taken:
 `bwa-mem` is the name of Heng Li's algorithm, and claiming it would deny it to the upstream
 ecosystem permanently. The crates.io package names differ from the Rust library names, which are
@@ -141,14 +141,14 @@ Cargo workspace, one crate per stage (mirrors bwa-mem2):
 | **`bwa-extend`** | **banded Smith-Waterman (`ksw_extend2`), the `SwBackend` trait, z-drop** |
 | `bwa-neon` | NEON SIMD SW kernels: batched cross-read extension, and the mate-rescue kernel |
 | `bwa-mem` | primary marking, MAPQ, CIGAR, tags, PE (`mem_pestat`/`mem_matesw`/`mem_pair`), pipeline glue |
-| `bwa-cli` | the `bwa-mem3` binary (`index` + `mem`) |
+| `bwa-cli` | the `bwa-mem4` binary (`index` + `mem`) |
 | `bwa-diff` | field-level SAM concordance (`sam-diff`) |
 
 For the end-to-end picture (one read's journey, a glossary of every abbreviation, and the rules for
 not breaking parity), read [ARCHITECTURE.md](ARCHITECTURE.md) first.
 
 **Before ANY differential run, `cargo build --release`.** `cargo test --release` does not relink
-`target/release/bwa-mem3`, because nothing in the test tree depends on the bin target. A comparison
+`target/release/bwa-mem4`, because nothing in the test tree depends on the bin target. A comparison
 run against a stale binary silently measures the old code, which has already cost real debugging
 time here: a verified fix appeared to change nothing.
 
@@ -175,7 +175,7 @@ byte-identity path, so they are free to land independently.
 ## Build, test, gates
 
 ```sh
-cargo build --release              # builds the bwa-mem3 binary
+cargo build --release              # builds the bwa-mem4 binary
 bash scripts/check.sh              # fmt --check + clippy -D warnings + cargo test --workspace
 bash scripts/oracle_diff.sh        # end-to-end SAM diff vs the installed bwa-mem2 (needs test data)
 bash scripts/index_diff.sh         # cmp our 5 index files vs bwa-mem2 index
@@ -187,7 +187,7 @@ regress `oracle_diff.sh`. New behavior is test-first (TDD); accelerated backends
 
 ## Workflow
 
-You have **read + fork** access. Fork `IPNP-BIPN/bwa-mem3-rs`, push a branch to your fork, and open a
+You have **read + fork** access. Fork `IPNP-BIPN/bwa-mem4-rs`, push a branch to your fork, and open a
 PR against `main`. One topic per branch, commit often. Please end commit messages with a
 `Co-Authored-By:` line if you pair, and avoid em-dashes in prose (a house style rule). Licensing
 follows bwa-mem2 (MIT); ports of your NEON code keep their attribution.

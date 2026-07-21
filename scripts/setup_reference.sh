@@ -30,7 +30,7 @@ perl -i -pe 's/\r\n/\n/g' "$REF/bwa-mem2/src/fastmap.cpp" "$REF/bwa-mem2/src/ban
 patch -p1 "$REF/bwa-mem2/src/fastmap.cpp" "$REF/fastmap.patch"
 patch -p1 "$REF/bwa-mem2/src/bandedSWA.cpp" "$REF/bandedSWA.cpp.patch"
 
-if [ ! -d "$REF/bwa-mem3-cpp/.git" ]; then
-  git clone --quiet https://github.com/fg-labs/bwa-mem3 "$REF/bwa-mem3-cpp"
+if [ ! -d "$REF/bwa-mem4-cpp/.git" ]; then
+  git clone --quiet https://github.com/fg-labs/bwa-mem3 "$REF/bwa-mem4-cpp"
 fi
 echo "reference/ ready (bwa-mem2 @ $REV + patches, fg-labs/bwa-mem3)"

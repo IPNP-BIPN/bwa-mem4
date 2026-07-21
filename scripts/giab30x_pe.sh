@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 M2=bwa-mem2
-M3=./target/release/bwa-mem3
+M3=./target/release/bwa-mem4
 IDX=work/genome.fa
 R1=work/giab30x/HG002_30x_R1.fastq.gz
 R2=work/giab30x/HG002_30x_R2.fastq.gz
@@ -38,7 +38,7 @@ run() {
 
 say "############################################################"
 say "# GIAB HG002 ~30x  PE identity re-run  $TS   (t$T, -K $K)"
-say "# bwa-mem3 @ $(git rev-parse --short HEAD) + uncommitted id_shift_c fix"
+say "# bwa-mem4 @ $(git rev-parse --short HEAD) + uncommitted id_shift_c fix"
 say "############################################################"
 
 a=$(run "$OUT/m2_pe" $M2 mem -t"$T" -K $K "$IDX" "$R1" "$R2") \

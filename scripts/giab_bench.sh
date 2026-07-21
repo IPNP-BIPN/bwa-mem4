@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real-data head-to-head: bwa-mem3 vs bwa-mem2 on GIAB HG002 (NIST HiSeq 300x, Sample_2A1).
+# Real-data head-to-head: bwa-mem4 vs bwa-mem2 on GIAB HG002 (NIST HiSeq 300x, Sample_2A1).
 # Our routine benches use wgsim-simulated reads; this validates that the speedup AND the
 # byte-identity hold on real sequencing data (real error profiles, adapters, N's, duplicates).
 #
@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-M3=./target/release/bwa-mem3
+M3=./target/release/bwa-mem4
 M2=bwa-mem2
 IDX3=work/genome.fa          # our index
 IDX2=work/genome_oracle.fa   # bwa-mem2's (byte-identical index files)
@@ -38,7 +38,7 @@ if [ "$n2" -ne "$n3" ]; then
   # the reported rate becomes meaningless -- it converges on 100%, which is exactly how the previous
   # version of this check produced "core-field diffs: 4025121 / 4025145 records (99.999404%)" and
   # was read as a 99.999% *match*.
-  echo "  [FAIL] RECORD COUNT DIFFERS: bwa-mem2 $n2 vs bwa-mem3 $n3 (delta $((n3 - n2)))"
+  echo "  [FAIL] RECORD COUNT DIFFERS: bwa-mem2 $n2 vs bwa-mem4 $n3 (delta $((n3 - n2)))"
   echo "         This is itself a real divergence. Positional comparison suppressed: it could only"
   echo "         report a meaningless ~100% rate. Diagnose with:"
   echo "           comm -3 <(cut -f1,2 /tmp/giab_m2.rec|sort) <(cut -f1,2 /tmp/giab_m3.rec|sort) | head"

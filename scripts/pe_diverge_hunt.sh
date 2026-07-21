@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 M2=bwa-mem2
-M3=./target/release/bwa-mem3
+M3=./target/release/bwa-mem4
 IDX=work/genome.fa
 R1=work/giab30x/HG002_30x_R1.fastq.gz
 R2=work/giab30x/HG002_30x_R2.fastq.gz

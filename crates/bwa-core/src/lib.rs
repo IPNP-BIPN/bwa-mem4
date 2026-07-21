@@ -1,9 +1,9 @@
-//! Types, constants and alignment options shared across bwa-mem3-rs.
+//! Types, constants and alignment options shared across bwa-mem4-rs.
 //!
 //! Everything here mirrors bwa-mem2 data structures so downstream crates can reason directly
 //! against the reference source in `reference/bwa-mem2`.
 //!
-//! This is the leaf of the crate graph: it depends on no other bwa-mem3 crate, so the option struct
+//! This is the leaf of the crate graph: it depends on no other bwa-mem4 crate, so the option struct
 //! and the nucleotide tables can be shared by the CLI, the index, the aligner and the SIMD backends
 //! without a cycle. Nothing here does I/O or alignment work.
 //!

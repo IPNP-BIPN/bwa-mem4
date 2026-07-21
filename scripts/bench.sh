@@ -3,7 +3,7 @@
 # canonical perf workload (région 2 Mbp index, 500k reads), single-threaded (-t1).
 #
 # Usage: scripts/bench.sh <binary> [se|pe] [reps]
-#   scripts/bench.sh target/release/bwa-mem3 se 3
+#   scripts/bench.sh target/release/bwa-mem4 se 3
 # Prints: "<mode> median_wall_s=<x> peak_rss_mb=<y>" plus the raw per-rep numbers.
 set -euo pipefail
 cd "$(dirname "$0")/.."

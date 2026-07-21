@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Interleaved head-to-head bwa-mem2 vs bwa-mem3 (drift-cancelled). SE/PE x t1/t8.
+# Interleaved head-to-head bwa-mem2 vs bwa-mem4 (drift-cancelled). SE/PE x t1/t8.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 M2IDX=work/genome_oracle.fa
 M3IDX=work/genome.fa
 R1=work/r1_500k.fq
 R2=work/r2_500k.fq
-OURS=./target/release/bwa-mem3
+OURS=./target/release/bwa-mem4
 
 t() { /usr/bin/time -p "$@" >/dev/null 2>/tmp/vt.log; grep '^real' /tmp/vt.log | awk '{print $2}'; }
 

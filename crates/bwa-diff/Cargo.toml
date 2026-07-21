@@ -1,6 +1,6 @@
 [package]
-name = "bwa-mem3-diff"
-description = "Field-level SAM concordance reporting (sam-diff) for bwa-mem3."
+name = "bwa-mem-oxide-diff"
+description = "Field-level SAM concordance reporting (sam-diff) for bwa-mem4."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
 categories = ["science"]
@@ -15,7 +15,7 @@ repository.workspace = true
 name = "sam-diff"
 path = "src/bin/sam_diff.rs"
 
-# The package is `bwa-mem3-diff` on crates.io, but the LIBRARY keeps its original name so the
+# The package is `bwa-mem4-diff` on crates.io, but the LIBRARY keeps its original name so the
 # `sam-diff` binary in this same package, which refers to it as `bwa_diff`, still resolves.
 [lib]
 name = "bwa_diff"

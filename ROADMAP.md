@@ -10,7 +10,7 @@ la meme idee.
 | Phase | Branche | But | Statut |
 |---|---|---|---|
 | 0 | `phase0-skeleton` | CLI `mem`/`index` (index stub), FASTQ -> SAM non-mappe, en-tete correct, harnais | fait |
-| 1 | `phase1-indexer` | `bwa-mem3 index` : `.pac/.ann/.amb/.bwt.2bit.64/.0123` | fait, `cmp` octet |
+| 1 | `phase1-indexer` | `bwa-mem4 index` : `.pac/.ann/.amb/.bwt.2bit.64/.0123` | fait, `cmp` octet |
 | 2 | `phase2-index-load` | chargeur + `get_occ`/`get_sa`/`backward_ext` + validation | fait |
 | 3 | `phase3-seeding` | SMEM + reseed + filtrage occ | fait |
 | 4 | `phase4-chaining` | `mem_chain` + `mem_chain_flt` | fait |
@@ -100,7 +100,7 @@ depuis le fork de Nils Homer (`fg-labs/bwa-mem3`, ~2x plus rapide) et sa PR #288
 
 **Gate** : sortie octet-identique au backend scalaire (property test + `oracle_diff.sh`) **et**
 speedup mesure (`/usr/bin/time`). A faire sur une branche partagee avec @nh13 (acces lecture +
-fork/PR accordes sur `IPNP-BIPN/bwa-mem3-rs`). Voir `DEPENDENCIES.md` pour la provenance.
+fork/PR accordes sur `IPNP-BIPN/bwa-mem4-rs`). Voir `DEPENDENCIES.md` pour la provenance.
 
 **Avancement** :
 - **Fondations** (fait) : API `extend_batch` sur `SwBackend` (batch inter-sequences comme
@@ -145,7 +145,7 @@ phase 9e). Ils ne sont pas la mesure courante et le fork n'a pas ete re-mesure d
 | Binaire | vs bwa-mem2 (mediane, ratio) |
 |---|---|
 | `bwa-mem2` 2.3 (sse2neon, oracle) | 1,00x |
-| **bwa-mem3-rs (nous)** | **~2,2x** |
+| **bwa-mem4-rs (nous)** | **~2,2x** |
 | `fg-labs/bwa-mem3` (fork @nh13, natif) | ~2,65x |
 
 (Ratios ; les temps absolus derivent avec le thermique. Depart de la phase perf : nous 1,48x, ~15,9 s.)
@@ -264,10 +264,10 @@ PE. **Tout benchmark doit declarer ce qu'il desactive** : la region 2 Mbp cachai
 
 ### Le mur du mate rescue : le nombre de cellules EST l'algorithme
 
-Compte direct (`BWA3_MATESW_TIME=1`, GIAB reel, 500k paires, `-t1`) : **1 838 008 jobs, 381 032 465
+Compte direct (`BWA4_MATESW_TIME=1`, GIAB reel, 500k paires, `-t1`) : **1 838 008 jobs, 381 032 465
 824 cellules DP**, soit 148 pb x fenetre de 1401 pb par ancre. Le rescue fait ~17x le travail DP de
 toute l'etape d'extension. Nous executons **deja ce meme compte 1,26x plus vite que bwa-mem2**
-(12,87 s contre 16,19 s, mesure des deux cotes par `-S` / `BWA3_NO_RESCUE=1`). Aller plus vite
+(12,87 s contre 16,19 s, mesure des deux cotes par `-S` / `BWA4_NO_RESCUE=1`). Aller plus vite
 demande de faire **moins de cellules**, et ce compte est l'algorithme de bwa : le changer change la
 sortie. Un prefiltre ungapped ne sauve rien non plus (148 bases x 1401 positions = exactement le
 compte qu'il pretend eviter, la position du mate dans la fenetre etant inconnue).

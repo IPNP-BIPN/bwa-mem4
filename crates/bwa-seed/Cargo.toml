@@ -1,6 +1,6 @@
 [package]
-name = "bwa-mem3-seed"
-description = "SMEM seeding over the FM-index for bwa-mem3."
+name = "bwa-mem-oxide-seed"
+description = "SMEM seeding over the FM-index for bwa-mem4."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
 categories = ["science"]

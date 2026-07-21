@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 30x real-WGS head-to-head: bwa-mem3 vs bwa-mem2 on GIAB HG002 (NIST HiSeq 300x subset, ~30x).
+# 30x real-WGS head-to-head: bwa-mem4 vs bwa-mem2 on GIAB HG002 (NIST HiSeq 300x subset, ~30x).
 # t8-only (t1 is days at this depth; t1 ratio comes from the depth-invariant small benches).
 # Both tools use the single byte-identical index work/genome.fa. Every timed run also pipes its
 # records through md5, so identity is checked on every pass at zero extra passes.
@@ -7,7 +7,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 M2=bwa-mem2
-M3=./target/release/bwa-mem3
+M3=./target/release/bwa-mem4
 IDX=work/genome.fa
 R1=work/giab30x/HG002_30x_R1.fastq.gz
 R2=work/giab30x/HG002_30x_R2.fastq.gz

@@ -915,7 +915,7 @@ mod tests {
     }
 }
 
-/// `BWA3_TRAFFIC=1`: count the 128-byte cache lines the FM index actually pulls, so the aligner's
+/// `BWA4_TRAFFIC=1`: count the 128-byte cache lines the FM index actually pulls, so the aligner's
 /// DRAM bandwidth can be compared against the fabric ceiling (~293 GB/s random on M4 Max). Atomics
 /// on the hot path: use at `-t1` and read the counts, not the wall clock.
 pub mod traffic {
@@ -931,7 +931,7 @@ pub mod traffic {
     /// bitmap read and its `get_occ` hit the same block. Counts steps, not calls.
     pub static SA_LINES: AtomicU64 = AtomicU64::new(0);
 
-    /// Whether `BWA3_TRAFFIC` was set in the environment. Read once and cached in a `OnceLock`, so
+    /// Whether `BWA4_TRAFFIC` was set in the environment. Read once and cached in a `OnceLock`, so
     /// the hot-path check is a relaxed atomic load rather than a `getenv`, and toggling the
     /// variable mid-run has no effect.
     ///
@@ -939,7 +939,7 @@ pub mod traffic {
     /// `true` if the variable is present with ANY value, including empty: presence is the switch.
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BWA3_TRAFFIC").is_some())
+        *ON.get_or_init(|| std::env::var_os("BWA4_TRAFFIC").is_some())
     }
 
     /// Print the accumulated line counts and the implied bandwidth to stderr. Call once at the end

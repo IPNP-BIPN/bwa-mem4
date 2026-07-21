@@ -11,7 +11,7 @@
 //!
 //! # Design (following bwa-mem2 `bandedSWA` and nh13's `fg-labs/bwa-mem3`, credited in `DEPENDENCIES.md`)
 //!
-//! bwa-mem2 / bwa-mem3-cpp accelerate seed extension by **inter-sequence batching**: `bandedSWA`
+//! bwa-mem2 / bwa-mem4-cpp accelerate seed extension by **inter-sequence batching**: `bandedSWA`
 //! packs `SIMD_WIDTH` independent alignments across NEON lanes (8 for int16, 16 for int8 on a
 //! 128-bit register), one alignment per lane, using an SoA layout `[column*SIMD_WIDTH + lane]`. Each
 //! lane runs the *same* integer recurrence as the scalar [`bwa_extend::ksw_extend2`], so the batched

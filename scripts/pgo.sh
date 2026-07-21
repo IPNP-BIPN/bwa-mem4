@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reproducible PGO build: instrument -> profile on the canonical workload (500k SE + PE,
-# région 2 Mbp) -> optimized rebuild. Produces target/aarch64-apple-darwin/release/bwa-mem3.
+# région 2 Mbp) -> optimized rebuild. Produces target/aarch64-apple-darwin/release/bwa-mem4.
 #
 # Requires cargo-pgo (`cargo install cargo-pgo`) and an llvm-profdata on PATH compatible with
 # rustc's LLVM. On this homebrew-rust host, homebrew LLVM provides it:
@@ -22,7 +22,7 @@ rm -rf target/pgo-profiles
 echo "[pgo] 1/3 instrumented build"
 cargo pgo build >/dev/null
 
-INSTR=target/aarch64-apple-darwin/release/bwa-mem3
+INSTR=target/aarch64-apple-darwin/release/bwa-mem4
 echo "[pgo] 2/3 profiling runs (SE + PE, 500k)"
 "$INSTR" mem -t1 -K "$K" "$IDX" work/r1_500k.fq            >/dev/null 2>&1
 "$INSTR" mem -t1 -K "$K" "$IDX" work/r1_500k.fq work/r2_500k.fq >/dev/null 2>&1

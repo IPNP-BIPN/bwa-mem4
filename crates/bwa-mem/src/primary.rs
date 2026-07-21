@@ -636,12 +636,12 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
             n_pri += 1;
         }
     }
-    // Debug aid: set `BWA3_DUMP_PRESORT=<read id>` to dump one read's regions immediately before
+    // Debug aid: set `BWA4_DUMP_PRESORT=<read id>` to dump one read's regions immediately before
     // the hash sort, which is where parity investigations usually start. Unlike
     // `band_width_trace_enabled` in
     // cigar.rs this is not cached, but it runs once per read rather than once per emitted
     // alignment, so the `var_os` cost is tolerable.
-    if std::env::var_os("BWA3_DUMP_PRESORT").is_some_and(|v| v.to_string_lossy() == id.to_string())
+    if std::env::var_os("BWA4_DUMP_PRESORT").is_some_and(|v| v.to_string_lossy() == id.to_string())
     {
         eprintln!("PRESORT id={id} n={}", a.len());
         for (i, r) in a.iter().enumerate() {

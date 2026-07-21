@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Phase-1 gate: our `bwa-mem3 index` must be byte-identical to `bwa-mem2 index`.
+# Phase-1 gate: our `bwa-mem4 index` must be byte-identical to `bwa-mem2 index`.
 # Builds both indexes for the same FASTA in separate dirs and `cmp`s the five files.
 #
-# Until phase 1 lands, `bwa-mem3 index` is a stub and this script reports that and exits 0.
+# Until phase 1 lands, `bwa-mem4 index` is a stub and this script reports that and exits 0.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -15,10 +15,10 @@ samtools faidx "$REF" "$REGION" > "$W/oracle/ref.fa"
 cp "$W/oracle/ref.fa" "$W/ours/ref.fa"
 
 cargo build --release --quiet
-OURS=target/release/bwa-mem3
+OURS=target/release/bwa-mem4
 
 if ! "$OURS" index "$W/ours/ref.fa" >/dev/null 2>&1; then
-  echo "SKIP: \`bwa-mem3 index\` not implemented yet (phase 1). Nothing to compare."
+  echo "SKIP: \`bwa-mem4 index\` not implemented yet (phase 1). Nothing to compare."
   exit 0
 fi
 

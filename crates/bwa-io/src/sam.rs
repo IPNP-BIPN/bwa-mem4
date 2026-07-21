@@ -302,16 +302,16 @@ mod tests {
             &mut buf,
             &sqs,
             None,
-            "bwa-mem3",
-            "bwa-mem3",
+            "bwa-mem4",
+            "bwa-mem4",
             "0.0.0",
-            "bwa-mem3 mem x",
+            "bwa-mem4 mem x",
         )
         .unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("@SQ\tSN:20:2000000-2200000\tLN:200001\n"));
         assert!(!s.contains("@HD"));
-        assert!(s.contains("\n@PG\tID:bwa-mem3\t"));
+        assert!(s.contains("\n@PG\tID:bwa-mem4\t"));
     }
 
     /// An ALT contig's `@SQ` line carries the `AH:*` suffix and a normal one does not
@@ -335,10 +335,10 @@ mod tests {
             &mut buf,
             &sqs,
             None,
-            "bwa-mem3",
-            "bwa-mem3",
+            "bwa-mem4",
+            "bwa-mem4",
             "0.0.0",
-            "bwa-mem3 mem x",
+            "bwa-mem4 mem x",
         )
         .unwrap();
         let s = String::from_utf8(buf).unwrap();
@@ -363,8 +363,8 @@ mod tests {
             &mut buf,
             &sqs,
             Some("@RG\tID:foo\tSM:bar"),
-            "bwa-mem3",
-            "bwa-mem3",
+            "bwa-mem4",
+            "bwa-mem4",
             "0.0.0",
             "cl",
         )
@@ -381,8 +381,8 @@ mod tests {
             &mut buf2,
             &sqs,
             Some("@SQ\tSN:other\tLN:7"),
-            "bwa-mem3",
-            "bwa-mem3",
+            "bwa-mem4",
+            "bwa-mem4",
             "0.0.0",
             "cl",
         )

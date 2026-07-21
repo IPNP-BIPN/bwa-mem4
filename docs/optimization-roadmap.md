@@ -1,4 +1,4 @@
-# CPU optimization roadmap (bwa-mem3-rs)
+# CPU optimization roadmap (bwa-mem4-rs)
 
 > ## ⚠️ 2026-07-16: this document's central premise is WRONG. Read this box first.
 >
@@ -8,7 +8,7 @@
 > construction.
 >
 > **Measured on the real genome index** (`work/genome.fa`, 500k reads, `-t1`, quiet host, interleaved,
-> instrumented via `BWA3_GPU_STATS`):
+> instrumented via `BWA4_GPU_STATS`):
 >
 > | | wall |
 > |---|---|
@@ -169,7 +169,7 @@ Two corollaries for anyone benchmarking here:
 ### Flat / denser suffix array: `-t1` +12%, `-t8` +0%. Not worth the RAM. (2026-07-16, measured)
 
 `get_sa` is the single largest cost at genome scale (**18.8%** of `-t1` wall, 21.3M lookups at
-177-193 ns; see `BWA3_CHAIN_TIME`), because the SA is sampled 1-in-8 and 7 lookups in 8 walk ~7 LF
+177-193 ns; see `BWA4_CHAIN_TIME`), because the SA is sampled 1-in-8 and 7 lookups in 8 walk ~7 LF
 steps, each a DRAM miss. Densifying the SA removes the walk **by construction**.
 
 Measured with the real thing, not a model: the 49.6 GB flat i64 SA extracted during the LISA work
@@ -186,7 +186,7 @@ customer.
 
 ### GPU line: at its ceiling, and the ceiling is 1.28x (2026-07-16, measured)
 
-Two results, both from a quiet host, `work/genome.fa`, 500k reads, interleaved, `BWA3_GPU_STATS`:
+Two results, both from a quiet host, `work/genome.fa`, 500k reads, interleaved, `BWA4_GPU_STATS`:
 
 **(a) The Metal kernel is ~8.4x a CPU core and costs 3% of the run.** `E_cpu = 4.33s` vs
 `extend_batch = 0.514s` at `-t1`. `--gpu` delivers 19.73 → 15.91s = **1.25x**, against an Amdahl
@@ -220,7 +220,7 @@ wasted SW. Highest ROI, zero risk.
 
 ### MLP: we run at ~6 lanes of the ~28 the core offers, and widening the lockstep does not fix it (2026-07-17)
 
-Measured with `BWA3_TRAFFIC=1`, which counts the 128-byte lines the FM index actually pulls (`-t1`,
+Measured with `BWA4_TRAFFIC=1`, which counts the 128-byte lines the FM index actually pulls (`-t1`,
 500k reads, genome): **1,075,478,506 lines x 128 B = 137.7 GB in 19.19s = 7.2 GB/s**.
 
 **That is ~20% of what ONE core can pull** (36.7 GB/s random 128B reads, `bench/uarch/`), and ~2.5%
@@ -231,7 +231,7 @@ we are not using. Do not build them.
 We are **latency**-bound. At ~108 ns per random access, 1.075e9 lines is ~118 s of raw latency
 compressed into 19.19 s, i.e. **~6 lanes of memory-level parallelism** against the ~28 an M4 P-core
 sustains (Lemire, independently). That 4.5x gap is the real headroom, and it is **not** the lockstep
-width: sweeping `BWA3_LOCKSTEP_N` on the *genome* index is flat and non-monotonic (N=8/16/24/32/48/64
+width: sweeping `BWA4_LOCKSTEP_N` on the *genome* index is flat and non-monotonic (N=8/16/24/32/48/64
 -> `-t8` 3.75/3.71/3.81/3.80/3.70/3.61 s, all within ~5%, with 24 and 32 *worse* than 16). Three
 hypotheses died here, all mine:
 - "reduce the shared footprint" -- refuted by the 20%-of-fabric measurement above;

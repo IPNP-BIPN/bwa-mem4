@@ -5,7 +5,7 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 ## Acceptees (par conception)
 
 - **`@PG` : DECIDE (3.0.0). Nous emettons notre propre identite, definitivement.** Notre sortie
-  emet `ID:bwa-mem3 PN:bwa-mem3 VN:<ver> CL:<notre argv>`, l'oracle emet `bwa-mem2`. Exclu du gate
+  emet `ID:bwa-mem4 PN:bwa-mem4 VN:<ver> CL:<notre argv>`, l'oracle emet `bwa-mem2`. Exclu du gate
   d'octet-identite (on compare `@SQ` + les lignes d'alignement).
 
   L'option alternative etait de se faire passer pour `bwa-mem2` dans le `@PG`, ce qui aurait rendu
@@ -15,7 +15,7 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   ici intracable, pour gagner une ligne d'en-tete que le gate exclut de toute facon. Un aligneur
   qui ment sur sa propre identite est un probleme, pas une fonctionnalite.
 
-  Consequence assumee : `diff` brut entre une sortie bwa-mem2 et une sortie bwa-mem3 montrera
+  Consequence assumee : `diff` brut entre une sortie bwa-mem2 et une sortie bwa-mem4 montrera
   toujours cette ligne. Tous les scripts du depot filtrent `^@PG` pour cette raison.
 
 ## Résolu (phase 8, via oracle instrumenté)

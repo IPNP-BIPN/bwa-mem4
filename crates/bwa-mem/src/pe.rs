@@ -1034,7 +1034,7 @@ fn cal_sub(opt: &MemOpt, r: &[MemAlnReg]) -> i32 {
     }
 }
 
-/// Env-gated (`BWA3_DUMP_PESTAT`) tracing of insert-size stats and every mate-rescue decision,
+/// Env-gated (`BWA4_DUMP_PESTAT`) tracing of insert-size stats and every mate-rescue decision,
 /// phrased in bwa's own `[PE]` wording so the two programs' stderr can be diffed directly.
 ///
 /// This is a debugging lever, not part of the algorithm: bwa prints the same lines unconditionally
@@ -1045,12 +1045,12 @@ fn cal_sub(opt: &MemOpt, r: &[MemAlnReg]) -> i32 {
 ///
 /// The result is cached in a `OnceLock`, so setting the variable mid-process has no effect.
 ///
-/// RETURNS true when `BWA3_DUMP_PESTAT` was set (to anything, including the empty string) at the
+/// RETURNS true when `BWA4_DUMP_PESTAT` was set (to anything, including the empty string) at the
 /// first call.
 fn dump_pestat() -> bool {
     // Process-wide cache of the env lookup, so the check costs nothing on the hot rescue path.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA3_DUMP_PESTAT").is_some())
+    *ON.get_or_init(|| std::env::var_os("BWA4_DUMP_PESTAT").is_some())
 }
 
 /// Estimate insert-size distributions for the four orientations over a whole batch. Port of

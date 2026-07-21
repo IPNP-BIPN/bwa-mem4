@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end oracle-diff: run bwa-mem2 (oracle) and bwa-mem3 (ours) on identical reads at a fixed
+# End-to-end oracle-diff: run bwa-mem2 (oracle) and bwa-mem4 (ours) on identical reads at a fixed
 # batch (-K) single-threaded, compare the SAM header and per-field alignment concordance.
 #
 # Phase-0 gate: @SQ header byte-identical + a concordance JSON produced (alignment concordance is
@@ -17,7 +17,7 @@ V="$(bwa-mem2 version 2>&1 | tail -1)"
 [ "$V" = "2.3" ] || echo "WARN: oracle bwa-mem2 version '$V' != expected 2.3" >&2
 
 cargo build --release --quiet
-OURS=target/release/bwa-mem3
+OURS=target/release/bwa-mem4
 
 echo "[run] oracle + ours (SE, -t1 -K $K)"
 bwa-mem2 mem -t1 -K "$K" "$IDX" "$W/r1.fq" 2>/dev/null > "$W/oracle_se.sam"

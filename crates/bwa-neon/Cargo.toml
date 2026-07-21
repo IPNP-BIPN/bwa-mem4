@@ -1,6 +1,6 @@
 [package]
-name = "bwa-mem3-neon"
-description = "Vectorised Smith-Waterman kernels for bwa-mem3: NEON on aarch64, AVX2 on x86_64, dispatched at runtime."
+name = "bwa-mem-oxide-neon"
+description = "Vectorised Smith-Waterman kernels for bwa-mem4: NEON on aarch64, AVX2 on x86_64, dispatched at runtime."
 readme = "../../README.md"
 keywords = ["bioinformatics", "alignment", "genomics", "bwa"]
 categories = ["science"]

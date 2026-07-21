@@ -10,11 +10,11 @@ OUT="work/pubbench_$TS"
 mkdir -p "$OUT"
 LOG="$OUT/results.log"
 
-M3=./target/release/bwa-mem3
+M3=./target/release/bwa-mem4
 say() { echo "$@" | tee -a "$LOG"; }
 
 say "############################################################"
-say "# bwa-mem3 publication benchmark  $TS"
+say "# bwa-mem4 publication benchmark  $TS"
 say "# host: $(uname -mnrs)"
 say "# binary: $(git rev-parse --short HEAD) ($(git log -1 --format=%s | cut -c1-60))"
 say "############################################################"

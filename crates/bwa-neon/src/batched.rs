@@ -253,7 +253,7 @@ fn cell_bound(job: &ExtendJob, max_sc: i32) -> i32 {
 /// `B * (o_min + e_min)`, while its score is capped at `min(len1, len2) * a`. So it can only beat an
 /// ungapped walk carrying `X` mismatches while `X <= o_min / (a + b - e_min)` -- which is
 /// `6 / (1 + 4 - 1) = 1` for bwa's defaults, i.e. a single mismatch. `x_threshold` carries that
-/// bound; above it we fall through to the kernel (bwa-mem3-cpp instead narrows the band, which buys
+/// bound; above it we fall through to the kernel (bwa-mem4-cpp instead narrows the band, which buys
 /// us nothing: our SIMD kernel walks every column under a mask, so a tighter band does not shorten
 /// the inner loop).
 ///

@@ -1,4 +1,4 @@
-//! `bwa-mem3 mem` subcommand: the command-line front end of the aligner.
+//! `bwa-mem4 mem` subcommand: the command-line front end of the aligner.
 //!
 //! Ports `main_mem` from `reference/bwa-mem2/src/fastmap.cpp`. Its job is argv in, SAM bytes out:
 //! parse options into [`bwa_core::MemOpt`], load the index, then stream batches of reads through
@@ -402,7 +402,7 @@ pub struct MemArgs {
     #[arg(short = 'v')]
     pub verbose: Option<i32>,
 
-    // Positional 1. The prefix passed to `bwa-mem3 index`, i.e. the FASTA path itself. The index
+    // Positional 1. The prefix passed to `bwa-mem4 index`, i.e. the FASTA path itself. The index
     // side files (`.bwt.2bit.64`, `.ann`, `.amb`, `.pac`, ...) are found by appending suffixes.
     /// Index prefix: the FASTA path that was indexed.
     pub index_prefix: PathBuf,
@@ -1374,7 +1374,7 @@ fn run_pipeline<B: Send>(
     })
 }
 
-/// Run `bwa-mem3 mem` end to end: build options, load the index, write the SAM header, then stream
+/// Run `bwa-mem4 mem` end to end: build options, load the index, write the SAM header, then stream
 /// batches through the align-and-format pipeline (single-end here, paired-end via [`run_pe`]).
 ///
 /// `argv` is the raw process command line, captured in `main` before clap consumed it, and is used
@@ -1406,7 +1406,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let unimplemented: &[(bool, &str, &str)] = &[];
     if let Some((_, flag, what)) = unimplemented.iter().find(|(given, _, _)| *given) {
         anyhow::bail!(
-            "{flag} is not implemented yet ({what}). bwa-mem3 parses it for CLI compatibility but \
+            "{flag} is not implemented yet ({what}). bwa-mem4 parses it for CLI compatibility but \
              would ignore it, so it refuses rather than emit output that silently differs from \
              bwa-mem2."
         );
@@ -1439,15 +1439,15 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // core -- affinity is a no-op on arm64 and QoS is only a hint -- so not creating the extra
     // workers is the only lever that works.
     //
-    // `BWA3_NO_PCORE_CAP=1` disables it, which is how the effect above stays measurable.
+    // `BWA4_NO_PCORE_CAP=1` disables it, which is how the effect above stays measurable.
     let pool_threads = match bwa_core::cpu::performance_core_count() {
-        Some(p) if n_threads > p && std::env::var_os("BWA3_NO_PCORE_CAP").is_none() => {
+        Some(p) if n_threads > p && std::env::var_os("BWA4_NO_PCORE_CAP").is_none() => {
             // `-v` default is 3 (bwa's `bwa_verbose`), so this prints unless the user quietened it.
             if args.verbose.unwrap_or(3) >= 3 {
                 eprintln!(
                     "[M::main_mem] -t {n_threads} exceeds the {p} performance cores; running {p} \
                      workers. The efficiency cores add no measurable throughput and cost ~8% more \
-                     CPU. Set BWA3_NO_PCORE_CAP=1 to use all {n_threads}."
+                     CPU. Set BWA4_NO_PCORE_CAP=1 to use all {n_threads}."
                 );
             }
             p
@@ -1558,16 +1558,28 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // The sink. Written to directly for the header here, then MOVED into the pipeline's writer
     // thread, which is the only thread that touches it afterwards.
     let mut out = Output::open(args.output.as_deref(), n_threads, args.reference.as_deref())?;
-    // The raw command line, verbatim, for `@PG CL:`.
-    // Single-space joined, so a quoted argument containing spaces is not re-quoted; that matches
-    // what bwa writes.
-    let command_line = argv.join(" ");
+    // The raw command line for `@PG CL:`. Single-space joined, so a quoted argument containing
+    // spaces is not re-quoted; that matches what bwa writes.
+    //
+    // DIVERGENCE FROM bwa-mem2, deliberate: tabs are escaped back to the two characters `\t`.
+    //
+    // bwa-mem2 writes the argument verbatim, so `-R "$(printf '@RG\tID:x')"` puts a REAL tab
+    // inside `CL:`, which is a SAM field separator. The `@PG` line then has seven fields instead of
+    // four and carries two `ID:` tags, one from the header and one from the read group. That is an
+    // invalid header: lenient parsers shrug, strict ones (noodles) reject the file. Reported
+    // upstream as bwa-mem2#293, still open.
+    //
+    // Escaping rather than stripping, because `\t` is exactly the spelling bwa itself ACCEPTS on
+    // the `-R` command line, so the field stays a faithful record of what the user typed and could
+    // be pasted back. This costs no byte-identity: `@PG` is excluded from every parity gate in this
+    // project precisely because it legitimately differs between the two tools.
+    let command_line = argv.join(" ").replace('\t', "\\t");
     sam::write_header(
         &mut out,
         &sqs,
         hdr_lines.as_deref(),
-        "bwa-mem3",
-        "bwa-mem3",
+        "bwa-mem4",
+        "bwa-mem4",
         env!("CARGO_PKG_VERSION"),
         &command_line,
     )?;
@@ -1712,9 +1724,9 @@ fn batched_regs(
         .collect()
 }
 
-/// Env-gated (`BWA3_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
+/// Env-gated (`BWA4_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
 ///
-/// `BWA3_DUMP_REGS`: set to ANY value (its content is never read, only its presence) to print each
+/// `BWA4_DUMP_REGS`: set to ANY value (its content is never read, only its presence) to print each
 /// read's candidate regions to stderr before and after dedup/primary-marking. Default off. A
 /// debugging aid for parity work against the oracle: it writes to stderr only, so it cannot change
 /// the SAM bytes, but it is very slow and unordered under `-t > 1`.
@@ -1726,7 +1738,7 @@ fn dump_regs_enabled() -> bool {
     // Cached decision. `OnceLock` rather than a plain static so the env read happens exactly once
     // even when several rayon workers reach it simultaneously.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA3_DUMP_REGS").is_some())
+    *ON.get_or_init(|| std::env::var_os("BWA4_DUMP_REGS").is_some())
 }
 
 /// Deduplicate + primary-mark a read's batched regions, then format its SAM record. Pure (no shared
@@ -2299,21 +2311,21 @@ fn run_pe(
 
         // Mate rescue, batched across the whole pair batch so the per-anchor insert-window SW fills
         // the SIMD lanes. Byte-identical to the per-pair rescue in `mem_sam_pe` (which is then told to
-        // skip it). `BWA3_SCALAR_RESCUE` keeps the per-pair path for A/B verification.
-        // `BWA3_SCALAR_RESCUE`: set to any value (presence only, content ignored) to skip the
+        // skip it). `BWA4_SCALAR_RESCUE` keeps the per-pair path for A/B verification.
+        // `BWA4_SCALAR_RESCUE`: set to any value (presence only, content ignored) to skip the
         // batched pass here and let `mem_sam_pe` do its original per-pair rescue instead. Default
         // off. An A/B verification switch: both paths are byte-identical, only the speed differs.
-        let scalar_rescue = std::env::var_os("BWA3_SCALAR_RESCUE").is_some();
-        // `BWA3_NO_RESCUE=1` skips mate rescue entirely, the analogue of bwa-mem2's `-S`. It is a
+        let scalar_rescue = std::env::var_os("BWA4_SCALAR_RESCUE").is_some();
+        // `BWA4_NO_RESCUE=1` skips mate rescue entirely, the analogue of bwa-mem2's `-S`. It is a
         // MEASUREMENT gate, not a lever: it changes the output by design, exactly as `-S` does. It
         // exists so our rescue cost can be measured DIRECTLY and compared like-for-like against
         // `bwa-mem2 -S`, instead of decomposed as `PE - 2 x SE` (which assumes a read costs the same
         // to seed and extend in SE as in PE -- unverified).
         // `-S` (MEM_F_NO_RESCUE) is the user-facing form of the same gate.
-        // Presence-only, like the gate above; the documented spelling is `BWA3_NO_RESCUE=1` but any
+        // Presence-only, like the gate above; the documented spelling is `BWA4_NO_RESCUE=1` but any
         // value works. Default off. True here means NO rescue happens anywhere, batched or per-pair.
         let no_rescue =
-            std::env::var_os("BWA3_NO_RESCUE").is_some() || opt.flag & flags::NO_RESCUE != 0;
+            std::env::var_os("BWA4_NO_RESCUE").is_some() || opt.flag & flags::NO_RESCUE != 0;
         if !scalar_rescue && !no_rescue {
             // One rescue job per pair: each mate's codes plus a MUTABLE borrow of its region list,
             // which the rescue appends newly found alignments to. Borrowing `prepared` mutably is
@@ -2365,7 +2377,7 @@ fn run_pe(
                     &mut pair.regs1,
                     &mut pair.regs2,
                     // rescue_done: true when nothing further should rescue -- either the batched
-                    // pass already did it, or BWA3_NO_RESCUE suppressed it outright.
+                    // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
                     !scalar_rescue || no_rescue,
                     &mut buf,
                 )
@@ -2445,7 +2457,7 @@ mod tests {
     use super::*;
 
     /// Two SAM records against a one-contig header, as the aligner would have formatted them.
-    const HEADER: &str = "@SQ\tSN:chr1\tLN:100\n@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:0\tCL:test\n";
+    const HEADER: &str = "@SQ\tSN:chr1\tLN:100\n@PG\tID:bwa-mem4\tPN:bwa-mem4\tVN:0\tCL:test\n";
     const RECORDS: &str = "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\tNM:i:0\n\
                            r2\t16\tchr1\t7\t60\t4M\t*\t0\t0\tTTTT\tIIII\tNM:i:1\n";
 
