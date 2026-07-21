@@ -1421,10 +1421,43 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let opt = build_opt(&args)?;
     // `-t` clamped to >= 1, as a usize for the pool builders. Same value as `opt.n_threads`.
     let n_threads = args.threads.max(1) as usize;
+
+    // Worker count for the POOL ONLY, capped to the Performance cores on Apple Silicon.
+    //
+    // READ THIS BEFORE MOVING THE CAP ANYWHERE ELSE. It must not touch `args.threads` or
+    // `opt.n_threads`, because `-K` defaults to `opt.chunk_size * args.threads` a few lines below
+    // (bwa's `aux.task_size = opt->chunk_size * opt->n_threads`, fastmap.cpp:964). Capping the
+    // thread count itself would therefore shrink the default batch, move the batch boundaries, and
+    // change the paired-end output, since the insert-size model is re-estimated per batch. A
+    // "threading only" change would then silently break byte-identity. The pool size, by contrast,
+    // is invisible in the output: order and global read ids do not depend on it.
+    //
+    // Why cap at all: on an M4 Max (12 P + 4 E) the four E cores measurably buy nothing (`-t16`
+    // 6.10 s wall against `-t12` 6.17 s, inside the spread of three repetitions) while costing 10%
+    // more CPU, because rayon splits work evenly and an E core here is several times slower, so its
+    // chunk straggles. See `bwa_core::cpu` for the measurements. macOS offers no way to forbid a
+    // core -- affinity is a no-op on arm64 and QoS is only a hint -- so not creating the extra
+    // workers is the only lever that works.
+    //
+    // `BWA3_NO_PCORE_CAP=1` disables it, which is how the effect above stays measurable.
+    let pool_threads = match bwa_core::cpu::performance_core_count() {
+        Some(p) if n_threads > p && std::env::var_os("BWA3_NO_PCORE_CAP").is_none() => {
+            // `-v` default is 3 (bwa's `bwa_verbose`), so this prints unless the user quietened it.
+            if args.verbose.unwrap_or(3) >= 3 {
+                eprintln!(
+                    "[M::main_mem] -t {n_threads} exceeds the {p} performance cores; running {p} \
+                     workers. The efficiency cores add no measurable throughput and cost ~8% more \
+                     CPU. Set BWA3_NO_PCORE_CAP=1 to use all {n_threads}."
+                );
+            }
+            p
+        }
+        _ => n_threads,
+    };
     // Fixed-size rayon pool. Output order and global read ids are independent of thread count, so
     // byte-identity holds at any `-t` once `-K` fixes the batch boundaries.
     rayon::ThreadPoolBuilder::new()
-        .num_threads(n_threads)
+        .num_threads(pool_threads)
         .build_global()
         .ok();
     // Batch size in INPUT BASES, not reads. Default `chunk_size * -t` (10M per thread), mirroring
@@ -2297,8 +2330,10 @@ fn run_pe(
             // Each pair's rescue is independent, so run chunks in parallel; a chunk of a few hundred
             // pairs still has enough rescue jobs to fill the SIMD lanes. Keeps -t8 scaling (the rescue
             // is otherwise a serial section) while byte-identical to the per-pair path.
+            // Read before the mutable borrow below; `par_chunks_mut` would otherwise hold it.
+            let chunk_pairs = rescue_pairs_per_chunk(rescue_jobs.len());
             rescue_jobs
-                .par_chunks_mut(RESCUE_PAIRS_PER_CHUNK)
+                .par_chunks_mut(chunk_pairs)
                 .for_each(|chunk| batch_mate_rescue(fm, bns, opt, &pes, chunk));
         }
 
@@ -2350,10 +2385,38 @@ fn run_pe(
     run_pipeline(out, read_batches, process)
 }
 
-/// Read pairs handed to one parallel mate-rescue task. A few hundred pairs still carries enough
-/// rescue jobs to fill the SIMD lanes, while being small enough to keep every worker busy. Purely a
-/// scheduling figure: the rescue result is independent of how the pairs are chunked.
-const RESCUE_PAIRS_PER_CHUNK: usize = 512;
+/// Read pairs handed to one parallel mate-rescue task, derived from the batch rather than fixed.
+///
+/// This was a hard-coded 512 and that was measurably too small. Sweeping it on 500k pairs against
+/// GRCh38 at `-t12`, two interleaved passes each, wall clock:
+///
+/// | pairs/chunk | 64 | 256 | 512 | 2048 | 4096 | 8192 | 16384 |
+/// |---|---|---|---|---|---|---|---|
+/// | seconds | 7.32 | 6.51 | 6.08 | **5.61** | 5.75 | 6.03 | 6.73 |
+///
+/// The curve is not about cache residency, which is what a constant would have been tuned for. It
+/// is about how many chunks exist per worker. A `-K 10000000` batch holds roughly 33k pairs, so 512
+/// makes ~65 chunks for 12 workers (scheduling overhead and lanes left underfilled) while 8192
+/// makes 4, which leaves eight workers with nothing. Both ends of the sweep are that same effect.
+///
+/// So the figure has to follow the batch and the pool, not sit still: aim for a couple of chunks
+/// per worker, which keeps work-stealing able to correct a straggler without paying for 65 task
+/// boundaries. `RESCUE_MIN_PAIRS_PER_CHUNK` keeps a tiny final batch from being split into
+/// per-worker slivers that cannot fill the SIMD lanes.
+///
+/// Purely a scheduling figure: the rescue result is independent of how the pairs are chunked,
+/// verified byte-identical at 512 and 2048 on 200,003 records.
+fn rescue_pairs_per_chunk(n_pairs: usize) -> usize {
+    /// Two chunks per worker: enough for work-stealing to rebalance, few enough to keep the SIMD
+    /// batches wide.
+    const CHUNKS_PER_WORKER: usize = 2;
+    /// Floor, so a small batch is not shredded into slivers narrower than the kernel's lanes.
+    const RESCUE_MIN_PAIRS_PER_CHUNK: usize = 256;
+    let workers = rayon::current_num_threads().max(1);
+    n_pairs
+        .div_ceil(workers * CHUNKS_PER_WORKER)
+        .max(RESCUE_MIN_PAIRS_PER_CHUNK)
+}
 
 /// One read pair prepared for the pairing/output stage: nt4 codes, dedup'd regions, names, quals.
 struct PrepPair {
