@@ -82,9 +82,19 @@ jobs:
       - name: Publish in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: |
           set -euo pipefail
+          # crates.io REQUIRES a User-Agent and answers 403 without one, so a bare `curl` always
+          # looks like "not published": the idempotency skip would republish what already landed, and
+          # the indexing wait would spin its full timeout and then declare the crate missing. Send a
+          # UA on every registry probe.
+          is_published() {
+            [ "$(curl -s -o /dev/null -w '%{http_code}' \
+                 -A "bwa-mem4-release (https://github.com/${GITHUB_REPOSITORY})" \
+                 --max-time 20 "https://crates.io/api/v1/crates/$1/$2")" = "200" ]
+          }
           # Dependency order, computed once and written down rather than rediscovered: a crate
           # cannot be published before everything it depends on is already on the registry.
           CRATES="bwa-mem4-core bwa-mem4-index bwa-mem4-extend bwa-mem4-neon bwa-mem4-seed \
@@ -112,7 +122,7 @@ jobs:
             VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
             # Idempotent: re-running after a partial failure must not abort on the crates that
             # already made it, or the workspace stays half-published.
-            if curl -fsSL "https://crates.io/api/v1/crates/$c/$VERSION" >/dev/null 2>&1; then
+            if is_published "$c" "$VERSION"; then
               echo "$c $VERSION is already on crates.io, skipping"
               continue
             fi
@@ -122,7 +132,7 @@ jobs:
             # crates.io indexes asynchronously; the next crate cannot resolve this one until it is
             # visible. Poll rather than sleeping a fixed guess.
             for i in $(seq 1 60); do
-              if curl -fsSL "https://crates.io/api/v1/crates/$c/$VERSION" >/dev/null 2>&1; then
+              if is_published "$c" "$VERSION"; then
                 echo "$c $VERSION is indexed"; break
               fi
               [ "$i" = "60" ] && { echo "::error::$c never appeared in the index"; exit 1; }
