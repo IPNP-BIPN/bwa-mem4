@@ -1340,7 +1340,7 @@ unsafe fn fwd_local_sw_neon_u8(
                 // the store, the row-max and the E carry), but the F recurrence below is reassociated
                 // off `mfe` so it never waits on H -- this is what shortens the critical column chain.
                 let mfe = vmaxq_u8(diag_v, e_v);
-                let mut h_v = vmaxq_u8(mfe, f_v);
+                let h_v = vmaxq_u8(mfe, f_v);
                 // Track the min column reaching a new row max (strict >, so ties keep the earlier j).
                 // `is_new_row_max` is all-ones in the lanes whose job just beat its own row best.
                 // `j as u8` is why the caller caps the query at 250 bases: the column index shares
@@ -1614,7 +1614,7 @@ unsafe fn fwd_local_sw_avx2_u8(
                 // it instead of the full `h_v` and stop waiting on H -- the same critical-chain
                 // shortening as the NEON u8 kernel (f -> h -> f becomes f -> f).
                 let mfe = _mm256_max_epu8(diag_v, e_v);
-                let mut h_v = _mm256_max_epu8(mfe, f_v);
+                let h_v = _mm256_max_epu8(mfe, f_v);
                 // Strict unsigned `>`, so a tie keeps the earlier `j`. This is the one place the
                 // signed `_mm256_cmpgt_epi8` would silently differ from NEON, for any score or column
                 // index above 127; `cgt_epu8` is why the caller's 250-base query cap still holds.
