@@ -62,7 +62,10 @@ fn reports_batch_count_on_stderr() {
         .lines()
         .find(|l| l.starts_with("[M::main_mem] processed "))
         .unwrap_or_else(|| panic!("stderr did not report the batch count:\n{err}"));
-    assert!(line.ends_with(" batches (-K 2000)"), "malformed line: {line}");
+    assert!(
+        line.ends_with(" batches (-K 2000)"),
+        "malformed line: {line}"
+    );
     let n: usize = line
         .trim_start_matches("[M::main_mem] processed ")
         .split(' ')

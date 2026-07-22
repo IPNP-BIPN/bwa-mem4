@@ -1603,11 +1603,7 @@ mod tests {
         for sm in &smems {
             // The read substring this SMEM's interval stands for (`m`/`n` are inclusive READ offsets).
             let sub = &read[sm.m as usize..=sm.n as usize];
-            assert_eq!(
-                sm.s,
-                naive_occ(&reference, sub),
-                "SMEM interval size wrong"
-            );
+            assert_eq!(sm.s, naive_occ(&reference, sub), "SMEM interval size wrong");
             assert!((sm.n - sm.m + 1) as i32 >= 19);
         }
 
