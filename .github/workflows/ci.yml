@@ -86,7 +86,22 @@ jobs:
       - name: Build (release)
         run: cargo build --workspace --release
 
+      # Log the runner's SIMD feature set on x86 targets, so a reader can tell which vector rescue
+      # kernels the test run actually exercised. `avx2` => the AVX2 u8/i16 kernels ran; `avx512bw` =>
+      # the AVX-512 u8/i16 kernels ran (their byte-identity tests self-skip when it is absent, so this
+      # is the only signal that they were validated rather than skipped). See crates/bwa-neon/src/matesw.rs.
+      - name: Log x86 SIMD features
+        if: contains(matrix.target_id, 'x86_64')
+        shell: bash
+        run: |
+          if [ -r /proc/cpuinfo ]; then
+            grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          else
+            sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null | tr 'A-Z ' 'a-z\n' | grep -E 'avx2|avx512' | sort -u | tr '\n' ' '; echo
+          fi
+
       # Includes the index byte-identity test, which rebuilds the index for testdata/tiny and
-      # compares all five files against the bwa-mem2 output committed alongside it.
+      # compares all five files against the bwa-mem2 output committed alongside it. On x86 this also
+      # runs the AVX2 rescue-kernel byte-identity gates, and the AVX-512 ones where the runner has it.
       - name: Test (release)
         run: cargo test --workspace --release
