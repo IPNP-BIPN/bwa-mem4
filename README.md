@@ -23,6 +23,16 @@ subset. Both aligners read the same on-disk index. Reproduce with `scripts/giab3
 Speed is on an Apple M4 Max. The ratio is not constant across thread counts: it decays as `-t`
 rises, so quote it with the thread count attached.
 
+These speed ratios are arm64/NEON measurements and do not transfer unchanged to x86_64. Both the
+extension and mate-rescue Smith-Waterman kernels are vectorised on x86_64 (AVX2, and AVX-512BW where
+the CPU has it, selected at runtime), so the SIMD paths are covered on both architectures; but a
+head-to-head against bwa-mem2 on a full x86_64 WGS run has not yet been recorded, and the paired-end
+ratio in particular (mate rescue is roughly half of PE time) should not be assumed portable until it
+is. The `bench-x86` workflow records two directional x86 signals on GitHub-hosted runners: a
+same-runner scalar/AVX2/AVX-512 rescue-kernel A/B, and a single-chromosome bwa-mem4-vs-bwa-mem2 run;
+both are cloud-noisy and small-scale, not the headline ratio. Byte-identity to bwa-mem2 holds on every
+architecture regardless.
+
 On Apple Silicon the worker pool is capped at the Performance-core count, because the Efficiency
 cores measurably do not help. Measured on an M4 Max (12 P + 4 E), 500k pairs against GRCh38, three
 repetitions: `-t16` and `-t12` finish in the same wall time (6.1 s, the difference inside the

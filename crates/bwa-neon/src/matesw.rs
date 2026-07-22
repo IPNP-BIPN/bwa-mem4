@@ -418,10 +418,10 @@ const U8_SCORE_LIMIT: i32 = 250;
 /// Score ceiling under which the 8-lane i16 kernel is exact, with headroom left for
 /// [`DEAD_CELL_SCORE`] at the other end of the range. Jobs above this fall back to the scalar path.
 ///
-/// Gated on aarch64 because its only reader is the NEON dispatch below. Without the gate an
-/// x86_64 build sees an unused constant, which is only a warning locally but a hard error under
-/// CI's `-D warnings`.
-#[cfg(target_arch = "aarch64")]
+/// Gated on aarch64/x86_64 because its only readers are the NEON and AVX2/AVX512 dispatches. Without
+/// the gate a scalar-only build sees an unused constant, which is only a warning locally but a hard
+/// error under CI's `-D warnings`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const I16_SCORE_LIMIT: i32 = 30_000;
 
 /// Length ksw pads a query of `qlen` out to. The lane count is bwa's kernel choice in `mem_matesw`
@@ -476,6 +476,47 @@ fn ksw_padded_qlen(qlen: usize, max_sc: i32) -> usize {
 ///
 /// The three implementations are interchangeable and must stay byte-identical; the choice between
 /// them is purely which one is legal for these lengths and scores, never a quality tradeoff.
+/// Runtime override of the rescue-kernel tier, mirroring the fork's `BWAMEM3_FORCE_TIER`
+/// (fg-labs/bwa-mem3, `src/simd_dispatch.cpp`). Two uses: a same-host A/B that isolates what the
+/// AVX2 / AVX-512 / scalar rescue kernel actually costs end-to-end (the whole-genome head-to-head
+/// cannot attribute time to one stage), and a pin for a user whose CPU regresses on the widest tier.
+/// The fork's own characterization is why the pin matters: AVX-512 at 512-bit width is only ~+2-4% on
+/// Intel Sapphire Rapids and roughly break-even on AMD Zen 4, where every 512-bit op issues as 2x
+/// 256-bit uops (`docs/src/whats-different/avx512-baseline.md` in the fork).
+///
+/// `BWA4_RESCUE_TIER=scalar|avx2|avx512`; anything else, or unset, means auto = widest available.
+/// Every tier is byte-identical, so this changes speed only, never output. Read once and cached.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RescueTier {
+    Auto,
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+/// Parse and cache `BWA4_RESCUE_TIER`. On first read it also prints the resolved override to stderr
+/// (once) when one is set, mirroring the fork's `BWAMEM3_DEBUG_SIMD` confirmation so a benchmark run
+/// can prove which path it took.
+fn forced_rescue_tier() -> RescueTier {
+    use std::sync::OnceLock;
+    static TIER: OnceLock<RescueTier> = OnceLock::new();
+    *TIER.get_or_init(|| match std::env::var("BWA4_RESCUE_TIER").ok().as_deref() {
+        Some("scalar") => {
+            eprintln!("[bwa-mem4] BWA4_RESCUE_TIER=scalar: forcing scalar mate-rescue kernel");
+            RescueTier::Scalar
+        }
+        Some("avx2") => {
+            eprintln!("[bwa-mem4] BWA4_RESCUE_TIER=avx2: capping mate-rescue kernel at AVX2");
+            RescueTier::Avx2
+        }
+        Some("avx512") => {
+            eprintln!("[bwa-mem4] BWA4_RESCUE_TIER=avx512: requiring AVX-512 mate-rescue kernel");
+            RescueTier::Avx512
+        }
+        _ => RescueTier::Auto,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fwd_local_sw_batch(
     jobs: &[FwdJob],
@@ -487,8 +528,15 @@ fn fwd_local_sw_batch(
     e_ins: i32,
     max_sc: i32,
 ) -> Vec<(i32, i32, i32, i32, i32)> {
+    // A forced `scalar` tier bypasses every vector path on all architectures (the fork's
+    // `BWAMEM3_FORCE_TIER=scalar`, and the `BWA3_SCALAR_RESCUE` toggle issue #12 measured with).
+    let tier = forced_rescue_tier();
+    if tier == RescueTier::Scalar {
+        return fwd_local_sw_scalar(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc);
+    }
     #[cfg(target_arch = "aarch64")]
     {
+        // avx2/avx512 forces have no aarch64 meaning; NEON is the only vector tier here.
         if std::arch::is_aarch64_feature_detected!("neon") && mat_is_standard(m, mat) {
             // Max reachable score per job = min(len) * match. Only the SCORE cells (H/E/F) live in the
             // SIMD vector; positions/te/qe are scalar i32, so window length is unconstrained. If every
@@ -518,22 +566,54 @@ fn fwd_local_sw_batch(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") && mat_is_standard(m, mat) {
+        if mat_is_standard(m, mat) {
             // Same score-ceiling test as the aarch64 arm above, verbatim: the threshold is bwa's
             // (`bwamem_pair.cpp:208`), not a property of the register we happen to run on, so it does
-            // not change when the vector gets twice as wide. See `ksw_padded_qlen` for why deriving
-            // any of this from the SIMD width would alter the output.
+            // not change when the vector gets twice or four times as wide. See `ksw_padded_qlen` for
+            // why deriving any of this from the SIMD width would alter the output.
             let score_ceiling = |j: &FwdJob| j.query.len().min(j.target.len()) as i32 * max_sc;
-            if jobs.iter().all(|j| {
+            let fits_u8 = jobs.iter().all(|j| {
                 score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
-            }) {
-                // SAFETY: avx2 detected; every H/E/F cell and query column < 250 fits u8; standard mat.
-                return unsafe {
-                    fwd_local_sw_avx2_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
-                };
+            });
+            let fits_i16 = jobs.iter().all(|j| {
+                score_ceiling(j) < I16_SCORE_LIMIT && j.target.len() < I16_SCORE_LIMIT as usize
+            });
+            // Prefer the widest legal vector: AVX-512BW (64 u8 / 32 i16 lanes) when the CPU has it,
+            // else AVX2 (32 / 16). The width is purely a throughput choice; every kernel is
+            // byte-identical, so the only thing the branch decides is how many lanes run at once.
+            // `avx512bw` implies `avx512f`, which is what the word/byte ops need. `BWA4_RESCUE_TIER`
+            // narrows the choice: `avx2` skips the AVX-512 branch, `avx512` skips the AVX2 one (so a
+            // forced-avx512 run on a host without it falls to scalar, never silently to AVX2).
+            let want_avx512 = matches!(tier, RescueTier::Auto | RescueTier::Avx512);
+            let want_avx2 = matches!(tier, RescueTier::Auto | RescueTier::Avx2);
+            if want_avx512 && std::arch::is_x86_feature_detected!("avx512bw") {
+                if fits_u8 {
+                    // SAFETY: avx512bw detected; u8 preconditions hold; standard mat.
+                    return unsafe {
+                        fwd_local_sw_avx512_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    };
+                }
+                if fits_i16 {
+                    // SAFETY: avx512bw detected; i16 range guaranteed; standard mat.
+                    return unsafe {
+                        fwd_local_sw_avx512_i16(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    };
+                }
             }
-            // No i16 AVX2 kernel exists yet, so a batch that overflows u8 falls through to the
-            // scalar lockstep below rather than to a wider vector path.
+            if want_avx2 && std::arch::is_x86_feature_detected!("avx2") {
+                if fits_u8 {
+                    // SAFETY: avx2 detected; every H/E/F cell and query column < 250 fits u8; standard mat.
+                    return unsafe {
+                        fwd_local_sw_avx2_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    };
+                }
+                if fits_i16 {
+                    // SAFETY: avx2 detected; i16 range guaranteed; standard mat.
+                    return unsafe {
+                        fwd_local_sw_avx2_i16(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    };
+                }
+            }
         }
     }
     fwd_local_sw_scalar(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
@@ -1678,6 +1758,631 @@ unsafe fn fwd_local_sw_avx2_u8(
     out
 }
 
+/// Lanes for the AVX2 i16 kernel: one `__m256i` holds 16 signed words, half the u8 width. This is the
+/// x86 counterpart of [`LANES16`] on aarch64, and the reason a job that overflows u8 no longer drops
+/// to the scalar lockstep on x86_64. Same "wider group is only extra padded work" argument as
+/// [`LANES32`].
+#[cfg(target_arch = "x86_64")]
+const LANES16: usize = 16;
+
+/// AVX2 `i16x16` forward local-SW: [`fwd_local_sw_neon`] transliterated to `__m256i`, so a batch whose
+/// score ceiling overflows u8 runs vectorised on x86_64 instead of falling through to
+/// [`fwd_local_sw_scalar`]. This is the second half of closing the x86 rescue gap (#12/#20): the u8
+/// kernel above already handles stock DNA scores, this one the high-scoring configs (large `a`, or the
+/// NEON gate's `(10, 40)` matrix) where `min(len) * match` exceeds 250.
+///
+/// The transliteration is mechanical, exactly as for [`fwd_local_sw_avx2_u8`], because every operation
+/// is element-wise and i16 signed arithmetic matches NEON's `int16x8` byte-for-byte. Two NEON spellings
+/// have no one-instruction AVX2 form and are rebuilt here:
+///
+/// - **`vcgeq_s16(a, b)`** (signed `>=`): recovered as `max_epi16(a, b) == a`. Every value compared
+///   this way is a base code (0..5) or [`PAD`] widened *unsigned* to a small positive i16, so the
+///   signed max is exact.
+/// - **`vbslq_s16(mask, a, b)`** = `mask ? a : b`: `_mm256_blendv_epi8(a, b, mask)` is `mask ? b : a`,
+///   so the operands swap, same as the u8 kernel's `bsl`. The per-word masks are all-ones/all-zero, so
+///   consulting the top bit of each byte is exact.
+///
+/// Unlike NEON's byte loads, widening a 16-code column to i16 is one `_mm_loadu_si128` (16 bytes) then
+/// `_mm256_cvtepu8_epi16`, the unsigned widen that keeps [`PAD`] = 255 as +255 rather than -1.
+///
+/// # Parameters / Returns
+/// As [`fwd_local_sw_batch`], with the same unchecked preconditions as [`fwd_local_sw_neon`]:
+/// `mat_is_standard(m, mat)`, and every job's score ceiling `min(qlen, tlen) * max_sc` plus target
+/// length under [`I16_SCORE_LIMIT`]. Byte-identical to [`fwd_local_sw_scalar`]
+/// (`avx2_verify::avx2_matesw_i16_matches_scalar`).
+///
+/// # Safety
+/// Caller must have confirmed AVX2 is available. Loads/stores use unchecked offsets bounded by
+/// `qmax`/`tmax`, derived from the same buffers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fwd_local_sw_avx2_i16(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    use std::arch::x86_64::*;
+
+    // `mask ? a : b`, per 16-bit lane; the all-ones/all-zero masks make the byte-granular blend exact.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn bsl(mask: __m256i, a: __m256i, b: __m256i) -> __m256i {
+        _mm256_blendv_epi8(b, a, mask)
+    }
+    // Signed `a >= b`, all-ones/all-zero per word. `max_epi16(a,b) == a` iff `a >= b`; used only on the
+    // small positive code/PAD values, where signed and unsigned max coincide.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn cge_epi16(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_cmpeq_epi16(_mm256_max_epi16(a, b), a)
+    }
+
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    // The standard matrix collapses to `mtch` (positive match) and `mis` (signed mismatch, e.g. -4),
+    // plus the fixed -1 for N, exactly as in the NEON i16 kernel.
+    let mtch = mat[0] as i16;
+    let mis = mat[1] as i16;
+    // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
+
+    let zero = _mm256_setzero_si256();
+    let mtch_v = _mm256_set1_epi16(mtch);
+    let mis_v = _mm256_set1_epi16(mis);
+    let n_v = _mm256_set1_epi16(-1);
+    let dead_v = _mm256_set1_epi16(DEAD_CELL_SCORE as i16);
+    let four_v = _mm256_set1_epi16(4);
+    let m_v = _mm256_set1_epi16(m as i16);
+    let zpad_v = _mm256_set1_epi16(ZPAD as i16);
+    let e_del_v = _mm256_set1_epi16(e_del as i16);
+    let oe_del_v = _mm256_set1_epi16(oe_del as i16);
+    let e_ins_v = _mm256_set1_epi16(e_ins as i16);
+    let oe_ins_v = _mm256_set1_epi16(oe_ins as i16);
+
+    for (group_idx, group) in jobs.chunks(LANES16).enumerate() {
+        let n_lanes = group.len();
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        let mut seq_q = vec![PAD; qmax * LANES16];
+        let mut seq_t = vec![PAD; tmax * LANES16];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES16],
+            [0usize; LANES16],
+            [i32::MAX; LANES16],
+            [i32::MAX; LANES16],
+        );
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES16 + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES16 + l] = ZPAD;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES16 + l] = b;
+            }
+        }
+
+        // i16 SoA DP state, one `__m256i` per column across the 16 lanes. `rowmax` stays i32; it is only
+        // read by the scalar bookkeeping. Plain wrapping i16 arithmetic is safe because the caller
+        // proved every ceiling is under `I16_SCORE_LIMIT` and the kill score is only `DEAD_CELL_SCORE`.
+        let mut h_prev = vec![0i16; qmax * LANES16];
+        let mut h_cur = vec![0i16; qmax * LANES16];
+        let mut e = vec![0i16; qmax * LANES16];
+        let mut rowmax = vec![0i32; tmax * LANES16];
+        let mut gmax = [0i32; LANES16];
+        let mut te = [-1i32; LANES16];
+        let mut qe = [0i32; LANES16];
+        let mut limit = [-1i32; LANES16];
+        let mut frozen = [false; LANES16];
+        for l in 0..n_lanes {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+
+        // Widen 16 u8 codes at `off` into an `i16x16`. `_mm256_cvtepu8_epi16` is the unsigned widen, so
+        // PAD (255) stays +255 and not -1, matching NEON's `vmovl_u8`.
+        let load_codes = |buf: &[u8], off: usize| -> __m256i {
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(buf.as_ptr().add(off) as *const __m128i))
+        };
+
+        // =====================================================================================
+        // Main DP, one target row per iteration. Structurally identical to `fwd_local_sw_neon`, at
+        // 16 lanes; only the per-cell arithmetic is vectorised, the bookkeeping stays scalar.
+        // =====================================================================================
+        for i in 0..tmax {
+            let t_v = load_codes(&seq_t, i * LANES16);
+            let mut f_v = zero;
+            let mut h_diag_v = zero;
+            let mut imax_v = zero;
+            let mut imax_col_v = zero; // min query column achieving this row's max
+            for j in 0..qmax {
+                let q_v = load_codes(&seq_q, j * LANES16);
+                // Four masks, four selects in increasing priority, exactly as the NEON i16 kernel:
+                //   eq        the bases match; n_mask either is N; zpad_mask query is profile padding;
+                //   pad_mask  cell is past a real position (dead target row, or query past the profile).
+                let eq = _mm256_cmpeq_epi16(t_v, q_v);
+                let n_mask = _mm256_or_si256(
+                    _mm256_cmpeq_epi16(t_v, four_v),
+                    _mm256_cmpeq_epi16(q_v, four_v),
+                );
+                let zpad_mask = _mm256_cmpeq_epi16(q_v, zpad_v);
+                let pad_mask =
+                    _mm256_or_si256(cge_epi16(t_v, m_v), _mm256_cmpgt_epi16(q_v, zpad_v));
+                let mut sc = bsl(eq, mtch_v, mis_v);
+                sc = bsl(n_mask, n_v, sc);
+                sc = bsl(zpad_mask, zero, sc); // ksw profile padding scores 0
+                sc = bsl(pad_mask, dead_v, sc); // dead padding: kill the cell outright
+
+                let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES16) as *const __m256i);
+                // H = max(0, H_diag + S, E, F); wrapping adds are in range by the ceiling guarantee.
+                let mut h_v = _mm256_add_epi16(h_diag_v, sc);
+                h_v = _mm256_max_epi16(h_v, zero);
+                h_v = _mm256_max_epi16(h_v, e_v);
+                // `mfe = max(0, H_diag + S, E)` excludes the serial F carry, so the F recurrence below
+                // reads it and the critical column chain stays f -> f (see the NEON i16 kernel).
+                let mfe = h_v;
+                h_v = _mm256_max_epi16(h_v, f_v);
+                // Strict signed `>`, so a tie keeps the earlier column.
+                let is_new_row_max = _mm256_cmpgt_epi16(h_v, imax_v);
+                imax_col_v = bsl(is_new_row_max, _mm256_set1_epi16(j as i16), imax_col_v);
+                imax_v = _mm256_max_epi16(imax_v, h_v);
+                _mm256_storeu_si256(h_cur.as_mut_ptr().add(j * LANES16) as *mut __m256i, h_v);
+
+                // E(i+1,j) = max(0, E - e_del, H - oe_del).
+                let e_new = _mm256_max_epi16(
+                    _mm256_sub_epi16(e_v, e_del_v),
+                    _mm256_sub_epi16(h_v, oe_del_v),
+                );
+                _mm256_storeu_si256(
+                    e.as_mut_ptr().add(j * LANES16) as *mut __m256i,
+                    _mm256_max_epi16(e_new, zero),
+                );
+                // F(i,j+1) = max(0, F - e_ins, mfe - oe_ins), reassociated off `mfe`.
+                let f_new = _mm256_max_epi16(
+                    _mm256_sub_epi16(f_v, e_ins_v),
+                    _mm256_sub_epi16(mfe, oe_ins_v),
+                );
+                f_v = _mm256_max_epi16(f_new, zero);
+                h_diag_v = _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES16) as *const __m256i);
+            }
+
+            let mut imax_arr = [0i16; LANES16];
+            let mut col_arr = [0i16; LANES16];
+            _mm256_storeu_si256(imax_arr.as_mut_ptr() as *mut __m256i, imax_v);
+            _mm256_storeu_si256(col_arr.as_mut_ptr() as *mut __m256i, imax_col_v);
+            for l in 0..n_lanes {
+                if i >= tlen[l] || frozen[l] {
+                    continue;
+                }
+                let row_max = imax_arr[l] as i32;
+                rowmax[i * LANES16 + l] = row_max;
+                if row_max > gmax[l] {
+                    gmax[l] = row_max;
+                    te[l] = i as i32;
+                    qe[l] = col_arr[l] as i32;
+                    if gmax[l] >= endsc[l] {
+                        frozen[l] = true;
+                        limit[l] = i as i32;
+                    }
+                }
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+
+            if (0..n_lanes).all(|l| frozen[l] || i + 1 >= tlen[l]) {
+                break;
+            }
+        }
+
+        extract_group(
+            n_lanes, group_idx, LANES16, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
+        );
+    }
+    out
+}
+
+/// Lanes for the AVX512 u8 kernel: one `__m512i` holds 64 bytes, twice the AVX2 u8 width. The i16
+/// AVX512 kernel reuses [`LANES32`] (32 words). As with every lane constant here, a wider group only
+/// adds padded work; no threshold moves, because every threshold is bwa's, not the register's.
+#[cfg(target_arch = "x86_64")]
+const LANES64: usize = 64;
+
+/// AVX512 `u8x64` forward local-SW: [`fwd_local_sw_avx2_u8`] widened to `__m512i`, 64 rescue jobs per
+/// group instead of 32. Mate-rescue jobs are cross-lane independent and near-uniform in size (query =
+/// read length, target = the insert-size window), so doubling the lane count keeps utilisation high;
+/// the kernel is throughput-bound after the F reassociation, which is the regime a wider vector helps.
+///
+/// AVX-512 changes the *spelling* of two things relative to AVX2, and both make the code simpler, not
+/// harder:
+///
+/// - **Comparisons return mask registers** (`__mmask64`), not vector masks. Unsigned compares are
+///   therefore *native*: `_mm512_cmpge_epu8_mask` / `_mm512_cmpgt_epu8_mask` replace AVX2's
+///   `max_epu8 == a` recovery, and there is no 127-boundary hazard to reason about.
+/// - **Blends take the mask directly**: `_mm512_mask_blend_epi8(k, a, b)` is `k ? b : a`, so the NEON
+///   `vbslq(mask, a, b) = mask ? a : b` becomes `_mm512_mask_blend_epi8(mask, b, a)` (operands swapped,
+///   same convention as the AVX2 `bsl`).
+///
+/// Everything else is identical to the AVX2 u8 kernel: saturating byte arithmetic supplies the
+/// `max(0, .)` clamps, scores are stored as magnitudes so the whole kernel stays unsigned, the F
+/// recurrence is reassociated off `mfe`, and the argmax column rides in the same byte lane as the
+/// scores (so the caller's 250-base query cap still holds at 64 lanes).
+///
+/// # Parameters / Returns
+/// As [`fwd_local_sw_batch`], same preconditions as [`fwd_local_sw_avx2_u8`]. Byte-identical to
+/// [`fwd_local_sw_scalar`] (`avx512_verify::avx512_matesw_u8_matches_scalar`, which runs only where
+/// `avx512bw` is present).
+///
+/// # Safety
+/// Caller must have confirmed AVX-512BW is available. Loads/stores use unchecked offsets bounded by
+/// `qmax`/`tmax`, derived from the same buffers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fwd_local_sw_avx512_u8(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    use std::arch::x86_64::*;
+
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    let mtch = mat[0] as u8;
+    let mispen = (-mat[1]) as u8;
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
+
+    let zero = _mm512_setzero_si512();
+    let mtch_v = _mm512_set1_epi8(mtch as i8);
+    let mispen_v = _mm512_set1_epi8(mispen as i8);
+    let one_v = _mm512_set1_epi8(1);
+    let four_v = _mm512_set1_epi8(4);
+    let m_v = _mm512_set1_epi8(m as i8);
+    let zpad_v = _mm512_set1_epi8(ZPAD as i8);
+    let e_del_v = _mm512_set1_epi8(e_del as i8);
+    let oe_del_v = _mm512_set1_epi8(oe_del as i8);
+    let e_ins_v = _mm512_set1_epi8(e_ins as i8);
+    let oe_ins_v = _mm512_set1_epi8(oe_ins as i8);
+
+    for (group_idx, group) in jobs.chunks(LANES64).enumerate() {
+        let n_lanes = group.len();
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        let mut seq_q = vec![PAD; qmax * LANES64];
+        let mut seq_t = vec![PAD; tmax * LANES64];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES64],
+            [0usize; LANES64],
+            [i32::MAX; LANES64],
+            [i32::MAX; LANES64],
+        );
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES64 + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES64 + l] = ZPAD;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES64 + l] = b;
+            }
+        }
+
+        let mut h_prev = vec![0u8; qmax * LANES64];
+        let mut h_cur = vec![0u8; qmax * LANES64];
+        let mut e = vec![0u8; qmax * LANES64];
+        let mut rowmax = vec![0i32; tmax * LANES64];
+        let mut gmax = [0i32; LANES64];
+        let mut te = [-1i32; LANES64];
+        let mut qe = [0i32; LANES64];
+        let mut limit = [-1i32; LANES64];
+        let mut frozen = [false; LANES64];
+        for l in 0..n_lanes {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+
+        for i in 0..tmax {
+            let t_v = _mm512_loadu_si512(seq_t.as_ptr().add(i * LANES64) as *const __m512i);
+            let mut f_v = zero;
+            let mut h_diag_v = zero;
+            let mut imax_v = zero;
+            let mut imax_col_v = zero;
+            for j in 0..qmax {
+                let q_v = _mm512_loadu_si512(seq_q.as_ptr().add(j * LANES64) as *const __m512i);
+                // Same four masks as the AVX2 u8 kernel, now as `__mmask64`. Unsigned `>=` / `>` are
+                // native here, so no `max_epu8`-based recovery and no 127 hazard.
+                let eq = _mm512_cmpeq_epi8_mask(t_v, q_v);
+                let n_mask =
+                    _mm512_cmpeq_epi8_mask(t_v, four_v) | _mm512_cmpeq_epi8_mask(q_v, four_v);
+                let zpad_mask = _mm512_cmpeq_epi8_mask(q_v, zpad_v);
+                let pad_mask =
+                    _mm512_cmpge_epu8_mask(t_v, m_v) | _mm512_cmpgt_epu8_mask(q_v, zpad_v);
+
+                let add_match = _mm512_adds_epu8(h_diag_v, mtch_v);
+                let sub_mis = _mm512_subs_epu8(h_diag_v, mispen_v);
+                let sub_n = _mm512_subs_epu8(h_diag_v, one_v);
+                // `mask ? a : b` = `mask_blend(mask, b, a)`. Applied in increasing priority, exactly the
+                // order the AVX2/NEON u8 kernels use.
+                let mut diag_v = _mm512_mask_blend_epi8(eq, sub_mis, add_match);
+                diag_v = _mm512_mask_blend_epi8(n_mask, diag_v, sub_n);
+                diag_v = _mm512_mask_blend_epi8(zpad_mask, diag_v, h_diag_v);
+                diag_v = _mm512_mask_blend_epi8(pad_mask, diag_v, zero);
+
+                let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES64) as *const __m512i);
+                let mfe = _mm512_max_epu8(diag_v, e_v);
+                let h_v = _mm512_max_epu8(mfe, f_v);
+                // Strict unsigned `>`, so a tie keeps the earlier column.
+                let is_new_row_max = _mm512_cmpgt_epu8_mask(h_v, imax_v);
+                imax_col_v =
+                    _mm512_mask_blend_epi8(is_new_row_max, imax_col_v, _mm512_set1_epi8(j as i8));
+                imax_v = _mm512_max_epu8(imax_v, h_v);
+                _mm512_storeu_si512(h_cur.as_mut_ptr().add(j * LANES64) as *mut __m512i, h_v);
+
+                let e_new = _mm512_max_epu8(
+                    _mm512_subs_epu8(e_v, e_del_v),
+                    _mm512_subs_epu8(h_v, oe_del_v),
+                );
+                _mm512_storeu_si512(e.as_mut_ptr().add(j * LANES64) as *mut __m512i, e_new);
+                f_v = _mm512_max_epu8(
+                    _mm512_subs_epu8(f_v, e_ins_v),
+                    _mm512_subs_epu8(mfe, oe_ins_v),
+                );
+                h_diag_v = _mm512_loadu_si512(h_prev.as_ptr().add(j * LANES64) as *const __m512i);
+            }
+
+            let mut imax_arr = [0u8; LANES64];
+            let mut col_arr = [0u8; LANES64];
+            _mm512_storeu_si512(imax_arr.as_mut_ptr() as *mut __m512i, imax_v);
+            _mm512_storeu_si512(col_arr.as_mut_ptr() as *mut __m512i, imax_col_v);
+            for l in 0..n_lanes {
+                if i >= tlen[l] || frozen[l] {
+                    continue;
+                }
+                let row_max = imax_arr[l] as i32;
+                rowmax[i * LANES64 + l] = row_max;
+                if row_max > gmax[l] {
+                    gmax[l] = row_max;
+                    te[l] = i as i32;
+                    qe[l] = col_arr[l] as i32;
+                    if gmax[l] >= endsc[l] {
+                        frozen[l] = true;
+                        limit[l] = i as i32;
+                    }
+                }
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+
+            if (0..n_lanes).all(|l| frozen[l] || i + 1 >= tlen[l]) {
+                break;
+            }
+        }
+
+        extract_group(
+            n_lanes, group_idx, LANES64, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
+        );
+    }
+    out
+}
+
+/// AVX512 `i16x32` forward local-SW: [`fwd_local_sw_avx2_i16`] widened to `__m512i`, 32 lanes. Selected
+/// on x86_64 when `avx512bw` is present and the batch overflows u8. Same mask-register simplifications
+/// as the AVX512 u8 kernel: `_mm512_cmp*_epi16_mask` yields `__mmask32`, `_mm512_mask_blend_epi16`
+/// consumes it directly, so the AVX2 `blendv`/`max_epi16 == a` recoveries disappear.
+///
+/// # Parameters / Returns
+/// As [`fwd_local_sw_batch`], same preconditions as [`fwd_local_sw_neon`]/[`fwd_local_sw_avx2_i16`].
+/// Byte-identical to [`fwd_local_sw_scalar`] (`avx512_verify::avx512_matesw_i16_matches_scalar`).
+///
+/// # Safety
+/// Caller must have confirmed AVX-512BW is available. Loads/stores use unchecked offsets bounded by
+/// `qmax`/`tmax`, derived from the same buffers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fwd_local_sw_avx512_i16(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    use std::arch::x86_64::*;
+
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    let mtch = mat[0] as i16;
+    let mis = mat[1] as i16;
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
+
+    let zero = _mm512_setzero_si512();
+    let mtch_v = _mm512_set1_epi16(mtch);
+    let mis_v = _mm512_set1_epi16(mis);
+    let n_v = _mm512_set1_epi16(-1);
+    let dead_v = _mm512_set1_epi16(DEAD_CELL_SCORE as i16);
+    let four_v = _mm512_set1_epi16(4);
+    let m_v = _mm512_set1_epi16(m as i16);
+    let zpad_v = _mm512_set1_epi16(ZPAD as i16);
+    let e_del_v = _mm512_set1_epi16(e_del as i16);
+    let oe_del_v = _mm512_set1_epi16(oe_del as i16);
+    let e_ins_v = _mm512_set1_epi16(e_ins as i16);
+    let oe_ins_v = _mm512_set1_epi16(oe_ins as i16);
+
+    for (group_idx, group) in jobs.chunks(LANES32).enumerate() {
+        let n_lanes = group.len();
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        let mut seq_q = vec![PAD; qmax * LANES32];
+        let mut seq_t = vec![PAD; tmax * LANES32];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES32],
+            [0usize; LANES32],
+            [i32::MAX; LANES32],
+            [i32::MAX; LANES32],
+        );
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES32 + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES32 + l] = ZPAD;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES32 + l] = b;
+            }
+        }
+
+        let mut h_prev = vec![0i16; qmax * LANES32];
+        let mut h_cur = vec![0i16; qmax * LANES32];
+        let mut e = vec![0i16; qmax * LANES32];
+        let mut rowmax = vec![0i32; tmax * LANES32];
+        let mut gmax = [0i32; LANES32];
+        let mut te = [-1i32; LANES32];
+        let mut qe = [0i32; LANES32];
+        let mut limit = [-1i32; LANES32];
+        let mut frozen = [false; LANES32];
+        for l in 0..n_lanes {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+
+        // Widen 32 u8 codes at `off` into an `i16x32`. `_mm512_cvtepu8_epi16` is the unsigned widen, so
+        // PAD (255) stays +255, matching NEON's `vmovl_u8`.
+        let load_codes = |buf: &[u8], off: usize| -> __m512i {
+            _mm512_cvtepu8_epi16(_mm256_loadu_si256(buf.as_ptr().add(off) as *const __m256i))
+        };
+
+        for i in 0..tmax {
+            let t_v = load_codes(&seq_t, i * LANES32);
+            let mut f_v = zero;
+            let mut h_diag_v = zero;
+            let mut imax_v = zero;
+            let mut imax_col_v = zero;
+            for j in 0..qmax {
+                let q_v = load_codes(&seq_q, j * LANES32);
+                let eq = _mm512_cmpeq_epi16_mask(t_v, q_v);
+                let n_mask =
+                    _mm512_cmpeq_epi16_mask(t_v, four_v) | _mm512_cmpeq_epi16_mask(q_v, four_v);
+                let zpad_mask = _mm512_cmpeq_epi16_mask(q_v, zpad_v);
+                let pad_mask =
+                    _mm512_cmpge_epi16_mask(t_v, m_v) | _mm512_cmpgt_epi16_mask(q_v, zpad_v);
+                // `mask ? a : b` = `mask_blend(mask, b, a)`, increasing priority.
+                let mut sc = _mm512_mask_blend_epi16(eq, mis_v, mtch_v);
+                sc = _mm512_mask_blend_epi16(n_mask, sc, n_v);
+                sc = _mm512_mask_blend_epi16(zpad_mask, sc, zero);
+                sc = _mm512_mask_blend_epi16(pad_mask, sc, dead_v);
+
+                let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES32) as *const __m512i);
+                let mut h_v = _mm512_add_epi16(h_diag_v, sc);
+                h_v = _mm512_max_epi16(h_v, zero);
+                h_v = _mm512_max_epi16(h_v, e_v);
+                let mfe = h_v;
+                h_v = _mm512_max_epi16(h_v, f_v);
+                let is_new_row_max = _mm512_cmpgt_epi16_mask(h_v, imax_v);
+                imax_col_v = _mm512_mask_blend_epi16(
+                    is_new_row_max,
+                    imax_col_v,
+                    _mm512_set1_epi16(j as i16),
+                );
+                imax_v = _mm512_max_epi16(imax_v, h_v);
+                _mm512_storeu_si512(h_cur.as_mut_ptr().add(j * LANES32) as *mut __m512i, h_v);
+
+                let e_new = _mm512_max_epi16(
+                    _mm512_sub_epi16(e_v, e_del_v),
+                    _mm512_sub_epi16(h_v, oe_del_v),
+                );
+                _mm512_storeu_si512(
+                    e.as_mut_ptr().add(j * LANES32) as *mut __m512i,
+                    _mm512_max_epi16(e_new, zero),
+                );
+                let f_new = _mm512_max_epi16(
+                    _mm512_sub_epi16(f_v, e_ins_v),
+                    _mm512_sub_epi16(mfe, oe_ins_v),
+                );
+                f_v = _mm512_max_epi16(f_new, zero);
+                h_diag_v = _mm512_loadu_si512(h_prev.as_ptr().add(j * LANES32) as *const __m512i);
+            }
+
+            let mut imax_arr = [0i16; LANES32];
+            let mut col_arr = [0i16; LANES32];
+            _mm512_storeu_si512(imax_arr.as_mut_ptr() as *mut __m512i, imax_v);
+            _mm512_storeu_si512(col_arr.as_mut_ptr() as *mut __m512i, imax_col_v);
+            for l in 0..n_lanes {
+                if i >= tlen[l] || frozen[l] {
+                    continue;
+                }
+                let row_max = imax_arr[l] as i32;
+                rowmax[i * LANES32 + l] = row_max;
+                if row_max > gmax[l] {
+                    gmax[l] = row_max;
+                    te[l] = i as i32;
+                    qe[l] = col_arr[l] as i32;
+                    if gmax[l] >= endsc[l] {
+                        frozen[l] = true;
+                        limit[l] = i as i32;
+                    }
+                }
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+
+            if (0..n_lanes).all(|l| frozen[l] || i + 1 >= tlen[l]) {
+                break;
+            }
+        }
+
+        extract_group(
+            n_lanes, group_idx, LANES32, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
+        );
+    }
+    out
+}
+
 /// Force-run verification of the AVX2 mate-rescue kernel against `fwd_local_sw_scalar`, byte-for-byte.
 ///
 /// On x86_64 the AVX2 path only *runs* when `is_x86_feature_detected!("avx2")`, which Rosetta reports
@@ -1808,6 +2513,362 @@ mod avx2_verify {
                     jobs[i].query.len()
                 );
             }
+        }
+    }
+
+    /// Reproducible mate-rescue-shaped jobs, shared by the u8 and i16 verify tests: a random target,
+    /// a random query planted 1-2 times with 0-3 substitutions, occasional N bases. Same generator and
+    /// shape as `avx2_matesw_u8_matches_scalar` and the NEON gate `tests::matesw_equals_scalar`.
+    fn rescue_jobs(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let (mut qbufs, mut tbufs) = (Vec::new(), Vec::new());
+        for _ in 0..n {
+            let qlen = 5 + (next() % 146) as usize;
+            let tlen = qlen + (next() % 500) as usize;
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            let copies = 1 + (next() % 2);
+            if next() % 5 != 0 {
+                for _ in 0..copies {
+                    if tlen > qlen {
+                        let at = (next() as usize) % (tlen - qlen + 1);
+                        for k in 0..qlen {
+                            t[at + k] = q[k];
+                        }
+                    }
+                }
+                for _ in 0..(next() % 4) {
+                    let p = (next() as usize) % qlen;
+                    q[p] = (next() % 4) as u8;
+                }
+            }
+            if next() % 4 == 0 {
+                q[(next() as usize) % qlen] = 4;
+            }
+            if next() % 4 == 0 {
+                t[(next() as usize) % tlen] = 4;
+            }
+            qbufs.push(q);
+            tbufs.push(t);
+        }
+        (qbufs, tbufs)
+    }
+
+    /// Compare the 16-lane AVX2 i16 kernel against the scalar lockstep, on the high-scoring `(10, 40)`
+    /// matrix whose ceiling overflows u8 and so selects the i16 path. This is the kernel that closes the
+    /// x86 gap for batches the u8 kernel cannot take (#12/#20): before it, they fell to the scalar DP.
+    ///
+    /// Like the u8 test, this calls the kernel *directly* rather than through `fwd_local_sw_batch`,
+    /// because under Rosetta the dispatch's `is_x86_feature_detected!("avx2")` reads false and would
+    /// route to scalar, so no AVX2 instruction would run.
+    #[test]
+    fn avx2_matesw_i16_matches_scalar() {
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let (qbufs, tbufs) = rescue_jobs(2000);
+        // match 10, mismatch -40: min(len) * 10 exceeds 250 for any query past ~25 bases, so the batch
+        // overflows u8 and this is exactly the i16 kernel's domain. Every value still fits i16.
+        let (a, b, minsc) = (10i8, 40i8, 190i32);
+        let mat = scmat(a, b);
+        let max_sc = a as i32;
+        let jobs: Vec<FwdJob> = qbufs
+            .iter()
+            .zip(tbufs.iter())
+            .map(|(q, t)| FwdJob {
+                query: q.as_slice(),
+                target: t.as_slice(),
+                minsc,
+                endsc: if t.len() % 2 == 0 { i32::MAX } else { 300 },
+            })
+            .collect();
+        let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+        // SAFETY: standard mat and every ceiling under I16_SCORE_LIMIT; AVX2 is assumed, not detected
+        // (Rosetta lies), so the kernel is exercised on this Apple-Silicon host as well as native x86.
+        let got =
+            unsafe { fwd_local_sw_avx2_i16(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
+        for i in 0..jobs.len() {
+            assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
+        }
+    }
+}
+
+/// Byte-identity gate for the two AVX-512 mate-rescue kernels, against `fwd_local_sw_scalar`.
+///
+/// Unlike the AVX2 tests, these cannot run under Rosetta: it does not implement AVX-512, so executing
+/// one of these kernels there faults. Each test therefore *self-skips* when `avx512bw` is absent -- so
+/// on this Apple-Silicon host and on any AVX-512-less x86 runner it is a no-op, and it only truly
+/// validates on a GitHub-hosted (or other) runner whose CPU exposes AVX-512BW. That is by design: the
+/// kernels are gated the same way at runtime, so a machine that skips the test also never dispatches
+/// to them. CI logs `/proc/cpuinfo` flags so a run where these actually executed is identifiable.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx512_verify {
+    use super::*;
+
+    /// Same bwa 5x5 matrix helper as the sibling test modules (they cannot see each other's privates).
+    fn scmat(a: i8, b: i8) -> Vec<i8> {
+        let mut mat = vec![0i8; 25];
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { a } else { -b };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+        mat
+    }
+
+    /// Same reproducible mate-rescue job generator as `avx2_verify::rescue_jobs`, duplicated because
+    /// sibling test modules cannot share private items (the established pattern in this file).
+    fn rescue_jobs(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let (mut qbufs, mut tbufs) = (Vec::new(), Vec::new());
+        for _ in 0..n {
+            let qlen = 5 + (next() % 146) as usize;
+            let tlen = qlen + (next() % 500) as usize;
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            let copies = 1 + (next() % 2);
+            if next() % 5 != 0 {
+                for _ in 0..copies {
+                    if tlen > qlen {
+                        let at = (next() as usize) % (tlen - qlen + 1);
+                        for k in 0..qlen {
+                            t[at + k] = q[k];
+                        }
+                    }
+                }
+                for _ in 0..(next() % 4) {
+                    let p = (next() as usize) % qlen;
+                    q[p] = (next() % 4) as u8;
+                }
+            }
+            if next() % 4 == 0 {
+                q[(next() as usize) % qlen] = 4;
+            }
+            if next() % 4 == 0 {
+                t[(next() as usize) % tlen] = 4;
+            }
+            qbufs.push(q);
+            tbufs.push(t);
+        }
+        (qbufs, tbufs)
+    }
+
+    /// The 64-lane AVX-512 u8 kernel vs the scalar lockstep, on stock DNA scores. Skipped where the CPU
+    /// lacks AVX-512BW (including under Rosetta), so it is only a real check on AVX-512 hardware.
+    #[test]
+    fn avx512_matesw_u8_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx512bw") {
+            eprintln!("skipping avx512_matesw_u8_matches_scalar: no avx512bw on this CPU");
+            return;
+        }
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let (qbufs, tbufs) = rescue_jobs(2000);
+        let (a, b, minsc) = (1i8, 4i8, 19i32);
+        let mat = scmat(a, b);
+        let max_sc = a as i32;
+        let jobs: Vec<FwdJob> = qbufs
+            .iter()
+            .zip(tbufs.iter())
+            .map(|(q, t)| FwdJob {
+                query: q.as_slice(),
+                target: t.as_slice(),
+                minsc,
+                endsc: if t.len() % 2 == 0 { i32::MAX } else { 30 },
+            })
+            .collect();
+        let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+        // SAFETY: avx512bw just confirmed; u8 preconditions hold for these stock-DNA-scored jobs.
+        let got =
+            unsafe { fwd_local_sw_avx512_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
+        for i in 0..jobs.len() {
+            assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
+        }
+    }
+
+    /// The 32-lane AVX-512 i16 kernel vs the scalar lockstep, on the high-scoring `(10, 40)` matrix that
+    /// overflows u8. Skipped without AVX-512BW.
+    #[test]
+    fn avx512_matesw_i16_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx512bw") {
+            eprintln!("skipping avx512_matesw_i16_matches_scalar: no avx512bw on this CPU");
+            return;
+        }
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let (qbufs, tbufs) = rescue_jobs(2000);
+        let (a, b, minsc) = (10i8, 40i8, 190i32);
+        let mat = scmat(a, b);
+        let max_sc = a as i32;
+        let jobs: Vec<FwdJob> = qbufs
+            .iter()
+            .zip(tbufs.iter())
+            .map(|(q, t)| FwdJob {
+                query: q.as_slice(),
+                target: t.as_slice(),
+                minsc,
+                endsc: if t.len() % 2 == 0 { i32::MAX } else { 300 },
+            })
+            .collect();
+        let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+        // SAFETY: avx512bw just confirmed; every ceiling is under I16_SCORE_LIMIT and mat is standard.
+        let got =
+            unsafe { fwd_local_sw_avx512_i16(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
+        for i in 0..jobs.len() {
+            assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
+        }
+    }
+}
+
+/// Same-runner A/B throughput probe for the x86 rescue kernels: scalar vs AVX2 vs (where present)
+/// AVX-512, on one set of mate-rescue-shaped jobs. `#[ignore]`d so it never runs in the normal test
+/// pass; CI's `bench-x86` workflow runs it with `--ignored --nocapture`.
+///
+/// This is the *trustworthy* half of the x86 measurement story (issue #20). It is not a bwa-mem2
+/// head-to-head, but it needs no reference genome and, crucially, times all three kernels on the
+/// **same** runner in the **same** process, so the CPU model and the VM's noisy neighbours cancel in
+/// the ratio. Absolute Gcell/s from a shared cloud runner is meaningless; the scalar-relative and
+/// avx2-relative speedups are what to read. The end-to-end small-reference A/B in the same workflow
+/// supplies the (deliberately caveated) whole-pipeline number.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    fn scmat(a: i8, b: i8) -> Vec<i8> {
+        let mut mat = vec![0i8; 25];
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { a } else { -b };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+        mat
+    }
+
+    /// Near-uniform mate-rescue jobs: 150 bp query, ~500 bp window, the query planted once with a few
+    /// substitutions. Uniform dimensions are the realistic case (query = read length, window = the
+    /// insert-size interval) and the one where wide vectors keep every lane busy.
+    fn bench_jobs(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut state = 0xdead_beef_1234_5678u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let (mut qbufs, mut tbufs) = (Vec::new(), Vec::new());
+        for _ in 0..n {
+            let qlen = 150usize;
+            let tlen = 500usize;
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            let at = (next() as usize) % (tlen - qlen + 1);
+            for k in 0..qlen {
+                t[at + k] = q[k];
+            }
+            for _ in 0..3 {
+                let p = (next() as usize) % qlen;
+                q[p] = (next() % 4) as u8;
+            }
+            qbufs.push(q);
+            tbufs.push(t);
+        }
+        (qbufs, tbufs)
+    }
+
+    #[test]
+    #[ignore = "throughput probe, run explicitly in the bench-x86 CI workflow"]
+    fn rescue_kernel_ab() {
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let (a, b, minsc) = (1i8, 4i8, 19i32); // stock DNA scores => the u8 kernels
+        let mat = scmat(a, b);
+        let max_sc = a as i32;
+        let (qbufs, tbufs) = bench_jobs(8192);
+        let jobs: Vec<FwdJob> = qbufs
+            .iter()
+            .zip(tbufs.iter())
+            .map(|(q, t)| FwdJob {
+                query: q.as_slice(),
+                target: t.as_slice(),
+                minsc,
+                endsc: i32::MAX,
+            })
+            .collect();
+        // "Cells" as issue #12 counts them: real query x real target, summed over jobs.
+        let cells: u64 = jobs
+            .iter()
+            .map(|j| (j.query.len() * j.target.len()) as u64)
+            .sum();
+
+        // Time the best of several reps (min wall = least noise), after one warm-up rep.
+        let reps = 5;
+        let bench = |label: &str, run: &dyn Fn() -> Vec<(i32, i32, i32, i32, i32)>| -> f64 {
+            let _ = run(); // warm up
+            let mut best = f64::INFINITY;
+            for _ in 0..reps {
+                let t0 = Instant::now();
+                let out = run();
+                let dt = t0.elapsed().as_secs_f64();
+                std::hint::black_box(&out);
+                best = best.min(dt);
+            }
+            let gcell = cells as f64 / best / 1e9;
+            eprintln!(
+                "  {label:<10} {best_ms:>8.2} ms   {gcell:>6.3} Gcell/s",
+                best_ms = best * 1e3
+            );
+            best
+        };
+
+        eprintln!(
+            "rescue_kernel_ab: {} jobs, {} DP cells (150 bp query, 500 bp window), best of {reps}",
+            jobs.len(),
+            cells
+        );
+        let scalar = bench("scalar", &|| {
+            fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+        });
+        // AVX2 is called directly so it is exercised even under Rosetta; on a native runner it is the
+        // same code the dispatch selects.
+        let avx2 = bench("avx2_u8", &|| unsafe {
+            fwd_local_sw_avx2_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+        });
+        eprintln!("  avx2 vs scalar: {:.2}x", scalar / avx2);
+        if std::arch::is_x86_feature_detected!("avx512bw") {
+            let avx512 = bench("avx512_u8", &|| unsafe {
+                fwd_local_sw_avx512_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+            });
+            eprintln!(
+                "  avx512 vs scalar: {:.2}x   avx512 vs avx2: {:.2}x",
+                scalar / avx512,
+                avx2 / avx512
+            );
+        } else {
+            eprintln!("  avx512_u8  skipped (no avx512bw on this runner)");
         }
     }
 }

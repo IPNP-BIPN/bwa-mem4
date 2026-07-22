@@ -1,0 +1,177 @@
+# x86_64 performance measurement. Deliberately NOT a gating check and NOT on push: benchmarks on
+# shared cloud runners are noisy, and a red X on a noisy number teaches nothing. Runs on manual
+# dispatch and weekly, and prints results for a human to read.
+#
+# Two jobs, matching the two honest levels of an x86 measurement (see the README caveat and
+# crates/bwa-neon/src/matesw.rs):
+#   kernel-ab          scalar vs AVX2 vs AVX-512 rescue-kernel throughput, all three timed in ONE
+#                      process on ONE runner, so the CPU model and noisy neighbours cancel in the
+#                      ratio. This is the trustworthy signal for whether the vector kernels help.
+#   endtoend-smallref  bwa-mem4 vs bwa-mem2 on a single human chromosome, both interleaved in one
+#                      job. A real whole-pipeline number, but small-scale and cloud-noisy by nature,
+#                      so read it as directional, not as the headline ratio.
+name: bench-x86
+
+on:
+  workflow_dispatch:
+    inputs:
+      read_pairs:
+        description: "Read pairs to simulate for the end-to-end job"
+        default: "2000000"
+        required: false
+  schedule:
+    # Mondays 05:00 UTC, offset from the parity/CI schedules.
+    - cron: "0 5 * * 1"
+
+concurrency:
+  group: bench-x86-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Ship-baseline codegen: the SIMD kernels are chosen at RUNTIME by feature detection, so an empty
+  # RUSTFLAGS still runs AVX2/AVX-512 on a runner that has them. This makes the end-to-end job time
+  # the same code path the released binary takes. (Overrides .cargo/config.toml's target-cpu=native.)
+  RUSTFLAGS: ""
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kernel-ab:
+    name: rescue kernel A/B (scalar vs AVX2 vs AVX-512)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log CPU SIMD features
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The kernel bench is an `#[ignore]`d in-crate test; `--ignored --nocapture` runs it and prints
+      # the scalar/AVX2/AVX-512 table. Where the runner lacks avx512bw the AVX-512 line self-skips
+      # (the "Log CPU SIMD features" step above shows whether that happened).
+      - name: Rescue kernel A/B
+        run: cargo test --release -p bwa-mem4-neon rescue_kernel_ab -- --ignored --nocapture
+
+  endtoend-smallref:
+    name: end-to-end vs bwa-mem2 (single chromosome, cloud-noisy)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash -el {0} # login shell so the micromamba env is active
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log CPU SIMD features
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "nproc: $(nproc)"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + wgsim + samtools (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          create-args: >-
+            bwa-mem2
+            wgsim
+            samtools
+          channels: conda-forge,bioconda
+
+      - name: Build bwa-mem4 (release)
+        shell: bash
+        run: cargo build --release -p bwa-mem4
+
+      - name: Fetch reference (GRCh38 chr21)
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz
+          gunzip -f chr21.fa.gz
+          ls -la chr21.fa
+
+      - name: Build shared index
+        run: |
+          cd work
+          # bwa-mem4's index is byte-identical to bwa-mem2's, so one build serves both aligners.
+          ../target/release/bwa-mem4 index chr21.fa
+
+      - name: Simulate reads
+        run: |
+          cd work
+          n="${{ github.event.inputs.read_pairs || '2000000' }}"
+          # Fixed seed so the read set is reproducible across runs.
+          wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          echo "simulated $n pairs"
+
+      - name: Interleaved head-to-head
+        run: |
+          cd work
+          T="$(nproc)"
+          M2=bwa-mem2
+          M4=../target/release/bwa-mem4
+          run_one() { # $1=tool $2=out ; prints "wall_s maxrss_kb"
+            /usr/bin/time -f '%e %M' -o t.txt "$@" > /dev/null 2>err.txt || { cat err.txt; exit 1; }
+            cat t.txt
+          }
+          echo "== warm-up (untimed) =="
+          $M2 mem -t "$T" chr21.fa r1.fq r2.fq > m2.sam 2> /dev/null
+          $M4 mem -t "$T" chr21.fa r1.fq r2.fq > m4.sam 2> /dev/null
+
+          echo "== record identity (informational; parity.yml is the real gate) =="
+          m2md5=$(grep -v '^@' m2.sam | md5sum | cut -d' ' -f1)
+          m4md5=$(grep -v '^@' m4.sam | md5sum | cut -d' ' -f1)
+          if [ "$m2md5" = "$m4md5" ]; then echo "records byte-identical ($m2md5)"; else echo "records DIFFER: mem2=$m2md5 mem4=$m4md5"; fi
+
+          echo "== timed reps (interleaved, best-of) =="
+          best_m2=""; best_m4=""
+          for rep in 1 2 3; do
+            r2=$(run_one $M2 mem -t "$T" chr21.fa r1.fq r2.fq); w2=${r2%% *}
+            r4=$(run_one $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w4=${r4%% *}
+            echo "rep $rep: bwa-mem2 ${r2} | bwa-mem4 ${r4}  (wall_s maxrss_kb)"
+            best_m2=$(awk -v a="$best_m2" -v b="$w2" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
+            best_m4=$(awk -v a="$best_m4" -v b="$w4" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
+          done
+
+          # Rescue-kernel tier sweep on bwa-mem4, same host, same data (BWA4_RESCUE_TIER, mirroring
+          # the fork's BWAMEM3_FORCE_TIER). This attributes end-to-end time to the rescue kernel: the
+          # avx512-vs-avx2 delta here is the real-hardware answer to whether the 512-bit kernel helps,
+          # which the bwa-mem2 head-to-head above cannot isolate. A forced tier absent on this host
+          # falls back to scalar (see the stderr "[bwa-mem4] BWA4_RESCUE_TIER=..." line).
+          echo "== bwa-mem4 rescue-tier sweep (same host) =="
+          for T4 in scalar avx2 avx512; do
+            export BWA4_RESCUE_TIER="$T4"
+            best=""
+            for rep in 1 2; do
+              r=$(run_one $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w=${r%% *}
+              best=$(awk -v a="$best" -v b="$w" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
+            done
+            unset BWA4_RESCUE_TIER
+            echo "  tier=$T4: best ${best}s"
+          done
+
+          echo
+          echo "== summary (single chr21, $T threads, cloud-noisy: DIRECTIONAL ONLY) =="
+          echo "best wall: bwa-mem2 ${best_m2}s | bwa-mem4 ${best_m4}s"
+          awk -v m2="$best_m2" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs bwa-mem2: %.2fx\n", m2/m4}'
+          echo "NOTE: shared-runner VM, single chromosome. Not the headline ratio; see README."
