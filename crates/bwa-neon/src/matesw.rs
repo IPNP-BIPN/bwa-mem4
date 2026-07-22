@@ -1176,7 +1176,9 @@ const LANES16: usize = 16;
 #[allow(clippy::too_many_arguments)]
 unsafe fn fwd_local_sw_neon_u8(
     jobs: &[FwdJob],
-    m: usize,
+    // Matrix dimension (5). No longer read now that dead-cell detection keys on the PAD byte's high
+    // bit rather than `>= m`; kept in the signature for parity with the i16 and AVX2 kernels.
+    _m: usize,
     mat: &[i8],
     o_del: i32,
     e_del: i32,
@@ -1197,16 +1199,41 @@ unsafe fn fwd_local_sw_neon_u8(
     // *magnitudes* here, not signed values: `mispen_v` and `one_v` are subtracted rather than added,
     // which is what lets the whole kernel stay unsigned.
     let zero = vdupq_n_u8(0);
-    let mtch_v = vdupq_n_u8(mtch);
-    let mispen_v = vdupq_n_u8(mispen);
-    let one_v = vdupq_n_u8(1); // N penalty
     let four_v = vdupq_n_u8(4);
-    let m_v = vdupq_n_u8(m as u8);
     let zpad_v = vdupq_n_u8(ZPAD);
     let e_del_v = vdupq_n_u8(e_del as u8);
     let oe_del_v = vdupq_n_u8(oe_del as u8);
     let e_ins_v = vdupq_n_u8(e_ins as u8);
     let oe_ins_v = vdupq_n_u8(oe_ins as u8);
+
+    // Substitution-score table, indexed by `target XOR query` and biased by `mispen` so every entry
+    // is a non-negative magnitude: one saturating add then one de-biasing saturating subtract
+    // reproduce `max(0, h_diag + S)` exactly, replacing the split form's three candidate adds and
+    // four selects. Real base codes are 0-3, so a real-vs-real XOR is 0 (match, +a) or 1-3
+    // (mismatch, -b); an XOR of 4-7 means exactly one operand is N (code 4), scoring bwa's -1. XOR
+    // >= 8 only arises from a PAD byte (255) and is masked out below, so those slots are don't-care.
+    // The both-N cell reads XOR 0 (a false match) and is corrected by the `t == 4` blend in the loop.
+    //
+    // The bias is `mispen`, the smallest value making the mismatch entry (bias - b) non-negative.
+    // Correctness needs the biased add not to saturate early: `max h_diag + bias + mtch < 256`. The
+    // caller caps the u8 kernel at a score ceiling under `U8_SCORE_LIMIT` (250), and for the DNA
+    // scores that select this kernel `mispen + mtch` is small (5 for bwa's a=1,b=4), so 249+5 = 254
+    // holds. Asserted so a future parameter set that breaks it fails loudly rather than silently.
+    debug_assert!(
+        (U8_SCORE_LIMIT as u32) + mispen as u32 + mtch as u32 <= 256,
+        "u8 rescue score table would saturate: mispen {mispen} + mtch {mtch} + ceiling too large"
+    );
+    let bias = mispen;
+    let mut tbl = [0u8; 16];
+    tbl[0] = bias + mtch; // match: +a
+                          // tbl[1..=3] = bias - b = 0 (mismatch), already zero
+    for e in tbl.iter_mut().take(8).skip(4) {
+        *e = bias - 1; // exactly one N (code 4): bwa scores -1
+    }
+    let score_tbl = vld1q_u8(tbl.as_ptr());
+    let bias_v = vdupq_n_u8(bias);
+    let n_score_v = vdupq_n_u8(bias - 1);
+    let high_bit_v = vdupq_n_u8(0x80);
 
     // Group setup is identical to `fwd_local_sw_scalar` at 16 lanes; see there for each variable.
     for (group_idx, group) in jobs.chunks(LANES16).enumerate() {
@@ -1277,32 +1304,26 @@ unsafe fn fwd_local_sw_neon_u8(
             for j in 0..qmax {
                 // Lane `l` = query base at column `j` of job `l`.
                 let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
-                // diag_v = max(0, h_diag + score): saturating add/sub floor at 0, no explicit max-0.
-                // Masks, all-ones per lane where they apply: `eq` the bases match, `n_mask` either is
-                // N, `zpad_mask` the query column is ksw profile padding, `pad_mask` the cell is
-                // past a real position (dead row, or query past the padded profile).
-                let eq = vceqq_u8(t_v, q_v);
-                let n_mask = vorrq_u8(vceqq_u8(t_v, four_v), vceqq_u8(q_v, four_v));
+                // diag_v = max(0, h_diag + score). The substitution score comes from one table lookup
+                // on `target XOR query` (see `score_tbl`), biased so it applies as a single saturating
+                // add followed by a de-biasing saturating subtract. Both saturations floor the result
+                // at 0, so no explicit `max(0, .)` is needed.
+                let xor_v = veorq_u8(t_v, q_v);
+                let mut sbt = vqtbl1q_u8(score_tbl, xor_v);
+                // A target N (code 4) scores -1, including the both-N cell the table read as a match
+                // (XOR 0). Only the target can be a real code XOR-ing to 0 with an N, so `t == 4`
+                // alone catches every case the table gets wrong; a query-side N already lands on a
+                // 4-7 slot and needs no fix.
+                sbt = vbslq_u8(vceqq_u8(t_v, four_v), n_score_v, sbt);
+                let scored = vqsubq_u8(vqaddq_u8(h_diag_v, sbt), bias_v);
+                // `zpad_mask`: the query column is ksw profile padding (score 0), so the cell carries
+                // the diagonal through unchanged. `pad_mask`: the cell is dead (a PAD byte, 255, the
+                // only value with bit 7 set), forced to 0 -- one `vtstq` on the high bit in place of
+                // the old `>= m` / `> ZPAD` pair.
                 let zpad_mask = vceqq_u8(q_v, zpad_v);
-                let pad_mask = vorrq_u8(vcgeq_u8(t_v, m_v), vcgtq_u8(q_v, zpad_v));
-                // Rather than build a score and add it, each of the four cases is applied directly
-                // to `h_diag` as a saturating add or subtract. That is what removes the need for a
-                // signed intermediate: a mismatch at h_diag = 2 with penalty 4 saturates to 0, which
-                // is exactly what `max(0, h_diag - 4)` should give, whereas a wrapping sub gives 254.
-                // The three candidate values of `max(0, H(i-1,j-1) + S)`, computed unconditionally
-                // for every lane and then selected between: the match case, the mismatch case, and
-                // the N case. Lane `l` of each is job `l`'s value.
-                let add_match = vqaddq_u8(h_diag_v, mtch_v);
-                let sub_mis = vqsubq_u8(h_diag_v, mispen_v);
-                // N scores -1 in bwa's matrix, not -b, hence a separate constant from `mispen_v`.
-                let sub_n = vqsubq_u8(h_diag_v, one_v);
-                // Lane `l` = max(0, H(i-1, j-1) + S) for job `l`, the diagonal arrival term, after
-                // the four selects below resolve which case this cell is.
-                let mut diag_v = vbslq_u8(eq, add_match, sub_mis);
-                diag_v = vbslq_u8(n_mask, sub_n, diag_v);
-                diag_v = vbslq_u8(zpad_mask, h_diag_v, diag_v); // score 0: diagonal passes through
-                                                                // Dead padding: force 0 outright. In the i16 kernel this is a `DEAD_CELL_SCORE`
-                                                                // that the `max(0, .)` then clamps; here 0 is written directly, same result.
+                let pad_mask = vtstq_u8(vorrq_u8(t_v, q_v), high_bit_v);
+                // Lane `l` = max(0, H(i-1, j-1) + S) for job `l`, after the padding overrides.
+                let mut diag_v = vbslq_u8(zpad_mask, h_diag_v, scored);
                 diag_v = vbslq_u8(pad_mask, zero, diag_v);
 
                 // Lane `l` = E(i, j) for job `l`, the deletion carry left by the previous row.
