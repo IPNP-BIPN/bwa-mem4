@@ -17,7 +17,7 @@ on:
     inputs:
       read_pairs:
         description: "Read pairs to simulate for the end-to-end job"
-        default: "2000000"
+        default: "1000000"
         required: false
   schedule:
     # Mondays 05:00 UTC, offset from the parity/CI schedules.
@@ -118,13 +118,16 @@ jobs:
       - name: Build shared index
         run: |
           cd work
-          # bwa-mem4's index is byte-identical to bwa-mem2's, so one build serves both aligners.
-          ../target/release/bwa-mem4 index chr21.fa
+          # Build with bwa-mem2's own indexer so the index is unambiguously bwa-mem2-readable;
+          # bwa-mem4 reads the identical files. (Building it with bwa-mem4 and feeding bwa-mem2 is
+          # what silently hung the first run.)
+          bwa-mem2 index chr21.fa
+          ls -la chr21.fa.*
 
       - name: Simulate reads
         run: |
           cd work
-          n="${{ github.event.inputs.read_pairs || '2000000' }}"
+          n="${{ github.event.inputs.read_pairs || '1000000' }}"
           # Fixed seed so the read set is reproducible across runs.
           wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
           echo "simulated $n pairs"
@@ -132,47 +135,55 @@ jobs:
       - name: Interleaved head-to-head
         run: |
           cd work
-          T="$(nproc)"
+          # Cap threads: a shared runner exposes few usable vCPUs even when nproc is large, and
+          # oversubscribing thrashes. Every alignment is wrapped in `timeout` so a hang fails the
+          # step in minutes with a visible message instead of eating the 60-min budget silently.
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
           M2=bwa-mem2
           M4=../target/release/bwa-mem4
-          run_one() { # $1=tool $2=out ; prints "wall_s maxrss_kb"
-            /usr/bin/time -f '%e %M' -o t.txt "$@" > /dev/null 2>err.txt || { cat err.txt; exit 1; }
+          echo "threads=$T"
+          # Runs the aligner under /usr/bin/time with a hard timeout; prints "wall_s maxrss_kb".
+          # $1 = label (for the failure message), rest = command.
+          run_one() {
+            local label="$1"; shift
+            if ! timeout 300 /usr/bin/time -f '%e %M' -o t.txt "$@" > /dev/null 2>err.txt; then
+              echo "FAILED/timeout: $label" >&2; tail -20 err.txt >&2; exit 1
+            fi
             cat t.txt
           }
-          echo "== warm-up (untimed) =="
-          $M2 mem -t "$T" chr21.fa r1.fq r2.fq > m2.sam 2> /dev/null
-          $M4 mem -t "$T" chr21.fa r1.fq r2.fq > m4.sam 2> /dev/null
+
+          echo "== warm-up (untimed, verifies both aligners read the index) =="
+          run_one "warmup bwa-mem2" $M2 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
+          $M2 mem -t "$T" chr21.fa r1.fq r2.fq > m2.sam 2>/dev/null
+          run_one "warmup bwa-mem4" $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
+          $M4 mem -t "$T" chr21.fa r1.fq r2.fq > m4.sam 2>/dev/null
 
           echo "== record identity (informational; parity.yml is the real gate) =="
           m2md5=$(grep -v '^@' m2.sam | md5sum | cut -d' ' -f1)
           m4md5=$(grep -v '^@' m4.sam | md5sum | cut -d' ' -f1)
           if [ "$m2md5" = "$m4md5" ]; then echo "records byte-identical ($m2md5)"; else echo "records DIFFER: mem2=$m2md5 mem4=$m4md5"; fi
 
-          echo "== timed reps (interleaved, best-of) =="
+          echo "== timed reps (interleaved, best-of 2) =="
           best_m2=""; best_m4=""
-          for rep in 1 2 3; do
-            r2=$(run_one $M2 mem -t "$T" chr21.fa r1.fq r2.fq); w2=${r2%% *}
-            r4=$(run_one $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w4=${r4%% *}
+          for rep in 1 2; do
+            r2=$(run_one "mem2 rep$rep" $M2 mem -t "$T" chr21.fa r1.fq r2.fq); w2=${r2%% *}
+            r4=$(run_one "mem4 rep$rep" $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w4=${r4%% *}
             echo "rep $rep: bwa-mem2 ${r2} | bwa-mem4 ${r4}  (wall_s maxrss_kb)"
             best_m2=$(awk -v a="$best_m2" -v b="$w2" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
             best_m4=$(awk -v a="$best_m4" -v b="$w4" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
           done
 
           # Rescue-kernel tier sweep on bwa-mem4, same host, same data (BWA4_RESCUE_TIER, mirroring
-          # the fork's BWAMEM3_FORCE_TIER). This attributes end-to-end time to the rescue kernel: the
-          # avx512-vs-avx2 delta here is the real-hardware answer to whether the 512-bit kernel helps,
-          # which the bwa-mem2 head-to-head above cannot isolate. A forced tier absent on this host
-          # falls back to scalar (see the stderr "[bwa-mem4] BWA4_RESCUE_TIER=..." line).
-          echo "== bwa-mem4 rescue-tier sweep (same host) =="
+          # the fork's BWAMEM3_FORCE_TIER). Attributes end-to-end time to the rescue kernel: the
+          # avx512-vs-avx2 delta is the real-hardware answer to whether the 512-bit kernel helps,
+          # which the bwa-mem2 head-to-head cannot isolate. A forced tier absent on this host falls
+          # back to scalar (watch for the "[bwa-mem4] BWA4_RESCUE_TIER=..." stderr line).
+          echo "== bwa-mem4 rescue-tier sweep (same host, 1 rep each) =="
           for T4 in scalar avx2 avx512; do
             export BWA4_RESCUE_TIER="$T4"
-            best=""
-            for rep in 1 2; do
-              r=$(run_one $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w=${r%% *}
-              best=$(awk -v a="$best" -v b="$w" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
-            done
+            r=$(run_one "tier=$T4" $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w=${r%% *}
             unset BWA4_RESCUE_TIER
-            echo "  tier=$T4: best ${best}s"
+            echo "  tier=$T4: ${w}s"
           done
 
           echo
