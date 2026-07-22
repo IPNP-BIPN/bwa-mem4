@@ -55,7 +55,7 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:
@@ -127,7 +127,35 @@ jobs:
               continue
             fi
             echo "::group::publish $c"
-            cargo publish -p "$c"
+            # crates.io rate-limits publishing NEW crate names: a burst, then a slow refill. A ten-
+            # crate workspace exhausts the burst partway and the rest 429 with an exact retry time
+            # ("Please try again after <date>"). Aborting there leaves the workspace half-published,
+            # so instead wait until the time crates.io names and retry the SAME crate. The `for`
+            # bounds it so a genuinely stuck publish cannot loop forever.
+            published=false
+            for attempt in $(seq 1 30); do
+              if cargo publish -p "$c" 2>/tmp/pub.err; then
+                published=true
+                break
+              fi
+              cat /tmp/pub.err
+              if ! grep -q "429 Too Many Requests" /tmp/pub.err; then
+                echo "::error::publish of $c failed for a non-rate-limit reason"
+                exit 1
+              fi
+              # Parse the RFC-2822 instant crates.io tells us to wait for; fall back to 130s.
+              when=$(sed -n 's/.*try again after \([^.]*\) and see.*/\1/p' /tmp/pub.err | head -1)
+              target=$(date -u -d "$when" +%s 2>/dev/null || echo "")
+              now=$(date -u +%s)
+              if [ -n "$target" ] && [ "$target" -gt "$now" ]; then
+                wait=$(( target - now + 10 ))
+              else
+                wait=130
+              fi
+              echo "$c rate-limited (attempt $attempt); waiting ${wait}s"
+              sleep "$wait"
+            done
+            [ "$published" = true ] || { echo "::error::$c never published within the retry budget"; exit 1; }
             echo "::endgroup::"
             # crates.io indexes asynchronously; the next crate cannot resolve this one until it is
             # visible. Poll rather than sleeping a fixed guess.
