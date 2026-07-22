@@ -1,9 +1,10 @@
 # Bioconda packaging for bwa-mem4
 
-`meta.yaml` and `build.sh` are a ready-to-submit Bioconda recipe. Bioconda is a
-third-party channel: recipes live in `bioconda/bioconda-recipes` and are merged
-by their maintainers after their bot builds and lints them, so this cannot be
-published from here. The steps:
+`meta.yaml` and `build.sh` are the Bioconda recipe. It has been **submitted** as
+bioconda/bioconda-recipes#67394; Bioconda's `@BiocondaBot` builds and lints the
+PR and their maintainers merge it (this repo cannot publish to the bioconda
+channel itself). The recipe here is the source of truth; keep it in sync with
+what lands there. For reference, the original submission steps were:
 
 1. **Prerequisite (done):** a `v4.0.0` GitHub release exists. The recipe builds
    from its source tarball; `meta.yaml`'s `sha256` is the checksum of
