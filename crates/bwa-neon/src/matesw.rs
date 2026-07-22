@@ -1068,6 +1068,10 @@ unsafe fn fwd_local_sw_neon(
                 let mut h_v = vaddq_s16(h_diag_v, sc);
                 h_v = vmaxq_s16(h_v, zero);
                 h_v = vmaxq_s16(h_v, e_v);
+                // `mfe = max(0, H_diag + S, E)` is the part of H that does not depend on the serial F
+                // carry; the F recurrence below reads it instead of the full `h_v` so the critical
+                // column chain drops from f -> h -> f (3 ops) to f -> f (2 ops). See the u8 kernel.
+                let mfe = h_v;
                 h_v = vmaxq_s16(h_v, f_v);
                 // Track the min column reaching a new row max (strict >, so ties keep the earlier j).
                 // `is_new_row_max` is all-ones in the lanes whose job just beat its own row best.
@@ -1084,7 +1088,7 @@ unsafe fn fwd_local_sw_neon(
                 // F(i,j+1) = max(0, F - e_ins, H - oe_ins), kept in a register: this is the loop's
                 // serial dependency, one sub + one max per column (`ksw.cpp:172-174`).
                 // Lane `l` = F(i, j+1) before the floor at 0; `f_v` then carries it to column j+1.
-                let f_new = vmaxq_s16(vsubq_s16(f_v, e_ins_v), vsubq_s16(h_v, oe_ins_v));
+                let f_new = vmaxq_s16(vsubq_s16(f_v, e_ins_v), vsubq_s16(mfe, oe_ins_v));
                 f_v = vmaxq_s16(f_new, zero);
                 // Preload the next column's diagonal from the previous row, mirroring `ksw.cpp:176`.
                 h_diag_v = vld1q_s16(h_prev.as_ptr().add(j * LANES));
@@ -1331,8 +1335,12 @@ unsafe fn fwd_local_sw_neon_u8(
                 // No explicit `max(0, .)` on H: `diag_v`, `e_v` and `f_v` are already >= 0 by
                 // saturation, so the two maxes are the whole H recurrence.
                 // Lane `l` becomes H(i, j) for job `l` after the second max.
-                let mut h_v = vmaxq_u8(diag_v, e_v);
-                h_v = vmaxq_u8(h_v, f_v);
+                // `mfe = max(diag, E)` is the part of H that does NOT depend on the row-serial F
+                // carry, so it can be computed before F is folded in. The full H still needs F (for
+                // the store, the row-max and the E carry), but the F recurrence below is reassociated
+                // off `mfe` so it never waits on H -- this is what shortens the critical column chain.
+                let mfe = vmaxq_u8(diag_v, e_v);
+                let mut h_v = vmaxq_u8(mfe, f_v);
                 // Track the min column reaching a new row max (strict >, so ties keep the earlier j).
                 // `is_new_row_max` is all-ones in the lanes whose job just beat its own row best.
                 // `j as u8` is why the caller caps the query at 250 bases: the column index shares
@@ -1352,8 +1360,13 @@ unsafe fn fwd_local_sw_neon_u8(
                 // Lane `l` = E(i+1, j), already floored at 0 by the saturating subtracts.
                 let e_new = vmaxq_u8(vqsubq_u8(e_v, e_del_v), vqsubq_u8(h_v, oe_del_v));
                 vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_new);
-                // Same for F, the row's serial carry.
-                f_v = vmaxq_u8(vqsubq_u8(f_v, e_ins_v), vqsubq_u8(h_v, oe_ins_v));
+                // F, the row's serial carry, reassociated off `mfe` instead of `h_v`. Byte-identical:
+                // f_next = max(f - e_ins, h - oe_ins) and h = max(mfe, f); the `f - oe_ins` branch
+                // inside h is dominated by `f - e_ins` because oe_ins >= e_ins (gap open >= 0) under
+                // the saturating subtracts, so max(f - e_ins, mfe - oe_ins) equals the original. The
+                // win is that `mfe - oe_ins` does not depend on this cell's `f_v`, so the F chain is
+                // f_v -> (sub, max) -> f_v (2 ops) instead of f_v -> h_v -> f_v (3 ops).
+                f_v = vmaxq_u8(vqsubq_u8(f_v, e_ins_v), vqsubq_u8(mfe, oe_ins_v));
                 h_diag_v = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
             }
 
@@ -1597,8 +1610,11 @@ unsafe fn fwd_local_sw_avx2_u8(
                 let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES32) as *const __m256i);
                 // No explicit `max(0, .)` on H: `diag_v`, `e_v` and `f_v` are already >= 0 by
                 // saturation, so the two maxes are the whole H recurrence.
-                let mut h_v = _mm256_max_epu8(diag_v, e_v);
-                h_v = _mm256_max_epu8(h_v, f_v);
+                // `mfe = max(diag, E)` excludes the serial F carry, so the F recurrence below can read
+                // it instead of the full `h_v` and stop waiting on H -- the same critical-chain
+                // shortening as the NEON u8 kernel (f -> h -> f becomes f -> f).
+                let mfe = _mm256_max_epu8(diag_v, e_v);
+                let mut h_v = _mm256_max_epu8(mfe, f_v);
                 // Strict unsigned `>`, so a tie keeps the earlier `j`. This is the one place the
                 // signed `_mm256_cmpgt_epi8` would silently differ from NEON, for any score or column
                 // index above 127; `cgt_epu8` is why the caller's 250-base query cap still holds.
@@ -1613,10 +1629,12 @@ unsafe fn fwd_local_sw_avx2_u8(
                     _mm256_subs_epu8(h_v, oe_del_v),
                 );
                 _mm256_storeu_si256(e.as_mut_ptr().add(j * LANES32) as *mut __m256i, e_new);
-                // Same for F, the row's serial carry.
+                // F, the row's serial carry, reassociated off `mfe` (see the NEON u8 kernel for the
+                // byte-identity argument: oe_ins >= e_ins makes the `f - oe_ins` branch inside H
+                // dominated, so `max(f - e_ins, mfe - oe_ins)` equals the original).
                 f_v = _mm256_max_epu8(
                     _mm256_subs_epu8(f_v, e_ins_v),
-                    _mm256_subs_epu8(h_v, oe_ins_v),
+                    _mm256_subs_epu8(mfe, oe_ins_v),
                 );
                 h_diag_v = _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES32) as *const __m256i);
             }
