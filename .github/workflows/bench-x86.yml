@@ -92,11 +92,16 @@ jobs:
         uses: mamba-org/setup-micromamba@v2
         with:
           environment-name: bench
+          # setup-micromamba@v2 has no `channels:` input; channels go through condarc.
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
           create-args: >-
             bwa-mem2
             wgsim
             samtools
-          channels: conda-forge,bioconda
+          init-shell: bash
 
       - name: Build bwa-mem4 (release)
         shell: bash
