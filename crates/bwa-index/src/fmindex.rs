@@ -517,6 +517,13 @@ impl FmIndex {
     /// The interval for `a ++ pattern`, with `s == 0` if that extended pattern does not occur.
     /// Note `s == 0` is a normal, expected result, not an error, and the returned `k`/`l` are then
     /// meaningless.
+    // Copied from the fork's PR #88 (`backwardExt` marked `__attribute__((always_inline))`): called
+    // ~1e9x per run, and returning the ~40-byte `Smem` by value forces a hidden-pointer store on
+    // both the SysV (x86) and AAPCS (arm64) ABIs unless the call is inlined into the lockstep walk.
+    // On x86 the fork measured that store at ~42% of the function's samples. `always` (not a plain
+    // `#[inline]` hint) because LTO's cost model otherwise declines this larger function, exactly the
+    // gcc-14 regression that PR fixed. Byte-identical: inlining changes no arithmetic.
+    #[inline(always)]
     pub fn backward_ext(&self, smem: Smem, a: usize) -> Smem {
         // Load the sp/ep checkpoint blocks once (all 4 bases share them), rather than re-deriving
         // the block index and re-indexing per base as `get_occ` would. Values are identical.
