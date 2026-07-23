@@ -1,26 +1,17 @@
-# x86_64 performance measurement. Deliberately NOT a gating check and NOT on push: benchmarks on
-# shared cloud runners are noisy, and a red X on a noisy number teaches nothing. Runs on manual
-# dispatch and weekly, and prints results for a human to read.
-#
-# Two jobs, matching the two honest levels of an x86 measurement (see the README caveat and
-# crates/bwa-neon/src/matesw.rs):
-#   kernel-ab          scalar vs AVX2 vs AVX-512 rescue-kernel throughput, all three timed in ONE
-#                      process on ONE runner, so the CPU model and noisy neighbours cancel in the
-#                      ratio. This is the trustworthy signal for whether the vector kernels help.
-#   endtoend-smallref  bwa-mem4 vs bwa-mem2 on a single human chromosome, both interleaved in one
-#                      job. A real whole-pipeline number, but small-scale and cloud-noisy by nature,
-#                      so read it as directional, not as the headline ratio.
+# x86_64 measurement (NOT gating). On this experiment branch the second job is a PROFILER, not the
+# decomposition head-to-head: bench-x86's decomposition already proved the x86 gap vs the fork is
+# NOT codegen (popcnt/AVX2/x86-64-v3 recover 0-3%), so it is structural/memory-latency-bound. This
+# locates WHERE the time goes.
 name: bench-x86
 
 on:
   workflow_dispatch:
     inputs:
       read_pairs:
-        description: "Read pairs to simulate for the end-to-end job"
+        description: "Read pairs to simulate for the profiling job"
         default: "1000000"
         required: false
   schedule:
-    # Mondays 05:00 UTC, offset from the parity/CI schedules.
     - cron: "0 5 * * 1"
 
 concurrency:
@@ -31,9 +22,6 @@ permissions:
   contents: read
 
 env:
-  # Ship-baseline codegen: the SIMD kernels are chosen at RUNTIME by feature detection, so an empty
-  # RUSTFLAGS still runs AVX2/AVX-512 on a runner that has them. This makes the end-to-end job time
-  # the same code path the released binary takes. (Overrides .cargo/config.toml's target-cpu=native.)
   RUSTFLAGS: ""
   CARGO_TERM_COLOR: always
 
@@ -44,55 +32,50 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-
       - name: Log CPU SIMD features
         shell: bash
         run: |
           echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
           echo -n "simd: "; grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96.1"
-
       - uses: Swatinem/rust-cache@v2
-
-      # The kernel bench is an `#[ignore]`d in-crate test; `--ignored --nocapture` runs it and prints
-      # the scalar/AVX2/AVX-512 table. Where the runner lacks avx512bw the AVX-512 line self-skips
-      # (the "Log CPU SIMD features" step above shows whether that happened).
       - name: Rescue kernel A/B
         run: cargo test --release -p bwa-mem4-neon rescue_kernel_ab -- --ignored --nocapture
 
-  endtoend-smallref:
-    name: end-to-end vs bwa-mem2 (single chromosome, cloud-noisy)
+  profile:
+    name: profile the structural x86 gap (perf + in-binary instrumentation)
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     defaults:
       run:
-        shell: bash -el {0} # login shell so the micromamba env is active
+        shell: bash -el {0}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Log CPU SIMD features
+      - name: Log CPU + perf availability
         shell: bash
         run: |
           echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
           echo -n "simd: "; grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           echo "nproc: $(nproc)"
+          echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo '?')"
+          sudo sysctl -w kernel.perf_event_paranoid=1 2>/dev/null || true
+          which perf || sudo apt-get -y install linux-tools-common "linux-tools-$(uname -r)" 2>/dev/null || sudo apt-get -y install linux-tools-generic || true
+          perf --version || echo "perf UNAVAILABLE (will rely on in-binary instrumentation)"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96.1"
-
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install bwa-mem2 + wgsim + samtools (bioconda)
+      - name: Install bwa-mem2 + fork + wgsim + samtools
         uses: mamba-org/setup-micromamba@v2
         with:
           environment-name: bench
-          # setup-micromamba@v2 has no `channels:` input; channels go through condarc.
           condarc: |
             channels:
               - conda-forge
@@ -104,113 +87,49 @@ jobs:
             samtools
           init-shell: bash
 
-      - name: Build bwa-mem4 (release) — baseline, +popcnt, x86-64-v3
+      - name: Build bwa-mem4 (release + frame pointers for perf)
         shell: bash
-        run: |
-          # EXPERIMENT: isolate the x86 seeding gap. Baseline x86-64-v1 lowers u64::count_ones()
-          # (the FM-index Occ rank, the hottest op) to a ~10-op SWAR software popcount; arm64 gets
-          # hardware CNT for free. Build three variants of the SAME code to decompose the gap:
-          #   baseline  = shipped (RUSTFLAGS="") -> SWAR popcount
-          #   popcnt    = +popcnt only           -> hardware POPCNT, nothing else
-          #   v3        = x86-64-v3 (AVX2+BMI2)   -> POPCNT + 256-bit auto-vec ceiling
-          RUSTFLAGS="" cargo build --release -p bwa-mem4 --target-dir target-base
-          RUSTFLAGS="-C target-feature=+popcnt" cargo build --release -p bwa-mem4 --target-dir target-popcnt
-          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p bwa-mem4 --target-dir target-v3
+        run: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release -p bwa-mem4
 
-      - name: Fetch reference (GRCh38 chr21)
+      - name: Prep reference + reads (chr21)
         run: |
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz
-          gunzip -f chr21.fa.gz
-          ls -la chr21.fa
-
-      - name: Build shared index
-        run: |
-          cd work
-          # Build with bwa-mem2's own indexer so the index is unambiguously bwa-mem2-readable;
-          # bwa-mem4 reads the identical files. (Building it with bwa-mem4 and feeding bwa-mem2 is
-          # what silently hung the first run.)
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           bwa-mem2 index chr21.fa
-          ls -la chr21.fa.*
-
-      - name: Simulate reads
-        run: |
-          cd work
           n="${{ github.event.inputs.read_pairs || '1000000' }}"
-          # Fixed seed so the read set is reproducible across runs.
           wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
           echo "simulated $n pairs"
 
-      - name: Interleaved head-to-head
+      - name: In-binary instrumentation (FM traffic + get_sa share)
         run: |
           cd work
-          # Cap threads: a shared runner exposes few usable vCPUs even when nproc is large, and
-          # oversubscribing thrashes. Every alignment is wrapped in `timeout` so a hang fails the
-          # step in minutes with a visible message instead of eating the 60-min budget silently.
+          M4=../target/release/bwa-mem4
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
-          M2=bwa-mem2
-          # The fork (fg-labs/bwa-mem3) is what #20/#27 actually benchmark against, not bwa-mem2.
-          # bioconda ships it as the `bwa-mem3` executable and it reads the same bwa-mem2 index.
-          FORK=bwa-mem3
-          M4=../target-base/release/bwa-mem4       # baseline (shipped): SWAR software popcount
-          M4P=../target-popcnt/release/bwa-mem4    # +popcnt only: hardware POPCNT
-          M4V=../target-v3/release/bwa-mem4        # x86-64-v3: POPCNT + 256-bit auto-vec
-          echo "threads=$T"
-          # Runs the aligner under /usr/bin/time with a hard timeout; prints "wall_s maxrss_kb".
-          # $1 = label (for the failure message), rest = command.
-          run_one() {
+          echo "== BWA4_TRAFFIC (FM-index cache-line traffic, 1 thread) =="
+          BWA4_TRAFFIC=1 $M4 mem -t 1 chr21.fa r1.fq r2.fq > /dev/null 2>traffic.txt || true
+          grep '\[traffic\]' traffic.txt || tail -8 traffic.txt
+          echo "== BWA4_CHAIN_TIME (get_sa_batch share of chaining) =="
+          BWA4_CHAIN_TIME=1 $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2>chain.txt || true
+          grep -iE 'chain|get_sa|sa|%' chain.txt | head || tail -8 chain.txt
+
+      - name: perf top symbols — bwa-mem4 vs fork
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../target/release/bwa-mem4
+          prof() {
             local label="$1"; shift
-            if ! timeout 300 /usr/bin/time -f '%e %M' -o t.txt "$@" > /dev/null 2>err.txt; then
-              echo "FAILED/timeout: $label" >&2; tail -20 err.txt >&2; exit 1
+            echo "==================== perf: $label ===================="
+            if perf record -F 999 -g --call-graph fp -o "p_$label.data" -- "$@" chr21.fa r1.fq r2.fq >/dev/null 2>rec_$label.err; then
+              echo "-- top self-time symbols --"
+              perf report -i "p_$label.data" --stdio --sort=overhead -n 2>/dev/null | grep -vE '^\s*#|^\s*$' | head -30
+            elif perf stat -d -- "$@" chr21.fa r1.fq r2.fq >/dev/null 2>"stat_$label.txt"; then
+              echo "-- perf record blocked; perf stat instead --"; cat "stat_$label.txt"
+            else
+              echo "perf unavailable for $label"; tail -5 rec_$label.err 2>/dev/null || true
             fi
-            cat t.txt
           }
-
-          echo "== warm-up (untimed) + byte-identity of all three mem4 builds =="
-          run_one "warmup bwa-mem2" $M2 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
-          $M2 mem -t "$T" chr21.fa r1.fq r2.fq > m2.sam 2>/dev/null
-          run_one "warmup bwa-mem3" $FORK mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
-          run_one "warmup mem4-base"   $M4  mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
-          $M4  mem -t "$T" chr21.fa r1.fq r2.fq > m4.sam  2>/dev/null
-          run_one "warmup mem4-popcnt" $M4P mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
-          $M4P mem -t "$T" chr21.fa r1.fq r2.fq > m4p.sam 2>/dev/null
-          run_one "warmup mem4-v3"     $M4V mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
-          $M4V mem -t "$T" chr21.fa r1.fq r2.fq > m4v.sam 2>/dev/null
-
-          echo "== record identity (the whole point: the popcnt/v3 builds must stay byte-identical) =="
-          m2md5=$(grep -v '^@' m2.sam  | md5sum | cut -d' ' -f1)
-          b4md5=$(grep -v '^@' m4.sam  | md5sum | cut -d' ' -f1)
-          p4md5=$(grep -v '^@' m4p.sam | md5sum | cut -d' ' -f1)
-          v4md5=$(grep -v '^@' m4v.sam | md5sum | cut -d' ' -f1)
-          echo "  mem2=$m2md5  base=$b4md5  popcnt=$p4md5  v3=$v4md5"
-          [ "$m2md5" = "$b4md5" ] && [ "$b4md5" = "$p4md5" ] && [ "$p4md5" = "$v4md5" ] \
-            && echo "  ALL byte-identical to bwa-mem2" || echo "  WARNING: a build DIFFERS"
-
-          echo "== timed reps (interleaved, best-of 2) =="
-          best_m2=""; best_fk=""; best_b=""; best_p=""; best_v=""
-          for rep in 1 2; do
-            r2=$(run_one "mem2 rep$rep" $M2 mem -t "$T" chr21.fa r1.fq r2.fq); w2=${r2%% *}
-            rf=$(run_one "fork rep$rep" $FORK mem -t "$T" chr21.fa r1.fq r2.fq); wf=${rf%% *}
-            rb=$(run_one "base rep$rep" $M4 mem -t "$T" chr21.fa r1.fq r2.fq); wb=${rb%% *}
-            rp=$(run_one "popcnt rep$rep" $M4P mem -t "$T" chr21.fa r1.fq r2.fq); wp=${rp%% *}
-            rv=$(run_one "v3 rep$rep" $M4V mem -t "$T" chr21.fa r1.fq r2.fq); wv=${rv%% *}
-            echo "rep $rep: mem2 ${w2} | fork ${wf} | base ${wb} | popcnt ${wp} | v3 ${wv}  (wall_s)"
-            best_m2=$(awk -v a="$best_m2" -v b="$w2" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
-            best_fk=$(awk -v a="$best_fk" -v b="$wf" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
-            best_b=$(awk -v a="$best_b" -v b="$wb" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
-            best_p=$(awk -v a="$best_p" -v b="$wp" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
-            best_v=$(awk -v a="$best_v" -v b="$wv" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
-          done
-
-          echo
-          echo "== summary (single chr21, $T threads, cloud-noisy: DIRECTIONAL ONLY) =="
-          echo "best wall: mem2 ${best_m2}s | fork ${best_fk}s | mem4-base ${best_b}s | mem4-popcnt ${best_p}s | mem4-v3 ${best_v}s"
-          awk -v m2="$best_m2" -v b="$best_b" -v p="$best_p" -v v="$best_v" -v fk="$best_fk" 'BEGIN{
-            printf "gap decomposition (vs fork, >1 = we win):\n"
-            printf "  mem4-base   vs fork: %.2fx\n", fk/b
-            printf "  mem4-popcnt vs fork: %.2fx   (popcnt recovers %.0f%% of the base->fork gap)\n", fk/p, (b-p)/(b-fk)*100
-            printf "  mem4-v3     vs fork: %.2fx   (v3 recovers %.0f%%)\n", fk/v, (b-v)/(b-fk)*100
-            printf "internal speedups vs base: popcnt %.2fx, v3 %.2fx\n", b/p, b/v
-          }'
-          echo "NOTE: shared-runner VM, single chromosome. Not the headline ratio; see README."
+          prof mem4 $M4 mem -t "$T"
+          prof fork bwa-mem3 mem -t "$T"
+          echo "PROFILE_DONE"
