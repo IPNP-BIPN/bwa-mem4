@@ -6,9 +6,9 @@ PR and their maintainers merge it (this repo cannot publish to the bioconda
 channel itself). The recipe here is the source of truth; keep it in sync with
 what lands there. For reference, the original submission steps were:
 
-1. **Prerequisite (done):** a `v4.0.0` GitHub release exists. The recipe builds
+1. **Prerequisite (done):** a `v4.1.0` GitHub release exists. The recipe builds
    from its source tarball; `meta.yaml`'s `sha256` is the checksum of
-   `https://github.com/IPNP-BIPN/bwa-mem4/archive/refs/tags/v4.0.0.tar.gz`
+   `https://github.com/IPNP-BIPN/bwa-mem4/archive/refs/tags/v4.1.0.tar.gz`
    (also in `SHA256` here). Regenerate with
    `curl -sL <url> | shasum -a 256` if the tag is ever recut.
 
