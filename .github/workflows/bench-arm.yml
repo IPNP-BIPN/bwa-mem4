@@ -1,0 +1,259 @@
+# ARM64 seeding memory-level-parallelism (MLP) measurement. Answers the Graviton scaling question
+# from GH #27 (Nils, Fulcrum): the fork ties us at -t1 SE on Graviton4 but wins 1.27-1.50x
+# multi-thread. The thesis (see memory: graviton-scaling-w-lockstep) is that our W=16 seeding
+# lockstep issues W*threads outstanding DRAM misses, which a narrow-per-core cloud-ARM memory
+# controller saturates at high -t, whereas Apple M4's fat unified bus hides it. bwa-mem2 and the
+# fork have no lockstep-N (immediate single-step prefetch, ~1-2 outstanding), so they don't saturate.
+#
+# The trustworthy signal is the BWA4_LOCKSTEP_N sweep: ONE binary, ONE host, ONE dataset, W swept
+# {2,4,8,16,32}. If wall time DROPS as W decreases at high thread count, the thesis holds and the fix
+# is a thread-adaptive W. Same-host ratio cancels the CPU model and noisy neighbours, exactly like
+# bench-x86's kernel-ab job.
+#
+# HARD CAVEAT: GitHub-hosted `ubuntu-24.04-arm` runners are Ampere/Azure-Cobalt class, NOT Graviton,
+# and expose few vCPUs. They reproduce the "cloud-ARM, narrow per-core bandwidth, many-thread
+# contention" REGIME, not Graviton exactly. For a real Graviton number, enable the optional
+# self-hosted job (needs an EC2 c7g/c8g runner you register). Read hosted-ARM results as directional.
+name: bench-arm
+
+on:
+  workflow_dispatch:
+    inputs:
+      read_pairs:
+        description: "Read pairs to simulate"
+        default: "1000000"
+        required: false
+      max_threads:
+        description: "Thread cap for the sweep (raise on a big/self-hosted runner to expose the effect)"
+        default: "0"   # 0 = use nproc
+        required: false
+      run_graviton:
+        description: "Also run the self-hosted Graviton job (needs a registered EC2 ARM64 runner)"
+        type: boolean
+        default: false
+  schedule:
+    # Tuesdays 05:00 UTC, offset from bench-x86 (Mondays) and the parity/CI schedules.
+    - cron: "0 5 * * 2"
+
+concurrency:
+  group: bench-arm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Ship-baseline codegen: NEON kernels are chosen at RUNTIME by feature detection, so an empty
+  # RUSTFLAGS still runs NEON. Times the same code path the released binary takes. (Overrides
+  # .cargo/config.toml's target-cpu=native.)
+  RUSTFLAGS: ""
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lockstep-sweep:
+    name: seeding W-sweep + fork head-to-head (hosted ARM, cloud-noisy)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash -el {0} # login shell so the micromamba env is active
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log CPU
+        shell: bash
+        run: |
+          echo "arch: $(uname -m)"
+          echo "model: $(grep -m1 -E 'model name|CPU implementer|Model' /proc/cpuinfo | cut -d: -f2- || true)"
+          echo "nproc: $(nproc)"
+          # Neoverse/Ampere identify via MIDR implementer/part, not 'model name'.
+          grep -m1 -E 'CPU implementer|CPU part' /proc/cpuinfo || true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # bwa-mem2 (index + oracle) and wgsim (reads) from bioconda. The fork (fg-labs bwa-mem3) is
+      # attempted but OPTIONAL: linux-aarch64 bioconda coverage is thinner than linux-64, and the
+      # load-bearing signal (the W-sweep on our own binary) does not need it.
+      - name: Install bwa-mem2 + wgsim (+ fork, optional) via bioconda
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            wgsim
+            samtools
+          init-shell: bash
+
+      - name: Try to install the fork (bwa-mem3), non-fatal
+        run: |
+          if micromamba install -n bench -y -c conda-forge -c bioconda bwa-mem3 2>/dev/null; then
+            echo "FORK_OK=1" >> "$GITHUB_ENV"; echo "fork bwa-mem3 installed"
+          else
+            echo "FORK_OK=0" >> "$GITHUB_ENV"; echo "fork bwa-mem3 unavailable on aarch64 bioconda; skipping head-to-head"
+          fi
+
+      - name: Build bwa-mem4 (release)
+        shell: bash
+        run: cargo build --release -p bwa-mem4
+
+      - name: Fetch reference (GRCh38 chr21)
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz
+          gunzip -f chr21.fa.gz
+          ls -la chr21.fa
+
+      - name: Build shared index (bwa-mem2 indexer; bwa-mem4 reads identical files)
+        run: |
+          cd work
+          bwa-mem2 index chr21.fa
+          ls -la chr21.fa.*
+
+      - name: Simulate reads
+        run: |
+          cd work
+          n="${{ github.event.inputs.read_pairs || '1000000' }}"
+          wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          echo "simulated $n pairs"
+
+      - name: Seeding W-sweep (the load-bearing signal)
+        run: |
+          cd work
+          M4=../target/release/bwa-mem4
+          # Thread count: the effect needs contention, so use as many vCPUs as we have (or the input
+          # override). On a 4-vCPU hosted runner the effect is muted; on a self-hosted Graviton set
+          # max_threads high.
+          T="${{ github.event.inputs.max_threads || '0' }}"
+          [ "$T" = "0" ] && T="$(nproc)"
+          echo "sweep at -t$T on $(nproc) vCPUs"
+
+          run_wall() { # $1=label, rest=cmd -> echoes wall seconds, hard timeout
+            local label="$1"; shift
+            if ! timeout 600 /usr/bin/time -f '%e' -o t.txt "$@" >/dev/null 2>err.txt; then
+              echo "FAILED/timeout: $label" >&2; tail -20 err.txt >&2; exit 1
+            fi
+            cat t.txt
+          }
+
+          # Warm-up (untimed): fault in the index, settle frequency.
+          run_wall "warmup" $M4 mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null
+
+          echo "== BWA4_LOCKSTEP_N sweep, SE (r1 only, isolates seeding), best-of-2, same host =="
+          echo "# W    best_wall_s"
+          best_overall=""; best_w=""
+          for W in 2 4 8 16 32; do
+            b=""
+            for rep in 1 2; do
+              export BWA4_LOCKSTEP_N="$W"
+              w=$(run_wall "N=$W rep$rep" $M4 mem -t "$T" chr21.fa r1.fq)
+              unset BWA4_LOCKSTEP_N
+              b=$(awk -v a="$b" -v x="$w" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
+            done
+            printf "  %-4s %s\n" "$W" "$b"
+            if [ -z "$best_overall" ] || awk -v a="$b" -v c="$best_overall" 'BEGIN{exit !(a<c)}'; then
+              best_overall="$b"; best_w="$W"
+            fi
+          done
+          echo
+          echo "fastest W at -t$T = $best_w ($best_overall s). Default is 16."
+          echo "If best_w < 16 here, the thread-adaptive-W thesis holds on this ARM host."
+          echo "NOTE: hosted ARM = Ampere-class, few vCPUs. DIRECTIONAL. Real Graviton = self-hosted job."
+
+      - name: Fork head-to-head (optional, PE, at max threads)
+        if: env.FORK_OK == '1'
+        run: |
+          cd work
+          M4=../target/release/bwa-mem4
+          FORK=bwa-mem3
+          T="${{ github.event.inputs.max_threads || '0' }}"; [ "$T" = "0" ] && T="$(nproc)"
+          run_wall() { local l="$1"; shift; timeout 600 /usr/bin/time -f '%e' -o t.txt "$@" >/dev/null 2>e.txt || { echo "FAIL $l">&2; tail e.txt>&2; exit 1; }; cat t.txt; }
+          echo "== bwa-mem4 (default W=16) vs fork bwa-mem3, PE, -t$T, best-of-2 =="
+          bf=""; b4=""
+          for rep in 1 2; do
+            rf=$(run_wall "fork $rep" $FORK mem -t "$T" chr21.fa r1.fq r2.fq)
+            r4=$(run_wall "mem4 $rep" $M4  mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep$rep: fork ${rf}s | mem4 ${r4}s"
+            bf=$(awk -v a="$bf" -v x="$rf" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
+            b4=$(awk -v a="$b4" -v x="$r4" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
+          done
+          awk -v f="$bf" -v m="$b4" 'BEGIN{printf "fork %.2fs | mem4 %.2fs | mem4-vs-fork %.2fx (>1 = we win)\n", f, m, f/m}'
+
+  # ----------------------------------------------------------------------------------------------
+  # OPTIONAL real-Graviton job. Off by default. To use:
+  #   1. Launch an EC2 Graviton3/4 instance (c7g.4xlarge / c8g.4xlarge = 16 vCPU Neoverse-v1/v2).
+  #   2. Register it as a GitHub Actions self-hosted runner with labels: self-hosted, linux, ARM64.
+  #   3. Re-run this workflow with run_graviton = true and max_threads = 16 (or the instance's vCPUs).
+  # The `if` guard keeps the job from queuing (and hanging on a missing runner) unless asked.
+  graviton-selfhosted:
+    name: seeding W-sweep on REAL Graviton (self-hosted EC2)
+    if: ${{ github.event.inputs.run_graviton == 'true' }}
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Log CPU (expect Neoverse-v1=Graviton3 / v2=Graviton4)
+        shell: bash
+        run: |
+          echo "nproc: $(nproc)"; grep -m1 -E 'CPU implementer|CPU part' /proc/cpuinfo || true
+          # 0x41=ARM implementer; part 0xd40=Neoverse-v1, 0xd4f=Neoverse-v2.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install bwa-mem2 + wgsim + fork via bioconda
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3
+            wgsim
+            samtools
+          init-shell: bash
+      - name: Build bwa-mem4 (release)
+        shell: bash
+        run: cargo build --release -p bwa-mem4
+      - name: Fetch + index chr21, simulate reads
+        run: |
+          mkdir -p work && cd work
+          curl -fsSL --retry 3 "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz" -o chr21.fa.gz
+          gunzip -f chr21.fa.gz
+          bwa-mem2 index chr21.fa
+          n="${{ github.event.inputs.read_pairs || '1000000' }}"
+          wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+      - name: W-sweep at full core count (the real Graviton answer)
+        run: |
+          cd work
+          M4=../target/release/bwa-mem4
+          T="${{ github.event.inputs.max_threads || '0' }}"; [ "$T" = "0" ] && T="$(nproc)"
+          run_wall() { local l="$1"; shift; timeout 900 /usr/bin/time -f '%e' -o t.txt "$@" >/dev/null 2>e.txt || { echo "FAIL $l">&2; tail e.txt>&2; exit 1; }; cat t.txt; }
+          run_wall warmup $M4 mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null
+          echo "== REAL Graviton BWA4_LOCKSTEP_N sweep, SE, -t$T, best-of-2 =="
+          echo "# W    best_wall_s"
+          for W in 2 4 8 16 32; do
+            b=""
+            for rep in 1 2; do
+              export BWA4_LOCKSTEP_N="$W"; w=$(run_wall "N=$W r$rep" $M4 mem -t "$T" chr21.fa r1.fq); unset BWA4_LOCKSTEP_N
+              b=$(awk -v a="$b" -v x="$w" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
+            done
+            printf "  %-4s %s\n" "$W" "$b"
+          done
+          echo "Lowest wall at W<16 confirms our lockstep oversubscribes Graviton's memory controller."
