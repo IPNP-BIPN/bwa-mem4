@@ -1735,16 +1735,19 @@ fn batched_regs(
     // Size of the rayon pool, i.e. effectively `-t`. Clamped so the division below cannot divide
     // by zero.
     let worker_count = rayon::current_num_threads().max(1);
-    // Reads per parallel chunk: exactly one chunk per worker (rounded up), so each SIMD extension
-    // batch is as wide as possible. Scheduling only, the per-read regions do not depend on it.
-    // Cap the chunk so concurrent workers hold only a bounded number of reads' seeding
-    // intermediates (SMEMs, resolved SA positions, chains, pre-dedup regions) at once, instead of the
-    // whole batch's. `div_ceil(worker_count)` alone makes each chunk `batch/-t` reads, so at large -K
-    // every worker materialises tens of thousands of reads' intermediates and peak RSS scales with
-    // the batch; capping it keeps lockstep wide enough to hide FM latency while bounding that memory.
-    // Scheduling only -- the per-read regions do not depend on the chunk size.
-    const REGS_CHUNK_CAP: usize = 2048;
-    let reads_per_chunk = codes.len().div_ceil(worker_count).clamp(1, REGS_CHUNK_CAP);
+    // Reads per parallel chunk. `div_ceil(worker_count)` alone makes each chunk `batch/-t` reads, so
+    // every worker materialises its whole share of the batch's seeding intermediates (SMEMs, resolved
+    // SA positions, chains, pre-dedup regions) at once and peak RSS scales with `-K` (= 10M*-t by
+    // default). We instead size the chunk so the intermediates held CONCURRENTLY are a fixed budget
+    // INDEPENDENT of `-t`: with `-t` chunks in flight, `chunk = INFLIGHT_READS / -t` gives
+    // `-t * chunk = INFLIGHT_READS` reads resident regardless of thread count. A floor keeps each
+    // lockstep batch wide enough to hide FM-index latency (so very high `-t` trades the flat-RAM
+    // property for lockstep width rather than the reverse), and we never chunk larger than one
+    // per-worker share. Scheduling only -- the per-read regions do not depend on the chunk size.
+    const INFLIGHT_READS: usize = 16384; // total reads' intermediates resident at once, all workers
+    const MIN_CHUNK: usize = 512; // lockstep floor: enough reads in flight to hide FM latency
+    let budget_chunk = (INFLIGHT_READS / worker_count).max(MIN_CHUNK);
+    let reads_per_chunk = codes.len().div_ceil(worker_count).min(budget_chunk).max(1);
     codes
         .par_chunks(reads_per_chunk)
         .flat_map(|chunk| align_reads_batched(fm, bns, opt, chunk, &NeonBackend))
