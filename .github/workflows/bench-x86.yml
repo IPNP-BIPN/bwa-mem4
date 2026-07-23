@@ -178,12 +178,18 @@ jobs:
           # avx512-vs-avx2 delta is the real-hardware answer to whether the 512-bit kernel helps,
           # which the bwa-mem2 head-to-head cannot isolate. A forced tier absent on this host falls
           # back to scalar (watch for the "[bwa-mem4] BWA4_RESCUE_TIER=..." stderr line).
+          # Informational, so a slow tier must NOT fail the job: the forced-scalar rescue is
+          # legitimately ~an order of magnitude slower (not hung), so it gets a longer budget and a
+          # timeout is reported, not fatal. The `if` consumes the exit code so `set -e` stays happy.
           echo "== bwa-mem4 rescue-tier sweep (same host, 1 rep each) =="
           for T4 in scalar avx2 avx512; do
             export BWA4_RESCUE_TIER="$T4"
-            r=$(run_one "tier=$T4" $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w=${r%% *}
+            if timeout 900 /usr/bin/time -f '%e' -o tt.txt $M4 mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null; then
+              echo "  tier=$T4: $(cat tt.txt)s"
+            else
+              echo "  tier=$T4: timed out (>900s) or failed"
+            fi
             unset BWA4_RESCUE_TIER
-            echo "  tier=$T4: ${w}s"
           done
 
           echo
