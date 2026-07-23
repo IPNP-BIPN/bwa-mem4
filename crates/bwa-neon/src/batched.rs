@@ -1136,6 +1136,14 @@ macro_rules! define_sw_kernel {
             let mut eh_e: Vec<$elem> = Vec::new();
             let mut qcode: Vec<$elem> = Vec::new();
             let mut tcode: Vec<$elem> = Vec::new();
+            // Substitution-score pre-pass buffers (bwa-mem2's `sbt_buf`, `bandedSWA.cpp:1183-1214`):
+            // the DNA match/mismatch/N score of each band column depends only on this row's target
+            // base and the column's query base, never on the DP recurrence. Computing it in a
+            // separate per-row loop and loading it in the DP body lifts ~7 vector ALU ops off the
+            // serial H/E/F critical path, where on x86 (fewer vector-ALU ports than lanes) they
+            // otherwise contend with the recurrence. Byte-identical: same values, only reordered.
+            let mut sbt_pos_buf: Vec<$elem> = Vec::new();
+            let mut sbt_neg_buf: Vec<$elem> = Vec::new();
 
             // =======================================================================
             // One chunk = one register's worth of independent alignments.
@@ -1183,6 +1191,11 @@ macro_rules! define_sw_kernel {
                 qcode.resize(stride * LANES, 0 as $elem);
                 tcode.clear();
                 tcode.resize((max_t + 1) * LANES, 0 as $elem);
+                // Same column layout as `qcode`; refilled per row by the substitution pre-pass.
+                sbt_pos_buf.clear();
+                sbt_pos_buf.resize(stride * LANES, 0 as $elem);
+                sbt_neg_buf.clear();
+                sbt_neg_buf.resize(stride * LANES, 0 as $elem);
                 for l in 0..nlane {
                     for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
                         qcode[ju * LANES + l] = c as $elem;
@@ -1298,6 +1311,23 @@ macro_rules! define_sw_kernel {
                     let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
                     let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
 
+                    // --- substitution pre-pass (vector, off the critical path) ---
+                    // For every band column, compute the same `sbt_pos`/`sbt_neg` the DP body used to
+                    // compute inline, and stash them. These ops depend only on `t_v` (fixed this row)
+                    // and the column's query base, so they carry no DP dependency and the scheduler
+                    // runs them at throughput here instead of braided into the H/E/F chain below.
+                    for j in gbeg..gend {
+                        let col_base = j as usize * LANES;
+                        let q_v = $lds(qcode.as_ptr().add(col_base));
+                        let is_eq = $ceq(t_v, q_v);
+                        let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                        // Byte-for-byte the expressions from the old inline block, unmoved.
+                        let sbt_pos = $bsl(is_n, zero_v, $bsl(is_eq, a_pos_v, zero_v));
+                        let sbt_neg = $bsl(is_n, npen_mag_v, $bsl(is_eq, zero_v, mm_mag_v));
+                        $sts(sbt_pos_buf.as_mut_ptr().add(col_base), sbt_pos);
+                        $sts(sbt_neg_buf.as_mut_ptr().add(col_base), sbt_neg);
+                    }
+
                     // The shared column loop over the union band. Every lane executes every column;
                     // `band` decides whether the lane keeps the result. This is the core trade of
                     // inter-sequence batching: uniform control flow at the cost of some wasted lanes.
@@ -1318,22 +1348,10 @@ macro_rules! define_sw_kernel {
                         // per lane.
                         let band = $andu(active_v, $andu($cge(j_v, beg_v), $clt(j_v, end_v)));
 
-                        // DNA substitution score split into positive parts (no gather):
-                        //   sbt_pos = (t==q && !N) ? a : 0 ;  sbt_neg = N ? |npen| : (t==q ? 0 : |mm|)
-                        // Lane `l` = job `l`'s query base code at column `j` (0..=4). One load, one
-                        // base per lane, which is what the SoA transpose above was built for.
-                        let q_v = $lds(qcode.as_ptr().add(col_base));
-                        // Three masks, each all-ones or all-zero per lane: bases equal, and either
-                        // base ambiguous (code >= 4). `t_is_n` was hoisted out of the loop since the
-                        // target base is fixed for the whole row.
-                        let is_eq = $ceq(t_v, q_v);
-                        let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                        // Nested selects, innermost first: match -> a, mismatch -> 0 on the positive
-                        // side and 0 / |mm| on the negative side; then the N case overrides both.
-                        // Order matters: N wins over equality, because two N bases compare equal but
-                        // must still score `npen`, not `a`.
-                        let sbt_pos = $bsl(is_n, zero_v, $bsl(is_eq, a_pos_v, zero_v));
-                        let sbt_neg = $bsl(is_n, npen_mag_v, $bsl(is_eq, zero_v, mm_mag_v));
+                        // Substitution scores for this column, precomputed by the pre-pass above.
+                        // Two loads replace the ~7 ALU ops that used to sit on the critical path here.
+                        let sbt_pos = $lds(sbt_pos_buf.as_ptr().add(col_base));
+                        let sbt_neg = $lds(sbt_neg_buf.as_ptr().add(col_base));
 
                         let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
                                                                      // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
