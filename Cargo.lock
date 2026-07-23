@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "anyhow",
  "bgzf",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-chain"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "bwa-mem4-core",
  "bwa-mem4-index",
@@ -162,14 +162,14 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-core"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "bwa-mem4-diff"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -177,11 +177,11 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-extend"
-version = "4.1.0"
+version = "4.1.1"
 
 [[package]]
 name = "bwa-mem4-index"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "bwa-mem4-core",
  "libsais-rs",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-io"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "bwa-mem4-core",
  "needletail",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-mem"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "bwa-mem4-chain",
  "bwa-mem4-core",
@@ -211,14 +211,14 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-neon"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "bwa-mem4-extend",
 ]
 
 [[package]]
 name = "bwa-mem4-seed"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "bwa-mem4-core",
  "bwa-mem4-index",
