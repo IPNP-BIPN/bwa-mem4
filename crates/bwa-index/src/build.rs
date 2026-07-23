@@ -58,7 +58,27 @@ use bwa_core::{dna, Error, Result};
 use rayon::prelude::*;
 
 use crate::rand48::Rand48;
+#[cfg(not(feature = "libsais"))]
 use crate::sais::suffix_array_inplace;
+
+/// `suffix_array_inplace` equivalent backed by libsais-rs (a pure-Rust translation of libsais),
+/// enabled by `--features libsais`. libsais writes the `2L`-length suffix array of `bref`; we prepend
+/// the empty (sentinel) suffix at row 0 so the layout matches [`suffix_array_inplace`] exactly:
+/// length `2L+1`, `sa[0] == 2L`, `sa[1..]` the suffix array of `bref`. A suffix array is unique, so
+/// this is byte-identical to the SA-IS path; it is only faster to build. `fs = 0` (no extra scratch),
+/// `freq = None` (we do not need the symbol histogram; `count[]` is computed separately below).
+#[cfg(feature = "libsais")]
+fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
+    let n = bref.len();
+    let mut sa = vec![0i64; n + 1];
+    let ret = libsais_rs::libsais64::libsais64(bref, &mut sa[1..], 0, None);
+    assert_eq!(
+        ret, 0,
+        "libsais64 suffix-array construction failed (ret={ret})"
+    );
+    sa[0] = n as i64;
+    sa
+}
 
 /// bwa-mem2's fixed RNG seed for ambiguous-base randomization, also echoed as the `.ann` third
 /// field. Hard-coded to 11 in `bns_fasta2bntseq` (`bntseq.cpp:311`: `bns->seed = 11; srand48(...)`).
@@ -611,7 +631,13 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     // `sa[row]` is where the suffix ranked `row`-th starts. `n` = N = 2L+1 is the ROW count, one
     // more than the position count because of the empty (sentinel) suffix at row 0.
     let two_l = bref.len(); // 2L
-    let sa = suffix_array_inplace(bref); // length N = 2L+1, sa[0] = 2L (memory-efficient SA-IS)
+                            // length N = 2L+1, sa[0] = 2L. Default: in-tree memory-efficient SA-IS. With `--features libsais`
+                            // the same array is produced by libsais-rs instead (faster build; a suffix array is UNIQUE so the
+                            // result is byte-identical, gated by scripts/index_diff.sh).
+    #[cfg(not(feature = "libsais"))]
+    let sa = suffix_array_inplace(bref);
+    #[cfg(feature = "libsais")]
+    let sa = suffix_array_libsais(bref);
     let n = sa.len(); // reference_seq_len = 2L + 1
 
     // ---- Step B: count[5], the cumulative base counts ----------------------------------------

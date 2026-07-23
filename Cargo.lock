@@ -184,6 +184,7 @@ name = "bwa-mem4-index"
 version = "4.0.1"
 dependencies = [
  "bwa-mem4-core",
+ "libsais-rs",
  "memmap2",
  "rayon",
 ]
@@ -721,6 +722,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "libsais-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40fe164dbd47ea0c20e78a121c980ef673326905f1d4fba55e3645a20ef6717f"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]

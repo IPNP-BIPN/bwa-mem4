@@ -20,6 +20,24 @@ name = "bwa_index"
 bwa-core = { workspace = true }
 rayon = { workspace = true }
 memmap2 = { workspace = true }
+# Optional faster suffix-array construction (index BUILD only). Off by default: the default build
+# uses the in-tree pure-Rust SA-IS and stays byte-identical with zero extra dependencies. With
+# `--features libsais` the SA is built by libsais-rs instead (a pure-Rust translation of Ilya
+# Grebnov's libsais, no C toolchain). A suffix array is UNIQUE, so the produced index is byte-identical
+# either way; `scripts/index_diff.sh` is the gate. Only `index` speed changes, never `mem` output.
+libsais-rs = { version = "0.2", optional = true }
+
+[features]
+# libsais is ON by default: it builds the suffix array via libsais-rs (a pure-Rust, Apache-2.0
+# translation of Ilya Grebnov's libsais), ~3x faster to build than the in-tree SA-IS and BYTE-IDENTICAL
+# (a suffix array is unique; gated by scripts/index_diff.sh). `--no-default-features` falls back to the
+# dependency-free SA-IS. Only `index` build speed changes, never `mem` output.
+default = ["libsais"]
+libsais = ["dep:libsais-rs"]
+
+[[example]]
+name = "libsais_parity"
+required-features = ["libsais"]
 
 [lints]
 workspace = true
