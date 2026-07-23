@@ -1737,7 +1737,14 @@ fn batched_regs(
     let worker_count = rayon::current_num_threads().max(1);
     // Reads per parallel chunk: exactly one chunk per worker (rounded up), so each SIMD extension
     // batch is as wide as possible. Scheduling only, the per-read regions do not depend on it.
-    let reads_per_chunk = codes.len().div_ceil(worker_count).max(1);
+    // Cap the chunk so concurrent workers hold only a bounded number of reads' seeding
+    // intermediates (SMEMs, resolved SA positions, chains, pre-dedup regions) at once, instead of the
+    // whole batch's. `div_ceil(worker_count)` alone makes each chunk `batch/-t` reads, so at large -K
+    // every worker materialises tens of thousands of reads' intermediates and peak RSS scales with
+    // the batch; capping it keeps lockstep wide enough to hide FM latency while bounding that memory.
+    // Scheduling only -- the per-read regions do not depend on the chunk size.
+    const REGS_CHUNK_CAP: usize = 2048;
+    let reads_per_chunk = codes.len().div_ceil(worker_count).clamp(1, REGS_CHUNK_CAP);
     codes
         .par_chunks(reads_per_chunk)
         .flat_map(|chunk| align_reads_batched(fm, bns, opt, chunk, &NeonBackend))
