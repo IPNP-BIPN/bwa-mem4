@@ -99,6 +99,7 @@ jobs:
               - bioconda
           create-args: >-
             bwa-mem2
+            bwa-mem3
             wgsim
             samtools
           init-shell: bash
@@ -140,6 +141,9 @@ jobs:
           # step in minutes with a visible message instead of eating the 60-min budget silently.
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
           M2=bwa-mem2
+          # The fork (fg-labs/bwa-mem3) is what #20/#27 actually benchmark against, not bwa-mem2.
+          # bioconda ships it as the `bwa-mem3` executable and it reads the same bwa-mem2 index.
+          FORK=bwa-mem3
           M4=../target/release/bwa-mem4
           echo "threads=$T"
           # Runs the aligner under /usr/bin/time with a hard timeout; prints "wall_s maxrss_kb".
@@ -152,9 +156,10 @@ jobs:
             cat t.txt
           }
 
-          echo "== warm-up (untimed, verifies both aligners read the index) =="
+          echo "== warm-up (untimed, verifies all three aligners read the index) =="
           run_one "warmup bwa-mem2" $M2 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
           $M2 mem -t "$T" chr21.fa r1.fq r2.fq > m2.sam 2>/dev/null
+          run_one "warmup bwa-mem3" $FORK mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
           run_one "warmup bwa-mem4" $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
           $M4 mem -t "$T" chr21.fa r1.fq r2.fq > m4.sam 2>/dev/null
 
@@ -164,12 +169,14 @@ jobs:
           if [ "$m2md5" = "$m4md5" ]; then echo "records byte-identical ($m2md5)"; else echo "records DIFFER: mem2=$m2md5 mem4=$m4md5"; fi
 
           echo "== timed reps (interleaved, best-of 2) =="
-          best_m2=""; best_m4=""
+          best_m2=""; best_fk=""; best_m4=""
           for rep in 1 2; do
             r2=$(run_one "mem2 rep$rep" $M2 mem -t "$T" chr21.fa r1.fq r2.fq); w2=${r2%% *}
+            rf=$(run_one "fork rep$rep" $FORK mem -t "$T" chr21.fa r1.fq r2.fq); wf=${rf%% *}
             r4=$(run_one "mem4 rep$rep" $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w4=${r4%% *}
-            echo "rep $rep: bwa-mem2 ${r2} | bwa-mem4 ${r4}  (wall_s maxrss_kb)"
+            echo "rep $rep: bwa-mem2 ${r2} | bwa-mem3 ${rf} | bwa-mem4 ${r4}  (wall_s maxrss_kb)"
             best_m2=$(awk -v a="$best_m2" -v b="$w2" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
+            best_fk=$(awk -v a="$best_fk" -v b="$wf" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
             best_m4=$(awk -v a="$best_m4" -v b="$w4" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
           done
 
@@ -194,6 +201,8 @@ jobs:
 
           echo
           echo "== summary (single chr21, $T threads, cloud-noisy: DIRECTIONAL ONLY) =="
-          echo "best wall: bwa-mem2 ${best_m2}s | bwa-mem4 ${best_m4}s"
+          echo "best wall: bwa-mem2 ${best_m2}s | bwa-mem3 ${best_fk}s | bwa-mem4 ${best_m4}s"
           awk -v m2="$best_m2" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs bwa-mem2: %.2fx\n", m2/m4}'
+          # The number #20/#27 care about: us vs the fork on x86. >1 means bwa-mem4 wins.
+          awk -v fk="$best_fk" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs fork (bwa-mem3): %.2fx  (>1 = we win)\n", fk/m4}'
           echo "NOTE: shared-runner VM, single chromosome. Not the headline ratio; see README."
