@@ -10,7 +10,7 @@ members = ["crates/*"]
 #
 # This version string is not decorative: it is emitted as `@PG VN:` on every SAM/BAM/CRAM file
 # produced, so it is the only record a downstream consumer has of which binary made their data.
-version = "4.0.1"
+version = "4.1.0"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
