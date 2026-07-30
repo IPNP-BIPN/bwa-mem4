@@ -705,7 +705,18 @@ pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
     }
     // Explicit stack of pending partitions, so recursion depth is bounded. `s`/`t` are the inclusive
     // bounds of the partition being worked on; `d` is the remaining depth budget for it.
-    let mut stack: Vec<(usize, usize, i64)> = Vec::new();
+    // Fixed array, not a `Vec`, exactly as klib declares it (`ks_isort_stack_t stack[64]`). A `Vec`
+    // here costs one heap allocation per sort the moment any partition is pushed, and this function
+    // is called ~10M times per real paired-end run (twice per `mem_sort_dedup_patch`, which mate
+    // rescue drives ~4.9M times; see `BWA4_DEDUP_SHAPE`). 64 slots cannot overflow: a push only ever
+    // happens for the LARGER half while the loop continues on the smaller, so the pending count is
+    // bounded by the recursion depth of repeated halving, i.e. `log2(usize::MAX)`.
+    //
+    // Pure implementation detail: the comparison and swap sequence is untouched, so the permutation
+    // is identical, which is the only property this port has to preserve.
+    let mut stack = [(0usize, 0usize, 0i64); 64];
+    // Number of occupied `stack` slots; `stack[top - 1]` is the most recently pushed partition.
+    let mut top = 0usize;
     // `s`/`t`: inclusive lo/hi array indices of the partition currently being worked on. Invariant at
     // the top of the loop: everything outside every pending partition (`stack` plus `[s, t]`) is
     // already in its final position relative to the other partitions, so partitions never interleave.
@@ -780,16 +791,22 @@ pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
             let ti = t - i;
             if is > ti {
                 if is > 16 {
-                    stack.push((s, i - 1, d));
+                    debug_assert!(top < stack.len(), "introsort stack overflow");
+                    stack[top] = (s, i - 1, d);
+                    top += 1;
                 }
                 s = if ti > 16 { i + 1 } else { t };
             } else {
                 if ti > 16 {
-                    stack.push((i + 1, t, d));
+                    debug_assert!(top < stack.len(), "introsort stack overflow");
+                    stack[top] = (i + 1, t, d);
+                    top += 1;
                 }
                 t = if is > 16 { i - 1 } else { s };
             }
-        } else if let Some((l, r, dep)) = stack.pop() {
+        } else if top > 0 {
+            top -= 1;
+            let (l, r, dep) = stack[top];
             s = l;
             t = r;
             d = dep;
