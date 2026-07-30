@@ -186,6 +186,109 @@ pub(crate) fn unpack_pac_base(pac: &[u8], l_pac: i64, pos: i64) -> u8 {
     }
 }
 
+/// Unpack the forward-strand bases at `[start, start + len)` from `.pac` into `out`.
+///
+/// The scalar form is one branch, one shift, one mask and a conditional complement per base, and
+/// `bns_fetch_seq` calls it ~1400 times per mate-rescue job, ~5 G bases over a real paired-end run.
+/// Four packed bytes hold sixteen bases, so the whole expansion is one table lookup (spread each
+/// byte over four lanes), one variable shift (`[6,4,2,0]` per group, as a negative left shift) and
+/// one mask: six instructions per sixteen bases instead of roughly ninety.
+///
+/// # Parameters
+/// - `pac`: the whole mapped `.pac`, including its trailer bytes, which are never indexed here.
+/// - `start`: first FORWARD-strand position to unpack; `start + len` must not exceed `l_pac`.
+/// - `out`: destination, filled with exactly `len` bases, one per byte, codes 0..=3.
+#[inline]
+fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    // Bases before the first whole packed byte, done one at a time so the block loop below can
+    // assume `pos % 4 == 0`.
+    let mut pos = start;
+    let end = start + len as i64;
+    while pos < end && (pos & 3) != 0 {
+        out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
+        pos += 1;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            use std::arch::aarch64::*;
+            // SAFETY: neon detected. Every load reads 4 bytes at `pos >> 2` with
+            // `pos + 16 <= end <= l_pac`, so the byte index is inside the payload; every store
+            // writes 16 bytes into capacity reserved by the caller's `with_capacity`.
+            unsafe {
+                // Spread byte `k` of the four loaded bytes across lanes `4k..4k+4`.
+                let spread = vld1q_u8([0u8, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3].as_ptr());
+                // Right shifts, as the negative left shifts `vshlq_u8` wants: within a byte the
+                // most significant pair is base 0, so the four bases need `>>6, >>4, >>2, >>0`.
+                let shifts = vld1q_s8(
+                    [-6i8, -4, -2, 0, -6, -4, -2, 0, -6, -4, -2, 0, -6, -4, -2, 0].as_ptr(),
+                );
+                let three = vdupq_n_u8(3);
+                while pos + 16 <= end {
+                    // The four packed bytes holding these sixteen bases, broadcast so the table
+                    // lookup can pick any of them into any lane.
+                    let word =
+                        (pac.as_ptr().add((pos >> 2) as usize) as *const u32).read_unaligned();
+                    let v = vreinterpretq_u8_u32(vdupq_n_u32(word));
+                    let v = vqtbl1q_u8(v, spread);
+                    let v = vandq_u8(vshlq_u8(v, shifts), three);
+                    let n = out.len();
+                    vst1q_u8(out.as_mut_ptr().add(n), v);
+                    out.set_len(n + 16);
+                    pos += 16;
+                }
+            }
+        }
+    }
+
+    // Tail (and the whole range on a non-NEON build).
+    while pos < end {
+        out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
+        pos += 1;
+    }
+}
+
+/// Unpack `[rb, re)` of the DOUBLED 2L coordinate space into a fresh byte vector, one base per byte.
+///
+/// Equivalent to `(rb..re).map(|p| unpack_pac_base(pac, l_pac, p)).collect()`, and tested against
+/// exactly that. The two halves are handled separately because they are different traversals of the
+/// same packed forward strand: `[0, L)` is a direct ascending unpack, while `[L, 2L)` is the
+/// forward range `[2L - re, 2L - rb)` read backwards with every base complemented (`3 - b`, which
+/// for 2-bit codes is `b ^ 3`). A range straddling `L` cannot arise from a contig-clamped window and
+/// falls back to the per-base loop.
+///
+/// # Parameters
+/// - `pac`: the whole mapped `.pac`.
+/// - `l_pac`: forward reference length `L`.
+/// - `rb`, `re`: half-open range in 2L space, `0 <= rb <= re <= 2L`.
+///
+/// # Returns
+/// `re - rb` bytes, base codes 0..=3.
+pub(crate) fn unpack_pac_range(pac: &[u8], l_pac: i64, rb: i64, re: i64) -> Vec<u8> {
+    let len = (re - rb).max(0) as usize;
+    let mut out = Vec::with_capacity(len + 16);
+    if len == 0 {
+        return out;
+    }
+    if re <= l_pac {
+        unpack_pac_fwd(pac, rb, len, &mut out);
+    } else if rb >= l_pac {
+        // Reverse-complement half: same packed bytes, read forward then flipped end for end.
+        unpack_pac_fwd(pac, 2 * l_pac - re, len, &mut out);
+        out.reverse();
+        for b in out.iter_mut() {
+            *b ^= 3;
+        }
+    } else {
+        for p in rb..re {
+            out.push(unpack_pac_base(pac, l_pac, p));
+        }
+    }
+    debug_assert_eq!(out.len(), len);
+    out
+}
+
 /// Build the path `<prefix>.<ext>`, the naming convention every index file follows.
 ///
 /// # Parameters
@@ -304,6 +407,11 @@ impl FmIndex {
         let cp_bytes = cp_size * std::mem::size_of::<CpOcc>();
         unsafe {
             let dst = std::slice::from_raw_parts_mut(cp_occ.as_mut_ptr() as *mut u8, cp_bytes);
+            // Hinted BEFORE the read, so the pages are faulted in at the promoted size instead of
+            // being collapsed afterwards by khugepaged. This is the single most valuable of the
+            // four: `cp_occ` is 6.2 GB on GRCh38 and every `get_occ` lands on it at a computed,
+            // unpredictable address. See `crate::hugepage` for why this cannot change output.
+            crate::hugepage::advise_hugepage(cp_occ.as_ptr() as *const u8, cp_bytes);
             bwt_file.read_exact(dst)?;
             cp_occ.set_len(cp_size);
         }
@@ -312,6 +420,8 @@ impl FmIndex {
         let mut sa_ms_byte = Vec::<i8>::with_capacity(sa_size);
         unsafe {
             let dst = std::slice::from_raw_parts_mut(sa_ms_byte.as_mut_ptr() as *mut u8, sa_size);
+            // 0.78 GB on GRCh38, walked randomly by `get_sa` alongside `sa_ls_word`.
+            crate::hugepage::advise_hugepage(sa_ms_byte.as_ptr() as *const u8, sa_size);
             bwt_file.read_exact(dst)?;
             sa_ms_byte.set_len(sa_size);
         }
@@ -321,6 +431,8 @@ impl FmIndex {
         let ls_bytes = sa_size * 4;
         unsafe {
             let dst = std::slice::from_raw_parts_mut(sa_ls_word.as_mut_ptr() as *mut u8, ls_bytes);
+            // 3.1 GB on GRCh38: the other half of every `get_sa` lookup.
+            crate::hugepage::advise_hugepage(sa_ls_word.as_ptr() as *const u8, ls_bytes);
             bwt_file.read_exact(dst)?;
             sa_ls_word.set_len(sa_size);
         }
@@ -359,6 +471,11 @@ impl FmIndex {
         // SAFETY: the index files are not mutated while a run holds them open; a concurrent external
         // truncation is out of scope (same assumption as bwa-mem2's mmap'd index).
         let pac = unsafe { Mmap::map(&pac_file)? };
+        // ~800 MB on GRCh38, read at extension time at positions derived from seed hits, i.e. also
+        // effectively random. A file-backed mapping only takes huge pages on a kernel and
+        // filesystem that support it (Linux >= 5.7 plus a THP-capable fs), so treat this one as a
+        // bonus rather than a load-bearing hint; it costs one ignored syscall where unsupported.
+        unsafe { crate::hugepage::advise_hugepage(pac.as_ptr(), pac.len()) };
 
         Ok(FmIndex {
             ref_seq_len,
@@ -856,6 +973,17 @@ impl FmIndex {
         unpack_pac_base(&self.pac, self.l_pac(), pos)
     }
 
+    /// [`base`](Self::base) over a whole range, vectorised. See [`unpack_pac_range`].
+    ///
+    /// # Parameters
+    /// - `rb`, `re`: half-open range in the doubled 2L coordinate space.
+    ///
+    /// # Returns
+    /// `re - rb` bytes, byte `i` equal to `self.base(rb + i as i64)`.
+    pub fn bases(&self, rb: i64, re: i64) -> Vec<u8> {
+        unpack_pac_range(&self.pac, self.l_pac(), rb, re)
+    }
+
     /// The loaded cumulative base counts (already `+1`, as bwa-mem2's `load_index`).
     ///
     /// # Returns
@@ -895,6 +1023,28 @@ impl FmIndex {
 
 #[cfg(test)]
 mod tests {
+
+    /// The vectorised range unpack must equal the per-base one, byte for byte, in both halves of
+    /// the doubled coordinate space and at every alignment of the range against the 4-base packing.
+    #[test]
+    fn unpack_range_matches_per_base() {
+        // A synthetic `.pac`: 4 bases per byte, so 64 forward bases, plus a trailer byte the real
+        // format carries and this code must never index.
+        let l_pac: i64 = 64;
+        let pac: Vec<u8> = (0..17u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        for rb in 0..(2 * l_pac) {
+            for len in [0i64, 1, 3, 4, 5, 15, 16, 17, 33, 64] {
+                let re = (rb + len).min(2 * l_pac);
+                let want: Vec<u8> = (rb..re)
+                    .map(|p| super::unpack_pac_base(&pac, l_pac, p))
+                    .collect();
+                let got = super::unpack_pac_range(&pac, l_pac, rb, re);
+                assert_eq!(got, want, "range [{rb}, {re}) of 2L = {}", 2 * l_pac);
+            }
+        }
+    }
     use super::*;
     use crate::sais::suffix_array_with_sentinel;
 

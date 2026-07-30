@@ -42,6 +42,8 @@ pub mod bntseq;
 pub mod build;
 /// FM-index loading and backward search.
 pub mod fmindex;
+/// Transparent-huge-page hint for the multi-gigabyte, randomly-walked index arrays.
+pub mod hugepage;
 /// Learned suffix array (BWA-MEME style). Experimental, no bwa-mem2 counterpart.
 pub mod lisa;
 /// 5-byte-per-element integer array used by the learned index.
