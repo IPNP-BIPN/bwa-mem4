@@ -16,6 +16,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cmd_index;
 mod cmd_mem;
+mod stage_time;
 
 // Top-level parsed command line. Holds nothing but the chosen subcommand: every real option lives
 // on `cmd_index::IndexArgs` or `cmd_mem::MemArgs`.
