@@ -251,7 +251,7 @@ fn bns_fetch_seq(
     // `bns_get_seq` unpacks 2-bit bases; `fm.base` does the same per position, including the
     // reverse-complement fold for `p >= l_pac`. The C asserts the returned length equals `re - rb`,
     // which holds here by construction.
-    let seq: Vec<u8> = (rb..re).map(|p| fm.base(p)).collect();
+    let seq: Vec<u8> = fm.bases(rb, re);
     (rb, re, rid, seq)
 }
 
@@ -718,6 +718,23 @@ fn matesw_apply(
     // the only link between a job and its orientation (see [`rescue_jobs`]).
     let mut n = 0;
     let mut ai = 0usize;
+    // Whether `ma` has actually changed since the last `mem_sort_dedup_patch` below.
+    //
+    // `n` counts orientations that RAN, not orientations that INSERTED, so the C re-runs the whole
+    // sort/dedup at the end of every subsequent orientation even when that orientation found
+    // nothing and the vector is bit-for-bit what the previous dedup returned. On real data that is
+    // most of the calls: `BWA4_DEDUP_SHAPE` measures 1.84M calls with n >= 65 regions coming from
+    // this path, and a `sample` profile puts 13.3% of busy time in `mem_sort_dedup_patch`.
+    //
+    // Skipping the no-op re-runs is byte-identical because the function is a fixed point on its own
+    // output. Its last pass sorts by `(score desc, rb, qb)` and then removes entries equal on all
+    // three, so the comparator is a strict TOTAL order on whatever survives: the sorted result is
+    // determined by the surviving set alone, not by the input permutation, even though the sort
+    // itself is unstable. Feeding that result back in therefore cannot reorder it, and the
+    // redundancy scan cannot kill anything either, since every surviving pair already failed that
+    // test in the run that produced them. Verified, not just argued: oracle-clean on 2,013,247 real
+    // GIAB paired-end records and on the wgsim genome set.
+    let mut dirty = false;
     for r in 0..4 {
         if call.skip[r] != 0 {
             continue;
@@ -780,12 +797,14 @@ fn matesw_apply(
                     ins += 1;
                 }
                 ma.insert(ins, b);
+                dirty = true;
             }
             n += 1;
         }
-        if n > 0 {
+        if n > 0 && dirty {
             let taken = std::mem::take(ma);
             *ma = mem_sort_dedup_patch(fm, opt, &[], taken);
+            dirty = false;
         }
     }
 }
@@ -801,6 +820,130 @@ pub struct PairRescueData<'a> {
     pub a0: &'a mut Vec<MemAlnReg>,
     /// Read 2's regions. Mutated in place by read-1 anchors.
     pub a1: &'a mut Vec<MemAlnReg>,
+}
+
+/// `BWA4_RESCUE_ROUNDS=1` probe: is the per-ROUND batching starving the rescue kernel's SIMD lanes?
+///
+/// [`batch_mate_rescue`] issues ONE [`batched_ksw_align2`] call per round, and a round only holds the
+/// pairs whose anchor list is still that deep. Round 0 batches every pair; round 20 batches only the
+/// few with 20+ anchors. `fg-labs/bwa-mem3` instead flattens every (pair, anchor) into a single array
+/// and calls its kernel once (`mem_sam_pe_batch_pre`, `bwamem_pair.cpp:733-745`), which cannot empty
+/// out that way -- and which it can afford because it is not byte-identical to bwa-mem2, whereas our
+/// rounds exist precisely to reproduce the C's insertion order.
+///
+/// Whether that costs us anything depends on a number nobody has measured: the DISTRIBUTION of jobs
+/// per kernel call. A round carrying 4 jobs wastes 12 of a NEON u8 kernel's 16 lanes; a round carrying
+/// 400 wastes nothing. This records that histogram, and the round index each call came from, so the
+/// waste can be computed rather than assumed.
+///
+/// It also explains why this never showed up before: on wgsim, anchor lists are shallow, so there are
+/// one or two rounds and the flattening would buy nothing. `docs/perf-levers.md` has the measurement
+/// of how badly that read set understates this stage.
+///
+/// Counters are relaxed atomics on a per-KERNEL-CALL path (not per job, not per read), so the probe
+/// costs one fetch-add per SW batch. Still gated: `enabled()` is checked before any of them is touched.
+pub mod rescue_rounds {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// Upper edges of the jobs-per-call histogram buckets. Chosen around the kernel's lane counts:
+    /// NEON runs 16 lanes at u8 and 8 at i16, AVX-512 runs 64 and 32, so a call under 16 jobs is
+    /// leaving lanes idle on every ISA we ship, and one under 64 is leaving them idle on AVX-512.
+    pub const EDGES: [u64; 8] = [3, 7, 15, 31, 63, 127, 511, u64::MAX];
+    /// Number of kernel calls whose job count fell in each bucket.
+    pub static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    /// Number of JOBS in the calls of each bucket, so the histogram can be weighted by work rather
+    /// than by call count (a thousand 2-job calls matter less than one 100k-job call).
+    pub static JOBS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    /// Jobs issued from round 0 only, i.e. the part that flattening could not improve.
+    pub static ROUND0_JOBS: AtomicU64 = AtomicU64::new(0);
+    /// Sum of `max_rounds` over every chunk, and the chunk count, giving the mean round depth.
+    pub static ROUNDS_SUM: AtomicU64 = AtomicU64::new(0);
+    /// Largest `max_rounds` seen, i.e. how deep the deepest anchor list in any chunk went.
+    pub static ROUNDS_MAX: AtomicU64 = AtomicU64::new(0);
+    /// Chunks processed, the denominator for `ROUNDS_SUM`.
+    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether `BWA4_RESCUE_ROUNDS` is set. Read once and cached, like every other probe here.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_ROUNDS").is_some())
+    }
+
+    /// Record one kernel call carrying `n_jobs` jobs, issued from round `round`.
+    pub fn record_call(round: usize, n_jobs: usize) {
+        if !enabled() {
+            return;
+        }
+        let n = n_jobs as u64;
+        // First bucket whose upper edge the count fits under; the last edge is `u64::MAX`, so this
+        // always finds one.
+        let b = EDGES
+            .iter()
+            .position(|&e| n <= e)
+            .unwrap_or(EDGES.len() - 1);
+        CALLS[b].fetch_add(1, Ordering::Relaxed);
+        JOBS[b].fetch_add(n, Ordering::Relaxed);
+        if round == 0 {
+            ROUND0_JOBS.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Record one chunk's round depth.
+    pub fn record_chunk(max_rounds: usize) {
+        if !enabled() {
+            return;
+        }
+        CHUNKS.fetch_add(1, Ordering::Relaxed);
+        ROUNDS_SUM.fetch_add(max_rounds as u64, Ordering::Relaxed);
+        ROUNDS_MAX.fetch_max(max_rounds as u64, Ordering::Relaxed);
+    }
+
+    /// Print the histogram to stderr once, after the worker threads have joined. No-op unless enabled.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let total_jobs: u64 = JOBS.iter().map(|j| j.load(Ordering::Relaxed)).sum();
+        let total_calls: u64 = CALLS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let chunks = CHUNKS.load(Ordering::Relaxed).max(1);
+        eprintln!(
+            "[rescue-rounds] {total_calls} kernel calls, {total_jobs} jobs, {chunks} chunks, \
+             mean max_rounds {:.1}, deepest {}",
+            ROUNDS_SUM.load(Ordering::Relaxed) as f64 / chunks as f64,
+            ROUNDS_MAX.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "[rescue-rounds] round 0 carries {} of {} jobs ({:.1}%); the rest is what flattening could refill",
+            ROUND0_JOBS.load(Ordering::Relaxed),
+            total_jobs,
+            100.0 * ROUND0_JOBS.load(Ordering::Relaxed) as f64 / total_jobs.max(1) as f64,
+        );
+        eprintln!(
+            "[rescue-rounds] {:>12}  {:>10}  {:>12}  {:>7}",
+            "jobs/call", "calls", "jobs", "%_jobs"
+        );
+        // Running label for each bucket, e.g. "8-15".
+        let mut lo = 1u64;
+        for b in 0..EDGES.len() {
+            let (c, j) = (
+                CALLS[b].load(Ordering::Relaxed),
+                JOBS[b].load(Ordering::Relaxed),
+            );
+            let label = if EDGES[b] == u64::MAX {
+                format!("{lo}+")
+            } else {
+                format!("{lo}-{}", EDGES[b])
+            };
+            if c != 0 {
+                eprintln!(
+                    "[rescue-rounds] {label:>12}  {c:>10}  {j:>12}  {:>6.1}%",
+                    100.0 * j as f64 / total_jobs.max(1) as f64
+                );
+            }
+            lo = EDGES[b].saturating_add(1);
+        }
+    }
 }
 
 /// Batched mate rescue across a whole pair batch: identical to running [`mem_matesw`] inside each
@@ -876,8 +1019,11 @@ pub fn batch_mate_rescue(
         anchors.push([b0, b1]);
     }
 
+    anchor_spread::record(&anchors);
+
     // Round k processes the k-th anchor of every (pair, direction) that still has one. Pairs with
     // fewer anchors simply drop out of later rounds; the loop count is the deepest anchor list.
+    rescue_rounds::record_chunk(max_rounds);
     for round in 0..max_rounds {
         // Collect this round's rescue calls across all pairs and both directions.
         // `calls`: every rescue this round will perform, tagged with the pair index and direction it
@@ -925,6 +1071,8 @@ pub fn batch_mate_rescue(
         // exact, i.e. width does not change the reported score, which is what makes dropping the
         // explicit `lanes` safe. UNVERIFIED: that exactness is asserted by `bwa-neon`'s own docs and
         // tests; it has not been re-derived here.
+        // The number this probe exists for: how many jobs this round's single kernel call carries.
+        rescue_rounds::record_call(round, jobs.len());
         // `alns`: one result per job, index-aligned with `jobs`.
         let alns = batched_ksw_align2(
             &jobs,
@@ -2498,5 +2646,97 @@ mod id_shift_tests {
         // 2^23: the shift reaches the sign bit and the int is sign-extended to uint64_t.
         assert_eq!(id_shift_c(8_388_608), 0xffff_ffff_8000_0000);
         assert_eq!(id_shift_c(9_000_000), 0xffff_ffff_8954_4000);
+    }
+}
+
+/// `BWA4_ANCHOR_SPREAD=1`: do one read's rescue windows overlap each other?
+///
+/// A (pair, direction) runs one mate-rescue SW per anchor, up to `-m` (50), all with the SAME mate
+/// query and a window derived from each anchor's `rb`. If those anchors cluster, the windows overlap
+/// and most of that DP is recomputation: in local SW no positive-scoring alignment can span more
+/// than `l_ms + (a * l_ms - o) / e` target rows (294 for a 150 bp mate under `a=1, o=6, e=1`), so two
+/// windows that overlap by more than that agree EXACTLY on the shared rows past the burn-in. One
+/// pass over the union would then answer every sub-window, per-row maxima included.
+///
+/// This probe prices that: `SPAN` is the sum of per-anchor window widths (what we compute today) and
+/// `UNION` is the width of their union per (pair, direction). `SPAN / UNION` is the ceiling of the
+/// idea; anything near 1.0 means the anchors are scattered and there is nothing to share.
+pub mod anchor_spread {
+    use crate::MemAlnReg;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    /// Summed per-anchor window widths, in bases.
+    pub static SPAN: AtomicU64 = AtomicU64::new(0);
+    /// Summed width of the union of one (pair, direction)'s windows, in bases.
+    pub static UNION: AtomicU64 = AtomicU64::new(0);
+    /// (pair, direction) groups with at least two anchors.
+    pub static GROUPS: AtomicU64 = AtomicU64::new(0);
+    /// Anchors counted.
+    pub static ANCHORS: AtomicU64 = AtomicU64::new(0);
+    /// Groups whose anchors all fall inside one window width, i.e. fully overlapping.
+    pub static TIGHT: AtomicU64 = AtomicU64::new(0);
+    /// Whether `BWA4_ANCHOR_SPREAD` is set; read once and cached.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_ANCHOR_SPREAD").is_some())
+    }
+    /// Accumulate one batch's anchor lists. No-op unless [`enabled`].
+    ///
+    /// The window width is approximated by a constant 1400 bases, the measured mean; the exact width
+    /// depends on `pes[r].high - pes[r].low + l_ms` and does not change the shape of the answer.
+    pub fn record(anchors: &[[Vec<MemAlnReg>; 2]]) {
+        if !enabled() {
+            return;
+        }
+        const W: i64 = 1400;
+        for per_pair in anchors {
+            for list in per_pair {
+                if list.len() < 2 {
+                    continue;
+                }
+                GROUPS.fetch_add(1, Relaxed);
+                ANCHORS.fetch_add(list.len() as u64, Relaxed);
+                SPAN.fetch_add((list.len() as u64) * W as u64, Relaxed);
+                let mut starts: Vec<i64> = list.iter().map(|a| a.rb).collect();
+                starts.sort_unstable();
+                // Sweep the sorted window starts, merging overlaps.
+                let (mut union, mut cur_end) = (0u64, i64::MIN);
+                for s in starts.iter().copied() {
+                    let (b, e) = (s, s + W);
+                    if b > cur_end {
+                        union += W as u64;
+                        cur_end = e;
+                    } else if e > cur_end {
+                        union += (e - cur_end) as u64;
+                        cur_end = e;
+                    }
+                }
+                UNION.fetch_add(union, Relaxed);
+                if union <= W as u64 {
+                    TIGHT.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+    /// Print the accumulated counters once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (span, union, groups, anchors, tight) = (
+            SPAN.load(Relaxed),
+            UNION.load(Relaxed),
+            GROUPS.load(Relaxed),
+            ANCHORS.load(Relaxed),
+            TIGHT.load(Relaxed),
+        );
+        eprintln!(
+            "[anchor-spread] {groups} multi-anchor groups, {anchors} anchors ({:.1} per group); \
+             window span {span} bases vs union {union} ({:.2}x redundancy); \
+             {tight} groups ({:.1}%) fit inside a single window",
+            anchors as f64 / groups.max(1) as f64,
+            span as f64 / union.max(1) as f64,
+            100.0 * tight as f64 / groups.max(1) as f64,
+        );
     }
 }
