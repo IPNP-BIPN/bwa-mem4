@@ -23,11 +23,44 @@ cd "$(dirname "$0")/.."
 MODE="${1:-se}"
 REPS="${2:-3}"
 T="${T:-8}"
+# `-K` batch size. Set `K=default` to omit the flag entirely and let every binary use bwa's own
+# default of `10M * threads`, which is what the gist's benchmark does and what the standing number
+# in docs/perf-levers.md is measured at:
+#
+#   T=16 K=default READS=work/giab_small/r1_1m.fq.gz READS2=work/giab_small/r2_1m.fq.gz \
+#     IDX=work/genome.fa scripts/fork_bench.sh pe 6
+#
+# Keeping an explicit `-K` is still the right choice when comparing two builds of ONE binary, since
+# it pins the batch boundaries and therefore the output.
 K="${K:-10000000}"
 IDX="${IDX:-work/genome.fa}"
 M2="${M2:-bwa-mem2}"
-FORK="${FORK:-reference/bwa-mem3-cpp/bwa-mem3.arm64}"
+# The in-tree arm64 build if it is there (the macOS dev host), else whatever `bwa-mem3` is on PATH
+# (a Linux benchmark box, where it comes from bioconda). Override with FORK=.
+if [ -z "${FORK:-}" ]; then
+  if [ -x reference/bwa-mem3-cpp/bwa-mem3.arm64 ]; then
+    FORK=reference/bwa-mem3-cpp/bwa-mem3.arm64
+  else
+    FORK=$(command -v bwa-mem3 || echo reference/bwa-mem3-cpp/bwa-mem3.arm64)
+  fi
+fi
 M4="${M4:-./target/release/bwa-mem4}"
+
+# ---- Portability: this script was written on macOS and has to run on the Linux benchmark box ----
+# Two BSD-only tools are involved. Probing beats uname: a Mac with GNU coreutils first on PATH, or a
+# Linux box without GNU time, both get the right answer this way.
+#   * `/usr/bin/time`: BSD spells the verbose form `-l` and reports peak RSS in BYTES; GNU spells it
+#     `-f FORMAT` and reports it in KILOBYTES. Both are parsed into bytes below.
+#   * `md5` vs `md5sum`: only ever compared against each other, so the differing output format
+#     (bare hash vs "hash  -") is immaterial as long as one tool is used for every arm.
+if /usr/bin/time -l true >/dev/null 2>&1; then
+  TIME_KIND=bsd
+elif /usr/bin/time -f '%e %M' true >/dev/null 2>&1; then
+  TIME_KIND=gnu
+else
+  echo "need /usr/bin/time supporting BSD -l or GNU -f" >&2; exit 1
+fi
+MD5=$(command -v md5 || command -v md5sum) || { echo "need md5 or md5sum" >&2; exit 1; }
 
 case "$MODE" in
   se) READ_FILES=("${READS:-work/r1_4m.fq}") ;;
@@ -55,10 +88,19 @@ run() {
   # neither bwa-mem2 nor we emit. Without it the fork trivially "differs" on every line and the
   # identity check says nothing. It runs on all three arms, not just the fork, so the pipelines
   # stay symmetric and no arm carries a cost its rivals do not: it is a no-op on the other two.
-  /usr/bin/time -l bash -c "$* 2>'$of.err' | grep -v '^@' | sed 's/\tHN:i:[0-9]*//' | tee >(wc -l >'$of.n') | md5 >'$of.md5'" 2>"$of.time"
+  local inner="$* 2>'$of.err' | grep -v '^@' | sed 's/\tHN:i:[0-9]*//' | tee >(wc -l >'$of.n') | $MD5 >'$of.md5'"
   local real rssb nb
-  real=$(awk '/ real /{print $1}' "$of.time" | head -1)
-  rssb=$(awk '/maximum resident set size/{print $1}' "$of.time")
+  if [ "$TIME_KIND" = bsd ]; then
+    /usr/bin/time -l bash -c "$inner" 2>"$of.time"
+    real=$(awk '/ real /{print $1}' "$of.time" | head -1)
+    rssb=$(awk '/maximum resident set size/{print $1}' "$of.time")
+  else
+    # GNU: one line, "<wall_seconds> <peak_rss_kilobytes>". Scaled to bytes so the caller's
+    # `/ 1048576` gives MB on both platforms.
+    /usr/bin/time -f '%e %M' bash -c "$inner" 2>"$of.time"
+    real=$(awk 'NF==2{w=$1; r=$2} END{print w}' "$of.time")
+    rssb=$(awk 'NF==2{w=$1; r=$2} END{print r*1024}' "$of.time")
+  fi
   # Only our arm reports its batch count; the other two show "-".
   nb=$(sed -n 's/.*processed \([0-9]*\) batches.*/\1/p' "$of.err" | tail -1)
   [ -n "$nb" ] || nb="-"
@@ -71,9 +113,11 @@ say "# idx=$IDX  reads=${READ_FILES[*]}"
 say "# bwa-mem4=$(git rev-parse --short HEAD)"
 say "############################################################"
 
-CMD_M2="$M2 mem -t$T -K $K $IDX ${READ_FILES[*]}"
-CMD_FORK="$FORK mem -t$T -K $K $IDX ${READ_FILES[*]}"
-CMD_M4="$M4 mem -t$T -K $K $IDX ${READ_FILES[*]}"
+# `K=default` means "pass no -K at all", i.e. each binary picks bwa's `10M * threads`.
+if [ "$K" = "default" ]; then KFLAG=""; else KFLAG="-K $K"; fi
+CMD_M2="$M2 mem -t$T $KFLAG $IDX ${READ_FILES[*]}"
+CMD_FORK="$FORK mem -t$T $KFLAG $IDX ${READ_FILES[*]}"
+CMD_M4="$M4 mem -t$T $KFLAG $IDX ${READ_FILES[*]}"
 
 say "warming all three binaries (untimed)..."
 for c in "$CMD_M2" "$CMD_FORK" "$CMD_M4"; do bash -c "$c" >/dev/null 2>&1; done

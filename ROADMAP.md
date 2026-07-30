@@ -50,6 +50,61 @@ pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
 (upstream `bwa-mem2#297`, ouvert depuis ce projet).
 
+## Campagne perf : le noyau de mate rescue, et le classement contre le fork
+
+**Etat au 2026-07-29 (M4 Max, 1M paires GIAB reelles, PE `-t12 -K 10M`, binaire PGO, ordre alterne,
+5 reps) : bwa-mem4 25.81s de moyenne contre 27.48s pour fg-labs/bwa-mem3, gagnant 5 fois sur 5,
+et nous restons les seuls octet-identiques a bwa-mem2 2.3 (2 013 247 enregistrements).** Avant ce
+tour la meme mesure donnait 0,981x, soit 2% de retard.
+
+**Banc de Nils, son echelle (giab-4m, GRCh38, `-t16`, `-K` par defaut, 8 lots) : bwa-mem2 188,24s,
+fork 98,13s, bwa-mem4 91,01s. 1,078x contre le fork, 3 fois sur 3, dispersion 0,5%, et 2,06x contre
+bwa-mem2 la ou le fork fait 1,91x.** Octet-identique sur 8 052 432 enregistrements, le fork divergeant
+sur 18. Son gist donnait le fork a 1,29x en sa faveur sur ce meme jeu : le renversement total vaut
+~1,39x. Reproductible par `T=16 K=default scripts/fork_bench.sh pe 3`.
+
+**Mise a jour finale (meme jour) : dans le regime EXACT du gist (`-t16`, `-K` par defaut, entree
+gzippee, sortie /dev/null), 6 victoires sur 6, rapport apparie median 1,104**, moyennes 25,68s pour
+le fork contre 23,38s. Le CPU confirme, 342,3s contre 313,0s. Le gist annoncait 1,27 a 1,50x en
+faveur du fork sur ce meme regime.
+
+Le dernier levier n'etait pas un kernel : a `-t16` notre pool rayon etait **plafonne a 12 workers**
+par le cap P-core macOS pendant que le fork en utilisait 16. Le cap se justifiait sur le petit banc
+simule ; sur donnees reelles il coute 9,2% de mur (24,25/26,31/26,39s plafonne contre
+23,00/23,09/23,82s sans). Il est desormais opt-in (`BWA4_PCORE_CAP=1`). Neutre en sortie, verifie :
+a `-K` fixe le md5 est inchange.
+
+La sonde de barriere (`BWA4_BARRIER_TIME=1`, nouvelle) a permis de le trouver et a REFUTE au passage
+l'hypothese du desequilibre de barriere : occupation 99,2% sur align, 97,5% sur rescue, 98,6% sur
+sam_emit, queues a 0-1%.
+
+Deux leviers, tous deux sur le noyau u8 de mate rescue, qui tournait a 7,5 Gcell/s alors que 16
+voies u8 a ~4 GHz en promettent bien davantage. La boucle de colonnes porte
+maintenant une plage rapide sans padding (`n_fast` = la plus courte requete vive du groupe), ce qui
+retire six operations vectorielles par cellule sur 92,5% de la matrice. Mesure a deux instruments :
+-14,2% de CPU noyau (3/3) et -9,7% de mur en build simple, -5,0% de mur en build PGO (4/4). Porte
+sur les six noyaux (NEON u8/i16, AVX2 u8/i16, AVX-512BW u8/i16).
+
+Le second est le **blocage deux lignes de cible** : les lignes `i` et `i+1` partagent le chargement
+de colonne de requete, `h_prev[j]`, `e[j]` et le rangement `h_cur[j]`, parce que la diagonale de la
+ligne `i+1` est le H de la colonne precedente de la ligne `i` et que son report E est celui que la
+ligne `i` vient de produire. Cinq acces memoire pour deux cellules au lieu de dix, et deux chaines H
+independantes a entrelacer. **-8,9% de CPU noyau (3/3, dispersion intra-bras de 0,02s)**, -6,3% sur
+l'etage rescue, -2,2% de mur (sous le plancher, garde sur la force de la mesure noyau). Porte sur les
+trois noyaux u8 (NEON, AVX2, AVX-512BW) ; les noyaux i16 gardent la boucle une ligne, c'est le chemin
+froid.
+
+**La verification x86 n'est plus une simple compilation** : Rosetta 2 execute AVX2 sur cette machine,
+donc `RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --workspace --target x86_64-apple-darwin`
+execute reellement les noyaux AVX2 contre la reference scalaire. Ajoute a `scripts/check.sh`.
+AVX-512 reste non couvert (pas de `avx512bw` sous Rosetta).
+
+Pistes fermees par la mesure dans le meme tour, toutes documentees dans `docs/perf-levers.md` :
+tri des jobs de rescue par longueur (les fenetres font toutes `2 * max_dist`, gain exactement nul),
+deduplication des jobs (19 sur 739 868), argmax de colonne recupere a la demande (+18% de CPU
+noyau), tri introsort indirect par tags d'index (-3,7% de mur), backend gzip (plafond 1,2%),
+arene plate pour la passe inverse (nul).
+
 ## Phase 0 de la campagne perf : mesure de reference contre le fork
 
 Trois bras entrelaces dans la meme passe (`scripts/fork_bench.sh`), index genome, binaire PGO,
@@ -109,6 +164,33 @@ casser l'octet-identite de l'index). Parite tenue : 21 tests d'index (chaque tab
 Impact vitesse du `read()` : **nul** (SE 4M `-t8` 28,54 s, le chargement est amorti sur 60 batches).
 
 ### Phase B, le deficit PE = le kernel de sauvetage de mate
+
+> ⚠️ **2026-07-29 : cette section est PERIMEE. Le deficit de 1,45x sur le rescue n'existe plus, et
+> les deux etapes suivantes qu'elle recommande ont ete testees et sont mortes.**
+>
+> Re-mesure sur **vraies donnees GIAB HG002** (1M paires, GRCh38, PE, `-t12`, bras entrelaces,
+> `scripts/fork_bench.sh`), binaire PGO des deux cotes :
+> **bwa-mem2 54,91 s / fork 28,18 s / bwa-mem4 28,71 s, soit 0,981x contre le fork** (RSS 0,985x),
+> nous octet-identiques a bwa-mem2 sur 2 013 247 enregistrements, pas le fork. C'est une egalite
+> sous le plancher de bruit de 3 %. Il n'y a plus de deficit PE a combler.
+>
+> Deux pieges que cette section illustre, tous deux mesures dans `docs/perf-levers.md` :
+> * **Le tableau ci-dessous est sur wgsim**, ou le mate rescue fait 10 % du wall contre **59,5 %**
+>   sur du reel. Le meme harnais donne 1,41x EN NOTRE FAVEUR sur wgsim et 1,10x CONTRE nous sur du
+>   reel : un basculement de 1,55x du seul fait du jeu de reads. Aucun chiffre de vitesse mesure sur
+>   `work/r1_500k.fq` n'est recevable.
+> * **Le PGO vaut 12,4 % sur du reel** (32,28 -> 28,71 s), pas les 8,5 % mesures sur wgsim. Un bras
+>   `cargo build --release` n'est pas comparable au binaire qu'on livre.
+>
+> Les deux suites recommandees ci-dessous, testees depuis :
+> * *« comparer `batched_ksw_align2` au kswv du fork »* : le fork aplatit tous ses jobs en un lot
+>   unique, nous appelons le kernel une fois par round. **Mort** : `BWA4_RESCUE_ROUNDS=1` mesure
+>   102 jobs par appel en moyenne, 93,5 % du travail dans des appels de 64 jobs ou plus, contre
+>   16 voies NEON u8. Les vecteurs sont deja pleins, aplatir ne refile rien.
+> * *« le rescue est LE levier »* : son cout est son nombre de cellules (3,68 M jobs pour 1M paires,
+>   ~207 k cellules chacun, ~762 G cellules), fixe par l'algorithme de bwa. `max_rounds` sature le
+>   plafond `-m` a 50 sur **tous** les chunks.
+
 
 **Decompose (t8, 500k paires, genome, PGO, mediane-3 ; `-S` isole le rescue) :**
 
@@ -424,8 +506,20 @@ porter le **seeding** sur accelerateur, ce qui est un autre projet.
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
    concordance de variants sur le truth set, ce qui est le langage d'un utilisateur clinique.
-2. **`mem_sort_dedup_patch`** : 11 % du profil PE, jamais regarde.
+2. **`mem_sort_dedup_patch`** : **regarde (2026-07-29)**, 13,3 % du busy sur un profil `sample` en
+   donnees reelles. Ce n'est PAS l'etage dedup (0,8 % du wall) : c'est le mate rescue qui reinsere une
+   region puis retrie tout le vecteur, a chaque orientation, sur jusqu'a 50 rounds. `BWA4_DEDUP_SHAPE`
+   mesure **n moyen = 94,87** et **1,84 M d'appels avec n >= 65**, tous venant du rescue.
+   Deux correctifs octet-identiques livres (`dirty` pour sauter les re-tris a vide, **-14,2 %
+   d'appels** ; pile d'introsort en tableau fixe, ~10 M d'allocations en moins) : **~2 % de wall en
+   design apparie 4/4, donc sous le plancher de 3 %**. Le reste est incompressible sans une structure
+   incrementale reproduisant l'ordre exact des egalites de klib, la permutation etant observable dans
+   la sortie. Detail complet et tables dans `docs/perf-levers.md`.
 3. **SA-IS parallele** (Tier B de la phase 8c) : l'indexeur reste mono-thread sur le tableau de
    suffixes, qui domine son pic RSS et son temps.
-4. **Re-mesurer le fork `fg-labs/bwa-mem3`** : la derniere comparaison date de la phase 9a, avant
-   toute la vague perf, et sur un benchmark dont on sait maintenant qu'il cachait le seeding.
+4. ~~**Re-mesurer le fork `fg-labs/bwa-mem3`**~~ : **fait (2026-07-29)**, sur vraies donnees GIAB et
+   en PGO : **0,981x, egalite**. Voir l'encart de la phase B et `docs/perf-levers.md`.
+5. **Verifier le PGO sur Graviton** : nh13 mesure le PGO a **-0,4 %** sur Graviton4 la ou il vaut
+   **+12,4 %** ici. Les deux ne peuvent pas etre une propriete du code : soit son build n'a pas
+   applique son profil, soit le benefice est propre a l'Apple Silicon. Seule question ouverte du
+   dossier, et elle se tranche de son cote.

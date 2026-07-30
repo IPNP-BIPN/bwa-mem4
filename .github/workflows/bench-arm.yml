@@ -257,3 +257,65 @@ jobs:
             printf "  %-4s %s\n" "$W" "$b"
           done
           echo "Lowest wall at W<16 confirms our lockstep oversubscribes Graviton's memory controller."
+
+      # The top-ranked hypothesis for the Graviton deficit, and the one that CANNOT be tested on the
+      # macOS dev host: Linux uses a 4 KiB base page, so a 64-entry dTLB covers 256 KiB of the 6.2 GB
+      # `cp_occ` that seeding walks at computed addresses. `fg-labs/bwa-mem3` calls
+      # madvise(MADV_HUGEPAGE) on exactly these arrays (reference/bwa-mem3-cpp/src/bwa_madvise.h);
+      # until this commit we called it nowhere. `BWA4_NO_HUGEPAGE=1` turns our hint off so both arms
+      # are the SAME binary. The AnonHugePages line is the mechanistic check: accept a wall delta
+      # only if the promotion actually happened.
+      - name: Hugepage A/B (Linux-only lever, invisible on the macOS dev host)
+        run: |
+          cd work
+          M4=../target/release/bwa-mem4
+          T="${{ github.event.inputs.max_threads || '0' }}"; [ "$T" = "0" ] && T="$(nproc)"
+          echo "THP policy: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo unavailable)"
+          run_wall() { timeout 900 /usr/bin/time -f '%e' -o t.txt "$@" >/dev/null 2>e.txt || { tail -3 e.txt >&2; echo FAIL; return; }; cat t.txt; }
+          run_wall $M4 mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null   # warm
+          echo "== SE and PE, hugepage hint ON vs OFF, best-of-2, interleaved =="
+          for mode in "r1.fq" "r1.fq r2.fq"; do
+            on=""; off=""
+            for rep in 1 2; do
+              w=$(run_wall $M4 mem -t "$T" chr21.fa $mode)
+              on=$(awk -v a="$on" -v x="$w" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
+              w=$(BWA4_NO_HUGEPAGE=1 run_wall $M4 mem -t "$T" chr21.fa $mode)
+              off=$(awk -v a="$off" -v x="$w" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
+            done
+            echo "  mode='$mode'  hint_on=${on}s  hint_off=${off}s  ratio=$(awk -v a="$off" -v b="$on" 'BEGIN{printf "%.3f", a/b}')x (>1 = hint helps)"
+          done
+          # Mechanistic confirmation: how much of the index actually got promoted.
+          $M4 mem -t "$T" chr21.fa r1.fq >/dev/null 2>&1 &
+          pid=$!; sleep 8; grep -E 'AnonHugePages|Rss' /proc/$pid/smaps_rollup 2>/dev/null || echo "smaps_rollup unavailable"; wait $pid || true
+
+      # Where the wall actually goes, per stage, in WALL clock on the main thread. This is the
+      # instrument that decides what to optimise next; without it every phase is a guess.
+      - name: Stage-time breakdown at -t1 and full core count
+        run: |
+          cd work
+          M4=../target/release/bwa-mem4
+          T="${{ github.event.inputs.max_threads || '0' }}"; [ "$T" = "0" ] && T="$(nproc)"
+          for t in 1 "$T"; do
+            echo "===== PE -t$t, -K 10M ====="
+            BWA4_STAGE_TIME=1 $M4 mem -t "$t" -K 10000000 chr21.fa r1.fq r2.fq >/dev/null 2>st.err || true
+            grep '^\[stage-time\]' st.err || echo "(no stage-time output)"
+          done
+
+      # The headline: are we ahead of the fork on ITS OWN benchmark regime (PE, full core count)?
+      - name: Fork head-to-head, PE, full core count
+        run: |
+          cd work
+          M4=../target/release/bwa-mem4
+          T="${{ github.event.inputs.max_threads || '0' }}"; [ "$T" = "0" ] && T="$(nproc)"
+          run_wall() { timeout 900 /usr/bin/time -f '%e' -o t.txt "$@" >/dev/null 2>e.txt || { tail -3 e.txt >&2; echo FAIL; return; }; cat t.txt; }
+          run_wall bwa-mem3 mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null
+          run_wall $M4     mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null
+          bf=""; bm=""
+          for rep in 1 2; do
+            f=$(run_wall bwa-mem3 mem -t "$T" chr21.fa r1.fq r2.fq)
+            m=$(run_wall $M4     mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "  rep$rep: fork ${f}s | mem4 ${m}s"
+            bf=$(awk -v a="$bf" -v x="$f" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
+            bm=$(awk -v a="$bm" -v x="$m" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
+          done
+          echo "best: fork ${bf}s | mem4 ${bm}s | mem4-vs-fork $(awk -v a="$bf" -v b="$bm" 'BEGIN{printf "%.3f", a/b}')x (>1 = we win)"
