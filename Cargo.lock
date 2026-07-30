@@ -178,6 +178,9 @@ dependencies = [
 [[package]]
 name = "bwa-mem4-extend"
 version = "4.2.0"
+dependencies = [
+ "hyalite",
+]
 
 [[package]]
 name = "bwa-mem4-index"
@@ -543,6 +546,12 @@ dependencies = [
  "glob",
  "libz-sys",
 ]
+
+[[package]]
+name = "hyalite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c37e8ecbf31c56fe972538ffb1e01de73e17ac8a8853908b03577c51da456b8e"
 
 [[package]]
 name = "icu_collections"
