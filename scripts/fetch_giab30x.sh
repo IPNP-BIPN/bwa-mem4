@@ -8,11 +8,18 @@ cd "$(dirname "$0")/.."
 BASE="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/HG002_HiSeq300x_fastq"
 FLOWCELLS="140528_D00360_0018_AH8VC6ADXX 140528_D00360_0019_BH8VDAADXX 140605_D00360_0020_AH9V1RADXX"
 PROJ="Project_RM8391_RM8392"
-OUT=work/giab30x
+OUT="${OUT:-work/giab30x}"
 mkdir -p "$OUT"
-R1OUT="$OUT/HG002_30x_R1.fastq.gz"
-R2OUT="$OUT/HG002_30x_R2.fastq.gz"
-TARGET_R1_BYTES=$((35 * 1024 * 1024 * 1024))
+R1OUT="${R1OUT:-$OUT/HG002_30x_R1.fastq.gz}"
+R2OUT="${R2OUT:-$OUT/HG002_30x_R2.fastq.gz}"
+# ~35 GB of gzipped R1 is ~320M pairs, i.e. 30x. Overridable because most uses do NOT want 30x:
+# re-sweeping a scheduling constant needs a few million REAL pairs (wgsim has mate rescue nearly
+# asleep, and rescue is 47-64% of paired-end compute on real data), not a whole genome's worth.
+#   TARGET_R1_GB=3 OUT=work/giab_small scripts/fetch_giab30x.sh
+TARGET_R1_BYTES=$(( ${TARGET_R1_GB:-35} * 1024 * 1024 * 1024 ))
+# `stat -f%z` is BSD, `-c%s` is GNU. Probed rather than switched on uname so a Mac with coreutils
+# first on PATH still works, same as scripts/fork_bench.sh.
+if stat -f%z "$0" >/dev/null 2>&1; then fsize() { stat -f%z "$1"; }; else fsize() { stat -c%s "$1"; }; fi
 : > "$R1OUT"; : > "$R2OUT"
 
 echo "[discover] listing R1 chunks..."
@@ -35,7 +42,7 @@ while read -r r1url; do
   echo "[dl $n] $(basename "$r1url")"
   curl -s --max-time 1800 --retry 4 --retry-delay 5 "$r1url" >> "$R1OUT" || { echo "  R1 fail"; break; }
   curl -s --max-time 1800 --retry 4 --retry-delay 5 "$r2url" >> "$R2OUT" || { echo "  R2 fail"; break; }
-  acc=$(stat -f%z "$R1OUT")
+  acc=$(fsize "$R1OUT")
   echo "  R1 total: $((acc/1024/1024)) MB / $((TARGET_R1_BYTES/1024/1024)) MB target"
   if [ "$acc" -ge "$TARGET_R1_BYTES" ]; then echo "[done] target reached at $n chunks"; break; fi
 done < "$OUT/r1_urls.txt"

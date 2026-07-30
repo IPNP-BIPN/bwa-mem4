@@ -38,6 +38,25 @@ if [ -x "$TC/bin/cargo" ] && [ -d "$TC/lib/rustlib/x86_64-apple-darwin" ]; then
       --workspace --all-targets --target x86_64-apple-darwin -- -D warnings 2>&1 \
     | grep -E "^error" | grep -v "x87" && { echo "x86_64 check FAILED"; exit 1; }
   echo "x86_64 OK"
+
+  # And actually RUN the x86_64 tests, under Rosetta. This works and it is not obvious that it
+  # should: Rosetta 2 on this machine executes AVX2, so `is_x86_feature_detected!("avx2")` is true
+  # and `avx2_matesw_*` / `avx2_u8_and_i16_match_scalar` really exercise the AVX2 kernels against
+  # the scalar reference instead of skipping. That turns every AVX2 change from compile-checked
+  # into verified, without an x86 box.
+  #
+  # `-C target-cpu=x86-64-v3` is required and replaces the workspace's `native`: `apple-m4` is not
+  # an x86 CPU name, and rustc otherwise aborts with "64-bit code requested on a subtarget that
+  # doesn't support it". v3 is the AVX2 level.
+  #
+  # AVX-512 is NOT covered: Rosetta has no `avx512bw`, so `avx512_matesw_*` take their
+  # feature-detect early return and report `ok` without running the kernel. Those paths stay
+  # CI-only.
+  echo "== x86_64 tests under Rosetta (AVX2 kernels really run) =="
+  RUSTC="$TC/bin/rustc" PATH="$TC/bin:$PATH" RUSTFLAGS="-C target-cpu=x86-64-v3" \
+    "$TC/bin/cargo" test --workspace --target x86_64-apple-darwin --release >/dev/null 2>&1 \
+    || { echo "x86_64 tests FAILED"; exit 1; }
+  echo "x86_64 tests OK"
 else
   echo "== x86_64 cross-check skipped (rustup toolchain or x86_64 std missing) =="
 fi
