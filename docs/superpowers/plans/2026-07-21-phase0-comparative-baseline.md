@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Produce a trustworthy three-arm measurement (bwa-mem2 2.3 / `fg-labs/bwa-mem3` / bwa-mem4) of wall time and peak RSS at `-t8` end-to-end on real WGS, so the rest of the campaign is aimed at a real deficit rather than a phase-9a-era one.
+**Goal:** Produce a trustworthy three-arm measurement (bwa-mem2 2.3 / `fg-labs/bwa-mem3` / bwa-mem4) of wall time and peak RSS at `-t8` end-to-end on real WGS, so the rest of the work is aimed at a real deficit rather than a phase-9a-era one.
 
 **Architecture:** One new Rust-visible behaviour (bwa-mem4 prints how many batches it processed), then two shell harnesses: `scripts/fork_bench.sh` at iteration scale (1-4M reads, minutes) and a third arm added to the existing `scripts/giab30x_bench.sh` at validation scale (30x, hours). The harnesses interleave arms within a pass, warm every binary first, and record RSS alongside wall time.
 
@@ -319,7 +319,7 @@ choosing it is an act rather than an accident."
 
 ### Task 3: `scripts/fork_bench.sh`, the three-arm iteration harness
 
-Iteration scale: 1-4M reads, minutes per pass, ratios depth-invariant. This is the script the rest of the campaign runs after every change.
+Iteration scale: 1-4M reads, minutes per pass, ratios depth-invariant. This is the script the rest of the work runs after every change.
 
 **Files:**
 - Create: `scripts/fork_bench.sh`
@@ -564,7 +564,7 @@ git commit -m "bench(30x): add the fork as a third arm, and record peak RSS
 The 30x harness is what produced the README's SE 2.62x / PE 1.85x, so it is
 where the fork comparison has to end up to be quotable. Arms stay interleaved
 within a rep. time -p becomes time -l for the RSS, which is an objective of this
-campaign and not a footnote; the fast-return crash guard is untouched."
+comparison and not a footnote; the fast-return crash guard is untouched."
 ```
 
 ---
@@ -639,7 +639,7 @@ this project has been quoting for months. That regime hid the two things that
 decide the comparison at -t8: the index load, where we mmap and a bwa-mem2
 derivative memcpys 16 GB, and the reader/writer pipeline.
 
-Whatever this table says is what the rest of the campaign is aimed at."
+Whatever this table says is what the rest of the work is aimed at."
 ```
 
 - [ ] **Step 6: Decide Phase B, in writing**

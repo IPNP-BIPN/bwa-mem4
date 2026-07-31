@@ -213,8 +213,34 @@ while we align all 345 pairs.
 [#297](https://github.com/bwa-mem2/bwa-mem2/issues/297), the x86-vs-arm64 disagreement described
 above, was filed from this project.
 
+## Credits
+
+This project is a from-scratch Rust implementation, written against bwa-mem2 as its oracle rather
+than forked from any existing codebase. It nonetheless owes work to others, and this section says
+who.
+
+**[bwa-mem2](https://github.com/bwa-mem2/bwa-mem2)**, by Vasimuddin Md and Sanchit Misra (Intel
+Corporation) and Heng Li, is the reference this project reimplements and the standard its output is
+checked against. Every acceptance gate here is a comparison to its bytes. Substantial parts of this
+code are a line-by-line reimplementation of theirs.
+
+**[bwa-mem3](https://github.com/fg-labs/bwa-mem3)**, by [Nils Homer](https://github.com/nh13)
+(Fulcrum Genomics), is the source of several optimisations implemented here. They were published in
+[bwa-mem2#288](https://github.com/bwa-mem2/bwa-mem2/pull/288) and in that fork, and reimplemented in
+Rust rather than copied: native NEON `kswv`, the `vbslq` blendv in `bandedSWA`, Apple Silicon
+P-core/E-core and cache-line tuning, and the PGO build. Per-optimisation provenance, including which
+of his measured results did and did not transfer here, is recorded in
+[DEPENDENCIES.md](DEPENDENCIES.md). bwa-mem3 is an independently maintained C++ project and remains
+the place to go for that lineage.
+
+Work reimplemented from the published literature (LISA/BWA-MEME, minibwa, and others), and the
+measurements showing which of those techniques paid off here and which measured at zero, is written
+up in [docs/perf-levers.md](docs/perf-levers.md).
+
 ## Licence
 
 MIT, in [LICENSE](LICENSE). This is a derivative work of
 [bwa-mem2](https://github.com/bwa-mem2/bwa-mem2) (Copyright 2019 Intel Corporation, Heng Li), which
-is also MIT licensed; its copyright notice is retained in full in that file.
+is also MIT licensed; its copyright notice is retained in full in that file. The notice of
+[bwa-mem3](https://github.com/fg-labs/bwa-mem3) (Copyright 2026 Fulcrum Genomics LLC), also MIT, is
+retained there too, for the optimisations described under Credits above.

@@ -877,7 +877,7 @@ Mean 21.99s vs 18.87s: **-14.2% kernel CPU, 3 of 3, in both orders.**
 | 4 | on, off | 17.726 / 31.37 | 14.963 / 27.92 |
 
 Mean wall 30.07s vs 27.14s: **-9.7%, 4 of 4, in both orders**; rescue stage 16.54 vs 14.36 (-13.2%),
-which matches the kernel-CPU measure. **First banked gain above the 3% floor in this campaign.**
+which matches the kernel-CPU measure. **First banked gain above the 3% floor in this comparison.**
 
 Note the host was drifting 28-31s during the wall runs. That is exactly why the paired alternating
 design plus a second, host-insensitive instrument (kernel CPU ns) is the standard here: either alone

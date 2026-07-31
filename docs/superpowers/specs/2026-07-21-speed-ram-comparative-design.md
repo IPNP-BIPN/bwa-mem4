@@ -1,20 +1,26 @@
-# Design: beating `fg-labs/bwa-mem3` on speed and RAM
+# Design: speed and RAM, measured against `fg-labs/bwa-mem3`
 
 Date: 2026-07-21. Status: approved (section 1 explicitly, the rest under a grant of autonomy).
 
+`fg-labs/bwa-mem3` is Nils Homer's independently maintained C++ project, MIT licensed, and several
+of the optimisations in our own NEON backend were reimplemented from his published work (see
+`DEPENDENCIES.md`). It is used here as a performance reference because it is the fastest
+bwa-mem2-compatible aligner we can run, not as a target to displace. Where our numbers are better,
+that is a comparison result; where his are, that is a lever for us to study.
+
 ## The goal, stated so it can be falsified
 
-Beat @nh13's C++ fork `fg-labs/bwa-mem3` on **wall time and peak RSS**, measured **end-to-end, `-t8`,
-on a real WGS**, while the SAM stays **byte-identical to bwa-mem2 2.3**.
+Improve **wall time and peak RSS** against the `fg-labs/bwa-mem3` reference, measured
+**end-to-end, `-t8`, on a real WGS**, while the SAM stays **byte-identical to bwa-mem2 2.3**.
 
 Three decisions fix the shape of everything below:
 
 - **The benchmark is `-t8` end-to-end on real data**, not `-t1` align-only. The only number we have
-  against the fork is `-t1` align-only (1.29x behind, phase 9a-era), and that regime excludes the two
+  against bwa-mem3 is `-t1` align-only (1.29x behind, phase 9a-era), and that regime excludes the two
   things we do better than a bwa-mem2 derivative: mmap instead of a 16 GB memcpy at load, and a
-  reader/writer pipeline. The fork has never been measured in the regime a user actually runs.
+  reader/writer pipeline. bwa-mem3 has never been measured in the regime a user actually runs.
 - **Byte-identity is non-negotiable.** This is the project's acceptance criterion and 4.0.0 just
-  shipped on it publicly. It also caps the campaign: it locks us into exact FM-index SMEM seeding,
+  shipped on it publicly. It also caps this comparison: it locks us into exact FM-index SMEM seeding,
   which is ~78% of the genome-scale profile. Aligners that go 4.5-6x faster (strobealign) get there
   by abandoning it. Our remaining wins are latency and bookkeeping, worth 5-15% each, not 2x.
 - **RAM is opportunistic, on both binaries.** No numeric target. `mem` peaks at ~20.2 GB, `index` at
@@ -29,7 +35,7 @@ The genome-scale profile is `build_chains_from_smems` 37.6%, `LsSlot::step` 21.1
 chased (SIMD width, ILP, SME, the f-recurrence, the whole GPU line) was optimising 4% of the time.
 The `~85% SW extension` and `~40-43% extension` figures in older docs were measured on `work/region.fa`,
 whose 2 Mbp BWT is cache-resident and hides seeding entirely. **No number measured on `region.fa` is
-admissible in this campaign.**
+admissible in this comparison.**
 
 And the seeding side is already saturated: five separately published "fewer memory accesses"
 techniques (LISA/BWA-MEME, flat 49.6 GB SA, minibwa's 10-mer cache, SA-line prefetch, Zhang BWT
@@ -46,7 +52,7 @@ and it only returns to the algorithm if a fresh measurement says we are actually
 Deliverable: a table, not a speedup. It answers Nils and it decides whether phase B happens.
 
 Three arms in one harness: `bwa-mem2` 2.3 (the oracle and historical denominator),
-`reference/bwa-mem3-cpp/bwa-mem3.arm64`, and us. The fork joins `scripts/giab30x_bench.sh` as a third
+`reference/bwa-mem3-cpp/bwa-mem3.arm64`, and us. bwa-mem3 joins `scripts/giab30x_bench.sh` as a third
 arm rather than getting a new script, so it inherits the per-pass md5 identity check and the
 "a pass this fast means the aligner crashed" guard.
 
@@ -71,10 +77,10 @@ Method rules, each one paid for by a past error in this repo:
   prefetch speedup" (real value 1.02x) and an "11.76x binning win" (cache warming) in this project.
 - Genome index only.
 - Our arm is the output of `scripts/pgo.sh`. A `cargo build --release` is ~15% slower and is not what
-  we ship, so timing it would flatter the fork by 15%.
+  we ship, so timing it would flatter bwa-mem3 by 15%.
 
 Phase 0 has three admissible outcomes and all three are accepted in advance: we already win (phase B
-is cancelled, the campaign becomes consolidate-and-publish), we lose (phase B is justified and
+is cancelled, this comparison becomes consolidate-and-publish), we lose (phase B is justified and
 targeted by the profile), or we win on time and lose on RSS (effort redirects to memory).
 
 ## Phase A — the frames nobody has opened
@@ -102,16 +108,16 @@ why it must be measured at 30x rather than argued about. Three candidates, in de
   rediscovered: the file offset 48 is not 64-byte aligned, so mapping it in place forfeits the
   one-cache-line-per-lookup guarantee that `#[repr(C, align(64))]` buys, and that guarantee measured
   ~8% of seeding. Trading 8% of the dominant frame for 10 GB is the wrong direction for a speed
-  campaign. It is listed here only to close it.
+  lever. It is listed here only to close it.
 
 **A4. `index` peak RSS (~75 GB) and time.** The i64 suffix array dominates both. SA-IS is still
 single-threaded (Tier B of phase 8c, deferred). This is a self-contained project with its own gate
 (`scripts/index_diff.sh`, byte-identical index files), and it is sequenced last within A because it
 helps a cost paid once rather than per run.
 
-## Phase B — the fork's seeding, conditional on phase 0
+## Phase B — bwa-mem3's seeding, conditional on phase 0
 
-Only if phase 0 shows we are behind in the `-t8` regime. Read the fork's seeding path against ours
+Only if phase 0 shows we are behind in the `-t8` regime. Read bwa-mem3's seeding path against ours
 line by line and port what is portable, byte-identically.
 
 Scoped by what is already known to be exhausted: its SW kernel fast-paths were audited line by line
