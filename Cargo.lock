@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "anyhow",
  "bgzf",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-chain"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "bwa-mem4-core",
  "bwa-mem4-index",
@@ -162,14 +162,14 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-core"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "bwa-mem4-diff"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -177,13 +177,17 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-extend"
-version = "4.1.0"
+version = "4.2.0"
+dependencies = [
+ "hyalite",
+]
 
 [[package]]
 name = "bwa-mem4-index"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "bwa-mem4-core",
+ "caps-sa",
  "libsais-rs",
  "memmap2",
  "rayon",
@@ -191,15 +195,16 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-io"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "bwa-mem4-core",
+ "flate2",
  "needletail",
 ]
 
 [[package]]
 name = "bwa-mem4-mem"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "bwa-mem4-chain",
  "bwa-mem4-core",
@@ -211,14 +216,14 @@ dependencies = [
 
 [[package]]
 name = "bwa-mem4-neon"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "bwa-mem4-extend",
 ]
 
 [[package]]
 name = "bwa-mem4-seed"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "bwa-mem4-core",
  "bwa-mem4-index",
@@ -262,6 +267,16 @@ checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
 dependencies = [
  "cc",
  "pkg-config",
+]
+
+[[package]]
+name = "caps-sa"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be62f8675f16876a7f29cfd8b26cc18dcc52eca05a8428d530cc7036b2269f30"
+dependencies = [
+ "rayon",
+ "tempfile",
 ]
 
 [[package]]
@@ -446,6 +461,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -459,6 +490,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -514,6 +546,12 @@ dependencies = [
  "glob",
  "libz-sys",
 ]
+
+[[package]]
+name = "hyalite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c37e8ecbf31c56fe972538ffb1e01de73e17ac8a8853908b03577c51da456b8e"
 
 [[package]]
 name = "icu_collections"
@@ -753,6 +791,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfae20f6b19ad527b550c223fddc3077a547fc70cda94b9b566575423fd303ee"
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -831,6 +875,12 @@ dependencies = [
  "memchr",
  "minimal-lexical",
 ]
+
+[[package]]
+name = "once_cell"
+version = "1.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "once_cell_polyfill"
@@ -982,6 +1032,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1105,6 +1168,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1290,6 +1366,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
 
 [[package]]
 name = "zmij"

@@ -143,6 +143,7 @@ pub fn batched_extend(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
+    extend_shape::record(jobs);
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
@@ -164,8 +165,89 @@ pub fn batched_extend(
     )
 }
 
+/// Widest legal extension kernel for this host, chosen at run time. AVX-512BW carries 64 u8 lanes
+/// against AVX2's 32, for the same arithmetic and the same results, so the only thing this decides
+/// is how many jobs share a register.
+///
+/// `BWA4_EXTEND_TIER` narrows the choice for benchmarking and for CI: `avx2` skips the AVX-512
+/// branch, `avx512` skips the AVX2 one (so a forced run on a host without AVX-512BW falls through
+/// to the scalar reference rather than silently taking AVX2, which would make a forced comparison
+/// meaningless). Anything else, or unset, means "widest available".
 #[cfg(target_arch = "x86_64")]
-use avx2::{batched_extend_avx2_i16 as sw_kernel_i16, batched_extend_avx2_u8 as sw_kernel_u8};
+fn extend_tier() -> (bool, bool) {
+    use std::sync::OnceLock;
+    static TIER: OnceLock<(bool, bool)> = OnceLock::new();
+    *TIER.get_or_init(|| match std::env::var("BWA4_EXTEND_TIER").as_deref() {
+        Ok("avx2") => (false, true),
+        Ok("avx512") => (true, false),
+        _ => (true, true),
+    })
+}
+
+/// # Safety
+/// Caller must have established the u8 preconditions (`dispatch_bins`' `U8_LEN` bounds) and that
+/// AVX2 is available; the AVX-512 branch additionally checks its own feature at run time.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sw_kernel_u8(
+    jobs: &[ExtendJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w0: i32,
+    end_bonus: i32,
+    zdrop: i32,
+) -> Vec<ExtendResult> {
+    let (want_512, want_2) = extend_tier();
+    if want_512 && is_x86_feature_detected!("avx512bw") {
+        return avx512::batched_extend_avx512_u8(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
+    if want_2 {
+        return avx2::batched_extend_avx2_u8(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
+    batched_extend_scalar(
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+    )
+}
+
+/// # Safety
+/// As [`sw_kernel_u8`], with the i16 bounds (`MAX_SEQ_LEN16`) instead.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sw_kernel_i16(
+    jobs: &[ExtendJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w0: i32,
+    end_bonus: i32,
+    zdrop: i32,
+) -> Vec<ExtendResult> {
+    let (want_512, want_2) = extend_tier();
+    if want_512 && is_x86_feature_detected!("avx512bw") {
+        return avx512::batched_extend_avx512_i16(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
+    if want_2 {
+        return avx2::batched_extend_avx2_i16(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
+    batched_extend_scalar(
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+    )
+}
 /// Element type / kernel alias for the current SIMD ISA: NEON on aarch64, AVX2 on x86_64.
 #[cfg(target_arch = "aarch64")]
 use neon::{batched_extend_neon_i16 as sw_kernel_i16, batched_extend_neon_u8 as sw_kernel_u8};
@@ -1136,6 +1218,14 @@ macro_rules! define_sw_kernel {
             let mut eh_e: Vec<$elem> = Vec::new();
             let mut qcode: Vec<$elem> = Vec::new();
             let mut tcode: Vec<$elem> = Vec::new();
+            // Substitution-score pre-pass buffers (bwa-mem2's `sbt_buf`, `bandedSWA.cpp:1183-1214`):
+            // the DNA match/mismatch/N score of each band column depends only on this row's target
+            // base and the column's query base, never on the DP recurrence. Computing it in a
+            // separate per-row loop and loading it in the DP body lifts ~7 vector ALU ops off the
+            // serial H/E/F critical path, where on x86 (fewer vector-ALU ports than lanes) they
+            // otherwise contend with the recurrence. Byte-identical: same values, only reordered.
+            let mut sbt_pos_buf: Vec<$elem> = Vec::new();
+            let mut sbt_neg_buf: Vec<$elem> = Vec::new();
 
             // =======================================================================
             // One chunk = one register's worth of independent alignments.
@@ -1183,6 +1273,11 @@ macro_rules! define_sw_kernel {
                 qcode.resize(stride * LANES, 0 as $elem);
                 tcode.clear();
                 tcode.resize((max_t + 1) * LANES, 0 as $elem);
+                // Same column layout as `qcode`; refilled per row by the substitution pre-pass.
+                sbt_pos_buf.clear();
+                sbt_pos_buf.resize(stride * LANES, 0 as $elem);
+                sbt_neg_buf.clear();
+                sbt_neg_buf.resize(stride * LANES, 0 as $elem);
                 for l in 0..nlane {
                     for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
                         qcode[ju * LANES + l] = c as $elem;
@@ -1298,6 +1393,23 @@ macro_rules! define_sw_kernel {
                     let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
                     let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
 
+                    // --- substitution pre-pass (vector, off the critical path) ---
+                    // For every band column, compute the same `sbt_pos`/`sbt_neg` the DP body used to
+                    // compute inline, and stash them. These ops depend only on `t_v` (fixed this row)
+                    // and the column's query base, so they carry no DP dependency and the scheduler
+                    // runs them at throughput here instead of braided into the H/E/F chain below.
+                    for j in gbeg..gend {
+                        let col_base = j as usize * LANES;
+                        let q_v = $lds(qcode.as_ptr().add(col_base));
+                        let is_eq = $ceq(t_v, q_v);
+                        let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                        // Byte-for-byte the expressions from the old inline block, unmoved.
+                        let sbt_pos = $bsl(is_n, zero_v, $bsl(is_eq, a_pos_v, zero_v));
+                        let sbt_neg = $bsl(is_n, npen_mag_v, $bsl(is_eq, zero_v, mm_mag_v));
+                        $sts(sbt_pos_buf.as_mut_ptr().add(col_base), sbt_pos);
+                        $sts(sbt_neg_buf.as_mut_ptr().add(col_base), sbt_neg);
+                    }
+
                     // The shared column loop over the union band. Every lane executes every column;
                     // `band` decides whether the lane keeps the result. This is the core trade of
                     // inter-sequence batching: uniform control flow at the cost of some wasted lanes.
@@ -1318,22 +1430,10 @@ macro_rules! define_sw_kernel {
                         // per lane.
                         let band = $andu(active_v, $andu($cge(j_v, beg_v), $clt(j_v, end_v)));
 
-                        // DNA substitution score split into positive parts (no gather):
-                        //   sbt_pos = (t==q && !N) ? a : 0 ;  sbt_neg = N ? |npen| : (t==q ? 0 : |mm|)
-                        // Lane `l` = job `l`'s query base code at column `j` (0..=4). One load, one
-                        // base per lane, which is what the SoA transpose above was built for.
-                        let q_v = $lds(qcode.as_ptr().add(col_base));
-                        // Three masks, each all-ones or all-zero per lane: bases equal, and either
-                        // base ambiguous (code >= 4). `t_is_n` was hoisted out of the loop since the
-                        // target base is fixed for the whole row.
-                        let is_eq = $ceq(t_v, q_v);
-                        let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                        // Nested selects, innermost first: match -> a, mismatch -> 0 on the positive
-                        // side and 0 / |mm| on the negative side; then the N case overrides both.
-                        // Order matters: N wins over equality, because two N bases compare equal but
-                        // must still score `npen`, not `a`.
-                        let sbt_pos = $bsl(is_n, zero_v, $bsl(is_eq, a_pos_v, zero_v));
-                        let sbt_neg = $bsl(is_n, npen_mag_v, $bsl(is_eq, zero_v, mm_mag_v));
+                        // Substitution scores for this column, precomputed by the pre-pass above.
+                        // Two loads replace the ~7 ALU ops that used to sit on the critical path here.
+                        let sbt_pos = $lds(sbt_pos_buf.as_ptr().add(col_base));
+                        let sbt_neg = $lds(sbt_neg_buf.as_ptr().add(col_base));
 
                         let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
                                                                      // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
@@ -1733,6 +1833,163 @@ mod avx2 {
     );
 }
 
+/// AVX-512BW instantiations of [`define_sw_kernel!`]: 64 u8 lanes and 32 i16 lanes, twice the AVX2
+/// width for the same arithmetic.
+///
+/// Byte-identical to the AVX2 and NEON kernels by construction, because the macro body is shared and
+/// the only thing that changes is how many independent jobs ride in one register. The one place
+/// AVX-512 is not a drop-in is comparison: it returns opmask registers (`__mmask64`/`__mmask32`)
+/// rather than all-ones vectors, and the macro consumes masks as vectors (it `and`s and `or`s them).
+/// Each compare therefore materialises its mask with `movm`, which costs one extra instruction but
+/// keeps the shared body untouched. `bsl` is a single `ternarylogic` (0xCA = `mask ? a : b`).
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use super::{clamp_band, default_result};
+    use bwa_extend::{ExtendJob, ExtendResult};
+    use std::arch::x86_64::*;
+
+    /// # Returns
+    /// A 512-bit vector whose every byte lane equals `x`. `as i8` is a bit reinterpretation: the u8
+    /// kernel treats lanes as unsigned, so values above 127 are intended.
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn set1_u8(x: u8) -> __m512i {
+        _mm512_set1_epi8(x as i8)
+    }
+    /// # Returns
+    /// A 512-bit vector whose every 16-bit lane equals `x`.
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn set1_i16(x: i16) -> __m512i {
+        _mm512_set1_epi16(x)
+    }
+
+    // Loads and stores: `p` addresses at least LANES elements of that type (64 u8, or 32 u16/i16),
+    // which the kernel guarantees is in bounds. Unaligned forms, 64 bytes moved.
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn loadu_u8(p: *const u8) -> __m512i {
+        _mm512_loadu_si512(p as *const __m512i)
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn loadu_u16(p: *const u16) -> __m512i {
+        _mm512_loadu_si512(p as *const __m512i)
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn loadu_i16(p: *const i16) -> __m512i {
+        _mm512_loadu_si512(p as *const __m512i)
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn storeu_u8(p: *mut u8, v: __m512i) {
+        _mm512_storeu_si512(p as *mut __m512i, v)
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn storeu_i16(p: *mut i16, v: __m512i) {
+        _mm512_storeu_si512(p as *mut __m512i, v)
+    }
+
+    // Comparisons. Each returns the all-ones/all-zero VECTOR the shared macro body expects, built
+    // from the opmask with `movm`. `v`/`a`/`b` are vectors of DP values or column indices.
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn ceqz8(v: __m512i) -> __m512i {
+        _mm512_movm_epi8(_mm512_cmpeq_epi8_mask(v, _mm512_setzero_si512()))
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn ceqz16(v: __m512i) -> __m512i {
+        _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(v, _mm512_setzero_si512()))
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn ceq8(a: __m512i, b: __m512i) -> __m512i {
+        _mm512_movm_epi8(_mm512_cmpeq_epi8_mask(a, b))
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn ceq16(a: __m512i, b: __m512i) -> __m512i {
+        _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(a, b))
+    }
+    /// Unsigned `a >= b`. Native here, unlike AVX2 where it has to be recovered from `max`.
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn cge_epu8(a: __m512i, b: __m512i) -> __m512i {
+        _mm512_movm_epi8(_mm512_cmpge_epu8_mask(a, b))
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn clt_epu8(a: __m512i, b: __m512i) -> __m512i {
+        _mm512_movm_epi8(_mm512_cmplt_epu8_mask(a, b))
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn cge_epi16(a: __m512i, b: __m512i) -> __m512i {
+        _mm512_movm_epi16(_mm512_cmpge_epi16_mask(a, b))
+    }
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn clt_epi16(a: __m512i, b: __m512i) -> __m512i {
+        _mm512_movm_epi16(_mm512_cmplt_epi16_mask(a, b))
+    }
+
+    /// `mask ? a : b`, the same convention as NEON's `vbslq`. One `ternarylogic`: the immediate
+    /// 0xCA is the truth table of `(mask & a) | (!mask & b)`, and the operation is bitwise so the
+    /// 32-bit lane granularity of the intrinsic is irrelevant.
+    #[target_feature(enable = "avx512bw")]
+    #[inline]
+    unsafe fn bsl512(mask: __m512i, a: __m512i, b: __m512i) -> __m512i {
+        _mm512_ternarylogic_epi32(mask, a, b, 0xCA)
+    }
+
+    define_sw_kernel!(
+        batched_extend_avx512_i16,
+        i16,
+        u16,
+        32,
+        feat = "avx512bw",
+        dup = set1_i16,
+        lds = loadu_i16,
+        sts = storeu_i16,
+        ldu = loadu_u16,
+        add = _mm512_add_epi16,
+        sub = _mm512_sub_epi16,
+        max = _mm512_max_epi16,
+        ceqz = ceqz16,
+        cge = cge_epi16,
+        clt = clt_epi16,
+        ceq = ceq16,
+        orru = _mm512_or_si512,
+        andu = _mm512_and_si512,
+        bsl = bsl512
+    );
+
+    define_sw_kernel!(
+        batched_extend_avx512_u8,
+        u8,
+        u8,
+        64,
+        feat = "avx512bw",
+        dup = set1_u8,
+        lds = loadu_u8,
+        sts = storeu_u8,
+        ldu = loadu_u8,
+        add = _mm512_adds_epu8,
+        sub = _mm512_subs_epu8,
+        max = _mm512_max_epu8,
+        ceqz = ceqz8,
+        cge = cge_epu8,
+        clt = clt_epu8,
+        ceq = ceq8,
+        orru = _mm512_or_si512,
+        andu = _mm512_and_si512,
+        bsl = bsl512
+    );
+}
+
 /// Force-run verification of the AVX2 kernels against the scalar `ksw_extend2`, byte-for-byte.
 ///
 /// On x86_64 the AVX2 path only *runs* when `is_x86_feature_detected!("avx2")`, which Rosetta
@@ -2048,6 +2305,250 @@ mod neon_verify {
                         *g,
                         expected,
                         "NEON {} diverged round {round} job {i} (batch {batch}) qlen={} tlen={}",
+                        if big { "i16" } else { "u8" },
+                        queries[i].len(),
+                        targets[i].len()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `BWA4_EXTEND_SHAPE=1`: lane-divergence accounting for the seed-extension kernel.
+///
+/// Unlike mate rescue, where every target window is `2 * max_dist` wide and length sorting was
+/// measured to save exactly nothing, extension jobs have wildly uneven query and target lengths (a
+/// seed can sit anywhere in the read), and the kernel runs every 16-lane chunk to `max_t` rows and
+/// `max_q + 1` columns over its lanes. This probe answers whether sorting the batch by length before
+/// chunking would pay: `EXEC` is what the kernel executes in caller order, `EXEC_SORTED` what it
+/// would execute after a `(tlen, qlen)` sort. Sorting is legal because each job's result depends
+/// only on that job.
+pub mod extend_shape {
+    use super::ExtendJob;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    /// Nominal cells: `sum(qlen * tlen)` over all jobs.
+    pub static CELLS: AtomicU64 = AtomicU64::new(0);
+    /// Cells the kernel actually runs, `16 * max_q * max_t` per 16-lane chunk, in caller order.
+    pub static EXEC: AtomicU64 = AtomicU64::new(0);
+    /// The same, had the batch been length-sorted before chunking.
+    pub static EXEC_SORTED: AtomicU64 = AtomicU64::new(0);
+    /// Jobs counted.
+    pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    /// Whether `BWA4_EXTEND_SHAPE` is set; read once and cached.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_EXTEND_SHAPE").is_some())
+    }
+    /// Accumulate one batch. No-op unless [`enabled`].
+    pub fn record(jobs: &[ExtendJob]) {
+        if !enabled() || jobs.is_empty() {
+            return;
+        }
+        const L: usize = 16;
+        let q: Vec<usize> = jobs.iter().map(|j| j.query.len()).collect();
+        let t: Vec<usize> = jobs.iter().map(|j| j.target.len()).collect();
+        let cost = |q: &[usize], t: &[usize]| -> u64 {
+            q.chunks(L)
+                .zip(t.chunks(L))
+                .map(|(qs, ts)| {
+                    (L * qs.iter().copied().max().unwrap_or(0)
+                        * ts.iter().copied().max().unwrap_or(0)) as u64
+                })
+                .sum()
+        };
+        CELLS.fetch_add(
+            q.iter().zip(t.iter()).map(|(a, b)| (a * b) as u64).sum(),
+            Relaxed,
+        );
+        EXEC.fetch_add(cost(&q, &t), Relaxed);
+        let mut ord: Vec<usize> = (0..jobs.len()).collect();
+        ord.sort_unstable_by_key(|&i| (t[i], q[i]));
+        let (qs, ts): (Vec<usize>, Vec<usize>) = ord.iter().map(|&i| (q[i], t[i])).unzip();
+        EXEC_SORTED.fetch_add(cost(&qs, &ts), Relaxed);
+        JOBS.fetch_add(jobs.len() as u64, Relaxed);
+    }
+    /// Print the accumulated counters once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (cells, exec, sorted, jobs) = (
+            CELLS.load(Relaxed),
+            EXEC.load(Relaxed),
+            EXEC_SORTED.load(Relaxed),
+            JOBS.load(Relaxed),
+        );
+        eprintln!(
+            "[extend-shape] {jobs} jobs, {cells} nominal cells, executed {exec} ({:.2}x), \
+             length-sorted would execute {sorted} ({:.2}x nominal, {:.1}% saved)",
+            exec as f64 / cells.max(1) as f64,
+            sorted as f64 / cells.max(1) as f64,
+            100.0 * (exec as f64 - sorted as f64) / exec.max(1) as f64,
+        );
+    }
+}
+
+/// Verification of the AVX-512BW kernels against the scalar `ksw_extend2`, byte-for-byte.
+///
+/// On x86_64 the AVX2 path only *runs* when `is_x86_feature_detected!("avx2")`, which Rosetta
+/// reports as `false` even though it *executes* AVX2 instructions. So this test calls the AVX2
+/// kernels directly (bypassing detection), which is how the port is validated on this Apple-Silicon
+/// host via `cargo test --target x86_64-apple-darwin` (Rosetta). On a native x86 CI runner (which has
+/// AVX2) it validates the real path. Requires an AVX2-capable executor.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx512_verify {
+    use bwa_extend::{ksw_extend2, ExtendJob};
+
+    /// bwa's default DNA scoring matrix, built the way `bwa_fill_scmat` does.
+    ///
+    /// # Returns
+    /// A 25-entry (`m = 5`) row-major matrix: `+1` on the diagonal (match), `-4` off-diagonal among
+    /// the concrete bases (mismatch), `-1` on the whole N row and N column. This is exactly the
+    /// uniform shape `is_uniform_dna` accepts, which is what routes the tests through the SIMD
+    /// kernels rather than the scalar fallback.
+    fn scoring() -> Vec<i8> {
+        // Match bonus and mismatch penalty magnitude: bwa's `-A 1 -B 4` defaults.
+        let (a, b) = (1i8, 4i8);
+        let mut mat = vec![0i8; 25];
+        // Write cursor walking the matrix in row-major order: four rows of (4 base scores + the N
+        // column), then the final all-N row.
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { a } else { -b };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+        mat
+    }
+
+    #[test]
+    fn avx512_u8_and_i16_match_scalar() {
+        // Unlike the AVX2 gate, this one CANNOT run under Rosetta: it has no `avx512bw`. On a
+        // host without the feature the test returns early and reports `ok` without having executed
+        // the kernel, so AVX-512 coverage comes from a native AVX-512 CI runner only.
+        if !std::arch::is_x86_feature_detected!("avx512bw") {
+            return;
+        }
+        let mat = scoring();
+        let mut state = 0xA7C2_0000_0000_0001u64;
+        // Deterministic LCG (the classic Numerical Recipes 64-bit multiplier/increment), returning
+        // the top 31 bits so the low-order-bit weakness of an LCG does not leak into the small
+        // moduli used below. A fixed seed keeps a failure reproducible: the assert prints the round.
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        // bwa's default gap penalties, held fixed so the randomization varies only band/zdrop/data.
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        for round in 0..200u32 {
+            // Randomized DP shape for this round: band half-width in cells (1..=150, so both
+            // "tight enough to clip the alignment" and "wider than the sequences" occur), z-drop in
+            // score units (0 included, which disables the test), and the band-clamp end bonus.
+            let w = 1 + (next() % 150) as i32;
+            let zdrop = (next() % 200) as i32;
+            let end_bonus = (next() % 12) as i32;
+            // Jobs per call, chosen to straddle the 16/32-lane chunk boundaries: exact multiples,
+            // one over, and a lone job, so partial final chunks are exercised.
+            let batch = *[1usize, 8, 16, 17, 32, 33, 48]
+                .get((next() % 7) as usize)
+                .unwrap();
+
+            // Keep both lengths and minval < 256 so the u8 kernel is exact, plus a longer-length set
+            // (minval up to a few thousand) for the i16 kernel.
+            for &big in &[false, true] {
+                // Owned backing storage for the batch, one entry per job: 2-bit base codes for the
+                // query and target, and the seed score the extension starts from. `ExtendJob`
+                // borrows from these, so they must outlive the `jobs` vector built below.
+                let mut queries: Vec<Vec<u8>> = Vec::new();
+                let mut targets: Vec<Vec<u8>> = Vec::new();
+                let mut h0s: Vec<i32> = Vec::new();
+                for _ in 0..batch {
+                    let qlen = if big {
+                        200 + (next() % 400) as usize
+                    } else {
+                        1 + (next() % 90) as usize
+                    };
+                    // Random query over codes 0..=3 only (no N, so the fast path is not trivially
+                    // declined), and a target a little longer so the extension has room to run off
+                    // the end of the query.
+                    let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                    let tlen = qlen + (next() % 30) as usize;
+                    let mut t: Vec<u8> = Vec::with_capacity(tlen);
+                    // Read cursor into `q` while synthesizing the target: mostly copy the next
+                    // query base (95%), otherwise emit a random base and coin-flip whether to also
+                    // advance `qi`. Copying gives a mismatch, advancing as well gives an indel, so
+                    // the target is a noisy relative of the query rather than unrelated noise. That
+                    // matters: an unrelated target dies to z-drop in a few rows and would never
+                    // reach the deep-DP code paths this test exists to check.
+                    let mut qi = 0usize;
+                    while t.len() < tlen {
+                        if qi < q.len() && next() % 100 >= 5 {
+                            t.push(q[qi]);
+                            qi += 1;
+                        } else {
+                            t.push((next() % 4) as u8);
+                            if next() % 2 == 0 {
+                                qi += 1;
+                            }
+                        }
+                    }
+                    queries.push(q);
+                    targets.push(t);
+                    // h0 >= 1: a zero starting score would make every cell dead from the start.
+                    h0s.push(1 + (next() % 20) as i32);
+                }
+                let jobs: Vec<ExtendJob> = (0..batch)
+                    .map(|i| ExtendJob {
+                        query: &queries[i],
+                        target: &targets[i],
+                        h0: h0s[i],
+                    })
+                    .collect();
+                // SAFETY: `avx512bw` was checked above.
+                let got = unsafe {
+                    if big {
+                        super::avx512::batched_extend_avx512_i16(
+                            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                        )
+                    } else {
+                        super::avx512::batched_extend_avx512_u8(
+                            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                        )
+                    }
+                };
+                // `got[i]` is the kernel's result for job `i`; `expected` is the authoritative
+                // scalar `ksw_extend2` run on that same job alone. Every field must match exactly:
+                // this is the byte-identity gate, not an approximate-score check.
+                for (i, g) in got.iter().enumerate() {
+                    let expected = ksw_extend2(
+                        &queries[i],
+                        &targets[i],
+                        5,
+                        &mat,
+                        o_del,
+                        e_del,
+                        o_ins,
+                        e_ins,
+                        w,
+                        end_bonus,
+                        zdrop,
+                        h0s[i],
+                    );
+                    assert_eq!(
+                        *g,
+                        expected,
+                        "AVX-512 {} diverged round {round} job {i} qlen={} tlen={}",
                         if big { "i16" } else { "u8" },
                         queries[i].len(),
                         targets[i].len()

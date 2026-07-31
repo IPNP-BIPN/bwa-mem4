@@ -76,7 +76,7 @@ use bwa_extend::{ksw_extend2, ExtendJob, ExtendResult, SwBackend};
 
 /// Seed extension: the lane-parallel `ksw_extend2` equivalent plus its scalar reference. Private
 /// because callers reach it through [`NeonBackend`]'s [`SwBackend`] impl, never directly.
-mod batched;
+pub mod batched;
 /// Mate rescue: the lane-parallel `ksw_align2` equivalent. Public because the paired-end code calls
 /// it directly (there is no `SwBackend` method for whole-read local alignment).
 pub mod matesw;

@@ -276,6 +276,92 @@ pub fn hash_64(mut key: u64) -> u64 {
     key
 }
 
+/// `BWA4_DEDUP_SHAPE=1` probe: how big is the region vector [`mem_sort_dedup_patch`] is handed, and
+/// how often. That decides which half of the function is worth attacking.
+///
+/// A `sample` profile of a real GIAB paired-end run puts 13.3% of busy time in this function, but it
+/// cannot say whether that is the two `ks_introsort_by` calls (which grow as `n log n` and cannot be
+/// replaced, since their exact unstable permutation is output-observable) or the O(n^2) backward
+/// scan. `n` settles it: a small `n` with a huge call count means the cost is per-call overhead and
+/// the sorts' constant factor, a large `n` means the scan.
+///
+/// Counts, not timings, so this is immune to the host drift that makes wall-clock A/Bs on this
+/// machine unreliable below ~10%. `from_rescue` splits the two callers apart: mate rescue passes an
+/// empty `codes` (`pe.rs:519`, `:788`) and is the one that runs millions of times.
+pub mod dedup_shape {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// Upper edges of the `n` histogram. Straddles the 16-element cutoff inside klib's introsort,
+    /// below which a partition is left entirely to the final insertion-sort pass.
+    pub const EDGES: [usize; 7] = [1, 2, 4, 8, 16, 64, usize::MAX];
+    /// Calls whose region count fell in each bucket, from the rescue caller (empty `codes`).
+    pub static RESCUE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    /// Same, from the dedup-stage caller (non-empty `codes`, merging enabled).
+    pub static PREP: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    /// Sum of `n` and of `n * n` over every call, giving the mean and the scan's growth term.
+    pub static N_SUM: AtomicU64 = AtomicU64::new(0);
+    pub static N2_SUM: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether `BWA4_DEDUP_SHAPE` is set. Read once and cached, like every other probe here.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_DEDUP_SHAPE").is_some())
+    }
+
+    /// Record one call on `n` regions. `from_rescue` is `codes.is_empty()`.
+    pub fn record(n: usize, from_rescue: bool) {
+        if !enabled() {
+            return;
+        }
+        let b = EDGES
+            .iter()
+            .position(|&e| n <= e)
+            .unwrap_or(EDGES.len() - 1);
+        if from_rescue { &RESCUE[b] } else { &PREP[b] }.fetch_add(1, Ordering::Relaxed);
+        N_SUM.fetch_add(n as u64, Ordering::Relaxed);
+        N2_SUM.fetch_add((n * n) as u64, Ordering::Relaxed);
+    }
+
+    /// Print the histogram once, after the workers have joined. No-op unless enabled.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let tot: u64 = RESCUE
+            .iter()
+            .chain(PREP.iter())
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        let n_sum = N_SUM.load(Ordering::Relaxed);
+        eprintln!(
+            "[dedup-shape] {tot} calls, mean n = {:.2}, mean n^2 = {:.1}",
+            n_sum as f64 / tot.max(1) as f64,
+            N2_SUM.load(Ordering::Relaxed) as f64 / tot.max(1) as f64,
+        );
+        eprintln!(
+            "[dedup-shape] {:>10}  {:>12}  {:>12}",
+            "n", "from_rescue", "from_prep"
+        );
+        let mut lo = 0usize;
+        for b in 0..EDGES.len() {
+            let (r, p) = (
+                RESCUE[b].load(Ordering::Relaxed),
+                PREP[b].load(Ordering::Relaxed),
+            );
+            let label = if EDGES[b] == usize::MAX {
+                format!("{lo}+")
+            } else {
+                format!("{lo}-{}", EDGES[b])
+            };
+            if r != 0 || p != 0 {
+                eprintln!("[dedup-shape] {label:>10}  {r:>12}  {p:>12}");
+            }
+            lo = EDGES[b].saturating_add(1);
+        }
+    }
+}
+
 /// Remove redundant and identical alignment regions, merging collinear ones. Port of
 /// `mem_sort_dedup_patch` (`bwamem.cpp:292`), including the `mem_patch_reg` merge branch.
 ///
@@ -314,6 +400,7 @@ pub fn mem_sort_dedup_patch(
     codes: &[u8],
     mut a: Vec<MemAlnReg>,
 ) -> Vec<MemAlnReg> {
+    dedup_shape::record(a.len(), codes.is_empty());
     if a.len() <= 1 {
         return a;
     }
@@ -327,6 +414,28 @@ pub fn mem_sort_dedup_patch(
     // Slack, in bp on the reference, for "these two regions could still be parts of one alignment".
     // Widened to i64 once here because every use compares it against int64 reference coordinates.
     let max_gap = i64::from(opt.max_chain_gap);
+    // Whether the collinear-merge branch can do anything at all. [`mem_patch_reg`] returns `None`
+    // immediately on an empty `codes` (its `query == 0` case, `primary.rs:147`), and mate rescue
+    // ALWAYS calls this function that way (`pe.rs:519`, `:788`). Hoisting the test out of the scan
+    // is what stops that path from cloning two 96-byte `MemAlnReg`s per candidate pair only to hand
+    // them to a call that cannot use them. Purely a short-circuit: when merging is off the branch
+    // previously ran, allocated, got `None`, and fell through to `j -= 1`, which is what it now does
+    // without the clones.
+    //
+    // MEASURED (2026-07-29): **no speed-up, kept anyway.** A `sample` profile of a real GIAB
+    // paired-end run attributes 13.3% of busy time to this function, almost all of it from mate
+    // rescue re-running the whole sort/dedup after every orientation that inserts, which is what
+    // made the dead clones look worth removing. An interleaved A/B on 1M real GIAB pairs (`-t12`,
+    // 3 reps) could not separate the two arms: 17.402/17.946/18.019s before against
+    // 17.903/18.109/19.562s after, i.e. the "after" arm reads SLOWER in every rep, which is an
+    // artifact of it always running second while the host drifted upward through the run.
+    //
+    // So the 13.3% is the two `ks_introsort_by` calls and the O(n^2) backward scan, NOT the clones.
+    // This stays because it is strictly less work for provably identical output, not because it was
+    // shown to be faster. Anyone chasing that 13.3% should start at the sorts, and should note that
+    // their permutation is output-observable (see the `ks_introsort_by` doc comment), so the
+    // algorithm cannot be swapped -- only its implementation.
+    let merging_enabled = !codes.is_empty();
 
     // ---- Pass 1a: sort by reference end ------------------------------------------------------
     // Sort by END position on the reference (`alnreg_slt2`). bwa's `ks_introsort` is *unstable* and
@@ -397,7 +506,7 @@ pub fn mem_sort_dedup_patch(
                 }
                 // `q` loses, but `p` survives and keeps scanning further back.
                 a[j_idx].qe = a[j_idx].qb;
-            } else if a[j_idx].rb < p_rb {
+            } else if merging_enabled && a[j_idx].rb < p_rb {
                 // Not redundant but `q` starts strictly earlier: candidate for a collinear merge.
                 // The `rb` test is what establishes `mem_patch_reg`'s `left.rb <= right.rb`
                 // precondition, with `q` as the left region and `p` as the right one.

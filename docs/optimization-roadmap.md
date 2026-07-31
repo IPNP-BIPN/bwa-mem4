@@ -265,6 +265,18 @@ hypotheses died here, all mine:
 > tool.
 
 ## Do NOT
+- **Expect `madvise(MADV_HUGEPAGE)` on the index arrays to buy anything. Built, measured dead
+  (2026-07-28), kept only for library consumers.** The fork calls it on `cp_occ`, both sampled-SA
+  arrays and `pac` (`reference/bwa-mem3-cpp/src/bwa_madvise.h`), we called it nowhere, and the TLB
+  reasoning is sound: on Linux's 4 KiB page a 6.2 GB randomly-walked `cp_occ` is **1.7x slower**
+  than under 2 MiB pages (`align` stage 5.714s at `THP=never` vs 3.309s at `THP=madvise`, GRCh38,
+  500k pairs, PE, `-t12`). It looked like the ranked-first lever.
+  It is a no-op for us: **`AnonHugePages` is 9866 MB with the hint on AND off**, because mimalloc
+  already hints THP on the arenas serving these allocations. The fork ships mimalloc too, so its
+  header never bought it anything either. Details and the reproducer in `docs/perf-levers.md`.
+  This makes **five** levers killed by existing machinery having already eaten them (LISA, the flat
+  SA, minibwa's 10-mer cache, the `get_sa_batch` prefetch, this). Before building any memory-system
+  lever, first check whether something in the stack already does it.
 - **Port Zhang's BWT-region binning. Measured dead (2026-07-17) before building it.** Zhang et al.
   (CCGrid'13 §IV) bin occurrence computations by BWT region so a round's accesses land in a window
   whose pages fit the TLB, reporting 1.43-1.54x single-thread / **1.21-1.36x multithreaded** -- which

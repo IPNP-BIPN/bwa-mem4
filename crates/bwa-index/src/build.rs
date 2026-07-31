@@ -58,7 +58,9 @@ use bwa_core::{dna, Error, Result};
 use rayon::prelude::*;
 
 use crate::rand48::Rand48;
-#[cfg(not(feature = "libsais"))]
+// Only the ARRAY backend of `build_bwt_and_samples` materializes a suffix array, so both importers
+// below are dead under `capsa`, which streams instead.
+#[cfg(all(not(feature = "libsais"), not(feature = "capsa")))]
 use crate::sais::suffix_array_inplace;
 
 /// `suffix_array_inplace` equivalent backed by libsais-rs (a pure-Rust translation of libsais),
@@ -67,7 +69,7 @@ use crate::sais::suffix_array_inplace;
 /// length `2L+1`, `sa[0] == 2L`, `sa[1..]` the suffix array of `bref`. A suffix array is unique, so
 /// this is byte-identical to the SA-IS path; it is only faster to build. `fs = 0` (no extra scratch),
 /// `freq = None` (we do not need the symbol histogram; `count[]` is computed separately below).
-#[cfg(feature = "libsais")]
+#[cfg(all(feature = "libsais", not(feature = "capsa")))]
 fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
     let n = bref.len();
     let mut sa = vec![0i64; n + 1];
@@ -541,6 +543,135 @@ fn write_amb(path: &Path, l_pac: i64, n_seqs: i32, ambs: &[AmbRec]) -> Result<()
     Ok(())
 }
 
+/// The BWT, the sentinel row and the sampled suffix array: everything downstream needs from the
+/// suffix array, produced without committing to how the suffix array itself is held.
+///
+/// The suffix array is the peak-RAM term of an index build (8 bytes x `N`, i.e. ~50 GB on GRCh38),
+/// and it is also the ONLY thing these three outputs depend on. Isolating them behind one function
+/// is what lets a streaming SA constructor never materialize the array at all: the array backend
+/// builds `sa` and fills the three outputs in parallel, the `capsa` backend fills them row by row
+/// from an emit callback. Both produce identical bytes, because a suffix array is UNIQUE: any two
+/// correct constructors return the same array, so every value written here is the same either way.
+///
+/// The three outputs, in the layout `write_fm_index` serializes:
+///
+/// * `bwt[i] = SENTINEL_CODE` if `sa[i] == 0`, else `bref[sa[i] - 1]`. The textbook transform: row
+///   `i` of the sorted-rotations matrix ends with the character PRECEDING suffix `sa[i]`, and the
+///   empty suffix has no predecessor. Mirrors `FMI_search.cpp:170-199`. Length `n`; the tail past
+///   the last full checkpoint block keeps [`DUMMY_CHAR`], the C's aligned-buffer padding.
+/// * `sentinel_index`: the unique ROW (not position) with `sa[i] == 0`.
+/// * `sa_samples[k] = sa[8k]`, `sa_count` of them (see [`SA_SAMPLE_STRIDE`]).
+///
+/// # Parameters
+///
+/// * `bref`: the 2L-space reference, codes 0..=3 only, length `2L = n - 1`.
+/// * `n`: `N = 2L + 1`, the ROW count. Must equal `bref.len() + 1`.
+/// * `sa_count`: `(n >> 3) + 1`, the sample count. Passed rather than recomputed so the caller's
+///   value and this one cannot drift apart.
+///
+/// # Returns
+///
+/// `(bwt, sentinel_index, sa_samples)`. Errors only on the `capsa` path, which does file I/O.
+///
+/// # Panics
+///
+/// If `bref` is empty (there is then no row 0 predecessor), or if the suffix array contains no
+/// row with `sa[i] == 0`, which would mean the constructor is broken.
+#[cfg(not(feature = "capsa"))]
+fn build_bwt_and_samples(
+    bref: &[u8],
+    n: usize,
+    sa_count: usize,
+) -> Result<(Vec<u8>, i64, Vec<i64>)> {
+    // Length N = 2L+1, sa[0] = 2L. Default: in-tree memory-efficient SA-IS. With `--features
+    // libsais` the same array is produced by libsais-rs instead (faster build; a suffix array is
+    // UNIQUE so the result is byte-identical, gated by scripts/index_diff.sh).
+    #[cfg(not(feature = "libsais"))]
+    let sa = suffix_array_inplace(bref);
+    #[cfg(feature = "libsais")]
+    let sa = suffix_array_libsais(bref);
+    debug_assert_eq!(sa.len(), n, "suffix array must have N = 2L + 1 rows");
+
+    // Each entry is independent of every other, so fill in parallel. The initial `DUMMY_CHAR` (6,
+    // `FMI_search.h:44`) is overwritten for all `n` rows; it documents the padding the checkpoint
+    // loop applies to rows past the end.
+    let mut bwt = vec![DUMMY_CHAR; n];
+    bwt.par_iter_mut()
+        .zip(sa.par_iter())
+        .for_each(|(bwt_symbol, &sa_value)| {
+            *bwt_symbol = if sa_value == 0 {
+                SENTINEL_CODE
+            } else {
+                bref[(sa_value - 1) as usize]
+            };
+        });
+    // `position_any` is safe despite its unordered name because exactly one element satisfies this.
+    let sentinel_index = sa
+        .par_iter()
+        .position_any(|&sa_value| sa_value == 0)
+        .expect("suffix array must contain the sentinel (0)") as i64;
+    let sa_samples: Vec<i64> = (0..sa_count)
+        .into_par_iter()
+        .map(|k| sa[k * SA_SAMPLE_STRIDE])
+        .collect();
+    Ok((bwt, sentinel_index, sa_samples))
+}
+
+/// Streaming (`--features capsa`) counterpart of [`build_bwt_and_samples`]: the same three outputs,
+/// filled from CaPS-SA's external-memory emit callback so the `8 * N`-byte suffix array is never
+/// resident. Only `bwt` (1 byte per row) and the samples (`N / 8` entries) stay in RAM.
+///
+/// `build_ext_mem` emits the suffix array of `bref` in rank order and WITHOUT a sentinel, i.e. the
+/// `k`-th call carries our `sa[k + 1]`. Our row 0 is the empty suffix (`sa[0] = 2L`), which the
+/// callback never sees, so it is filled before the walk starts.
+#[cfg(feature = "capsa")]
+fn build_bwt_and_samples(
+    bref: &[u8],
+    n: usize,
+    sa_count: usize,
+) -> Result<(Vec<u8>, i64, Vec<i64>)> {
+    let two_l = bref.len();
+    assert!(two_l > 0, "reference must be non-empty");
+    debug_assert_eq!(n, two_l + 1);
+
+    let mut bwt = vec![DUMMY_CHAR; n];
+    let mut sa_samples = vec![0i64; sa_count];
+    // Row 0 is the empty suffix: `sa[0] = 2L != 0`, so it is NOT the sentinel row, and its
+    // preceding character is the last base of the 2L reference.
+    bwt[0] = bref[two_l - 1];
+    sa_samples[0] = two_l as i64;
+
+    // `-1` means "not seen yet"; the assert below turns a constructor that never emits row 0 into a
+    // build failure rather than a silently wrong index.
+    let mut sentinel_index: i64 = -1;
+    // Next row to fill. Invariant at each callback entry: rows `0..row` of `bwt` are final, and
+    // every sample index `< row / 8` is final.
+    let mut row = 1usize;
+    let opts = caps_sa::ExtMemOpts::default();
+    caps_sa::build_ext_mem(bref, &opts, |pos| {
+        // `sa_value` is a 2L-space POSITION, our `sa[row]`.
+        let sa_value = pos as i64;
+        bwt[row] = if sa_value == 0 {
+            sentinel_index = row as i64;
+            SENTINEL_CODE
+        } else {
+            bref[(sa_value - 1) as usize]
+        };
+        if row.is_multiple_of(SA_SAMPLE_STRIDE) {
+            sa_samples[row / SA_SAMPLE_STRIDE] = sa_value;
+        }
+        row += 1;
+        Ok(())
+    })?;
+
+    assert_eq!(row, n, "CaPS-SA emitted {} rows, expected {}", row, n);
+    assert!(
+        sentinel_index >= 0,
+        "suffix array must contain the sentinel (0)"
+    );
+    Ok((bwt, sentinel_index, sa_samples))
+}
+
 /// `.bwt.2bit.64`: `[ref_seq_len:i64 | count[5]:i64 | CP_OCC[] | sa_ms_byte[]:i8 | sa_ls_word[]:u32
 /// | sentinel_index:i64]`, all little-endian. `bref` is the 2L forward++RC binary reference.
 ///
@@ -631,14 +762,10 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     // `sa[row]` is where the suffix ranked `row`-th starts. `n` = N = 2L+1 is the ROW count, one
     // more than the position count because of the empty (sentinel) suffix at row 0.
     let two_l = bref.len(); // 2L
-                            // length N = 2L+1, sa[0] = 2L. Default: in-tree memory-efficient SA-IS. With `--features libsais`
-                            // the same array is produced by libsais-rs instead (faster build; a suffix array is UNIQUE so the
-                            // result is byte-identical, gated by scripts/index_diff.sh).
-    #[cfg(not(feature = "libsais"))]
-    let sa = suffix_array_inplace(bref);
-    #[cfg(feature = "libsais")]
-    let sa = suffix_array_libsais(bref);
-    let n = sa.len(); // reference_seq_len = 2L + 1
+    let n = two_l + 1; // reference_seq_len = N = 2L + 1 (the +1 is the empty/sentinel suffix at row 0)
+                       // `sa_count` is the number of sampled SA entries (sample `k` <-> ROW `8k`); computed here so the SA
+                       // producer below can size `sa_samples`. `N = 2L+1` is odd, so `(N>>3)*8 <= N-1` and no slot is wasted.
+    let sa_count = (n >> 3) + 1;
 
     // ---- Step B: count[5], the cumulative base counts ----------------------------------------
     // count[5] = {0, #A, #A+#C, #A+#C+#G, 2L} over the 2L binary bases (parallel histogram reduce).
@@ -677,36 +804,18 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
         two_l as i64,
     ];
 
-    // BWT: bwt[i] = 4 (sentinel) if sa[i]==0 else bref[sa[i]-1]. Each entry is independent, so fill
-    // in parallel; the sentinel row (the unique sa[i]==0) is found by a parallel search.
-    //
-    // This is the textbook Burrows-Wheeler transform: row `i` of the sorted-rotations matrix ends
-    // with the character PRECEDING suffix `sa[i]`, and `sa[i] == 0` has no predecessor, hence the
-    // sentinel symbol 4. Mirrors `FMI_search.cpp:170-199`.
-    //
-    // ---- Step C: the BWT itself ---------------------------------------------------------------
-    // The initial fill value 6 is [`DUMMY_CHAR`] (`FMI_search.h:44`), the C's padding for the tail of
-    // its 64-aligned `bwt` buffer. Every one of the `n` entries is overwritten below, so the 6 only
-    // matters as documentation of intent; the real padding is applied in the checkpoint loop, which
-    // substitutes 6 for out-of-range rows so the last partial block matches the C byte for byte.
-    // `bwt` is indexed by ROW (length N), holding the base code that PRECEDES that row's suffix.
-    let mut bwt = vec![DUMMY_CHAR; n];
-    bwt.par_iter_mut()
-        .zip(sa.par_iter())
-        .for_each(|(bwt_symbol, &sa_value)| {
-            *bwt_symbol = if sa_value == 0 {
-                SENTINEL_CODE
-            } else {
-                bref[(sa_value - 1) as usize]
-            };
-        });
-    // `sentinel_index` is a ROW, not a position: the unique row whose suffix starts at 2L-space
-    // position 0, hence has no preceding character. `position_any` is safe despite its unordered
-    // name because exactly one element satisfies the predicate.
-    let sentinel_index = sa
-        .par_iter()
-        .position_any(|&sa_value| sa_value == 0)
-        .expect("suffix array must contain the sentinel (0)") as i64;
+    // ---- Step C: the BWT, the sentinel row, and the sampled SA (streaming-capable) -------------
+    // These three are the ONLY consumers of the suffix array. `build_bwt_and_samples` produces all of
+    // them: the BWT (`bwt[i] = 4 (sentinel) if sa[i]==0 else bref[sa[i]-1]`; the textbook transform,
+    // where row `i` ends with the character PRECEDING suffix `sa[i]` and `sa[i]==0` has no predecessor,
+    // mirroring `FMI_search.cpp:170-199`); `sentinel_index`, the unique ROW whose suffix starts at
+    // position 0; and `sa_samples[k] = sa[8k]`. The default array backend materializes the full SA and
+    // fills these in parallel; the `capsa` streaming backend fills them row-by-row from CaPS-SA's
+    // external-memory emit callback, so the 8-byte-per-row SA is never resident (only `bwt`, at 1
+    // byte/row). Both backends produce byte-identical output (a suffix array is UNIQUE). `bwt` is
+    // indexed by ROW (length N); out-of-range tail rows keep `DUMMY_CHAR` (6), the C's aligned-buffer
+    // padding, which the checkpoint loop below substitutes for rows past the end.
+    let (bwt, sentinel_index, sa_samples) = build_bwt_and_samples(bref, n, sa_count)?;
 
     // CP_OCC checkpoints, one per 64-base block. `one_hot[block_index]` is independent per block; `cp_count[block_index]`
     // is the running base-count prefix over prior blocks. Compute both per block in parallel, then a
@@ -782,13 +891,13 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     // position is never set, but it does mean a reader MUST sign-extend consistently (we mirror it
     // with `i8` in `FmIndex`, not `u8`).
     // ---- Step E: the sampled suffix array ------------------------------------------------------
-    // `sa_count` is the number of SAMPLES, not rows: sample `k` corresponds to ROW `8k`.
-    let sa_count = (n >> 3) + 1;
-    let (sa_ls_word, sa_ms_byte): (Vec<u32>, Vec<u8>) = (0..sa_count)
-        .into_par_iter()
-        .map(|k| {
+    // `sa_samples[k]` is already `sa[8k]`, produced by `build_bwt_and_samples` above (which is what
+    // lets the streaming backend avoid ever holding `sa`). All that remains is the 40-bit split.
+    let (sa_ls_word, sa_ms_byte): (Vec<u32>, Vec<u8>) = sa_samples
+        .par_iter()
+        .map(|&sample| {
             // `v` is a 2L-space reference POSITION (the suffix start for row `8k`), not a row.
-            let v = sa[k * SA_SAMPLE_STRIDE] as u64;
+            let v = sample as u64;
             ((v & 0xFFFF_FFFF) as u32, ((v >> 32) & 0xFF) as u8)
         })
         .unzip();

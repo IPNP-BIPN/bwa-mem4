@@ -16,6 +16,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cmd_index;
 mod cmd_mem;
+mod stage_time;
 
 // Top-level parsed command line. Holds nothing but the chosen subcommand: every real option lives
 // on `cmd_index::IndexArgs` or `cmd_mem::MemArgs`.
@@ -49,6 +50,12 @@ enum Cmd {
     // variant every production run takes.
     /// Align reads to an indexed reference.
     Mem(cmd_mem::MemArgs),
+    // No payload. Exists purely because `bwa-mem2 version` is a SUBCOMMAND, not a flag, and a
+    // drop-in replacement that only answers `--version` breaks any script that calls the former.
+    // It prints the bare version and nothing else, as bwa-mem2 does ("2.3"), so a caller can use it
+    // unquoted; `--version` keeps clap's "bwa-mem4 4.2.0" form for humans.
+    /// Print the version number, as `bwa-mem2 version` does.
+    Version,
 }
 
 /// Process entry point: capture argv, parse it, dispatch to the chosen subcommand.
@@ -66,5 +73,9 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Index(args) => cmd_index::run(args),
         Cmd::Mem(args) => cmd_mem::run(args, &argv),
+        Cmd::Version => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }

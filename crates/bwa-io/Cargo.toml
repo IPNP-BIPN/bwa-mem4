@@ -14,6 +14,36 @@ repository.workspace = true
 [dependencies]
 bwa-core = { workspace = true }
 needletail = { workspace = true }
+# Fast inflate backend for gzipped FASTQ input. ON by default via bwa-cli's `default` feature.
+#
+# needletail constructs the decompressor itself (`flate2::read::MultiGzDecoder`), so we cannot pass
+# it one. We do not have to: flate2 picks its backend by CARGO FEATURE, and features are additive
+# across the dependency graph, so enabling `zlib-rs` on OUR flate2 dependency switches needletail's
+# flate2 too, with no change to needletail and no code here.
+#
+# The default resolution is `miniz_oxide`, the slowest mainstream inflate. In paired-end mode ONE
+# reader thread inflates both mate files (see `PairedFastqReader`), so this is the whole input
+# path's throughput.
+#
+# `zlib-rs` over `zlib-ng`: same speed class, pure Rust, so no cmake and no C toolchain, which is
+# why this can be a default at all. Measured on 1M real GIAB pairs, PE `-t12`, `.fq.gz` input, the
+# `wait_read` stage goes 0.786s -> 0.48s (-38%); zlib-ng landed at 0.565s, between the two. See
+# docs/perf-levers.md for why that is a ~1.2% ceiling on wall and therefore below the 3% floor.
+#
+# Cannot affect output: inflate is a bijection, so every backend yields the same decompressed bytes,
+# hence the same records, hence the same `-K` batch boundaries. Verified: all three backends emit
+# the same SAM md5 (`67aa384bcc8af01f3618f1816f6b7606`) on gzipped real GIAB input.
+flate2 = { version = "1.1", optional = true, default-features = false, features = [
+    "zlib-rs",
+] }
+
+[features]
+# NOT defaulted here on purpose: the binary crate (bwa-cli) owns the default, so that a
+# `cargo build -p bwa-mem4 --no-default-features` can actually reach back and turn it off. A default
+# here would be un-disableable from the binary's build line, since bwa-cli takes bwa-io with its
+# default features.
+# Swap the gzip decompressor for zlib-rs. Additive and code-free; see the dependency comment above.
+fast-gzip = ["dep:flate2"]
 
 [lints]
 workspace = true

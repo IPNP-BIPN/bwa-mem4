@@ -65,6 +65,8 @@ use bwa_mem::{
 };
 use bwa_neon::NeonBackend;
 
+use crate::stage_time::{self, Stage};
+
 // ---- SAM FLAG bits set by this file (SAM spec section 1.4). The pairing bits 0x1/0x2/0x40/0x80
 //      belong to the paired-end path in `bwa-mem` and never appear here ----
 
@@ -1131,6 +1133,15 @@ const BGZF_COMPRESSION_LEVEL: u8 = 6;
 /// become a syscall. Sized here, not inherited from bwa (which never writes compressed SAM).
 const BGZF_SINK_BUFFER_BYTES: usize = 1 << 20;
 
+/// 1 MiB of buffering under the uncompressed sink, for the same reason and for one more.
+///
+/// `BufWriter`'s 8 KiB default was harmless while a batch arrived as ONE `Vec<u8>`: a write larger
+/// than the buffer bypasses it entirely, so a 400 MB batch was a single `write`. Now that a batch
+/// arrives as per-record pieces of a few hundred bytes each (see `run_pipeline`), the buffer is
+/// what turns them back into few, large syscalls. At 8 KiB a `-t16` batch would be ~50k of them;
+/// at 1 MiB it is ~400. Output bytes are identical either way, only the syscall count changes.
+const PLAIN_SINK_BUFFER_BYTES: usize = 1 << 20;
+
 impl Write for Output {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -1201,7 +1212,10 @@ impl Output {
     /// file only once the header text has streamed through (see [`HtsTranscoder`]).
     fn open(path: Option<&Path>, threads: usize, reference: Option<&Path>) -> anyhow::Result<Self> {
         match path {
-            None => Ok(Output::Plain(Box::new(BufWriter::new(std::io::stdout())))),
+            None => Ok(Output::Plain(Box::new(BufWriter::with_capacity(
+                PLAIN_SINK_BUFFER_BYTES,
+                std::io::stdout(),
+            )))),
             Some(path) => {
                 // Binary formats first, by the same case-insensitive suffix rule as `.gz` below, and
                 // before the `File::create` further down: htslib must be the one to open the file.
@@ -1262,7 +1276,10 @@ impl Output {
                         bgzf::MultithreadedWriter::with_worker_count(worker_count, sink, level),
                     )))
                 } else {
-                    Ok(Output::Plain(Box::new(BufWriter::new(file))))
+                    Ok(Output::Plain(Box::new(BufWriter::with_capacity(
+                        PLAIN_SINK_BUFFER_BYTES,
+                        file,
+                    ))))
                 }
             }
         }
@@ -1311,8 +1328,19 @@ const SAM_WRITEBEHIND: usize = 3;
 /// - `read_batches`: runs on the reader thread. Sends `(batch, base_id)` where `base_id` is the
 ///   cumulative count of reads (SE) or pairs (PE) emitted before this batch. That id must be global
 ///   across batches: downstream tie-breaks hash it, so restarting it per batch would change output.
-/// - `process`: runs on the main thread and returns one batch's SAM bytes. Internally parallel over
-///   the rayon pool; must be a pure function of its arguments for the byte-identity claim to hold.
+/// - `process`: runs on the main thread and returns one batch's SAM bytes AS PER-RECORD PIECES, in
+///   output order. Internally parallel over the rayon pool; must be a pure function of its
+///   arguments for the byte-identity claim to hold.
+///
+///   The pieces are handed over as a `Vec<Vec<u8>>` rather than concatenated into one buffer,
+///   because concatenating cost a single-threaded memcpy of the whole batch's SAM text (~400 MB at
+///   `-t16`) plus the first-touch page faults on a fresh allocation that large, and it made the
+///   text momentarily resident TWICE at exactly the instant that sets peak RSS. The writer loops
+///   over the pieces instead. This cannot change the output: the byte stream is the same pieces in
+///   the same order, and every `Output` variant is chunk-boundary agnostic (`Plain` and `Bgzf`
+///   buffer, and the `Bam`/`Cram` transcoder already carries an unterminated line across `write`
+///   calls in `pending`). It is the same shape as bwa-mem2, which `fputs`es each `seqs[i].sam`
+///   individually rather than building a batch buffer (`fastmap.cpp`).
 ///
 /// # Returns
 ///
@@ -1328,7 +1356,7 @@ const SAM_WRITEBEHIND: usize = 3;
 fn run_pipeline<B: Send>(
     out: Output,
     read_batches: impl FnOnce(std::sync::mpsc::SyncSender<(B, u64)>) -> anyhow::Result<()> + Send,
-    process: impl Fn(B, u64) -> Vec<u8>,
+    process: impl Fn(B, u64) -> Vec<Vec<u8>>,
     // `-v`, so the batch count obeys the same quiet switch as bwa's own progress lines. It is a
     // measurement instrument (see `crates/bwa-cli/tests/batch_count.rs`), so it is on by default.
     verbose: i32,
@@ -1341,8 +1369,10 @@ fn run_pipeline<B: Send>(
         // Reader -> main. Carries `(batch, base_id)`; blocks the reader once BATCH_READAHEAD
         // batches are queued, which is what bounds resident memory.
         let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<(B, u64)>(BATCH_READAHEAD);
-        // Main -> writer. Carries one batch's finished SAM bytes, already in output order.
-        let (sam_tx, sam_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(SAM_WRITEBEHIND);
+        // Main -> writer. Carries one batch's finished SAM bytes as per-record pieces, already in
+        // output order; the writer concatenates them into the sink's buffer rather than into a
+        // second heap allocation.
+        let (sam_tx, sam_rx) = std::sync::mpsc::sync_channel::<Vec<Vec<u8>>>(SAM_WRITEBEHIND);
 
         // ---- Reader and writer threads. `out` is MOVED into the writer, so it is only ever
         //      touched from one thread ----
@@ -1352,8 +1382,12 @@ fn run_pipeline<B: Send>(
         let writer = scope.spawn(move || -> anyhow::Result<()> {
             // Rebound to make the move explicit: the sink now lives on this thread and nowhere else.
             let mut out = out;
-            for buf in sam_rx {
-                out.write_all(&buf)?;
+            for pieces in sam_rx {
+                // In order, so the concatenation of the pieces is exactly the batch's SAM text.
+                // `Output`'s buffering is what turns these back into few, large syscalls.
+                for piece in &pieces {
+                    out.write_all(piece)?;
+                }
             }
             out.finish()?;
             Ok(())
@@ -1365,11 +1399,27 @@ fn run_pipeline<B: Send>(
         // processed and its bytes handed to the writer, so appending this batch's bytes preserves
         // input order.
         let mut n_batches = 0usize;
-        for (batch, base_id) in batch_rx {
+        // Spelled as an explicit `recv` loop rather than `for .. in batch_rx` purely so the two
+        // BLOCKING operations can be timed apart from the compute between them. `recv` returning
+        // `Err` is exactly the iterator's stop condition (the sender was dropped), so the loop is
+        // semantically identical to the `for` it replaces.
+        loop {
+            // Blocked here == starved by the reader. Charged to `wait_read`, which is the one
+            // number that says whether input (decompress + parse) is the bottleneck.
+            let t_wait = std::time::Instant::now();
+            let Ok((batch, base_id)) = batch_rx.recv() else {
+                break; // reader finished or died; its error surfaces on join below
+            };
+            stage_time::add(Stage::WaitRead, t_wait.elapsed());
             n_batches += 1;
+            stage_time::count_batch();
             // This batch's complete SAM text, all records concatenated in read order.
             let buf = process(batch, base_id);
-            if sam_tx.send(buf).is_err() {
+            // Blocked here == throttled by the writer (a slow sink, or BGZF/htslib backpressure).
+            let t_send = std::time::Instant::now();
+            let sent = sam_tx.send(buf);
+            stage_time::add(Stage::WaitWrite, t_send.elapsed());
+            if sent.is_err() {
                 break; // writer exited; its error surfaces on join below
             }
         }
@@ -1452,15 +1502,33 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // core -- affinity is a no-op on arm64 and QoS is only a hint -- so not creating the extra
     // workers is the only lever that works.
     //
-    // `BWA4_NO_PCORE_CAP=1` disables it, which is how the effect above stays measurable.
+    // MEASURED AGAIN (2026-07-29) ON THE REAL WORKLOAD, AND THE CAP IS NOW OFF BY DEFAULT.
+    // On 1M real GIAB pairs, gzipped, paired-end, `-t16`, default `-K`, alternating, 3 reps:
+    //
+    //   capped to 12 P cores : 24.25 / 26.31 / 26.39 s   (mean 25.65)
+    //   all 16 cores         : 23.00 / 23.09 / 23.82 s   (mean 23.30)   -9.2%, 3 of 3
+    //   fg-labs/bwa-mem3     : 25.38 / 24.74 / 27.37 s   (mean 25.83)
+    //
+    // The cap's original claim ("no measurable throughput, ~8% more CPU") holds for CPU time and is
+    // WRONG for wall time here: uncapped burns more CPU (281-324s against 260-290s) and still
+    // finishes 9% sooner, because a slow core doing some of the work still beats an idle one. The
+    // measurement that justified the cap was on the small simulated benchmark, where mate rescue is
+    // nearly cold and the E-core straggler dominates a short parallel region; on real paired-end
+    // data rescue is ~49% of wall and there is plenty of work to hide the stragglers behind.
+    //
+    // It also decided the head-to-head: capped we were at parity with the fork at `-t16`, uncapped
+    // we are 1.10x ahead (paired ratios 1.103 / 1.071 / 1.149).
+    //
+    // `BWA4_PCORE_CAP=1` restores the old behaviour, which is how the effect stays measurable and
+    // how anyone hitting the simulated-benchmark regime can get it back. Nothing here can change
+    // output: the pool size is independent of `-K`, which is what fixes batch boundaries.
     let pool_threads = match bwa_core::cpu::performance_core_count() {
-        Some(p) if n_threads > p && std::env::var_os("BWA4_NO_PCORE_CAP").is_none() => {
+        Some(p) if n_threads > p && std::env::var_os("BWA4_PCORE_CAP").is_some() => {
             // `-v` default is 3 (bwa's `bwa_verbose`), so this prints unless the user quietened it.
             if args.verbose.unwrap_or(3) >= 3 {
                 eprintln!(
-                    "[M::main_mem] -t {n_threads} exceeds the {p} performance cores; running {p} \
-                     workers. The efficiency cores add no measurable throughput and cost ~8% more \
-                     CPU. Set BWA4_NO_PCORE_CAP=1 to use all {n_threads}."
+                    "[M::main_mem] BWA4_PCORE_CAP set: -t {n_threads} exceeds the {p} performance \
+                     cores; running {p} workers."
                 );
             }
             p
@@ -1616,8 +1684,17 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
             args.verbose.unwrap_or(3),
         )?;
         bwa_neon::matesw::cells::dump();
+        bwa_neon::batched::extend_shape::dump();
+        bwa_mem::pe::rescue_rounds::dump();
+        bwa_mem::primary::dedup_shape::dump();
+        bwa_mem::pe::anchor_spread::dump();
         bwa_chain::chain_time::dump();
         bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
+        // Last, because it is the widest view: the others break down one stage, this one accounts
+        // for all of them. Runs on the main thread, where the stage accumulators live.
+        stage_time::dump(t_run.elapsed());
+        stage_time::barrier::dump();
+        stage_time::barrier::dump();
         return Ok(());
     }
 
@@ -1657,43 +1734,48 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // thread count once -K fixes the batch boundaries.
     // `batch` is one `-K` worth of reads in input order; `base_id` is the global id of its first
     // read (see the reader above). Returns the batch's complete SAM text.
-    let process = |batch: Vec<Record>, base_id: u64| -> Vec<u8> {
+    let process = |batch: Vec<Record>, base_id: u64| -> Vec<Vec<u8>> {
         // ASCII bases -> nt4 codes (A=0, C=1, G=2, T=3, anything else 4), once per read.
         // Parallel to `batch`: `all_codes[i]` is `batch[i]`'s sequence, same length.
-        let all_codes: Vec<Vec<u8>> = batch
-            .iter()
-            .map(|rec| rec.seq.iter().map(|&base| dna::nt4(base)).collect())
-            .collect();
+        //
+        // Run on the pool, as bwa-mem2 does (it encodes inside `mem_kernel1_core`, under `kt_for`).
+        // `dna::nt4` is a pure 256-entry table lookup, so `all_codes[i]` depends on `batch[i]` and
+        // nothing else, and `par_iter` is INDEXED so element order is preserved: byte-identical.
+        let all_codes: Vec<Vec<u8>> = stage_time::measure(Stage::Encode, || {
+            batch
+                .par_iter()
+                .map(|rec| rec.seq.iter().map(|&base| dna::nt4(base)).collect())
+                .collect()
+        });
         // Per-read candidate alignments BEFORE dedup and primary marking, also parallel to `batch`.
-        let regs_all = batched_regs(&fm, &bns, &opt, &all_codes);
+        let regs_all =
+            stage_time::measure(Stage::Align, || batched_regs(&fm, &bns, &opt, &all_codes));
         // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
         // `into_par_iter` yields the owned `Vec<MemAlnReg>`, dropping a per-read Vec allocation+copy.
         // One entry per read: that read's finished SAM records (possibly several, possibly one
         // unmapped record, never empty). rayon's indexed parallel iterators preserve read order.
-        let per_read_sam: Vec<Vec<u8>> = batch
-            .par_iter()
-            .zip(all_codes.par_iter())
-            .zip(regs_all.into_par_iter())
-            .enumerate()
-            .map(|(read_in_batch, ((rec, codes), regs_pre))| {
-                finish_se(
-                    &fm,
-                    &bns,
-                    &opt,
-                    rec,
-                    codes,
-                    regs_pre,
-                    base_id + read_in_batch as u64,
-                )
-            })
-            .collect();
-        // Concatenate in read order; the parallel map above preserved it.
-        // Pre-sized to the exact total so the concatenation never reallocates.
-        let mut buf = Vec::with_capacity(per_read_sam.iter().map(Vec::len).sum());
-        for read_records in &per_read_sam {
-            buf.extend_from_slice(read_records);
-        }
-        buf
+        let per_read_sam: Vec<Vec<u8>> = stage_time::measure(Stage::SamEmit, || {
+            batch
+                .par_iter()
+                .zip(all_codes.par_iter())
+                .zip(regs_all.into_par_iter())
+                .enumerate()
+                .map(|(read_in_batch, ((rec, codes), regs_pre))| {
+                    finish_se(
+                        &fm,
+                        &bns,
+                        &opt,
+                        rec,
+                        codes,
+                        regs_pre,
+                        base_id + read_in_batch as u64,
+                    )
+                })
+                .collect()
+        });
+        // Handed to the writer as pieces, in read order (the indexed parallel map above preserved
+        // it). No concatenation: see `run_pipeline`'s docs for why that buffer is not built.
+        per_read_sam
     };
 
     run_pipeline(
@@ -1705,6 +1787,9 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     )?;
     bwa_chain::chain_time::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
+    // Last, because it is the widest view: the others break down one stage, this one accounts for
+    // all of them. Runs on the main thread, where the stage accumulators live.
+    stage_time::dump(t_run.elapsed());
     Ok(())
 }
 
@@ -1735,13 +1820,29 @@ fn batched_regs(
     // Size of the rayon pool, i.e. effectively `-t`. Clamped so the division below cannot divide
     // by zero.
     let worker_count = rayon::current_num_threads().max(1);
-    // Reads per parallel chunk: exactly one chunk per worker (rounded up), so each SIMD extension
-    // batch is as wide as possible. Scheduling only, the per-read regions do not depend on it.
-    let reads_per_chunk = codes.len().div_ceil(worker_count).max(1);
-    codes
-        .par_chunks(reads_per_chunk)
-        .flat_map(|chunk| align_reads_batched(fm, bns, opt, chunk, &NeonBackend))
-        .collect()
+    // Reads per parallel chunk. `div_ceil(worker_count)` alone makes each chunk `batch/-t` reads, so
+    // every worker materialises its whole share of the batch's seeding intermediates (SMEMs, resolved
+    // SA positions, chains, pre-dedup regions) at once and peak RSS scales with `-K` (= 10M*-t by
+    // default). We instead size the chunk so the intermediates held CONCURRENTLY are a fixed budget
+    // INDEPENDENT of `-t`: with `-t` chunks in flight, `chunk = INFLIGHT_READS / -t` gives
+    // `-t * chunk = INFLIGHT_READS` reads resident regardless of thread count. A floor keeps each
+    // lockstep batch wide enough to hide FM-index latency (so very high `-t` trades the flat-RAM
+    // property for lockstep width rather than the reverse), and we never chunk larger than one
+    // per-worker share. Scheduling only -- the per-read regions do not depend on the chunk size.
+    const INFLIGHT_READS: usize = 16384; // total reads' intermediates resident at once, all workers
+    const MIN_CHUNK: usize = 512; // lockstep floor: enough reads in flight to hide FM latency
+    let budget_chunk = (INFLIGHT_READS / worker_count).max(MIN_CHUNK);
+    let reads_per_chunk = codes.len().div_ceil(worker_count).min(budget_chunk).max(1);
+    crate::stage_time::barrier::region(crate::stage_time::Stage::Align, || {
+        codes
+            .par_chunks(reads_per_chunk)
+            .flat_map(|chunk| {
+                crate::stage_time::barrier::worker(|| {
+                    align_reads_batched(fm, bns, opt, chunk, &NeonBackend)
+                })
+            })
+            .collect()
+    })
 }
 
 /// Env-gated (`BWA4_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
@@ -2243,27 +2344,31 @@ fn run_pe(
     // path; primary marking and pairing happen later, per bwa-mem2.
     // `batch` is one `-K` worth of read PAIRS in input order; `base_pair` is the global id of its
     // first pair. Returns the batch's complete SAM text.
-    let process = |batch: Vec<(Record, Record)>, base_pair: u64| -> Vec<u8> {
+    let process = |batch: Vec<(Record, Record)>, base_pair: u64| -> Vec<Vec<u8>> {
         // ---- Both mates of every pair, interleaved as c1,c2,c1,c2,... so the batched extension
         //      sees one flat list of reads ----
         // Length is `2 * batch.len()`; index `2i` is pair `i`'s mate 1 and `2i+1` its mate 2.
-        let all_codes: Vec<Vec<u8>> = batch
-            .iter()
-            .flat_map(|(rec1, rec2)| {
-                [
-                    rec1.seq
-                        .iter()
-                        .map(|&base| dna::nt4(base))
-                        .collect::<Vec<u8>>(),
-                    rec2.seq
-                        .iter()
-                        .map(|&base| dna::nt4(base))
-                        .collect::<Vec<u8>>(),
-                ]
+        //
+        // Run on the pool, as bwa-mem2 does (it encodes inside `mem_kernel1_core`, under `kt_for`).
+        // Indexed by the FLAT read index `i`, so `i >> 1` is the pair and `i & 1` the mate: an
+        // indexed `par_iter` over a range preserves order exactly, and `dna::nt4` is a pure table
+        // lookup, so each entry depends only on its own read. Byte-identical to the serial form.
+        let all_codes: Vec<Vec<u8>> = stage_time::measure(Stage::Encode, || {
+            stage_time::barrier::region(Stage::Encode, || {
+                (0..2 * batch.len())
+                    .into_par_iter()
+                    .map(|i| {
+                        stage_time::barrier::worker(|| {
+                            let (rec1, rec2) = &batch[i >> 1];
+                            let seq = if i & 1 == 0 { &rec1.seq } else { &rec2.seq };
+                            seq.iter().map(|&base| dna::nt4(base)).collect()
+                        })
+                    })
+                    .collect()
             })
-            .collect();
+        });
         // Pre-dedup regions, in the same interleaved order as `all_codes`.
-        let regs_all = batched_regs(fm, bns, opt, &all_codes);
+        let regs_all = stage_time::measure(Stage::Align, || batched_regs(fm, bns, opt, &all_codes));
 
         // ---- De-interleave: pair up each mate's owned codes + regions by sequential moves (no
         //      content copy), so the parallel prep can consume them instead of cloning
@@ -2272,64 +2377,77 @@ fn run_pe(
         // number of items at every point, so the four `next()` calls below always take mate 1's
         // codes, mate 2's codes, mate 1's regions and mate 2's regions of the SAME pair. Each
         // `unwrap` is sound because both lists hold exactly `2 * batch.len()` items.
-        let mut code_iter = all_codes.into_iter();
-        let mut regs_iter = regs_all.into_iter();
         // Re-paired, one entry per input pair, in pair order: ((codes1, codes2), (regs1, regs2)).
         #[allow(clippy::type_complexity)]
-        let paired: Vec<((Vec<u8>, Vec<u8>), (Vec<MemAlnReg>, Vec<MemAlnReg>))> = (0..batch.len())
-            .map(|_| {
-                let codes1 = code_iter.next().unwrap();
-                let codes2 = code_iter.next().unwrap();
-                let regs1 = regs_iter.next().unwrap();
-                let regs2 = regs_iter.next().unwrap();
-                ((codes1, codes2), (regs1, regs2))
-            })
-            .collect();
+        let paired: Vec<((Vec<u8>, Vec<u8>), (Vec<MemAlnReg>, Vec<MemAlnReg>))> =
+            stage_time::measure(Stage::Deinterleave, || {
+                let mut code_iter = all_codes.into_iter();
+                let mut regs_iter = regs_all.into_iter();
+                (0..batch.len())
+                    .map(|_| {
+                        let codes1 = code_iter.next().unwrap();
+                        let codes2 = code_iter.next().unwrap();
+                        let regs1 = regs_iter.next().unwrap();
+                        let regs2 = regs_iter.next().unwrap();
+                        ((codes1, codes2), (regs1, regs2))
+                    })
+                    .collect()
+            });
 
         // ---- Per-mate dedup. Regions are per-read independent, so this is byte-identical to the
         //      single-end path; pairing decisions come later ----
         // Everything the pairing and output stages need, one entry per pair in pair order. Mutable
         // because mate rescue writes new regions into it and `mem_sam_pe` then rewrites them again.
-        let mut prepared: Vec<PrepPair> = batch
-            .par_iter()
-            .zip(paired.into_par_iter())
-            .map(
-                |((rec1, rec2), ((codes1, codes2), (regs_pre1, regs_pre2)))| {
-                    let mut regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
-                    let mut regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
-                    // `bwamem.cpp:1161`, applied to both mates of the pair.
-                    bwa_mem::stamp_is_alt(bns, &mut regs1);
-                    bwa_mem::stamp_is_alt(bns, &mut regs2);
-                    PrepPair {
-                        codes1,
-                        codes2,
-                        regs1,
-                        regs2,
-                        name1: rec1.name.clone(),
-                        name2: rec2.name.clone(),
-                        qual1: rec1.qual.clone(),
-                        qual2: rec2.qual.clone(),
-                        comment1: rec1.comment.clone(),
-                        comment2: rec2.comment.clone(),
-                    }
-                },
-            )
-            .collect();
+        let mut prepared: Vec<PrepPair> = stage_time::measure(Stage::DedupPrep, || {
+            stage_time::barrier::region(Stage::DedupPrep, || {
+                batch
+                    .par_iter()
+                    .zip(paired.into_par_iter())
+                    .map(
+                        |((rec1, rec2), ((codes1, codes2), (regs_pre1, regs_pre2)))| {
+                            stage_time::barrier::worker(|| {
+                                let mut regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
+                                let mut regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
+                                // `bwamem.cpp:1161`, applied to both mates of the pair.
+                                bwa_mem::stamp_is_alt(bns, &mut regs1);
+                                bwa_mem::stamp_is_alt(bns, &mut regs2);
+                                PrepPair {
+                                    codes1,
+                                    codes2,
+                                    regs1,
+                                    regs2,
+                                    name1: rec1.name.clone(),
+                                    name2: rec2.name.clone(),
+                                    qual1: rec1.qual.clone(),
+                                    qual2: rec2.qual.clone(),
+                                    comment1: rec1.comment.clone(),
+                                    comment2: rec2.comment.clone(),
+                                }
+                            })
+                        },
+                    )
+                    .collect()
+            })
+        });
 
         // ---- Insert-size distribution, estimated once over the WHOLE batch. This is why batch
         //      boundaries (`-K`) are visible in paired-end output ----
         // Borrowed view of every mate's regions, re-interleaved, as `mem_pestat` expects: it reads
         // consecutive pairs of entries as the two ends of one pair.
-        let regs_ref: Vec<&[MemAlnReg]> = prepared
-            .iter()
-            .flat_map(|pair| [pair.regs1.as_slice(), pair.regs2.as_slice()])
-            .collect();
+        // Charged to `pestat` rather than to a row of its own: it exists only to feed `mem_pestat`
+        // and shares its fate under any fix.
+        let regs_ref: Vec<&[MemAlnReg]> = stage_time::measure(Stage::Pestat, || {
+            prepared
+                .iter()
+                .flat_map(|pair| [pair.regs1.as_slice(), pair.regs2.as_slice()])
+                .collect()
+        });
         // The insert-size model in force for THIS batch: the four orientations' mean, std and the
         // properly-paired bounds, in bases. Fixed by `-I`, or inferred from this batch's own
         // unambiguous pairs. Read by both mate rescue and `mem_sam_pe`.
         let pes = match pes0 {
             Some(fixed) => fixed,
-            None => mem_pestat(opt, bns.l_pac, &regs_ref),
+            None => stage_time::measure(Stage::Pestat, || mem_pestat(opt, bns.l_pac, &regs_ref)),
         };
 
         // Mate rescue, batched across the whole pair batch so the per-anchor insert-window SW fills
@@ -2350,71 +2468,77 @@ fn run_pe(
         let no_rescue =
             std::env::var_os("BWA4_NO_RESCUE").is_some() || opt.flag & flags::NO_RESCUE != 0;
         if !scalar_rescue && !no_rescue {
-            // One rescue job per pair: each mate's codes plus a MUTABLE borrow of its region list,
-            // which the rescue appends newly found alignments to. Borrowing `prepared` mutably is
-            // why this vector exists at all rather than the rescue reading `prepared` directly.
-            let mut rescue_jobs: Vec<PairRescueData> = prepared
-                .iter_mut()
-                .map(|pair| PairRescueData {
-                    seq0: pair.codes1.as_slice(),
-                    seq1: pair.codes2.as_slice(),
-                    a0: &mut pair.regs1,
-                    a1: &mut pair.regs2,
-                })
-                .collect();
-            // Each pair's rescue is independent, so run chunks in parallel; a chunk of a few hundred
-            // pairs still has enough rescue jobs to fill the SIMD lanes. Keeps -t8 scaling (the rescue
-            // is otherwise a serial section) while byte-identical to the per-pair path.
-            // Read before the mutable borrow below; `par_chunks_mut` would otherwise hold it.
-            let chunk_pairs = rescue_pairs_per_chunk(rescue_jobs.len());
-            rescue_jobs
-                .par_chunks_mut(chunk_pairs)
-                .for_each(|chunk| batch_mate_rescue(fm, bns, opt, &pes, chunk));
+            stage_time::measure(Stage::Rescue, || {
+                // One rescue job per pair: each mate's codes plus a MUTABLE borrow of its region list,
+                // which the rescue appends newly found alignments to. Borrowing `prepared` mutably is
+                // why this vector exists at all rather than the rescue reading `prepared` directly.
+                let mut rescue_jobs: Vec<PairRescueData> = prepared
+                    .iter_mut()
+                    .map(|pair| PairRescueData {
+                        seq0: pair.codes1.as_slice(),
+                        seq1: pair.codes2.as_slice(),
+                        a0: &mut pair.regs1,
+                        a1: &mut pair.regs2,
+                    })
+                    .collect();
+                // Each pair's rescue is independent, so run chunks in parallel; a chunk of a few hundred
+                // pairs still has enough rescue jobs to fill the SIMD lanes. Keeps -t8 scaling (the rescue
+                // is otherwise a serial section) while byte-identical to the per-pair path.
+                // Read before the mutable borrow below; `par_chunks_mut` would otherwise hold it.
+                let chunk_pairs = rescue_pairs_per_chunk(rescue_jobs.len());
+                stage_time::barrier::region(Stage::Rescue, || {
+                    rescue_jobs.par_chunks_mut(chunk_pairs).for_each(|chunk| {
+                        stage_time::barrier::worker(|| batch_mate_rescue(fm, bns, opt, &pes, chunk))
+                    });
+                });
+            });
         }
 
         // Emit paired SAM in parallel (each pair owns its regions; global pair id fixes hashes).
         // One entry per pair, in pair order: that pair's SAM records (normally two, more when either
         // mate is split). rayon's indexed parallel iterator preserves the order.
-        let bufs: Vec<Vec<u8>> = prepared
-            .par_iter_mut()
-            .enumerate()
-            .map(|(pair_in_batch, pair)| {
-                // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
-                // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
-                let names = [pair.name1.clone(), pair.name2.clone()];
-                let seqs = [pair.codes1.as_slice(), pair.codes2.as_slice()];
-                let quals = [pair.qual1.as_deref(), pair.qual2.as_deref()];
-                let comments = [pair.comment1.as_deref(), pair.comment2.as_deref()];
-                // This pair's SAM text.
-                let mut buf = Vec::new();
-                mem_sam_pe(
-                    fm,
-                    bns,
-                    opt,
-                    &pes,
-                    base_pair + pair_in_batch as u64,
-                    &names,
-                    &seqs,
-                    &quals,
-                    &comments,
-                    &mut pair.regs1,
-                    &mut pair.regs2,
-                    // rescue_done: true when nothing further should rescue -- either the batched
-                    // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
-                    !scalar_rescue || no_rescue,
-                    &mut buf,
-                )
-                .expect("write to Vec");
-                buf
+        let bufs: Vec<Vec<u8>> = stage_time::measure(Stage::SamEmit, || {
+            stage_time::barrier::region(Stage::SamEmit, || {
+                prepared
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(pair_in_batch, pair)| {
+                        stage_time::barrier::worker(|| {
+                            // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
+                            // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
+                            let names = [pair.name1.clone(), pair.name2.clone()];
+                            let seqs = [pair.codes1.as_slice(), pair.codes2.as_slice()];
+                            let quals = [pair.qual1.as_deref(), pair.qual2.as_deref()];
+                            let comments = [pair.comment1.as_deref(), pair.comment2.as_deref()];
+                            // This pair's SAM text.
+                            let mut buf = Vec::new();
+                            mem_sam_pe(
+                                fm,
+                                bns,
+                                opt,
+                                &pes,
+                                base_pair + pair_in_batch as u64,
+                                &names,
+                                &seqs,
+                                &quals,
+                                &comments,
+                                &mut pair.regs1,
+                                &mut pair.regs2,
+                                // rescue_done: true when nothing further should rescue -- either the batched
+                                // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
+                                !scalar_rescue || no_rescue,
+                                &mut buf,
+                            )
+                            .expect("write to Vec");
+                            buf
+                        })
+                    })
+                    .collect()
             })
-            .collect();
-        // Concatenate in pair order; the parallel map above preserved it.
-        // Pre-sized to the exact total so the concatenation never reallocates.
-        let mut buf = Vec::with_capacity(bufs.iter().map(Vec::len).sum());
-        for pair_records in &bufs {
-            buf.extend_from_slice(pair_records);
-        }
-        buf
+        });
+        // Handed to the writer as pieces, in pair order (the indexed parallel map above preserved
+        // it). No concatenation: see `run_pipeline`'s docs for why that buffer is not built.
+        bufs
     };
 
     run_pipeline(out, read_batches, process, verbose, k_batch)
@@ -2441,16 +2565,88 @@ fn run_pe(
 ///
 /// Purely a scheduling figure: the rescue result is independent of how the pairs are chunked,
 /// verified byte-identical at 512 and 2048 on 200,003 records.
+///
+/// ## Why the constant is now overridable
+///
+/// The sweep above was run at `-t12` on a 33k-pair batch and never repeated. `BWA4_STAGE_TIME`
+/// says it matters: on GRCh38, 500k pairs, `-K` 10M, PE, the two big stages scale very differently
+/// from `-t1` to `-t12`:
+///
+/// | stage | `-t1` | `-t12` | speed-up | efficiency |
+/// |---|---|---|---|---|
+/// | align | 28.687s | 3.110s | 9.22x | 77% |
+/// | **rescue** | 2.645s | **0.495s** | **5.35x** | **45%** |
+///
+/// Two chunks per worker is 24 tasks for 12 workers over a cost distribution whose mean is 207k DP
+/// cells per job with a heavy tail, which is a straggler trap: one slow chunk holds the barrier and
+/// there is nothing left to steal. That matters far more than the 10% share above suggests, because
+/// these are wgsim reads, where `docs/perf-levers.md` measures mate rescue as nearly asleep; on real
+/// GIAB it is 47-64% of paired-end compute.
+///
+/// ## Re-swept on REAL data (2026-07-29). Result: null. The formula above stands.
+///
+/// The sweep above used `work/r1_500k.fq`, i.e. wgsim, where `BWA4_STAGE_TIME` puts mate rescue at
+/// **10%** of the wall. On real GIAB HG002 it is **59.5%** (`align` 34.1%), so the wgsim sweep tuned
+/// the dominant stage of paired-end using a workload in which that stage is asleep. Re-swept on 1M
+/// real GIAB pairs against GRCh38, and the conclusion is that this constant should NOT change:
+///
+/// A/B of the two candidate FORMULAS in the configuration that matters (`-t16`, DEFAULT `-K`, so
+/// 540k pairs per batch: this formula yields 16892 pairs/chunk, a size-targeting one yields 768),
+/// interleaved within each rep, `rescue` stage / total wall in seconds:
+///
+/// | rep | this formula | size-targeting |
+/// |---|---|---|
+/// | 1 | 15.622 / 27.566 | 14.480 / 26.167 |
+/// | 2 | 16.184 / 27.962 | 15.843 / 28.759 |
+/// | 3 | 19.241 / 32.908 | 16.611 / 29.033 |
+///
+/// Best-of-3 favours the alternative by 5.1% of wall; the MEDIAN favours this one by 2.8%. Drift of
+/// one arm against ITSELF reaches 19% (27.566 -> 32.908), i.e. larger than the gap between arms. No
+/// measurable difference, so the previously-tuned code is kept.
+///
+/// ### Two traps, recorded because both nearly produced a wrong commit
+///
+/// **Forcing a chunk SIZE on a fixed batch confounds size with count.** Sweeping sizes via the
+/// override at `-K` 10M (33,784 pairs per batch) looked catastrophic at the top end (16384
+/// pairs/chunk: rescue 68.3s vs 15.7s at 512, `-t16`). That is not a chunk-size cost: 16384 on a
+/// 33,784-pair batch is **3 chunks for 16 workers**, so 13 workers idle. This formula can never
+/// produce that, since it fixes the count at `2 * workers`. At the default `-K` the same 16892 costs
+/// 15.6s, not 68s. Sweep the FORMULAS, not forced sizes, or fix the chunk count while varying size.
+///
+/// **The left branch is real and is the reason for the floor.** Below ~256 pairs the batched kernel
+/// runs out of jobs to fill its lanes, and that IS a size effect: `-t12` rescue 36.3s at 64
+/// pairs/chunk, 25.9s at 128, 21.6s at 256, then flat to 768. `RESCUE_MIN_PAIRS_PER_CHUNK` is what
+/// keeps a small final batch out of that hole.
+///
+/// `BWA4_RESCUE_PAIRS_PER_CHUNK=<n>` overrides the result outright, so the figure stays sweepable on
+/// ONE binary, the same arrangement as `BWA4_LOCKSTEP_N`. It bypasses the floor too, which is what
+/// makes the sub-256 measurements above possible. It cannot change output for the reason already
+/// given.
 fn rescue_pairs_per_chunk(n_pairs: usize) -> usize {
     /// Two chunks per worker: enough for work-stealing to rebalance, few enough to keep the SIMD
     /// batches wide.
     const CHUNKS_PER_WORKER: usize = 2;
     /// Floor, so a small batch is not shredded into slivers narrower than the kernel's lanes.
     const RESCUE_MIN_PAIRS_PER_CHUNK: usize = 256;
+    if let Some(forced) = rescue_pairs_override() {
+        return forced;
+    }
     let workers = rayon::current_num_threads().max(1);
     n_pairs
         .div_ceil(workers * CHUNKS_PER_WORKER)
         .max(RESCUE_MIN_PAIRS_PER_CHUNK)
+}
+
+/// `BWA4_RESCUE_PAIRS_PER_CHUNK`, the measurement override for [`rescue_pairs_per_chunk`]. Read once
+/// and cached; 0 or an unparseable value means "not set" rather than an error, since this is a knob.
+fn rescue_pairs_override() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BWA4_RESCUE_PAIRS_PER_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
 }
 
 /// One read pair prepared for the pairing/output stage: nt4 codes, dedup'd regions, names, quals.
