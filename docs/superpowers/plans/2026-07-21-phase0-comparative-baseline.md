@@ -477,7 +477,7 @@ Expected: the `WARNING: only 1 batches` block appears.
 
 ```bash
 git add scripts/fork_bench.sh
-git commit -m "bench: three-arm harness against the nh13 fork, with RSS and batch count
+git commit -m "bench: three-arm harness with fg-labs/bwa-mem3, RSS and batch count
 
 The only number we have against fg-labs/bwa-mem3 is phase-9a-era, -t1,
 align-only, on a 2 Mbp region whose BWT sits in cache. That regime excludes the
@@ -490,6 +490,12 @@ warms every binary first, reports peak RSS next to wall time because RAM is an
 objective here too, and warns when the batch count is low enough that the
 pipeline is inert."
 ```
+
+> The commit this step actually produced, `aa2705c`, carries an earlier subject
+> line naming the project's author rather than the project. The wording above is
+> the corrected one; the commit itself is left as it was rather than rewriting
+> published history a second time. Same for `ef0d191`, which introduced the
+> design document under its former title.
 
 ---
 
