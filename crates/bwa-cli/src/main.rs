@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cmd_index;
+mod cmd_longread;
 mod cmd_mem;
 mod stage_time;
 

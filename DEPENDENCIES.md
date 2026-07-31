@@ -13,6 +13,7 @@ Versions exactes gelees dans `Cargo.lock` (pin de record). Justifications :
 | `serde`, `serde_json` | rapport de concordance JSON (`sam-diff`) | MIT/Apache-2.0 |
 | `sha2` | shasum de determinisme dans le harnais | MIT/Apache-2.0 |
 | `rust-htslib` | sortie BAM/CRAM (`mem -o out.bam` / `out.cram`) | MIT |
+| `rammap-core` | mapping long-read (`mem -x pacbio\|pbref\|ont2d`), voir plus bas | MIT |
 
 Dev-only (jamais dans le binaire livre) : `noodles-*` (validation SAM/BAM cote test), `rust-bio` /
 `block-aligner` (bootstrap de seeding/SW).
@@ -34,3 +35,11 @@ Dev-only (jamais dans le binaire livre) : `noodles-*` (validation SAM/BAM cote t
   Reliquat (perf pure) : `kswv` NEON natif, int8x16 (16 lanes), tuning P/E-core, PGO.
 - **sse2neon** v1.8.0 (licence MIT) : uniquement cote *oracle* (rebuild instrumente bit-identique du
   binaire bwa-mem2 patche pour le diagnostic de parite), jamais dans notre binaire Rust.
+- **rammap-core** v1.1.2 (licence MIT, projet de jwanglab) : mappeur long-read pur Rust, equivalent
+  minimap2. Utilise tel quel comme dependance, sans reimplementation ni modification : `mem -x
+  pacbio|pbref|ont2d` lui delegue entierement la carte, et le `@PG` du SAM produit nomme `rammap` et
+  non `bwa-mem4`. C'est le seul chemin de ce binaire dont l'oracle n'est pas bwa-mem2 ; son gate est
+  `scripts/longread_parity.sh`, qui exige des enregistrements identiques a ceux du binaire `rammap`.
+  `-x intractg` n'est PAS delegue et reste sur le chemin bwa octet-identique. La version est epinglee
+  dans `crates/bwa-cli/Cargo.toml` et verifiee contre la chaine ecrite dans le `@PG` par le test
+  `cmd_longread::tests::pg_version_matches_the_linked_crate`.

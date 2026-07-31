@@ -150,7 +150,7 @@ jobs:
             /tmp/ours.sam
           retention-days: 5
 
-      - name: Option parity vs bwa-mem2 (58 cases)
+      - name: Option parity vs bwa-mem2 (64 cases)
         env:
           IDX: testdata/tiny/tiny.fa
           R1: /tmp/ci_1.fq
@@ -167,9 +167,28 @@ jobs:
           # The script always exits 0 so the full report is printed; the pass/fail decision is here.
           grep -q "0 failed" /tmp/parity.log
 
+      # The long-read path's oracle is rammap, not bwa-mem2, so it cannot ride on the step above.
+      # The binary is installed rather than skipped: `longread_parity.sh` exits 0 with a SKIP when
+      # rammap is missing, which would make this step green while testing nothing. The version is
+      # the one `crates/bwa-cli/Cargo.toml` links, enforced by a unit test, so a bump that forgets
+      # this line fails at `cargo test` rather than silently comparing against the wrong mapper.
+      - name: Install rammap (the long-read oracle)
+        run: cargo install rammap --version 1.1.2 --locked
+
+      - name: Long-read parity vs rammap
+        env:
+          IDX: testdata/tiny/tiny.fa
+          READS: /tmp/ci_1.fq
+        run: |
+          set -o pipefail
+          bash scripts/longread_parity.sh ./target/release/bwa-mem4 | tee /tmp/longread.log
+          grep -q "^RESULT: long-read path matches rammap" /tmp/longread.log
+
       - name: Upload the report on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: parity-report
-          path: /tmp/parity.log
+          path: |
+            /tmp/parity.log
+            /tmp/longread.log

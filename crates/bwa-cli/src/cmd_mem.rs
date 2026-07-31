@@ -123,13 +123,15 @@ const CIGAR_LEN_SHIFT: u32 = 4;
 /// # Scope note
 ///
 /// bwa's getopt string is `"51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:"`
-/// (`fastmap.cpp:660`). Every letter in it is accepted here except three:
-/// - `-x STR` (preset modes `pacbio`/`ont2d`/`intractg`): NOT accepted. It rewrites a dozen options
-///   at once (`fastmap.cpp:820-855`) and takes a *different* branch to `update_a`, so it is a real
-///   behavioural feature rather than a spelling, and silently ignoring it would be dangerous.
-/// - `-1` (disable multithreaded I/O): NOT accepted; this port's I/O pipeline has no such switch.
-/// - `-f FILE`: NOT accepted. In bwa it is a bare alias for `-o` (`fastmap.cpp:674`, one shared
-///   branch); use `-o`.
+/// (`fastmap.cpp:660`). Every letter in it is now accepted. Three deserve a note:
+/// - `-x STR` (preset modes `pacbio`/`pbref`/`ont2d`/`intractg`): rewrites up to nine options at
+///   once (`fastmap.cpp:820-855`) and takes a *different* branch to `update_a`, so a preset
+///   suppresses the `-A` rescaling. Implemented in PHASE 2 of [`build_opt`].
+/// - `-1` (disable multithreaded I/O): accepted and INERT. This port's reader and writer are
+///   separate threads by construction, and the flag cannot affect SAM bytes in either
+///   implementation.
+/// - `-f FILE`: accepted as a short alias of `-o`, which is exactly what it is in bwa
+///   (`fastmap.cpp:674`, one shared branch).
 ///
 /// Two accepted options are inert and marked NO-OP at their fields: `-j` and `-v`. Both are inert
 /// for reasons that cannot affect SAM bytes, explained there.
@@ -423,8 +425,29 @@ pub struct MemArgs {
     /// Write SAM to PATH instead of stdout. A `.gz`/`.bgz` suffix selects BGZF (block-gzip) output,
     /// compressed in parallel on `-t` worker threads (readable by samtools/bgzip/tabix); `.bam` and
     /// `.cram` select binary BAM/CRAM via htslib (`.cram` also needs `--reference`).
-    #[arg(short = 'o', long)]
+    #[arg(short = 'o', long, short_alias = 'f')]
     pub output: Option<PathBuf>,
+    // `-x STR` -> `mode` (`fastmap.cpp:665`), applied AFTER the whole getopt loop
+    // (`fastmap.cpp:818-859`). Not a spelling: it rewrites up to nine options at once, each only
+    // where the user left the default, and it takes a DIFFERENT branch to `update_a`, so giving
+    // `-x` suppresses the `-A` rescaling entirely. See PHASE 2 in `build_opt`.
+    //
+    // bwa-mem2 prints a warning for any mode ("doesn't work well with long reads or contigs; please
+    // use minimap2 instead") and this port prints it too: it goes to stderr, so it cannot touch SAM
+    // bytes, and a user reaching for `-x pacbio` deserves the same steer bwa gives them.
+    /// Read type preset: `pacbio`, `pbref`, `ont2d` or `intractg`. Rewrites several scoring and
+    /// seeding options at once, each only where it was not given explicitly.
+    #[arg(short = 'x')]
+    pub read_type: Option<String>,
+    // `-1` -> `no_mt_io` (`fastmap.cpp:664`), which makes bwa-mem2 read and write on the worker
+    // thread instead of a dedicated one. ACCEPTED AND INERT here, like `-j` and `-v`: this port's
+    // reader and writer are separate threads by construction and there is no single-threaded I/O
+    // path to fall back to. Accepting it matters anyway, because a script that passes `-1` to
+    // bwa-mem2 must not die on an unknown argument here, and the flag cannot affect SAM bytes in
+    // either implementation.
+    /// NO-OP, accepted for command-line compatibility: bwa's "disable multithreaded I/O".
+    #[arg(short = '1')]
+    pub no_mt_io: bool,
     // Long-only and not a bwa flag: bwa has no CRAM output, so there is no short letter to match.
     // Only CRAM reads it. It is the FASTA the CRAM decoder will need to reconstruct SEQ, so it must
     // be the same sequences as the index prefix; htslib loads it through its `.fai`.
@@ -845,7 +868,78 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     // enters this block; it just multiplies by 1, so the result is identical. Order inside the block
     // is irrelevant (each field is independent), but the block as a whole must run after every
     // option has been applied and before the matrix is filled.
-    if args.match_score.is_some() {
+    // The C's shape is `if (mode) { presets } else update_a(opt, &opt0);` (`fastmap.cpp:818-860`),
+    // and the `else` is load-bearing: **a preset SUPPRESSES the `-A` rescaling entirely**, even when
+    // `-A` was given. Writing this as two independent `if`s would rescale a preset's values and
+    // diverge from bwa on `-x pacbio -A 2`.
+    //
+    // Reachability: of the four modes below, only `intractg` is reached through `run`, which routes
+    // `pacbio`/`pbref`/`ont2d` to rammap before this function is called (see `cmd_longread`). The
+    // other three branches are kept, and kept correct, for two reasons: `build_opt` is a pure
+    // function whose contract is "bwa's option semantics", and the routing is a policy decision that
+    // a future release could revisit. `presets_match_bwa_long_read` exercises them directly, so they
+    // cannot rot silently while unreachable from the binary's main path.
+    if let Some(mode) = args.read_type.as_deref() {
+        // Same text and the same stream as bwa-mem2 (`fastmap.cpp:820`). stderr only, so it cannot
+        // reach the SAM bytes.
+        eprintln!(
+            "WARNING: bwa-mem2 doesn't work well with long reads or contigs; please use minimap2 \
+             instead."
+        );
+        match mode {
+            "intractg" => {
+                // Intra-species contig alignment: expensive gaps, harsh mismatches, mild clipping.
+                if args.gap_open.is_none() {
+                    opt.o_del = 16;
+                    opt.o_ins = 16;
+                }
+                if args.mismatch.is_none() {
+                    opt.b = 9;
+                }
+                if args.clip_penalty.is_none() {
+                    opt.pen_clip5 = 5;
+                    opt.pen_clip3 = 5;
+                }
+            }
+            // `pbref` is bwa's third spelling of the pacbio preset; the C tests all three in one
+            // branch and only splits `ont2d` out afterwards.
+            "pacbio" | "pbref" | "ont2d" => {
+                // Long, error-prone reads: gaps and mismatches nearly free, no clipping penalty,
+                // and a much more aggressive re-seed.
+                if args.gap_open.is_none() {
+                    opt.o_del = 1;
+                    opt.o_ins = 1;
+                }
+                if args.gap_extend.is_none() {
+                    opt.e_del = 1;
+                    opt.e_ins = 1;
+                }
+                if args.mismatch.is_none() {
+                    opt.b = 1;
+                }
+                // The C's guard is `opt0.split_factor == 0.`, a float compare against the flag it
+                // sets to `1.` in the `-r` branch; `None` here is the same predicate.
+                if args.split_factor.is_none() {
+                    opt.split_factor = 10.0;
+                }
+                let ont = mode == "ont2d";
+                if args.min_chain_weight.is_none() {
+                    opt.min_chain_weight = if ont { 20 } else { 40 };
+                }
+                if args.min_seed_len.is_none() {
+                    opt.min_seed_len = if ont { 14 } else { 17 };
+                }
+                if args.clip_penalty.is_none() {
+                    opt.pen_clip5 = 0;
+                    opt.pen_clip3 = 0;
+                }
+            }
+            other => {
+                // The C prints `[E::main_mem] unknown read type '<x>'` and returns 1.
+                anyhow::bail!("unknown read type '{other}'");
+            }
+        }
+    } else if args.match_score.is_some() {
         if args.mismatch.is_none() {
             opt.b *= opt.a;
         }
@@ -1473,6 +1567,43 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
              would ignore it, so it refuses rather than emit output that silently differs from \
              bwa-mem2."
         );
+    }
+
+    // ================= Long-read routing, before any bwa work =================
+    //
+    // `-x pacbio|pbref|ont2d` leaves this file entirely: bwa's long-read presets are a short-read
+    // design retuned, and bwa-mem2's own code tells the user not to use them. See `cmd_longread` for
+    // the reasoning, the preset mapping and what it does to the output contract. `-x intractg` is
+    // NOT routed and continues below on the bwa-identical path.
+    //
+    // Placed before `build_opt` because none of bwa's options apply to a different mapper; the only
+    // thing consumed here is `-o` (where the SAM goes) and the read paths.
+    if let Some(mode) = args.read_type.as_deref() {
+        if let Some(preset) = crate::cmd_longread::preset_for(mode) {
+            let mut reads = vec![args.reads.clone()];
+            if let Some(r2) = args.reads2.clone() {
+                reads.push(r2);
+            }
+            // Same sink choice as the short-read path: a file when `-o` was given, else stdout.
+            let mut out: Box<dyn std::io::Write> = match &args.output {
+                Some(path) => Box::new(std::io::BufWriter::new(
+                    std::fs::File::create(path)
+                        .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?,
+                )),
+                None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
+            };
+            // The long-read path runs on the rayon pool too, so `-t` must be honoured here: the
+            // pool setup further down is never reached on this branch. Same fixed-size pool, and
+            // the same reason it is fixed: nothing about the mapping depends on how many workers
+            // there are, so the thread count is a speed knob only.
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(args.threads.max(1) as usize)
+                .build_global()
+                .ok();
+            crate::cmd_longread::run(preset, mode, &args.index_prefix, &reads, &mut out, argv)?;
+            out.flush()?;
+            return Ok(());
+        }
     }
 
     // ================= Options and thread pool =================
@@ -2737,5 +2868,132 @@ mod tests {
         };
         assert!(err.contains("--reference"), "unexpected message: {err}");
         assert!(!path.exists(), "the file must not have been created");
+    }
+
+    /// Parse a `mem` command line into [`MemArgs`], for the option-semantics tests below.
+    ///
+    /// `MemArgs` derives `Args`, not `Parser`, because it is a subcommand's body; wrapping it in a
+    /// throwaway `Parser` is how clap exposes it to a test. The index prefix and read file are
+    /// positional and required, so every call supplies them; neither is opened, because `build_opt`
+    /// only reads the option fields.
+    fn args_from(extra: &[&str]) -> MemArgs {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            mem: MemArgs,
+        }
+        let mut argv: Vec<&str> = vec!["mem"];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["idx.fa", "reads.fq"]);
+        Wrapper::parse_from(argv).mem
+    }
+
+    /// `-x intractg` sets exactly the three groups bwa sets, and nothing else moves.
+    ///
+    /// Values from `fastmap.cpp:822-828`: gap open 16, mismatch 9, clip penalties 5. This is the one
+    /// preset that still runs through bwa's own path here, so `scripts/opt_parity.sh` checks it
+    /// end-to-end against the oracle too; this test pins the numbers so a failure says which field
+    /// moved rather than just "the SAM differs".
+    #[test]
+    fn presets_match_bwa_intractg() {
+        let opt = build_opt(&args_from(&["-x", "intractg"])).unwrap();
+        assert_eq!((opt.o_del, opt.o_ins), (16, 16), "gap open");
+        assert_eq!(opt.b, 9, "mismatch");
+        assert_eq!((opt.pen_clip5, opt.pen_clip3), (5, 5), "clip penalty");
+        // Untouched by this preset, so still at bwa's defaults.
+        assert_eq!((opt.e_del, opt.e_ins), (1, 1), "gap extend");
+        assert_eq!(opt.min_seed_len, 19, "min seed len");
+    }
+
+    /// The three long-read presets set what bwa sets, `ont2d` differing from `pacbio` in exactly two
+    /// fields, and `pbref` being an alias of `pacbio`.
+    ///
+    /// These modes are routed to rammap by `run`, so nothing else in this binary exercises them.
+    /// That is precisely why they are tested here: an unreachable branch that is silently wrong
+    /// becomes a bug the moment the routing policy changes. Values from `fastmap.cpp:829-855`.
+    #[test]
+    fn presets_match_bwa_long_read() {
+        for mode in ["pacbio", "pbref", "ont2d"] {
+            let opt = build_opt(&args_from(&["-x", mode])).unwrap();
+            let ont = mode == "ont2d";
+            assert_eq!((opt.o_del, opt.o_ins), (1, 1), "{mode}: gap open");
+            assert_eq!((opt.e_del, opt.e_ins), (1, 1), "{mode}: gap extend");
+            assert_eq!(opt.b, 1, "{mode}: mismatch");
+            assert_eq!(opt.split_factor, 10.0, "{mode}: split factor");
+            assert_eq!(
+                (opt.pen_clip5, opt.pen_clip3),
+                (0, 0),
+                "{mode}: clip penalty"
+            );
+            // The only two fields where ont2d and pacbio disagree.
+            assert_eq!(
+                opt.min_chain_weight,
+                if ont { 20 } else { 40 },
+                "{mode}: min chain weight"
+            );
+            assert_eq!(
+                opt.min_seed_len,
+                if ont { 14 } else { 17 },
+                "{mode}: min seed len"
+            );
+        }
+    }
+
+    /// A preset leaves an explicitly-given option alone, and suppresses the `-A` rescaling.
+    ///
+    /// Both halves come from one line of C: `if (mode) { ... } else update_a(opt, &opt0);`. Written
+    /// as two independent `if`s, `-x pacbio -A 2` would rescale the preset's values and diverge; the
+    /// mismatch penalty is the visible symptom, 1 rather than 2.
+    #[test]
+    fn preset_defers_to_explicit_options_and_suppresses_rescaling() {
+        // Explicit -B wins over the preset's mismatch penalty.
+        let opt = build_opt(&args_from(&["-x", "intractg", "-B", "3"])).unwrap();
+        assert_eq!(opt.b, 3, "explicit -B must survive the preset");
+        assert_eq!(
+            (opt.o_del, opt.o_ins),
+            (16, 16),
+            "the rest of the preset still applies"
+        );
+
+        // Explicit -k wins over ont2d's 14.
+        let opt = build_opt(&args_from(&["-x", "ont2d", "-k", "25"])).unwrap();
+        assert_eq!(opt.min_seed_len, 25, "explicit -k must survive the preset");
+
+        // -A with a preset: the preset's values stand unscaled.
+        let opt = build_opt(&args_from(&["-x", "pacbio", "-A", "2"])).unwrap();
+        assert_eq!(opt.a, 2, "-A itself still applies");
+        assert_eq!(opt.b, 1, "the preset's mismatch must NOT be rescaled by -A");
+
+        // Without a preset, the same -A does rescale: this is the branch the preset suppresses.
+        let scaled = build_opt(&args_from(&["-A", "2"])).unwrap();
+        assert_eq!(scaled.b, 8, "-A 2 rescales the default mismatch of 4");
+    }
+
+    /// An unknown `-x` is rejected, as bwa's `[E::main_mem] unknown read type` is.
+    #[test]
+    fn unknown_read_type_is_rejected() {
+        let err = build_opt(&args_from(&["-x", "nanopore"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown read type"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// `-f` is bwa's bare alias of `-o`, and `-1` parses without affecting anything.
+    ///
+    /// Both are pure command-line compatibility: a script written for bwa-mem2 must not die here on
+    /// an unknown argument. `-1` has no field to check beyond parsing, which is the whole claim.
+    #[test]
+    fn f_aliases_o_and_minus_one_parses() {
+        let args = args_from(&["-f", "out.sam"]);
+        assert_eq!(
+            args.output.as_deref(),
+            Some(std::path::Path::new("out.sam")),
+            "-f must fill the same field as -o"
+        );
+        assert!(args_from(&["-1"]).no_mt_io, "-1 must parse");
     }
 }

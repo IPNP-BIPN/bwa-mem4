@@ -12,6 +12,12 @@
 /scratch/
 
 # Committed fixtures live under testdata/ and crates/*/tests/golden/ and are NOT ignored.
+#
+# One exception, because it is written INTO testdata/: the long-read path caches rammap's minimizer
+# index beside the reference the first time `mem -x pacbio|ont2d` runs, so pointing a test at
+# testdata/tiny leaves a `.mmi` there. It is a build artifact of the reference, derived and
+# reproducible, never a fixture.
+*.rammap.*.mmi
 
 .DS_Store
 

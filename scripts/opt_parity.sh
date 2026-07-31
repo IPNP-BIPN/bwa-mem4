@@ -116,6 +116,30 @@ check_o() {
   fi
 }
 
+# `-f FILE` is a bare alias of `-o` in bwa: one shared getopt branch (`fastmap.cpp:674`), so the two
+# letters write the same file. Checked against the oracle's `-f` rather than against our own `-o`,
+# because the claim under test is "bwa's -f and ours agree", not "our two spellings agree". Needs its
+# own helper for the same reason `-o` does: with the SAM in a file there is nothing on stdout for
+# `check` to compare.
+check_f() {
+  local label="-f file (alias of -o)" mode="pe"
+  local base=(-t2 -K 10000000)
+  $M2 mem "${base[@]}" -f "$TMP/f_a.sam" "$IDX" "$R1" "$R2" 2>/dev/null
+  $M3 mem "${base[@]}" -f "$TMP/f_b.sam" "$IDX" "$R1" "$R2" 2>/dev/null
+  local rc3=$?
+  if [ $rc3 -ne 0 ]; then
+    printf '  %-28s %-3s [FAIL] mem4 exited non-zero\n' "$label" "$mode"; fail=$((fail+1)); failed_opts+=("$label"); return
+  fi
+  grep -v '^@PG' "$TMP/f_a.sam" > "$TMP/f_a2.sam"
+  grep -v '^@PG' "$TMP/f_b.sam" > "$TMP/f_b2.sam"
+  if cmp -s "$TMP/f_a2.sam" "$TMP/f_b2.sam"; then
+    printf '  %-28s %-3s [PASS]\n' "$label" "$mode"; pass=$((pass+1))
+  else
+    printf '  %-28s %-3s [FAIL] -f output differs from the oracle\n' "$label" "$mode"
+    fail=$((fail+1)); failed_opts+=("$label")
+  fi
+}
+
 # BGZF output (`-o out.gz`) is OURS, not bwa-mem2's, so there is no oracle to compare against and
 # this is a round-trip check instead: decompressing it must reproduce the plain `-o` bytes exactly,
 # and samtools must accept it. `@PG` is stripped on both sides because its `CL:` records the output
@@ -239,6 +263,33 @@ check "-a -Y (pe)" pe -a -Y
 
 echo "=== input and output paths ==="
 check "-p (interleaved)" pi -p
+
+# `-x` presets. These were unimplemented until 4.2.x and are the only options that rewrite SEVERAL
+# others at once, each only where the user left the default, AND suppress the `-A` rescaling by
+# taking a different branch to `update_a` (`fastmap.cpp:818-860`).
+#
+# ONLY `-x intractg` is testable here. The other three (`pacbio`, `pbref`, `ont2d`) are routed to
+# rammap and deliberately do NOT produce bwa-mem2's output, so asserting parity for them would
+# assert the opposite of what the code promises; `scripts/longread_parity.sh` owns those and its
+# oracle is rammap. The preset TABLE for all four is pinned by unit tests on `build_opt`
+# (`presets_match_bwa_*` in `cmd_mem.rs`), which is what keeps the values honest even though the
+# `mem` path never reaches three of them.
+#
+# Two cases for intractg: the preset alone, and the preset with an option it would otherwise have
+# set, which is the only way to catch a "wrote the value unconditionally" bug.
+echo "=== -x read-type presets ==="
+check "-x intractg"        se -x intractg
+check "-x intractg -B 3"   se -x intractg -B 3
+check "-x intractg -O 5"   se -x intractg -O 5
+check "-x intractg (pe)"   pe -x intractg
+
+# `-f` is a bare alias of `-o` in bwa (one shared getopt branch), and `-1` is accepted-and-inert on
+# both sides. Neither can change the records; the check is that they parse and route identically.
+# `-f` goes through `check_f` rather than `check`, because a flag that redirects the SAM to a file
+# produces nothing on stdout for `check` to compare.
+echo "=== -f alias and -1 ==="
+check "-1 (no_mt_io)"      se -1
+check_f
 check_o
 check_bgzf
 

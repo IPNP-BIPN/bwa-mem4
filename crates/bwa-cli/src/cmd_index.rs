@@ -18,6 +18,18 @@ pub struct IndexArgs {
     /// `.ann`, `.amb`, `.bwt.2bit.64` and `.0123`, and `<prefix>` is what `mem` is then given.
     #[arg(short = 'p')]
     pub prefix: Option<PathBuf>,
+    // NOT a bwa flag and OFF by default, deliberately. bwa's five files are an FM-index; the
+    // long-read path (`mem -x pacbio|pbref|ont2d`) is served by rammap, which needs a MINIMIZER
+    // index instead and cannot read bwa's. Building it here means a long-read run does not pay for
+    // it on first use, but it is opt-in because it roughly doubles index time and adds several GB
+    // that a short-read user would never open.
+    //
+    // The five bwa files are untouched and stay byte-identical to `bwa-mem2 index` either way; this
+    // only ever ADDS `<prefix>.rammap.<preset>.mmi`, which is exactly the name `mem` looks for.
+    /// Also build rammap minimizer indexes for long-read mapping: `map-ont`, `map-pb`, or `all`.
+    /// Repeatable. Without this, `mem -x ont2d`/`pacbio` builds and caches one on first use.
+    #[arg(long = "mmi", value_name = "PRESET")]
+    pub mmi: Vec<String>,
 }
 
 /// Build the index and report elapsed time on stderr.
@@ -52,5 +64,49 @@ pub fn run(args: IndexArgs) -> anyhow::Result<()> {
         args.fasta.display(),
         t0.elapsed().as_secs_f64()
     );
+    // Optional minimizer indexes, after the bwa five so a failure here cannot leave those missing.
+    for preset in resolve_mmi_presets(&args.mmi)? {
+        let t = Instant::now();
+        let path = crate::cmd_longread::mmi_path(&prefix, preset);
+        crate::cmd_longread::build_mmi(preset, &args.fasta, &path)?;
+        eprintln!(
+            "[bwa-mem4 index] built {} in {:.3}s",
+            path.display(),
+            t.elapsed().as_secs_f64()
+        );
+    }
     Ok(())
+}
+
+/// Expand the `--mmi` values into the presets to build.
+///
+/// # Parameters
+/// - `values`: the raw `--mmi` arguments. `all` expands to every long-read preset `mem -x` can
+///   route to; the names are the same ones `mem` reports.
+///
+/// # Returns
+/// The presets to build, deduplicated and in a stable order, or an error naming the accepted values.
+fn resolve_mmi_presets(values: &[String]) -> anyhow::Result<Vec<rammap::Preset>> {
+    use rammap::Preset;
+    let mut out: Vec<Preset> = Vec::new();
+    let push = |p: Preset, out: &mut Vec<Preset>| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for v in values {
+        match v.as_str() {
+            "all" => {
+                push(Preset::MapOnt, &mut out);
+                push(Preset::MapPb, &mut out);
+            }
+            "map-ont" | "ont2d" | "ont" => push(Preset::MapOnt, &mut out),
+            "map-pb" | "pacbio" | "pbref" | "pb" => push(Preset::MapPb, &mut out),
+            other => anyhow::bail!(
+                "unknown --mmi preset '{other}': expected map-ont, map-pb or all \
+                 (bwa's spellings ont2d, pacbio and pbref are accepted too)"
+            ),
+        }
+    }
+    Ok(out)
 }

@@ -6,6 +6,10 @@ A native Rust reimplementation of the short-read aligner
 
 Not "equivalent alignments". The same bytes.
 
+One deliberate exception, described in full [below](#the-one-path-that-is-deliberately-not-byte-identical-long-reads):
+bwa's three long-read presets are mapped by rammap rather than reproduced, because bwa-mem2's own
+code tells you not to use them.
+
 ## Status
 
 | | |
@@ -85,6 +89,35 @@ mechanism is at `bwamem.cpp:2302`, where the 8-bit versus 16-bit SIMD kernel is 
 
 **At default scoring the two builds agree exactly**, so the 30x results above are unaffected.
 Parity here is stated against the arm64 build, which is the side that stays consistent.
+
+## The one path that is deliberately not byte-identical: long reads
+
+`-x pacbio`, `-x pbref` and `-x ont2d` do **not** reproduce bwa-mem2. They are mapped by
+[rammap](https://github.com/jwanglab/rammap) instead, a pure-Rust minimap2-equivalent, and produce
+its output.
+
+The reason is bwa-mem2's own: it prints `WARNING: bwa-mem2 doesn't work well with long reads or
+contigs; please use minimap2 instead.` before running any of them (`fastmap.cpp:820`). The presets
+only retune a short-read seed-and-extend design (cheaper gaps, a longer re-seed, no clip penalty)
+and cannot turn it into a long-read mapper. Reproducing that output byte for byte, which this port
+did until 4.2.x, faithfully reproduces a result its own author tells you not to use.
+
+The substitution is never silent:
+
+- a banner on stderr names the mapper that ran and the preset it was given;
+- the `@PG` line records `rammap` and its version, not `bwa-mem4`, so the file says who made it;
+- `-x intractg` is **not** routed. It is intra-species contig alignment, not long reads, and stays
+  on the bwa-identical path, checked against the oracle by `scripts/opt_parity.sh` like every other
+  option.
+
+rammap needs a minimizer index, which bwa's FM-index cannot supply, so one is built from the
+reference FASTA and cached beside it as `<prefix>.rammap.<preset>.mmi`. Build it up front with
+`bwa-mem4 index --mmi all <ref.fa>` to keep it off the first run. The five bwa index files are
+untouched either way and stay byte-identical to `bwa-mem2 index`.
+
+The gate for this path is `scripts/longread_parity.sh`, the only test here whose oracle is not
+bwa-mem2: it maps the same reads with the `rammap` binary and requires identical records, for all
+three presets, plus `-t1 == -t8` and a check that `-x intractg` still comes out of bwa's code.
 
 ## Verification
 

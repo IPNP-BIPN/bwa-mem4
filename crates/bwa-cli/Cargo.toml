@@ -28,6 +28,7 @@ anyhow = { workspace = true }
 rayon = { workspace = true }
 bgzf = { workspace = true }
 rust-htslib = { workspace = true }
+rammap-core = "1.1.2"
 
 [features]
 # Suffix-array backend passthrough for `bwa-mem4 index`. `bwa-index` owns the actual choice (see
