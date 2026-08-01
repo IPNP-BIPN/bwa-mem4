@@ -10,6 +10,21 @@
 //! full of divergences still exits 0, so a CI gate must inspect the JSON, not the exit status.
 //! Argument parsing is hand-rolled (no clap) to keep this diagnostic dependency-light; `--json` is
 //! the only flag and anything else is taken as a positional path.
+//!
+//! # Rust mechanics used in this file
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `src/bin/name.rs` | by convention a standalone EXECUTABLE within the crate, built alongside the library. It is why this file has a `main` and `lib.rs` does not. |
+//! | `fn main() -> ExitCode` | the program's entry point. Returning `ExitCode` rather than nothing is what lets it choose the process exit status explicitly. |
+//! | `ExitCode` | the value the operating system sees when the program ends. 0 conventionally means success. |
+//! | `std::env::args()` | walks the command-line arguments, the first being the program's own name, which is why the scan below starts at index 1. |
+//! | `.collect()` | gathers that walk into a `Vec<String>`, so arguments can be indexed and looked ahead at. A flag taking a value needs the lookahead. |
+//! | `Vec<String>` | a growable list of owned strings. |
+//! | `.as_str()` | views an owned `String` as borrowed text, which is what `match` needs to compare it against string literals. |
+//! | `match` on text | multi-way branch on the argument's value: the `"--json"` arm consumes two entries, the catch-all arm one. |
+//! | `Option<String>` | the `--json` destination: either a path or nothing. |
+//! | `while` with a manual cursor | used instead of a `for` loop because a flag consumes TWO arguments, and a `for` loop cannot skip ahead. |
 
 use std::path::Path;
 use std::process::ExitCode;
