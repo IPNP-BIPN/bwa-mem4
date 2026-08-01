@@ -22,6 +22,32 @@
 //! 4. [`ksw_align2`], which is [`ksw_local_fwd`] run twice (forwards, then on the reversed prefixes)
 //!    to recover where the alignment started (ports `ksw_align2`, `ksw.cpp:370`).
 //!
+//! # Rust mechanics used in this file
+//!
+//! This file is deliberately written in the least idiomatic Rust in the tree, and that is the
+//! point: it is a line-by-line port of C, and diffing it against `ksw.cpp` is the workflow that
+//! finds parity bugs. So it uses indexed loops rather than iterators, single-letter names rather
+//! than descriptive ones, and explicit `mut` counters rather than functional pipelines. Idiomatic
+//! Rust here would be less readable, not more, because it would no longer line up with the C.
+//!
+//! The one thing that genuinely matters is INTEGER BEHAVIOUR. Byte-identity means reproducing the
+//! C's arithmetic exactly, including where it truncates and where it can overflow.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `i32`, `i8` | signed 32- and 8-bit integers. The widths are copied from the C, not chosen. A wider type would silently avoid an overflow the C has, and produce a different score. |
+//! | `as i32` on a float | truncation TOWARD ZERO, discarding the fraction. This matches C's `(int)` cast exactly, which is why the band-width computation can be transcribed directly. |
+//! | `as usize` | conversion to the index type. Every one of these marks a place where a signed C index becomes a Rust index; they are frequent here because the C uses `int` for both arithmetic and indexing, and Rust does not. |
+//! | `vec![0i32; n]` | allocates a vector of `n` zeroed values. The suffix on the literal fixes the element type. |
+//! | `let mut x = ...` | a variable that will be reassigned. Rust bindings are read-only by default, so every `mut` in the DP loops marks genuine mutable state, which makes the loop-carried variables visible at a glance. |
+//! | `x.max(0)` / `x.min(y)` | the larger or smaller of two values, as a method rather than a macro. `x.max(0)` is the local-alignment floor and appears wherever the C writes a conditional zeroing. |
+//! | `.iter().copied().max()` | walks a slice, yields values rather than references, and returns the largest as an `Option`. Used once, to find the best entry of the scoring matrix. |
+//! | `.unwrap_or(0)` | supplies a fallback for that `Option`, covering an empty matrix. |
+//! | `mat[..n]` | a slice of the first `n` entries, borrowed with no copy. |
+//! | `-1i32` | a typed literal. Several counters use -1 as "not set yet", exactly as the C does, so the type must be signed. |
+//! | `for i in 0..n` | counts 0 to n-1. The upper bound is excluded. |
+//! | `if a > b { a } else { b }` written out | kept in preference to `.max()` in the innermost DP cells, because it mirrors the C's expression shape line for line. |
+//!
 //! # Glossary: the short names kept from the C, in plain language
 //!
 //! These names are **deliberately not renamed**. Checking this file line by line against
@@ -229,6 +255,11 @@ pub fn ksw_extend2(
     // Zero is not a score here, it is the sentinel "no alignment reaches this cell": the local
     // recurrence floors at 0 and the inner loop tests `big_m != 0` before adding a substitution
     // score. That is also why `h0 > 0` is required.
+    //
+    // Rust: `vec![0i32; n]` allocates and zeroes in one step, which is what makes it the exact
+    // equivalent of the C's `calloc` here, including the all-zero starting state the recurrence
+    // depends on. The C keeps one array of two-field structs; splitting it into two vectors is a
+    // memory-layout change only and cannot alter any computed value.
     let mut eh_h = vec![0i32; qlen + 1];
     let mut eh_e = vec![0i32; qlen + 1];
     // Row -1 (the "before the seed" row): the alignment starts at score h0 in column -1, and every

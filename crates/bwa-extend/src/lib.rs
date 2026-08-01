@@ -28,6 +28,30 @@
 //! `qle`/`tle` are how many query/target bases the best local alignment consumed; `gscore`/`gtle`
 //! are the score and target length of the best alignment that instead consumes the *whole* query.
 //! The full glossary of the short C-derived names lives in the [`sw`] module header.
+//!
+//! # Rust mechanics used in this file
+//!
+//! The whole point of this file is one language feature: a TRAIT. A trait is a list of operations
+//! that several unrelated types can each provide in their own way. [`SwBackend`] is that list for
+//! seed extension, [`ScalarBackend`] is the plain implementation of it, and the NEON kernels in
+//! `bwa-neon` are another. Code written against the trait works with any of them, which is exactly
+//! what makes "the scalar version is the definition of correct, and everything else must match it"
+//! expressible as ordinary compiled code rather than as a convention.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `pub trait SwBackend { ... }` | declares that list of operations. It contains signatures, and no bodies: it says what an implementation must be able to do, not how. |
+//! | `impl SwBackend for ScalarBackend` | supplies those operations for one concrete type. A second such block elsewhere makes a second backend, with no change to any code that uses the trait. |
+//! | `fn f<B: SwBackend>(backend: &B)` | a generic function accepting anything implementing the trait. The compiler produces one specialised copy per backend actually used, so calls go direct rather than through a pointer: the abstraction has no run-time cost. |
+//! | `&B` | that backend, borrowed. The acceptance gates only call it; they never own or modify it. |
+//! | `struct ExtendJob<'a>` | a struct holding BORROWED data, so it must say how long that borrow is good for. `'a` is a name for that lifetime, chosen by whoever builds the job. |
+//! | `'a` (a lifetime) | a compile-time label, never a value and never present in the binary. It exists so the compiler can prove the read and the reference slice outlive the job that points at them, which is what makes passing slices around free of copies and free of dangling pointers. |
+//! | `assert_eq!(a, b)` | crash if the two differ, printing both. The acceptance gates are built from these because the requirement really is exact equality of integers, not approximate agreement. |
+//! | `#[cfg(test)]` | the module that follows is compiled only for tests. |
+//!
+//! Note what is NOT here: no `dyn`, no `Box`. The backends are chosen at compile time through the
+//! generic parameter, not at run time through a pointer, because seed extension is the hot inner
+//! loop and an indirect call per alignment would be measurable.
 
 pub mod sw;
 
