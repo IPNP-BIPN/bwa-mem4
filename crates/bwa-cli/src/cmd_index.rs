@@ -1,4 +1,14 @@
 //! `bwa-mem4 index` subcommand: build the FMD index (byte-identical to `bwa-mem2 index`).
+//!
+//! # Rust mechanics used in this file
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `#[derive(Args)]` | generates the option parser for this subcommand from the struct below. |
+//! | `///` vs `//` on the struct | not a style choice here. `///` documents an item AND is what clap picks up as help text, so the struct carries `//` (to keep `index`'s help exactly as bwa prints it) while each field carries `///` (which IS the intended help string). |
+//! | `PathBuf` | an owned filesystem path, the growable counterpart of the borrowed `&Path`. Owned because it comes from argv and must outlive the parse. |
+//! | `Option<PathBuf>` | an optional path: `-p` given, or not. |
+//! | `Instant` | a monotonic clock reading, used to report how long the build took. |
 
 use std::path::PathBuf;
 use std::time::Instant;

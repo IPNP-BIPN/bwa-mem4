@@ -34,6 +34,20 @@
 //! | `ont2d` | `map-ont` | Nanopore 2D reads; bwa's own preset lowers `min_seed_len` to 14 |
 //! | `pacbio` | `map-pb` | noisy PacBio CLR, which is what bwa's preset targets |
 //! | `pbref` | `map-pb` | bwa treats `pbref` and `pacbio` identically (one shared branch) |
+//!
+//! # Rust mechanics used in this file
+//!
+//! Nothing exotic here. What is worth noticing is what the `use` lines below mean: this file is
+//! mostly a translation layer, converting bwa's option surface into another crate's types and
+//! calling into it. `rammap` is consumed exactly as published, with no fork and no local patch, so
+//! everything named below belongs to that crate rather than to this project.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `use rammap::align::map::MapContext;` | imports a name from a dependency so it can be written unqualified. The path mirrors that crate's module layout, not ours. |
+//! | `enum Preset` | a fixed set of named alternatives. The bwa `-x` mode is mapped onto one of rammap's, which is the whole substance of the routing table above. |
+//! | `Option<Preset>` | the mapping's result: a rammap preset, or `None` meaning "this `-x` stays on the bwa path". `-x intractg` is that `None`, and keeping it typed this way is why the byte-identical path cannot be routed away by accident. |
+//! | `anyhow::Result<T>` | succeeds with `T` or fails with any error carrying context, as elsewhere in this crate. |
 
 use anyhow::{Context, Result};
 use rammap::align::extend::AlignmentContext;
