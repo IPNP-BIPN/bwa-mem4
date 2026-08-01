@@ -14,6 +14,38 @@
 //! read to a handful of candidate loci, and only then runs Smith-Waterman around those loci. This
 //! crate produces the seeds; `bwa-chain` groups them; `bwa-extend` does the DP.
 //!
+//! # Rust mechanics used in this file
+//!
+//! Two structures dominate this file and neither is obvious from the outside.
+//!
+//! The first is the LOCKSTEP driver. Seeding is bound by memory latency, not by arithmetic: each
+//! index lookup reaches into a multi-gigabyte array and waits. So instead of finishing one read
+//! before starting the next, the driver keeps several reads in flight at once, advancing each by
+//! one step per pass, so the waits overlap. `Vec<Option<LsSlot>>` is that set of in-flight reads,
+//! and a slot becoming `None` is how a finished read leaves the rotation.
+//!
+//! The second is `std::mem::swap` and `std::mem::take`. Rust will not let you move a value out of
+//! a struct field or a vector slot, because that would leave behind something the type system has
+//! no name for. These two functions are the sanctioned way around it: `swap` exchanges the contents
+//! of two places, and `take` removes a value and leaves the type's default behind. Both are used
+//! here to move whole vectors around without copying their contents.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `Vec<Option<LsSlot>>` | the in-flight read slots. `Some` is an active read, `None` an empty seat. |
+//! | `std::mem::take(&mut x)` | takes `x`'s value and leaves the default (an empty vector) in its place. Used to hand a finished read's seed list to the output without copying it. |
+//! | `std::mem::swap(&mut a, &mut b)` | exchanges two values. In the interval arithmetic it swaps the forward and reverse-complement bounds, which is the C's pointer trick expressed without pointers. |
+//! | `Vec<Vec<Smem>>` | one seed list per input read, indexed by read number. |
+//! | `&mut Vec<Smem>` as a parameter | an output buffer supplied by the caller and appended to in place, so one allocation is reused across every read instead of one per read. |
+//! | `&mut [Smem]` | an exclusive borrow of a scratch buffer whose length is fixed. Reused the same way. |
+//! | `(0..n).map(\|_\| Vec::new()).collect()` | builds `n` independent empty vectors. `_` marks the counter as unused; `vec![Vec::new(); n]` would not do, since that would require cloning. |
+//! | `.filter(\|s\| s.is_some()).count()` | counts the still-active slots, which is the rotation's stopping condition. |
+//! | `.map(\|r\| r.len()).max().unwrap_or(0)` | the longest read, with 0 for an empty input. |
+//! | `Vec::with_capacity(n)` | reserves room up front so the slot table never reallocates mid-run. |
+//! | `Smem::default()` | the type's zero value, from a derived `Default`. `vec![Smem::default(); n]` pre-fills the scratch buffer. |
+//! | `as usize` / `as i64` | explicit conversions between the signed arithmetic the C uses and the unsigned type Rust needs for indexing. Frequent here for that reason alone. |
+//! | `&[i64; 5]` | a borrowed FIXED-size array of five counts, one per base code including N. The length is part of the type, so a mis-sized table will not compile. |
+//!
 //! **What an SMEM is.** A MEM (maximal exact match) is a read substring that occurs somewhere in
 //! the reference and cannot be extended left or right without losing all its occurrences. A
 //! *super*-maximal exact match (SMEM) is a MEM that is not contained inside another MEM of the same
@@ -304,12 +336,21 @@ pub fn collect_smems_batched(
     // advances a cursor or moves the phase forward.
     let mut live = slots.iter().filter(|s| s.is_some()).count();
     while live > 0 {
+        // Rust: `.iter_mut()` walks the slot table yielding an exclusive borrow of each entry, so
+        // each in-flight read can be advanced in place. `.as_mut()` on the `Option` turns "maybe a
+        // slot" into "maybe an exclusive borrow of a slot" without moving anything out, and the
+        // let-else skips the empty seats.
         for slot_opt in slots.iter_mut() {
             let Some(slot) = slot_opt.as_mut() else {
                 continue;
             };
             slot.step(fm, reads[slot.ridx], min_seed_len, &counts);
             if slot.phase == LsPhase::Done {
+                // Rust: this is the move-out problem and its sanctioned solution. `slot.out` is a
+                // vector owned by a struct that is still in use, so it cannot simply be handed over.
+                // `take` swaps it for an empty vector and returns the original, transferring the
+                // seeds to the output with no copy while leaving `slot` in a valid state, ready to
+                // be reset onto the next read.
                 output[slot.ridx] = std::mem::take(&mut slot.out);
                 if next_read < reads.len() {
                     slot.reset_to(next_read, 0, min_intv, false);
