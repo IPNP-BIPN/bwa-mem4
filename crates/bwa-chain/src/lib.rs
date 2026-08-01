@@ -43,6 +43,39 @@
 //! |---|---|---|
 //! | `l_pac` | `bns->l_pac` | Length of the FORWARD reference in bases. The searched text is `2 * l_pac` long: the forward genome followed by its reverse complement. A position `>= l_pac` is therefore a reverse-strand hit, which is why strand tests here are plain coordinate comparisons. |
 //! | `rid` | `bns_intv2rid` | Reference-sequence index, i.e. which contig (chromosome) a position falls in. Negative means "no single contig": the interval bridges a contig boundary (-1) or the forward/reverse seam at `l_pac` (-2), and bwa discards such seeds. |
+//!
+//! # Rust mechanics used in this file
+//!
+//! Two things here look strange to a reader coming from the C and are worth flagging up front.
+//! First, the sort routines are ports of klib's, and they take the comparison as a FUNCTION passed
+//! in by the caller, so one sort implementation serves every ordering in the file. Second, the
+//! reorder step near the end of `build_chains_from_resolved` moves values out of a vector one at a
+//! time in an arbitrary order, which Rust does not permit directly; the `Vec<Option<_>>` there is
+//! the standard way around it, explained at the site.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `&MemChain` / `&mut MemChain` | a borrow of one chain: read-only, or exclusive and writable. A function taking `&mut` modifies the caller's chain in place and returns nothing. |
+//! | `&mut [T]` | an exclusive borrow of a contiguous run of values. The sorts take this, so they reorder the caller's storage rather than producing a new list. |
+//! | `fn f<T>(...)` | a GENERIC function: `T` stands for whatever element type the caller has. One compiled copy is produced per type actually used, so this is not slower than writing it out by hand. |
+//! | `impl Fn(&T, &T) -> bool` | a parameter that is itself a function: "give me something callable that takes two elements and says whether the first sorts before the second". It is how the klib sorts stay one implementation while their orderings differ per call site. |
+//! | `\|x, y\| x.w > y.w` | an anonymous inline function written at the call site, supplying exactly that comparison. |
+//! | `&impl Fn(...)` | the same thing, borrowed, so the inner sorts can be handed the caller's comparison without taking ownership of it. |
+//! | `Vec<Option<MemChain>>` | a list whose slots can be individually emptied. See the comment at the reorder step for why this is necessary rather than fussy. |
+//! | `.take()` | on an `Option`: removes the value, leaving `None` behind, and hands it over. This is what lets one slot be moved out while the rest of the vector stays intact. |
+//! | `.expect("...")` | unwrap a value, crashing with that message if it is absent. Used only where absence would mean an internal invariant is already broken, in which case continuing would be worse. |
+//! | `.into_iter()` | walks a collection by CONSUMING it, yielding owned values rather than borrows. `.iter()` by contrast borrows and leaves the collection usable afterwards. |
+//! | `.map(Some)` | wraps every element in `Some`, passing the constructor by name instead of writing `\|c\| Some(c)`. |
+//! | `.collect()` | gathers a walk into a container, chosen from the declared type of the destination. |
+//! | `.retain(\|c\| ...)` | keeps only the elements passing the test, dropping the rest, in place. |
+//! | `.sort_by_key(\|s\| ...)` | sorts by a value computed per element. The key here packs two 32-bit fields into one 64-bit integer so a single comparison orders by both, in that priority. |
+//! | `u64::from(x) << 32 \| u64::from(y)` | that packing: widen, shift the first field into the high half, bitwise-OR the second into the low half. |
+//! | `Vec::with_capacity(n)` | reserves room up front so the vector does not repeatedly grow and copy. |
+//! | `&mut Vec<i64>` as a parameter | an output buffer supplied by the caller and filled in place, so a hot loop can reuse one allocation across reads instead of returning a fresh vector each time. |
+//! | `as f32` / `as f64` | explicit integer-to-float conversions. Rust performs none implicitly, so every one of them is visible. |
+//! | `x << 1` | a left shift by one bit, i.e. multiply by two. |
+//! | `debug_assert_eq!` | a check compiled into debug and test builds only, and absent from a release binary. Used for invariants that must hold but are too costly to verify on every release run. |
+//! | `if let Some(t) = ...` | run this block only when there is a value, binding it. |
 //! | `rbeg` | `mem_seed_t.rbeg` | Reference begin of a seed, in 2L space. |
 //! | `qbeg` | `mem_seed_t.qbeg` | Query begin of a seed: a 0-based offset into the read. |
 //! | `w` | `mem_chain_t.w` | Chain WEIGHT: the smaller of (bases of the read covered by the chain's seeds) and (bases of the reference covered), counting each covered base once even where seeds overlap. A crude "how much of this alignment is actually supported by exact matches" score, used to rank chains. |
@@ -344,6 +377,12 @@ pub fn sa_positions_for_read(
     // u64 key (`m` in the high half, `n` in the low half, both u32) yields the same permutation. It
     // must happen before the position walk, because the chain merge consumes seeds strictly in this
     // order and the greedy "offer to one chain" rule makes that order observable.
+    //
+    // Rust: one integer key encoding a two-level ordering. `s.m` is widened to 64 bits and shifted
+    // into the high half, `s.n` occupies the low half, so comparing the packed values compares `m`
+    // first and only falls through to `n` when the `m`s are equal. This is the standard way to get a
+    // multi-field sort out of a single-key sort, and it is exact rather than approximate because
+    // both fields are known to fit in 32 bits.
     smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
     // Cap on materialized occurrences per SMEM (default 500), widened to i64 to compare against `s`.
     let max_occ = i64::from(opt.max_occ);
@@ -572,6 +611,13 @@ pub fn build_chains_from_resolved(
     let order: Vec<usize> = tree.in_order();
     debug_assert_eq!(order.len(), chains.len());
     // `chains` re-wrapped so each element can be moved out once, by index, in `order`'s order.
+    //
+    // Rust: the reason for the `Option` wrapper. The chains must come out in `order`, which is an
+    // arbitrary permutation, and each must be moved out whole rather than copied (a `MemChain` owns
+    // a vector of seeds). Rust forbids moving a value out of a vector by index, because that would
+    // leave a hole the type system cannot describe. Wrapping each element in an `Option` gives the
+    // hole a name: `.take()` below removes the chain and leaves `None` in its place, which IS a
+    // valid value, so the vector stays consistent throughout. No chain is cloned.
     let mut slots: Vec<Option<MemChain>> = chains.into_iter().map(Some).collect();
     let out = order
         .into_iter()
@@ -598,6 +644,16 @@ pub fn build_chains_from_resolved(
 /// - `lt`: strict less-than under the desired order. In [`mem_chain_flt`] it is `x.w > y.w`, so
 ///   "less" means "heavier" and the result is weight-descending. It must be a strict weak ordering:
 ///   `lt(x, x)` returning true would loop the inner while past the front.
+// Rust: read the signature as "sorts a run of ANY element type, using a comparison the caller
+// supplies". `<T>` is the element-type blank; `&mut [T]` is the caller's own storage, reordered in
+// place; `&impl Fn(&T, &T) -> bool` is a borrowed callable taking two elements and answering
+// whether the first comes first. Passing the ordering in is why one implementation serves every
+// sort in this file, and why "less" can be made to mean "heavier" at the `mem_chain_flt` call site
+// without a second copy of the algorithm.
+//
+// `a.swap(i, j)` exchanges two elements of a slice. It exists as a method because the obvious
+// three-line temporary-variable version would need two exclusive borrows of `a` at once, which the
+// compiler refuses.
 fn ks_insertsort_by<T>(a: &mut [T], lt: &impl Fn(&T, &T) -> bool) {
     for i in 1..a.len() {
         let mut j = i;

@@ -35,6 +35,35 @@
 //! to propagate back upward, and why the tree's final shape depends on the insertion ORDER and not
 //! only on the set of keys inserted.
 //!
+//! # Rust mechanics used in this file
+//!
+//! One design decision explains most of what this file looks like. The C is a tree of nodes linked
+//! by POINTERS. Rust's ownership rules make a pointer-linked tree genuinely awkward: every node
+//! would need a single owner, and a split reaches into a parent and two children at once, which is
+//! exactly the pattern the compiler refuses. The port sidesteps this entirely by keeping all nodes
+//! in one flat `Vec<Node>` and using their INDEX where the C uses a pointer. This is the standard
+//! Rust answer, usually called an arena. It also happens to be why child links can be plain
+//! `usize`: an index cannot dangle, because the vector owns every node for the tree's whole life.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `Vec<Node>` + `usize` ids | the arena described above. `nodes[x]` is "the node the C would have reached through pointer `x`". Reading it needs no unsafe code and no reference counting. |
+//! | `Vec<(i64, usize)>` | a list of PAIRS. Each key slot carries the chain's reference position and an opaque payload index into the caller's own storage; the tree never looks at the payload. |
+//! | `(a, b)` | a tuple, an anonymous grouping of values. `.0` and `.1` reach its members by position. |
+//! | `let (mut begin, mut end) = (0, n);` | destructuring: declare two variables from one tuple in a single statement. |
+//! | `pub(crate)` | visible inside this crate only, not to the outside world. It is what keeps the tree an implementation detail of chaining. |
+//! | `isize` vs `usize` | signed and unsigned pointer-width integers. The distinction is load-bearing here: [`getp_aux`] returns a slot index that can legitimately be -1, meaning "before the first key", so its type must be SIGNED. Storing it as `usize` would wrap that -1 into a huge positive number and index far out of bounds. |
+//! | `as isize` / `as usize` | conversions between the two. Every one of them in this file marks a place where a slot index crosses that signed/unsigned boundary, which is why they are written out rather than hidden. |
+//! | `&Node` / `&mut Node` | a borrow of one node, shared (read-only) or exclusive (writable). A function taking `&mut self` may modify the arena; one taking `&self` may only read it. |
+//! | `keys[T..MAX_KEYS]` | a range slice: the upper half of a full node, taken during a split. |
+//! | `.to_vec()` | copies a borrowed slice into a new owned `Vec`. Needed during the split because the two halves must end up independently owned. |
+//! | `.insert(i, v)` | inserts into the middle of a vector, shifting later elements up. This is how a key lands in its sorted slot, and the shifting is what preserves klib's observable ordering of duplicate keys. |
+//! | `.enumerate()` | walks a sequence yielding `(index, element)` pairs, for when the position is needed as well as the value. |
+//! | `.extend(...)` | appends every element of a walk to a vector in one call. |
+//! | `\|&(_, i)\| i` | a closure destructuring the tuple it is handed and keeping only the second member. `_` discards the first. |
+//! | `&mut Vec<usize>` as a parameter | an output accumulator passed down a recursion, appended to in place instead of each level returning and merging its own vector. |
+//! | `Option<usize>` | the lookup's answer: a payload index, or nothing when no chain qualifies. |
+//!
 //! # Glossary: names kept identical to klib
 //!
 //! | name | klib origin | meaning |
@@ -132,8 +161,14 @@ fn getp_aux(node: &Node, k: i64) -> (isize, i32) {
     }
     // Lower-bound binary search over this node's key slots: on exit `begin` is the first slot whose
     // `pos >= k`, or `keys.len()` if every key is below `k`. `end` is exclusive throughout.
+    //
+    // Rust: one statement declaring two variables by destructuring a tuple. `0usize` carries its
+    // type as a suffix, which then fixes `end`'s type too. Both need `mut` because the loop moves
+    // them; a binding is read-only unless declared otherwise.
     let (mut begin, mut end) = (0usize, node.keys.len());
     while begin < end {
+        // Rust: `>> 1` is a right shift by one bit, i.e. integer division by two. Both operands are
+        // `usize`, so this cannot go negative and cannot overflow at any node size reachable here.
         let mid = (begin + end) >> 1;
         if node.keys[mid].0 < k {
             begin = mid + 1;
@@ -149,6 +184,10 @@ fn getp_aux(node: &Node, k: i64) -> (isize, i32) {
     // `begin`, and the caller wants the slot BELOW, hence the decrement.
     let r = if k < node.keys[begin].0 { -1 } else { 0 };
     if r < 0 {
+        // Rust: this is why the returned slot is `isize` and not `usize`. When `begin` is 0 the
+        // answer is -1, meaning "before the first key", a legitimate result the caller acts on.
+        // The cast to `isize` happens BEFORE the subtraction; doing it after would wrap 0 - 1 into
+        // the largest possible `usize` and index catastrophically out of bounds.
         return (begin as isize - 1, r);
     }
     (begin as isize, r)
@@ -237,7 +276,19 @@ impl KbTree {
     ///   key slot `i` of `x` and the new sibling at child slot `i + 1`. Range `0 ..= x.keys.len()`.
     /// - `y`: node id of the full child being split. Must hold exactly `MAX_KEYS` keys.
     fn split(&mut self, x: usize, i: usize, y: usize) {
+        // The braced block below is not decoration, and it is the one place where the Rust shape of
+        // this port differs visibly from the C's. The C reaches into the parent and both children at
+        // the same time through pointers. Rust does not allow two exclusive borrows of `self.nodes`
+        // to be alive at once, so this function is staged instead: the block borrows ONLY the full
+        // child, takes everything it needs out of it, and ends. Its four results come out as a
+        // tuple, and by then the borrow is over, which is what makes the `self.nodes.push(...)` and
+        // the parent borrow below legal.
+        //
+        // Rust: a braced block is an expression, so `let (a, b, c, d) = { ... };` runs the block and
+        // destructures its final value into four variables in one statement.
         let (z_internal, z_keys, z_ptrs, median) = {
+            // Rust: an exclusive borrow of one element of the arena. Nothing else may touch
+            // `self.nodes` until this borrow ends at the closing brace.
             let full_node = &mut self.nodes[y];
             // Upper half of the keys, slots `T ..< MAX_KEYS` (that is `T - 1` of them). Slot `T - 1`
             // is deliberately excluded: it is the median that goes up, not into `z`.
@@ -258,6 +309,9 @@ impl KbTree {
             (full_node.is_internal, z_keys, z_ptrs, median)
         };
         // Node id of the fresh right-hand sibling, allocated at the end of the arena.
+        //
+        // Rust: the new node's id is simply where it lands in the arena. Reading the length BEFORE
+        // pushing is what makes that true, and it is the arena equivalent of the C's allocation.
         let z = self.nodes.len();
         self.nodes.push(Node {
             is_internal: z_internal,
