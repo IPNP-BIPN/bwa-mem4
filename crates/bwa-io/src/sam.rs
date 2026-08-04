@@ -46,6 +46,31 @@
 //! Reading order: [`write_header`] (once per file), then [`write_unmapped`] and
 //! [`write_mapped_se`] (once per emitted record). None of the three makes a decision: the caller
 //! (`bwa-cli::cmd_mem::write_aln_se`) has already chosen every field and every tag.
+//!
+//! # Rust mechanics used in this file
+//!
+//! The thing to understand here is `W: Write`: these three functions do not know, and cannot know,
+//! whether they are writing to a terminal, a file, a compressor or an in-memory buffer. That is
+//! what lets the tests at the bottom capture the exact bytes and compare them literally, which is
+//! how byte-identity is actually enforced.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `W: Write` | a generic parameter bounded by a trait: accept ANY type that knows how to be written to. The compiler generates a separate specialised copy per type actually used, so the flexibility costs nothing at run time. |
+//! | `&mut W` | that sink, borrowed exclusively. Writing advances it, so the borrow must be exclusive; nothing is returned. |
+//! | `io::Result<()>` | succeeds with nothing, or fails with an I/O error. `()` is the empty type, used where C would say `void`. Every function here returns it because the only thing that can go wrong is the sink. |
+//! | `?` after a write | propagate an I/O failure to the caller immediately. It appears on every line, which is why a full-disk error surfaces at once instead of being silently dropped. |
+//! | `Ok(())` | the explicit success value at the end of each function: "finished, nothing to report". |
+//! | `&[SqRecord]` | a borrowed, read-only view of a list of contigs. The caller keeps ownership; nothing is copied. |
+//! | `&str` vs `String` | borrowed text versus owned text. Parameters take `&str` because they only read; [`SqRecord`] stores `String` because it must outlive the call that built it. |
+//! | `b"..."` | a byte-string literal. The SAM line is assembled as raw bytes, not text, because read sequences are not guaranteed to be valid text. |
+//! | `write!` / `writeln!` | format into a sink, the second adding a newline. Anything in braces is interpolated. |
+//! | `{qname}` | interpolation naming the variable directly, rather than passing it as a separate argument. |
+//! | `Some(q) if !q.is_empty()` | a match arm with a GUARD: matches only when the pattern fits AND the extra condition holds. It is what folds "no quality at all" and "an empty quality string" into the same `*` output. |
+//! | `.is_some_and(...)` | on an `Option`: true when there is a value AND it passes the test. False for `None`, with no unwrapping needed. |
+//! | `.any(...)` | true if at least one element of a walk passes the test, stopping at the first that does. |
+//! | `#[allow(clippy::too_many_arguments)]` | switches off one lint for the item below. [`write_mapped_se`] has ten parameters because a SAM line has that many independent fields; grouping them into a struct would hide which ones the caller must decide. |
+//! | `.unwrap()` in tests | "this cannot fail, and if it does, crash the test". Acceptable in a test, never on the aligner's own paths. |
 
 use std::io::{self, Write};
 
@@ -132,6 +157,11 @@ pub fn write_header<W: Write>(
     // True when the `-H` block already contains at least one line-initial `@SQ\t`, i.e. the user
     // brought their own reference dictionary; the C's `n_SQ != 0`. Suppresses OUR `@SQ` loop only,
     // never the user's lines, which are written unchanged further down.
+    //
+    // Rust: read inside out. `.split('\n')` walks the block line by line, `.any(...)` reports
+    // whether at least one of them starts with the marker, and `.is_some_and(...)` wraps the whole
+    // test so that "no `-H` block at all" is simply false rather than something to unwrap first.
+    // Nothing is allocated: the lines are borrowed windows onto the block.
     let user_supplied_sq =
         hdr_lines.is_some_and(|block| block.split('\n').any(|line| line.starts_with("@SQ\t")));
     if !user_supplied_sq {
@@ -194,6 +224,13 @@ pub fn write_unmapped<W: Write>(
     // ---- Columns 10-11: SEQ as sequenced, QUAL or `*` ----
     w.write_all(seq)?;
     w.write_all(b"\t")?;
+    // Two different absences, one output. FASTA input gives `None`; a read whose quality line is
+    // present but empty gives `Some(&[])`. SAM spells both `*`, so both must land on the same arm.
+    //
+    // Rust: `if !quals.is_empty()` is a GUARD on the first arm. When it fails, matching continues
+    // to the catch-all `_` rather than stopping, which is precisely what merges the two cases. A
+    // guard is not a nested `if`: an `if` inside the arm body would leave the empty case writing
+    // nothing at all, and silently produce a SAM line one field short.
     match qual {
         Some(quals) if !quals.is_empty() => w.write_all(quals)?,
         _ => w.write_all(SAM_MISSING)?,
@@ -203,6 +240,11 @@ pub fn write_unmapped<W: Write>(
     // Everything after AS/XS, built up in bwa's emission order (RG:Z, then the `-C` comment) and
     // written as one block. Stays empty when neither `-R` nor `-C` is in effect, in which case the
     // line ends right after XS:i:0.
+    //
+    // Rust: an ordinary growable byte buffer, filled by two functions that each borrow it
+    // exclusively (`&mut`) and append in place. Building the block here rather than writing the two
+    // pieces straight to `w` is what makes their ORDER visible in one place, and tag order is part
+    // of the byte-identity gate.
     let mut trailing_tags = Vec::new();
     // `-R`: bwa stamps RG:Z on every record, unmapped ones included.
     bwa_core::rg::append_rg_tag(&mut trailing_tags);
@@ -266,6 +308,12 @@ pub fn write_mapped_se<W: Write>(
 ) -> io::Result<()> {
     // ---- Columns 1-6 (QNAME..CIGAR), then 7-9 hard-coded to the single-end mate defaults
     //      (RNEXT `*`, PNEXT 0, TLEN 0); the paired-end path formats its own line ----
+    //
+    // Rust: every `{name}` interpolates the parameter of that name, and every literal tab between
+    // them is a real field separator. The three trailing `*\t0\t0` are the single-end mate columns,
+    // written as constants because they never vary on this path. The whole line is one formatting
+    // call so that the field ORDER is readable as a single string rather than reconstructed from a
+    // sequence of writes.
     write!(
         w,
         "{qname}\t{flag}\t{rname}\t{pos}\t{mapq}\t{cigar}\t*\t0\t0\t"
@@ -273,6 +321,13 @@ pub fn write_mapped_se<W: Write>(
     // ---- Columns 10-11: SEQ (already in reference orientation) and QUAL ----
     w.write_all(seq)?;
     w.write_all(b"\t")?;
+    // Two different absences, one output. FASTA input gives `None`; a read whose quality line is
+    // present but empty gives `Some(&[])`. SAM spells both `*`, so both must land on the same arm.
+    //
+    // Rust: `if !quals.is_empty()` is a GUARD on the first arm. When it fails, matching continues
+    // to the catch-all `_` rather than stopping, which is precisely what merges the two cases. A
+    // guard is not a nested `if`: an `if` inside the arm body would leave the empty case writing
+    // nothing at all, and silently produce a SAM line one field short.
     match qual {
         Some(quals) if !quals.is_empty() => w.write_all(quals)?,
         _ => w.write_all(SAM_MISSING)?,
@@ -290,6 +345,10 @@ pub fn write_mapped_se<W: Write>(
 mod tests {
     use super::*;
 
+    // Rust: the sink here is a plain `Vec<u8>`, which qualifies as a `Write` just as a file does.
+    // That is the whole point of the generic parameter: these tests exercise the real production
+    // function and then compare its output byte for byte, with no file, no temporary directory and
+    // no separate test-only formatting path that could drift from the shipped one.
     #[test]
     fn header_has_no_hd_and_exact_sq() {
         let mut buf = Vec::new();

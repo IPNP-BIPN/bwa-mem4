@@ -22,6 +22,28 @@
 //! The stages tile the batch loop without gaps: `sum(stages) + epsilon == total wall`, where the
 //! epsilon is index load and header emission outside the loop. A stage that a given path never
 //! enters (the paired-end-only ones, under single-end) simply stays at zero and is not printed.
+//!
+//! # Rust mechanics used in this file
+//!
+//! The design note above rests on one language choice, so it is worth spelling out. The other
+//! probes in this tree accumulate into ATOMIC counters, because rayon workers write them from many
+//! threads at once, and an atomic add is the cheapest thing that is still correct there. This probe
+//! is only ever touched by the main thread, so it uses `thread_local` `Cell`s instead: a `Cell` is
+//! plain mutable storage with no synchronisation whatsoever, and `thread_local` gives each thread
+//! its own copy. That is why the disabled cost really is one bool load and an untaken branch, with
+//! nothing on any worker's hot path.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `thread_local!` | declares storage of which every thread gets its own private copy. No thread can see another's, so no locking or atomics are needed to touch it. |
+//! | `Cell<T>` | a container whose contents can be replaced even through a shared borrow. Ordinary Rust forbids that; `Cell` permits it precisely because it is single-threaded and cannot be shared across threads. |
+//! | `.get()` / `.set(v)` | read and overwrite a `Cell`. Both are plain loads and stores. |
+//! | `Instant` | a monotonic clock reading, unaffected by the wall clock being adjusted. Two of them subtract to a `Duration`. |
+//! | `.elapsed()` | time since an `Instant` was taken. |
+//! | `Duration::as_nanos()` | that span in nanoseconds. |
+//! | `std::env::var_os(...)` | reads an environment variable, here `BWA4_STAGE_TIME`, without requiring it to be valid text. |
+//! | `OnceLock<bool>` + `.get_or_init(...)` | a slot filled at most once, on first use, from any thread. It is what turns the environment lookup into a single read for the whole process, so a disabled probe costs a cached bool load rather than a `getenv` at every stage boundary. |
+//! | `const { ... }` in an array repeat | forces the repeated element to be built at compile time. It is what allows an array of `Cell`s to be declared, since `Cell` cannot be cloned the way an ordinary repeated initialiser would require. |
 
 use std::cell::Cell;
 use std::sync::OnceLock;

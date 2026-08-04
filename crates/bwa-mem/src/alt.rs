@@ -32,6 +32,23 @@
 //! | `NM` / `nm`      | Edit distance: mismatches plus inserted plus deleted bases.              |
 //! | `rid`            | Contig index (a "reference id"), indexing `BntSeq::contigs`.             |
 
+//! # Rust mechanics used in this file
+//!
+//! `get_pri_idx` returns `Option<usize>`: either this region hangs off a primary, and here is that
+//! primary's index, or it does not. The index is into the SAME slice the function was given, which is
+//! a convention a raw `usize` cannot express and the doc comment therefore states explicitly. A
+//! reference to the primary would have been the C-shaped answer and is not available here: the slice
+//! is being examined while the caller intends to mutate it, and Rust will not hand out a borrow that
+//! outlives that intent. An index is the standard way through, and it is checked at every use.
+//!
+//! The tag builder returns `Vec<Option<String>>`, one slot per region, `None` where the region has no
+//! alternates. Same reasoning as the CIGAR module's `xa` field: a missing tag and an empty tag are
+//! different bytes in the output, so they must be different values in the program.
+//!
+//! `xa_drop_ratio` is an `f64` compared against a ratio of `i32` scores. The C does the same
+//! comparison in `double`, and the cast happens at the same point here, because a ratio that lands
+//! exactly on the threshold decides whether a record carries an alternate at all.
+
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 

@@ -25,6 +25,34 @@
 //!
 //! Reading order: [`Record`] (what comes out), [`FastqReader`] (one file), then the two paired
 //! variants, then the two private header-splitting helpers at the bottom.
+//!
+//! # Rust mechanics used in this file
+//!
+//! `Result`, `?` and `Option` are glossed in full in `bwa_core::error` and `bwa_core::cpu`; this
+//! table covers what is new here. The two ideas worth the most attention are the trait object that
+//! hides which decompressor is in use, and the borrowed-versus-owned distinction that forces every
+//! field of [`Record`] to be copied out of the parser's buffer.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `Box<dyn FastxReader>` | a value on the heap whose exact type is not known at compile time, only the set of operations it supports (the "trait"). Here it may be a plain-file parser or a gzip-decompressing one; the code below calls `.next()` on it without caring which. `Box` is needed because the two possibilities have different sizes. |
+//! | `dyn` | marks that dispatch happens at run time, through a hidden pointer to the right implementation, rather than being resolved by the compiler. |
+//! | `impl` | a block attaching methods to a type. `FastqReader` gets three; they are called as `reader.next_batch(...)`. |
+//! | `&mut self` | the method borrows the reader exclusively and advances it. That is why reading is a mutation: position lives inside the parser, not in a returned cursor. |
+//! | `P: AsRef<Path>` | a generic parameter with a BOUND: accept any type that can be viewed as a filesystem path. It is what lets callers pass a `&str`, a `String` or a `PathBuf` without converting first. The compiler generates a version per type actually used, so this costs nothing at run time. |
+//! | `Self` | inside an `impl`, the type being implemented. `Ok(Self { inner })` builds one and wraps it in a success. |
+//! | `Self { inner }` | field shorthand: when a local variable has the same name as the field, writing it once means `inner: inner`. |
+//! | `Vec<u8>` vs `&[u8]` | owned bytes versus a borrowed window onto somebody else's. [`Record`] holds owned copies because the parser reuses one internal buffer for every record; a borrow would dangle as soon as the next read is pulled. |
+//! | `.into_owned()` | turns a maybe-borrowed value into a definitely-owned one, copying only if it was still a borrow. Used to lift text out of the parser's buffer. |
+//! | `String::from_utf8_lossy` | interprets bytes as text, substituting a replacement character for anything invalid instead of failing. Read names are not guaranteed to be valid UTF-8, and refusing a file over a stray byte in a name would be worse than mangling that one name. |
+//! | `match (a, b)` | matching on a PAIR of values at once. The paired reader uses it to handle all four end-of-file combinations of two files in one place, and the compiler checks that none is forgotten. |
+//! | `_ => ...` | the catch-all arm, here standing for "exactly one of the two files ended". |
+//! | `let Some(x) = ... else { ... }` | bind and continue, or run a block that must leave the function. Used for the two mid-pair end-of-file checks. |
+//! | `format!(...)` | builds an owned `String` from a template, `{}` marking where each argument goes. |
+//! | `.into()` | converts into whatever the surrounding code needs, here a string literal into the owned `String` the error variant carries. |
+//! | `.iter().position(...)` | walks and returns the index of the first element passing a test, or `None`. |
+//! | `u8::is_ascii_whitespace` | a method passed BY NAME as the test, instead of writing `\|c\| c.is_ascii_whitespace()`. Identical meaning, shorter. |
+//! | `&id[a..b]`, `&id[a..]` | a slice of an existing buffer, with no copy. An omitted bound means "to the end". |
 
 use bwa_core::{Error, Result};
 use needletail::{parse_fastx_file, FastxReader};
@@ -76,6 +104,14 @@ impl FastqReader {
     ///   FASTA; the format and the compression are both sniffed by needletail, not from the
     ///   extension. Must exist and be readable, otherwise [`Error::Fastq`] is returned.
     pub fn from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        // needletail opens the file, sniffs its magic bytes, and hands back whichever parser fits:
+        // plain or gzip-decompressing. Which one it is never appears in the types below, because
+        // `Box<dyn FastxReader>` describes only what the parser can DO.
+        //
+        // Rust: `.map_err(...)` rewrites the error inside a `Result` while leaving a success
+        // untouched, here translating needletail's error type into ours. The `?` then propagates
+        // that translated failure to our caller. Without the `map_err` the `?` would not compile,
+        // since there is no automatic conversion between the two error types.
         let inner = parse_fastx_file(path).map_err(|e| Error::Fastq(e.to_string()))?;
         Ok(Self { inner })
     }
@@ -100,6 +136,12 @@ impl FastqReader {
                 let comment = comment_from_id(rec.id());
                 // FASTQ line 2 (bases) and line 4 (Phred+33), both owned copies. `qual` is `None`
                 // for FASTA input, where lines 3 and 4 do not exist.
+                //
+                // Rust: this is where the borrowed-to-owned copy happens, and it is not optional.
+                // `.into_owned()` and `.to_vec()` each allocate a fresh buffer, because `rec` is a
+                // window onto memory needletail will overwrite on the next call. `.map(...)` on the
+                // quality applies the copy only when there is one, leaving `None` alone, which is
+                // how FASTA input (no quality line at all) passes through untouched.
                 let seq = rec.seq().into_owned();
                 let qual = rec.qual().map(<[u8]>::to_vec);
                 Ok(Some(Record {
@@ -197,6 +239,10 @@ impl PairedFastqReader {
         let mut batch = Vec::new();
         let mut bases_so_far = 0usize;
         while bases_so_far < k_batch {
+            // Rust: both files are advanced, then the PAIR of answers is matched at once. The three
+            // arms below cover all four combinations, and the compiler refuses the code if one is
+            // left out. That exhaustiveness is what guarantees the "one file ran out early" case
+            // cannot be forgotten, which is the case that would otherwise emit mis-mated records.
             match (self.r1.next_record()?, self.r2.next_record()?) {
                 // Both files yielded: `mate1` is the R1 read, `mate2` the R2 read of one fragment.
                 // They are paired by POSITION; their names are not compared here.
@@ -304,6 +350,10 @@ impl InterleavedFastqReader {
 fn comment_from_id(id: &[u8]) -> Option<String> {
     // Byte offset of the first whitespace, i.e. one past the end of the QNAME field. `?` returns
     // `None` for a bare-name header, which has no comment by definition.
+    //
+    // Rust: `.position(...)` walks until the test passes and yields that index, or `None` if it
+    // never does. The method is passed by name rather than wrapped in a closure. The trailing `?`
+    // turns "no whitespace anywhere" into an immediate `None` return from this function.
     let first_space = id.iter().position(u8::is_ascii_whitespace)?;
     // The tail starting AT that whitespace, so offsets found in it are relative to `first_space`.
     let after_name = &id[first_space..];
@@ -311,10 +361,18 @@ fn comment_from_id(id: &[u8]) -> Option<String> {
     // whitespace and so carries no comment.
     // Absolute offset into `id` of the comment's first non-whitespace byte; everything from there
     // to the end of the line, whitespace included, is the comment.
+    //
+    // Rust: the `.map(...)` in the middle is a coordinate fix, not a search. `.position` measured
+    // from the start of `after_name`, but the slice on the next line indexes into `id`, so the two
+    // origins have to be reconciled. Getting this wrong would silently truncate every comment by
+    // the length of the read name. The `?` after it returns `None` for a header that was nothing
+    // but trailing whitespace.
     let comment_start = after_name
         .iter()
         .position(|c| !c.is_ascii_whitespace())
         .map(|offset| first_space + offset)?;
+    // Copy the tail out as owned text. `from_utf8_lossy` tolerates invalid bytes rather than
+    // rejecting the record, and `.into_owned()` makes the result independent of `id`.
     Some(String::from_utf8_lossy(&id[comment_start..]).into_owned())
 }
 
@@ -338,11 +396,19 @@ fn comment_from_id(id: &[u8]) -> Option<String> {
 fn qname_from_id(id: &[u8]) -> String {
     // One past the last QNAME byte: the first whitespace, or the whole slice for a bare-name
     // header (which is the common case for simulated reads).
+    //
+    // Rust: `.unwrap_or(v)` supplies a fallback when the search found nothing, so "no whitespace"
+    // becomes "the name runs to the end of the line" instead of an error. This is the common case
+    // for simulated reads, not an edge case.
     let name_end = id
         .iter()
         .position(u8::is_ascii_whitespace)
         .unwrap_or(id.len());
     // The QNAME candidate, narrowed by the read-number trim below before being copied out.
+    //
+    // Rust: `mut` here makes the BORROW re-pointable, not the bytes writable. The line below can
+    // therefore aim `name` at a shorter window of the same buffer, and `id` itself is never
+    // modified. No copy happens until the `from_utf8_lossy` at the end.
     let mut name = &id[..name_end];
     // Trailing `/<digit>` (bwa's `trim_readno`). READNO_SUFFIX_LEN is the `/` plus the digit.
     if name.len() > READNO_SUFFIX_LEN

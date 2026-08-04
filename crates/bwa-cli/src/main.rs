@@ -6,6 +6,17 @@
 //! bytes. See [`cmd_mem::MemArgs`] for the option surface and the three bwa options not carried
 //! over.
 
+//! # Rust mechanics used in this file
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `main.rs` | by convention the EXECUTABLE's entry point, as opposed to `lib.rs`, which is a library's root. This is the function the operating system starts. |
+//! | `#[derive(Parser)]` | generates a whole command-line parser from a struct definition, using the `clap` crate. The fields become options and the doc comments become the help text, so the declaration and the documentation cannot drift apart. |
+//! | `#[derive(Subcommand)]` | the same for an enum, where each variant is one subcommand (`index`, `mem`). |
+//! | `#[global_allocator]` | designates which allocator the whole program uses for every heap allocation. Declaring one replaces the system default process-wide, including inside dependencies. |
+//! | `static GLOBAL: ... = ...;` | a single value existing for the program's whole run. Here it is the allocator itself. |
+//! | `use a::{B, C};` | imports two names from one module, so they can be written unqualified below. |
+
 use clap::{Parser, Subcommand};
 
 // mimalloc as the global allocator: the pipeline makes many small short-lived allocations (per-job
@@ -54,7 +65,7 @@ enum Cmd {
     // No payload. Exists purely because `bwa-mem2 version` is a SUBCOMMAND, not a flag, and a
     // drop-in replacement that only answers `--version` breaks any script that calls the former.
     // It prints the bare version and nothing else, as bwa-mem2 does ("2.3"), so a caller can use it
-    // unquoted; `--version` keeps clap's "bwa-mem4 4.3.0" form for humans.
+    // unquoted; `--version` keeps clap's "bwa-mem4 4.3.1" form for humans.
     /// Print the version number, as `bwa-mem2 version` does.
     Version,
 }

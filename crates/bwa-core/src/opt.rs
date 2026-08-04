@@ -51,6 +51,32 @@
 //! Reading order: the [`flags`] module (behaviour bits), then [`MemOpt`] (every tunable, grouped as
 //! in the four stages above), then [`MemOpt::fill_scmat`] (the one derived field, and the ordering
 //! rule that governs it).
+//!
+//! # Rust mechanics used in this file
+//!
+//! Structurally this file is simple: a bag of named settings plus the code that computes their
+//! defaults. Most of its length is documentation of what each setting MEANS, which is biology, not
+//! language. The table below covers the language part.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `struct` | a record with named fields, like a C struct. [`MemOpt`] is one field per command-line option, so the whole configuration travels as a single value. |
+//! | `pub mod name { ... }` | a module declared inline, in braces, rather than in its own file. Used for [`flags`] so the bit constants get their own namespace (`flags::PE`) without a separate file. |
+//! | `i32`, `f32`, `f64` | a 32-bit signed integer, and single- and double-precision floats. The widths are chosen to match the C's `mem_opt_t` field for field, because divergence in a width would change results at the edges. |
+//! | `i8` | a signed 8-bit integer, range -128 to 127. The scoring matrix uses it because the C does (`int8_t mat[25]`), including the fact that extreme scores wrap rather than saturate. |
+//! | `[i8; 25]` | a fixed array of 25 such values. The length is part of the type, so a matrix of the wrong size will not compile. |
+//! | `0x2`, `1 << 30` | hexadecimal and bit-shift notation for integer literals. The flag constants are single bits, so hexadecimal shows at a glance which bit each one is. |
+//! | `10_000_000` | underscores as digit separators. They are ignored by the compiler and exist purely so a reader can see the magnitude. |
+//! | `#[derive(Debug, Clone)]` | asks the compiler to generate two capabilities: `Debug` prints the struct for developers, `Clone` makes an explicit copy. `Clone` is needed because Rust does not copy a struct like this implicitly; a copy must be asked for by name. |
+//! | `impl Default for MemOpt` | supplies the "no arguments given" value. `MemOpt::default()` then returns it. This is the port of the C's `mem_opt_init()`. |
+//! | `impl MemOpt { ... }` | a block attaching methods to the type. A method's first parameter is the value it is called on. |
+//! | `&mut self` | that first parameter, borrowed exclusively: the method modifies the value in place and returns nothing. |
+//! | `Self` | inside such a block, a shorthand for the type being implemented. |
+//! | `&mut [i8; 25]` | an exclusive borrow of an array, passed to a free function so it can be written in place without copying it in and back out. |
+//! | `for x in 0..4` | loops over 0, 1, 2, 3. The range is half-open: the upper bound is excluded. |
+//! | `for _ in 0..n` | the same, when the counter itself is not used. `_` is the "deliberately unnamed" placeholder. |
+//! | `as i8` | a narrowing cast, which TRUNCATES rather than erroring on overflow. That is deliberate here: the C does the same, so preserving the wrap preserves parity. |
+//! | `50.0f64.ln()` | a suffixed float literal (`f64`) with a method called on it directly. `.ln()` is the natural logarithm. |
 
 /// `MemOpt::flag` bits, mirroring bwa-mem2's `MEM_F_*` (`reference/bwa-mem2/src/bwamem.h:62-73`).
 ///
@@ -354,6 +380,11 @@ impl Default for MemOpt {
             mask_level_redun: 0.95,
             mapq_coef_len: 50.0,
             // (int)log(50) = 3, matching bwa-mem2's integer `mapQ_coef_fac`.
+            //
+            // Rust: the double cast is the point, not clutter. `ln()` gives 3.912; `as i32`
+            // TRUNCATES it to 3; `as f64` widens that 3 back to a float for storage. Casting
+            // straight to `f64` would keep 3.912 and quietly change every MAPQ this binary emits.
+            // The C's `(int)` truncation is reproduced deliberately.
             mapq_coef_fac: (50.0f64.ln() as i32) as f64,
             max_ins: 10000,
             max_matesw: 50,
@@ -386,6 +417,10 @@ impl MemOpt {
     ///   the whole subject of the paragraph above. No other field is touched, so calling this twice
     ///   in a row is harmless (it is idempotent for a fixed `a`/`b`).
     pub fn fill_scmat(&mut self) {
+        // Rust: two of `self`'s own fields are read by value while a third is borrowed exclusively
+        // for writing, all in one call. The compiler checks that the borrowed field and the read
+        // fields are distinct; had `mat` been passed alongside a second borrow of `self`, this line
+        // would not compile. That check is what makes in-place mutation safe to do casually here.
         fill_scmat(self.a, self.b, &mut self.mat);
     }
 }
@@ -419,6 +454,12 @@ fn fill_scmat(a: i32, b: i32, mat: &mut [i8; 25]) {
     for read_base in 0..4 {
         // Columns 0..=3 of this row: this base scored against each of the four real bases.
         for ref_base in 0..4 {
+            // Same base: reward. Different bases: penalty, negated HERE because `b` is stored as a
+            // positive magnitude everywhere else in the struct.
+            //
+            // Rust: `if`/`else` in value position again, each branch supplying an `i8`. Note
+            // `-(b as i8)`: the cast happens first, then the negation, so a `b` above 127 wraps
+            // exactly as the C's `int8_t` does rather than being caught.
             mat[cell] = if read_base == ref_base {
                 a as i8
             } else {

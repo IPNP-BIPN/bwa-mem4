@@ -62,6 +62,48 @@
 //! | `seedcov`  | How many of the region's bases are backed by exact seed matches.                |
 //! | `frac_rep` | Fraction of the region's seeds landing in repetitive reference.                 |
 //! | `H0_`      | bwa's -99 sentinel for "this bound was never set" (here [`H0_SENTINEL`]).       |
+//!
+//! # Rust mechanics used in this crate
+//!
+//! This crate has no `unsafe` at all and allocates nothing exotic. What it does have is a hard
+//! constraint that shapes every type decision in it: the output must be byte-identical to a C
+//! program, which means Rust's freedom to reorder, to choose a different numeric width, or to sort
+//! differently is a LIABILITY here, not a feature. Most of what follows is about giving that freedom
+//! up on purpose.
+//!
+//! **Sorting is the sharpest example.** Rust offers `sort` (stable, allocates) and `sort_unstable`
+//! (faster, may reorder equal elements). They are not interchangeable in this crate, and the choice
+//! at each call site is load-bearing:
+//!
+//! * `sort_unstable` is correct only where the comparison key is TOTAL, meaning no two distinct
+//!   elements ever compare equal. Where the C sorts on a key that can tie, using it would let the
+//!   tied records come out in a different order than the C's `qsort` produced, and the SAM would
+//!   differ on exactly those reads.
+//! * `sort_by_key(..)` with `std::cmp::Reverse(k)` is how a descending sort is expressed without
+//!   negating the key, which matters because negating an `i32` key is not order-preserving at
+//!   `i32::MIN`.
+//! * Where the C's sort is `ks_introsort` and its permutation of tied elements is observable in the
+//!   output, neither of Rust's sorts will do, because "some order" is not the same as "the C's
+//!   order". Those sites call [`bwa_chain::ks_introsort_by`], a port of the C's own algorithm, and
+//!   the ties themselves are broken by a reproduced Thomas Wang hash of the global read id
+//!   ([`primary::hash_64`]) so the result cannot depend on thread count or batch boundaries. This is
+//!   where parity investigations usually start.
+//!
+//! **Floating point is the second.** MAPQ and the pairing scores go through `f64`, and the width is
+//! not incidental: an `f32` intermediate would round differently and flip a MAPQ on a small number
+//! of reads. Where the C computes in `double`, this code computes in `f64` and says so at the site.
+//!
+//! | Construct | What it means, and why it is here |
+//! |-----------|-----------------------------------|
+//! | `Option<T>` | a value that may be absent, with the absence visible in the type. It replaces the C's sentinel-pointer and out-of-band-integer idioms, except where the SENTINEL ITSELF is part of the format, as with `H0_SENTINEL` (-99), which is kept as a number because the C's later tests compare against it. |
+//! | `Option<(i32, i32)>` returns | "either this merge happened and here are its two numbers, or it did not". The C signals the same thing with a return code plus out-parameters; the tuple makes it impossible to read the numbers when the answer was "no". |
+//! | `[Option<Orient>; 4]` + `.flatten()` | a fixed four-slot array indexed by orientation, iterated skipping the empty slots. `flatten()` yields the present entries in ASCENDING index order, which is the property that makes the rescue order match the C's loop. |
+//! | `pub struct PairRescueData<'a>` | a bundle of borrowed slices handed to the batched rescue path. The `'a` lifetime says it may not outlive the batch it points into, so the batched path cannot accidentally retain a view of a recycled buffer. Nothing is copied to build it. |
+//! | `&mut Vec<MemAlnReg>` parameters | the pipeline stages mutate the caller's region list in place, exactly as the C does, rather than returning a new vector per stage. The exclusive borrow is what makes "this stage owns the list for its duration" a compile-time fact. |
+//! | `Vec<u32>` for a CIGAR | one packed `len << 4 \| op` per operation, the same encoding SAM's BAM form uses and the same the C keeps. Not a vector of structs, because the packing is part of the interface to the writer. |
+//! | `#[derive(Debug, Clone, Copy)]` on the small records | `Copy` on [`pe::PeStat`] and friends because they are a handful of numbers; the big region and alignment structs deliberately do NOT get `Copy`, so that passing one around is a visible move or an explicit clone. |
+//! | `impl Default for PeStat` | a hand-written default rather than a derive, because "no statistics yet" has bwa-specific values that are not the all-zeros a derive would produce. |
+//! | shadowing (`let re = ..` inside a block) | Rust allows a name to be rebound in an inner scope. `across.rs` does this where the C reuses a variable for a different meaning, and every such site is flagged, because a reader diffing against the C needs to know which `re` is meant. |
 
 use crate::across::RegMeta;
 use bwa_chain::{build_chains, mem_chain_flt, MemChain};

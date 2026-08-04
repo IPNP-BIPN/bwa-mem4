@@ -9,6 +9,52 @@
 //! `bench_batch` example measures the speedup (~1.4x on mixed lengths, ~2.1x when lengths are
 //! uniform, over the scalar per-lane loop).
 //!
+//! # Rust mechanics used in this crate
+//!
+//! This crate is where the tree's SIMD lives, so it is the one place where `unsafe` appears for a
+//! reason other than talking to the operating system. Four language features carry the whole design,
+//! and they are worth understanding together because each one covers a hole the others leave.
+//!
+//! **`#[cfg(target_arch = ..)]`** decides at COMPILE time which code exists at all. The NEON kernels
+//! are compiled only into an aarch64 binary, the AVX2 ones only into an x86_64 binary. Code behind a
+//! false `cfg` is not compiled, not type-checked against this target's intrinsics, and cannot be
+//! called; that is what lets one source tree carry two instruction sets without either one having to
+//! pretend to exist on the other.
+//!
+//! **`is_aarch64_feature_detected!` / `is_x86_feature_detected!`** decide at RUN time whether the
+//! CPU actually has the feature the compiled code needs. A binary built for aarch64 may still run on
+//! a chip lacking a given extension, and executing an instruction the silicon does not implement is
+//! a crash, not a wrong answer. The detection macro is therefore the gate every kernel call sits
+//! behind, and the scalar path is what runs when it says no.
+//!
+//! **`#[target_feature(enable = "neon")]`** tells the compiler it may emit that instruction set
+//! inside one function. A function carrying it is `unsafe` for exactly the reason above: calling it
+//! on a CPU without the feature is undefined behaviour. So the obligation is "the caller has run the
+//! detection macro", each call site discharges it in an `unsafe` block with a `SAFETY` note naming
+//! the check, and the detection happens once per dispatch rather than once per job.
+//!
+//! **`macro_rules! define_sw_kernel`** writes the kernel body once and instantiates it per
+//! (instruction set, lane width): NEON u8 x16 and i16 x8, AVX2 u8 x32 and i16 x16. This is textual
+//! generation rather than generics because the operations are intrinsics with different names and
+//! signatures per ISA, which no trait bound describes. The point is not brevity: four hand-written
+//! copies of an affine-gap recurrence would drift, and a drifted lane produces a wrong alignment on
+//! some fraction of reads rather than a compile error. One macro means one recurrence.
+//!
+//! The remaining safety obligation is numeric, not architectural, and it is worth stating plainly
+//! because it is what makes byte-identity survive vectorisation. The u8 kernels are chosen only when
+//! a job's own bound proves every DP value fits in a `u8` (`minval = h0 + min(len) * a < 256`), and
+//! the i16 kernels when it fits an `i16`. Inside those bounds the vector arithmetic is EXACT, not
+//! approximate, so a lane computes the same integers the scalar kernel would, and the batched result
+//! is identical by construction rather than by tolerance. Jobs that exceed both bounds fall to
+//! scalar. The equivalence is enforced by a test gate ([`bwa_extend::assert_backend_batch_matches_scalar`]),
+//! not merely asserted here.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `impl SwBackend for NeonBackend` | the crate plugs into the pipeline through a trait, so the aligner never names an instruction set. Swapping backends is a type change at one site, and the scalar implementation stays the specification. |
+//! | SoA layout `[column * LANES + lane]` | structure-of-arrays: lane `l`'s value for column `c` sits next to the other lanes' values for the same column, which is what makes one vector load fetch one column across all lanes. The array-of-structures layout a reader might expect would need a gather per step. |
+//! | `unsafe fn` for the kernels | the obligation is the caller's (feature detected, lengths within the width's bound), which is why each is documented with what it requires rather than being wrapped in a safe function that could not check it. |
+//!
 //! # Design (following bwa-mem2 `bandedSWA` and nh13's `fg-labs/bwa-mem3`, credited in `DEPENDENCIES.md`)
 //!
 //! bwa-mem2 / bwa-mem4-cpp accelerate seed extension by **inter-sequence batching**: `bandedSWA`

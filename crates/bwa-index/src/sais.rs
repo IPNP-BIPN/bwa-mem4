@@ -58,6 +58,26 @@
 //! INVARIANT shared by both: the input must be terminated by a symbol that is strictly smaller than
 //! every other symbol and occurs exactly once. Both arrange this by mapping input bytes to `b + 1`
 //! and appending a `0`. Without it the induction has no anchor and the result is silently wrong.
+//!
+//! # Rust mechanics used in this file
+//!
+//! The clear implementation is ordinary Rust: vectors of `usize`, slices passed by reference. The
+//! in-place one is where the language starts doing real work, and all of it is in service of one
+//! goal, never allocating a second array the size of the genome. Nothing below uses `unsafe`; the
+//! memory saving comes from types, not from switching the compiler off.
+//!
+//! | Construct | What it means, and why it is here |
+//! |-----------|-----------------------------------|
+//! | `&[usize]` vs `Vec<usize>` | a slice BORROWS someone else's elements; a `Vec` OWNS them. Helpers take `&[..]` so a caller can hand them a whole vector, part of one, or a region of the output array, with no copy and no question of who frees it. |
+//! | `&mut [i64]` | an exclusive borrow: while it exists, no other path may read or write those elements. This is what makes the induction scans safe to write as plain indexing, and it is checked at compile time, so it costs nothing at run time. |
+//! | `sa.split_at_mut(k)` | splits one exclusive borrow into two that cannot overlap. The recursion needs to read the reduced string out of the SA array's tail while writing the sub-answer into its head. Without this the borrow checker would reject the aliasing, and the alternative would be a second allocation, which is exactly what this variant exists to avoid. |
+//! | `trait IntStr` | the recursion has to run over two different things: the raw byte reference at the top level, and an `i64` slice packed inside the SA array at every level below. A trait lets both answer `get(i)` and `len()`, so ONE copy of the algorithm serves both. |
+//! | `fn sais_rec<S: IntStr>(..)` | a generic function. The compiler emits a separate specialised copy per concrete `S`, so `s.get(i)` compiles down to the byte load or the slice load directly, with no indirect call. Same code to read, no dispatch cost. |
+//! | `struct ByteStr<'a>(&'a [u8])` | a newtype wrapping a borrowed slice. The `'a` is the lifetime: it records that a `ByteStr` may not outlive the text it points at. This is how the top level presents the genome as a `b+1`-shifted, sentinel-terminated string WITHOUT materialising one, since `get` synthesises the shift and the trailing zero on the fly. |
+//! | `struct TypeBits(Vec<u64>)` | another newtype, hiding a hand-rolled bitset behind `set_s` / `is_s` / `is_lms`. One bit per position instead of the byte a `Vec<bool>` would spend, which is about 5.4 GB on a human reference. Methods are `#[inline]`, so the shifting and masking is what actually lands in the loop. |
+//! | `#[inline]` | a hint that the body should be pasted into the caller. It matters on the one-line accessors above precisely because they sit in the innermost loops. |
+//! | `as i64` / `as usize` casts | positions are stored as `i64` so `-1` can mean "slot empty", but indexing requires `usize`. The casts are the seam between those two roles, and they are deliberate rather than incidental: a value only gets cast back to `usize` after it has been checked non-negative. |
+//! | `.into_iter().map(..).collect()` | consumes a vector and builds another of a different element type, reusing nothing. Fine in `suffix_array_with_sentinel`, whose whole purpose is clarity, and precisely what `suffix_array_inplace` refuses to do. |
 
 /// "No suffix placed here yet" marker for the `usize` implementation. Distinguishable from a real
 /// position because a position is always `< n`.
@@ -458,6 +478,12 @@ const IEMPTY: i64 = -1;
 /// Field 0 is the bit storage: bit `i` (word `i >> 6`, bit `i & 63`) is 1 iff TEXT POSITION `i` is
 /// S-type, 0 for L-type. Sized to cover `0..n`; bits past `n` in the final word stay zero and are
 /// never read.
+// Rust: `struct TypeBits(Vec<u64>)` is a tuple struct, or newtype: a distinct type that wraps one
+// value and adds nothing at run time. The point is not encapsulation for its own sake. A bare
+// `Vec<u64>` would let any caller index words directly and get the bit arithmetic wrong; wrapping it
+// means the only ways in are `set_s`, `is_s` and `is_lms`, so the `i >> 6` / `i & 63` split is
+// written once. `.0` names the wrapped field, and since the type has no other state it occupies
+// exactly as much memory as the vector it holds.
 struct TypeBits(Vec<u64>);
 impl TypeBits {
     /// Allocate a bitvector covering positions `0..n`, all initially L-type (zero).
@@ -497,6 +523,17 @@ impl TypeBits {
 
 /// Read-only integer string for SA-IS. Implemented for the byte reference at the top level (no i64
 /// copy of the input) and for an i64 slice (the reduced sub-problem packed inside the SA array).
+// Rust: a trait is a set of operations a type promises to provide, and `sais_rec` is written against
+// this one instead of against a concrete array type. Two very different things need to look like "a
+// string of integers" here: the genome itself, which is bytes on the way in and must never be copied
+// into i64s, and the reduced string of LMS names, which is already i64 and already lives inside the
+// output array. Both implement `get`/`len`, so one recursion serves both.
+//
+// The cost of this abstraction is zero. Because `sais_rec` is generic (`<S: IntStr>`) rather than
+// taking a `&dyn IntStr`, the compiler produces one specialised copy of the function per concrete
+// type and inlines the accessor into the loop. A `dyn` version would be one copy of the code with an
+// indirect call per character read, which in the innermost loop of index construction is exactly
+// where it would hurt.
 trait IntStr {
     /// The CHARACTER at TEXT POSITION `i` (`i` must be `< len()`). Always non-negative and less
     /// than the `alphabet_size` passed alongside the string.
@@ -510,6 +547,11 @@ trait IntStr {
 /// Field 0 is the raw text, borrowed and never copied or modified: the `+1` shift and the trailing
 /// `0` are synthesised on the fly by the `IntStr` impl, which is what avoids an i64 copy of the
 /// whole genome.
+// Rust: `<'a>` is a lifetime parameter, and `&'a [u8]` ties the wrapper to the text it borrows. It
+// generates no code and costs no memory; it is a compile-time note that a `ByteStr` may not outlive
+// the reference slice, which is what rules out handing the recursion a view of a buffer that has
+// already been freed. `impl IntStr for ByteStr<'_>` uses `'_` because the impl does not care WHICH
+// lifetime it is, only that there is one.
 struct ByteStr<'a>(&'a [u8]);
 impl IntStr for ByteStr<'_> {
     #[inline]
@@ -835,6 +877,16 @@ fn sais_rec<S: IntStr>(s: &S, sa: &mut [i64], alphabet_size: usize) {
         // Names repeat, so the reduced string is not a permutation and its order must actually be
         // computed. `tail` IS the reduced string (read-only to the callee), `head[..n_lms]` is the
         // disjoint region its answer is written into.
+        //
+        // Rust: this line is the whole reason the in-place variant is possible. `sa` is a `&mut
+        // [i64]`, an EXCLUSIVE borrow, so it cannot simply be handed to the recursion twice, once to
+        // read the reduced string and once to write the answer. `split_at_mut` consumes that one
+        // borrow and returns two that provably cover disjoint halves, which the compiler then treats
+        // as independent. The alternative, copying the reduced string into a fresh vector, is what
+        // every textbook implementation does and what this crate cannot afford at genome scale.
+        // Note that the split point comes from the algorithm, not from convenience: `n - n_lms >=
+        // n_lms` holds because no two LMS positions are adjacent, so the head really is large enough
+        // for the answer.
         let (head, tail) = sa.split_at_mut(n - n_lms);
         sais_rec(&IntSlice(tail), &mut head[..n_lms], num_names);
     } else {

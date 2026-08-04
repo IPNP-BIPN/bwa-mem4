@@ -403,6 +403,24 @@ impl FmIndex {
         // ---- Payload: checkpoints, then the two sampled-SA arrays, then the sentinel row ------
         // Destination for the checkpoints, allocated 64-byte aligned by `CpOcc`'s `align(64)`.
         // `cp_bytes` is the BYTE length of that array in the file: cp_size * 64.
+        //
+        // Rust, for the three reads that follow, which all use the same shape. Read in plain terms:
+        // reserve the exact memory, aim the file read straight at it, then declare it filled.
+        //
+        // - `with_capacity(n)` reserves room for `n` elements without creating any. At this point
+        //   the vector's LENGTH is 0 while its capacity is `n`, so nothing may be read from it yet.
+        // - `as_mut_ptr() as *mut u8` takes the address of that reserved memory and views it as
+        //   plain bytes, which is what `read_exact` needs. `from_raw_parts_mut` wraps the address
+        //   and a byte count back into a writable slice. This is the step the compiler cannot check
+        //   (nothing in the types says the length is right), which is why it needs `unsafe` and why
+        //   the SAFETY paragraph above exists.
+        // - `set_len(n)` afterwards is the promise that all `n` elements now hold real data. It must
+        //   come after the read and never before: a vector claiming elements it does not have would
+        //   hand out uninitialised memory to safe code.
+        //
+        // The obvious alternative, reading into a `Vec<u8>` and converting afterwards, is safe and
+        // needs no `unsafe` at all. It is rejected here for one measured reason: it would hold both
+        // the bytes and the converted array at once, doubling peak memory on a 19 GB index.
         let mut cp_occ = Vec::<CpOcc>::with_capacity(cp_size);
         let cp_bytes = cp_size * std::mem::size_of::<CpOcc>();
         unsafe {

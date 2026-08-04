@@ -112,6 +112,15 @@ extern "C" {
 /// `ptr` must point to `len` bytes of memory owned by the caller and valid for the duration of the
 /// call. Nothing is read or written through it here: the pointer is passed to the kernel purely as
 /// the identity of a VMA range.
+// Rust: `unsafe fn` puts the obligation on the CALLER, and the `# Safety` section above is the
+// contract it must satisfy. Every call site therefore needs its own `unsafe` block, which is the
+// mechanism that makes the obligation visible where it is actually discharged rather than buried
+// here. Note what this function does NOT do: it never reads or writes through the pointer. It hands
+// the address and length to the kernel as the identity of a memory range, so the only thing the
+// caller really promises is that the range exists for the duration of the call.
+//
+// The `#[cfg]` pair below means this compiles to an empty function on macOS: `madvise` with
+// `MADV_HUGEPAGE` is Linux-only, and there is nothing to fall back to.
 pub unsafe fn advise_hugepage(ptr: *const u8, len: usize) {
     #[cfg(target_os = "linux")]
     {

@@ -16,6 +16,43 @@
 //! 5. [`run`]: the single-end driver, and [`run_pe`] the paired-end one.
 //! 6. [`finish_se`] and [`write_aln_se`]: which alignments become records, and the exact bytes.
 //!
+//! # Rust mechanics used in this file
+//!
+//! This is where the program's concurrency lives, so it is the densest file in the tree for
+//! language features. Three ideas carry most of it.
+//!
+//! **Scoped threads.** `std::thread::scope` starts threads that are GUARANTEED to have finished
+//! before the scope's closing brace. That guarantee is what lets those threads borrow local
+//! variables directly: the compiler can see the data outlives them. Without it, everything shared
+//! with a thread would have to be reference-counted and heap-allocated first.
+//!
+//! **Bounded channels.** A channel is a queue between threads. `sync_channel(n)` bounds it at `n`
+//! items, so a producer that outruns its consumer BLOCKS rather than growing the queue without
+//! limit. That bound is what caps how many read batches and how many finished SAM buffers exist at
+//! once, and therefore caps peak memory on a 30x whole-genome run.
+//!
+//! **Indexed parallel iteration.** `rayon`'s `.par_iter()` spreads a loop across the thread pool.
+//! The crucial property for this project is that it is INDEXED: results come back in input order,
+//! not completion order. That is why parallelism here cannot perturb the emitted bytes, and it is
+//! the reason `-t` does not appear anywhere in the output.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `std::thread::scope(\|scope\| ...)` | opens a region in which threads may be started and are all joined before it ends. |
+//! | `scope.spawn(move \|\| ...)` | starts one such thread running that closure. |
+//! | `move \|\|` | a closure that TAKES OWNERSHIP of what it mentions rather than borrowing it. Required when handing work to another thread, since a borrow could otherwise outlive its owner. |
+//! | `sync_channel::<T>(n)` | a queue of at most `n` values of type `T`, with a sender and a receiver half. |
+//! | `SyncSender<T>` / receiver | the two ends. Sending on a full queue waits; receiving on an empty one waits; the receiver ends cleanly when every sender is gone. |
+//! | `impl FnOnce(...) -> R + Send` | a parameter that is a callable, usable once, and safe to move to another thread. It is how [`run_pipeline`] takes the reader's body from its caller. |
+//! | `.par_iter()` / `.into_par_iter()` | parallel walks over a collection, borrowing or consuming it. Order-preserving. |
+//! | `.zip(...)` | walks two collections in step, pairing their elements. Used to carry a read, its encoded bases and its regions together through one parallel pass. |
+//! | `Box<dyn Write + Send>` | an output sink whose concrete type is decided at run time (stdout, a file, a compressor) and which can be moved to the writer thread. `dyn` means the choice is resolved through a pointer, which is fine here: it is one indirect call per buffer, not per read. |
+//! | `enum Output` with `impl Write` | the several output shapes gathered into one type that itself behaves as a sink, so the pipeline needs to know only "somewhere to write". |
+//! | `#[derive(Args)]` | generates the option parser from the struct below. |
+//! | `#[arg(short = 'k')]` | binds a field to a single-letter flag. The letters are bwa's, not clap's defaults, which is why `-h` and `-V` are explicitly disabled: bwa uses them for XA hits and the XR tag. |
+//! | `anyhow::Result<T>` | a `Result` whose error can be any failure carrying context. Used at this layer, while the library crates use their own precise `bwa_core::Error`. |
+//! | `?` | propagate a failure to the caller. |
+//!
 //! # Glossary
 //!
 //! Short names below mirror the C on purpose, because the correspondence is what makes this file
@@ -1457,11 +1494,21 @@ fn run_pipeline<B: Send>(
     // `-K` in bases, echoed next to the count so a log records the setting that produced it.
     k_batch: usize,
 ) -> anyhow::Result<()> {
+    // Rust: everything spawned inside this scope is guaranteed to have finished before the closing
+    // brace, and the compiler relies on that guarantee to let those threads borrow local variables
+    // directly. Without a scope, each of the reader's and writer's captures would have to be
+    // reference-counted and heap-allocated to prove it outlives the thread. The `-> Result` on the
+    // closure means the scope as a whole yields the first failure any of them reported.
     std::thread::scope(|scope| -> anyhow::Result<()> {
         // ---- Channels. A couple of batches read-ahead / write-behind is enough to hide I/O
         //      behind compute; deeper queues only cost memory (a batch is ~10M bases) ----
         // Reader -> main. Carries `(batch, base_id)`; blocks the reader once BATCH_READAHEAD
         // batches are queued, which is what bounds resident memory.
+        //
+        // Rust: `sync_channel(n)` is BOUNDED. Sending into a full queue blocks the sender until the
+        // consumer catches up, so the reader cannot run ahead of the aligner and accumulate
+        // batches. That blocking is the memory bound: at roughly 10M bases per batch, an unbounded
+        // queue would let a fast disk pull an entire whole-genome run into RAM.
         let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<(B, u64)>(BATCH_READAHEAD);
         // Main -> writer. Carries one batch's finished SAM bytes as per-record pieces, already in
         // output order; the writer concatenates them into the sink's buffer rather than into a
@@ -1472,10 +1519,19 @@ fn run_pipeline<B: Send>(
         //      touched from one thread ----
         // Join handles. Each yields the thread's `anyhow::Result`, which is the only place a reader
         // or writer error is observed, hence the joins at the end of the scope.
+        //
+        // Rust: `move` makes each closure take OWNERSHIP of what it mentions. The reader owns its
+        // sending half of the batch channel; the writer owns the output sink. Ownership is what
+        // makes the single-writer property a compile-time fact rather than a convention: no other
+        // thread can name `out` after this line, so no other thread can write to the sink.
         let reader = scope.spawn(move || read_batches(batch_tx));
         let writer = scope.spawn(move || -> anyhow::Result<()> {
             // Rebound to make the move explicit: the sink now lives on this thread and nowhere else.
             let mut out = out;
+            // Rust: a channel receiver can be walked like any other sequence. It yields each value
+            // as it arrives, blocking while the queue is empty, and ends by itself once every
+            // sender has been dropped. That is why no explicit shutdown message is needed: the loop
+            // finishes when the main thread stops sending and releases its half.
             for pieces in sam_rx {
                 // In order, so the concatenation of the pieces is exactly the batch's SAM text.
                 // `Output`'s buffering is what turns these back into few, large syscalls.

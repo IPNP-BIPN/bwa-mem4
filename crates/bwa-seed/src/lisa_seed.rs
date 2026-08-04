@@ -11,6 +11,19 @@
 //! and therefore the emitted SMEM set and the seeds derived from it — is identical to the FM path.
 //! `l` is never needed and is left at 0.
 //!
+//! # Rust mechanics used in this file
+//!
+//! This file mirrors the driver in the crate root step for step, so its language constructs are the
+//! same ones: the lockstep slot rotation, `std::mem::take`/`swap`, and the reused scratch buffers.
+//! The crate-root table glosses all of them and is the place to start.
+//!
+//! What is specific here is that the two seeding paths are kept as SEPARATE code rather than being
+//! unified behind a trait. That is deliberate, and it is a readability decision rather than a
+//! performance one: the argument for byte-identity is "this file has the same control flow as that
+//! one, with each `backward_ext` replaced by a span lookup", and that argument is checkable by
+//! diffing the two files side by side. Hiding both behind one interface would make the code shorter
+//! and the parity claim unverifiable.
+//!
 //! This is the correctness-first form (each interval is a from-scratch learned-index search). The
 //! forward phase can later narrow incrementally ([`LearnedSa::narrow`]); the backward phase re-searches
 //! (prepending does not nest in a suffix array). Byte-identity is validated against the FM path below.

@@ -3,6 +3,23 @@
 //! bwa-mem2 randomizes ambiguous (N) bases in `.pac` with `lrand48() & 3` after `srand48(11)`.
 //! Reproducing glibc's generator exactly is required for byte-identical `.pac` on references that
 //! contain N runs. (N-free references never call it.)
+//!
+//! # Rust mechanics used in this file
+//!
+//! Small file, but it shows two things the rest of the crate leans on.
+//!
+//! The first is `wrapping_mul` / `wrapping_add`. In Rust, plain `*` and `+` on integers PANIC on
+//! overflow in debug builds and wrap silently in release ones, which would make this generator
+//! behave differently depending on how the binary was compiled. The `wrapping_*` methods ask for
+//! wrapping in both, which is what C's unsigned arithmetic does unconditionally and therefore what
+//! reproducing glibc requires. Using them is a statement that the overflow is intended, not an
+//! oversight; here it is the whole point, since an LCG is defined modulo `2^48`.
+//!
+//! The second is `&mut self` on `Rand48::lrand48`. Drawing a number CHANGES the generator, and the
+//! signature says so: the caller must hold the generator exclusively to draw from it. That is not
+//! ceremony. Byte-identity depends on the ORDER of draws, so two threads sharing one generator would
+//! produce a different `.pac` run to run, and the type system refuses to let that compile. The state
+//! field is private for the same reason: nothing outside may peek at it or rewind it.
 
 /// The 48-bit LCG state, matching glibc's `drand48` family.
 pub struct Rand48 {

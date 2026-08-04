@@ -81,6 +81,35 @@
 //! | `max_off` | furthest excursion of the DP optimum from the main diagonal; drives acceptance test 2. |
 //! | `lim` | in the discard pass: how many surviving regions this read has produced so far, which bounds the containment scan. |
 
+//! # Rust mechanics used in this file
+//!
+//! This is the batching layer, so its Rust is about one question: how do you take work belonging to
+//! many different reads, reorder it for the SIMD kernel, and put every answer back in the right
+//! place, without copying the reads and without the compiler losing track of who owns what.
+//!
+//! **Back-pointers instead of references.** `SideJob` carries `read: usize` and `reg: usize`, plain
+//! indices into the batch's outer vectors, where a C port might have kept a pointer to the region.
+//! Indices are used deliberately: the job array gets SORTED by length before it reaches the kernel,
+//! and a reference into a vector that is simultaneously being mutated is precisely what Rust forbids.
+//! Indices survive the sort, cost nothing, and make the scatter step trivially correct.
+//!
+//! **Sorting for lanes, not for order.** `sort_by_key(|&k| std::cmp::Reverse(len))` sorts descending
+//! without negating the key, which matters because negation is not order-preserving at `i32::MIN`.
+//! The sort is allowed to be arbitrary among equal lengths precisely because it is NOT
+//! output-observable: each job's result depends only on its own `(query, target, h0, w)`, so any
+//! permutation produces the same regions. That is the argument the whole batching design rests on,
+//! and it is why this file may use a standard sort where `primary.rs` may not.
+//!
+//! **Inline bytes rather than arena offsets.** The C's `SeqPair` stores `(idq, idr, len1, len2)`
+//! offsets into shared arenas; `SideJob` owns its query and target bytes. The trade is a copy per job
+//! against never having to reason about whether an arena outlived its indices, and at these sizes the
+//! copy does not show up in the profile.
+//!
+//! **Shadowing is flagged, not silent.** Inside the right-extension block a local `re` means an
+//! offset into `rseq`, not the region end that `re` means everywhere else in the crate. Rust allows
+//! that rebinding; a reader diffing this against `bwamem.cpp` would be misled by it, so every such
+//! site says so in a comment.
+
 use crate::{cal_max_gap, MemAlnReg, H0_SENTINEL, MAX_BAND_TRY};
 use bwa_chain::{build_chains_from_smems, mem_chain_flt, MemChain};
 use bwa_core::MemOpt;

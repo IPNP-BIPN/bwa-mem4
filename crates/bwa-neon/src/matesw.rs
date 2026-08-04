@@ -11,6 +11,23 @@
 //! [`bwa_extend::ksw_align2`] on that job. The scalar per-job loop is the portable fallback and the
 //! source of truth the NEON kernels are validated against (`matesw_equals_scalar`).
 //!
+//! # Rust mechanics used in this file
+//!
+//! Same machinery as [`crate::batched`] (see the crate note for `cfg` / feature detection /
+//! `target_feature` / the kernel macro), with one addition that is worth calling out because it is a
+//! precondition rather than a bound.
+//!
+//! `mat_is_standard(m, mat)` is checked BEFORE the vector path is taken. The scoring matrix is
+//! supplied by the caller, and the SIMD kernels hard-code the standard bwa matrix's shape into their
+//! arithmetic; on any other matrix the vector result would be wrong rather than merely slow. So the
+//! dispatch is a conjunction: the ISA is present AND the matrix is the one the kernels assume. Fail
+//! either and the scalar per-job loop runs, which is also the source of truth the kernels are
+//! validated against (`matesw_equals_scalar`).
+//!
+//! The rest reads as it does in the sibling file: jobs are length-sorted so lanes finish together,
+//! results are scattered back into input order, and every `unsafe` call carries a `SAFETY` note
+//! naming both the detected feature and the width bound that keeps the lane arithmetic exact.
+//!
 //! # How this differs from [`crate::batched`], and why that is not an inconsistency
 //!
 //! Both files run affine-gap Smith-Waterman, but they port *different* C functions and the

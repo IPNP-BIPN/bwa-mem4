@@ -54,6 +54,29 @@
 //! | `min_l` | the shorter of two regions' query lengths |
 //! | `q_s` / `r_s` | in `mem_patch_reg`, the merged score predicted from query spans / from reference spans |
 
+//! # Rust mechanics used in this file
+//!
+//! Two things in this file exist BECAUSE of Rust, in the sense that the obvious Rust would have been
+//! wrong, and one because of the C.
+//!
+//! **The sort is a port, not a call.** `ks_introsort_by` is bwa's own introsort, reimplemented rather
+//! than replaced by `sort_by` or `sort_unstable_by`. Rust's sorts are correct sorts; they are simply
+//! not THIS sort. The dedup pass keys on `re` alone, so equal keys are common, and which of two tied
+//! regions ends up first is visible in the SAM. Using a standard sort would produce a valid ordering
+//! and a different output file, which for this project is the same as being broken.
+//!
+//! **The tie-break is a reproduced hash.** `hash_64` is Thomas Wang's mixer, fed `id + i` where `id`
+//! is the GLOBAL read index, never a batch-local one. That choice is what makes the output
+//! independent of thread count and of where batch boundaries happen to fall: any other mixing
+//! function would be an equally good hash and a different SAM.
+//!
+//! **The merge returns `Option<(i32, i32)>`.** The C signals "regions merged" with a return code and
+//! writes the resulting score and band width through out-parameters. Here the two numbers only exist
+//! inside the `Some`, so there is no state in which the caller can read a score that was never
+//! computed. `std::mem::take` appears for the same reason elsewhere in the crate: it moves a vector
+//! out and leaves an empty one behind, which is how a stage rebuilds its input in place without
+//! cloning it or leaving a half-valid value visible.
+
 use bwa_chain::ks_introsort_by;
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};

@@ -49,6 +49,42 @@
 //! mask per base would cost more than the extra 4.6 GB of address space (it is memory-mapped, see
 //! `fmindex::FmIndex::load`).
 
+//! # Rust mechanics used in this file
+//!
+//! Index construction is the one place in the tree that is both memory-bound and embarrassingly
+//! parallel, so this file is mostly about two things: rayon, and getting rid of large allocations
+//! the moment they stop being needed.
+//!
+//! **Parallelism.** Every parallel loop here is a rayon iterator, and each one is race-free by
+//! CONSTRUCTION rather than by locking:
+//!
+//! * `par_iter_mut()` hands each thread an exclusive borrow of distinct elements. Two threads cannot
+//!   receive the same slot, so `*dst = ...` needs no synchronisation.
+//! * `split_at_mut(L)` (used to fill the reverse-complement half of `bref` while reading the forward
+//!   half) splits one exclusive borrow into two non-overlapping ones. This is what makes "read from
+//!   the front, write to the back, in parallel" expressible at all; without it the borrow checker
+//!   would reject the aliasing and the code would need a second buffer.
+//! * `.zip(other.par_iter())` walks two arrays in lockstep in parallel, pairing element `i` with
+//!   element `i`. Output order is fixed by INDEX, never by which thread finishes first, which is the
+//!   property byte-identity depends on.
+//! * `into_par_iter()` consumes a collection in parallel rather than borrowing it.
+//!
+//! None of this uses `unsafe`, and none of it uses a mutex. That is the point: the safety argument
+//! is "the splits are disjoint", and rayon's API is what makes the compiler check it.
+//!
+//! **Memory.** `drop(forward)` appears in the middle of a function, which is unusual enough to
+//! explain. A value normally lives until the end of its scope; `drop` frees it early, on purpose,
+//! because the next step allocates the suffix array and holding both at once would add about 3 GB of
+//! peak RSS on a human reference. Peak, not total, is the number that decides whether the indexer
+//! runs on a given machine.
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `File::create(..).and_then(|f| BufWriter::new(f).write_all(..))?` | `BufWriter` batches many small writes into one syscall each; `and_then` chains the two fallible steps; `?` propagates either failure. Writing the `.pac` byte by byte unbuffered would be dominated by syscall overhead. |
+//! | `OsString` | a filename as the operating system represents it, which is not guaranteed to be valid UTF-8. Used to append extensions to the index prefix without assuming the user's path is text. |
+//! | `write!` / `writeln!` to a `BufWriter` | formatted output whose exact spacing has to match the C's `printf`. The macros are the formatting layer; the byte-identity traps they hide are documented at each call site. |
+//! | `&[u8]` parameters everywhere | the big arrays are passed as borrowed slices, so no stage copies the genome to hand it to the next one. |
+
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufWriter, Write};

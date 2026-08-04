@@ -30,6 +30,24 @@
 //!
 //! Reading order: [`Rec`] (what is compared), [`parse_primary`] (SAM in, keyed map out), then
 //! [`compare`] (two maps in, [`Report`] out). The binary `sam_diff` is a thin argv wrapper.
+//!
+//! # Rust mechanics used in this file
+//!
+//! | Construct | What it means |
+//! |-----------|---------------|
+//! | `HashMap<String, Rec>` | a lookup table from an owned key to an owned value. Unordered by design, which is exactly why this tool is order-insensitive and therefore cannot substitute for the byte gate. |
+//! | `#[derive(Serialize)]` | generates the code that turns a value into JSON. From the `serde` crate; the field names in the output are the field names below, so renaming a field changes the report format. |
+//! | `#[derive(PartialEq)]` | generates `==` for the type, comparing every field. It is what lets two [`Rec`]s be compared in one operation instead of field by field, and it is why adding a field silently widens what "the records agree" means. |
+//! | `#[derive(Clone)]` | permits an explicit copy. Rust never duplicates a struct implicitly. |
+//! | `&Path` | a borrowed filesystem path. Read-only, no copy. |
+//! | `std::io::Result<T>` | succeeds with `T`, or fails with an I/O error. |
+//! | `.lines()` | walks a block of text one line at a time, borrowing rather than allocating. |
+//! | `.split('\t')` | walks the tab-separated columns of a line, one `.next()` per column. Because each call consumes the NEXT column, the order of the bindings below IS the column order and cannot be rearranged. |
+//! | `.unwrap_or(v)` | supply a fallback when there is no value. Used at every column so a truncated line yields a degraded record rather than aborting the whole diagnostic. |
+//! | `.parse()` | text to number, returning a `Result`. Paired with `.unwrap_or(0)` here for the same reason. |
+//! | `flag & BIT != 0` | a bit test: true when that one bit is set. `&` is bitwise AND, not a borrow, in this position. |
+//! | `continue` | skip to the next iteration of the loop. |
+//! | `u32`, `i64` | unsigned 32-bit and signed 64-bit integers. Widths follow what SAM can hold. |
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -188,11 +206,21 @@ pub fn parse_primary(path: &Path) -> std::io::Result<HashMap<String, Rec>> {
         // column 6 (SEQ, QUAL, tags) is deliberately not read.
         // Tab-separated columns, consumed left to right; each `next()` advances one column, so the
         // order of these bindings IS the column order and must not be rearranged.
+        //
+        // Rust: `fields` is a CURSOR, not a list. Each `.next()` below hands over one column and moves
+        // it forward permanently, which is why the bindings must appear in column order and why the
+        // columns past 6 are simply never requested rather than skipped explicitly. It is also why
+        // `mut` is required: consuming a column mutates the cursor.
         let mut fields = line.split('\t');
         // Column 1 QNAME: the read name, shared by both mates of a pair.
         let qname = fields.next().unwrap_or("");
         // Column 2 FLAG: the bitfield, parsed as decimal. Tested immediately, so secondary and
         // supplementary lines cost only two columns of parsing.
+        //
+        // Rust: two independent fallbacks on one line. `.unwrap_or("0")` covers a line with no
+        // second column at all; `.parse().unwrap_or(0)` covers a second column that is not a
+        // number. Both degrade to flag 0 rather than failing, which is the deliberate policy for a
+        // diagnostic tool: it must still produce a report on damaged input.
         let flag: u32 = fields.next().unwrap_or("0").parse().unwrap_or(0);
         if flag & FLAG_SECONDARY != 0 || flag & FLAG_SUPPLEMENTARY != 0 {
             continue;
