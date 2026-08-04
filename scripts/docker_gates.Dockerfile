@@ -1,9 +1,10 @@
-# Build environment for the x86_64 harness driven by scripts/x86_docker.sh.
+# Build environment for the containerised gates driven by scripts/docker_gates.sh.
 #
-# Pinned to the workspace's rust-version so the container and CI agree on the compiler. On Apple
-# Silicon this runs under Rosetta via Docker Desktop: `avx2` is exposed, `avx512bw` is not, so the
-# AVX-512 kernels compile here but never execute.
-FROM --platform=linux/amd64 rust:1.96-bookworm
+# Pinned to the workspace's rust-version so the container and CI agree on the compiler. No
+# `--platform` here: the script passes it, because the same file serves both the amd64 image (which
+# runs under Rosetta on Apple Silicon, exposing `avx2` but not `avx512bw`) and the arm64 one (which
+# runs natively, and is therefore the only one whose timings mean anything on this machine).
+FROM rust:1.96-bookworm
 
 # rust-htslib builds htslib from source, so the C toolchain and the compression / transport
 # libraries it links must be present; clang and libclang are what bindgen needs. samtools and tabix

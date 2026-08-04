@@ -71,13 +71,23 @@ Trois gates : `scripts/check.sh` (fmt/clippy/tests), `scripts/opt_parity.sh` (58
 d'options comparees `cmp` au binaire C), `scripts/alt_parity.sh` + `scripts/giab30x_pe.sh` (le WGS
 complet). Les deux premiers tournent en CI a chaque push.
 
-Un quatrieme harnais, `scripts/x86_docker.sh`, fait tourner la parite et la mesure de RAM sur
-**x86_64** depuis une machine Apple Silicon, dans un conteneur `linux/amd64` (Rosetta expose `avx2`,
-donc ces noyaux s'executent reellement ; `avx512bw` non). Resultat au 2026-08-04 : 62 combinaisons
-sur 64 octet-identiques a l'oracle x86_64, les deux restantes etant le desaccord `-A 2` deja connu
-(205 enregistrements sur 8000, meme chiffre que depuis arm64, voir `DIVERGENCES.md` et l'upstream
-`bwa-mem2#297`). Ce harnais ne mesure PAS la vitesse : sous emulation les rapports ne se conservent
-pas, et c'est precisement la variable en cause dans le jalon v4.3.2.
+Un quatrieme harnais, `scripts/docker_gates.sh`, rejoue toutes les portes **en conteneur**, sur les
+deux plateformes, depuis une machine Apple Silicon : `build`, `check`, `parity`, `rss`, `bench`.
+
+* `ARCH=amd64` (defaut) tourne sous Rosetta. `avx2` est expose donc ces noyaux s'executent vraiment,
+  `avx512bw` ne l'est pas. Resultat au 2026-08-04 : `check` 89 tests verts, `parity` **62 sur 64**
+  octet-identiques a l'oracle x86_64, les deux restantes etant le desaccord `-A 2` deja connu
+  (205 enregistrements sur 8000, meme chiffre que depuis arm64, voir `DIVERGENCES.md` et l'upstream
+  `bwa-mem2#297`).
+* `ARCH=arm64` tourne **nativement**, donc ses temps sont reels. C'est le seul mode ou `bench`
+  accepte de s'executer : sous emulation les rapports de vitesse ne se conservent pas, et
+  `bench` refuse explicitement plutot que de produire un chiffre qui ressemblerait a une mesure.
+
+`rss` compare le pic memoire de bwa-mem4 a celui du fork `fg-labs/bwa-mem3`, construit dans le
+conteneur, dans les deux regimes de `-K`. Sur une reference de 200 kb (index retire du pic) le
+rapport a `-t16` est de 0,84 a `-K` par defaut et 0,40 a `-K` fixe : la croissance par lot decrite
+dans l'issue #25 ne se reproduit pas a cette echelle, seul le cout de base a `-t1` reste superieur
+(1,53x, soit environ 100 MB constants). La mesure a l'echelle du genome reste a faire.
 
 **Residus connus** : voir `DIVERGENCES.md`. Le principal n'est pas de nous : bwa-mem2 **ne s'accorde
 pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c'est le build arm64
