@@ -8,9 +8,10 @@
 //! - [`batched_extend_scalar`]: the portable reference (scalar per-lane cell arithmetic, step 2b-i).
 //! - The SIMD kernels: one `define_sw_kernel!` macro, instantiated per ISA + lane width, so the
 //!   variants cannot drift. **NEON** (`mod neon`, aarch64): u8 x16 / i16 x8. **AVX2** (`mod avx2`,
-//!   x86_64): u8 x32 / i16 x16 (256-bit, twice NEON's width). All are exact because a local
-//!   extension's `H`/`E`/`F` stay in `[0, minval]` with `minval = h0 + min(len)*a`, so the per-job
-//!   bound decides u8 (`minval < 256`) vs i16 (`< 32768`) vs the scalar fallback.
+//!   x86_64): u8 x32 / i16 x16 (256-bit, twice NEON's width). **SSE4.1** (`mod sse41`, x86_64):
+//!   u8 x16 / i16 x8, the 128-bit tier for hosts without AVX2 and for emulated runs. All are exact
+//!   because a local extension's `H`/`E`/`F` stay in `[0, minval]` with `minval = h0 + min(len)*a`,
+//!   so the per-job bound decides u8 (`minval < 256`) vs i16 (`< 32768`) vs the scalar fallback.
 //!
 //! [`batched_extend`] dispatches to [`simd_dispatch`] when the ISA feature is present (NEON on
 //! aarch64, AVX2 on x86_64): the ungapped-diagonal HIT fast path, then bwa-mem2's
@@ -179,7 +180,13 @@ pub fn batched_extend(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        // SSE4.1 is enough to enter the vector path: `sw_kernel_u8` / `sw_kernel_i16` pick the
+        // widest tier the host actually has. Before the 128-bit kernels existed this test was AVX2
+        // only, which sent every AVX2-less x86 host, including plenty of VMs that mask the feature,
+        // down the scalar path at roughly a third of the vector speed.
+        if std::arch::is_x86_feature_detected!("avx2")
+            || std::arch::is_x86_feature_detected!("sse4.1")
+        {
             return simd_dispatch(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             );
@@ -194,18 +201,23 @@ pub fn batched_extend(
 /// against AVX2's 32, for the same arithmetic and the same results, so the only thing this decides
 /// is how many jobs share a register.
 ///
-/// `BWA4_EXTEND_TIER` narrows the choice for benchmarking and for CI: `avx2` skips the AVX-512
-/// branch, `avx512` skips the AVX2 one (so a forced run on a host without AVX-512BW falls through
-/// to the scalar reference rather than silently taking AVX2, which would make a forced comparison
-/// meaningless). Anything else, or unset, means "widest available".
+/// `BWA4_EXTEND_TIER` narrows the choice for benchmarking and for CI, as `(avx512, avx2, sse41)`
+/// permissions: naming one tier disables the wider ones, so a forced run on a host that lacks the
+/// named tier falls through to the scalar reference rather than silently taking a wider one, which
+/// would make a forced comparison meaningless. Anything else, or unset, means "widest available".
+///
+/// `sse41` is worth forcing in one specific situation: under emulation on Apple Silicon, where a
+/// 256-bit AVX2 operation costs the translator a pair of 128-bit NEON operations plus lane fixups,
+/// and the narrower kernel is consequently the faster one. See the [`sse41`] module.
 #[cfg(target_arch = "x86_64")]
-fn extend_tier() -> (bool, bool) {
+fn extend_tier() -> (bool, bool, bool) {
     use std::sync::OnceLock;
-    static TIER: OnceLock<(bool, bool)> = OnceLock::new();
+    static TIER: OnceLock<(bool, bool, bool)> = OnceLock::new();
     *TIER.get_or_init(|| match std::env::var("BWA4_EXTEND_TIER").as_deref() {
-        Ok("avx2") => (false, true),
-        Ok("avx512") => (true, false),
-        _ => (true, true),
+        Ok("sse41") => (false, false, true),
+        Ok("avx2") => (false, true, true),
+        Ok("avx512") => (true, false, false),
+        _ => (true, true, true),
     })
 }
 
@@ -226,14 +238,19 @@ unsafe fn sw_kernel_u8(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
-    let (want_512, want_2) = extend_tier();
+    let (want_512, want_2, want_sse) = extend_tier();
     if want_512 && is_x86_feature_detected!("avx512bw") {
         return avx512::batched_extend_avx512_u8(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
     }
-    if want_2 {
+    if want_2 && is_x86_feature_detected!("avx2") {
         return avx2::batched_extend_avx2_u8(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
+    if want_sse && is_x86_feature_detected!("sse4.1") {
+        return sse41::batched_extend_sse41_u8(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
     }
@@ -258,14 +275,19 @@ unsafe fn sw_kernel_i16(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
-    let (want_512, want_2) = extend_tier();
+    let (want_512, want_2, want_sse) = extend_tier();
     if want_512 && is_x86_feature_detected!("avx512bw") {
         return avx512::batched_extend_avx512_i16(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
     }
-    if want_2 {
+    if want_2 && is_x86_feature_detected!("avx2") {
         return avx2::batched_extend_avx2_i16(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
+    if want_sse && is_x86_feature_detected!("sse4.1") {
+        return sse41::batched_extend_sse41_i16(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
     }
@@ -1858,6 +1880,169 @@ mod avx2 {
     );
 }
 
+/// SSE4.1 (x86_64) instantiations of [`define_sw_kernel!`]: 16 u8 lanes / 8 i16 lanes, the same
+/// widths the NEON kernels use, because both are 128-bit register files.
+///
+/// Two reasons this tier exists rather than falling through to the scalar reference.
+///
+/// The first is coverage. AVX2 is a 2013 instruction set, but plenty of x86_64 still lacks it:
+/// pre-Haswell hardware, and more importantly virtual machines and container hosts that mask CPU
+/// features. Until this module, such a host ran the SCALAR kernel, which the micro-benchmark puts
+/// at roughly a third of the vector speed. SSE4.1 is part of every x86_64 worth aligning on.
+///
+/// The second is measured. Under Rosetta on Apple Silicon, 256-bit AVX2 must be split into pairs of
+/// 128-bit NEON operations plus lane fixups, and `examples/bench_batch` shows the result: the AVX2
+/// kernel comes out at 0.42x the SCALAR kernel at 8 jobs and only 1.25x at 32, where the same code
+/// compiled to NEON reaches 2.93x. A 128-bit kernel maps one-to-one onto the host registers, so it
+/// is the tier that makes an emulated x86 run informative rather than a study of the translator.
+///
+/// Only `blendv_epi8` is genuinely SSE4.1; everything else here is SSE2, which x86_64 guarantees.
+/// The wrapper set is the same shape as the AVX2 one and for the same reasons: x86 has no unsigned
+/// integer compare, and its blend takes its arguments in the opposite order from NEON's `vbslq`.
+#[cfg(target_arch = "x86_64")]
+mod sse41 {
+    use super::{clamp_band, default_result};
+    use bwa_extend::{ExtendJob, ExtendResult};
+    use std::arch::x86_64::*;
+
+    /// # Returns
+    /// A 128-bit vector whose every byte lane equals `x`. The `as i8` is a bit reinterpretation:
+    /// this kernel reads its lanes as unsigned, so a value above 127 is intended.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn set1_u8(x: u8) -> __m128i {
+        _mm_set1_epi8(x as i8)
+    }
+    /// # Returns
+    /// A 128-bit vector whose every 16-bit lane equals `x`; negative values are meaningful here.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn set1_i16(x: i16) -> __m128i {
+        _mm_set1_epi16(x)
+    }
+
+    // Loads and stores. `p` addresses at least LANES elements of that type (16 u8, or 8 u16/i16),
+    // which the kernel guarantees is in bounds; `v` is the vector to write. Unaligned forms, so no
+    // alignment requirement, 16 bytes moved.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn loadu_u8(p: *const u8) -> __m128i {
+        _mm_loadu_si128(p as *const __m128i)
+    }
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn loadu_u16(p: *const u16) -> __m128i {
+        _mm_loadu_si128(p as *const __m128i)
+    }
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn loadu_i16(p: *const i16) -> __m128i {
+        _mm_loadu_si128(p as *const __m128i)
+    }
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn storeu_u8(p: *mut u8, v: __m128i) {
+        _mm_storeu_si128(p as *mut __m128i, v)
+    }
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn storeu_i16(p: *mut i16, v: __m128i) {
+        _mm_storeu_si128(p as *mut __m128i, v)
+    }
+
+    // x == 0, the mask that drives the local restart. `v` is a vector of DP values, in practice the
+    // diagonal predecessor; the result is all-ones in the lanes that were zero.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn ceqz8(v: __m128i) -> __m128i {
+        _mm_cmpeq_epi8(v, _mm_setzero_si128())
+    }
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn ceqz16(v: __m128i) -> __m128i {
+        _mm_cmpeq_epi16(v, _mm_setzero_si128())
+    }
+
+    // `a >= b` via `max(a, b) == a`, and `a < b` as its negation. The detour is the same one the
+    // AVX2 module documents: x86 offers only SIGNED integer compares, which would misread any u8
+    // lane above 127 as negative, while `max_epu8` is a true unsigned max. The `xor` with
+    // `set1_epi8(-1)` is mask negation (that constant is 0xFF in every byte, an all-ones vector).
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn cge_epu8(a: __m128i, b: __m128i) -> __m128i {
+        _mm_cmpeq_epi8(_mm_max_epu8(a, b), a)
+    }
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn clt_epu8(a: __m128i, b: __m128i) -> __m128i {
+        _mm_xor_si128(cge_epu8(a, b), _mm_set1_epi8(-1))
+    }
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn cge_epi16(a: __m128i, b: __m128i) -> __m128i {
+        _mm_cmpeq_epi16(_mm_max_epi16(a, b), a)
+    }
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn clt_epi16(a: __m128i, b: __m128i) -> __m128i {
+        _mm_xor_si128(cge_epi16(a, b), _mm_set1_epi8(-1))
+    }
+
+    /// Blend select. NEON's `vbslq(mask, a, b)` is `mask ? a : b`; `_mm_blendv_epi8(a, b, mask)` is
+    /// `mask ? b : a`, hence the swap. `mask` must be a per-lane all-ones/all-zero mask as produced
+    /// by the compares above; only the top bit of each byte is consulted, which is why the 16-bit
+    /// kernel can reuse this byte-granular blend (its masks are all-ones across both bytes).
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn bsl128(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+        _mm_blendv_epi8(b, a, mask)
+    }
+
+    define_sw_kernel!(
+        batched_extend_sse41_i16,
+        i16,
+        u16,
+        8,
+        feat = "sse4.1",
+        dup = set1_i16,
+        lds = loadu_i16,
+        sts = storeu_i16,
+        ldu = loadu_u16,
+        add = _mm_add_epi16,
+        sub = _mm_sub_epi16,
+        max = _mm_max_epi16,
+        ceqz = ceqz16,
+        cge = cge_epi16,
+        clt = clt_epi16,
+        ceq = _mm_cmpeq_epi16,
+        orru = _mm_or_si128,
+        andu = _mm_and_si128,
+        bsl = bsl128
+    );
+
+    define_sw_kernel!(
+        batched_extend_sse41_u8,
+        u8,
+        u8,
+        16,
+        feat = "sse4.1",
+        dup = set1_u8,
+        lds = loadu_u8,
+        sts = storeu_u8,
+        ldu = loadu_u8,
+        add = _mm_adds_epu8,
+        sub = _mm_subs_epu8,
+        max = _mm_max_epu8,
+        ceqz = ceqz8,
+        cge = cge_epu8,
+        clt = clt_epu8,
+        ceq = _mm_cmpeq_epi8,
+        orru = _mm_or_si128,
+        andu = _mm_and_si128,
+        bsl = bsl128
+    );
+}
+
 /// AVX-512BW instantiations of [`define_sw_kernel!`]: 64 u8 lanes and 32 i16 lanes, twice the AVX2
 /// width for the same arithmetic.
 ///
@@ -2146,6 +2331,23 @@ mod avx2_verify {
                         )
                     }
                 };
+                // The 128-bit tier runs the same shared macro body at half the lane count, so its
+                // chunk boundaries fall in different places. Checked in the same loop against the
+                // same scalar answers rather than in a test of its own: a divergence that only
+                // shows at one lane width is exactly what a separate, differently-seeded test would
+                // miss.
+                // SAFETY: SSE4.1 is present on any executor that has AVX2, which this test requires.
+                let got_sse = unsafe {
+                    if big {
+                        super::sse41::batched_extend_sse41_i16(
+                            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                        )
+                    } else {
+                        super::sse41::batched_extend_sse41_u8(
+                            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                        )
+                    }
+                };
                 // `got[i]` is the kernel's result for job `i`; `expected` is the authoritative
                 // scalar `ksw_extend2` run on that same job alone. Every field must match exactly:
                 // this is the byte-identity gate, not an approximate-score check.
@@ -2168,6 +2370,14 @@ mod avx2_verify {
                         *g,
                         expected,
                         "AVX2 {} diverged round {round} job {i} qlen={} tlen={}",
+                        if big { "i16" } else { "u8" },
+                        queries[i].len(),
+                        targets[i].len()
+                    );
+                    assert_eq!(
+                        got_sse[i],
+                        expected,
+                        "SSE4.1 {} diverged round {round} job {i} qlen={} tlen={}",
                         if big { "i16" } else { "u8" },
                         queries[i].len(),
                         targets[i].len()
