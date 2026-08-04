@@ -7,8 +7,9 @@ Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.
 mesures : chaque phase garde son resultat, y compris les negatifs, pour ne pas re-instruire deux fois
 la meme idee.
 
-La numerotation reste en 4.x et n'ira pas en 5.x : le binaire s'appelle `bwa-mem4`, la version suit
-le nom, comme les 3.x l'ont fait sous le nom `bwa-mem3`.
+La numerotation reste en 4.3.x et n'ira ni en 4.4 ni en 5.x : le binaire s'appelle `bwa-mem4`, la
+version suit le nom, et les lots avancent sur le troisieme chiffre pour garder les releases
+rapprochees.
 
 | Phase | Branche | But | Statut |
 |---|---|---|---|
@@ -25,7 +26,7 @@ le nom, comme les 3.x l'ont fait sous le nom `bwa-mem3`.
 | 9b | `phase9b-gpu` | backend Metal du SW | **abandonnee**, backend retire (voir plus bas) |
 | 9c-9e | | recurrence bandedSWA, prefetch de seeding, vague perf | fait |
 | 10 | | ALT contigs, BAM/CRAM, CI, packaging, release 4.0.0 | fait |
-| 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | a faire, jalon v4.5.0 |
+| 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | a faire, jalon v4.3.3 |
 
 ## Releases
 
@@ -41,11 +42,13 @@ le nom, comme les 3.x l'ont fait sous le nom `bwa-mem3`.
 
 | Jalon | Contenu | Etat |
 |---|---|---|
-| v4.5.0 | phase 11, gate GIAB `hap.py`/`vcfeval` ; suivi upstream `bwa-mem2#297` | ouvert |
-| v4.6.0 | SA-IS parallele (l'indexeur reste mono-thread sur le tableau de suffixes), structure de dedup incrementale | ouvert |
+| v4.3.2 | parite perf x86_64 (issues #20, #25, #27, #32, #33) | ouvert |
+| v4.3.3 | phase 11, gate GIAB `hap.py`/`vcfeval` ; suivi upstream `bwa-mem2#297` | ouvert |
+| v4.3.4 | SA-IS parallele (l'indexeur reste mono-thread sur le tableau de suffixes), structure de dedup incrementale | ouvert |
 
-Le jalon perf x86_64 (issues #20, #25, #27, #32, #33) reste ouvert : il demande une machine x86_64 et
-un WGS complet, pas une mesure sur Apple Silicon.
+Les jalons avancent d'un cran sur le troisieme chiffre : une release courte et frequente plutot
+qu'un saut de version mineure a chaque lot. Le jalon perf x86_64 demande une machine x86_64 et un
+WGS complet, pas une mesure sur Apple Silicon.
 
 ## Statut (4.3.1)
 
