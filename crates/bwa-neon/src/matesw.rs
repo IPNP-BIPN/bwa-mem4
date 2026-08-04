@@ -615,6 +615,7 @@ fn ksw_padded_qlen(qlen: usize, max_sc: i32) -> usize {
 enum RescueTier {
     Auto,
     Scalar,
+    Sse41,
     Avx2,
     Avx512,
 }
@@ -629,6 +630,10 @@ fn forced_rescue_tier() -> RescueTier {
         Some("scalar") => {
             eprintln!("[bwa-mem4] BWA4_RESCUE_TIER=scalar: forcing scalar mate-rescue kernel");
             RescueTier::Scalar
+        }
+        Some("sse41") => {
+            eprintln!("[bwa-mem4] BWA4_RESCUE_TIER=sse41: capping mate-rescue kernel at SSE4.1");
+            RescueTier::Sse41
         }
         Some("avx2") => {
             eprintln!("[bwa-mem4] BWA4_RESCUE_TIER=avx2: capping mate-rescue kernel at AVX2");
@@ -710,7 +715,19 @@ fn fwd_local_sw_batch(
             // narrows the choice: `avx2` skips the AVX-512 branch, `avx512` skips the AVX2 one (so a
             // forced-avx512 run on a host without it falls to scalar, never silently to AVX2).
             let want_avx512 = matches!(tier, RescueTier::Auto | RescueTier::Avx512);
-            let want_avx2 = matches!(tier, RescueTier::Auto | RescueTier::Avx2);
+            // `Auto` here means "the tier the extension kernels calibrated to". Rescue and extension
+            // are the same kind of work on the same registers, so a host where 256-bit is a bad deal
+            // for one is a host where it is a bad deal for the other, and running a second timing
+            // probe to rediscover that would only cost milliseconds to reach the same answer.
+            let want_avx2 = match tier {
+                RescueTier::Avx2 => true,
+                RescueTier::Auto => crate::batched::prefers_wide_x86(),
+                _ => false,
+            };
+            let want_sse41 = matches!(
+                tier,
+                RescueTier::Auto | RescueTier::Sse41 | RescueTier::Avx2
+            );
             if want_avx512 && std::arch::is_x86_feature_detected!("avx512bw") {
                 if fits_u8 {
                     // SAFETY: avx512bw detected; u8 preconditions hold; standard mat.
@@ -736,6 +753,20 @@ fn fwd_local_sw_batch(
                     // SAFETY: avx2 detected; i16 range guaranteed; standard mat.
                     return unsafe {
                         fwd_local_sw_avx2_i16(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    };
+                }
+            }
+            if want_sse41 && std::arch::is_x86_feature_detected!("sse4.1") {
+                if fits_u8 {
+                    // SAFETY: sse4.1 detected; u8 preconditions as for the AVX2 arm; standard mat.
+                    return unsafe {
+                        fwd_local_sw_sse41_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    };
+                }
+                if fits_i16 {
+                    // SAFETY: sse4.1 detected; i16 range guaranteed; standard mat.
+                    return unsafe {
+                        fwd_local_sw_sse41_i16(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                     };
                 }
             }
@@ -2571,6 +2602,683 @@ unsafe fn fwd_local_sw_avx2_i16(
 #[cfg(target_arch = "x86_64")]
 const LANES64: usize = 64;
 
+// ---------------------------------------------------------------------------------------------
+// SSE4.1 (128-bit) rescue kernels.
+//
+// Same two reasons as the extension kernels in `crate::batched::sse41`. Coverage: without these, an
+// x86_64 host without AVX2, which includes VMs and container hosts that mask CPU features, ran mate
+// rescue through the scalar path. And width: a 256-bit operation is only worth its encoding when
+// the hardware executes it as one operation, which under emulation it does not.
+//
+// The transliteration from the AVX2 kernels is mechanical, operation for operation, because every
+// intrinsic they use is element-wise and has an exact 128-bit spelling. The one exception is the
+// widening load: AVX2 widens 16 codes with `_mm_loadu_si128` + `_mm256_cvtepu8_epi16`, and the
+// 128-bit form widens 8 with `_mm_loadl_epi64` + `_mm_cvtepu8_epi16`. Byte-identity is not argued
+// from that mechanical correspondence, it is tested: `sse41_verify` checks both kernels against the
+// scalar reference on the same randomised jobs the AVX2 gate uses.
+// ---------------------------------------------------------------------------------------------
+
+/// SSE4.1's element-wise byte ops behave exactly like NEON's despite the 128-bit-lane split that
+/// afflicts its *shuffles*. Two operations have no direct SSE4.1 spelling and are emulated below with
+/// the same trick `crate::batched`'s SSE4.1 kernels use:
+///
+/// - **unsigned compare**: SSE4.1 has only *signed* `_mm_cmpgt_epi8`, which reads any score above
+///   127 as negative. `cge_epu8(a, b)` is recovered as `max_epu8(a, b) == a`, and `cgt_epu8(a, b)`
+///   as `!cge_epu8(b, a)`. Both are exact for all 256 byte values, including the ties that
+///   `vcgtq_u8` must reject (the strict `>` on the row argmax is what keeps `qe` at the *smallest*
+///   attaining column, `ksw.cpp:216-218`).
+/// - **bit-select**: NEON `vbslq_u8(mask, a, b)` is `mask ? a : b`; `_mm_blendv_epi8(a, b, mask)`
+///   is `mask ? b : a`, i.e. the operands are the other way round.
+///
+/// No cross-lane reduction is needed anywhere: the row accumulators are spilled to arrays and read
+/// per lane, exactly as the NEON kernel does, so `vmaxvq_u8` never appears and neither does the
+/// `_mm_extracti128_si256` dance it would require.
+///
+/// # Parameters
+/// As [`fwd_local_sw_batch`], with the same unchecked preconditions as [`fwd_local_sw_neon_u8`]:
+/// `mat_is_standard(m, mat)`, every job's score ceiling `min(qlen, tlen) * max_sc` under
+/// [`U8_SCORE_LIMIT`], and every query shorter than [`U8_SCORE_LIMIT`] bases.
+///
+/// # Returns
+/// As [`fwd_local_sw_batch`], and byte-identical to [`fwd_local_sw_scalar`] on the same input
+/// (`sse41_verify::sse41_matesw_u8_matches_scalar`).
+///
+/// # Safety
+/// Caller must have confirmed SSE4.1 is available. Loads and stores use unchecked pointer offsets
+/// bounded by `qmax`/`tmax`, which are derived from the same buffers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fwd_local_sw_sse41_u8(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    use std::arch::x86_64::*;
+
+    // --- the three NEON primitives SSE4.1 does not spell directly -------------------------------
+    // `a >= b`, unsigned, as an all-ones/all-zero byte mask. `max_epu8` is a true unsigned max, so
+    // `max(a,b) == a` is exactly `a >= b`; the signed `cmpgt_epi8` would misread scores above 127.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn cge_epu8(a: __m128i, b: __m128i) -> __m128i {
+        _mm_cmpeq_epi8(_mm_max_epu8(a, b), a)
+    }
+    // `a > b`, unsigned: the complement of `b >= a`. `set1_epi8(-1)` is 0xFF per byte, i.e. an
+    // all-ones vector, so the xor is a mask negation and not an arithmetic negation.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn cgt_epu8(a: __m128i, b: __m128i) -> __m128i {
+        _mm_xor_si128(cge_epu8(b, a), _mm_set1_epi8(-1))
+    }
+    // NEON `vbslq_u8(mask, a, b)` = `mask ? a : b`. `_mm_blendv_epi8(a, b, mask)` = `mask ? b : a`,
+    // hence the swapped operands; only the top bit of each mask byte is consulted, which the
+    // all-ones masks above satisfy.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn bsl(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+        _mm_blendv_epi8(b, a, mask)
+    }
+
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    let mtch = mat[0] as u8; // match bonus (>= 0)
+    let mispen = (-mat[1]) as u8; // mismatch penalty b (mat[1] = -b)
+                                  // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
+
+    // Broadcast constants, scores held as *magnitudes* (subtracted, not added) so the whole kernel
+    // stays unsigned; see the NEON u8 kernel's header for why that is what makes u8 viable.
+    let zero = _mm_setzero_si128();
+    let mtch_v = _mm_set1_epi8(mtch as i8);
+    let mispen_v = _mm_set1_epi8(mispen as i8);
+    let one_v = _mm_set1_epi8(1); // N penalty
+    let four_v = _mm_set1_epi8(4);
+    let m_v = _mm_set1_epi8(m as i8);
+    let zpad_v = _mm_set1_epi8(ZPAD as i8);
+    let e_del_v = _mm_set1_epi8(e_del as i8);
+    let oe_del_v = _mm_set1_epi8(oe_del as i8);
+    let e_ins_v = _mm_set1_epi8(e_ins as i8);
+    let oe_ins_v = _mm_set1_epi8(oe_ins as i8);
+
+    // Group setup is identical to `fwd_local_sw_scalar` at 16 lanes; see there for each variable.
+    for (group_idx, group) in jobs.chunks(LANES16).enumerate() {
+        let n_lanes = group.len();
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        let mut seq_q = vec![PAD; qmax * LANES16];
+        let mut seq_t = vec![PAD; tmax * LANES16];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES16],
+            [0usize; LANES16],
+            [i32::MAX; LANES16],
+            [i32::MAX; LANES16],
+        );
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES16 + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES16 + l] = ZPAD;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES16 + l] = b;
+            }
+        }
+
+        // Same DP state as the scalar path, narrowed to u8 so a column of all 16 lanes is one
+        // `_mm_loadu_si128`. Legal only because local SW keeps every value in `[0, ceiling]` and
+        // the caller proved the ceiling is under 250.
+        let mut h_prev = vec![0u8; qmax * LANES16];
+        let mut h_cur = vec![0u8; qmax * LANES16];
+        let mut e = vec![0u8; qmax * LANES16];
+        let mut rowmax = vec![0i32; tmax * LANES16];
+        let mut gmax = [0i32; LANES16];
+        let mut te = [-1i32; LANES16];
+        let mut qe = [0i32; LANES16];
+        let mut limit = [-1i32; LANES16];
+        let mut frozen = [false; LANES16];
+        for l in 0..n_lanes {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+        // Columns below the shortest live query: no live lane can be showing ZPAD or PAD there.
+        let n_fast = if fastcol_enabled() {
+            qlen[..n_lanes].iter().copied().min().unwrap_or(0).min(qmax)
+        } else {
+            0
+        };
+
+        // =====================================================================================
+        // Main DP, two target rows per iteration when two are left. Same transformation, and the
+        // same byte-identity argument, as `fwd_local_sw_neon_u8`: rows `i` and `i+1` share the
+        // query-column load, `h_prev[j]`, `e[j]` and the `h_cur[j]` store, because row `i+1`'s
+        // diagonal is row `i`'s previous-column H and its E carry is what row `i` just produced.
+        // =====================================================================================
+        macro_rules! finish_row {
+            ($row:expr, $imax:expr, $col:expr) => {{
+                let row = $row;
+                let mut imax_arr = [0u8; LANES16];
+                let mut col_arr = [0u8; LANES16];
+                _mm_storeu_si128(imax_arr.as_mut_ptr() as *mut __m128i, $imax);
+                _mm_storeu_si128(col_arr.as_mut_ptr() as *mut __m128i, $col);
+                for l in 0..n_lanes {
+                    if row >= tlen[l] || frozen[l] {
+                        continue;
+                    }
+                    // Job `l`'s best H anywhere in target row `row`, widened out of the lane.
+                    let row_max = imax_arr[l] as i32;
+                    rowmax[row * LANES16 + l] = row_max;
+                    if row_max > gmax[l] {
+                        gmax[l] = row_max;
+                        te[l] = row as i32;
+                        qe[l] = col_arr[l] as i32;
+                        if gmax[l] >= endsc[l] {
+                            frozen[l] = true;
+                            limit[l] = row as i32;
+                        }
+                    }
+                }
+            }};
+        }
+
+        let pair_rows = rowpair_enabled();
+        let mut i = 0usize;
+        while i < tmax {
+            // Rows consumed by this iteration: 2 when a full pair is left, else 1.
+            let rows = if pair_rows && i + 1 < tmax { 2 } else { 1 };
+            if rows == 2 {
+                let t0_v = _mm_loadu_si128(seq_t.as_ptr().add(i * LANES16) as *const __m128i);
+                let t1_v = _mm_loadu_si128(seq_t.as_ptr().add((i + 1) * LANES16) as *const __m128i);
+                let t0_is_n = _mm_cmpeq_epi8(t0_v, four_v);
+                let t1_is_n = _mm_cmpeq_epi8(t1_v, four_v);
+                let (mut f0, mut f1) = (zero, zero);
+                let (mut d0, mut d1) = (zero, zero);
+                let (mut imax0, mut imax1) = (zero, zero);
+                let (mut col0, mut col1) = (zero, zero);
+                let mut j_v = zero;
+
+                for j in 0..n_fast {
+                    let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
+
+                    let eq0 = _mm_cmpeq_epi8(t0_v, q_v);
+                    let n0 = _mm_or_si128(t0_is_n, _mm_cmpeq_epi8(q_v, four_v));
+                    let mut diag0 =
+                        bsl(eq0, _mm_adds_epu8(d0, mtch_v), _mm_subs_epu8(d0, mispen_v));
+                    diag0 = bsl(n0, _mm_subs_epu8(d0, one_v), diag0);
+                    let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
+                    let mfe0 = _mm_max_epu8(diag0, e_v);
+                    let h0 = _mm_max_epu8(mfe0, f0);
+                    col0 = bsl(cgt_epu8(h0, imax0), j_v, col0);
+                    imax0 = _mm_max_epu8(imax0, h0);
+                    // E(i+1, j), handed to row i+1 in a register rather than stored and reloaded.
+                    let e_mid =
+                        _mm_max_epu8(_mm_subs_epu8(e_v, e_del_v), _mm_subs_epu8(h0, oe_del_v));
+                    f0 = _mm_max_epu8(_mm_subs_epu8(f0, e_ins_v), _mm_subs_epu8(mfe0, oe_ins_v));
+                    d0 = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES16) as *const __m128i);
+
+                    let eq1 = _mm_cmpeq_epi8(t1_v, q_v);
+                    let n1 = _mm_or_si128(t1_is_n, _mm_cmpeq_epi8(q_v, four_v));
+                    let mut diag1 =
+                        bsl(eq1, _mm_adds_epu8(d1, mtch_v), _mm_subs_epu8(d1, mispen_v));
+                    diag1 = bsl(n1, _mm_subs_epu8(d1, one_v), diag1);
+                    let mfe1 = _mm_max_epu8(diag1, e_mid);
+                    let h1 = _mm_max_epu8(mfe1, f1);
+                    col1 = bsl(cgt_epu8(h1, imax1), j_v, col1);
+                    imax1 = _mm_max_epu8(imax1, h1);
+                    _mm_storeu_si128(
+                        e.as_mut_ptr().add(j * LANES16) as *mut __m128i,
+                        _mm_max_epu8(_mm_subs_epu8(e_mid, e_del_v), _mm_subs_epu8(h1, oe_del_v)),
+                    );
+                    f1 = _mm_max_epu8(_mm_subs_epu8(f1, e_ins_v), _mm_subs_epu8(mfe1, oe_ins_v));
+                    d1 = h0;
+                    _mm_storeu_si128(h_cur.as_mut_ptr().add(j * LANES16) as *mut __m128i, h1);
+                    j_v = _mm_add_epi8(j_v, one_v);
+                }
+
+                for j in n_fast..qmax {
+                    let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
+                    let zpad_mask = _mm_cmpeq_epi8(q_v, zpad_v);
+                    let q_pad = cgt_epu8(q_v, zpad_v);
+
+                    let eq0 = _mm_cmpeq_epi8(t0_v, q_v);
+                    let n0 = _mm_or_si128(t0_is_n, _mm_cmpeq_epi8(q_v, four_v));
+                    let mut diag0 =
+                        bsl(eq0, _mm_adds_epu8(d0, mtch_v), _mm_subs_epu8(d0, mispen_v));
+                    diag0 = bsl(n0, _mm_subs_epu8(d0, one_v), diag0);
+                    diag0 = bsl(zpad_mask, d0, diag0);
+                    diag0 = bsl(_mm_or_si128(cge_epu8(t0_v, m_v), q_pad), zero, diag0);
+                    let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
+                    let mfe0 = _mm_max_epu8(diag0, e_v);
+                    let h0 = _mm_max_epu8(mfe0, f0);
+                    col0 = bsl(cgt_epu8(h0, imax0), j_v, col0);
+                    imax0 = _mm_max_epu8(imax0, h0);
+                    let e_mid =
+                        _mm_max_epu8(_mm_subs_epu8(e_v, e_del_v), _mm_subs_epu8(h0, oe_del_v));
+                    f0 = _mm_max_epu8(_mm_subs_epu8(f0, e_ins_v), _mm_subs_epu8(mfe0, oe_ins_v));
+                    d0 = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES16) as *const __m128i);
+
+                    let eq1 = _mm_cmpeq_epi8(t1_v, q_v);
+                    let n1 = _mm_or_si128(t1_is_n, _mm_cmpeq_epi8(q_v, four_v));
+                    let mut diag1 =
+                        bsl(eq1, _mm_adds_epu8(d1, mtch_v), _mm_subs_epu8(d1, mispen_v));
+                    diag1 = bsl(n1, _mm_subs_epu8(d1, one_v), diag1);
+                    diag1 = bsl(zpad_mask, d1, diag1);
+                    diag1 = bsl(_mm_or_si128(cge_epu8(t1_v, m_v), q_pad), zero, diag1);
+                    let mfe1 = _mm_max_epu8(diag1, e_mid);
+                    let h1 = _mm_max_epu8(mfe1, f1);
+                    col1 = bsl(cgt_epu8(h1, imax1), j_v, col1);
+                    imax1 = _mm_max_epu8(imax1, h1);
+                    _mm_storeu_si128(
+                        e.as_mut_ptr().add(j * LANES16) as *mut __m128i,
+                        _mm_max_epu8(_mm_subs_epu8(e_mid, e_del_v), _mm_subs_epu8(h1, oe_del_v)),
+                    );
+                    f1 = _mm_max_epu8(_mm_subs_epu8(f1, e_ins_v), _mm_subs_epu8(mfe1, oe_ins_v));
+                    d1 = h0;
+                    _mm_storeu_si128(h_cur.as_mut_ptr().add(j * LANES16) as *mut __m128i, h1);
+                    j_v = _mm_add_epi8(j_v, one_v);
+                }
+
+                // Row order matters: freezing at row `i` must suppress row `i+1`.
+                finish_row!(i, imax0, col0);
+                finish_row!(i + 1, imax1, col1);
+            } else {
+                // Lane `l` = target base at row `i` of job `l`.
+                let t_v = _mm_loadu_si128(seq_t.as_ptr().add(i * LANES16) as *const __m128i);
+                // Row accumulators, one lane per job, same invariant as the scalar version at the top of
+                // column `j`: F(i, j), H(i-1, j-1), max H(i, 0..j), and its smallest attaining column.
+                let mut f_v = zero;
+                let mut h_diag_v = zero;
+                let mut imax_v = zero;
+                let mut imax_col_v = zero; // min query column achieving this row's max
+                                           // Carried column index (bumped by `one_v`, which is set1_epi8(1)) and the row-invariant
+                                           // "target is N" mask. See `fwd_local_sw_neon_u8` for the reasoning.
+                let mut j_v = zero;
+                let t_is_n = _mm_cmpeq_epi8(t_v, four_v);
+
+                // Padding-free column range: below `n_fast` no live lane shows ZPAD or PAD, so the two
+                // padding masks and their selects are not emitted. Identical argument to the NEON u8
+                // kernel, including why a dead target row may be left un-killed here.
+                for j in 0..n_fast {
+                    let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
+                    let eq = _mm_cmpeq_epi8(t_v, q_v);
+                    let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi8(q_v, four_v));
+                    let add_match = _mm_adds_epu8(h_diag_v, mtch_v);
+                    let sub_mis = _mm_subs_epu8(h_diag_v, mispen_v);
+                    let sub_n = _mm_subs_epu8(h_diag_v, one_v);
+                    let mut diag_v = bsl(eq, add_match, sub_mis);
+                    diag_v = bsl(n_mask, sub_n, diag_v);
+                    let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
+                    let mfe = _mm_max_epu8(diag_v, e_v);
+                    let h_v = _mm_max_epu8(mfe, f_v);
+                    let is_new_row_max = cgt_epu8(h_v, imax_v);
+                    imax_col_v = bsl(is_new_row_max, j_v, imax_col_v);
+                    imax_v = _mm_max_epu8(imax_v, h_v);
+                    _mm_storeu_si128(h_cur.as_mut_ptr().add(j * LANES16) as *mut __m128i, h_v);
+                    let e_new =
+                        _mm_max_epu8(_mm_subs_epu8(e_v, e_del_v), _mm_subs_epu8(h_v, oe_del_v));
+                    _mm_storeu_si128(e.as_mut_ptr().add(j * LANES16) as *mut __m128i, e_new);
+                    f_v = _mm_max_epu8(_mm_subs_epu8(f_v, e_ins_v), _mm_subs_epu8(mfe, oe_ins_v));
+                    h_diag_v = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES16) as *const __m128i);
+                    j_v = _mm_add_epi8(j_v, one_v);
+                }
+
+                // Tail: the columns where ZPAD / PAD can appear, full logic.
+                for j in n_fast..qmax {
+                    // Lane `l` = query base at column `j` of job `l`.
+                    let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
+                    // Masks, all-ones per lane where they apply: `eq` the bases match, `n_mask` either is
+                    // N, `zpad_mask` the query column is ksw profile padding, `pad_mask` the cell is past
+                    // a real position (dead row, or query past the padded profile).
+                    let eq = _mm_cmpeq_epi8(t_v, q_v);
+                    let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi8(q_v, four_v));
+                    let zpad_mask = _mm_cmpeq_epi8(q_v, zpad_v);
+                    let pad_mask = _mm_or_si128(cge_epu8(t_v, m_v), cgt_epu8(q_v, zpad_v));
+                    // Each of the four cases is applied straight to `h_diag` as a saturating add or sub,
+                    // never as a signed score that is then added: a mismatch at h_diag = 2 with penalty 4
+                    // saturates to 0, which is `max(0, h_diag - 4)`, whereas a wrapping sub gives 254.
+                    let add_match = _mm_adds_epu8(h_diag_v, mtch_v);
+                    let sub_mis = _mm_subs_epu8(h_diag_v, mispen_v);
+                    // N scores -1 in bwa's matrix, not -b, hence a separate constant from `mispen_v`.
+                    let sub_n = _mm_subs_epu8(h_diag_v, one_v);
+                    // Lane `l` = max(0, H(i-1, j-1) + S) for job `l` once the four selects resolve which
+                    // case this cell is.
+                    let mut diag_v = bsl(eq, add_match, sub_mis);
+                    diag_v = bsl(n_mask, sub_n, diag_v);
+                    diag_v = bsl(zpad_mask, h_diag_v, diag_v); // score 0: diagonal passes through
+                                                               // Dead padding: force 0 outright, as in the NEON u8 kernel.
+                    diag_v = bsl(pad_mask, zero, diag_v);
+
+                    // Lane `l` = E(i, j) for job `l`, the deletion carry left by the previous row.
+                    let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
+                    // No explicit `max(0, .)` on H: `diag_v`, `e_v` and `f_v` are already >= 0 by
+                    // saturation, so the two maxes are the whole H recurrence.
+                    // `mfe = max(diag, E)` excludes the serial F carry, so the F recurrence below can read
+                    // it instead of the full `h_v` and stop waiting on H -- the same critical-chain
+                    // shortening as the NEON u8 kernel (f -> h -> f becomes f -> f).
+                    let mfe = _mm_max_epu8(diag_v, e_v);
+                    let h_v = _mm_max_epu8(mfe, f_v);
+                    // Strict unsigned `>`, so a tie keeps the earlier `j`. This is the one place the
+                    // signed `_mm_cmpgt_epi8` would silently differ from NEON, for any score or column
+                    // index above 127; `cgt_epu8` is why the caller's 250-base query cap still holds.
+                    let is_new_row_max = cgt_epu8(h_v, imax_v);
+                    imax_col_v = bsl(is_new_row_max, j_v, imax_col_v);
+                    imax_v = _mm_max_epu8(imax_v, h_v);
+                    _mm_storeu_si128(h_cur.as_mut_ptr().add(j * LANES16) as *mut __m128i, h_v);
+
+                    // e = max(0, e-e_del, h-oe_del); both saturating subs supply their own clamp.
+                    let e_new =
+                        _mm_max_epu8(_mm_subs_epu8(e_v, e_del_v), _mm_subs_epu8(h_v, oe_del_v));
+                    _mm_storeu_si128(e.as_mut_ptr().add(j * LANES16) as *mut __m128i, e_new);
+                    // F, the row's serial carry, reassociated off `mfe` (see the NEON u8 kernel for the
+                    // byte-identity argument: oe_ins >= e_ins makes the `f - oe_ins` branch inside H
+                    // dominated, so `max(f - e_ins, mfe - oe_ins)` equals the original).
+                    f_v = _mm_max_epu8(_mm_subs_epu8(f_v, e_ins_v), _mm_subs_epu8(mfe, oe_ins_v));
+                    h_diag_v = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES16) as *const __m128i);
+                    j_v = _mm_add_epi8(j_v, one_v);
+                }
+                finish_row!(i, imax_v, imax_col_v);
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+
+            // Early exit once every live lane is either frozen or out of target: purely a speed win,
+            // as in the NEON kernels. See the longer note in `fwd_local_sw_neon`.
+            if (0..n_lanes).all(|l| frozen[l] || i + rows >= tlen[l]) {
+                break;
+            }
+            i += rows;
+        }
+
+        extract_group(
+            n_lanes, group_idx, LANES16, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
+        );
+    }
+    out
+}
+/// SSE4.1 `i16x8` forward local-SW: [`fwd_local_sw_neon`] transliterated to `__m128i`, so a batch whose
+/// score ceiling overflows u8 runs vectorised on x86_64 instead of falling through to
+/// [`fwd_local_sw_scalar`]. This is the second half of closing the x86 rescue gap (#12/#20): the u8
+/// kernel above already handles stock DNA scores, this one the high-scoring configs (large `a`, or the
+/// NEON gate's `(10, 40)` matrix) where `min(len) * match` exceeds 250.
+///
+/// The transliteration is mechanical, exactly as for [`fwd_local_sw_sse41_u8`], because every operation
+/// is element-wise and i16 signed arithmetic matches NEON's `int16x8` byte-for-byte. Two NEON spellings
+/// have no one-instruction SSE4.1 form and are rebuilt here:
+///
+/// - **`vcgeq_s16(a, b)`** (signed `>=`): recovered as `max_epi16(a, b) == a`. Every value compared
+///   this way is a base code (0..5) or [`PAD`] widened *unsigned* to a small positive i16, so the
+///   signed max is exact.
+/// - **`vbslq_s16(mask, a, b)`** = `mask ? a : b`: `_mm_blendv_epi8(a, b, mask)` is `mask ? b : a`,
+///   so the operands swap, same as the u8 kernel's `bsl`. The per-word masks are all-ones/all-zero, so
+///   consulting the top bit of each byte is exact.
+///
+/// Unlike NEON's byte loads, widening an 8-code column to i16 is one `_mm_loadl_epi64` (8 bytes) then
+/// `_mm_cvtepu8_epi16`, the unsigned widen that keeps [`PAD`] = 255 as +255 rather than -1.
+///
+/// # Parameters / Returns
+/// As [`fwd_local_sw_batch`], with the same unchecked preconditions as [`fwd_local_sw_neon`]:
+/// `mat_is_standard(m, mat)`, and every job's score ceiling `min(qlen, tlen) * max_sc` plus target
+/// length under [`I16_SCORE_LIMIT`]. Byte-identical to [`fwd_local_sw_scalar`]
+/// (`sse41_verify::sse41_matesw_i16_matches_scalar`).
+///
+/// # Safety
+/// Caller must have confirmed SSE4.1 is available. Loads/stores use unchecked offsets bounded by
+/// `qmax`/`tmax`, derived from the same buffers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fwd_local_sw_sse41_i16(
+    jobs: &[FwdJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    max_sc: i32,
+) -> Vec<(i32, i32, i32, i32, i32)> {
+    use std::arch::x86_64::*;
+
+    // `mask ? a : b`, per 16-bit lane; the all-ones/all-zero masks make the byte-granular blend exact.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn bsl(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+        _mm_blendv_epi8(b, a, mask)
+    }
+    // Signed `a >= b`, all-ones/all-zero per word. `max_epi16(a,b) == a` iff `a >= b`; used only on the
+    // small positive code/PAD values, where signed and unsigned max coincide.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn cge_epi16(a: __m128i, b: __m128i) -> __m128i {
+        _mm_cmpeq_epi16(_mm_max_epi16(a, b), a)
+    }
+
+    let oe_del = o_del + e_del;
+    let oe_ins = o_ins + e_ins;
+    // The standard matrix collapses to `mtch` (positive match) and `mis` (signed mismatch, e.g. -4),
+    // plus the fixed -1 for N, exactly as in the NEON i16 kernel.
+    let mtch = mat[0] as i16;
+    let mis = mat[1] as i16;
+    // (score, te, qe, score2, te2) seeded with ksw's `g_defr`: score2 defaults to -1, not 0.
+    let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
+
+    let zero = _mm_setzero_si128();
+    // Increment for the carried column counter `j_v` (see the fast column range below).
+    let one_v = _mm_set1_epi16(1);
+    let mtch_v = _mm_set1_epi16(mtch);
+    let mis_v = _mm_set1_epi16(mis);
+    let n_v = _mm_set1_epi16(-1);
+    let dead_v = _mm_set1_epi16(DEAD_CELL_SCORE as i16);
+    let four_v = _mm_set1_epi16(4);
+    let m_v = _mm_set1_epi16(m as i16);
+    let zpad_v = _mm_set1_epi16(ZPAD as i16);
+    let e_del_v = _mm_set1_epi16(e_del as i16);
+    let oe_del_v = _mm_set1_epi16(oe_del as i16);
+    let e_ins_v = _mm_set1_epi16(e_ins as i16);
+    let oe_ins_v = _mm_set1_epi16(oe_ins as i16);
+
+    for (group_idx, group) in jobs.chunks(LANES).enumerate() {
+        let n_lanes = group.len();
+        let qmax = group
+            .iter()
+            .map(|j| ksw_padded_qlen(j.query.len(), max_sc))
+            .max()
+            .unwrap_or(0);
+        let tmax = group.iter().map(|j| j.target.len()).max().unwrap_or(0);
+        if qmax == 0 || tmax == 0 {
+            continue;
+        }
+
+        let mut seq_q = vec![PAD; qmax * LANES];
+        let mut seq_t = vec![PAD; tmax * LANES];
+        let (mut qlen, mut tlen, mut minsc, mut endsc) = (
+            [0usize; LANES],
+            [0usize; LANES],
+            [i32::MAX; LANES],
+            [i32::MAX; LANES],
+        );
+        for (l, j) in group.iter().enumerate() {
+            qlen[l] = j.query.len();
+            tlen[l] = j.target.len();
+            minsc[l] = j.minsc;
+            endsc[l] = j.endsc;
+            for (c, &b) in j.query.iter().enumerate() {
+                seq_q[c * LANES + l] = b;
+            }
+            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
+                seq_q[c * LANES + l] = ZPAD;
+            }
+            for (r, &b) in j.target.iter().enumerate() {
+                seq_t[r * LANES + l] = b;
+            }
+        }
+
+        // i16 SoA DP state, one `__m128i` per column across the 16 lanes. `rowmax` stays i32; it is only
+        // read by the scalar bookkeeping. Plain wrapping i16 arithmetic is safe because the caller
+        // proved every ceiling is under `I16_SCORE_LIMIT` and the kill score is only `DEAD_CELL_SCORE`.
+        let mut h_prev = vec![0i16; qmax * LANES];
+        let mut h_cur = vec![0i16; qmax * LANES];
+        let mut e = vec![0i16; qmax * LANES];
+        let mut rowmax = vec![0i32; tmax * LANES];
+        let mut gmax = [0i32; LANES];
+        let mut te = [-1i32; LANES];
+        let mut qe = [0i32; LANES];
+        let mut limit = [-1i32; LANES];
+        let mut frozen = [false; LANES];
+        for l in 0..n_lanes {
+            limit[l] = tlen[l] as i32 - 1;
+        }
+        // Columns below the shortest live query: no live lane can be showing ZPAD or PAD there.
+        let n_fast = if fastcol_enabled() {
+            qlen[..n_lanes].iter().copied().min().unwrap_or(0).min(qmax)
+        } else {
+            0
+        };
+
+        // Widen 16 u8 codes at `off` into an `i16x8`. `_mm_cvtepu8_epi16` is the unsigned widen, so
+        // PAD (255) stays +255 and not -1, matching NEON's `vmovl_u8`.
+        let load_codes = |buf: &[u8], off: usize| -> __m128i {
+            _mm_cvtepu8_epi16(_mm_loadl_epi64(buf.as_ptr().add(off) as *const __m128i))
+        };
+
+        // =====================================================================================
+        // Main DP, one target row per iteration. Structurally identical to `fwd_local_sw_neon`, at
+        // 8 lanes; only the per-cell arithmetic is vectorised, the bookkeeping stays scalar.
+        // =====================================================================================
+        for i in 0..tmax {
+            let t_v = load_codes(&seq_t, i * LANES);
+            let mut f_v = zero;
+            let mut h_diag_v = zero;
+            let mut imax_v = zero;
+            let mut imax_col_v = zero; // min query column achieving this row's max
+                                       // Carried column index and the row-invariant "target is N" mask; see the NEON u8 kernel.
+            let mut j_v = zero;
+            let t_is_n = _mm_cmpeq_epi16(t_v, four_v);
+
+            // Padding-free column range, same argument as every other kernel here.
+            for j in 0..n_fast {
+                let q_v = load_codes(&seq_q, j * LANES);
+                let eq = _mm_cmpeq_epi16(t_v, q_v);
+                let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi16(q_v, four_v));
+                let mut sc = bsl(eq, mtch_v, mis_v);
+                sc = bsl(n_mask, n_v, sc);
+                let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES) as *const __m128i);
+                let mut h_v = _mm_add_epi16(h_diag_v, sc);
+                h_v = _mm_max_epi16(h_v, zero);
+                h_v = _mm_max_epi16(h_v, e_v);
+                let mfe = h_v;
+                h_v = _mm_max_epi16(h_v, f_v);
+                let is_new_row_max = _mm_cmpgt_epi16(h_v, imax_v);
+                imax_col_v = bsl(is_new_row_max, j_v, imax_col_v);
+                imax_v = _mm_max_epi16(imax_v, h_v);
+                _mm_storeu_si128(h_cur.as_mut_ptr().add(j * LANES) as *mut __m128i, h_v);
+                let e_new =
+                    _mm_max_epi16(_mm_sub_epi16(e_v, e_del_v), _mm_sub_epi16(h_v, oe_del_v));
+                _mm_storeu_si128(
+                    e.as_mut_ptr().add(j * LANES) as *mut __m128i,
+                    _mm_max_epi16(e_new, zero),
+                );
+                let f_new =
+                    _mm_max_epi16(_mm_sub_epi16(f_v, e_ins_v), _mm_sub_epi16(mfe, oe_ins_v));
+                f_v = _mm_max_epi16(f_new, zero);
+                h_diag_v = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES) as *const __m128i);
+                j_v = _mm_add_epi16(j_v, one_v);
+            }
+
+            // Tail: the columns where ZPAD / PAD can appear, full logic.
+            for j in n_fast..qmax {
+                let q_v = load_codes(&seq_q, j * LANES);
+                // Four masks, four selects in increasing priority, exactly as the NEON i16 kernel:
+                //   eq        the bases match; n_mask either is N; zpad_mask query is profile padding;
+                //   pad_mask  cell is past a real position (dead target row, or query past the profile).
+                let eq = _mm_cmpeq_epi16(t_v, q_v);
+                let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi16(q_v, four_v));
+                let zpad_mask = _mm_cmpeq_epi16(q_v, zpad_v);
+                let pad_mask = _mm_or_si128(cge_epi16(t_v, m_v), _mm_cmpgt_epi16(q_v, zpad_v));
+                let mut sc = bsl(eq, mtch_v, mis_v);
+                sc = bsl(n_mask, n_v, sc);
+                sc = bsl(zpad_mask, zero, sc); // ksw profile padding scores 0
+                sc = bsl(pad_mask, dead_v, sc); // dead padding: kill the cell outright
+
+                let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES) as *const __m128i);
+                // H = max(0, H_diag + S, E, F); wrapping adds are in range by the ceiling guarantee.
+                let mut h_v = _mm_add_epi16(h_diag_v, sc);
+                h_v = _mm_max_epi16(h_v, zero);
+                h_v = _mm_max_epi16(h_v, e_v);
+                // `mfe = max(0, H_diag + S, E)` excludes the serial F carry, so the F recurrence below
+                // reads it and the critical column chain stays f -> f (see the NEON i16 kernel).
+                let mfe = h_v;
+                h_v = _mm_max_epi16(h_v, f_v);
+                // Strict signed `>`, so a tie keeps the earlier column.
+                let is_new_row_max = _mm_cmpgt_epi16(h_v, imax_v);
+                imax_col_v = bsl(is_new_row_max, j_v, imax_col_v);
+                imax_v = _mm_max_epi16(imax_v, h_v);
+                _mm_storeu_si128(h_cur.as_mut_ptr().add(j * LANES) as *mut __m128i, h_v);
+
+                // E(i+1,j) = max(0, E - e_del, H - oe_del).
+                let e_new =
+                    _mm_max_epi16(_mm_sub_epi16(e_v, e_del_v), _mm_sub_epi16(h_v, oe_del_v));
+                _mm_storeu_si128(
+                    e.as_mut_ptr().add(j * LANES) as *mut __m128i,
+                    _mm_max_epi16(e_new, zero),
+                );
+                // F(i,j+1) = max(0, F - e_ins, mfe - oe_ins), reassociated off `mfe`.
+                let f_new =
+                    _mm_max_epi16(_mm_sub_epi16(f_v, e_ins_v), _mm_sub_epi16(mfe, oe_ins_v));
+                f_v = _mm_max_epi16(f_new, zero);
+                h_diag_v = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES) as *const __m128i);
+                j_v = _mm_add_epi16(j_v, one_v);
+            }
+
+            let mut imax_arr = [0i16; LANES];
+            let mut col_arr = [0i16; LANES];
+            _mm_storeu_si128(imax_arr.as_mut_ptr() as *mut __m128i, imax_v);
+            _mm_storeu_si128(col_arr.as_mut_ptr() as *mut __m128i, imax_col_v);
+            for l in 0..n_lanes {
+                if i >= tlen[l] || frozen[l] {
+                    continue;
+                }
+                let row_max = imax_arr[l] as i32;
+                rowmax[i * LANES + l] = row_max;
+                if row_max > gmax[l] {
+                    gmax[l] = row_max;
+                    te[l] = i as i32;
+                    qe[l] = col_arr[l] as i32;
+                    if gmax[l] >= endsc[l] {
+                        frozen[l] = true;
+                        limit[l] = i as i32;
+                    }
+                }
+            }
+            std::mem::swap(&mut h_prev, &mut h_cur);
+
+            if (0..n_lanes).all(|l| frozen[l] || i + 1 >= tlen[l]) {
+                break;
+            }
+        }
+
+        extract_group(
+            n_lanes, group_idx, LANES, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
+        );
+    }
+    out
+}
 /// AVX512 `u8x64` forward local-SW: [`fwd_local_sw_avx2_u8`] widened to `__m512i`, 64 rescue jobs per
 /// group instead of 32. Mate-rescue jobs are cross-lane independent and near-uniform in size (query =
 /// read length, target = the insert-size window), so doubling the lane count keeps utilisation high;
@@ -3337,7 +4045,7 @@ mod avx2_verify {
     /// Reproducible mate-rescue-shaped jobs, shared by the u8 and i16 verify tests: a random target,
     /// a random query planted 1-2 times with 0-3 substitutions, occasional N bases. Same generator and
     /// shape as `avx2_matesw_u8_matches_scalar` and the NEON gate `tests::matesw_equals_scalar`.
-    fn rescue_jobs(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    pub(super) fn rescue_jobs(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let mut state = 0x1234_5678_9abc_def1u64;
         let mut next = move || {
             state = state
@@ -3409,6 +4117,94 @@ mod avx2_verify {
         // (Rosetta lies), so the kernel is exercised on this Apple-Silicon host as well as native x86.
         let got =
             unsafe { fwd_local_sw_avx2_i16(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
+        for i in 0..jobs.len() {
+            assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
+        }
+    }
+}
+
+/// Byte-identity gate for the two 128-bit mate-rescue kernels, against `fwd_local_sw_scalar`.
+///
+/// Same jobs and same scoring pairs as the AVX2 gate above, on purpose: the SSE4.1 kernels are that
+/// code transliterated operation for operation, so what has to be proved is that the group width
+/// change (16 lanes instead of 32, 8 instead of 16) did not move a padded row or column that the
+/// wider kernel happened to leave inert. Reusing the fixture makes the two tests comparable; a
+/// different generator would have made a divergence look like a different test.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod sse41_verify {
+    use super::*;
+
+    /// bwa 5x5 score matrix; a copy for the same reason `avx2_verify` keeps its own.
+    fn scmat(a: i8, b: i8) -> Vec<i8> {
+        let mut mat = vec![0i8; 25];
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { a } else { -b };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+        mat
+    }
+
+    #[test]
+    fn sse41_matesw_u8_matches_scalar() {
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let (qbufs, tbufs) = super::avx2_verify::rescue_jobs(2000);
+        let (a, b, minsc) = (1i8, 4i8, 19i32);
+        let mat = scmat(a, b);
+        let max_sc = a as i32;
+        let jobs: Vec<FwdJob> = qbufs
+            .iter()
+            .zip(tbufs.iter())
+            .map(|(q, t)| FwdJob {
+                query: q.as_slice(),
+                target: t.as_slice(),
+                minsc,
+                // Half the jobs freeze on `endsc`, which is what drives the `score2` row-scan
+                // truncation; at 16 lanes it truncates at different jobs than at 32.
+                endsc: if t.len() % 2 == 0 { i32::MAX } else { 30 },
+            })
+            .collect();
+        let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+        // SAFETY: standard mat, and every ceiling under U8_SCORE_LIMIT at match score 1. SSE4.1 is
+        // assumed rather than detected, as in the AVX2 gate: under Rosetta detection lies, and this
+        // kernel is exactly the one that host should be running.
+        let got =
+            unsafe { fwd_local_sw_sse41_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
+        for i in 0..jobs.len() {
+            assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
+        }
+    }
+
+    #[test]
+    fn sse41_matesw_i16_matches_scalar() {
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let (qbufs, tbufs) = super::avx2_verify::rescue_jobs(2000);
+        // match 10 / mismatch -40 overflows u8 past ~25 bases, which is the i16 kernel's domain.
+        let (a, b, minsc) = (10i8, 40i8, 190i32);
+        let mat = scmat(a, b);
+        let max_sc = a as i32;
+        let jobs: Vec<FwdJob> = qbufs
+            .iter()
+            .zip(tbufs.iter())
+            .map(|(q, t)| FwdJob {
+                query: q.as_slice(),
+                target: t.as_slice(),
+                minsc,
+                endsc: if t.len() % 2 == 0 { i32::MAX } else { 300 },
+            })
+            .collect();
+        let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+        // SAFETY: standard mat, every ceiling under I16_SCORE_LIMIT; SSE4.1 assumed as above.
+        let got =
+            unsafe { fwd_local_sw_sse41_i16(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
         for i in 0..jobs.len() {
             assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
         }

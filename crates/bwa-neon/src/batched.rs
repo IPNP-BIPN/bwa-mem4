@@ -197,28 +197,197 @@ pub fn batched_extend(
     )
 }
 
-/// Widest legal extension kernel for this host, chosen at run time. AVX-512BW carries 64 u8 lanes
-/// against AVX2's 32, for the same arithmetic and the same results, so the only thing this decides
-/// is how many jobs share a register.
+/// Which x86_64 extension kernel to run. All four produce identical results; the only thing this
+/// decides is how many jobs ride in one register, and therefore how fast.
 ///
-/// `BWA4_EXTEND_TIER` narrows the choice for benchmarking and for CI, as `(avx512, avx2, sse41)`
-/// permissions: naming one tier disables the wider ones, so a forced run on a host that lacks the
-/// named tier falls through to the scalar reference rather than silently taking a wider one, which
-/// would make a forced comparison meaningless. Anything else, or unset, means "widest available".
+/// Wider is not automatically faster, which is the whole reason this is a decision rather than a
+/// constant. Measured with `examples/bench_batch` under Rosetta on Apple Silicon, where a 256-bit
+/// operation is not one operation but a pair of 128-bit NEON ones plus lane fixups:
 ///
-/// `sse41` is worth forcing in one specific situation: under emulation on Apple Silicon, where a
-/// 256-bit AVX2 operation costs the translator a pair of 128-bit NEON operations plus lane fixups,
-/// and the narrower kernel is consequently the faster one. See the [`sse41`] module.
+/// | jobs | AVX2 (32 u8 lanes) | SSE4.1 (16 u8 lanes) |
+/// |------|--------------------|----------------------|
+/// | 8    | 0.41x the scalar kernel | 1.19x |
+/// | 16   | 0.72x | 1.86x |
+/// | 32   | 1.21x | 1.84x |
+/// | 64   | 1.25x | 1.92x |
+///
+/// The same macro body compiled to NEON reaches 2.93x, and the scalar kernel runs at the same speed
+/// on both hosts, which is what identifies the translator rather than the code as the cost.
+///
+/// So the tier is CALIBRATED at first use rather than assumed: both candidate kernels run a fixed
+/// synthetic batch and the faster one wins. That costs a few milliseconds once per process and it
+/// is the only way to be right on a host whose vector units are emulated, virtualised, or simply
+/// slower at the wider width (AVX-512 downclocking is the same shape of problem on some Xeons).
+/// Results cannot change with the choice: every tier is byte-identical to the scalar reference, so
+/// picking differently on two runs of the same machine is a speed difference and nothing else.
 #[cfg(target_arch = "x86_64")]
-fn extend_tier() -> (bool, bool, bool) {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tier {
+    Avx512,
+    Avx2,
+    Sse41,
+    /// No vector tier available; the caller falls back to [`batched_extend_scalar`].
+    Scalar,
+}
+
+/// Whether the calibration chose a 256-bit-or-wider kernel on this host.
+///
+/// Exposed for the mate-rescue dispatch in [`crate::matesw`], which faces the same question about
+/// the same registers and would only spend milliseconds rediscovering the same answer with a probe
+/// of its own. Always `true` on a host with no 128-bit alternative to fall back to.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn prefers_wide_x86() -> bool {
+    matches!(extend_tier(), Tier::Avx2 | Tier::Avx512)
+}
+
+/// The tier this process will use, decided once.
+///
+/// `BWA4_EXTEND_TIER=avx512|avx2|sse41|scalar` skips the calibration and names the tier. A forced
+/// tier the host does not have falls through to scalar rather than silently taking another one,
+/// which would make a forced comparison meaningless.
+#[cfg(target_arch = "x86_64")]
+fn extend_tier() -> Tier {
     use std::sync::OnceLock;
-    static TIER: OnceLock<(bool, bool, bool)> = OnceLock::new();
-    *TIER.get_or_init(|| match std::env::var("BWA4_EXTEND_TIER").as_deref() {
-        Ok("sse41") => (false, false, true),
-        Ok("avx2") => (false, true, true),
-        Ok("avx512") => (true, false, false),
-        _ => (true, true, true),
+    static TIER: OnceLock<Tier> = OnceLock::new();
+    *TIER.get_or_init(|| {
+        let have_512 = is_x86_feature_detected!("avx512bw");
+        let have_2 = is_x86_feature_detected!("avx2");
+        let have_sse = is_x86_feature_detected!("sse4.1");
+        match std::env::var("BWA4_EXTEND_TIER").as_deref() {
+            Ok("avx512") => return if have_512 { Tier::Avx512 } else { Tier::Scalar },
+            Ok("avx2") => return if have_2 { Tier::Avx2 } else { Tier::Scalar },
+            Ok("sse41") => return if have_sse { Tier::Sse41 } else { Tier::Scalar },
+            Ok("scalar") => return Tier::Scalar,
+            _ => {}
+        }
+        calibrate(have_512, have_2, have_sse)
     })
+}
+
+/// Time each available tier on a fixed synthetic batch and return the fastest.
+///
+/// The workload is deliberately small and deterministic: 64 jobs of about a read's length, the shape
+/// the u8 kernel actually sees, repeated a few times and scored on the BEST run of each tier rather
+/// than the mean, because the fastest observation is the one least polluted by whatever else the
+/// machine was doing.
+///
+/// The wider tier wins ties and near-ties (it must be more than 5% faster to be displaced), so a
+/// noisy measurement on a normal x86 host cannot demote it. On a host where the wide tier is
+/// genuinely handicapped the margin is not 5% but a factor of two or three, as the table on [`Tier`]
+/// shows, and no tie-break rule hides that.
+#[cfg(target_arch = "x86_64")]
+fn calibrate(have_512: bool, have_2: bool, have_sse: bool) -> Tier {
+    if !have_sse && !have_2 && !have_512 {
+        return Tier::Scalar;
+    }
+    // A tier that cannot be compared is simply taken: with only one candidate there is nothing to
+    // measure, and paying milliseconds to confirm the obvious would be silly.
+    if !have_sse {
+        return if have_512 {
+            Tier::Avx512
+        } else if have_2 {
+            Tier::Avx2
+        } else {
+            Tier::Scalar
+        };
+    }
+
+    // Synthetic batch. A fixed multiplicative LCG rather than a random source, so two processes on
+    // the same machine calibrate against exactly the same work and a slow tier cannot be blamed on
+    // having drawn a harder batch.
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+    let mut queries: Vec<Vec<u8>> = Vec::with_capacity(64);
+    let mut targets: Vec<Vec<u8>> = Vec::with_capacity(64);
+    for _ in 0..64 {
+        let qlen = 60 + next() % 60;
+        let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+        // Target is a noisy copy of the query, not unrelated noise: an unrelated target dies to
+        // z-drop within a few rows and would time the early-exit path instead of the kernel.
+        let mut tgt = Vec::with_capacity(qlen + 20);
+        let mut qi = 0;
+        while tgt.len() < qlen + 20 {
+            if qi < q.len() && next() % 100 >= 5 {
+                tgt.push(q[qi]);
+                qi += 1;
+            } else {
+                tgt.push((next() % 4) as u8);
+            }
+        }
+        queries.push(q);
+        targets.push(tgt);
+    }
+    let jobs: Vec<ExtendJob> = (0..64)
+        .map(|i| ExtendJob {
+            query: &queries[i],
+            target: &targets[i],
+            h0: 10,
+        })
+        .collect();
+    // bwa's defaults, so the calibration measures the scoring scheme the run will actually use.
+    let mat: Vec<i8> = {
+        let mut mat = vec![0i8; 25];
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { 1 } else { -4 };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+        mat
+    };
+
+    // `time` returns the best of three runs of one kernel over the batch above.
+    let time = |f: &dyn Fn()| {
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            f();
+            best = best.min(t0.elapsed());
+        }
+        best
+    };
+    // SAFETY of each closure: the feature it needs was detected above, and the jobs are read-only
+    // short sequences well inside the u8 kernel's value bounds (h0 = 10, query < 128 bases).
+    let sse = time(&|| {
+        let _ = unsafe { sse41::batched_extend_sse41_u8(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100) };
+    });
+    let mut best_tier = Tier::Sse41;
+    let mut best_time = sse;
+    if have_2 {
+        let t = time(&|| {
+            let _ =
+                unsafe { avx2::batched_extend_avx2_u8(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100) };
+        });
+        // 95%: the wider tier keeps the tie, see the doc comment.
+        if t.as_secs_f64() < best_time.as_secs_f64() * 0.95 || best_tier == Tier::Sse41 && t <= sse
+        {
+            best_tier = Tier::Avx2;
+            best_time = t;
+        }
+    }
+    if have_512 {
+        let t = time(&|| {
+            let _ = unsafe {
+                avx512::batched_extend_avx512_u8(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100)
+            };
+        });
+        if t.as_secs_f64() < best_time.as_secs_f64() * 0.95 {
+            best_tier = Tier::Avx512;
+        }
+    }
+    best_tier
 }
 
 /// # Safety
@@ -238,21 +407,23 @@ unsafe fn sw_kernel_u8(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
-    let (want_512, want_2, want_sse) = extend_tier();
-    if want_512 && is_x86_feature_detected!("avx512bw") {
-        return avx512::batched_extend_avx512_u8(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-        );
-    }
-    if want_2 && is_x86_feature_detected!("avx2") {
-        return avx2::batched_extend_avx2_u8(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-        );
-    }
-    if want_sse && is_x86_feature_detected!("sse4.1") {
-        return sse41::batched_extend_sse41_u8(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-        );
+    match extend_tier() {
+        Tier::Avx512 => {
+            return avx512::batched_extend_avx512_u8(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            )
+        }
+        Tier::Avx2 => {
+            return avx2::batched_extend_avx2_u8(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            )
+        }
+        Tier::Sse41 => {
+            return sse41::batched_extend_sse41_u8(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            )
+        }
+        Tier::Scalar => {}
     }
     batched_extend_scalar(
         jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
@@ -275,21 +446,23 @@ unsafe fn sw_kernel_i16(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
-    let (want_512, want_2, want_sse) = extend_tier();
-    if want_512 && is_x86_feature_detected!("avx512bw") {
-        return avx512::batched_extend_avx512_i16(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-        );
-    }
-    if want_2 && is_x86_feature_detected!("avx2") {
-        return avx2::batched_extend_avx2_i16(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-        );
-    }
-    if want_sse && is_x86_feature_detected!("sse4.1") {
-        return sse41::batched_extend_sse41_i16(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-        );
+    match extend_tier() {
+        Tier::Avx512 => {
+            return avx512::batched_extend_avx512_i16(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            )
+        }
+        Tier::Avx2 => {
+            return avx2::batched_extend_avx2_i16(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            )
+        }
+        Tier::Sse41 => {
+            return sse41::batched_extend_sse41_i16(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            )
+        }
+        Tier::Scalar => {}
     }
     batched_extend_scalar(
         jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
