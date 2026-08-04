@@ -670,6 +670,31 @@ pub fn align_reads_batched<B: SwBackend>(
         let mut rbegs = vec![0i64; all_positions.len()];
         // Start instant for the optional `get_sa` profiling counters, or `None` when profiling is
         // off, in which case no clock is read at all.
+        // `BWA4_SA_DUP=1`: how many of a chunk's lookups ask for a row another lookup in the same
+        // chunk already wants. Measured on GRCh38: 20-24%. That number is the CEILING on what
+        // deduplicating before resolution could save, and the ceiling turned out not to be worth
+        // reaching: resolving each distinct row once and scattering the answer back needs the
+        // lookups sorted first, and on this fixture the sort costs as much as the ~22% of walks it
+        // removes. Best of four interleaved runs at -t16 on 500k pairs: 63.42 s CPU without the
+        // dedup, 64.49 s with it, and the wall clock a tie at 6.48 s against 6.50 s. Kept as a probe
+        // and a recorded negative, so the idea is not re-instructed a third time.
+        //
+        // What made it not pay is the fix in the commit before it: with the prefetch window at 128
+        // the walks overlap well enough that removing a fifth of them buys back less than an
+        // O(n log n) pass costs. At the old window of 32 the arithmetic might well have gone the
+        // other way.
+        if std::env::var_os("BWA4_SA_DUP").is_some() {
+            let mut c = all_positions.clone();
+            c.sort_unstable();
+            let total = c.len();
+            c.dedup();
+            eprintln!(
+                "[sa-dup] {} lookups, {} distinct rows, {:.1}% duplicates",
+                total,
+                c.len(),
+                100.0 * (total - c.len()) as f64 / total.max(1) as f64
+            );
+        }
         let sa_timer = bwa_chain::chain_time::enabled().then(std::time::Instant::now);
         if std::env::var_os("BWA4_SA_SORT").is_some() {
             // SPIKE (Zhang et al., CCGrid 2013 "Optimizing BWT-Based Sequence Alignment on Multicore

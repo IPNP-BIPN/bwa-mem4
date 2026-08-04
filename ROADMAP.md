@@ -94,6 +94,41 @@ pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
 (upstream `bwa-mem2#297`, ouvert depuis ce projet).
 
+## Campagne perf : la resolution du suffix array (2026-08-04)
+
+Profil du regime du gist de @nh13 (GRCh38, `-t16`, `-K` par defaut, entree gzippee) : l'etage
+`align` fait **77 % du mur**, occupation du pool 98,9 %, donc pas un probleme de barriere. Dedans,
+`BWA4_CHAIN_TIME` designe la construction des chaines, et la construction des chaines c'est
+**42 567 543 resolutions de suffix array pour 500k paires**, chacune une marche aleatoire dans un
+index de 10 Go. Le goulot est la latence memoire, pas le DP.
+
+**Ce qui a paye.** La fenetre de prefetch de `get_sa_batch` (nombre de marches LF en vol) etait a 32.
+Balayage a `-t16` sur GRCh38, cout par lookup : W=8 369 ns, 16 272 ns, 32 211 ns, 64 185 ns,
+96 162 ns, **128 152 ns**, 192 147 ns, 256 144 ns. Reglee a 128, le coude et non le minimum : au-dela
+la courbe est plate et les tableaux de pile encombrent le L1. `BWA4_SA_WINDOW` permet de rebalayer
+ailleurs. Neutre en sortie par construction, verifie par md5 d'un run GRCh38 complet a W=32 et W=128.
+
+Deux autres, plus petites : chargement de l'index par `pread` depuis le pool (10 Go depuis un page
+cache chaud etaient copies par un seul thread, 2,4 s contre 1,8 s pour le fork, maintenant 1,8 s,
+RSS inchange), et suppression du teardown (`mem::forget` sur l'index plutot que rendre 10 Go region
+par region apres le dernier octet ecrit).
+
+Resultat dans le regime du gist, 5M paires, meilleur de 3, bras alternes : mur 41,35 s -> **39,58 s**
+contre 36,52 s pour le fork, soit un rapport qui passe de 1,14x a **1,08x** ; CPU 573 s -> **564 s**
+contre 550 s, soit 1,055x -> **1,025x**.
+
+**Ce qui n'a pas paye, et qu'il ne faut pas re-instruire.** 20 a 24 % des lookups d'un lot demandent
+une ligne qu'un autre lookup du meme lot demande deja (`BWA4_SA_DUP=1`). Resoudre chaque ligne
+distincte une seule fois exige de trier les lookups d'abord, et le tri coute autant que les ~22 % de
+marches evitees : meilleur de quatre passes alternees a `-t16` sur 500k paires, **63,42 s de CPU sans
+la deduplication contre 64,49 s avec**, et le mur a egalite (6,48 s contre 6,50 s). C'est une
+consequence du point precedent : a fenetre 128 les marches se recouvrent assez bien pour que retirer
+un cinquieme d'entre elles rapporte moins qu'un passage en O(n log n) ne coute. A l'ancienne fenetre
+de 32, l'arbitrage aurait pu s'inverser.
+
+Le tri seul (spike CCGrid 2013, `BWA4_SA_SORT=1`) est lui aussi neutre desormais : 158 ns par lookup
+dans les deux ordres.
+
 ## Campagne perf : le noyau de mate rescue, et le classement contre le fork
 
 **Etat au 2026-07-29 (M4 Max, 1M paires GIAB reelles, PE `-t12 -K 10M`, binaire PGO, ordre alterne,
