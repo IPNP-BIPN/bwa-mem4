@@ -51,6 +51,19 @@
 //! | `eh`, `mj` | ksw DP row state and its last non-zero column (not used in this file) |
 //! | `csub` | second-best score at the SAME locus; caps MAPQ on internally repetitive loci |
 
+//! # Rust mechanics used in this file
+//!
+//! | Construct | What it means, and why it is here |
+//! |-----------|-----------------------------------|
+//! | `pub struct PairRescueData<'a>` | the batched rescue path's input: two read slices and two MUTABLE borrows of the mates' region vectors, bundled in one value. The `'a` lifetime ties the bundle to the batch buffers it points into, so it cannot outlive them; the `&'a mut Vec<..>` fields mean rescue appends to the caller's lists in place, as the C does, with the compiler guaranteeing no other path holds a view of those lists at the same time. |
+//! | `[Option<Orient>; 4]` with `.flatten()` | four orientation slots (FF, FR, RF, RR), each either used or not. `flatten()` on the array iterator yields the occupied ones in ASCENDING slot order, which is exactly the C's loop order, so the rescue calls happen in the same sequence and the regions are appended in the same order. |
+//! | `#[derive(Debug, Clone, Copy)]` on `PeStat` | four numbers; `Copy` makes passing one around free and non-moving. |
+//! | `impl Default for PeStat` (hand-written) | "no statistics yet" is not all-zeros in bwa's terms, so the default is written out rather than derived. |
+//! | `samples.sort_unstable()` | legitimate here, and only here, because the samples are plain integers: equal elements are INDISTINGUISHABLE, so no permutation of them is observable. Contrast the dedup sort in `primary.rs`, where equal keys carry different payloads and the permutation is output-visible. |
+//! | `f64` throughout the pairing scores | the C computes these in `double`. Narrowing to `f32` would round differently and flip pairing decisions on a small fraction of reads; the width is part of the contract, not a performance knob. |
+//! | `std::io::Write` on a generic writer | SAM records are formatted into any sink implementing `Write`, so the same code serves a file, a pipe and an in-memory buffer in tests. The formatting is byte-exact, which is why the writer is buffered by the caller rather than here. |
+//! | `wrapping_add` on the read id | the C adds an `int64_t` id that is allowed to wrap; asking for wrapping explicitly keeps debug and release builds identical. |
+
 use std::io::{self, Write};
 
 use bwa_core::MemOpt;

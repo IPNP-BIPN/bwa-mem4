@@ -34,6 +34,16 @@
 //! alternating match run lengths and reference letters (`10A5^AC6`), which lets a reader
 //! reconstruct the reference sequence from the read plus the CIGAR alone.
 //!
+//! # Rust mechanics used in this file
+//!
+//! | Construct | What it means, and why it is here |
+//! |-----------|-----------------------------------|
+//! | `Vec<u32>` for the CIGAR | one operation per element, packed as `len << 4 \| op`. This is BAM's own encoding and the C's, so the vector can be handed to the writer unchanged; a `Vec<(u32, u8)>` would be friendlier to read and would need a conversion pass that has to get the packing right anyway. |
+//! | `Option<String>` for `xa` | the `XA:Z:` tag is genuinely absent on most records, and the type says so. Absent is not the empty string: an empty `XA` would be emitted as a tag with no value. |
+//! | `Option<(i32, Vec<u32>, i32, String)>` return | the four things a successful global alignment produces (score, CIGAR, edit distance, MD string), or nothing. Grouping them in the `Some` means no caller can read an `NM` that was never computed. |
+//! | `String` for `MD` | built by pushing runs and mismatched bases; owned because it outlives the alignment scratch it was derived from. |
+//! | `#[derive(Debug, Clone)]` on `MemAln` and no `Copy` | the struct owns a `Vec` and a `String`, so duplicating it is a real cost and must be written as an explicit `.clone()` rather than happening silently at every assignment. |
+//!
 //! # Reading order
 //!
 //! 1. [`MemAln`], the output record, and [`MemAln::unmapped`].
