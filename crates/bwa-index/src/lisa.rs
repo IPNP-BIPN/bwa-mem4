@@ -54,6 +54,20 @@
 //! is in-memory: `sa` and `keys` are [`Packed40`], 5 bytes per element, little-endian low-5-bytes of
 //! a `u64`, no padding and no alignment requirement (element `i` occupies bytes `5i .. 5i+5`). At
 //! human-genome scale (`2L + 1` ~ 6.2e9 rows) that is ~31 GB per array instead of ~49.6 GB as `u64`.
+//!
+//! # Rust mechanics used in this file
+//!
+//! The learned-index path is ordinary safe Rust; what is worth pointing out is how it avoids copying
+//! and how it expresses "search with a hint".
+//!
+//! | Construct | What it means, and why it is here |
+//! |-----------|-----------------------------------|
+//! | `fn seeded_partition_point<P: Fn(usize) -> bool>(n, hint, pred)` | a binary search taking the PREDICATE as a type parameter rather than a function pointer. The compiler stamps out one specialised copy per call site and inlines the comparison, so the abstraction is free. The predicate is over indices, not values, because the value at an index costs a probe into a 31 GB array and the caller decides how to spend those probes. |
+//! | `std::cmp::Ordering` | the three-way result (`Less` / `Equal` / `Greater`) returned by comparisons. Used instead of a pair of booleans so that a comparison against a reference suffix is decided once and then matched on, rather than being run twice. |
+//! | `.iter().rev().map(\|&c\| 3 - c).collect::<Vec<u8>>()` | the reverse complement of a query, built in one pass. `rev` walks backwards, `map` complements, `collect` allocates exactly once because the iterator knows its length. The closure's `&c` pattern destructures the reference so `c` is the byte itself rather than a pointer to it. |
+//! | `&[u8]` query and reference | both are borrowed. The reference slice is a view into the memory-mapped 2L-space array, so a search touches only the pages it actually compares, and no part of the genome is copied to perform a lookup. |
+//! | `Packed40` / `Rmi` fields | plain owned members of `LearnedSa`. Ownership here means lifetime is tied to the index object, so nothing can outlive the arrays it points into. |
+//! | `wrapping_mul` / `wrapping_add` in the tests | the test-local pseudo-random generator wraps on purpose, exactly as in the `rand48` module. In test code the reason is only reproducibility, not format compatibility. |
 
 use crate::packed::Packed40;
 use crate::rmi::Rmi;

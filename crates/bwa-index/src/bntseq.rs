@@ -44,6 +44,23 @@
 //! 3. [`BntSeq::pos2rid`], then [`BntSeq::intv2rid`], then [`BntSeq::fetch_bounds`].
 //! 4. [`parse_ann`] / [`parse_amb`]: the file readers, which are straightforward.
 
+//! # Rust mechanics used in this file
+//!
+//! This is the crate's parsing module, so it is where Rust's error and string types show up rather
+//! than its pointer machinery. There is no `unsafe` here at all.
+//!
+//! | Construct | What it means, and why it is here |
+//! |-----------|-----------------------------------|
+//! | `Result<T>` (the crate alias for `Result<T, Error>`) | a return value that is either `Ok(v)` or `Err(e)`. Rust has no exceptions: a function that can fail says so in its type, and the caller cannot ignore it by accident. Every malformed `.ann` line therefore has to be handled somewhere explicit. |
+//! | `?` | "unwrap or return the error to my caller". It is what keeps the parsers readable: the happy path stays a straight line, and each `?` is a visible point where the function may exit early. |
+//! | `.ok_or_else(..)?` | converts an `Option` (a field that may not be there) into a `Result` with a message. `_else` means the message is only built when the field is actually missing, so the formatting cost is not paid on the happy path. |
+//! | `.map_err(..)` | replaces a library error (here `str::parse`'s) with this crate's `Error::IndexFormat`, carrying a label that says WHICH field of WHICH file failed. Without it the user would get "invalid digit found in string" and no location. |
+//! | `fn next_parse<'a, T, I>(..) where T: FromStr, I: Iterator<Item = &'a str>` | one generic helper covering every field of both files. `T: FromStr` means "any type that knows how to parse itself from text", so the same function yields an `i64` here and an `i32` there; the concrete `T` is inferred from the `let` annotation at the call site, which is why the callers all write their types out. |
+//! | `String` vs `&str` | `String` owns its bytes, `&str` borrows a window into someone else's. Contig names are `String` because `BntSeq` outlives the file text it was parsed from; the parsing helpers pass `&str` around because nothing there needs to own anything. |
+//! | `Path` / `PathBuf` | the same borrowed/owned pair for filesystem paths. Distinct from strings because a path is not required to be valid UTF-8 on either Linux or macOS. |
+//! | `#[derive(Debug, Clone)]` on the records | `Debug` gives `{:?}` printing, used by test failure messages; `Clone` an explicit deep copy. Neither is implicit in Rust, which is why they are requested by name. |
+//! | `.iter().filter(..).count()` | an iterator chain that reads as a sentence and compiles to the loop you would have written. No intermediate vector is built: `filter` yields lazily and `count` consumes. |
+
 use bwa_core::{Error, Result};
 use std::path::{Path, PathBuf};
 

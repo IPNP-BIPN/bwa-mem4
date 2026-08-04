@@ -5,6 +5,18 @@
 //! from 49.6 GB to 31 GB at genome scale — the two biggest RAM items of the learned index. Values are
 //! little-endian; only the low 5 bytes are stored.
 
+//! # Rust mechanics used in this file
+//!
+//! | Construct | What it means, and why it is here |
+//! |-----------|-----------------------------------|
+//! | `pub struct Packed40 { data: Vec<u8>, len: usize }` | the byte buffer is private, so the only ways in are `get` / `put` / the constructors. That is what keeps the "5 bytes per element, little-endian, no padding" rule stated once instead of at every call site. |
+//! | `u64::from_le_bytes(buf)` | assembles an integer from a fixed `[u8; 8]` in explicit little-endian order. `get` copies the 5 stored bytes into a ZEROED 8-byte buffer first: the last element has only 5 readable bytes, so an 8-byte load at its offset would read past the allocation, and the zero fill is simultaneously what clears the top 24 bits. |
+//! | `pub fn from_fn<F>(len, f) where F: Fn(usize) -> u64 + Sync` | a generic over the CALLER's closure. `Fn` means it may be called many times and does not mutate captured state; `Sync` means it is safe to call from several threads at once. Those two bounds are what let the body hand `f` to rayon, and the compiler rejects any closure that does not qualify, so the parallelism cannot be made unsound by a caller. |
+//! | `data.par_chunks_mut(5).enumerate().for_each(..)` | rayon's parallel iterator. `par_chunks_mut` cuts the buffer into non-overlapping 5-byte windows and hands each thread its own exclusive borrow, so "one element per slot, slots disjoint" is enforced by the split rather than by convention. `enumerate` supplies the chunk index, which IS the element index. No lock, no atomics, and no `unsafe`. |
+//! | `#[derive(Clone)]` | generates the obvious deep copy (the `Vec` is cloned). Written as a derive rather than by hand because there is nothing non-obvious to say. |
+//! | `#[inline]` on `get` / `len` | these are one-line accessors called inside binary searches over tens of gigabytes; inlining is what makes the byte assembly land in the loop instead of behind a call. |
+//! | `partition_point_in<P: Fn(u64) -> bool>` | passing behaviour as an argument. The search is written once and specialised by the compiler for each concrete closure, so it costs no more than writing the comparison inline. |
+
 use rayon::prelude::*;
 
 /// A 5-byte-per-element array of values in `[0, 2^40)`.

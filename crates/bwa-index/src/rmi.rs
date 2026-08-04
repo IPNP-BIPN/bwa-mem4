@@ -36,6 +36,22 @@
 //! bytes per leaf, so even a million leaves is 20 MB against ~31 GB of keys. That asymmetry is why
 //! `n_leaves` can be raised freely to shrink `leaf_err` until the last-mile search fits one or two
 //! cache lines.
+//!
+//! # Rust mechanics used in this file
+//!
+//! | Construct | What it means, and why it is here |
+//! |-----------|-----------------------------------|
+//! | `#[derive(Clone, Copy, Debug, Default)]` on `LinearModel` | four generated traits, each requested deliberately. `Copy` says the type is two `f64`s and may be duplicated by a bitwise copy, so passing one around never involves ownership questions or a move; that is only sound for small POD-like types, which is why it is not derived on the big structures. `Default` gives the zero model, and the doc above states what that degenerate model MEANS rather than leaving it as an accident of the derive. |
+//! | `f64` rather than `f32` | not a Rust idiom but a numeric decision the type makes visible: a 40-bit key needs more than `f32`'s 24-bit mantissa to be represented distinctly at all. |
+//! | `as usize` / `as u64` on predictions | converting a `f64` prediction into an index. Rust's `as` on floats SATURATES rather than wrapping or invoking undefined behaviour, so a wild prediction clamps instead of producing garbage. The bounded search that follows is what makes a wrong-but-valid prediction merely slow rather than incorrect. |
+//! | `struct Rmi { root: LinearModel, leaves: Vec<..>, .. }` | plain ownership: the RMI owns its models, and `lower_bound` borrows the key array it searches (`&Packed40`) instead of owning it. One structure, one lifetime, no reference counting. |
+//! | no `unsafe`, no `dyn` | every model is a concrete struct evaluated by an inlined method. The hierarchy is data, not a trait object graph, so a lookup is two multiply-adds and no indirect calls. |
+//!
+//! One consequence worth stating plainly, because it is the opposite of the rule everywhere else in
+//! this tree: floating-point results here may differ across compilers and architectures, and that is
+//! ACCEPTABLE. `Rmi::lower_bound` returns the same index a binary search would, because the
+//! prediction only chooses where to start looking and the bounded search then corrects it. The
+//! byte-identity contract is upheld by the search, not by the arithmetic.
 
 /// A single-variable linear model `pos ~= slope * key + intercept`, evaluated in `f64`.
 ///
