@@ -55,5 +55,30 @@ capsa = ["bwa-index/capsa"]
 default = ["fast-gzip"]
 fast-gzip = ["bwa-io/fast-gzip"]
 
+[features]
+# Suffix-array backend passthrough for `bwa-mem4 index`. `bwa-index` owns the actual choice (see
+# crates/bwa-index/Cargo.toml); this exists so the streaming CaPS-SA backend can be selected when
+# building the BINARY, which is the only way a user reaches `bwa-mem4 index`:
+#
+#     cargo build --release -p bwa-mem4 --features capsa
+#
+# Purely ADDITIVE, and deliberately so: `bwa-index`'s own `libsais` default is force-enabled across
+# the workspace by feature unification (bwa-seed/bwa-chain/bwa-mem all depend on bwa-index with
+# default features), so a `--no-default-features` here could not turn it off. `capsa` therefore
+# takes precedence over `libsais` inside `bwa-index` via `cfg(not(feature = "capsa"))` rather than
+# by being mutually exclusive with it. Byte-identical either way (a suffix array is unique); only
+# index build speed and peak build RAM change, never `mem` output.
+capsa = ["bwa-index/capsa"]
+
+# Fast gzip input passthrough. ON by default through `bwa-io`'s own default; this entry exists so
+# the binary's build line can still name it, and so `--no-default-features` has something to turn
+# off when a build wants the stock miniz_oxide inflate:
+#
+#     cargo build --release -p bwa-mem4 --no-default-features
+#
+# No external build tool: the backend is `zlib-rs`, pure Rust. See crates/bwa-io/Cargo.toml.
+default = ["fast-gzip"]
+fast-gzip = ["bwa-io/fast-gzip"]
+
 [lints]
 workspace = true
