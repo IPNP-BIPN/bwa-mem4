@@ -18,6 +18,31 @@
 //! (64 u8 lanes) is a follow-up (needs the k-mask blend variant). The AVX2 kernels are validated
 //! byte-identical to `ksw_extend2` by a force-run test executed under Rosetta (`avx2_verify`).
 //!
+//! # Rust mechanics used in this file
+//!
+//! The crate note explains the four features (`cfg`, run-time feature detection, `target_feature`,
+//! and the kernel macro). Three details are specific to this file.
+//!
+//! **The macro is the anti-drift device.** `define_sw_kernel!` is instantiated four times, once per
+//! (instruction set, lane width). Written by hand, those four copies of the affine-gap recurrence
+//! would diverge under maintenance, and a diverged lane does not fail to compile: it silently
+//! produces a different alignment for some fraction of reads. The macro makes "the four kernels
+//! implement the same recurrence" a property of the source rather than of the reviewer's attention.
+//! Its parameters are the things that legitimately differ (lane count, element type, the intrinsic
+//! names, the `#[target_feature]` string), and nothing else may.
+//!
+//! **The `unsafe` is bounded by two separate claims, and both are written at each call site.** One
+//! is architectural, that the ISA was detected. The other is numeric, that this job's values fit the
+//! lane width being used: the `SAFETY` notes say "U8_LEN bounds keep all values and positions in u8"
+//! or the i16 equivalent. The second claim is what the length-binning above exists to establish, so
+//! the dispatch and the safety argument are the same piece of reasoning read twice.
+//!
+//! **Sorting jobs by length is result-preserving, and that is a real argument rather than an
+//! assumption.** Each job's extension depends only on its own `(query, target, h0, w)`, so the order
+//! in which jobs are packed into lanes cannot change any job's answer, only how well the lanes are
+//! filled. That is the reason a plain `sort_by_key` is allowed here while the dedup pass in
+//! `bwa-mem` may not use one.
+//!
 //! # Order to read this file in
 //!
 //! 1. [`batched_extend`], the entry point: it only picks a path.
