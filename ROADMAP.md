@@ -71,6 +71,14 @@ Trois gates : `scripts/check.sh` (fmt/clippy/tests), `scripts/opt_parity.sh` (58
 d'options comparees `cmp` au binaire C), `scripts/alt_parity.sh` + `scripts/giab30x_pe.sh` (le WGS
 complet). Les deux premiers tournent en CI a chaque push.
 
+Un quatrieme harnais, `scripts/x86_docker.sh`, fait tourner la parite et la mesure de RAM sur
+**x86_64** depuis une machine Apple Silicon, dans un conteneur `linux/amd64` (Rosetta expose `avx2`,
+donc ces noyaux s'executent reellement ; `avx512bw` non). Resultat au 2026-08-04 : 62 combinaisons
+sur 64 octet-identiques a l'oracle x86_64, les deux restantes etant le desaccord `-A 2` deja connu
+(205 enregistrements sur 8000, meme chiffre que depuis arm64, voir `DIVERGENCES.md` et l'upstream
+`bwa-mem2#297`). Ce harnais ne mesure PAS la vitesse : sous emulation les rapports ne se conservent
+pas, et c'est precisement la variable en cause dans le jalon v4.3.2.
+
 **Residus connus** : voir `DIVERGENCES.md`. Le principal n'est pas de nous : bwa-mem2 **ne s'accorde
 pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c'est le build arm64
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
