@@ -30,8 +30,8 @@
 //! items, so a producer that outruns its consumer BLOCKS rather than growing the queue without
 //! limit. That bound is what caps how many read batches and how many finished SAM buffers exist at
 //! once, and therefore caps peak memory on a 30x whole-genome run. The bound is in BATCHES, and a
-//! batch is `-K` bases which itself defaults to 10M per thread, so the depth is chosen from the
-//! batch size rather than fixed: see [`queue_depths`].
+//! batch is `-K` bases which itself defaults to 10M per thread, so a depth of one is already double
+//! buffering and anything deeper is measured in hundreds of megabytes: see [`queue_depths`].
 //!
 //! **Indexed parallel iteration.** `rayon`'s `.par_iter()` spreads a loop across the thread pool.
 //! The crucial property for this project is that it is INDEXED: results come back in input order,
@@ -1433,41 +1433,34 @@ impl Output {
     }
 }
 
-/// Batches the reader may run ahead of the aligner, and formatted SAM buffers the aligner may run
-/// ahead of the writer, when the batch is small enough for the queues to be free.
-///
-/// Neither can affect output: the main thread still consumes batches strictly in order, and the
-/// writer still receives them in that order. They are purely a memory/latency trade.
-const BATCH_READAHEAD_SHALLOW: usize = 2;
-const SAM_WRITEBEHIND_SHALLOW: usize = 3;
-
-/// Above this batch size, both queues drop to one. See [`queue_depths`] for why.
-///
-/// 32M bases is one `-t3` batch at the default `-K` of 10M per thread, so a laptop run keeps the
-/// deeper queues and a many-core run does not.
-const DEEP_QUEUE_MAX_BASES: usize = 32_000_000;
-
 /// How many batches may be in flight, as `(readahead, writebehind)`.
 ///
-/// The queues are bounded in BATCHES, and a batch is `-K` bases, which at the default `-K` of 10M
-/// per thread means the batch itself grows with `-t`. Two constants therefore did two different
-/// things depending on how the tool was invoked: at `-t1` they cost about 60 MB, and at `-t16` they
-/// cost about 800 MB of records and SAM text that nothing is reading yet. That is the whole of the
-/// memory gap against `fg-labs/bwa-mem3` reported in issue #25: measured on a 200 kb reference so
-/// the index contributes nothing, peak RSS was 1.53x the fork's at `-K` 10M and the ratio grew with
-/// `-K`, while at a small `-K` we were LIGHTER than the fork. The excess tracked `-K`, not the
-/// per-read state.
+/// One each way, which is double buffering: while the aligner works on a batch, the reader may have
+/// exactly one more ready and the writer may have exactly one still draining. Nothing deeper.
 ///
-/// So the depth is now a function of the batch size rather than a constant. Small batches keep the
-/// deeper queues, which is where they earn their keep: a stalling or slow-to-decompress input can
-/// be hidden behind compute for the cost of a few tens of megabytes. Large batches get one of each,
-/// because a single 160M-base batch already gives the reader plenty of runway and the second one
-/// buys latency tolerance nobody asked for at a price measured in gigabytes.
+/// It used to be 2 and 3, and those were the whole of the memory gap against `fg-labs/bwa-mem3`
+/// reported in issue #25. The queues are bounded in BATCHES, and a batch is `-K` bases, which at the
+/// default `-K` of 10M PER THREAD grows with `-t`. So the two constants meant something different at
+/// every invocation: measured on a 200 kb reference so the index contributes nothing to the peak,
+/// they cost about 100 MB at `-K` 10M and about 430 MB at `-K` 100M, all of it records and SAM text
+/// that nothing was reading yet. At a small `-K` we were already LIGHTER than the fork, which is
+/// what says the excess tracked the queue depth and not the per-read state the issue's Mechanism
+/// section named.
 ///
-/// `BWA4_QUEUE_DEPTH=read,write` overrides both, for measuring the trade rather than guessing at
-/// it. Out-of-range or unparseable values are ignored rather than clamped silently, so a typo in a
-/// benchmark script does not quietly change what is being measured.
-fn queue_depths(k_batch: usize) -> (usize, usize) {
+/// The depth those constants bought was not paying for itself. On chr21 with 500k pairs at `-t8`,
+/// native arm64, going from (2,3) to (1,1): plain FASTQ 19.72s -> 20.02s, gzipped input 15.32s ->
+/// 14.90s. Both differences are inside the run-to-run spread, and the gzipped case, the one a deeper
+/// queue is supposed to protect, came out slightly faster. A queue that does not hide latency is
+/// just memory.
+///
+/// `BWA4_QUEUE_DEPTH=read,write` raises them again, so the trade can be measured on a machine where
+/// input really is the bottleneck rather than argued about here. A value that does not parse, or
+/// that asks for a zero-length queue, is ignored rather than clamped silently: a typo in a benchmark
+/// script should not quietly change what is being measured.
+const BATCH_READAHEAD: usize = 1;
+const SAM_WRITEBEHIND: usize = 1;
+
+fn queue_depths() -> (usize, usize) {
     if let Ok(s) = std::env::var("BWA4_QUEUE_DEPTH") {
         if let Some((r, w)) = s.split_once(',') {
             if let (Ok(r), Ok(w)) = (r.trim().parse::<usize>(), w.trim().parse::<usize>()) {
@@ -1477,11 +1470,7 @@ fn queue_depths(k_batch: usize) -> (usize, usize) {
             }
         }
     }
-    if k_batch > DEEP_QUEUE_MAX_BASES {
-        (1, 1)
-    } else {
-        (BATCH_READAHEAD_SHALLOW, SAM_WRITEBEHIND_SHALLOW)
-    }
+    (BATCH_READAHEAD, SAM_WRITEBEHIND)
 }
 
 /// Overlap I/O with compute. A **reader** thread produces batches (opening the FASTQ *inside* the
@@ -1552,7 +1541,7 @@ fn run_pipeline<B: Send>(
         // consumer catches up, so the reader cannot run ahead of the aligner and accumulate
         // batches. That blocking is the memory bound: at roughly 10M bases per batch, an unbounded
         // queue would let a fast disk pull an entire whole-genome run into RAM.
-        let (readahead, writebehind) = queue_depths(k_batch);
+        let (readahead, writebehind) = queue_depths();
         let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<(B, u64)>(readahead);
         // Main -> writer. Carries one batch's finished SAM bytes as per-record pieces, already in
         // output order; the writer concatenates them into the sink's buffer rather than into a
@@ -2906,36 +2895,16 @@ struct PrepPair {
 mod tests {
     use super::*;
 
-    /// The queue depths are a memory decision, so what is pinned here is the SWITCH, not the
-    /// numbers: a small batch keeps the deeper queues, a large one drops to a single batch in
-    /// flight. Getting this backwards is exactly the regression issue #25 describes, and it is
-    /// invisible in the output (it changes only peak RSS), so nothing else would catch it.
+    /// The queue depths are a memory decision that is invisible in the output, so nothing else
+    /// would catch a regression here. What is pinned is that the default is double buffering and
+    /// that the override is honoured only when it parses to two usable depths.
     ///
-    /// The env override is deliberately not exercised here: `set_var` is process-global and the
-    /// test harness runs tests in threads, so a test that sets it would leak into whatever else is
-    /// running at that moment.
+    /// The env override itself is not exercised: `set_var` is process-global and the harness runs
+    /// tests in threads, so setting it here would leak into whatever else is running.
     #[test]
-    fn queue_depth_follows_batch_size() {
-        assert_eq!(
-            queue_depths(10_000_000),
-            (2, 3),
-            "one -t1 batch: deep queues"
-        );
-        assert_eq!(
-            queue_depths(DEEP_QUEUE_MAX_BASES),
-            (2, 3),
-            "boundary is inclusive"
-        );
-        assert_eq!(
-            queue_depths(DEEP_QUEUE_MAX_BASES + 1),
-            (1, 1),
-            "past the boundary, one batch in flight"
-        );
-        assert_eq!(
-            queue_depths(160_000_000),
-            (1, 1),
-            "a -t16 batch at the default -K"
-        );
+    fn queue_depth_defaults_to_double_buffering() {
+        assert_eq!(queue_depths(), (BATCH_READAHEAD, SAM_WRITEBEHIND));
+        assert_eq!((BATCH_READAHEAD, SAM_WRITEBEHIND), (1, 1));
     }
 
     /// Two SAM records against a one-contig header, as the aligner would have formatted them.
