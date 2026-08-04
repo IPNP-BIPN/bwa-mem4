@@ -94,6 +94,35 @@ pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
 (upstream `bwa-mem2#297`, ouvert depuis ce projet).
 
+## Campagne perf : passer devant le fork a -t16 (2026-08-04, suite)
+
+Point de depart : dans le regime du gist de @nh13 (GRCh38, `-t16`, `-K` par defaut, entree gzippee,
+5M paires), le fork etait devant de 1,17x en mur. Point d'arrivee : **5 victoires sur 5, rapport
+0,963 a 0,992, meilleur temps 38,66 s contre 39,72 s**.
+
+Ce qui a paye, dans l'ordre ou ca a ete trouve :
+
+1. **Fenetre de prefetch SA 32 -> 128** (voir la section suivante). 1,17x -> 1,14x.
+2. **Chargement d'index par `pread` parallele et teardown supprime.** 1,14x -> 1,08x.
+3. **Lecture demarree avant le chargement de l'index.** Le thread lecteur naissait dans le pipeline,
+   donc apres 10 Go d'index en memoire ; inflater et parser le premier lot de 160M bases coute ~1 s
+   et le chargement 1,8 s. Ils se recouvrent desormais. 6,43 s -> 5,85 s sur 500k paires a `-t16`.
+4. **Recouvrement des lots.** Un lot traversait ses etages en serie et ils ne remplissent pas le pool
+   egalement : align 98,9 % d'occupation, rescue 86 %, dedup 69 %, encode 29 %. La queue fine du lot
+   N tourne maintenant contre l'align du lot N+1, le seul etage qui absorbe tous les coeurs. Deux
+   lots en vol, l'ordre de sortie reste porte par l'ordre de retrait, pas par l'ordre d'achevement.
+   Cout : ~2,2 GB de RSS en plus (13,5 -> 15,7 GB), et c'est le poste qui a rendu la victoire
+   possible.
+5. **PGO**, cycle reproductible dans le conteneur (`scripts/docker_gates.sh`, `llvm-tools` dans
+   l'image) : -4 % de CPU. Contrairement a ce que le gist observait sur sa machine.
+
+Negatifs enregistres : la fenetre lockstep du seeding (`BWA4_LOCKSTEP_N`) est deja optimale a 16 sur
+un vrai index (32 : 18,8 s de seeding, 64 : 20,0 s, 128 : 20,2 s contre 17,0 s), et la
+deduplication des lookups SA ne paie pas (section suivante).
+
+Le CPU etait deja passe sous celui du fork avant le recouvrement (0,96), ce qui disait que le travail
+restant n'etait pas du calcul mais du remplissage de pool. C'est ce que le point 4 est allé chercher.
+
 ## Campagne perf : la resolution du suffix array (2026-08-04)
 
 Profil du regime du gist de @nh13 (GRCh38, `-t16`, `-K` par defaut, entree gzippee) : l'etage

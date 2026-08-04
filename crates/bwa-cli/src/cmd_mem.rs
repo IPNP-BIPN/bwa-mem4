@@ -1588,7 +1588,8 @@ fn run_pipeline<B: Send>(
     // Already produced by a reader the CALLER started, so that reading and inflating the first
     // batch overlaps the index load instead of queueing behind it. See `spawn_reader`.
     batch_rx: std::sync::mpsc::Receiver<(B, u64)>,
-    process: impl Fn(B, u64) -> Vec<Vec<u8>>,
+    // `Sync` because two batches are processed at once, on different threads.
+    process: impl Fn(B, u64) -> Vec<Vec<u8>> + Sync,
     // `-v`, so the batch count obeys the same quiet switch as bwa's own progress lines. It is a
     // measurement instrument (see `crates/bwa-cli/tests/batch_count.rs`), so it is on by default.
     verbose: i32,
@@ -1653,6 +1654,26 @@ fn run_pipeline<B: Send>(
         // BLOCKING operations can be timed apart from the compute between them. `recv` returning
         // `Err` is exactly the iterator's stop condition (the sender was dropped), so the loop is
         // semantically identical to the `for` it replaces.
+        // The batch whose `process` is currently running, if any. Holding ONE means two batches are
+        // in flight at a time: the one being started and the one still finishing.
+        //
+        // Why that is worth a thread. A batch walks its stages in sequence (encode, align, rescue,
+        // dedup, emit) and they do not fill the pool equally: measured at `-t16` on GRCh38, align
+        // keeps it 98.9% busy but rescue is at 86%, dedup at 69% and encode at 29%. Run one batch at
+        // a time, those low-occupancy stages are wall clock with half the machine idle, and over ten
+        // batches that is seconds. Overlapped, batch N's thin tail runs against batch N+1's align,
+        // which is the one stage that can absorb every core.
+        //
+        // Output order is untouched, and not by luck: the handle is joined and its bytes sent to the
+        // writer BEFORE the next batch's handle takes its place, so the writer still sees batches in
+        // input order. Only the order in which work is DONE changes, and no batch's result depends
+        // on another's (`-K` fixes the boundaries, and the tie-break hash keys on the global read id
+        // rather than on anything batch-local).
+        //
+        // The cost is one more resident batch: records and regions for two batches instead of one,
+        // on top of the reader's queue. That is the same currency `queue_depths` spends, and it is
+        // spent here because this is where it buys wall clock rather than latency tolerance.
+        let mut inflight: Option<std::thread::ScopedJoinHandle<'_, Vec<Vec<u8>>>> = None;
         loop {
             // Blocked here == starved by the reader. Charged to `wait_read`, which is the one
             // number that says whether input (decompress + parse) is the bottleneck.
@@ -1663,15 +1684,32 @@ fn run_pipeline<B: Send>(
             stage_time::add(Stage::WaitRead, t_wait.elapsed());
             n_batches += 1;
             stage_time::count_batch();
-            // This batch's complete SAM text, all records concatenated in read order.
-            let buf = process(batch, base_id);
-            // Blocked here == throttled by the writer (a slow sink, or BGZF/htslib backpressure).
-            let t_send = std::time::Instant::now();
-            let sent = sam_tx.send(buf);
-            stage_time::add(Stage::WaitWrite, t_send.elapsed());
-            if sent.is_err() {
-                break; // writer exited; its error surfaces on join below
+            // Start this batch, THEN retire the previous one: reversing the two lines would be the
+            // old serial pipeline with extra threads.
+            // `move` so the worker OWNS its batch and id; `process` is borrowed, which is why it
+            // has to be `Sync`.
+            // `&process` is what moves into the worker, not `process` itself: the closure is shared
+            // between the two batches in flight, so it is borrowed and must be `Sync`.
+            let process_ref = &process;
+            let started = scope.spawn(move || process_ref(batch, base_id));
+            if let Some(prev) = inflight.replace(started) {
+                let buf = prev.join().expect("batch worker panicked");
+                // Blocked here == throttled by the writer (a slow sink, or BGZF/htslib backpressure).
+                let t_send = std::time::Instant::now();
+                let sent = sam_tx.send(buf);
+                stage_time::add(Stage::WaitWrite, t_send.elapsed());
+                if sent.is_err() {
+                    break; // writer exited; its error surfaces on join below
+                }
             }
+        }
+        // The last batch has no successor to overlap with, so it is retired here. A send failure
+        // needs no branch: the writer's own error is what surfaces, on the join below.
+        if let Some(prev) = inflight.take() {
+            let buf = prev.join().expect("batch worker panicked");
+            let t_send = std::time::Instant::now();
+            let _ = sam_tx.send(buf);
+            stage_time::add(Stage::WaitWrite, t_send.elapsed());
         }
         drop(sam_tx);
         // Reported because it is the one number that says whether this pipeline did anything: the
