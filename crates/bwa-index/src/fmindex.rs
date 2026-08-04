@@ -51,7 +51,6 @@
 //! 6. [`FmIndex::get_sa_batch`] and [`FmIndex::prefetch_occ`]: latency hiding only, no new logic.
 
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use bwa_core::Result;
@@ -329,6 +328,60 @@ fn rd_i64(bytes: &[u8], cursor: &mut usize) -> i64 {
     v
 }
 
+/// Fill `dst` from `file` starting at byte `offset`, using every core.
+///
+/// The three payload arrays of a human index are 6.2 GB, 0.78 GB and 3.1 GB. Reading them with one
+/// sequential `read_exact` is one thread doing a 10 GB memcpy out of the page cache, and on a warm
+/// cache that is what the whole load costs: about 2.4 s against the C fork's 1.8 s, measured on a
+/// GRCh38 index in tmpfs. Splitting the copy across the pool takes it to well under a second, and
+/// the only thing that changes is which thread copies which byte.
+///
+/// `read_exact_at` (POSIX `pread`) is what makes that legal without a lock: it takes the offset as an
+/// argument instead of using the file's shared cursor, so N threads can read N disjoint ranges of
+/// the same descriptor with no seeking and no interference. There is no such thing on Windows, hence
+/// the `cfg`; the sequential fallback there is correct, just slower.
+///
+/// # Parameters
+/// * `file`: the open index file. Not advanced: every read is positional, so the caller's cursor is
+///   untouched and the caller must therefore pass explicit offsets.
+/// * `offset`: absolute byte offset in the file of `dst[0]`.
+/// * `dst`: destination bytes, filled completely or an error is returned.
+///
+/// # Errors
+/// The first chunk read that fails or hits end-of-file early. A short file is an error here, not a
+/// partially filled buffer: the caller is about to `set_len` on these bytes.
+#[cfg(unix)]
+fn read_at_parallel(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> Result<()> {
+    use rayon::prelude::*;
+    use std::os::unix::fs::FileExt;
+
+    // One chunk per worker, with a floor so a small array is not split into slivers whose per-chunk
+    // syscall overhead exceeds the copy they perform.
+    const MIN_CHUNK: usize = 8 << 20;
+    let workers = rayon::current_num_threads().max(1);
+    let chunk = (dst.len() / workers).max(MIN_CHUNK);
+    dst.par_chunks_mut(chunk)
+        .enumerate()
+        .try_for_each(|(i, part)| -> Result<()> {
+            // `chunk` is the stride every earlier part used, so part `i` starts exactly there.
+            file.read_exact_at(part, offset + (i * chunk) as u64)?;
+            Ok(())
+        })
+}
+
+/// Sequential fallback: same contract as the parallel version, for targets without `pread`.
+#[cfg(not(unix))]
+fn read_at_parallel(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(dst)?;
+    Ok(())
+}
+
+/// Cached `BWA4_SA_WINDOW`, read once: a `getenv` per batched lookup would be its own cost.
+static SA_WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 impl FmIndex {
     /// Load `<prefix>.bwt.2bit.64` and `<prefix>.0123`.
     ///
@@ -362,11 +415,14 @@ impl FmIndex {
         // cache -> aligned buffer) per array, so load stays fast; `cp_occ`'s 64-byte alignment,
         // which the file's offset-48 layout denies an in-place mmap, is satisfied because the
         // destination `Vec<CpOcc>` is freshly allocated and therefore aligned.
-        let mut bwt_file = std::fs::File::open(sibling(prefix, "bwt.2bit.64"))?;
+        let bwt_file = std::fs::File::open(sibling(prefix, "bwt.2bit.64"))?;
+        /// Bytes before the first payload array: `ref_seq_len` plus `count[5]`, six little-endian
+        /// i64. Every payload offset below is measured from here.
+        const HEADER_BYTES: u64 = 48;
 
         // ---- Header: ref_seq_len, then count[5] (six i64, little-endian, 48 bytes) -----------
         let mut header = [0u8; 48];
-        bwt_file.read_exact(&mut header)?;
+        read_at_parallel(&bwt_file, 0, &mut header)?;
         let mut cursor = 0usize;
         // First header field: the BWT ROW count, 2L + 1 (2L reference bases plus the sentinel row).
         // Every later size in the file is derived from it, so it is read before anything else.
@@ -430,7 +486,7 @@ impl FmIndex {
             // four: `cp_occ` is 6.2 GB on GRCh38 and every `get_occ` lands on it at a computed,
             // unpredictable address. See `crate::hugepage` for why this cannot change output.
             crate::hugepage::advise_hugepage(cp_occ.as_ptr() as *const u8, cp_bytes);
-            bwt_file.read_exact(dst)?;
+            read_at_parallel(&bwt_file, HEADER_BYTES, dst)?;
             cp_occ.set_len(cp_size);
         }
 
@@ -440,7 +496,7 @@ impl FmIndex {
             let dst = std::slice::from_raw_parts_mut(sa_ms_byte.as_mut_ptr() as *mut u8, sa_size);
             // 0.78 GB on GRCh38, walked randomly by `get_sa` alongside `sa_ls_word`.
             crate::hugepage::advise_hugepage(sa_ms_byte.as_ptr() as *const u8, sa_size);
-            bwt_file.read_exact(dst)?;
+            read_at_parallel(&bwt_file, HEADER_BYTES + cp_bytes as u64, dst)?;
             sa_ms_byte.set_len(sa_size);
         }
 
@@ -451,14 +507,24 @@ impl FmIndex {
             let dst = std::slice::from_raw_parts_mut(sa_ls_word.as_mut_ptr() as *mut u8, ls_bytes);
             // 3.1 GB on GRCh38: the other half of every `get_sa` lookup.
             crate::hugepage::advise_hugepage(sa_ls_word.as_ptr() as *const u8, ls_bytes);
-            bwt_file.read_exact(dst)?;
+            read_at_parallel(
+                &bwt_file,
+                HEADER_BYTES + cp_bytes as u64 + sa_size as u64,
+                dst,
+            )?;
             sa_ls_word.set_len(sa_size);
         }
 
         // Trailing header field: the one BWT ROW (not a reference position) whose suffix is the
         // whole text, i.e. the row with `sa[row] == 0`. Only `backward_ext` reads it.
+        // Positional too: the three payload reads above never touched the file cursor, so it still
+        // sits just past the header and a plain `read_exact` here would read the wrong eight bytes.
         let mut sentinel_buf = [0u8; 8];
-        bwt_file.read_exact(&mut sentinel_buf)?;
+        read_at_parallel(
+            &bwt_file,
+            HEADER_BYTES + cp_bytes as u64 + sa_size as u64 + ls_bytes as u64,
+            &mut sentinel_buf,
+        )?;
         let sentinel_index = i64::from_le_bytes(sentinel_buf);
 
         // `one_hot_mask[y]` = the top `y` bits set. Built by the C's exact recurrence
@@ -873,10 +939,31 @@ impl FmIndex {
     ///   contents are ignored, never read.
     pub fn get_sa_batch(&self, positions: &[i64], out: &mut [i64]) {
         debug_assert_eq!(positions.len(), out.len());
-        // Window width: how many independent LF-walks are kept in flight. Chosen to be enough
-        // outstanding misses to saturate the memory system while `sp`/`off`/`slot` stay small
-        // enough to live in registers/L1. Changing it alters speed only, never results.
-        const W: usize = 32;
+        // Window width: how many independent LF-walks are kept in flight, which is how many DRAM
+        // misses are outstanding at once. This is the single hottest number in the aligner on a
+        // whole-genome run: SA resolution is 42.5M random lookups per 500k pairs and it dominates
+        // chain building, which in turn dominates the align stage.
+        //
+        // Swept on GRCh38 at -t16, 500k pairs, cost per lookup: W=8 369 ns, 16 272 ns, 32 211 ns,
+        // 64 185 ns, 96 162 ns, 128 152 ns, 192 147 ns, 256 144 ns. It was 32. Past 128 the curve is
+        // flat and the per-call stack arrays (`sp`/`off`/`slot`, 13 bytes a slot) start crowding L1,
+        // so 128 is where the knee is rather than where the minimum is.
+        //
+        // Width changes how many walks overlap, never which rows are visited or in what order a
+        // given walk proceeds, so it cannot move a byte of output. `BWA4_SA_WINDOW` narrows it at
+        // run time for sweeping on another machine.
+        const W: usize = 128;
+        // Slots actually kept in flight this call. `W` is the compile-time ceiling (the arrays are
+        // fixed-size), `BWA4_SA_WINDOW` narrows it so the width can be swept on a machine without
+        // rebuilding. Width changes how many misses overlap, never which rows are visited, so it
+        // cannot move a byte of output.
+        let width = *SA_WINDOW.get_or_init(|| {
+            std::env::var("BWA4_SA_WINDOW")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|w| (1..=W).contains(w))
+                .unwrap_or(W)
+        });
         // Read one SAMPLED suffix-array entry: `p` is a BWT row that is a multiple of 8, and the
         // result is a 2L-space reference position reassembled from its split 8+32-bit storage.
         let sa = |p: i64| -> i64 {
@@ -887,7 +974,7 @@ impl FmIndex {
         let mut base = 0usize;
         while base < positions.len() {
             // Elements in this window: W, or fewer for the final partial window.
-            let w = (positions.len() - base).min(W);
+            let w = (positions.len() - base).min(width);
             // Per-slot walk state, indexed by the LOCAL index `j` in `0..w` (global index is
             // `base + j`). `sp[j]` is slot `j`'s current BWT ROW, `off[j]` its LF step count, so
             // the same invariant as `get_sa` holds per slot: answer == sa[sp[j]] + off[j].

@@ -1620,6 +1620,30 @@ fn run_pipeline<B: Send>(
     })
 }
 
+/// Hand the index to the operating system instead of freeing it.
+///
+/// The FM index and the packed reference are about 10 GB on a human genome, spread over three large
+/// allocations plus a memory map. Dropping them walks the allocator's structures and returns the
+/// pages a region at a time, and that teardown happens after the last SAM byte has already been
+/// written, so every millisecond of it is wall clock the user waits for nothing. `mem::forget` skips
+/// it; the process is about to exit, and exit reclaims every page at once anyway.
+///
+/// This is a leak in the strict sense and it is deliberate, so it is worth being precise about why
+/// it is sound HERE and would not be in general:
+///
+/// * Nothing observes these values afterwards. `run` returns immediately after this call, and the
+///   output sink was already flushed and closed by the writer thread.
+/// * Neither type owns a resource whose release is externally visible: no temporary file to unlink,
+///   no lock to hand back. The memory map's descriptor is closed by the kernel at exit like any
+///   other.
+/// * It is not a growth leak. It happens once, at the end, to values that lived for the whole run.
+///
+/// If either type ever gains a side effect on drop, this has to go.
+fn forget_index(fm: bwa_index::FmIndex, bns: bwa_index::BntSeq) {
+    std::mem::forget(fm);
+    std::mem::forget(bns);
+}
+
 /// Run `bwa-mem4 mem` end to end: build options, load the index, write the SAM header, then stream
 /// batches through the align-and-format pipeline (single-end here, paired-end via [`run_pe`]).
 ///
@@ -1915,6 +1939,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         stage_time::dump(t_run.elapsed());
         stage_time::barrier::dump();
         stage_time::barrier::dump();
+        forget_index(fm, bns);
         return Ok(());
     }
 
@@ -2010,6 +2035,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Last, because it is the widest view: the others break down one stage, this one accounts for
     // all of them. Runs on the main thread, where the stage accumulators live.
     stage_time::dump(t_run.elapsed());
+    forget_index(fm, bns);
     Ok(())
 }
 
