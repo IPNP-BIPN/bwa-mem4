@@ -5,9 +5,11 @@
 #
 #   ARCH=amd64 (default) — Docker Desktop runs the image under Rosetta. `avx2` is exposed, so those
 #     kernels really execute; `avx512bw` is not, so those never do. Correctness, parity and memory
-#     are meaningful here. WALL TIME IS NOT: emulation taxes instruction mixes unequally, which is
-#     exactly the variable under test when comparing one vectorised kernel to another. Issues #20,
-#     #27, #32 and #33 need native x86_64 hardware and this harness cannot stand in for it.
+#     are meaningful here. TIMINGS ARE EMULATED, and emulation does not tax every instruction mix
+#     equally, so an absolute second here means nothing about a real x86_64 box. What CAN be read
+#     from it is the RATIO between two binaries running under the same emulator, and how far that
+#     ratio sits from the same pair's ratio measured natively on arm64 — run both and the harness
+#     prints the two side by side. Every emulated line is labelled as such.
 #
 #   ARCH=arm64 — the image runs NATIVELY on Apple Silicon. Timings here are real, and comparable to
 #     a host run, which is what makes `bench` worth having. The AVX2 and AVX-512 paths do not exist
@@ -18,11 +20,16 @@
 #   scripts/docker_gates.sh check     # fmt + clippy -D warnings + workspace tests, in the container
 #   scripts/docker_gates.sh parity    # opt_parity.sh against the platform's bwa-mem2 oracle
 #   scripts/docker_gates.sh rss       # peak RSS vs -t, bwa-mem4 against the fork, both -K regimes
-#   scripts/docker_gates.sh bench     # wall time; refuses to run under emulation
+#   scripts/docker_gates.sh bench     # wall time, N reps alternated, median reported
 #   scripts/docker_gates.sh all       # build, check, parity, rss
 #   scripts/docker_gates.sh shell     # interactive container, both binaries on PATH
 #
 #   ARCH=arm64 scripts/docker_gates.sh bench
+#   REF=work/chr21arm/chr21.fa R1=work/r1_500k.fq R2=work/r2_500k.fq REPS=3 scripts/docker_gates.sh bench
+#
+# BENCH FIXTURE. By default the tiny 200 kb reference is used, which is fine for a smoke run and
+# useless for a performance claim: the index fits in cache and the seeding work is unrepresentative.
+# Point REF/R1/R2 at a real index and real reads for anything that will be quoted.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$PWD"
@@ -140,24 +147,36 @@ cmd_rss() {
     done"
 }
 
-# Wall time. Refuses to run on amd64, on purpose: under emulation the number would look like a
-# measurement and would not be one. See the header.
+# Wall time. bwa-mem4 against the fork and against bwa-mem2. The loop itself lives in
+# scripts/bench_in_container.sh; this half only resolves the fixture and hands it over.
+#
+# On amd64 the run is emulated. Read the RATIO between two binaries under the same emulator, never
+# the seconds, and compare that ratio against the arm64 native one before quoting anything.
 cmd_bench() {
-  if [ "$ARCH" = amd64 ]; then
-    echo "REFUSED: amd64 images run under emulation here, so wall time is not a measurement."
-    echo "Use ARCH=arm64 for a native container run, or a native x86_64 machine for #20/#27/#32/#33."
-    exit 1
+  local ref r1 r2
+  if [ -z "${REF:-}" ]; then
+    cmd_fixture
+    ref=/build/pt/tiny.fa; r1=/build/pt/big_1.fq; r2=/build/pt/big_2.fq
+  else
+    # Host paths become container paths: the repo is mounted at /work.
+    ref="/work/${REF#./}"; r1="/work/${R1#./}"; r2="/work/${R2#./}"
   fi
-  cmd_fixture; cmd_fork
-  run "$IMAGE" bash -c "
-    cd /build/pt
-    printf '%-10s %-4s %-8s\n' tool -t wall_s
-    for t in 1 4 8 16; do
-      for tool in /build/fork/bwa-mem3 /build/target/release/bwa-mem4; do
-        s=\$( { /usr/bin/time -f '%e' \$tool mem -t \$t -K $CHUNK tiny.fa big_1.fq big_2.fq >/dev/null; } 2>&1 | tail -1 )
-        printf '%-10s %-4s %-8s\n' \"\$(basename \$tool)\" \"\$t\" \"\$s\"
-      done
-    done"
+  cmd_fork
+  fetch_oracle >/dev/null 2>&1 || true
+  local label="$PLATFORM"
+  if [ "$ARCH" = amd64 ]; then
+    label="$PLATFORM  EMULATED (Rosetta) - ratios only, the seconds mean nothing on their own"
+  else
+    label="$PLATFORM  NATIVE"
+  fi
+  run -e BENCH_REF="$ref" -e BENCH_R1="$r1" -e BENCH_R2="$r2" \
+      -e BENCH_REPS="${REPS:-3}" -e BENCH_THREADS="${THREADS:-1 4 8 16}" \
+      -e BENCH_CHUNK="$CHUNK" -e BENCH_LABEL="$label" \
+      "$IMAGE" bash -c '
+        cp /oracle/bwa-mem2* /usr/local/bin/ 2>/dev/null && chmod +x /usr/local/bin/bwa-mem2* 2>/dev/null || true
+        TOOLS="/build/fork/bwa-mem3 /build/target/release/bwa-mem4"
+        command -v bwa-mem2 >/dev/null && TOOLS="bwa-mem2 $TOOLS"
+        BENCH_TOOLS="$TOOLS" bash /work/scripts/bench_in_container.sh'
 }
 
 cmd_shell() {
