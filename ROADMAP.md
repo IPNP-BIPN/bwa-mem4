@@ -3,9 +3,12 @@
 Une phase = une branche. Commits frequents ; PR vers `dev`, `dev` promu sur `main` a la release.
 Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.3 patche (oracle).
 
-**Version courante : 4.0.0.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
+**Version courante : 4.3.1.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
 mesures : chaque phase garde son resultat, y compris les negatifs, pour ne pas re-instruire deux fois
 la meme idee.
+
+La numerotation reste en 4.x et n'ira pas en 5.x : le binaire s'appelle `bwa-mem4`, la version suit
+le nom, comme les 3.x l'ont fait sous le nom `bwa-mem3`.
 
 | Phase | Branche | But | Statut |
 |---|---|---|---|
@@ -22,9 +25,29 @@ la meme idee.
 | 9b | `phase9b-gpu` | backend Metal du SW | **abandonnee**, backend retire (voir plus bas) |
 | 9c-9e | | recurrence bandedSWA, prefetch de seeding, vague perf | fait |
 | 10 | | ALT contigs, BAM/CRAM, CI, packaging, release 4.0.0 | fait |
-| 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | a faire |
+| 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | a faire, jalon v4.5.0 |
 
-## Statut (4.0.0)
+## Releases
+
+| Version | Date | Contenu |
+|---|---|---|
+| 4.0.0 / 4.0.1 | 2026-07-22 | ALT contigs, BAM/CRAM, packaging, CI |
+| 4.1.0 / 4.1.1 | 2026-07-23 | correctifs de release |
+| 4.2.0 | 2026-07-30 | vague perf (mate rescue, dedup, `.pac` vectorise, CaPS-SA), sonde par etage |
+| 4.3.0 | 2026-07-31 | `-x` route vers rammap, sous-commande `version`, credits bwa-mem3 / @nh13 |
+| 4.3.1 | 2026-08-04 | passe de documentation : couche mecanique Rust sur les 10 crates ; aucun changement de comportement |
+
+## Jalons ouverts (GitHub Projects nº3)
+
+| Jalon | Contenu | Etat |
+|---|---|---|
+| v4.5.0 | phase 11, gate GIAB `hap.py`/`vcfeval` ; suivi upstream `bwa-mem2#297` | ouvert |
+| v4.6.0 | SA-IS parallele (l'indexeur reste mono-thread sur le tableau de suffixes), structure de dedup incrementale | ouvert |
+
+Le jalon perf x86_64 (issues #20, #25, #27, #32, #33) reste ouvert : il demande une machine x86_64 et
+un WGS complet, pas une mesure sur Apple Silicon.
+
+## Statut (4.3.1)
 
 Parite mesuree sur un **WGS humain reel 32,9x** (GIAB HG002, 2x150), genome entier, pas un
 sous-echantillon, les deux aligneurs lisant le meme index sur disque (`scripts/giab30x_pe.sh`) :
