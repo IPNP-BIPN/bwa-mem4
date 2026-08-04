@@ -17,5 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # The repo arrives as a bind mount from macOS; keeping target/ in a named volume instead is what
 # makes rebuilds take seconds rather than minutes.
+# llvm-tools carries llvm-profdata, which is what merges the raw counters a
+# `-Cprofile-generate` build writes. Needed by the `pgo` step; harmless otherwise.
+RUN rustup component add llvm-tools-preview
+
 ENV CARGO_TARGET_DIR=/build/target
 WORKDIR /work

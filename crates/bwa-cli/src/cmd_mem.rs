@@ -1473,6 +1473,42 @@ fn queue_depths() -> (usize, usize) {
     (BATCH_READAHEAD, SAM_WRITEBEHIND)
 }
 
+/// The single-end reader's body, as a closure the caller hands to [`spawn_reader`] before loading
+/// the index. The paired twin is [`pe_read_batches`]; both exist for the same reason, which is that
+/// the first batch's read, inflate and parse should not queue behind a 10 GB index load.
+///
+/// # Parameters
+/// * `reads_path`: the FASTQ, gzipped or not. Owned, so the closure borrows nothing.
+/// * `k_batch`: `-K` in input bases; fixes the batch boundaries and therefore the output.
+fn se_read_batches(
+    reads_path: std::path::PathBuf,
+    k_batch: usize,
+) -> impl FnOnce(std::sync::mpsc::SyncSender<(Vec<Record>, u64)>) -> anyhow::Result<()> + Send + 'static
+{
+    move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
+        // Opened INSIDE the closure so the reader itself never crosses a thread boundary.
+        let mut reader = FastqReader::from_path(&reads_path)?;
+        // Number of reads emitted in all previous batches, i.e. the global 0-based id of this
+        // batch's first read. Invariant at the top of each turn: it equals the total length of every
+        // batch already sent. Must stay global across batches, since downstream tie-breaks hash it.
+        let mut base_id = 0u64;
+        loop {
+            // Up to `k_batch` INPUT BASES worth of reads; empty only at end of file.
+            let batch = reader.next_batch(k_batch)?;
+            if batch.is_empty() {
+                break;
+            }
+            // Read count, saved before the move so `base_id` can advance after the send.
+            let n = batch.len() as u64;
+            if tx.send((batch, base_id)).is_err() {
+                break;
+            }
+            base_id += n;
+        }
+        Ok(())
+    }
+}
+
 /// Overlap I/O with compute. A **reader** thread produces batches (opening the FASTQ *inside* the
 /// thread, so the reader never crosses a thread boundary: only the `Send` record batches do), the
 /// main thread aligns+formats each batch (internally parallel across the rayon pool) into one byte
@@ -1516,9 +1552,42 @@ fn queue_depths() -> (usize, usize) {
 /// Exactly one reader and one writer, and the main thread consumes batches sequentially, so record
 /// order in the output file equals record order in the input. Errors on either thread surface at
 /// `join`, which is why the send failures below only `break` rather than reporting.
+/// Start the reader thread NOW, before the caller loads the index.
+///
+/// The reader opens the FASTQ, inflates it if it is gzipped, and parses records; on a whole-genome
+/// run at the default `-K` the first batch is 160M bases and that work is on the order of a second.
+/// The index load is another 1.8 s. Done in sequence, as they were, the run pays for both before the
+/// first alignment starts; started here, they overlap and the run pays for the longer of the two.
+///
+/// The reader owns everything it touches (an owned path, the batch size) so it needs no borrow from
+/// the caller and can outlive this call. The channel is bounded at the same readahead depth the
+/// pipeline uses, so the reader still cannot run ahead and accumulate batches while the index is
+/// loading: it fills the queue and blocks, which is exactly the intended behaviour.
+///
+/// Output is unaffected. The reader produces the same batches in the same order with the same base
+/// ids; only the moment it starts changes.
+///
+/// # Returns
+/// The receiving half to hand to [`run_pipeline`], and the join handle, which must be joined after
+/// the pipeline so a reader error is not silently dropped.
+fn spawn_reader<B: Send + 'static>(
+    read_batches: impl FnOnce(std::sync::mpsc::SyncSender<(B, u64)>) -> anyhow::Result<()>
+        + Send
+        + 'static,
+) -> (
+    std::sync::mpsc::Receiver<(B, u64)>,
+    std::thread::JoinHandle<anyhow::Result<()>>,
+) {
+    let (readahead, _) = queue_depths();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(B, u64)>(readahead);
+    (rx, std::thread::spawn(move || read_batches(tx)))
+}
+
 fn run_pipeline<B: Send>(
     out: Output,
-    read_batches: impl FnOnce(std::sync::mpsc::SyncSender<(B, u64)>) -> anyhow::Result<()> + Send,
+    // Already produced by a reader the CALLER started, so that reading and inflating the first
+    // batch overlaps the index load instead of queueing behind it. See `spawn_reader`.
+    batch_rx: std::sync::mpsc::Receiver<(B, u64)>,
     process: impl Fn(B, u64) -> Vec<Vec<u8>>,
     // `-v`, so the batch count obeys the same quiet switch as bwa's own progress lines. It is a
     // measurement instrument (see `crates/bwa-cli/tests/batch_count.rs`), so it is on by default.
@@ -1541,8 +1610,7 @@ fn run_pipeline<B: Send>(
         // consumer catches up, so the reader cannot run ahead of the aligner and accumulate
         // batches. That blocking is the memory bound: at roughly 10M bases per batch, an unbounded
         // queue would let a fast disk pull an entire whole-genome run into RAM.
-        let (readahead, writebehind) = queue_depths();
-        let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<(B, u64)>(readahead);
+        let (_readahead, writebehind) = queue_depths();
         // Main -> writer. Carries one batch's finished SAM bytes as per-record pieces, already in
         // output order; the writer concatenates them into the sink's buffer rather than into a
         // second heap allocation.
@@ -1557,7 +1625,6 @@ fn run_pipeline<B: Send>(
         // sending half of the batch channel; the writer owns the output sink. Ownership is what
         // makes the single-writer property a compile-time fact rather than a convention: no other
         // thread can name `out` after this line, so no other thread can write to the sink.
-        let reader = scope.spawn(move || read_batches(batch_tx));
         let writer = scope.spawn(move || -> anyhow::Result<()> {
             // Rebound to make the move explicit: the sink now lives on this thread and nowhere else.
             let mut out = out;
@@ -1614,7 +1681,6 @@ fn run_pipeline<B: Send>(
             eprintln!("[M::main_mem] processed {n_batches} batches (-K {k_batch})");
         }
 
-        reader.join().expect("reader thread panicked")?;
         writer.join().expect("writer thread panicked")?;
         Ok(())
     })
@@ -1794,6 +1860,29 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         .unwrap_or(opt.chunk_size * i64::from(args.threads))
         .max(1) as usize;
 
+    // ================= Start reading before loading the index =================
+    //
+    // The reader opens the FASTQ, inflates it if gzipped and parses records; at the default `-K` on
+    // a 16-thread run that first batch is 160M bases, which is on the order of a second of work. The
+    // index load is another ~1.8 s. Started here rather than inside the pipeline, the two overlap
+    // and the run pays for the longer of them instead of their sum.
+    //
+    // The channel is bounded at the same readahead depth as before, so the reader still cannot
+    // accumulate batches while the index loads: it fills the queue and blocks. Output is unaffected,
+    // since the batches, their order and their base ids are identical either way.
+    let paired = args.reads2.is_some() || args.smart_pairing;
+    let (pe_batch_rx, se_batch_rx, reader) = if paired {
+        let (rx, h) = spawn_reader(pe_read_batches(
+            args.reads.clone(),
+            args.reads2.clone(),
+            k_batch,
+        ));
+        (Some(rx), None, h)
+    } else {
+        let (rx, h) = spawn_reader(se_read_batches(args.reads.clone(), k_batch));
+        (None, Some(rx), h)
+    };
+
     // ================= Load the index =================
     //
     // The two halves of a bwa index: `FmIndex` is the FMD index used for seeding (exact-match
@@ -1915,20 +2004,20 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     if args.reads2.is_some() || args.smart_pairing {
         // Cloned so the borrow of `args` ends before `args.reads` is borrowed in the same call.
         // `None` here means `-p`: one interleaved file.
-        let reads2 = args.reads2.clone();
         run_pe(
             &fm,
             &bns,
             &opt,
-            &args.reads,
-            reads2.as_deref(),
+            pe_batch_rx.expect("paired branch always has the paired receiver"),
             k_batch,
             out,
             pes0,
             args.verbose.unwrap_or(3),
         )?;
+        reader.join().expect("reader thread panicked")?;
         bwa_neon::matesw::cells::dump();
         bwa_neon::batched::extend_shape::dump();
+        bwa_mem::across::align_split::dump();
         bwa_mem::pe::rescue_rounds::dump();
         bwa_mem::primary::dedup_shape::dump();
         bwa_mem::pe::anchor_spread::dump();
@@ -1945,33 +2034,9 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
 
     // ================= Single-end pipeline =================
     //
-    // Reader thread: open the FASTQ here and stream fixed-`-K` batches with their cumulative base id.
-    // Owned copy of the input path, moved into the reader closure (which outlives `args`).
-    let reads_path = args.reads.clone();
-    // `tx` is the bounded reader -> main channel; sending blocks once the readahead depth is reached.
-    let read_batches =
-        move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
-            // Opened INSIDE the closure so the reader itself never crosses a thread boundary.
-            let mut reader = FastqReader::from_path(&reads_path)?;
-            // Number of reads emitted in all previous batches, i.e. the global 0-based id of this
-            // batch's first read. Invariant at the top of each turn: it equals the total length of every
-            // batch already sent. Must stay global across batches, since downstream tie-breaks hash it.
-            let mut base_id = 0u64;
-            loop {
-                // Up to `k_batch` INPUT BASES worth of reads; empty only at end of file.
-                let batch = reader.next_batch(k_batch)?;
-                if batch.is_empty() {
-                    break;
-                }
-                // Read count, saved before the move so `base_id` can advance after the send.
-                let n = batch.len() as u64;
-                if tx.send((batch, base_id)).is_err() {
-                    break;
-                }
-                base_id += n;
-            }
-            Ok(())
-        };
+    // The reader for this path was already started above, before the index load; `se_batch_rx` is
+    // its receiving half.
+    let batch_rx = se_batch_rx.expect("single-end branch always has the single-end receiver");
 
     // Main: seed -> chain -> BATCHED seed extension across the whole read batch (NEON backend),
     // mirroring bwa-mem2's mem_chain2aln_across_reads_V2. Chunked so extension parallelizes; each
@@ -2023,13 +2088,8 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         per_read_sam
     };
 
-    run_pipeline(
-        out,
-        read_batches,
-        process,
-        args.verbose.unwrap_or(3),
-        k_batch,
-    )?;
+    run_pipeline(out, batch_rx, process, args.verbose.unwrap_or(3), k_batch)?;
+    reader.join().expect("reader thread panicked")?;
     bwa_chain::chain_time::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
     // Last, because it is the widest view: the others break down one stage, this one accounts for
@@ -2510,6 +2570,65 @@ fn write_aln_se(
     .expect("write to Vec");
 }
 
+/// One batch of paired records plus the global id of its first pair, as the reader hands it over.
+/// Named because the closure type that produces it is otherwise long enough to be unreadable.
+type PeBatch = (Vec<(Record, Record)>, u64);
+
+/// Sending half of the reader-to-pipeline channel for paired input.
+type PeBatchSender = std::sync::mpsc::SyncSender<PeBatch>;
+
+/// The paired-end reader's body, as a closure the caller can hand to [`spawn_reader`] BEFORE the
+/// index is loaded.
+///
+/// Extracted from `run_pe` for exactly that reason: the reader used to be built inside the pipeline,
+/// which meant the first batch's read, inflate and parse could not begin until the 10 GB index was
+/// in memory. Nothing about what it produces changed.
+///
+/// # Parameters
+/// * `reads1`, `reads2`: mate files, or `reads1` alone for interleaved input under `-p`. Owned, so
+///   the closure borrows nothing and can be moved to a thread that outlives this call.
+/// * `k_batch`: `-K` in input bases; fixes the batch boundaries and therefore the output.
+fn pe_read_batches(
+    reads1: std::path::PathBuf,
+    reads2: Option<std::path::PathBuf>,
+    k_batch: usize,
+) -> impl FnOnce(PeBatchSender) -> anyhow::Result<()> + Send + 'static {
+    move |tx: std::sync::mpsc::SyncSender<(Vec<(Record, Record)>, u64)>| -> anyhow::Result<()> {
+        // Two files, or one interleaved file under `-p`.
+        // Exactly one of these is `Some` for the life of the closure; the pair of `Option`s is
+        // how the two reader types are held without a trait object. Both yield the same batch
+        // type, so the rest of the loop is shared.
+        let mut two: Option<PairedFastqReader> = None;
+        let mut one: Option<InterleavedFastqReader> = None;
+        match &reads2 {
+            Some(r2) => two = Some(PairedFastqReader::from_paths(&reads1, r2)?),
+            None => one = Some(InterleavedFastqReader::from_path(&reads1)?),
+        }
+        // Pairs (not reads) emitted in all previous batches, so the global 0-based id of this
+        // batch's first pair. Invariant at the top of each turn: it equals the summed length of
+        // every batch already sent. `mem_sam_pe` hashes it to break ties, so it must be global.
+        let mut base_pair = 0u64;
+        loop {
+            // Up to `k_batch` input bases worth of PAIRS; empty only at end of input.
+            let batch = match (two.as_mut(), one.as_mut()) {
+                (Some(r), _) => r.next_batch(k_batch)?,
+                (_, Some(r)) => r.next_batch(k_batch)?,
+                _ => unreachable!("one reader is always set"),
+            };
+            if batch.is_empty() {
+                break;
+            }
+            // Pair count, saved before the move so `base_pair` can advance after the send.
+            let n = batch.len() as u64;
+            if tx.send((batch, base_pair)).is_err() {
+                break;
+            }
+            base_pair += n;
+        }
+        Ok(())
+    }
+}
+
 /// Paired-end driver: per batch, align+dedup both ends of every pair, estimate insert sizes
 /// (`mem_pestat`), then emit paired SAM (`mem_sam_pe`). The pair index is global across batches (for
 /// the `hash` tie-break), matching bwa-mem2's `(n_processed>>1)+i`.
@@ -2533,9 +2652,9 @@ fn run_pe(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
-    reads1: &std::path::Path,
-    // `None` under `-p`: both mates come interleaved from `reads1`.
-    reads2: Option<&std::path::Path>,
+    // The reader is already running when this is called: `run` starts it before loading the index
+    // so the first batch's read, inflate and parse overlap the load. This is its receiving half.
+    batch_rx: std::sync::mpsc::Receiver<PeBatch>,
     k_batch: usize,
     out: Output,
     // `-I`: user-supplied insert-size distribution. When present bwa copies it per batch and never
@@ -2548,43 +2667,6 @@ fn run_pe(
     // Reader thread: open the mate files here and stream fixed-`-K` pair batches with the cumulative
     // pair id (global across batches for the `hash` tie-break, matching bwa-mem2's `(n_processed>>1)+i`).
     // Owned copies, so the closure can be moved onto the reader thread without borrowing the caller.
-    let (reads1, reads2) = (reads1.to_owned(), reads2.map(std::path::Path::to_owned));
-    let read_batches =
-        move |tx: std::sync::mpsc::SyncSender<(Vec<(Record, Record)>, u64)>| -> anyhow::Result<()> {
-            // Two files, or one interleaved file under `-p`.
-            // Exactly one of these is `Some` for the life of the closure; the pair of `Option`s is
-            // how the two reader types are held without a trait object. Both yield the same batch
-            // type, so the rest of the loop is shared.
-            let mut two: Option<PairedFastqReader> = None;
-            let mut one: Option<InterleavedFastqReader> = None;
-            match &reads2 {
-                Some(r2) => two = Some(PairedFastqReader::from_paths(&reads1, r2)?),
-                None => one = Some(InterleavedFastqReader::from_path(&reads1)?),
-            }
-            // Pairs (not reads) emitted in all previous batches, so the global 0-based id of this
-            // batch's first pair. Invariant at the top of each turn: it equals the summed length of
-            // every batch already sent. `mem_sam_pe` hashes it to break ties, so it must be global.
-            let mut base_pair = 0u64;
-            loop {
-                // Up to `k_batch` input bases worth of PAIRS; empty only at end of input.
-                let batch = match (two.as_mut(), one.as_mut()) {
-                    (Some(r), _) => r.next_batch(k_batch)?,
-                    (_, Some(r)) => r.next_batch(k_batch)?,
-                    _ => unreachable!("one reader is always set"),
-                };
-                if batch.is_empty() {
-                    break;
-                }
-                // Pair count, saved before the move so `base_pair` can advance after the send.
-                let n = batch.len() as u64;
-                if tx.send((batch, base_pair)).is_err() {
-                    break;
-                }
-                base_pair += n;
-            }
-            Ok(())
-        };
-
     // Seed -> chain -> BATCHED extension over both ends of every pair (interleaved c1,c2,...), then
     // per-read dedup. Regions are per-read independent, so this is byte-identical to the per-read
     // path; primary marking and pairing happen later, per bwa-mem2.
@@ -2787,7 +2869,9 @@ fn run_pe(
         bufs
     };
 
-    run_pipeline(out, read_batches, process, verbose, k_batch)
+    // The reader is joined by `run`, which owns its handle: it started the thread before the index
+    // load, so it is also the place that observes a reader error.
+    run_pipeline(out, batch_rx, process, verbose, k_batch)
 }
 
 /// Read pairs handed to one parallel mate-rescue task, derived from the batch rather than fixed.

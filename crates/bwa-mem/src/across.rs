@@ -558,6 +558,53 @@ struct SideJob {
     active: bool,
 }
 
+/// `BWA4_ALIGN_SPLIT=1`: where the align stage's CPU actually goes.
+///
+/// `BWA4_STAGE_TIME` shows align as one 77%-of-wall block and `BWA4_CHAIN_TIME` carves out the SA
+/// walk and the chain merge, which between them did not account for most of it. This splits the rest
+/// the same way the code is structured: seeding (round-1 SMEMs over the whole batch), then the
+/// banded-DP extension. Each counter is nanoseconds summed over every thread, so they are directly
+/// comparable with `/usr/bin/time`'s CPU figure and with each other.
+pub mod align_split {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    /// Time inside `mem_collect_smem_batched`, the round-1 SMEM collection.
+    pub static SEED_NS: AtomicU64 = AtomicU64::new(0);
+    /// Time inside the batched extension kernels, both sides, retries included.
+    pub static EXTEND_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe is on. Read once; the disabled path costs one atomic load per phase.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_ALIGN_SPLIT").is_some())
+    }
+
+    /// Run `f`, adding its duration to `counter` when the probe is on. Returns `f`'s value either
+    /// way, so call sites read the same whether the probe exists or not.
+    pub fn measure<T>(counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let t0 = std::time::Instant::now();
+        let out = f();
+        counter.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        out
+    }
+
+    /// Print the counters once, after the workers have joined. No-op unless enabled.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        eprintln!(
+            "[align-split] seeding={:.3}s extension={:.3}s (CPU, summed over threads)",
+            SEED_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            EXTEND_NS.load(Ordering::Relaxed) as f64 / 1e9,
+        );
+    }
+}
+
 /// Align a batch of reads (2-bit codes) through seeding, chaining, and **batched** extension,
 /// returning each read's alignment regions (pre-dedup), byte-identical to [`crate::align_read`].
 ///
@@ -612,7 +659,9 @@ pub fn align_reads_batched<B: SwBackend>(
     let refs: Vec<&[u8]> = reads.iter().map(|c| c.as_slice()).collect();
     // One vector of round-1 SMEMs per read, parallel to `reads`. At this point each SMEM carries an
     // SA *interval* (`k`, `s`), not yet resolved reference positions.
-    let per_read_smems = mem_collect_smem_batched(fm, &refs, opt);
+    let per_read_smems = align_split::measure(&align_split::SEED_NS, || {
+        mem_collect_smem_batched(fm, &refs, opt)
+    });
     if std::env::var_os("BWA4_DUMP_SMEMS").is_some() {
         for sm in &per_read_smems {
             eprintln!("SMEM tot={}", sm.len());
@@ -1263,18 +1312,20 @@ fn run_side<B: SwBackend>(
             .collect();
         // `opt.mat` is the flattened `ALPHABET_SIZE x ALPHABET_SIZE` substitution matrix.
         // `results` is parallel to `batch`, hence to `active_idxs`, not to `jobs`.
-        let results = backend.extend_batch(
-            &batch,
-            ALPHABET_SIZE,
-            &opt.mat,
-            opt.o_del,
-            opt.e_del,
-            opt.o_ins,
-            opt.e_ins,
-            w,
-            pen_clip,
-            opt.zdrop,
-        );
+        let results = align_split::measure(&align_split::EXTEND_NS, || {
+            backend.extend_batch(
+                &batch,
+                ALPHABET_SIZE,
+                &opt.mat,
+                opt.o_del,
+                opt.e_del,
+                opt.o_ins,
+                opt.e_ins,
+                w,
+                pen_clip,
+                opt.zdrop,
+            )
+        });
 
         // ---- step 3: acceptance test, then scatter or requeue each job ----
         for (lane, &job_idx) in active_idxs.iter().enumerate() {
