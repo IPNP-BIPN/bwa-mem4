@@ -133,6 +133,21 @@ Meme protocole que la correction ci-dessous, parce que c'est le seul qui a tenu 
 | changement | avant | apres | verdict |
 |---|---|---|---|
 | `panic = "abort"` dans `[profile.release]` | 40,27 s | **39,69 s** | garde, 5 victoires sur 5, ~1,4 % |
+| PGO entraine sur `testdata/tiny` seulement | 40,54 s | **38,42 s** | **garde, cable dans `release.yml`, ~4,7 %** |
+
+Le PGO est le plus gros gain verifie de la journee, et la surprise est la taille du jeu
+d'entrainement : `scripts/pgo.sh` avertit depuis longtemps qu'entrainer sur une petite reference
+profile les mauvais chemins (sur simule contre 2 Mbp, le mate rescue pese ~10 % du mur ; sur GIAB
+reel contre le genome entier, ~59 %). Mesure faite : entrainer sur la seule fixture `testdata/tiny`
+committee, puis aligner 500k paires reelles contre GRCh38, donne 38,42 s contre 40,54 s de CPU,
+quatre victoires sur quatre. Ce dont le PGO a besoin de cet entrainement, ce sont les branches prises
+par les boucles de seeding et de DP, et leur forme ne depend pas de la taille de la reference.
+
+Cable dans `.github/workflows/release.yml` : instrumentation, entrainement sur la fixture committee
+(`index` puis `mem`, les deux moities du code FM), fusion avec le `llvm-profdata` de la toolchain
+epinglee, reconstruction. Une compilation de plus par cible. Consequence a connaitre : un binaire de
+release n'est plus reproductible bit a bit par un simple `cargo build --release`, il l'est en
+rejouant cette recette.
 
 `panic = "abort"` retire les tables de deroulement et les points d'atterrissage : le binaire n'a rien
 a derouler, un panic ici est un bug et le processus ne detient rien que l'OS ne reprenne. Cargo

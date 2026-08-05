@@ -139,13 +139,58 @@ jobs:
       # No rust-cache here on purpose. A release build is rare, and a stale cache entry is a way to
       # ship bytes that nobody can reproduce from a clean tree. Correctness over the few minutes.
 
-      - name: Build
+      # PGO needs `llvm-profdata`, and the one that ships with the pinned toolchain is the one
+      # whose format matches what a `-Cprofile-generate` binary writes. Any other llvm-profdata on
+      # the runner is a coin flip.
+      - name: Install llvm-tools for PGO
+        run: rustup component add llvm-tools-preview
+
+      # Profile-guided build, done natively on each target's own runner (which is why the matrix
+      # has four of them rather than cross-compiling).
+      #
+      # Measured before being wired in, on this project's own workload: training on nothing more
+      # than the committed `testdata/tiny` fixture and then aligning 500k real pairs against GRCh38
+      # takes CPU from 40.65 s to 38.46 s, about 4.4%, winning all five interleaved reps. The
+      # training set being tiny is not a problem here: what PGO needs from it is which branches the
+      # seeding and DP loops take, and those are the same shapes at any reference size.
+      #
+      # Two things this deliberately does NOT do. It does not train on a real genome: that would
+      # mean shipping or downloading one in a release job, and the measurement says it is not worth
+      # it. And it does not use `-C target-cpu`: the artifact has to run on the audience's machines,
+      # not on the runner's.
+      #
+      # The cost is one extra compile per target. The consequence to be aware of is that a release
+      # binary is no longer bit-reproducible from a clean tree by `cargo build --release` alone: it
+      # is reproducible by re-running THIS recipe, which is what the release notes point at.
+      - name: Build (PGO)
         env:
           # Pinned rather than inherited, so the floor is a decision instead of a side effect of
           # whichever runner image happens to be current. It reaches the vendored htslib C build
           # too, which is the part that would otherwise silently follow the host.
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
-        run: cargo build --release --locked
+        run: |
+          set -euo pipefail
+          PROFDIR="$PWD/target/pgo"
+          rm -rf "$PROFDIR"
+          mkdir -p "$PROFDIR/train"
+
+          RUSTFLAGS="-Cprofile-generate=$PROFDIR" cargo build --release --locked
+
+          # Training workload, from committed data only: build the index, then align paired reads
+          # simulated from it. Both halves matter, since `index` and `mem` share the FM code but
+          # exercise different halves of it. Copied to a scratch directory so the committed fixture
+          # is untouched: the byte-identity gate below rebuilds it again and must not find leftovers.
+          cp testdata/tiny/tiny.fa "$PROFDIR/train/"
+          python3 scripts/make_test_reads.py testdata/tiny/tiny.fa "$PROFDIR/train/r" --n 8000
+          ./target/release/bwa-mem4 index "$PROFDIR/train/tiny.fa"
+          ./target/release/bwa-mem4 mem -t 2 "$PROFDIR/train/tiny.fa" \
+              "$PROFDIR/train/r_1.fq" "$PROFDIR/train/r_2.fq" > /dev/null
+
+          PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)
+          [ -n "$PROFDATA" ] || { echo "::error::llvm-profdata not found in the toolchain"; exit 1; }
+          "$PROFDATA" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/*.profraw
+
+          RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata" cargo build --release --locked
 
       # Guards the promise above. Without this, swapping a runner label months from now would
       # raise the minimum macOS on published binaries and nobody would notice until a user on an
