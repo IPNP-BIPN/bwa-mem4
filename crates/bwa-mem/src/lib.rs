@@ -814,6 +814,12 @@ pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec
     regs
 }
 
+/// Re-export of `bwa-seed`'s seeding-statistics dump, so the CLI can print it without taking a
+/// direct dependency on that crate for one debug line.
+pub fn seed_stats_dump() {
+    bwa_seed::seed_stats::dump();
+}
+
 /// Whether `BWA4_DUMP_REGS` is set, read once.
 ///
 /// Cached for the same reason as [`crate::primary`]'s presort switch: this is consulted twice per

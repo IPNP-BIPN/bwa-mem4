@@ -935,6 +935,11 @@ fn align_reads_batched_inner<B: SwBackend>(
     let skip_contained = skip_contained_enabled();
 
     // ---- collection pass: one region skeleton + up to one left and one right job per seed ----
+    // Reused across every chain of every read in this chunk: `bases_into` clears it and refills it,
+    // so the only thing carried over is the allocation. One window per chain over a whole genome is
+    // millions of short vectors, and returning an owned one each time made the allocator visible
+    // next to the unpack itself.
+    let mut rseq_buf: Vec<u8> = Vec::new();
     for (r, codes) in reads.iter().enumerate() {
         // This read's length in bases, and its surviving chains. `l_query` is the 3' limit every
         // right-side decision below compares against.
@@ -993,8 +998,10 @@ fn align_reads_batched_inner<B: SwBackend>(
             // replaced was 18.1 s of CPU on a 500k-pair `-t16` run, roughly a quarter of the align
             // stage, because it redid the index arithmetic, the strand test and the shift for every
             // single base of every chain's window.
-            let rseq: Vec<u8> =
-                align_split::measure(&align_split::REFSEQ_NS, || fm.bases(rmax0, rmax1));
+            align_split::measure(&align_split::REFSEQ_NS, || {
+                fm.bases_into(rmax0, rmax1, &mut rseq_buf);
+            });
+            let rseq = &rseq_buf[..];
 
             // Seeds in descending (score, index) order.
             //

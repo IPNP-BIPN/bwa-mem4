@@ -265,13 +265,28 @@ fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
 /// # Returns
 /// `re - rb` bytes, base codes 0..=3.
 pub(crate) fn unpack_pac_range(pac: &[u8], l_pac: i64, rb: i64, re: i64) -> Vec<u8> {
+    let mut out = Vec::new();
+    unpack_pac_range_into(pac, l_pac, rb, re, &mut out);
+    out
+}
+
+/// [`unpack_pac_range`] into a caller-owned buffer. See [`FmIndex::bases_into`] for why the
+/// buffer-reusing form exists.
+///
+/// # Parameters
+/// * `pac`, `l_pac`: the packed reference and the forward length, as for [`unpack_pac_range`].
+/// * `rb`, `re`: half-open 2L-space range.
+/// * `out`: cleared, then filled with `re - rb` bytes. The `+ 16` of reserve is what lets the NEON
+///   loop store a whole 16-lane vector past the last full block without a bounds check.
+pub(crate) fn unpack_pac_range_into(pac: &[u8], l_pac: i64, rb: i64, re: i64, out: &mut Vec<u8>) {
     let len = (re - rb).max(0) as usize;
-    let mut out = Vec::with_capacity(len + 16);
+    out.clear();
     if len == 0 {
-        return out;
+        return;
     }
+    out.reserve(len + 16);
     if re <= l_pac {
-        unpack_pac_fwd(pac, rb, len, &mut out);
+        unpack_pac_fwd(pac, rb, len, out);
     } else if rb >= l_pac {
         // Reverse-complement half: same packed bytes, read forward then flipped end for end.
         //
@@ -280,7 +295,7 @@ pub(crate) fn unpack_pac_range(pac: &[u8], l_pac: i64, rb: i64, re: i64) -> Vec<
         // for the pair, on a 500k-pair `-t16` run. `reverse()` is a vectorised memory reversal and
         // the `^= 3` loop auto-vectorises; a hand-fused loop is neither, and two vector passes beat
         // one scalar pass by a wide margin here.
-        unpack_pac_fwd(pac, 2 * l_pac - re, len, &mut out);
+        unpack_pac_fwd(pac, 2 * l_pac - re, len, out);
         out.reverse();
         for b in out.iter_mut() {
             // Complement in bwa's A=0 C=1 G=2 T=3 order, where complementary codes sum to 3.
@@ -292,7 +307,6 @@ pub(crate) fn unpack_pac_range(pac: &[u8], l_pac: i64, rb: i64, re: i64) -> Vec<
         }
     }
     debug_assert_eq!(out.len(), len);
-    out
 }
 
 /// Build the path `<prefix>.<ext>`, the naming convention every index file follows.
@@ -1094,6 +1108,21 @@ impl FmIndex {
     /// `re - rb` bytes, byte `i` equal to `self.base(rb + i as i64)`.
     pub fn bases(&self, rb: i64, re: i64) -> Vec<u8> {
         unpack_pac_range(&self.pac, self.l_pac(), rb, re)
+    }
+
+    /// [`bases`](Self::bases) into a caller-owned buffer, so a hot loop allocates once instead of
+    /// once per call.
+    ///
+    /// The aligner materialises one window per chain, which on a whole-genome run is millions of
+    /// short vectors; returning an owned `Vec` each time made the allocator, not the unpack, a
+    /// visible cost. `out` is CLEARED first, so the result is exactly what [`bases`](Self::bases)
+    /// would have returned and never a leftover tail from a longer previous window.
+    ///
+    /// # Parameters
+    /// - `rb`, `re`: half-open range in the doubled 2L coordinate space.
+    /// - `out`: destination, cleared then filled with `re - rb` bytes. Its capacity is kept.
+    pub fn bases_into(&self, rb: i64, re: i64, out: &mut Vec<u8>) {
+        unpack_pac_range_into(&self.pac, self.l_pac(), rb, re, out);
     }
 
     /// The loaded cumulative base counts (already `+1`, as bwa-mem2's `load_index`).
