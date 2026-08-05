@@ -125,6 +125,38 @@ Le traceback est aussi une forme plus couteuse que ce que mesure le tableau ci-d
 que le score, donc il n'ameliore pas le verdict de vitesse. Sa valeur pour ce projet est l'oracle,
 pas la vitesse.
 
+## Indexeur : le tableau de suffixes est parallelisable, mais pas par le portage Rust (2026-08-05)
+
+Resume : `libsais64_omp` (portage rayon, pur Rust) perd ; **le C libsais avec OpenMP gagne 4,3x** et
+produit le meme tableau. Il est desormais disponible derriere `--features libsais-c`, eteint par
+defaut parce qu'il exige un toolchain C et libomp a la compilation, ce que le defaut pur Rust evite.
+
+Mesure sur le texte 2L, tableaux **identiques dans tous les cas** (un tableau de suffixes est unique) :
+
+| texte | pur Rust (defaut) | C 1 thread | C 4 | C 8 | C 16 |
+|---|---|---|---|---|---|
+| chr21, 93 M bases | 3,27 s | 1,95 s | 1,05 s | **0,85 s** | 1,22 s |
+| chr1, 498 M bases | 20,15 s | 12,21 s | 5,85 s | **4,63 s** | 7,27 s |
+
+Deux choses a retenir. Le C bat le portage Rust **meme a un seul thread** (1,7x), donc une partie du
+gain n'est pas le parallelisme. Et le coude est a 8 threads : au-dela, les sections paralleles de
+libsais perdent contre leur propre coordination, d'ou le plafond `min(rayon, 8)` et la variable
+`BWA4_SA_THREADS` pour une machine dont le coude est ailleurs.
+
+Bout en bout sur `bwa-mem4 index` (chr21, conteneur Linux arm64) : **3,347 s -> 1,356 s**, cinq
+fichiers octet-identiques a la fixture committee.
+
+### Ce qui a ete essaye et rejete
+
+* `libsais64_omp`, le portage rayon pur Rust : **plus lent** que sa propre version serie, 3,23 s
+  contre 2,56 s sur chr21 et 18,44 s contre 16,01 s sur chr1. Revert.
+* [`sufr`](https://github.com/TravisWheelerLab/sufr) : tri fusion parallele partitionne, avec
+  `libsufr`. Abandonne apres **plus de 100 minutes de CPU sur chr21** la ou libsais met 3 s. Ce
+  n'est pas le meme objet : il construit un index sur disque avec LCP et masques de graine, pour des
+  requetes, pas un tableau de suffixes en memoire pour un builder d'index.
+
+### Note historique
+
 ## Indexeur : le tableau de suffixes reste mono-thread, et ce n'est pas faute d'avoir essaye (2026-08-05)
 
 Tout le reste de `bwa-mem4 index` est deja parallele (rayon) : le pack `.pac`, la moitie complement

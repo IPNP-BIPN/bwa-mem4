@@ -26,6 +26,17 @@ memmap2 = { workspace = true }
 # Grebnov's libsais, no C toolchain). A suffix array is UNIQUE, so the produced index is byte-identical
 # either way; `scripts/index_diff.sh` is the gate. Only `index` speed changes, never `mem` output.
 libsais-rs = { version = "0.2", optional = true }
+# Bindings to Ilya Grebnov's C libsais, with OpenMP. Optional and OFF by default: it needs a C
+# toolchain and an OpenMP runtime at build time, which the pure-Rust translation above exists to
+# avoid. What it buys, measured on the 2L text of chr21 (93 M bases) and chr1 (498 M bases), suffix
+# arrays identical to the Rust translation's in every case:
+#
+#   chr21: pure Rust 3.27s | C 1 thread 1.95s | 4 threads 1.05s | 8 threads 0.85s | 16 threads 1.22s
+#   chr1:  pure Rust 20.15s | C 1 thread 12.21s | 4 threads 5.85s | 8 threads 4.63s | 16 threads 7.27s
+#
+# So about 4.3x on the stage that dominates `bwa-mem4 index`, and note the knee: past 8 threads
+# libsais's own parallel sections start losing to their coordination.
+libsais = { version = "0.2", optional = true }
 # Optional CaPS-SA suffix-array construction (index BUILD only). Cache-friendly parallel sample-sort
 # SACA (COMBINE-lab port); exposes both an in-memory build and an EXTERNAL-MEMORY (bounded-RAM) build.
 # A suffix array is UNIQUE, so the produced index is byte-identical either way; only build speed / peak
@@ -39,6 +50,9 @@ caps-sa = { version = "0.6", optional = true }
 # dependency-free SA-IS. Only `index` build speed changes, never `mem` output.
 default = ["libsais"]
 libsais = ["dep:libsais-rs"]
+# The C libsais with OpenMP, for a parallel suffix array. Byte-identical output (a suffix array is
+# unique), 4.3x faster on a 500 Mbase text, at the cost of a C toolchain and libomp at build time.
+libsais-c = ["dep:libsais"]
 # Experimental CaPS-SA backend (spike). Not in `default`. In-memory build ~ libsais-class speed, plus a
 # bounded-RAM external-memory build that libsais/SA-IS cannot do. Byte-identical (a SA is unique).
 capsa = ["dep:caps-sa"]

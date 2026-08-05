@@ -105,7 +105,44 @@ use crate::sais::suffix_array_inplace;
 /// length `2L+1`, `sa[0] == 2L`, `sa[1..]` the suffix array of `bref`. A suffix array is unique, so
 /// this is byte-identical to the SA-IS path; it is only faster to build. `fs = 0` (no extra scratch),
 /// `freq = None` (we do not need the symbol histogram; `count[]` is computed separately below).
-#[cfg(all(feature = "libsais", not(feature = "capsa")))]
+/// Parallel suffix array via the C libsais with OpenMP, behind `--features libsais-c`.
+///
+/// Same array as every other backend here, because a suffix array is UNIQUE: a parallel
+/// construction either produces the same permutation or is wrong. The `index_diff` gate is what
+/// checks that rather than this comment.
+///
+/// Thread count is capped, and the cap is measured rather than guessed. On the 2L text of chr1
+/// (498 M bases), libsais takes 12.21 s at one thread, 5.85 s at four, 4.63 s at eight and 7.27 s
+/// at sixteen: past the knee its own parallel sections lose to their coordination. `BWA4_SA_THREADS`
+/// overrides for a machine whose knee sits elsewhere.
+///
+/// # Parameters
+/// * `bref`: the 2L-space reference, one byte per base, codes `0..=3`.
+///
+/// # Returns
+/// `2L + 1` entries: `sa[0] = 2L` (the sentinel suffix) and `sa[1..]` the suffix array of `bref`,
+/// the same layout every other backend returns.
+#[cfg(all(feature = "libsais-c", not(feature = "capsa")))]
+fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
+    let n = bref.len();
+    let mut sa = vec![0i64; n + 1];
+    let threads = std::env::var("BWA4_SA_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| rayon::current_num_threads().min(8))
+        .max(1);
+    let built: Vec<i64> = libsais::SuffixArrayConstruction::for_text(bref)
+        .in_owned_buffer()
+        .multi_threaded(libsais::ThreadCount::fixed(threads as u16))
+        .run()
+        .expect("libsais C suffix-array construction")
+        .into_vec();
+    sa[1..].copy_from_slice(&built);
+    sa[0] = n as i64;
+    sa
+}
+
+#[cfg(all(feature = "libsais", not(feature = "libsais-c"), not(feature = "capsa")))]
 fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
     let n = bref.len();
     let mut sa = vec![0i64; n + 1];
@@ -622,9 +659,9 @@ fn build_bwt_and_samples(
     // Length N = 2L+1, sa[0] = 2L. Default: in-tree memory-efficient SA-IS. With `--features
     // libsais` the same array is produced by libsais-rs instead (faster build; a suffix array is
     // UNIQUE so the result is byte-identical, gated by scripts/index_diff.sh).
-    #[cfg(not(feature = "libsais"))]
+    #[cfg(all(not(feature = "libsais"), not(feature = "libsais-c")))]
     let sa = suffix_array_inplace(bref);
-    #[cfg(feature = "libsais")]
+    #[cfg(any(feature = "libsais", feature = "libsais-c"))]
     let sa = suffix_array_libsais(bref);
     debug_assert_eq!(sa.len(), n, "suffix array must have N = 2L + 1 rows");
 
