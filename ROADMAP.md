@@ -94,6 +94,30 @@ pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
 (upstream `bwa-mem2#297`, ouvert depuis ce projet).
 
+## hyalite comme noyau de production : non (2026-08-05)
+
+hyalite 0.2 sert d'oracle independant (voir `crates/bwa-extend/tests/third_party_oracle.rs`). Question
+posee : ses noyaux striped pourraient-ils remplacer les notres et nous faire gagner du temps ?
+
+Mesure, formes de mate rescue reelles (requete 150 bp contre fenetre de 1672 bases, 2000 paires,
+0,502 Gcellules, mono-thread, M4 Max ; conteneur Linux arm64 a 2 % pres) :
+
+| noyau | debit |
+|---|---|
+| notre `ksw_align2` scalaire | 0,54-0,56 Gcell/s |
+| hyalite `align_pairs` (striped SIMD) | **2,18-2,22 Gcell/s** |
+| notre noyau NEON u8 batche (`BWA4_MATESW_TIME`, donnees reelles) | **10,59 Gcell/s/thread** |
+
+hyalite est donc 4x notre repli scalaire et environ 5x plus lent que le noyau qui tourne reellement
+en production. La raison est structurelle et non un defaut de leur code : ils font du striped
+intra-sequence (Farrar), une paire a la fois, ce qui est le bon choix pour une bibliotheque a usage
+general ; nous faisons du batch inter-sequence sur 16 voies u8, ce qui est le bon choix quand on a
+des milliers de jobs independants et aucune envie de payer le profil raye par paire.
+
+Deux barrieres s'ajoutent, independamment du debit : hyalite ne rend ni `qb`/`tb` (pas de passe
+`KSW_XSTART`) ni un `score2` compatible avec le max par ligne rembourre de bwa, et le mate rescue
+consomme les deux. Sa valeur pour ce projet est donc l'oracle, pas la vitesse.
+
 ## Campagne perf : passer devant le fork a -t16 (2026-08-04, suite)
 
 Point de depart : dans le regime du gist de @nh13 (GRCh38, `-t16`, `-K` par defaut, entree gzippee,
