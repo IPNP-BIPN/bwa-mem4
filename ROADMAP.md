@@ -151,10 +151,29 @@ trois cas : conteneur Linux arm64 **3,347 s (pur Rust) -> 1,341 s (C + OpenMP)**
 **2,56 s -> 1,742 s** avec le nouveau defaut serie, qui est le gain que tout le monde recoit sans
 installer quoi que ce soit.
 
+### Pourquoi le portage pur Rust ne rattrape pas
+
+Comparaison directe des trois sur le meme texte (chr21, 93 M bases), tableaux identiques partout,
+`libsais-rs` en 0.2.2 :
+
+| | serie | 4 threads | 8 threads | 16 threads |
+|---|---|---|---|---|
+| `libsais-rs` (pur Rust) | 3,02 s | 2,98 s | **2,81 s** | 3,34 s |
+| `libsais` (C) | 1,92 s | 1,04 s | **0,81 s** | 1,00 s |
+
+Le portage Rust **ne parallelise quasiment pas** : 7 % entre son mode serie et ses 8 threads, contre
+2,4x pour le C. C'est ce qui explique le resultat de la veille, ou cabler `libsais64_omp` dans
+l'indexeur etait neutre ou negatif : un etage qui gagne 7 % ne paie pas le surcout de mise en place
+dans le contexte du builder. Le C, lui, gagne deja 1,6x **en serie** et 3,7x a 8 threads.
+
+`libsais-rs` passe quand meme en 0.2.2 (0.2.0 -> 0.2.2 vaut ~8 % en serie), puisqu'il reste le
+backend de repli sans compilateur C.
+
 ### Ce qui a ete essaye et rejete
 
-* `libsais64_omp`, le portage rayon pur Rust : **plus lent** que sa propre version serie, 3,23 s
-  contre 2,56 s sur chr21 et 18,44 s contre 16,01 s sur chr1. Revert.
+* `libsais64_omp`, le portage rayon pur Rust, cable dans l'indexeur : **plus lent** que sa propre
+  version serie, 3,23 s contre 2,56 s sur chr21 et 18,44 s contre 16,01 s sur chr1. Revert, et la
+  mesure ci-dessus dit pourquoi.
 * [`sufr`](https://github.com/TravisWheelerLab/sufr) : tri fusion parallele partitionne, avec
   `libsufr`. Abandonne apres **plus de 100 minutes de CPU sur chr21** la ou libsais met 3 s. Ce
   n'est pas le meme objet : il construit un index sur disque avec LCP et masques de graine, pour des
