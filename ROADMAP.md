@@ -125,6 +125,30 @@ Le traceback est aussi une forme plus couteuse que ce que mesure le tableau ci-d
 que le score, donc il n'ameliore pas le verdict de vitesse. Sa valeur pour ce projet est l'oracle,
 pas la vitesse.
 
+## Indexeur : le tableau de suffixes reste mono-thread, et ce n'est pas faute d'avoir essaye (2026-08-05)
+
+Tout le reste de `bwa-mem4 index` est deja parallele (rayon) : le pack `.pac`, la moitie complement
+inverse du `.0123`, la BWT, les blocs de checkpoints, le one-hot. Il ne restait que la construction
+du tableau de suffixes, qui est l'issue #37 et le jalon v4.3.4.
+
+`libsais-rs` expose `libsais64_omp(t, sa, fs, freq, threads)`, un point d'entree parallele backe par
+rayon. Cable, verifie octet-identique (un tableau de suffixes est UNIQUE : une construction parallele
+produit la meme permutation ou elle est fausse), et mesure sur deux tailles :
+
+| reference | `libsais64` serial | `libsais64_omp`, 16 threads |
+|---|---|---|
+| chr21, 46 Mb | **2,56-2,60 s** | 3,23 s |
+| chr1, 250 Mb | **16,01 s** | 18,44 s |
+
+Plus lent aux deux echelles, d'environ 15 %. Le portage rayon de libsais paie sa mise en place sans
+la rentabiliser a ces tailles. Change **revert**, negatif consigne : ne pas re-cabler `_omp` sans une
+mesure a l'echelle du genome entier qui montre l'inversion.
+
+Candidat restant pour #37 : [`sufr`](https://github.com/TravisWheelerLab/sufr), construction
+parallele par partitionnement et tri fusion, avec sa bibliotheque `libsufr`. Aucune comparaison
+publiee contre libsais, et il produit aussi un LCP dont nous n'avons pas besoin (donc de la memoire
+en plus). A mesurer avant d'y toucher, pas a adopter sur la description.
+
 ## Petits gains verifies (2026-08-05)
 
 Meme protocole que la correction ci-dessous, parce que c'est le seul qui a tenu : A/B entrelace,
