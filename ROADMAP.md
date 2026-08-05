@@ -205,6 +205,34 @@ parallele par partitionnement et tri fusion, avec sa bibliotheque `libsufr`. Auc
 publiee contre libsais, et il produit aussi un LCP dont nous n'avons pas besoin (donc de la memoire
 en plus). A mesurer avant d'y toucher, pas a adopter sur la description.
 
+## noodles contre htslib pour l'ecriture BAM : prototype mesure (2026-08-05)
+
+Question posee : remplacer `rust-htslib` par `noodles` (pur Rust) pour la sortie binaire. Prototype
+ecrit, deux transcodeurs texte SAM -> BAM sur **la meme entree** (chr21, 1 060 841 enregistrements,
+439 MB de texte), donc la seule difference mesuree est l'ecrivain.
+
+| threads | htslib (ce qu'on livre) | noodles |
+|---|---|---|
+| 1 | 5,24 s | **1,69 s** |
+| 4 | 1,35 s | **0,93 s** |
+| 8 | **0,68 s** | 0,93 s |
+
+Correction, verifiee et pas supposee : **enregistrements identiques** (`samtools view` des deux BAM,
+`cmp` octet a octet), en-tetes identiques, et les deux **redonnent exactement le SAM d'entree**.
+Taille : 92 098 890 octets pour htslib, 91 640 005 pour noodles, soit 0,5 % de moins.
+
+Lecture : noodles gagne largement a bas parallelisme (3,1x a un thread) et **plafonne a 0,93 s** quand
+htslib continue de descendre. Le plafond dit ou est le vrai probleme : a 8 threads htslib a cache
+toute sa compression et c'est le **parsing du texte** qui domine, des deux cotes. Autrement dit, notre
+pipeline formate du texte SAM puis le **re-parse** pour ecrire le BAM.
+
+Le vrai gain n'est donc pas le choix de la bibliotheque, c'est de construire les enregistrements BAM
+**directement depuis les champs de l'aligneur**, sans passer par le texte. L'octet-identite ne
+contraint que la sortie SAM ; le BAM est notre propre format de sortie et n'a pas d'oracle. C'est un
+chantier separe, et il rendrait la comparaison ci-dessus caduque.
+
+CRAM non evalue : c'est la ou htslib est l'implementation de reference et ou le risque se concentre.
+
 ## Petits gains verifies (2026-08-05)
 
 Meme protocole que la correction ci-dessous, parce que c'est le seul qui a tenu : A/B entrelace,
