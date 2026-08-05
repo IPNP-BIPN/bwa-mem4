@@ -18,10 +18,19 @@
 //! - `qe`/`te`/`qb`/`tb` depend on bwa's tie-breaking among equally scoring alignments and on the
 //!   `KSW_XSTART` reverse pass over reversed prefixes. hyalite reports its own end positions under
 //!   its own rules, so a mismatch there would mean nothing.
-//! - `qb`/`tb` come from the `KSW_XSTART` reverse pass over reversed prefixes, which hyalite does
-//!   not run; there is nothing to compare them against.
+//! - `qb`/`tb` come from the `KSW_XSTART` reverse pass over reversed prefixes, and that pass only
+//!   runs when the score clears `minsc`; below it ksw reports `-1` and `mem_matesw` discards the
+//!   rescue. hyalite 0.2 reports its own start coordinates from a traceback, so the two ARE
+//!   comparable, but only on the pairs where our pass ran at all.
 //!
-//! hyalite 0.2 changed what is checkable here. It now reports the **per-target-position maxima**
+//! hyalite 0.2 changed what is checkable here twice over. It reports **start coordinates** from a
+//! traceback (`align`), so the four span endpoints can be compared against ksw's `KSW_XSTART`
+//! recovery: over 600 random pairs, every pair whose score cleared `minsc`, and therefore ran the
+//! recovery, agreed on all four (499 of 499; the rest report `-1` by construction and are skipped).
+//! Note the conventions differ, ksw's ends are inclusive and hyalite's exclusive, so `qe` is
+//! `query_end - 1`.
+//!
+//! It also reports the **per-target-position maxima**
 //! (`align_pair_position_max`: `out[t]` is the best local score ending at target position `t`) and
 //! a `score2` built from them, so this test also cross-checks the second-best score and its column,
 //! which drive `csub` and therefore MAPQ on every rescued mate. Those were previously validated only
@@ -72,7 +81,7 @@
 const LANES: usize = 16;
 
 use bwa_mem4_extend::ksw_align2;
-use hyalite::{align_pair, align_pair_position_max, Mode, Scoring, SearchType};
+use hyalite::{align, align_pair, align_pair_position_max, Mode, Scoring, SearchType};
 
 /// bwa's default DNA matrix, built as `bwa_fill_scmat` does.
 ///
@@ -253,6 +262,7 @@ fn local_sw_score_matches_independent_implementation() {
         // Counted and asserted non-zero at the end: a generator change that stopped producing
         // lane-aligned queries would silently turn the second-best check into dead code.
         let mut checked_quadruples = 0u32;
+        let mut checked_spans = 0u32;
         for round in 0..300u32 {
             let qlen = 1 + (next() % 160) as usize;
             // Query over the full alphabet, N included (code 4) at ~3%.
@@ -300,8 +310,35 @@ fn local_sw_score_matches_independent_implementation() {
             // why ragged ones are not comparable). `minsc` is bwa's own threshold for a rescue to
             // count, `min_seed_len * a` at the defaults, so the second-best tracker is exercised in
             // the regime `mem_matesw` actually runs it in rather than at some test-only setting.
+            let minsc = 19 * i32::from(a);
+            // Span endpoints, on every length. `qb == -1` means the start-recovery pass did not run
+            // (score below `minsc`), which is bwa's own behaviour and leaves nothing to compare.
+            {
+                let r = ksw_align2(&q, &t, 5, &mat, o, e, o, e, minsc, i32::from(mat[0]), 16);
+                if r.qb >= 0 {
+                    let scoring = Scoring::new(5, to_hyalite_matrix(&mat, 5), o + e, e)
+                        .expect("bwa's matrix and penalties are a valid hyalite scoring scheme");
+                    // `1 << 30` is the traceback's memory ceiling: generous, since these are test
+                    // sized pairs, and an error here would mean the pair was too big rather than
+                    // that anything disagreed.
+                    let al = align(&q, &t, &scoring, Mode::Sw, 1 << 30)
+                        .expect("codes are all inside the 5-symbol alphabet");
+                    assert_eq!(
+                        (r.score, r.qb, r.qe, r.tb, r.te),
+                        (
+                            al.score,
+                            al.query_start as i32,
+                            al.query_end as i32 - 1,
+                            al.target_start as i32,
+                            al.target_end as i32 - 1
+                        ),
+                        "alignment span disagrees with hyalite at A={a} B={b} O={o} E={e} \
+                         round {round}, qlen={qlen} tlen={tlen}"
+                    );
+                    checked_spans += 1;
+                }
+            }
             if qlen.is_multiple_of(LANES) {
-                let minsc = 19 * i32::from(a);
                 let ours4 = ours_with_score2(&q, &t, &mat, o, e, minsc);
                 let theirs4 = oracle_with_score2(&q, &t, &mat, o, e, minsc);
                 assert_eq!(
@@ -315,6 +352,10 @@ fn local_sw_score_matches_independent_implementation() {
         assert!(
             checked_quadruples > 0,
             "no lane-aligned query was generated at A={a} B={b}, so score2 went unchecked"
+        );
+        assert!(
+            checked_spans > 0,
+            "no pair cleared minsc at A={a} B={b}, so the span endpoints went unchecked"
         );
     }
 }

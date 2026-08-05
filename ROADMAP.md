@@ -114,9 +114,16 @@ intra-sequence (Farrar), une paire a la fois, ce qui est le bon choix pour une b
 general ; nous faisons du batch inter-sequence sur 16 voies u8, ce qui est le bon choix quand on a
 des milliers de jobs independants et aucune envie de payer le profil raye par paire.
 
-Deux barrieres s'ajoutent, independamment du debit : hyalite ne rend ni `qb`/`tb` (pas de passe
-`KSW_XSTART`) ni un `score2` compatible avec le max par ligne rembourre de bwa, et le mate rescue
-consomme les deux. Sa valeur pour ce projet est donc l'oracle, pas la vitesse.
+Correction d'une erreur de la premiere redaction de cette section : hyalite 0.2 **rend bien** les
+coordonnees de debut, par traceback (`align`), et elles s'accordent avec la recuperation `KSW_XSTART`
+de ksw sur les 499 paires (sur 600) dont le score franchit `minsc` et declenche donc cette passe.
+C'est verifie dans l'oracle depuis. La barriere restante est `score2` : le max par ligne de bwa
+inclut les colonnes de bourrage du profil de requete, celui de hyalite est le vrai max par colonne,
+et le mate rescue consomme `score2` pour `csub`.
+
+Le traceback est aussi une forme plus couteuse que ce que mesure le tableau ci-dessus, qui n'utilise
+que le score, donc il n'ameliore pas le verdict de vitesse. Sa valeur pour ce projet est l'oracle,
+pas la vitesse.
 
 ## Campagne perf : passer devant le fork a -t16 (2026-08-04, suite)
 
