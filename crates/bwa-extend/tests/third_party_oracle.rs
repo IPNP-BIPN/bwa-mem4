@@ -18,9 +18,41 @@
 //! - `qe`/`te`/`qb`/`tb` depend on bwa's tie-breaking among equally scoring alignments and on the
 //!   `KSW_XSTART` reverse pass over reversed prefixes. hyalite reports its own end positions under
 //!   its own rules, so a mismatch there would mean nothing.
-//! - `score2`/`te2` come from the per-row maxima above `minsc`, outside an exclusion window around
-//!   `te`. hyalite does not compute per-row maxima at all (there is no such quantity anywhere in its
-//!   API), which is also why it cannot replace our mate-rescue kernel.
+//! - `qb`/`tb` come from the `KSW_XSTART` reverse pass over reversed prefixes, which hyalite does
+//!   not run; there is nothing to compare them against.
+//!
+//! hyalite 0.2 changed what is checkable here. It now reports the **per-target-position maxima**
+//! (`align_pair_position_max`: `out[t]` is the best local score ending at target position `t`) and
+//! a `score2` built from them, so this test also cross-checks the second-best score and its column,
+//! which drive `csub` and therefore MAPQ on every rescued mate. Those were previously validated only
+//! against our own scalar reference, which is exactly the hole this file exists to close: a misread
+//! of `ksw.cpp`'s `score2` recipe would have been reproduced identically by all six of our kernels.
+//!
+//! One subtlety worth stating because it is the difference between a real check and a tautology:
+//! `align_pair_position_max` is a pure per-column maximum of an independently written DP. hyalite's
+//! own `score2` then applies bwa's peak-collapsing recipe to it. Comparing against that checks BOTH
+//! the DP and the recipe, and a disagreement has to be read carefully, since the recipe is
+//! documented as a reimplementation of ours rather than an independent invention.
+//!
+//! # Why the second-best check runs only on lane-aligned queries
+//!
+//! bwa's per-row maximum is not the DP's per-column maximum, and the difference is observable here.
+//! `ksw_qinit` rounds the query profile up to `slen * lanes` columns and fills the tail with
+//! score-0 entries; a zero-score column leaves `h = h_diag`, so those padding cells carry a diagonal
+//! forward and land in the row max that feeds the `b` array and therefore `score2`. `sw.rs` says so
+//! from reading `ksw.cpp`; this test now says so from measurement.
+//!
+//! Measured over 600 random pairs at two scoring schemes: on queries whose length is a multiple of
+//! the 16-lane width, where the profile needs no padding at all, our `(score, te, score2, te2)` and
+//! hyalite's agree on every pair. On ragged queries 8 pairs disagree, and inspecting one of them
+//! (`score2 = 20` at target column 162, where an independent naive DP and hyalite both put the true
+//! column maximum at 10) shows the padding artifact directly: the score exists in bwa's padded row
+//! max and nowhere in the real matrix.
+//!
+//! So the quadruple is asserted on lane-aligned queries, which is a real check of the second-best
+//! machinery, and the score alone is asserted on arbitrary lengths. Widening the first would not
+//! find a bug in us; it would only re-discover that we reproduce bwa's padding, which is required
+//! for byte-identity and is not negotiable.
 //!
 //! # Two conventions that must be translated, not assumed
 //!
@@ -35,8 +67,12 @@
 //! hyalite carries a single gap-penalty pair, so it cannot express `o_del != o_ins`. The test
 //! therefore runs symmetric penalties, which is bwa's default (`-O 6 -E 1`).
 
+/// ksw's SIMD width for the u8 kernel, and the modulus that decides whether a query needs padding.
+/// Not a tuning knob here: it is the number `ksw_qinit` rounds the profile up to.
+const LANES: usize = 16;
+
 use bwa_mem4_extend::ksw_align2;
-use hyalite::{align_pair, Mode, Scoring, SearchType};
+use hyalite::{align_pair, align_pair_position_max, Mode, Scoring, SearchType};
 
 /// bwa's default DNA matrix, built as `bwa_fill_scmat` does.
 ///
@@ -122,6 +158,76 @@ fn oracle_score(query: &[u8], target: &[u8], mat: &[i8], o: i32, e: i32) -> i32 
         .score
 }
 
+/// Our full mate-rescue result for one pair, second-best tracking ENABLED.
+///
+/// # Parameters
+/// - `query`, `target`: nt4 codes, `0..=4`.
+/// - `mat`, `o`, `e`: bwa's matrix and its symmetric gap open / extend magnitudes.
+/// - `minsc`: bwa's `minsc`, the score a column must reach before it can be a second-best peak.
+///
+/// # Returns
+/// `(score, te, score2, te2)`, the four fields hyalite 0.2 can now be asked about.
+fn ours_with_score2(
+    query: &[u8],
+    target: &[u8],
+    mat: &[i8],
+    o: i32,
+    e: i32,
+    minsc: i32,
+) -> (i32, i32, i32, i32) {
+    let r = ksw_align2(
+        query,
+        target,
+        5,
+        mat,
+        o,
+        e,
+        o,
+        e,
+        minsc,
+        i32::from(mat[0]),
+        16,
+    );
+    (r.score, r.te, r.score2, r.te2)
+}
+
+/// hyalite's answer to the same question, via the per-target-position maxima it gained in 0.2.
+///
+/// # Returns
+/// `(score, te, score2, te2)` in our conventions: `te`/`te2` are 0-based target columns, and a
+/// missing second-best is `-1` in both fields, which is what `ksw_align2` reports.
+fn oracle_with_score2(
+    query: &[u8],
+    target: &[u8],
+    mat: &[i8],
+    o: i32,
+    e: i32,
+    minsc: i32,
+) -> (i32, i32, i32, i32) {
+    let scoring = Scoring::new(5, to_hyalite_matrix(mat, 5), o + e, e)
+        .expect("bwa's matrix and penalties are a valid hyalite scoring scheme");
+    // `colmax[t]` = best local score ending at target column `t`, from hyalite's own DP.
+    let mut colmax: Vec<i32> = Vec::new();
+    let hit = align_pair_position_max(query, target, &scoring, &mut colmax)
+        .expect("codes are all inside the 5-symbol alphabet");
+    // `target_end` is `None` exactly when the best score is 0, i.e. no positive alignment; our
+    // `te` is `-1` there, which is the same statement in ksw's vocabulary.
+    let te = hit.target_end.map_or(-1, |t| t as i32);
+    // The window half-width uses the matrix maximum, not the best score, which for bwa's DNA
+    // matrix is the match bonus.
+    let (score2, te2) = match hyalite::score2(
+        &colmax,
+        hit.score,
+        te.max(0) as usize,
+        i32::from(mat[0]),
+        minsc,
+    ) {
+        Some((s, p)) => (s, p as i32),
+        None => (-1, -1),
+    };
+    (hit.score, te, score2, te2)
+}
+
 /// Our local SW score must equal an independent implementation's, over randomised pairs.
 ///
 /// The pairs are built the way the kernel tests build them: mostly a copy of the query so the
@@ -144,6 +250,9 @@ fn local_sw_score_matches_independent_implementation() {
                 .wrapping_add(1442695040888963407);
             state >> 33
         };
+        // Counted and asserted non-zero at the end: a generator change that stopped producing
+        // lane-aligned queries would silently turn the second-best check into dead code.
+        let mut checked_quadruples = 0u32;
         for round in 0..300u32 {
             let qlen = 1 + (next() % 160) as usize;
             // Query over the full alphabet, N included (code 4) at ~3%.
@@ -186,6 +295,26 @@ fn local_sw_score_matches_independent_implementation() {
                 "local SW score disagrees with hyalite at A={a} B={b} O={o} E={e} round {round}, \
                  qlen={qlen} tlen={tlen}"
             );
+
+            // The mate-rescue quadruple, on the lane-aligned queries only (see the module docs for
+            // why ragged ones are not comparable). `minsc` is bwa's own threshold for a rescue to
+            // count, `min_seed_len * a` at the defaults, so the second-best tracker is exercised in
+            // the regime `mem_matesw` actually runs it in rather than at some test-only setting.
+            if qlen.is_multiple_of(LANES) {
+                let minsc = 19 * i32::from(a);
+                let ours4 = ours_with_score2(&q, &t, &mat, o, e, minsc);
+                let theirs4 = oracle_with_score2(&q, &t, &mat, o, e, minsc);
+                assert_eq!(
+                    ours4, theirs4,
+                    "(score, te, score2, te2) disagrees with hyalite at A={a} B={b} O={o} E={e} \
+                     round {round}, qlen={qlen} tlen={tlen}"
+                );
+                checked_quadruples += 1;
+            }
         }
+        assert!(
+            checked_quadruples > 0,
+            "no lane-aligned query was generated at A={a} B={b}, so score2 went unchecked"
+        );
     }
 }
