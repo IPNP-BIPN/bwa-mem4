@@ -76,3 +76,12 @@ rust-htslib = { version = "1", default-features = false }
 [profile.release]
 codegen-units = 1
 lto = "fat"
+# Unwinding costs code size and inhibits optimisation even when nothing panics, and this binary has
+# no unwinding to do: a panic here is a bug, and the process holds nothing the OS will not reclaim.
+#
+# Measured, because the profile is not the place for folklore: interleaved A/B at -t4 on 500k pairs
+# against GRCh38, CPU seconds, abort won all five reps, medians 39.69 against 40.27, about 1.4%.
+#
+# Cargo ignores this for the test and bench profiles, so `cargo test --release` still builds with
+# unwinding and a `should_panic` test would still work. The workspace has none today either way.
+panic = "abort"

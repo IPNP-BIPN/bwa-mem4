@@ -125,6 +125,22 @@ Le traceback est aussi une forme plus couteuse que ce que mesure le tableau ci-d
 que le score, donc il n'ameliore pas le verdict de vitesse. Sa valeur pour ce projet est l'oracle,
 pas la vitesse.
 
+## Petits gains verifies (2026-08-05)
+
+Meme protocole que la correction ci-dessous, parce que c'est le seul qui a tenu : A/B entrelace,
+`-t4` sur 500k paires contre GRCh38, secondes CPU, medianes.
+
+| changement | avant | apres | verdict |
+|---|---|---|---|
+| `panic = "abort"` dans `[profile.release]` | 40,27 s | **39,69 s** | garde, 5 victoires sur 5, ~1,4 % |
+
+`panic = "abort"` retire les tables de deroulement et les points d'atterrissage : le binaire n'a rien
+a derouler, un panic ici est un bug et le processus ne detient rien que l'OS ne reprenne. Cargo
+ignore le reglage pour les profils test et bench, donc `cargo test --release` compile toujours avec
+deroulement et un `should_panic` continuerait de fonctionner.
+
+Sortie inchangee (md5 GRCh38), `opt_parity.sh` 62/64, `check.sh` vert.
+
 ## Correction : la deuxieme vague (2026-08-05) n'a rien gagne, et pourquoi
 
 Trois changements ont ete faits apres la campagne ci-dessous, sur la foi d'une sonde. Mesure faite
