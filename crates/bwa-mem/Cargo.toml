@@ -22,3 +22,9 @@ bwa-neon = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# Compiles the `BWA4_ALIGN_SPLIT` timers into the align stage. Off by default: the wrappers sit
+# around `run_side` and `extend_batch`, and even with the flag unset they cost measurable CPU by
+# standing between the caller and the inliner. Turn on to locate a hot spot, not to ship.
+align-split = []

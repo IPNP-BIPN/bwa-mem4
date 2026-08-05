@@ -578,7 +578,9 @@ pub mod align_split {
     pub static SIDE_NS: AtomicU64 = AtomicU64::new(0);
     /// Time inside `mem_chain_flt`, the chain filter.
     pub static CHAINFLT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Time materialising each chain's reference window from the packed reference.
+    /// Time materialising each chain's reference window from the packed reference. No longer
+    /// recorded: the counter is kept so the reporting line and any script reading it still parse,
+    /// but the wrapper was removed from the per-chain path once it had done its job. See there.
     pub static REFSEQ_NS: AtomicU64 = AtomicU64::new(0);
     /// Time inside `align_reads_batched` as a whole. Subtracting the parts (seeding, extension, and
     /// `BWA4_CHAIN_TIME`'s SA walk and chain merge) leaves the glue: chain filtering, job collection
@@ -594,6 +596,12 @@ pub mod align_split {
 
     /// Run `f`, adding its duration to `counter` when the probe is on. Returns `f`'s value either
     /// way, so call sites read the same whether the probe exists or not.
+    ///
+    /// Compiled out entirely without the `align-split` feature, and that is not caution for its own
+    /// sake: wrapping `run_side` and `extend_batch` in a closure cost measurable CPU even with the
+    /// flag off, because the wrapper is a barrier the inliner does not always see through. The
+    /// counters exist to find a hot spot once; they should not be in the shipped binary.
+    #[cfg(feature = "align-split")]
     pub fn measure<T>(counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
         if !enabled() {
             return f();
@@ -602,6 +610,14 @@ pub mod align_split {
         let out = f();
         counter.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         out
+    }
+
+    /// Feature-off form: calls `f` and nothing else. `#[inline(always)]` so the wrapper leaves no
+    /// trace at all in the generated code.
+    #[cfg(not(feature = "align-split"))]
+    #[inline(always)]
+    pub fn measure<T>(_counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        f()
     }
 
     /// Print the counters once, after the workers have joined. No-op unless enabled.
@@ -685,6 +701,11 @@ pub fn align_reads_batched<B: SwBackend>(
 }
 
 /// The body of [`align_reads_batched`], split out only so the probe above can time it as a whole.
+///
+/// `inline(always)`: with the probe compiled out the wrapper is a bare call, and leaving a function
+/// boundary in the middle of the hottest path in the aligner is not free. The split exists for
+/// instrumentation, so it should cost nothing when the instrumentation is not there.
+#[inline(always)]
 #[allow(clippy::too_many_lines)]
 fn align_reads_batched_inner<B: SwBackend>(
     fm: &FmIndex,
@@ -998,9 +1019,12 @@ fn align_reads_batched_inner<B: SwBackend>(
             // replaced was 18.1 s of CPU on a 500k-pair `-t16` run, roughly a quarter of the align
             // stage, because it redid the index arithmetic, the strand test and the shift for every
             // single base of every chain's window.
-            align_split::measure(&align_split::REFSEQ_NS, || {
-                fm.bases_into(rmax0, rmax1, &mut rseq_buf);
-            });
+            // Not wrapped in the `align_split` probe any more. It was, and that is how the
+            // per-base unpack was found, but the wrapper costs a cached-flag load and a closure on
+            // a path that runs once per CHAIN; once the number it was measuring had been fixed, the
+            // probe was the only thing left on the path. The coarser counters (seeding, side,
+            // chain filter) stay: they wrap per-batch and per-read work, where the check is free.
+            fm.bases_into(rmax0, rmax1, &mut rseq_buf);
             let rseq = &rseq_buf[..];
 
             // Seeds in descending (score, index) order.

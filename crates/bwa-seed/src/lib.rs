@@ -555,9 +555,15 @@ impl LsSlot {
     /// - `counts`: the index's C array, hoisted by the driver. `counts[b]` is the first BWT ROW whose
     ///   suffix starts with base `b`; `counts[4]` is the total row count.
     fn step(&mut self, fm: &FmIndex, codes: &[u8], min_seed_len: i32, counts: &[i64; 5]) {
-        // Read once per call rather than per extension: this drives counters on a path that runs
-        // 1.7 billion times per 500k pairs, and even a cached `OnceLock` load is not free there.
+        // Read once per call rather than per extension, and compiled out entirely unless the
+        // `seed-stats` feature is on: this sits on a path that runs 1.7 billion times per 500k
+        // pairs, where even a predictable branch is measurable (it cost about 3% of CPU when it
+        // was unconditional).
+        #[cfg(feature = "seed-stats")]
         let stats_on = seed_stats::enabled();
+        // Read once per call, not once per backward round: the round loop runs often enough that
+        // even a `OnceLock` load in its header showed up against the pre-prefetch baseline.
+        let pf_ahead = prefetch_ahead();
         // Per-walk occurrence floor: round 1 shares one value, round 2 carries the parent's `s + 1`.
         let min_intv = self.min_intv;
         // Length of this read in bases; the exclusive upper bound of every READ offset below.
@@ -595,6 +601,7 @@ impl LsSlot {
                 self.num_prev = 0;
                 self.j = self.x + 1;
                 self.phase = LsPhase::Fwd;
+                #[cfg(feature = "seed-stats")]
                 if stats_on {
                     seed_stats::STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -620,6 +627,7 @@ impl LsSlot {
                 std::mem::swap(&mut rc_view.k, &mut rc_view.l);
                 // `rc_extended`: interval of `complement(aj)` prepended to the RC pattern, which is
                 // the RC of `pattern + aj`.
+                #[cfg(feature = "seed-stats")]
                 if stats_on {
                     use std::sync::atomic::Ordering::Relaxed;
                     seed_stats::FWD_STEPS.fetch_add(1, Relaxed);
@@ -690,7 +698,7 @@ impl LsSlot {
                 // than run over the whole array.
                 //
                 // Prefetching cannot change a result: it moves lines into cache and nothing else.
-                for c in self.prev[..self.num_prev.min(prefetch_ahead())].iter() {
+                for c in self.prev[..self.num_prev.min(pf_ahead)].iter() {
                     fm.prefetch_occ(c.k, c.k + c.s);
                 }
                 let mut p = 0usize;
@@ -698,6 +706,7 @@ impl LsSlot {
                     let candidate = self.prev[p];
                     // Interval of `a` prepended to the candidate: same read substring one base longer
                     // on the LEFT. Plain backward extension, no k/l swap.
+                    #[cfg(feature = "seed-stats")]
                     if stats_on {
                         seed_stats::BWD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -724,6 +733,7 @@ impl LsSlot {
                 // emitted this round; they survive only if they add a distinct occurrence count.
                 while p < self.num_prev {
                     let candidate = self.prev[p];
+                    #[cfg(feature = "seed-stats")]
                     if stats_on {
                         seed_stats::BWD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -813,8 +823,11 @@ fn smems_from_pos(
     prev: &mut [Smem],
     out: &mut Vec<Smem>,
 ) -> usize {
-    // As in the lockstep driver: read the probe flag once per call, not per extension.
+    // As in the lockstep driver: read once per call, and compiled out without the feature.
+    #[cfg(feature = "seed-stats")]
     let stats_on = seed_stats::enabled();
+    // As above: hoisted out of the round loop.
+    let pf_ahead = prefetch_ahead();
     // ---- Section 0: the single-base seed interval at `x` -------------------------------------
     // Reminder (see the module glossary): `x` is the read position every SMEM found here must
     // cover; `k`/`l`/`s` are the FM interval's forward start row, reverse-complement start row and
@@ -943,7 +956,7 @@ fn smems_from_pos(
         // buffer. Invariant: `prev[..num_curr]` are already-extended survivors and `prev[p..num_prev]`
         // are not-yet-examined candidates; since `num_curr <= p` always, nothing is clobbered early.
         // Same batch prefetch as the lockstep driver; see there for why it cannot change a result.
-        for c in prev[..num_prev.min(prefetch_ahead())].iter() {
+        for c in prev[..num_prev.min(pf_ahead)].iter() {
             fm.prefetch_occ(c.k, c.k + c.s);
         }
         let mut p = 0usize;
@@ -952,6 +965,7 @@ fn smems_from_pos(
             let candidate = prev[p];
             // Plain backward_ext here: no k/l swap, because this really is a left extension.
             // `new_smem` is the interval of `codes[jj ..= candidate.n]`, one base longer on the LEFT.
+            #[cfg(feature = "seed-stats")]
             if stats_on {
                 seed_stats::BWD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -988,6 +1002,7 @@ fn smems_from_pos(
         while p < num_prev {
             // A strictly shorter candidate than the one the first loop stopped on.
             let candidate = prev[p];
+            #[cfg(feature = "seed-stats")]
             if stats_on {
                 seed_stats::BWD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }

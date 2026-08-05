@@ -125,6 +125,38 @@ Le traceback est aussi une forme plus couteuse que ce que mesure le tableau ci-d
 que le score, donc il n'ameliore pas le verdict de vitesse. Sa valeur pour ce projet est l'oracle,
 pas la vitesse.
 
+## Correction : la deuxieme vague (2026-08-05) n'a rien gagne, et pourquoi
+
+Trois changements ont ete faits apres la campagne ci-dessous, sur la foi d'une sonde. Mesure faite
+apres coup, A/B entrelace contre le binaire d'avant (`6fcdea9`), CPU a `-t4` sur 500k paires, ou la
+dispersion est la plus faible : **egalite a 0 a 2 % pres**. Aucun gain demontrable.
+
+Ce qui s'est passe merite d'etre ecrit, parce que c'est un piege de methode et pas de code. La sonde
+`BWA4_ALIGN_SPLIT` attribuait **18,1 s de CPU** a la materialisation de la fenetre de reference. Elle
+enveloppait cette materialisation dans une fermeture avec deux `Instant::now()`, **par chaine**, soit
+des dizaines de millions de fois : l'essentiel des 18,1 s etait la sonde elle-meme. Passer au
+depaquetage groupe puis au tampon reutilise a fait tomber le chiffre affiche a 8,0 s, ce qui semblait
+un gain de 10 s ; le A/B bout en bout des deux variantes, tout le reste egal, donne **41,09 s contre
+41,26 s de CPU**, c'est-a-dire rien.
+
+Consequences tirees :
+
+* Les deux sondes (`BWA4_ALIGN_SPLIT`, `BWA4_SEED_STATS`) sont desormais derriere des features cargo
+  eteintes par defaut. Compilees en dur, les compteurs de seeding coutaient a eux seuls ~3 % de CPU,
+  sur une boucle qui tourne 1,7 milliard de fois : une branche previsible et jamais prise n'y est
+  pas gratuite.
+* Une sonde qui enveloppe un appel dans une fermeture se paie deux fois : le temps qu'elle mesure et
+  l'inlining qu'elle empeche. Elle doit envelopper du travail par lot, pas par chaine.
+* Le depaquetage groupe et le tampon reutilise sont **gardes** : ils sont neutres en vitesse et
+  suppriment une allocation par chaine, ce qui reste la bonne forme. Ils ne sont simplement pas le
+  gain annonce.
+* Le prefetch des candidats de la ronde arriere est **neutre** aussi (`BWA4_SEED_PREFETCH=0` contre
+  `=8` : 40,7 contre 40,2, puis 41,6 contre 41,3). Garde, avec le bouton pour le rebalayer sur une
+  machine ou la latence memoire domine davantage.
+
+Le gain reel contre le fork reste celui de la campagne ci-dessous, mesure quand la machine etait
+calme. La lecon : ne rien annoncer sur la foi d'une sonde sans un A/B bout en bout entrelace.
+
 ## Campagne perf : passer devant le fork a -t16 (2026-08-04, suite)
 
 Point de depart : dans le regime du gist de @nh13 (GRCh38, `-t16`, `-K` par defaut, entree gzippee,

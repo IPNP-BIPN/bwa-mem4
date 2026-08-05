@@ -26,3 +26,9 @@ bwa-neon = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# Compiles the `BWA4_SEED_STATS` counters into the seeding loops. Off by default because those
+# loops run about 1.7 billion times per 500k pairs and even a predictable, never-taken branch is
+# worth ~3% of CPU there. Turn it on to size a proposed optimisation, not to run production.
+seed-stats = []
