@@ -25,6 +25,10 @@ memmap2 = { workspace = true }
 # `--features libsais` the SA is built by libsais-rs instead (a pure-Rust translation of Ilya
 # Grebnov's libsais, no C toolchain). A suffix array is UNIQUE, so the produced index is byte-identical
 # either way; `scripts/index_diff.sh` is the gate. Only `index` speed changes, never `mem` output.
+# NOTE the naming trap, since these two crates are one hyphen apart and are different projects:
+#   `libsais-rs` = henriksson-lab/libsais-rs, a pure-Rust TRANSLATION of libsais, no C toolchain.
+#   `libsais`    = feldroop/libsais-rs, BINDINGS to Ilya Grebnov's C libsais (vendored source).
+# Both are used here, under the features below, and they produce identical suffix arrays.
 libsais-rs = { version = "0.2", optional = true }
 # Bindings to Ilya Grebnov's C libsais, with OpenMP. Optional and OFF by default: it needs a C
 # toolchain and an OpenMP runtime at build time, which the pure-Rust translation above exists to
