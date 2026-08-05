@@ -369,10 +369,12 @@ pub(crate) fn gen_cigar2(
     // Owned copy of the query codes, because the reverse-strand branch below mutates it in place.
     // Length `l_query`; indexed by the `query_pos` cursor during the NM/MD walk.
     let mut query: Vec<u8> = query_codes.to_vec();
-    // The reference side of the alignment: `rlen` nt4 codes for packed positions `[rb, re)`. We
-    // materialize the reference slice base by base rather than calling a `bns_get_seq`
-    // equivalent; `fm.base(p)` already handles the reverse-strand half of the pac.
-    let mut rseq: Vec<u8> = (rb..re).map(|p| fm.base(p)).collect();
+    // The reference side of the alignment: `rlen` nt4 codes for packed positions `[rb, re)`.
+    // `bases` is the bulk unpack; it handles the reverse-strand half of the pac exactly as the
+    // per-base `base(p)` did, and does the index arithmetic once for the range instead of once per
+    // base. This runs per emitted record, so it is on the same footing as the window fetch in
+    // `across.rs`.
+    let mut rseq: Vec<u8> = fm.bases(rb, re);
     // Reverse both sides for reverse-strand hits (bwa.cpp:274). This is NOT a complement, only an
     // order reversal, and it exists purely so that ties in gap placement resolve to the leftmost
     // position *in forward-genome coordinates*. Dropping it still yields valid alignments, just

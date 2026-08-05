@@ -264,6 +264,20 @@ fn mem_patch_reg(
     Some((score, w))
 }
 
+/// The read id named by `BWA4_DUMP_PRESORT`, parsed once.
+///
+/// # Returns
+/// `Some(id)` when the variable is set to something that parses as a read id, `None` otherwise.
+/// Read once per process: see the call site for why a per-read `var_os` was a measurable cost.
+fn presort_dump_id() -> &'static Option<u64> {
+    static ID: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var("BWA4_DUMP_PRESORT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
 /// Thomas Wang's 64-bit integer hash (`hash_64`), the deterministic tie-breaker for equal-scoring
 /// regions.
 ///
@@ -769,12 +783,13 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
         }
     }
     // Debug aid: set `BWA4_DUMP_PRESORT=<read id>` to dump one read's regions immediately before
-    // the hash sort, which is where parity investigations usually start. Unlike
-    // `band_width_trace_enabled` in
-    // cigar.rs this is not cached, but it runs once per read rather than once per emitted
-    // alignment, so the `var_os` cost is tolerable.
-    if std::env::var_os("BWA4_DUMP_PRESORT").is_some_and(|v| v.to_string_lossy() == id.to_string())
-    {
+    // the hash sort, which is where parity investigations usually start.
+    //
+    // Cached, and the caching is not cosmetic. This runs once per READ, and `var_os` is not free:
+    // on macOS `getenv` takes a process-wide lock, so at `-t16` sixteen workers were serialising on
+    // it once per read. A host `sample` profile put `getenv` and its lock among the heaviest leaves,
+    // level with `mem_mark_primary_se` itself.
+    if *presort_dump_id() == Some(id) {
         eprintln!("PRESORT id={id} n={}", a.len());
         for (i, r) in a.iter().enumerate() {
             eprintln!(

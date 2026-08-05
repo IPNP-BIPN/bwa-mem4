@@ -512,7 +512,7 @@ pub(crate) fn mem_chain2aln_meta(
     // The window's reference bases, materialised once and shared by every seed of the chain.
     // Index `i` of `rseq` is absolute pac position `rmax0 + i`; that offset is the source of every
     // `- rmax0` / `+ rmax0` conversion below.
-    let rseq: Vec<u8> = (rmax0..rmax1).map(|p| fm.base(p)).collect();
+    let rseq: Vec<u8> = fm.bases(rmax0, rmax1);
 
     // ===================== step 2: decide the order the seeds are extended in =====================
     // Seeds in descending (score, index) order (`bwamem.cpp:2190-2192` plus the `for (k = c->n-1;
@@ -814,6 +814,16 @@ pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec
     regs
 }
 
+/// Whether `BWA4_DUMP_REGS` is set, read once.
+///
+/// Cached for the same reason as [`crate::primary`]'s presort switch: this is consulted twice per
+/// read, and `var_os` takes a process-wide lock on macOS, so at `-t16` it was sixteen threads
+/// queueing for an environment variable that is unset in every real run.
+fn dump_regs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_DUMP_REGS").is_some())
+}
+
 /// Align one read and deduplicate its regions (`mem_sort_dedup_patch`), WITHOUT primary marking.
 /// This is the per-read input to paired-end statistics (`mem_pestat`) and pairing, which mark
 /// primaries themselves.
@@ -831,13 +841,13 @@ pub fn align_read_dedup(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) 
     // Raw regions before dedup, dumped first so a divergence can be attributed to extension rather
     // than to the dedup pass.
     let regs = align_read(fm, bns, opt, codes);
-    if std::env::var_os("BWA4_DUMP_REGS").is_some() {
+    if dump_regs_enabled() {
         dump_regs(bns, "pre-dedup", &regs);
     }
     let mut deduped = mem_sort_dedup_patch(fm, opt, codes, regs);
     // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after the dedup.
     crate::primary::stamp_is_alt(bns, &mut deduped);
-    if std::env::var_os("BWA4_DUMP_REGS").is_some() {
+    if dump_regs_enabled() {
         dump_regs(bns, "post-dedup", &deduped);
     }
     deduped

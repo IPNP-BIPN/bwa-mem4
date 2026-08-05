@@ -573,6 +573,18 @@ pub mod align_split {
     pub static SEED_NS: AtomicU64 = AtomicU64::new(0);
     /// Time inside the batched extension kernels, both sides, retries included.
     pub static EXTEND_NS: AtomicU64 = AtomicU64::new(0);
+    /// Time inside `run_side`, the two extension drivers, kernel time included. Subtracting
+    /// [`EXTEND_NS`] from it leaves the job collection, the length sort and the result scatter.
+    pub static SIDE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Time inside `mem_chain_flt`, the chain filter.
+    pub static CHAINFLT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Time materialising each chain's reference window from the packed reference.
+    pub static REFSEQ_NS: AtomicU64 = AtomicU64::new(0);
+    /// Time inside `align_reads_batched` as a whole. Subtracting the parts (seeding, extension, and
+    /// `BWA4_CHAIN_TIME`'s SA walk and chain merge) leaves the glue: chain filtering, job collection
+    /// and sorting, result scatter, region assembly. That remainder is where the next lever has to
+    /// come from once the named stages are accounted for.
+    pub static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
     /// Whether the probe is on. Read once; the disabled path costs one atomic load per phase.
     pub fn enabled() -> bool {
@@ -597,10 +609,23 @@ pub mod align_split {
         if !enabled() {
             return;
         }
-        eprintln!(
-            "[align-split] seeding={:.3}s extension={:.3}s (CPU, summed over threads)",
+        let (seed, ext, total) = (
             SEED_NS.load(Ordering::Relaxed) as f64 / 1e9,
             EXTEND_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            TOTAL_NS.load(Ordering::Relaxed) as f64 / 1e9,
+        );
+        let (side, flt) = (
+            SIDE_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            CHAINFLT_NS.load(Ordering::Relaxed) as f64 / 1e9,
+        );
+        eprintln!(
+            "[align-split] total={total:.3}s seeding={seed:.3}s side={side:.3}s (of which \
+             kernels={ext:.3}s, so collect+sort+scatter={:.3}s) chain_flt={flt:.3}s \
+             refseq={:.3}s rest={:.3}s (CPU summed over threads; `rest` still holds the SA walk \
+             and chain merge that BWA4_CHAIN_TIME reports)",
+            side - ext,
+            REFSEQ_NS.load(Ordering::Relaxed) as f64 / 1e9,
+            total - seed - side - flt - REFSEQ_NS.load(Ordering::Relaxed) as f64 / 1e9,
         );
     }
 }
@@ -641,6 +666,27 @@ pub mod align_split {
 /// Batch size is the caller's business. The only thing that scales with it here is the seeding and
 /// SA-resolution lockstep, which is where the win comes from.
 pub fn align_reads_batched<B: SwBackend>(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    reads: &[Vec<u8>],
+    backend: &B,
+) -> Vec<Vec<MemAlnReg>> {
+    // Whole-function timer for the split probe; `None` and free when the probe is off.
+    let t_all = align_split::enabled().then(std::time::Instant::now);
+    let out = align_reads_batched_inner(fm, bns, opt, reads, backend);
+    if let Some(t) = t_all {
+        align_split::TOTAL_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    out
+}
+
+/// The body of [`align_reads_batched`], split out only so the probe above can time it as a whole.
+#[allow(clippy::too_many_lines)]
+fn align_reads_batched_inner<B: SwBackend>(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
@@ -837,7 +883,7 @@ pub fn align_reads_batched<B: SwBackend>(
             }
             // The kept chains: overlapping and dominated chains dropped, `kept`/`w` filled in. This
             // is the value the closure yields into `per_read_chains`.
-            let out = mem_chain_flt(opt, pre);
+            let out = align_split::measure(&align_split::CHAINFLT_NS, || mem_chain_flt(opt, pre));
             if dump_chains {
                 eprintln!("CHAIN nchains={}", out.len());
                 for (ci, c) in out.iter().enumerate() {
@@ -943,7 +989,12 @@ pub fn align_reads_batched<B: SwBackend>(
             // Materialise the window's bases once per chain, so both sides of every seed slice out of
             // it. `fm.base` unpacks the 2-bit pac; the C gets the same bytes from `bns_fetch_seq_v2`
             // (`bwamem.cpp:2175-2181`). Indices into `rseq` are therefore `position - rmax0`.
-            let rseq: Vec<u8> = (rmax0..rmax1).map(|p| fm.base(p)).collect();
+            // `bases` unpacks the whole window in one vectorised pass; the per-base `base(p)` this
+            // replaced was 18.1 s of CPU on a 500k-pair `-t16` run, roughly a quarter of the align
+            // stage, because it redid the index arithmetic, the strand test and the shift for every
+            // single base of every chain's window.
+            let rseq: Vec<u8> =
+                align_split::measure(&align_split::REFSEQ_NS, || fm.bases(rmax0, rmax1));
 
             // Seeds in descending (score, index) order.
             //
@@ -1127,7 +1178,9 @@ pub fn align_reads_batched<B: SwBackend>(
     // `pen_clip5` for the left side, `pen_clip3` for the right: bwa constructs two
     // `BandedPairWiseSW` objects differing only in that penalty (`bwamem.cpp:2452-2458`). The
     // penalty decides whether a soft clip beats running the alignment to the end of the query.
-    run_side(backend, opt, &mut left_jobs, &mut regs, opt.pen_clip5, true);
+    align_split::measure(&align_split::SIDE_NS, || {
+        run_side(backend, opt, &mut left_jobs, &mut regs, opt.pen_clip5, true)
+    });
 
     // The hard serialisation point, and the reason there are two job arrays rather than one: a right
     // extension resumes from the score the left extension reached, so every left job in the whole
@@ -1151,14 +1204,16 @@ pub fn align_reads_batched<B: SwBackend>(
         // instead of narrowing it.
         job.prev = job.h0;
     }
-    run_side(
-        backend,
-        opt,
-        &mut right_jobs,
-        &mut regs,
-        opt.pen_clip3,
-        false,
-    );
+    align_split::measure(&align_split::SIDE_NS, || {
+        run_side(
+            backend,
+            opt,
+            &mut right_jobs,
+            &mut regs,
+            opt.pen_clip3,
+            false,
+        )
+    });
 
     // ---- seedcov, per region, from final bounds (mirrors mem_chain2aln's tail) ----
     // `seedcov` is the number of query bases covered by seeds that fall entirely inside the finished
