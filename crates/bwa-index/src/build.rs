@@ -96,7 +96,11 @@ use rayon::prelude::*;
 use crate::rand48::Rand48;
 // Only the ARRAY backend of `build_bwt_and_samples` materializes a suffix array, so both importers
 // below are dead under `capsa`, which streams instead.
-#[cfg(all(not(feature = "libsais"), not(feature = "capsa")))]
+#[cfg(all(
+    not(feature = "libsais"),
+    not(feature = "libsais-c"),
+    not(feature = "capsa")
+))]
 use crate::sais::suffix_array_inplace;
 
 /// `suffix_array_inplace` equivalent backed by libsais-rs (a pure-Rust translation of libsais),
@@ -105,44 +109,69 @@ use crate::sais::suffix_array_inplace;
 /// length `2L+1`, `sa[0] == 2L`, `sa[1..]` the suffix array of `bref`. A suffix array is unique, so
 /// this is byte-identical to the SA-IS path; it is only faster to build. `fs = 0` (no extra scratch),
 /// `freq = None` (we do not need the symbol histogram; `count[]` is computed separately below).
-/// Parallel suffix array via the C libsais with OpenMP, behind `--features libsais-c`.
+/// Suffix array via Ilya Grebnov's C libsais, the default backend.
 ///
-/// Same array as every other backend here, because a suffix array is UNIQUE: a parallel
-/// construction either produces the same permutation or is wrong. The `index_diff` gate is what
-/// checks that rather than this comment.
+/// Same array as every other backend here, because a suffix array is UNIQUE: a different
+/// construction either produces the same permutation or is wrong. The `index_diff` gate checks
+/// that, not this comment.
 ///
-/// Thread count is capped, and the cap is measured rather than guessed. On the 2L text of chr1
-/// (498 M bases), libsais takes 12.21 s at one thread, 5.85 s at four, 4.63 s at eight and 7.27 s
-/// at sixteen: past the knee its own parallel sections lose to their coordination. `BWA4_SA_THREADS`
-/// overrides for a machine whose knee sits elsewhere.
+/// Why the C rather than the pure-Rust translation, which was the default until now: it is faster
+/// at every thread count, including one. On the 2L text, arrays identical in every case:
+///
+/// | text | Rust translation | C, 1 thread | C, 4 | C, 8 | C, 16 |
+/// |------|------------------|-------------|------|------|-------|
+/// | chr21, 93 M bases | 3.27 s | 1.95 s | 1.05 s | **0.85 s** | 1.22 s |
+/// | chr1, 498 M bases | 20.15 s | 12.21 s | 5.85 s | **4.63 s** | 7.27 s |
+///
+/// The C source is vendored by the `libsais` crate, so this adds a C COMPILER to the build and no
+/// system package. The CLI already needs one for `rust-htslib`, so for the shipped binary it costs
+/// nothing new; `--features libsais` still selects the translation for a build with no C at all.
+///
+/// With `--features libsais-c-omp` the same call runs OpenMP-parallel, which is where the 4.3x is.
+/// The thread cap is measured rather than guessed: past eight, libsais's own parallel sections lose
+/// to their coordination (16 threads is slower than 4 on both texts above). `BWA4_SA_THREADS`
+/// overrides it for a machine whose knee sits elsewhere.
 ///
 /// # Parameters
 /// * `bref`: the 2L-space reference, one byte per base, codes `0..=3`.
 ///
 /// # Returns
-/// `2L + 1` entries: `sa[0] = 2L` (the sentinel suffix) and `sa[1..]` the suffix array of `bref`,
-/// the same layout every other backend returns.
+/// `2L + 1` entries: `sa[0] = 2L` (the sentinel suffix) then the suffix array of `bref`, the layout
+/// every backend here returns.
 #[cfg(all(feature = "libsais-c", not(feature = "capsa")))]
 fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
     let n = bref.len();
     let mut sa = vec![0i64; n + 1];
-    let threads = std::env::var("BWA4_SA_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| rayon::current_num_threads().min(8))
-        .max(1);
-    let built: Vec<i64> = libsais::SuffixArrayConstruction::for_text(bref)
+    // The builder is typed by its threading choice, so the serial and parallel arms each finish the
+    // chain themselves rather than sharing a half-built value.
+    #[cfg(not(feature = "libsais-c-omp"))]
+    let build = libsais::SuffixArrayConstruction::for_text(bref)
         .in_owned_buffer()
-        .multi_threaded(libsais::ThreadCount::fixed(threads as u16))
+        .single_threaded();
+    #[cfg(feature = "libsais-c-omp")]
+    let build = {
+        let build = libsais::SuffixArrayConstruction::for_text(bref).in_owned_buffer();
+        let threads = std::env::var("BWA4_SA_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| rayon::current_num_threads().min(8))
+            .max(1);
+        build.multi_threaded(libsais::ThreadCount::fixed(threads as u16))
+    };
+    let built: Vec<i64> = build
         .run()
-        .expect("libsais C suffix-array construction")
+        .expect("libsais suffix-array construction")
         .into_vec();
     sa[1..].copy_from_slice(&built);
     sa[0] = n as i64;
     sa
 }
 
-#[cfg(all(feature = "libsais", not(feature = "libsais-c"), not(feature = "capsa")))]
+#[cfg(all(
+    feature = "libsais",
+    not(feature = "libsais-c"),
+    not(feature = "capsa")
+))]
 fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
     let n = bref.len();
     let mut sa = vec![0i64; n + 1];

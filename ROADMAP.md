@@ -127,9 +127,12 @@ pas la vitesse.
 
 ## Indexeur : le tableau de suffixes est parallelisable, mais pas par le portage Rust (2026-08-05)
 
-Resume : `libsais64_omp` (portage rayon, pur Rust) perd ; **le C libsais avec OpenMP gagne 4,3x** et
-produit le meme tableau. Il est desormais disponible derriere `--features libsais-c`, eteint par
-defaut parce qu'il exige un toolchain C et libomp a la compilation, ce que le defaut pur Rust evite.
+Resume : `libsais64_omp` (portage rayon, pur Rust) perd ; **le C libsais gagne a tous les nombres de
+threads, y compris a un seul**, et produit le meme tableau. Il est desormais le backend **par
+defaut** (`libsais-c`), en version serie : la crate embarque la source C, donc cela ajoute un
+compilateur C et aucun paquet systeme, et le binaire en exigeait deja un pour `rust-htslib`.
+`--features libsais-c-omp` ajoute OpenMP (la ou sont les 4,3x, mais il faut libomp) et
+`--features libsais` garde le portage pur Rust pour une compilation sans C du tout.
 
 Mesure sur le texte 2L, tableaux **identiques dans tous les cas** (un tableau de suffixes est unique) :
 
@@ -143,8 +146,10 @@ gain n'est pas le parallelisme. Et le coude est a 8 threads : au-dela, les secti
 libsais perdent contre leur propre coordination, d'ou le plafond `min(rayon, 8)` et la variable
 `BWA4_SA_THREADS` pour une machine dont le coude est ailleurs.
 
-Bout en bout sur `bwa-mem4 index` (chr21, conteneur Linux arm64) : **3,347 s -> 1,356 s**, cinq
-fichiers octet-identiques a la fixture committee.
+Bout en bout sur `bwa-mem4 index`, cinq fichiers octet-identiques a la fixture committee dans les
+trois cas : conteneur Linux arm64 **3,347 s (pur Rust) -> 1,341 s (C + OpenMP)** ; hote macOS
+**2,56 s -> 1,742 s** avec le nouveau defaut serie, qui est le gain que tout le monde recoit sans
+installer quoi que ce soit.
 
 ### Ce qui a ete essaye et rejete
 

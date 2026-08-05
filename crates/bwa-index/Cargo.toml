@@ -36,7 +36,7 @@ libsais-rs = { version = "0.2", optional = true }
 #
 # So about 4.3x on the stage that dominates `bwa-mem4 index`, and note the knee: past 8 threads
 # libsais's own parallel sections start losing to their coordination.
-libsais = { version = "0.2", optional = true }
+libsais = { version = "0.2", optional = true, default-features = false }
 # Optional CaPS-SA suffix-array construction (index BUILD only). Cache-friendly parallel sample-sort
 # SACA (COMBINE-lab port); exposes both an in-memory build and an EXTERNAL-MEMORY (bounded-RAM) build.
 # A suffix array is UNIQUE, so the produced index is byte-identical either way; only build speed / peak
@@ -48,11 +48,17 @@ caps-sa = { version = "0.6", optional = true }
 # translation of Ilya Grebnov's libsais), ~3x faster to build than the in-tree SA-IS and BYTE-IDENTICAL
 # (a suffix array is unique; gated by scripts/index_diff.sh). `--no-default-features` falls back to the
 # dependency-free SA-IS. Only `index` build speed changes, never `mem` output.
-default = ["libsais"]
+default = ["libsais-c"]
+# The pure-Rust translation. No longer the default, kept as the escape hatch for a build with no C
+# compiler at all (the CLI needs one anyway for rust-htslib, but this crate on its own does not).
 libsais = ["dep:libsais-rs"]
-# The C libsais with OpenMP, for a parallel suffix array. Byte-identical output (a suffix array is
-# unique), 4.3x faster on a 500 Mbase text, at the cost of a C toolchain and libomp at build time.
+# Ilya Grebnov's C libsais, serial. This is the default: it needs a C compiler and nothing else (the
+# C source is vendored by the crate, there is no system package to install), and it is 1.7x faster
+# than the Rust translation before any threading enters the picture.
 libsais-c = ["dep:libsais"]
+# ... and with OpenMP, which is where the 4.3x is. Needs libomp at build time: present on Linux with
+# gcc, needs `brew install libomp` on macOS. Off by default for that reason alone.
+libsais-c-omp = ["libsais-c", "libsais/openmp"]
 # Experimental CaPS-SA backend (spike). Not in `default`. In-memory build ~ libsais-class speed, plus a
 # bounded-RAM external-memory build that libsais/SA-IS cannot do. Byte-identical (a SA is unique).
 capsa = ["dep:caps-sa"]
