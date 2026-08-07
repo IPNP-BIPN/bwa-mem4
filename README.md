@@ -209,9 +209,11 @@ FASTQ input is plain or gzipped, and the format is sniffed from the file's magic
 its extension, so a gzipped file named `.fq` works.
 
 Building with `--features multi-format` also accepts **bzip2, xz and zstd** FASTQ input. It is off by
-default because those three formats come from C libraries, and the default build needs no compression
-toolchain at all. The gzip path does not change when the feature is on: gzip is recognised first and
-keeps its pure-Rust `zlib-rs` inflate.
+default because it costs about 11 seconds of build time and 3.5% of binary size to compile three
+vendored C libraries, and adds them to the supply chain, for formats `bwa-mem2` does not read. It is
+not off because of a toolchain requirement: this binary already needs a C compiler for htslib and for
+libsais. The gzip path does not change when the feature is on: gzip is recognised first and keeps its
+pure-Rust `zlib-rs` inflate.
 
 `bwa-mem2` reads neither of the three, so this is an extension rather than a parity feature. The
 output does not depend on it: the same reads, gzipped or zstd-compressed, produce the same SAM

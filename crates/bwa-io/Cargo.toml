@@ -51,14 +51,28 @@ flate2 = { version = "1.1", optional = true, default-features = false, features 
 # default features.
 # Swap the gzip decompressor for zlib-rs. Additive and code-free; see the dependency comment above.
 fast-gzip = ["dep:flate2"]
-# Accept bzip2, xz and zstd FASTQ input as well as plain and gzip. OFF by default, and the reason is
-# not caution: niffler's bz2, lzma and zstd paths are bindings to three C libraries, so turning this
-# on turns a build that needs no compression toolchain into one that needs three. Plain and gzip
-# input do not go through niffler even when this is enabled (see `fastq::open_reader`), so the
-# default path keeps the zlib-rs inflate that was measured at -38% against miniz_oxide.
+# Accept bzip2, xz and zstd FASTQ input as well as plain and gzip. OFF by default, for three reasons
+# that are worth stating precisely, because the obvious one is wrong.
 #
-# bwa-mem2 accepts neither of these formats, so this is an extension, not a parity feature: a run
-# reading a `.zst` produces the same SAM as the same reads gzipped, which is what the test asserts.
+# The obvious-and-wrong one: "it would add a C toolchain requirement". Not for the shipped binary. It
+# already needs a C compiler for `rust-htslib`, and since the suffix-array backend moved to the C
+# libsais it needs one twice over. This crate ON ITS OWN is C-free today (flate2 runs on `zlib-rs`,
+# pure Rust), and that is the only sense in which the claim holds.
+#
+# The real ones, measured:
+#   * build time: +11 s on a cold release build (25 s -> 36 s in the CI container), which is the
+#     three vendored C libraries compiling. None of them needs a system package.
+#   * binary size: 3 041 952 -> 3 148 064 bytes, +3.5%.
+#   * supply chain: three more C libraries to track for advisories, for a format nobody has asked
+#     for yet.
+#
+# And it is an extension rather than parity: `bwa-mem2` reads none of the three. What the feature
+# must NOT do is change the output, which is what the tests assert: the same reads spelled five
+# different ways parse to the same records, and a chromosome-scale run from `.zst` produces the same
+# SAM md5 as from `.gz`.
+#
+# Plain and gzip input do not go through niffler even when this is on (see `fastq::open_reader`), so
+# the default path keeps the zlib-rs inflate measured at -38% against miniz_oxide.
 multi-format = ["dep:niffler"]
 
 [lints]
