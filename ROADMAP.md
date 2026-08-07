@@ -377,10 +377,21 @@ interieures ne touchent jamais la memoire.
 
 Mesure au calme, trois repetitions par bras, dispersion 0,4 % : **16,00 / 16,06 / 16,01 s** de CPU
 noyau contre **16,46 / 16,44 / 16,41**, soit **+2,6 %**. Rendements decroissants nets face aux +9,5 %
-de la paire, la pression sur les registres etant l'explication la plus probable. Le noyau pesant la
-moitie du run, cela vaut ~1,3 % bout en bout ; les deux repetitions bout-en-bout qui ont tourne avant
-que l'hote se charge donnent -0,8 %, meme signe et meme ordre. NEON seulement : AVX2 a 16 registres
-vectoriels contre 32, et quatre lignes demandent seize accumulateurs vivants avant les constantes.
+de la paire, la pression sur les registres etant l'explication la plus probable. NEON seulement :
+AVX2 a 16 registres vectoriels contre 32, et quatre lignes demandent seize accumulateurs vivants
+avant les constantes.
+
+Bout en bout, meme protocole que partout ailleurs ici (`-t4`, 500k paires reelles contre GRCh38,
+secondes CPU), sur un hote redevenu calme, **5 victoires sur 5** :
+
+| | repetitions | mediane |
+|---|---|---|
+| avant | 105,29 / 105,57 / 106,05 / 106,24 / 106,27 | 106,05 s |
+| apres | 104,51 / 104,83 / 105,18 / 105,12 / 105,02 | **105,02 s**, -0,97 % |
+
+La projection depuis le noyau (+2,6 % sur 51 % du run) donnait -1,3 %. Le reel est **-0,97 %**, un
+peu en dessous, ce qui est le sens attendu : le poste "mate rescue" du run inclut de la mise en lots
+et de l'extraction que le quadruplet ne touche pas. C'est le chiffre a citer, pas la projection.
 
 ### Ce qui n'a pas marche : sauter la reparation du N
 
