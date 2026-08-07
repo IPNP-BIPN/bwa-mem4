@@ -19,6 +19,17 @@ on:
         description: "Read pairs to simulate for the end-to-end job"
         default: "1000000"
         required: false
+      # GitHub's ubuntu-22.04 pool is heterogeneous: an Intel draw reports avx512bw and an AMD draw
+      # does not, and which one you get is luck. The AVX-512 kernels have therefore never been TIMED
+      # (the 2026-08-03 run drew AMD and printed "avx512_u8 skipped"), while their byte-identity
+      # tests DID run on an Intel CI draw the next day. Since the kernel A/B job takes about one
+      # minute and the end-to-end job takes an hour, this switch makes "dispatch again until the
+      # pool gives us AVX-512 hardware" a cheap thing to do rather than an hour-long one.
+      kernel_ab_only:
+        description: "Run only the one-minute kernel A/B job (use to re-draw for an AVX-512 runner)"
+        type: boolean
+        default: false
+        required: false
   schedule:
     # Mondays 05:00 UTC, offset from the parity/CI schedules.
     - cron: "0 5 * * 1"
@@ -66,6 +77,10 @@ jobs:
 
   endtoend-smallref:
     name: end-to-end vs bwa-mem2 (single chromosome, cloud-noisy)
+    # Skipped when the dispatch asked for a kernel-A/B-only re-draw. The condition is written against
+    # the string 'true' because a workflow_dispatch input arrives as a string even when typed boolean,
+    # and it must stay true for the weekly schedule, where `inputs` is empty.
+    if: github.event.inputs.kernel_ab_only != 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     defaults:
