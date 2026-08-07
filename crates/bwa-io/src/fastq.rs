@@ -95,6 +95,59 @@ pub struct FastqReader {
     inner: Box<dyn FastxReader>,
 }
 
+/// Open a FASTQ/FASTA file and return the parser for it, whatever its compression.
+///
+/// Plain and gzip go straight to needletail, which sniffs the magic bytes and builds its own
+/// decompressor. That path is untouched and stays on flate2 with the `zlib-rs` backend, which is
+/// where the measured inflate speed lives.
+///
+/// With `--features multi-format`, anything needletail does not recognise is offered to niffler
+/// first, which adds bzip2, xz and zstd. The order matters and is not arbitrary: sniffing here
+/// rather than dispatching on the file extension means a `.fq` that is really zstd still works, and
+/// a gzip file never leaves the fast path because it is recognised before niffler is consulted.
+///
+/// # Parameters
+/// * `path`: the file, from argv. Format and compression are both detected from content.
+///
+/// # Errors
+/// [`Error::Fastq`] if the file cannot be opened, is empty, or is not a format any enabled backend
+/// recognises. The message names the path, since a user who passed the wrong file gets nothing else
+/// to go on.
+fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
+    // The first two bytes decide: 0x1f 0x8b is gzip, and needletail handles both that and plain
+    // text. Read them without consuming the file, since needletail opens it again by path.
+    let magic = {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)
+            .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+        let mut buf = [0u8; 2];
+        // A file shorter than two bytes cannot be a FASTQ; let needletail produce that error.
+        let n = f.read(&mut buf).unwrap_or(0);
+        if n == 2 {
+            Some(buf)
+        } else {
+            None
+        }
+    };
+    let is_gzip = magic == Some([0x1f, 0x8b]);
+    let looks_like_text = magic.is_some_and(|m| m[0] == b'@' || m[0] == b'>');
+
+    if is_gzip || looks_like_text || cfg!(not(feature = "multi-format")) {
+        return parse_fastx_file(path).map_err(|e| Error::Fastq(e.to_string()));
+    }
+
+    #[cfg(feature = "multi-format")]
+    {
+        // niffler picks the decompressor from the same magic bytes and hands back a `Read`;
+        // needletail then parses the decompressed stream exactly as it would a plain file.
+        let (reader, _format) = niffler::send::from_path(path)
+            .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+        needletail::parse_fastx_reader(reader).map_err(|e| Error::Fastq(e.to_string()))
+    }
+    #[cfg(not(feature = "multi-format"))]
+    unreachable!("the branch above returns when the feature is off")
+}
+
 impl FastqReader {
     /// Open a FASTQ (optionally gzipped) file.
     ///
@@ -104,16 +157,9 @@ impl FastqReader {
     ///   FASTA; the format and the compression are both sniffed by needletail, not from the
     ///   extension. Must exist and be readable, otherwise [`Error::Fastq`] is returned.
     pub fn from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        // needletail opens the file, sniffs its magic bytes, and hands back whichever parser fits:
-        // plain or gzip-decompressing. Which one it is never appears in the types below, because
-        // `Box<dyn FastxReader>` describes only what the parser can DO.
-        //
-        // Rust: `.map_err(...)` rewrites the error inside a `Result` while leaving a success
-        // untouched, here translating needletail's error type into ours. The `?` then propagates
-        // that translated failure to our caller. Without the `map_err` the `?` would not compile,
-        // since there is no automatic conversion between the two error types.
-        let inner = parse_fastx_file(path).map_err(|e| Error::Fastq(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: open_reader(path.as_ref())?,
+        })
     }
 
     /// Pull the next read, or `None` at EOF.
@@ -427,6 +473,68 @@ fn qname_from_id(id: &[u8]) -> String {
 /// raising it would strip multi-digit suffixes bwa keeps (`read/12`) and break the two mates'
 /// QNAMEs apart, which is byte-visible in SAM column 1 and, under `-p`, breaks mate detection.
 const READNO_SUFFIX_LEN: usize = 2;
+
+#[cfg(all(test, feature = "multi-format"))]
+mod multi_format_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// The same reads, compressed four ways, must parse to the same records.
+    ///
+    /// This is the whole promise of the feature: a `.zst` FASTQ is not a different input, it is the
+    /// same input spelled differently, and the aligner downstream cannot tell. Building the fixtures
+    /// here rather than committing four binaries keeps the test honest about what it compresses.
+    #[test]
+    fn every_compression_yields_the_same_records() {
+        let plain = b"@r1 comment\nACGTACGTAC\n+\nIIIIIIIIII\n@r2\nTTTTGGGGCC\n+\nJJJJJJJJJJ\n";
+        let dir = std::env::temp_dir().join(format!("bwa4_multifmt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write = |name: &str, bytes: &[u8]| -> std::path::PathBuf {
+            let p = dir.join(name);
+            std::fs::File::create(&p).unwrap().write_all(bytes).unwrap();
+            p
+        };
+        // niffler's writer is the same dispatcher the reader uses, so the fixtures are compressed by
+        // the code path the test is about rather than by whatever tool happens to be installed.
+        let compress = |name: &str, fmt: niffler::compression::Format| -> std::path::PathBuf {
+            let p = dir.join(name);
+            let mut w = niffler::to_path(&p, fmt, niffler::Level::One).unwrap();
+            w.write_all(plain).unwrap();
+            drop(w);
+            p
+        };
+
+        let paths = [
+            write("reads.fq", plain),
+            compress("reads.fq.gz", niffler::compression::Format::Gzip),
+            compress("reads.fq.bz2", niffler::compression::Format::Bzip),
+            compress("reads.fq.zst", niffler::compression::Format::Zstd),
+            compress("reads.fq.xz", niffler::compression::Format::Lzma),
+        ];
+
+        // Records from the uncompressed file, the reference every other spelling must match.
+        let read_all = |p: &std::path::Path| -> Vec<(String, Vec<u8>, Option<Vec<u8>>)> {
+            let mut r = FastqReader::from_path(p).unwrap();
+            let mut out = Vec::new();
+            while let Some(rec) = r.next_record().unwrap() {
+                out.push((rec.name.clone(), rec.seq.clone(), rec.qual.clone()));
+            }
+            out
+        };
+        let expected = read_all(&paths[0]);
+        assert_eq!(expected.len(), 2, "fixture should hold two reads");
+        for p in &paths[1..] {
+            assert_eq!(
+                read_all(p),
+                expected,
+                "{} parsed differently from the uncompressed fixture",
+                p.display()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
 
 #[cfg(test)]
 mod tests {

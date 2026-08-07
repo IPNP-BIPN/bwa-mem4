@@ -14,6 +14,13 @@ repository.workspace = true
 [dependencies]
 bwa-core = { workspace = true }
 needletail = { workspace = true }
+# Format sniffing for the `multi-format` feature. Default features, deliberately: niffler's own
+# `bz2`/`lzma`/`zstd` features only add the wrapper, and the backing `*-sys` crates are configured
+# by the `bzip2/default` and `liblzma/default` entries in ITS default set, so subtracting them
+# produces a graph that does not link. Taking the default also pulls its gzip path, which costs
+# nothing here: features are additive, so our `flate2/zlib-rs` still wins, and gzip input never
+# reaches niffler anyway (`fastq::open_reader` recognises it first).
+niffler = { version = "3", optional = true }
 # Fast inflate backend for gzipped FASTQ input. ON by default via bwa-cli's `default` feature.
 #
 # needletail constructs the decompressor itself (`flate2::read::MultiGzDecoder`), so we cannot pass
@@ -44,6 +51,15 @@ flate2 = { version = "1.1", optional = true, default-features = false, features 
 # default features.
 # Swap the gzip decompressor for zlib-rs. Additive and code-free; see the dependency comment above.
 fast-gzip = ["dep:flate2"]
+# Accept bzip2, xz and zstd FASTQ input as well as plain and gzip. OFF by default, and the reason is
+# not caution: niffler's bz2, lzma and zstd paths are bindings to three C libraries, so turning this
+# on turns a build that needs no compression toolchain into one that needs three. Plain and gzip
+# input do not go through niffler even when this is enabled (see `fastq::open_reader`), so the
+# default path keeps the zlib-rs inflate that was measured at -38% against miniz_oxide.
+#
+# bwa-mem2 accepts neither of these formats, so this is an extension, not a parity feature: a run
+# reading a `.zst` produces the same SAM as the same reads gzipped, which is what the test asserts.
+multi-format = ["dep:niffler"]
 
 [lints]
 workspace = true

@@ -31,6 +31,10 @@ rust-htslib = { workspace = true }
 rammap-core = "1.1.2"
 
 [features]
+# Passthrough for `bwa-io`'s multi-format FASTQ input (bzip2, xz, zstd). Off by default: it pulls
+# three C compression libraries. See crates/bwa-io/Cargo.toml for why they are not optional inside
+# niffler's own feature set.
+multi-format = ["bwa-io/multi-format"]
 # Suffix-array backend passthrough for `bwa-mem4 index`. `bwa-index` owns the actual choice (see
 # crates/bwa-index/Cargo.toml); this exists so the streaming CaPS-SA backend can be selected when
 # building the BINARY, which is the only way a user reaches `bwa-mem4 index`:

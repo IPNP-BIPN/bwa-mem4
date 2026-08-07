@@ -203,6 +203,21 @@ records are identical, and `samtools view -C -T` on our own BAM produces the sam
 | BAM | 8,203,307 | 5.5x |
 | CRAM | 1,187,099 | 37.9x |
 
+## Input formats
+
+FASTQ input is plain or gzipped, and the format is sniffed from the file's magic bytes rather than
+its extension, so a gzipped file named `.fq` works.
+
+Building with `--features multi-format` also accepts **bzip2, xz and zstd** FASTQ input. It is off by
+default because those three formats come from C libraries, and the default build needs no compression
+toolchain at all. The gzip path does not change when the feature is on: gzip is recognised first and
+keeps its pure-Rust `zlib-rs` inflate.
+
+`bwa-mem2` reads neither of the three, so this is an extension rather than a parity feature. The
+output does not depend on it: the same reads, gzipped or zstd-compressed, produce the same SAM
+(asserted by `every_compression_yields_the_same_records`, and checked end to end on a chromosome-scale
+run).
+
 ## Installing
 
 Prebuilt binaries for Linux and macOS, x86_64 and arm64, are attached to each
