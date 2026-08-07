@@ -358,23 +358,38 @@ u8/i16) tournent pour de vrai des que le runner a `avx512bw`. Tirage CI du 2026-
 avx512bw avx512f`, et les quatre tests apparaissent en `ok` dans le journal. Ce n'est donc pas du code
 jamais execute.
 
-**Vitesse : jamais mesuree.** Le pool `ubuntu-22.04` de GitHub est heterogene et le tirage n'est pas
-choisissable. Deux tirages du banc de suite ont donne la meme machine sans AVX-512 :
+**Vitesse : mesuree, enfin.** Le pool `ubuntu-22.04` de GitHub est heterogene et le tirage n'est pas
+choisissable, ce qui est la seule raison pour laquelle ce chiffre a manque si longtemps. Cinq tirages,
+un seul Intel :
 
-| date | modele | `simd:` | ligne AVX-512 du banc |
-|---|---|---|---|
-| 2026-08-03 (hebdo) | AMD EPYC 7763 | `avx2` | `avx512_u8 skipped` |
-| 2026-08-07 (manuel) | AMD EPYC 7763 | `avx2` | `avx512_u8 skipped` |
+| date | modele | `simd:` | scalaire | AVX2 u8 | AVX-512 u8 |
+|---|---|---|---|---|---|
+| 2026-08-03 (hebdo) | AMD EPYC 7763 | `avx2` | 0,130 | 10,09 | *skipped* |
+| 2026-08-07 #1 | AMD EPYC 7763 | `avx2` | 0,130 | 10,09 | *skipped* |
+| **2026-08-07 #2** | **Intel Xeon Platinum 8573C** | `avx2 avx512bw avx512f` | 0,131 | 8,29 | **10,39** |
+| 2026-08-07 #3 | AMD EPYC 7763 | `avx2` | 0,128 | 9,78 | *skipped* |
+| 2026-08-07 #4 | AMD EPYC 7763 | `avx2` | 0,131 | 9,85 | *skipped* |
 
-Pour reference, ce que ce tirage AMD donne quand meme : rescue scalaire 0,130 Gcell/s, AVX2 u8 **10,09
-Gcell/s**, soit **77x**.
+En Gcell/s. Sur l'hote Intel : **AVX-512 vaut 1,25x l'AVX2** (79,2x le scalaire contre 63,2x). Une
+seule observation, mais les trois arms sont chronometres **dans le meme processus sur le meme hote**,
+donc le rapport 1,25x ne depend ni du tirage ni du voisinage.
+
+Deux lectures, et la seconde compte plus que la premiere :
+
+1. **Le noyau 512 bits sert.** 1,25x sur un etage qui pese ~39 % des echantillons de travail
+   (profil arm64, voir la section precedente) vaudrait ~8 % du CPU total sur une telle machine. La
+   calibration a l'execution le choisit deja toute seule : rien a cabler.
+2. **Le gain vient de la largeur, pas de la machine.** Ce Xeon fait 8,29 Gcell/s en AVX2 la ou
+   l'EPYC 7763 en fait 9,78 a 10,09. Autrement dit l'AVX-512 de l'Intel arrive tout juste au niveau
+   que l'AMD atteint **en AVX2 seul**. Le 512 bits rattrape un hote plus lent par vecteur ; il ne
+   place pas l'Intel devant.
 
 Localement c'est hors d'atteinte et il ne faut pas y revenir : Rosetta n'expose pas `avx512bw`, et le
 TCG de QEMU n'implemente pas AVX-512 (il s'arrete a AVX2). Il n'y a pas d'emulateur a essayer.
 
-Ce qui a ete fait a la place : `bench-x86` accepte une entree `kernel_ab_only`, qui saute le job
+Ce qui a rendu la mesure possible : `bench-x86` accepte une entree `kernel_ab_only`, qui saute le job
 bout-en-bout d'une heure et ne lance que le A/B de noyau d'une minute. Retirer au sort une machine
-Intel coute maintenant une minute par essai au lieu d'une heure.
+Intel coute une minute par essai au lieu d'une heure, et il en a fallu trois.
 
 ## Contre le fork, avec tout ce qui precede (2026-08-07)
 
