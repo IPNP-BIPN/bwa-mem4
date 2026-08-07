@@ -491,6 +491,26 @@ fn rowpair_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_ROWPAIR").is_none_or(|v| v != "0"))
 }
 
+/// Whether the NEON u8 rescue kernel processes target rows FOUR at a time. `BWA4_RESCUE_ROWQUAD=0`
+/// drops back to the pair loop (itself still governed by [`rowpair_enabled`]), so the three widths
+/// are A/B-able inside one binary. Read once and cached.
+///
+/// Same argument as the pair, taken one step further: a group of four rows loads the query column,
+/// `e[j]` and `h_prev[j]` once and stores `e[j]` and `h_cur[j]` once, so five memory operations
+/// cover four cells instead of the pair's five for two. The three interior E carries and the three
+/// interior diagonals stay in registers and never reach memory at all.
+///
+/// NEON only for now, hence the `cfg`. The x86 u8 kernels keep the pair loop: AVX2 has 16 vector
+/// registers against NEON's 32, and four rows need sixteen live accumulators (`f`, `d`, `imax`,
+/// `col` per row) before the constants, so a quad body there would likely spill more than it saves.
+/// Measure before porting.
+#[cfg(target_arch = "aarch64")]
+fn rowquad_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_ROWQUAD").is_none_or(|v| v != "0"))
+}
+
 /// Lanes processed in lockstep per group. 8 = one NEON `int16x8`.
 const LANES: usize = 8;
 
@@ -1632,11 +1652,175 @@ unsafe fn fwd_local_sw_neon_u8(
         }
 
         let pair_rows = rowpair_enabled();
+        let quad_rows = pair_rows && rowquad_enabled();
         let mut i = 0usize;
         while i < tmax {
-            // Rows consumed by this iteration: 2 when a full pair is left, else 1.
-            let rows = if pair_rows && i + 1 < tmax { 2 } else { 1 };
-            if rows == 2 {
+            // Rows consumed by this iteration: 4 when a full quad is left, else 2, else 1. The
+            // narrower bodies are the tail, and are also what `BWA4_RESCUE_ROWQUAD=0` falls back to.
+            let rows = if quad_rows && i + 3 < tmax {
+                4
+            } else if pair_rows && i + 1 < tmax {
+                2
+            } else {
+                1
+            };
+            if rows == 4 {
+                let t0_v = vld1q_u8(seq_t.as_ptr().add(i * LANES16));
+                let t1_v = vld1q_u8(seq_t.as_ptr().add((i + 1) * LANES16));
+                let t2_v = vld1q_u8(seq_t.as_ptr().add((i + 2) * LANES16));
+                let t3_v = vld1q_u8(seq_t.as_ptr().add((i + 3) * LANES16));
+                let t0_is_n = vceqq_u8(t0_v, four_v);
+                let t1_is_n = vceqq_u8(t1_v, four_v);
+                let t2_is_n = vceqq_u8(t2_v, four_v);
+                let t3_is_n = vceqq_u8(t3_v, four_v);
+                // Four independent sets of row accumulators. `d0` is the only diagonal that comes
+                // from memory; `d1`/`d2`/`d3` are the previous column's H from the row above, handed
+                // over in a register.
+                let (mut f0, mut f1, mut f2, mut f3) = (zero, zero, zero, zero);
+                let (mut d0, mut d1, mut d2, mut d3) = (zero, zero, zero, zero);
+                let (mut imax0, mut imax1, mut imax2, mut imax3) = (zero, zero, zero, zero);
+                let (mut col0, mut col1, mut col2, mut col3) = (zero, zero, zero, zero);
+                let mut j_v = zero;
+
+                // ---- Fast column range: no ZPAD, no PAD (see the one-row body below) ----------
+                for j in 0..n_fast {
+                    // The one load all four rows use.
+                    let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
+
+                    // Row i. `e_v` is E(i, j), the only E that comes from memory.
+                    let mut s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
+                    s0 = vbslq_u8(t0_is_n, n_score_v, s0);
+                    let diag0 = vqsubq_u8(vqaddq_u8(d0, s0), bias_v);
+                    let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
+                    let mfe0 = vmaxq_u8(diag0, e_v);
+                    let h0 = vmaxq_u8(mfe0, f0);
+                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
+                    imax0 = vmaxq_u8(imax0, h0);
+                    let e1 = vmaxq_u8(vqsubq_u8(e_v, e_del_v), vqsubq_u8(h0, oe_del_v));
+                    f0 = vmaxq_u8(vqsubq_u8(f0, e_ins_v), vqsubq_u8(mfe0, oe_ins_v));
+                    d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
+
+                    // Row i+1, whose diagonal H(i, j-1) is the previous column's `h0` and whose E
+                    // carry row i just produced in a register.
+                    let mut s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
+                    s1 = vbslq_u8(t1_is_n, n_score_v, s1);
+                    let diag1 = vqsubq_u8(vqaddq_u8(d1, s1), bias_v);
+                    let mfe1 = vmaxq_u8(diag1, e1);
+                    let h1 = vmaxq_u8(mfe1, f1);
+                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
+                    imax1 = vmaxq_u8(imax1, h1);
+                    let e2 = vmaxq_u8(vqsubq_u8(e1, e_del_v), vqsubq_u8(h1, oe_del_v));
+                    f1 = vmaxq_u8(vqsubq_u8(f1, e_ins_v), vqsubq_u8(mfe1, oe_ins_v));
+                    d1 = h0;
+
+                    // Row i+2.
+                    let mut s2 = vqtbl1q_u8(score_tbl, veorq_u8(t2_v, q_v));
+                    s2 = vbslq_u8(t2_is_n, n_score_v, s2);
+                    let diag2 = vqsubq_u8(vqaddq_u8(d2, s2), bias_v);
+                    let mfe2 = vmaxq_u8(diag2, e2);
+                    let h2 = vmaxq_u8(mfe2, f2);
+                    col2 = vbslq_u8(vcgtq_u8(h2, imax2), j_v, col2);
+                    imax2 = vmaxq_u8(imax2, h2);
+                    let e3 = vmaxq_u8(vqsubq_u8(e2, e_del_v), vqsubq_u8(h2, oe_del_v));
+                    f2 = vmaxq_u8(vqsubq_u8(f2, e_ins_v), vqsubq_u8(mfe2, oe_ins_v));
+                    d2 = h1;
+
+                    // Row i+3, the only one of the four whose H and E reach memory.
+                    let mut s3 = vqtbl1q_u8(score_tbl, veorq_u8(t3_v, q_v));
+                    s3 = vbslq_u8(t3_is_n, n_score_v, s3);
+                    let diag3 = vqsubq_u8(vqaddq_u8(d3, s3), bias_v);
+                    let mfe3 = vmaxq_u8(diag3, e3);
+                    let h3 = vmaxq_u8(mfe3, f3);
+                    col3 = vbslq_u8(vcgtq_u8(h3, imax3), j_v, col3);
+                    imax3 = vmaxq_u8(imax3, h3);
+                    vst1q_u8(
+                        e.as_mut_ptr().add(j * LANES16),
+                        vmaxq_u8(vqsubq_u8(e3, e_del_v), vqsubq_u8(h3, oe_del_v)),
+                    );
+                    f3 = vmaxq_u8(vqsubq_u8(f3, e_ins_v), vqsubq_u8(mfe3, oe_ins_v));
+                    d3 = h2;
+                    vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h3);
+                    j_v = vaddq_u8(j_v, one_v);
+                }
+
+                // ---- Tail: ZPAD / PAD possible, full logic, still four rows at a time ----------
+                // `q_pad` is hoisted out of the four PAD tests: the pair body recomputes
+                // `vtstq_u8(vorrq_u8(t, q), high_bit)` per row, but the query half of that OR is the
+                // same for all four, so it is tested once and OR-ed with each row's target test.
+                for j in n_fast..qmax {
+                    let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
+                    let zpad_mask = vceqq_u8(q_v, zpad_v);
+                    let q_pad = vtstq_u8(q_v, high_bit_v);
+
+                    let mut s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
+                    s0 = vbslq_u8(t0_is_n, n_score_v, s0);
+                    let scored0 = vqsubq_u8(vqaddq_u8(d0, s0), bias_v);
+                    let pad0 = vorrq_u8(q_pad, vtstq_u8(t0_v, high_bit_v));
+                    let mut diag0 = vbslq_u8(zpad_mask, d0, scored0);
+                    diag0 = vbslq_u8(pad0, zero, diag0);
+                    let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
+                    let mfe0 = vmaxq_u8(diag0, e_v);
+                    let h0 = vmaxq_u8(mfe0, f0);
+                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
+                    imax0 = vmaxq_u8(imax0, h0);
+                    let e1 = vmaxq_u8(vqsubq_u8(e_v, e_del_v), vqsubq_u8(h0, oe_del_v));
+                    f0 = vmaxq_u8(vqsubq_u8(f0, e_ins_v), vqsubq_u8(mfe0, oe_ins_v));
+                    d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
+
+                    let mut s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
+                    s1 = vbslq_u8(t1_is_n, n_score_v, s1);
+                    let scored1 = vqsubq_u8(vqaddq_u8(d1, s1), bias_v);
+                    let pad1 = vorrq_u8(q_pad, vtstq_u8(t1_v, high_bit_v));
+                    let mut diag1 = vbslq_u8(zpad_mask, d1, scored1);
+                    diag1 = vbslq_u8(pad1, zero, diag1);
+                    let mfe1 = vmaxq_u8(diag1, e1);
+                    let h1 = vmaxq_u8(mfe1, f1);
+                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
+                    imax1 = vmaxq_u8(imax1, h1);
+                    let e2 = vmaxq_u8(vqsubq_u8(e1, e_del_v), vqsubq_u8(h1, oe_del_v));
+                    f1 = vmaxq_u8(vqsubq_u8(f1, e_ins_v), vqsubq_u8(mfe1, oe_ins_v));
+                    d1 = h0;
+
+                    let mut s2 = vqtbl1q_u8(score_tbl, veorq_u8(t2_v, q_v));
+                    s2 = vbslq_u8(t2_is_n, n_score_v, s2);
+                    let scored2 = vqsubq_u8(vqaddq_u8(d2, s2), bias_v);
+                    let pad2 = vorrq_u8(q_pad, vtstq_u8(t2_v, high_bit_v));
+                    let mut diag2 = vbslq_u8(zpad_mask, d2, scored2);
+                    diag2 = vbslq_u8(pad2, zero, diag2);
+                    let mfe2 = vmaxq_u8(diag2, e2);
+                    let h2 = vmaxq_u8(mfe2, f2);
+                    col2 = vbslq_u8(vcgtq_u8(h2, imax2), j_v, col2);
+                    imax2 = vmaxq_u8(imax2, h2);
+                    let e3 = vmaxq_u8(vqsubq_u8(e2, e_del_v), vqsubq_u8(h2, oe_del_v));
+                    f2 = vmaxq_u8(vqsubq_u8(f2, e_ins_v), vqsubq_u8(mfe2, oe_ins_v));
+                    d2 = h1;
+
+                    let mut s3 = vqtbl1q_u8(score_tbl, veorq_u8(t3_v, q_v));
+                    s3 = vbslq_u8(t3_is_n, n_score_v, s3);
+                    let scored3 = vqsubq_u8(vqaddq_u8(d3, s3), bias_v);
+                    let pad3 = vorrq_u8(q_pad, vtstq_u8(t3_v, high_bit_v));
+                    let mut diag3 = vbslq_u8(zpad_mask, d3, scored3);
+                    diag3 = vbslq_u8(pad3, zero, diag3);
+                    let mfe3 = vmaxq_u8(diag3, e3);
+                    let h3 = vmaxq_u8(mfe3, f3);
+                    col3 = vbslq_u8(vcgtq_u8(h3, imax3), j_v, col3);
+                    imax3 = vmaxq_u8(imax3, h3);
+                    vst1q_u8(
+                        e.as_mut_ptr().add(j * LANES16),
+                        vmaxq_u8(vqsubq_u8(e3, e_del_v), vqsubq_u8(h3, oe_del_v)),
+                    );
+                    f3 = vmaxq_u8(vqsubq_u8(f3, e_ins_v), vqsubq_u8(mfe3, oe_ins_v));
+                    d3 = h2;
+                    vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h3);
+                    j_v = vaddq_u8(j_v, one_v);
+                }
+
+                // Row order matters here: freezing at row `i` must suppress rows `i+1..=i+3`.
+                finish_row!(i, imax0, col0);
+                finish_row!(i + 1, imax1, col1);
+                finish_row!(i + 2, imax2, col2);
+                finish_row!(i + 3, imax3, col3);
+            } else if rows == 2 {
                 let t0_v = vld1q_u8(seq_t.as_ptr().add(i * LANES16));
                 let t1_v = vld1q_u8(seq_t.as_ptr().add((i + 1) * LANES16));
                 let t0_is_n = vceqq_u8(t0_v, four_v);
@@ -3969,8 +4153,13 @@ mod avx2_verify {
         for _ in 0..2000 {
             let qlen = 5 + (next() % 146) as usize; // 5..=150 (varied lens exercise padding)
             let tlen = qlen + (next() % 500) as usize; // window >= query
-            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
-            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                                                       // `% 5`, not `% 4`: code 4 is N, and it is the one symbol the score table gets wrong on
+                                                       // its own (both-N reads as a match through XOR 0), so every kernel has to repair it with
+                                                       // an explicit blend. Real reference has N runs, so this was always covered end to end,
+                                                       // but drawing it here means a kernel that skips or misplaces the repair fails in
+                                                       // `cargo test` instead of in a whole-genome md5.
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
             // 1 or 2 planted copies of the query; two copies is what gives `score2` something to find.
             let copies = 1 + (next() % 2);
             if next() % 5 != 0 {
@@ -4057,8 +4246,13 @@ mod avx2_verify {
         for _ in 0..n {
             let qlen = 5 + (next() % 146) as usize;
             let tlen = qlen + (next() % 500) as usize;
-            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
-            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            // `% 5`, not `% 4`: code 4 is N, and it is the one symbol the score table gets wrong on
+            // its own (both-N reads as a match through XOR 0), so every kernel has to repair it with
+            // an explicit blend. Real reference has N runs, so this was always covered end to end,
+            // but drawing it here means a kernel that skips or misplaces the repair fails in
+            // `cargo test` instead of in a whole-genome md5.
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
             let copies = 1 + (next() % 2);
             if next() % 5 != 0 {
                 for _ in 0..copies {
@@ -4256,8 +4450,13 @@ mod avx512_verify {
         for _ in 0..n {
             let qlen = 5 + (next() % 146) as usize;
             let tlen = qlen + (next() % 500) as usize;
-            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
-            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            // `% 5`, not `% 4`: code 4 is N, and it is the one symbol the score table gets wrong on
+            // its own (both-N reads as a match through XOR 0), so every kernel has to repair it with
+            // an explicit blend. Real reference has N runs, so this was always covered end to end,
+            // but drawing it here means a kernel that skips or misplaces the repair fails in
+            // `cargo test` instead of in a whole-genome md5.
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
             let copies = 1 + (next() % 2);
             if next() % 5 != 0 {
                 for _ in 0..copies {
@@ -4398,8 +4597,13 @@ mod bench {
         for _ in 0..n {
             let qlen = 150usize;
             let tlen = 500usize;
-            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
-            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            // `% 5`, not `% 4`: code 4 is N, and it is the one symbol the score table gets wrong on
+            // its own (both-N reads as a match through XOR 0), so every kernel has to repair it with
+            // an explicit blend. Real reference has N runs, so this was always covered end to end,
+            // but drawing it here means a kernel that skips or misplaces the repair fails in
+            // `cargo test` instead of in a whole-genome md5.
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
             let at = (next() as usize) % (tlen - qlen + 1);
             for k in 0..qlen {
                 t[at + k] = q[k];
@@ -4542,8 +4746,13 @@ mod tests {
         for _ in 0..2000 {
             let qlen = 5 + (next() % 146) as usize; // 5..=150 (varied lens exercise padding)
             let tlen = qlen + (next() % 500) as usize; // window >= query
-            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
-            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                                                       // `% 5`, not `% 4`: code 4 is N, and it is the one symbol the score table gets wrong on
+                                                       // its own (both-N reads as a match through XOR 0), so every kernel has to repair it with
+                                                       // an explicit blend. Real reference has N runs, so this was always covered end to end,
+                                                       // but drawing it here means a kernel that skips or misplaces the repair fails in
+                                                       // `cargo test` instead of in a whole-genome md5.
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
             // Embed one or two mutated copies of the query into the target so local alignments (and a
             // 2nd-best, for score2) exist.
             // 1 or 2 planted copies of the query; two copies is what gives `score2` something to find.
