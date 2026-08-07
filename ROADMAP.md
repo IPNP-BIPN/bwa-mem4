@@ -382,12 +382,17 @@ Intel coute maintenant une minute par essai au lieu d'une heure.
 
 | | mur | CPU |
 |---|---|---|
-| bwa-mem4 | **112,87 / 121,47 s** | **883,5 / 949,7 s** |
-| `fg-labs/bwa-mem3` | 134,41 / 137,54 s | 1043,8 / 1070,1 s |
-| rapport | **0,84 / 0,88** | **0,85 / 0,89** |
+| bwa-mem4 | **112,87 / 121,47 / 114,57 s** | **883,5 / 949,7 / 891,3 s** |
+| `fg-labs/bwa-mem3` | 134,41 / 137,54 / 165,04 s | 1043,8 / 1070,1 / 1175,6 s |
+| rapport | **0,84 / 0,88 / 0,69** | **0,85 / 0,89 / 0,76** |
 
-Deux repetitions sur deux, dans les deux metriques. L'ordre de grandeur de l'avance est de 12 a 16 %,
-tres au-dessus de la derive de la machine, contrairement aux effets de 2 % mesures plus haut.
+Trois repetitions sur trois, dans les deux metriques. L'avance est de 12 a 16 % sur les deux premieres
+repetitions ; la troisieme (0,69) est a lire avec prudence, le fork y prend 20 % de plus que dans les
+deux precedentes alors que nos trois mesures a nous tiennent dans 8 %. C'est donc la mesure du fork
+qui a derive, pas nous qui avons accelere. Retenir 0,84-0,88, pas 0,69.
+
+Dans tous les cas l'ordre de grandeur de l'avance est tres au-dessus de la derive de la machine,
+contrairement aux effets de 2 % mesures plus haut, qui eux exigent le protocole `-t4`.
 
 ## Petits gains verifies (2026-08-05)
 
