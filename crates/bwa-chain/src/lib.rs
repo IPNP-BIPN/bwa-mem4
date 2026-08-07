@@ -873,6 +873,83 @@ pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
     }
 }
 
+/// Below this length the indirection in [`ks_introsort_by_key`] costs more than the moves it saves,
+/// so that function sorts the elements directly instead. 16 is also klib's own partition cutoff, so
+/// an array this short never partitions at all: [`ks_introsort_by`] goes straight to its final
+/// insertion-sort pass, which is already the cheapest thing available for it.
+const INDIRECT_SORT_MIN: usize = 16;
+
+/// [`ks_introsort_by`] with the element moves done once, on a permutation, instead of throughout the
+/// sort. Produces **exactly** the array `ks_introsort_by` would.
+///
+/// # Why this exists
+///
+/// `mem_sort_dedup_patch` sorts `MemAlnReg`, which is 96 bytes, and it is the single most-called
+/// sort in the run: 970 814 calls on 200k real GIAB pairs, mean length 105, and mate rescue drives
+/// 570k of those with 65 elements or more (`BWA4_DEDUP_SHAPE`). Every quicksort swap therefore moves
+/// 192 bytes. Sorting `(key, index)` pairs instead moves 12 to 32 bytes per swap, and the elements
+/// move exactly once, at the end.
+///
+/// # Why the permutation is identical, which is the only thing that matters
+///
+/// `ks_introsort_by`'s control flow depends on nothing but the sequence of `lt` outcomes. Here the
+/// key travels WITH its index in the same slot, so at every step of the algorithm the pair at
+/// position `x` carries the key of whatever element the direct sort would have at position `x`.
+/// Every comparison therefore has the same operands and the same outcome, every swap moves the same
+/// two logical elements, and the final index order is precisely the permutation the direct sort
+/// applies. That equality is asserted on random inputs, including heavily tied ones, by
+/// `indirect_sort_matches_direct` below.
+///
+/// This matters because the permutation is OUTPUT-OBSERVABLE: `mem_sort_dedup_patch` sorts by `re`
+/// alone and then drops, among regions that tie, the one the sort happened to put first. A sort that
+/// merely produces *a* correct order (Rust's `sort_unstable_by`, the C++ fork's pdqsort) picks a
+/// different survivor and a different SAM byte.
+///
+/// # Parameters
+///
+/// - `a`: the vector, sorted in place. It is REPLACED rather than permuted in place, which is what
+///   lets the final gather be a straight forward-order fill.
+/// - `perm`: scratch for the `(key, index)` pairs. Contents are discarded on entry; the caller keeps
+///   the ALLOCATION between calls, which is the whole reason it is a parameter.
+/// - `spare`: scratch for the gather. On return it holds `a`'s previous buffer, so a caller that
+///   passes the same `spare` every time never allocates for either vector after the first call.
+/// - `key`: extracts the sort key. Must depend only on the element, never on its position.
+/// - `lt`: strict less-than on keys, with the same strict-weak-ordering requirement
+///   [`ks_introsort_by`] documents (its Hoare scan uses the pivot as a sentinel).
+///
+/// # Why the scratch is not just allocated here
+///
+/// It was, first, and that version measured NEUTRAL end to end even though it removed 7.7% of
+/// `mem_sort_dedup_patch`'s samples. Two `Vec`s per sort at roughly 10 million sorts per million real
+/// pairs is on the order of 20 million allocations, which is the same size as the saving. The
+/// buffers are passed in so that number is one per thread instead.
+pub fn ks_introsort_by_key<T: Clone, K: Copy>(
+    a: &mut Vec<T>,
+    perm: &mut Vec<(K, u32)>,
+    spare: &mut Vec<T>,
+    key: impl Fn(&T) -> K,
+    lt: impl Fn(&K, &K) -> bool,
+) {
+    let n = a.len();
+    if n <= INDIRECT_SORT_MIN {
+        ks_introsort_by(a.as_mut_slice(), |x, y| lt(&key(x), &key(y)));
+        return;
+    }
+    // The permutation being sorted: each slot carries an element's key and where that element
+    // currently lives in `a`. `u32` because a read's region list is orders of magnitude below 4
+    // billion, and halving the index width halves what each swap moves.
+    perm.clear();
+    perm.extend(a.iter().enumerate().map(|(i, e)| (key(e), i as u32)));
+    ks_introsort_by(perm, |x, y| lt(&x.0, &y.0));
+    // The single gather. Reading `a` out of order is cheap here: the whole array is a few kilobytes
+    // and has just been walked twice, so it is resident.
+    spare.clear();
+    spare.extend(perm.iter().map(|&(_, i)| a[i as usize].clone()));
+    // `a` takes the gathered order and `spare` walks away with `a`'s old buffer, ready to be the
+    // gather target again next call.
+    std::mem::swap(a, spare);
+}
+
 /// Filter chains for a single read: drop light chains, then prune overlapping ones. Port of
 /// `mem_chain_flt` (`bwamem.cpp:506`), restricted to one `seqid` group.
 ///
@@ -1108,6 +1185,71 @@ mod tests {
             s2.sort_unstable();
             assert_eq!(s1, s2, "not a permutation at n={n}");
         }
+    }
+
+    /// The whole contract of [`ks_introsort_by_key`]: not "sorted", which any sort gives, but the
+    /// SAME ARRAY [`ks_introsort_by`] produces, element for element. The elements carry a payload
+    /// that the comparator never looks at, so a run of tied keys can only come out in the same order
+    /// if the two sorts really applied the same permutation.
+    ///
+    /// The key space is deliberately tiny (`% 8` at the widest, `% 3` at the narrowest) so that ties
+    /// are the common case rather than a corner one, and the sizes straddle both cutoffs that matter:
+    /// `INDIRECT_SORT_MIN` (16, below which this delegates) and klib's own partition cutoff.
+    #[test]
+    fn indirect_sort_matches_direct() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for &n in &[0usize, 1, 2, 3, 15, 16, 17, 33, 64, 105, 200, 1000] {
+            for &modulus in &[3u32, 8, 1000] {
+                // `.1` is the payload: distinct, never compared, and therefore the only thing that
+                // can reveal a difference in how ties were ordered.
+                let orig: Vec<(u32, u32)> = (0..n).map(|i| (next() % modulus, i as u32)).collect();
+                let mut direct = orig.clone();
+                ks_introsort_by(&mut direct, |x, y| x.0 < y.0);
+                let mut indirect = orig.clone();
+                let (mut perm, mut spare) = (Vec::new(), Vec::new());
+                ks_introsort_by_key(&mut indirect, &mut perm, &mut spare, |e| e.0, |x, y| x < y);
+                assert_eq!(direct, indirect, "n={n}, keys mod {modulus}");
+            }
+        }
+    }
+
+    /// The second sort in `mem_sort_dedup_patch` is a three-field comparator (score descending, then
+    /// `rb`, then `qb`), so the key is a tuple rather than a scalar. Same equality, same reason.
+    #[test]
+    fn indirect_sort_matches_direct_on_tuple_keys() {
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i32
+        };
+        // (score, rb, qb, payload), with the three key fields drawn from small ranges so that
+        // partial ties (same score, different rb) and full ties both occur.
+        let orig: Vec<(i32, i64, i32, u32)> = (0..300)
+            .map(|i| (next() % 5, (next() % 7) as i64, next() % 3, i as u32))
+            .collect();
+        let lt = |x: &(i32, i64, i32), y: &(i32, i64, i32)| {
+            x.0 > y.0 || (x.0 == y.0 && (x.1 < y.1 || (x.1 == y.1 && x.2 < y.2)))
+        };
+        let mut direct = orig.clone();
+        ks_introsort_by(&mut direct, |x, y| lt(&(x.0, x.1, x.2), &(y.0, y.1, y.2)));
+        let mut indirect = orig.clone();
+        let (mut perm, mut spare) = (Vec::new(), Vec::new());
+        ks_introsort_by_key(
+            &mut indirect,
+            &mut perm,
+            &mut spare,
+            |e| (e.0, e.1, e.2),
+            lt,
+        );
+        assert_eq!(direct, indirect);
     }
 
     #[test]

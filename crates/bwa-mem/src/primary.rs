@@ -77,7 +77,7 @@
 //! out and leaves an empty one behind, which is how a stage rebuilds its input in place without
 //! cloning it or leaving a half-valid value visible.
 
-use bwa_chain::ks_introsort_by;
+use bwa_chain::{ks_introsort_by, ks_introsort_by_key};
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 
@@ -431,6 +431,35 @@ pub mod dedup_shape {
 ///
 /// The surviving regions, sorted by score descending then `rb` then `qb`, with the killed ones
 /// compacted out and merged ones rewritten in place. Possibly shorter than the input, never longer.
+/// Scratch for the two [`ks_introsort_by_key`] calls below, one set per thread, reused for the whole
+/// run. There are roughly ten million of those sorts per million real pairs, so the allocations are
+/// the measurable part: see that function's note on why the first, allocating version gained nothing.
+///
+/// `SORT_SPARE` is shared by both sorts because they run one after the other, never nested. The
+/// three buffers grow to the largest region list a thread ever sees (hundreds of entries, tens of
+/// kilobytes) and stay there.
+///
+/// Rust: `thread_local!` gives each thread its own instance, so no lock and no sharing; `const {}`
+/// initialisers make first access a plain load rather than a lazy-init check. `RefCell` is the
+/// single-threaded borrow check, and every borrow below is confined to one statement, which is what
+/// keeps it from ever failing.
+mod sort_scratch {
+    use super::MemAlnReg;
+    use std::cell::RefCell;
+
+    /// Pass 1a's permutation: `re` and the index of the region it came from.
+    type PermRe = Vec<(i64, u32)>;
+    /// Pass 3's permutation: the three-field sort key `(score, rb, qb)` and the same index.
+    type PermScore = Vec<((i32, i64, i32), u32)>;
+
+    thread_local! {
+        pub static PERM_RE: RefCell<PermRe> = const { RefCell::new(Vec::new()) };
+        pub static PERM_SCORE: RefCell<PermScore> = const { RefCell::new(Vec::new()) };
+        /// The gather target, which comes back holding the previous region buffer.
+        pub static SPARE: RefCell<Vec<MemAlnReg>> = const { RefCell::new(Vec::new()) };
+    }
+}
+
 pub fn mem_sort_dedup_patch(
     fm: &FmIndex,
     opt: &MemOpt,
@@ -479,7 +508,15 @@ pub fn mem_sort_dedup_patch(
     // the key is `re` alone, so ties are both common and consequential: the redundancy test below
     // drops `q` (the earlier entry) whenever the scores tie, meaning the order among equal-`re`
     // regions decides which alignment survives. A stable sort silently picks a different one.
-    ks_introsort_by(&mut a, |x, y| x.re < y.re);
+    //
+    // `_by_key` rather than `_by`: same algorithm, same permutation (proved and tested in
+    // `bwa-chain`), but the 96-byte `MemAlnReg`s move once at the end instead of twice per swap.
+    // This sort and the one in pass 3 are together the most-executed sort in the run.
+    sort_scratch::PERM_RE.with_borrow_mut(|perm| {
+        sort_scratch::SPARE.with_borrow_mut(|spare| {
+            ks_introsort_by_key(&mut a, perm, spare, |r| r.re, |x, y| x < y);
+        });
+    });
     // `n_comp` counts how many original regions were folded into this one; it starts at 1 (itself)
     // and the merge branch accumulates. Only `mem_patch_reg` merging changes it.
     for r in &mut a {
@@ -591,8 +628,16 @@ pub fn mem_sort_dedup_patch(
 
     // ---- Pass 3: re-sort by score and drop exact coordinate duplicates ------------------------
     // Sort by score desc, then rb, then qb (`alnreg_slt`), again with bwa's unstable introsort.
-    ks_introsort_by(&mut a, |x, y| {
-        x.score > y.score || (x.score == y.score && (x.rb < y.rb || (x.rb == y.rb && x.qb < y.qb)))
+    sort_scratch::PERM_SCORE.with_borrow_mut(|perm| {
+        sort_scratch::SPARE.with_borrow_mut(|spare| {
+            ks_introsort_by_key(
+                &mut a,
+                perm,
+                spare,
+                |r| (r.score, r.rb, r.qb),
+                |x, y| x.0 > y.0 || (x.0 == y.0 && (x.1 < y.1 || (x.1 == y.1 && x.2 < y.2))),
+            );
+        });
     });
     // Exact-duplicate removal (`bwamem.cpp:343`). After the score sort, identical regions are
     // adjacent, so a single linear pass comparing each entry to its predecessor suffices. Note the
