@@ -285,6 +285,70 @@ Parite verifiee, pas supposee : `samtools view` du BAM et les enregistrements du
 meme md5 (`c833bb42...`), sur les deux moteurs de compression. Les octets compresses, eux, different
 d'un moteur a l'autre : le BAM n'est pas l'oracle, le SAM texte l'est.
 
+## Ou le fork est reellement moins cher, profil contre profil (2026-08-07)
+
+Hypothese de depart, ecrite ici hier : le seeding pese ~30 % et l'ecart restant avec le fork y est
+cache. **Faux, et mesure.** Profil par echantillonnage (`sample`, 17-18 s de fenetre) des deux
+binaires sur **exactement la meme charge** : 1 M paires GIAB reelles contre GRCh38, `-t8`, sortie
+jetee. Parts des echantillons de travail (les attentes de threads exclues des deux cotes).
+
+| etage | bwa-mem4 | `fg-labs/bwa-mem3` |
+|---|---|---|
+| noyau de mate rescue | 39,2 % | 38,6 % |
+| DP principal (extension) | 20,0 % | 18,5 % |
+| **tri + dedup des regions** | **15,1 %** | **7,6 %** |
+| **seeding (recherche arriere)** | **6,7 %** | **17,0 %** |
+| resolution du suffix array | 3,9 % | 5,4 % |
+| chainage | 5,1 % | 3,8 % |
+| fenetre de reference | 1,1 % | 3,8 % |
+
+Deux lectures, opposees a ce qui etait suppose :
+
+1. **Notre seeding est deja ~2,5x moins cher que le sien** (6 634 echantillons contre 18 311). Le
+   lockstep et le prefetch par lot font leur travail. L'hypothese "ecart d'implementation dans le
+   seeding" est morte : il n'y a rien a rattraper, c'est nous qui sommes devant.
+2. **Notre tri de regions coute deux fois le sien.** C'est la, et nulle part ailleurs, que le fork
+   est structurellement moins cher.
+
+Course complete sur cette charge, pour situer : nous 28,60 s de mur / 220,21 s de CPU, le fork
+33,52 / 247,89. Nous gagnons de 15 % en mur, 11 % en CPU.
+
+### Le tri : ce que l'octet-identite coute exactement, chiffre
+
+Le fork trie avec **pdqsort**, nous avec le `ks_introsort` de klib, parce que la permutation est
+**observable en sortie** : `mem_sort_dedup_patch` trie sur `re` seul puis tue, parmi des regions a
+egalite, celle que le tri a mise en premier.
+
+Ce n'est pas de la prudence heritee, c'est verifie : en remplacant les deux tris par
+`sort_unstable_by` (le pdqsort de Rust), le **md5 du SAM change** sur 200k paires reelles.
+
+Et le prix de cette contrainte est maintenant chiffre. Meme binaire, seuls les deux tris changent,
+A/B entrelace, 1 M paires, `-t8`, secondes CPU : **219,56 s avec `ks_introsort` contre 213,38 s avec
+pdqsort, 3 victoires sur 3, soit 2,8 %.** Voila la totalite de ce que l'octet-identite nous coute sur
+cet etage. C'est le plafond de tout ce qui reste a gagner ici, et il est interdit.
+
+### Ce qui etait recuperable dans ce plafond, et l'a ete
+
+`ks_introsort_by_key` : meme algorithme, meme permutation (prouvee et testee), mais le tri porte sur
+des paires `(cle, index)` et les `MemAlnReg` de 96 octets ne bougent qu'une fois, a la fin.
+`BWA4_DEDUP_SHAPE` dit pourquoi ca vaut la peine : 970 814 appels pour 200k paires, longueur moyenne
+105, dont 570k a 65 regions ou plus, tous venant du mate rescue qui retrie apres chaque insertion.
+
+Deux versions, et l'ecart entre les deux est la lecon :
+
+| version | echantillons de la fonction | A/B bout en bout |
+|---|---|---|
+| indirect, `Vec` alloues par appel | 14 812 -> 13 665 (-7,7 %) | **nul**, 2 victoires sur 5 |
+| indirect, tampons `thread_local` reutilises | idem | **-1,9 %**, 4 victoires sur 5 |
+
+~20 millions d'allocations par million de paires coutent exactement ce que l'indirection fait gagner.
+Le protocole du gain final est celui a plus faible dispersion ici : `-t4`, 500k paires reelles contre
+GRCh38, medianes 106,94 s contre 108,97 s. Sortie octet-identique (chr21 et GRCh38).
+
+Note de methode, valable pour tout ce qui suit : a `-t8` sur cette machine la derive thermique
+atteint 10 % au fil d'une serie, ce qui noie un effet de 2 %. Les series a `-t8` ci-dessus ne servent
+qu'a comparer des choses tres differentes ; tout gain de l'ordre du pour-cent se mesure a `-t4`.
+
 ## Petits gains verifies (2026-08-05)
 
 Meme protocole que la correction ci-dessous, parce que c'est le seul qui a tenu : A/B entrelace,
