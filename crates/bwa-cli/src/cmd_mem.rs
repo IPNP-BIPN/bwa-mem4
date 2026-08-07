@@ -1633,14 +1633,42 @@ fn run_pipeline<B: Send>(
             // as it arrives, blocking while the queue is empty, and ends by itself once every
             // sender has been dropped. That is why no explicit shutdown message is needed: the loop
             // finishes when the main thread stops sending and releases its half.
-            for pieces in sam_rx {
+            // `BWA4_WRITER_PROBE=1`: report how much of the writer thread's life was spent WRITING
+            // versus BLOCKED waiting for a batch. The writer is the pipeline's only serial stage, so
+            // "blocked" time is headroom and "writing" time approaching the wall clock means the
+            // sink, not the aligner, sets the pace. One `Instant::now()` pair per BATCH (a few dozen
+            // per run), never per record, so the measurement cannot pay for itself twice the way a
+            // per-call probe does.
+            let probe = std::env::var_os("BWA4_WRITER_PROBE").is_some();
+            // Seconds spent inside `write_all` and seconds spent inside `recv`. Both stay 0 when the
+            // probe is off, and neither is read in that case.
+            let (mut writing, mut blocked) = (0f64, 0f64);
+            loop {
+                let t0 = probe.then(std::time::Instant::now);
+                // `recv` returning `Err` is the iterator's stop condition (every sender dropped), so
+                // this loop is semantically the `for pieces in sam_rx` it replaces.
+                let Ok(pieces) = sam_rx.recv() else { break };
+                let t1 = probe.then(std::time::Instant::now);
                 // In order, so the concatenation of the pieces is exactly the batch's SAM text.
                 // `Output`'s buffering is what turns these back into few, large syscalls.
                 for piece in &pieces {
                     out.write_all(piece)?;
                 }
+                if let (Some(t0), Some(t1)) = (t0, t1) {
+                    blocked += t1.duration_since(t0).as_secs_f64();
+                    writing += t1.elapsed().as_secs_f64();
+                }
             }
+            let t_finish = probe.then(std::time::Instant::now);
             out.finish()?;
+            if let Some(t) = t_finish {
+                eprintln!(
+                    "[writer] writing {:.3}s, blocked {:.3}s, finish {:.3}s",
+                    writing,
+                    blocked,
+                    t.elapsed().as_secs_f64()
+                );
+            }
             Ok(())
         });
 
