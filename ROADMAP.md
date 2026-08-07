@@ -349,6 +349,46 @@ Note de methode, valable pour tout ce qui suit : a `-t8` sur cette machine la de
 atteint 10 % au fil d'une serie, ce qui noie un effet de 2 %. Les series a `-t8` ci-dessus ne servent
 qu'a comparer des choses tres differentes ; tout gain de l'ordre du pour-cent se mesure a `-t4`.
 
+## AVX-512 : correct, jamais chronometre, et pourquoi (2026-08-07)
+
+Etat separe en deux, parce que les deux reponses sont differentes.
+
+**Correction : validee.** Les quatre tests d'octet-identite `avx512_verify` (extension u8/i16, rescue
+u8/i16) tournent pour de vrai des que le runner a `avx512bw`. Tirage CI du 2026-08-04 : `simd: avx2
+avx512bw avx512f`, et les quatre tests apparaissent en `ok` dans le journal. Ce n'est donc pas du code
+jamais execute.
+
+**Vitesse : jamais mesuree.** Le pool `ubuntu-22.04` de GitHub est heterogene et le tirage n'est pas
+choisissable. Deux tirages du banc de suite ont donne la meme machine sans AVX-512 :
+
+| date | modele | `simd:` | ligne AVX-512 du banc |
+|---|---|---|---|
+| 2026-08-03 (hebdo) | AMD EPYC 7763 | `avx2` | `avx512_u8 skipped` |
+| 2026-08-07 (manuel) | AMD EPYC 7763 | `avx2` | `avx512_u8 skipped` |
+
+Pour reference, ce que ce tirage AMD donne quand meme : rescue scalaire 0,130 Gcell/s, AVX2 u8 **10,09
+Gcell/s**, soit **77x**.
+
+Localement c'est hors d'atteinte et il ne faut pas y revenir : Rosetta n'expose pas `avx512bw`, et le
+TCG de QEMU n'implemente pas AVX-512 (il s'arrete a AVX2). Il n'y a pas d'emulateur a essayer.
+
+Ce qui a ete fait a la place : `bench-x86` accepte une entree `kernel_ab_only`, qui saute le job
+bout-en-bout d'une heure et ne lance que le A/B de noyau d'une minute. Retirer au sort une machine
+Intel coute maintenant une minute par essai au lieu d'une heure.
+
+## Contre le fork, avec tout ce qui precede (2026-08-07)
+
+4 M paires GIAB reelles contre GRCh38, `-t8`, A/B entrelace, sortie jetee.
+
+| | mur | CPU |
+|---|---|---|
+| bwa-mem4 | **112,87 / 121,47 s** | **883,5 / 949,7 s** |
+| `fg-labs/bwa-mem3` | 134,41 / 137,54 s | 1043,8 / 1070,1 s |
+| rapport | **0,84 / 0,88** | **0,85 / 0,89** |
+
+Deux repetitions sur deux, dans les deux metriques. L'ordre de grandeur de l'avance est de 12 a 16 %,
+tres au-dessus de la derive de la machine, contrairement aux effets de 2 % mesures plus haut.
+
 ## Petits gains verifies (2026-08-05)
 
 Meme protocole que la correction ci-dessous, parce que c'est le seul qui a tenu : A/B entrelace,
