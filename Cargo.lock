@@ -649,6 +649,7 @@ dependencies = [
  "cc",
  "fs-utils",
  "glob",
+ "libdeflate-sys",
  "libz-sys",
 ]
 

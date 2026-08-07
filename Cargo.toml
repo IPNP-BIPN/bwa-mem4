@@ -68,7 +68,18 @@ mimalloc = { version = "0.1", default-features = false }
 # and curl: we only ever WRITE local files, and htslib's own writers never pick those codecs (BAM is
 # BGZF/deflate; CRAM defaults to gzip + rANS), so dropping them costs nothing and removes three C
 # libraries from the build. Reading a third-party CRAM that used them is out of scope here.
-rust-htslib = { version = "1", default-features = false }
+#
+# `libdeflate` replaces zlib as htslib's deflate engine, which is what BGZF spends its time in, so it
+# is the BAM/CRAM path's compressor and nothing else. Measured, interleaved A/B on 1M pairs against
+# chr21 at -t8, CPU seconds, `-o out.bam`: libdeflate won all five reps, medians 174.06 against
+# 181.11, about 3.9%. Wall clock is unchanged (22.13 against 22.24): htslib compresses on its own
+# background threads, which have slack at -t8, so the saving is CPU that the rest of the machine gets
+# back rather than time this run stops waiting for.
+#
+# It costs NOTHING in supply chain: `libdeflate-sys` is already compiled and linked into this binary
+# for the `.sam.gz` path (`bgzf` -> `libdeflater` -> `libdeflate-sys`), and `cargo tree -i
+# libdeflate-sys` shows hts-sys sharing that exact version rather than adding a second copy.
+rust-htslib = { version = "1", default-features = false, features = ["libdeflate"] }
 
 # Release profile tuned for reproducible builds: a single codegen unit removes parallel-codegen
 # nondeterminism; fat LTO is a pure optimization (deterministic under a fixed toolchain, changes no
