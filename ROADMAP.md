@@ -233,6 +233,58 @@ chantier separe, et il rendrait la comparaison ci-dessus caduque.
 
 CRAM non evalue : c'est la ou htslib est l'implementation de reference et ou le risque se concentre.
 
+## Le double passage texte du BAM : mesure faite, le chantier ne le vaut pas (2026-08-07)
+
+La section ci-dessus concluait que le vrai gain serait de construire les enregistrements BAM
+directement depuis les champs de l'aligneur. Cette conclusion etait tiree d'un prototype qui mesurait
+le transcodeur **isole**, hors pipeline. Mesure dans le pipeline, elle ne tient pas.
+
+Sonde `BWA4_WRITER_PROBE=1` : le fil ecrivain, seul etage serie du pipeline, compte ses secondes
+passees a ecrire et ses secondes passees bloque sur le canal. Une paire d'`Instant::now()` par
+**lot** (quelques dizaines par run), jamais par enregistrement, exactement pour ne pas repeter la
+faute de la sonde `BWA4_ALIGN_SPLIT` decrite plus bas.
+
+chr21, 1 M paires, `-t16`, 2 M enregistrements :
+
+| sortie | ecrit | bloque |
+|---|---|---|
+| `out.sam` | 0,151 s | 14,254 s |
+| `out.sam.gz` | 0,583 s | 18,178 s |
+| `out.bam` | **1,417 s** | 13,879 s |
+
+Lecture : sur un mur de 15,4 s l'ecrivain BAM travaille 1,4 s et attend 13,9 s, soit **9 %
+d'occupation**. Supprimer entierement le parsing du texte rendrait au mieux ces 1,4 s de CPU sur ~207
+s de CPU total, soit **0,7 %**, et **rien du tout** en temps mur, puisque l'etage n'est pas le goulot.
+Le chantier (deux formateurs d'enregistrements a garder en phase, dont celui de `pe.rs`, sans oracle
+pour le second) est hors de proportion avec ce que la mesure promet. **Abandonne.**
+
+Ce que la mesure designe a la place : le surcout BAM n'est pas le parsing, c'est la **compression**.
+`out.bam` coute ~19 s de CPU de plus que `out.sam` et l'ecrivain n'en explique que 1,4 : le reste est
+du deflate sur les fils de fond de htslib.
+
+### Le gain reel : libdeflate comme moteur deflate de htslib
+
+`rust-htslib`, feature `libdeflate`. A/B entrelace, chr21, 1 M paires, `-t8`, `-o out.bam`, secondes
+CPU :
+
+| | zlib (avant) | libdeflate (apres) |
+|---|---|---|
+| repetitions | 176,39 / 181,42 / 178,62 / 181,11 / 183,70 | 171,07 / 172,15 / 174,41 / 174,06 / 181,53 |
+| mediane CPU | 181,11 s | **174,06 s**, ~3,9 %, **5 victoires sur 5** |
+| mediane mur | 22,24 s | 22,13 s, egalite |
+
+Le mur ne bouge pas et c'est attendu : htslib compresse sur ses propres fils de fond, qui ont du mou a
+`-t8`. Le gain est du CPU rendu au reste de la machine, pas du temps que ce run cesse d'attendre. A
+`-t16` la mesure est plus bruitee (medianes 210,61 contre 204,38, 2 victoires sur 3), meme sens.
+
+Cout en chaine d'approvisionnement : **nul**. `libdeflate-sys` est deja compile et lie dans ce binaire
+pour le chemin `.sam.gz` (`bgzf` -> `libdeflater`), et `cargo tree -i libdeflate-sys` montre `hts-sys`
+partageant la meme version 1.25.2 au lieu d'en ajouter une seconde copie.
+
+Parite verifiee, pas supposee : `samtools view` du BAM et les enregistrements du SAM texte donnent le
+meme md5 (`c833bb42...`), sur les deux moteurs de compression. Les octets compresses, eux, different
+d'un moteur a l'autre : le BAM n'est pas l'oracle, le SAM texte l'est.
+
 ## Petits gains verifies (2026-08-05)
 
 Meme protocole que la correction ci-dessous, parce que c'est le seul qui a tenu : A/B entrelace,
