@@ -349,6 +349,56 @@ Note de methode, valable pour tout ce qui suit : a `-t8` sur cette machine la de
 atteint 10 % au fil d'une serie, ce qui noie un effet de 2 %. Les series a `-t8` ci-dessus ne servent
 qu'a comparer des choses tres differentes ; tout gain de l'ordre du pour-cent se mesure a `-t4`.
 
+## Le mate rescue, le plus gros poste restant (2026-08-07)
+
+Ce que la sonde `BWA4_MATESW_TIME` dit du poste, sur 500k paires reelles a `-t4` :
+
+| | |
+|---|---|
+| CPU dans le noyau | **54,4 s sur les ~107 s du run**, soit ~51 % |
+| travaux | 1 837 905, pour 381 Gcellules |
+| forme moyenne | requete 148 bp contre fenetre 1401 bp = **207 417 cellules par travail** |
+| taxe de divergence de voie | 1,09x, et trier par longueur en economiserait **0,0 %** |
+| travaux dupliques dans un appel | 35 sur 1 837 905, soit 0,0 % |
+
+Les deux dernieres lignes ferment deux pistes avant de les ouvrir : ni le tri par longueur ni la
+deduplication n'ont quoi que ce soit a recuperer. Les cellules, elles, sont fixees par l'algorithme
+(SW local plein sur le rectangle, comme bwa). Reste donc le cout par cellule.
+
+### Ce qui a marche : quatre lignes de cible a la fois
+
+Le corps par PAIRES etait deja la, et il paie toujours : `BWA4_RESCUE_ROWPAIR=0` fait tomber le debit
+de 9,41 a 8,59 Gcell/s, **+9,5 %**, reproductible a 0,4 % pres.
+
+Quatre lignes poussent l'idee d'un cran : un quadruplet charge la colonne de requete, `e[j]` et
+`h_prev[j]` une fois et ecrit `e[j]` et `h_cur[j]` une fois, soit **cinq operations memoire pour
+quatre cellules** au lieu de cinq pour deux. Les trois retenues E interieures et les trois diagonales
+interieures ne touchent jamais la memoire.
+
+Mesure au calme, trois repetitions par bras, dispersion 0,4 % : **16,00 / 16,06 / 16,01 s** de CPU
+noyau contre **16,46 / 16,44 / 16,41**, soit **+2,6 %**. Rendements decroissants nets face aux +9,5 %
+de la paire, la pression sur les registres etant l'explication la plus probable. Le noyau pesant la
+moitie du run, cela vaut ~1,3 % bout en bout ; les deux repetitions bout-en-bout qui ont tourne avant
+que l'hote se charge donnent -0,8 %, meme signe et meme ordre. NEON seulement : AVX2 a 16 registres
+vectoriels contre 32, et quatre lignes demandent seize accumulateurs vivants avant les constantes.
+
+### Ce qui n'a pas marche : sauter la reparation du N
+
+Le tableau de scores donne deja le -1 de bwa des que le XOR vaut 4-7, donc la seule cellule qu'il rate
+est **N contre N**, qui lit XOR 0 et ressemble a un appariement. D'ou un `vbslq_u8` par ligne. Quand
+aucune voie du groupe ne porte de N, ce melange est prouvablement inutile : condition invariante de
+boucle, que LLVM devrait pouvoir sortir en dupliquant la boucle.
+
+Il ne l'a pas fait. Debit tombe de 9,63 a **8,95 Gcell/s**, soit **-7 %** : le test dans la boucle
+coute plus que les quatre operations qu'il economise. Annule. A ne pas retenter sous cette forme ; il
+faudrait deux corps ecrits a la main, et le gain theorique (4 operations sur ~64 par colonne) ne le
+justifie pas.
+
+Effet de bord garde, lui : les tests d'equivalence au scalaire tirent maintenant le code 4 (N) en plus
+des quatre bases reelles. Le N etait couvert bout en bout (le genome en est plein) mais pas en test
+unitaire, ce qui laissait un noyau oubliant la reparation echouer sur un md5 de genome entier plutot
+que dans `cargo test`.
+
 ## AVX-512 : correct, jamais chronometre, et pourquoi (2026-08-07)
 
 Etat separe en deux, parce que les deux reponses sont differentes.
