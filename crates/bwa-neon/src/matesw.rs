@@ -5276,6 +5276,117 @@ mod tests {
         }
     }
 
+    /// The u8/i16 dispatch boundary, straddled deliberately (issue #54, trap 3).
+    ///
+    /// The u8 rescue kernel is exact only while every H/E/F cell stays under [`U8_SCORE_LIMIT`], and
+    /// `fwd_local_sw_batch` routes a job to the 8-lane i16 kernel the moment its score ceiling
+    /// `min(qlen, tlen) * max_sc` reaches it. A GPU port has to detect saturation at **exactly** the
+    /// same threshold: one off-by-one and it returns a clipped score where the CPU replayed the job
+    /// in a wider type, which is a wrong answer, not a slower one.
+    ///
+    /// Random sweeps never land on that edge. This one is built to sit on it: for each of several
+    /// match bonuses `a`, query lengths are chosen so that `qlen * a` falls exactly on 248, 249, 250,
+    /// 251, 254, 255 and 256, on both sides of the 250 limit and on both sides of the u8 lane's own
+    /// 255 wrap. The second sweep straddles the other u8 precondition, `qlen < 250`, which exists
+    /// because the argmax column shares the lane with the score.
+    ///
+    /// Both `score` and `score2` are compared, `score2` because `minsc` is set low enough that the
+    /// rival-alignment list is populated: a saturation bug that spared the best alignment but
+    /// clipped a runner-up would change MAPQ and nothing else.
+    #[test]
+    fn matesw_saturation_boundary_equals_scalar() {
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let mut state = 0xB0DE_1234_5678_9AB1u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+
+        // (match bonus, mismatch penalty). `a` values chosen so `qlen * a` can hit the targets below
+        // exactly: 2 and 5 divide 250, 3 and 7 do not, so the sweep covers both aligned and
+        // misaligned arithmetic on the threshold.
+        for &(a, b) in &[(1i8, 4i8), (2, 8), (3, 12), (5, 20), (7, 28)] {
+            let mat = scmat(a, b);
+            let max_sc = a as i32;
+            let mut qbufs: Vec<Vec<u8>> = Vec::new();
+            let mut tbufs: Vec<Vec<u8>> = Vec::new();
+            for &target_product in &[248i32, 249, 250, 251, 254, 255, 256] {
+                // The qlen whose ceiling brackets the target product from below and above, so the
+                // sweep covers the exact edge even when `a` does not divide it.
+                for qlen in [
+                    (target_product / max_sc) as usize,
+                    (target_product / max_sc) as usize + 1,
+                ] {
+                    if qlen == 0 || qlen > 400 {
+                        continue;
+                    }
+                    // Target longer than the query, so `min(qlen, tlen)` is the query and the
+                    // ceiling is exactly `qlen * a`.
+                    let tlen = qlen * 3 + 17;
+                    let q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
+                    let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+                    // Two planted copies: the first gives a perfect alignment that reaches the
+                    // ceiling exactly, the second gives `score2` something at nearly the same score,
+                    // which is where a clipped runner-up would show.
+                    t[2..2 + qlen].copy_from_slice(&q);
+                    let at = tlen - qlen - 3;
+                    t[at..at + qlen].copy_from_slice(&q);
+                    // One mismatch in the second copy, so the two are close but not equal.
+                    t[at + qlen / 2] = (t[at + qlen / 2] + 1) % 4;
+                    qbufs.push(q);
+                    tbufs.push(t);
+                }
+            }
+            // The other u8 precondition: the query must be under 250 BASES, because the argmax
+            // column shares the lane with the score. Straddled with a=1 so the ceiling is not what
+            // moves.
+            if a == 1 {
+                for &qlen in &[248usize, 249, 250, 251] {
+                    let tlen = qlen + 40;
+                    let q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
+                    let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+                    t[10..10 + qlen].copy_from_slice(&q);
+                    qbufs.push(q);
+                    tbufs.push(t);
+                }
+            }
+
+            let jobs: Vec<KswJob> = qbufs
+                .iter()
+                .zip(tbufs.iter())
+                .map(|(q, t)| KswJob {
+                    query: q.as_slice(),
+                    target: t.as_slice(),
+                })
+                .collect();
+            // `minsc` low enough that the `score2` list is really populated.
+            let minsc = max_sc * 5;
+            let batched =
+                batched_ksw_align2(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
+            for (i, j) in jobs.iter().enumerate() {
+                // The width bwa's own `KSW_XBYTE` test would pick, which is observable through the
+                // padded query length and therefore through `score2`.
+                let lanes = if j.query.len() as i32 * max_sc < 250 {
+                    16
+                } else {
+                    8
+                };
+                let want = ksw_align2(
+                    j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, lanes,
+                );
+                assert_eq!(
+                    batched[i],
+                    want,
+                    "boundary job {i}: a {a}, qlen {}, ceiling {}",
+                    j.query.len(),
+                    j.query.len().min(j.target.len()) as i32 * max_sc
+                );
+            }
+        }
+    }
+
     /// The rescue kernel's argmax tie rule, on inputs where ties are the norm (issue #54, trap 2).
     ///
     /// `matesw.rs` keeps the FIRST maximum (`vcgtq_u8`, strict `>`), the opposite of the extension

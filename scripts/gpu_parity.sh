@@ -42,23 +42,37 @@ cargo build --release --quiet
 # any two invocations that pass different options, so including it would make every comparison here
 # fail for a reason that has nothing to do with alignment.
 body_md5() {
-  env "$@" "$BIN" mem -t"$T" -K "$K" "$IDX" "$R1" "$R2" 2>/dev/null | grep -v '^@' | md5sum 2>/dev/null | awk '{print $1}' ||
-  env "$@" "$BIN" mem -t"$T" -K "$K" "$IDX" "$R1" "$R2" 2>/dev/null | grep -v '^@' | md5
+  env "$@" "$BIN" mem -t"$T" $EXTRA -K "$K" "$IDX" "$R1" "$R2" 2>/dev/null | grep -v '^@' | md5sum 2>/dev/null | awk '{print $1}' ||
+  env "$@" "$BIN" mem -t"$T" $EXTRA -K "$K" "$IDX" "$R1" "$R2" 2>/dev/null | grep -v '^@' | md5
 }
 
-echo "[1/3] determinism: three CPU runs must agree"
-D1=$(body_md5 BWA4_GPU=off)
-D2=$(body_md5 BWA4_GPU=off)
-D3=$(body_md5 BWA4_GPU=off)
-echo "  $D1"
-echo "  $D2"
-echo "  $D3"
-if [ "$D1" != "$D2" ] || [ "$D2" != "$D3" ]; then
-  echo "DETERMINISM: FAIL (the reference path is not reproducible; nothing below is meaningful)" >&2
-  exit 1
-fi
+# Extra CLI options for the run. EVERY comparison below is done twice: once at the default band, and
+# once at `-w 5`.
+#
+# The narrow band is not a stress test for its own sake, it is issue #54 trap 5. At the default
+# `-w 100`, `BWA4_ALIGN_SPLIT` measures **0 requeues out of 2 109 519 extension jobs**: the
+# acceptance test passes at round 0 for every job, so `max_off` never decides anything and a GPU that
+# computed it wrongly would be invisible here. At `-w 5` the same 200k pairs requeue **1.406%** of
+# jobs into round 1. That is the only arm in which trap 5 is actually under test.
+EXTRA=""
+
+echo "[1/3] determinism: three CPU runs must agree, at both band widths"
+for EXTRA_ARM in "" "-w 5"; do
+  EXTRA="$EXTRA_ARM"
+  label="${EXTRA_ARM:-default band}"
+  D1=$(body_md5 BWA4_GPU=off)
+  D2=$(body_md5 BWA4_GPU=off)
+  D3=$(body_md5 BWA4_GPU=off)
+  echo "  [$label] $D1"
+  echo "  [$label] $D2"
+  echo "  [$label] $D3"
+  if [ "$D1" != "$D2" ] || [ "$D2" != "$D3" ]; then
+    echo "DETERMINISM: FAIL at $label (reference not reproducible; nothing below is meaningful)" >&2
+    exit 1
+  fi
+  if [ -z "$EXTRA_ARM" ]; then REF="$D1"; else REF_W5="$D1"; fi
+done
 echo "  determinism: PASS"
-REF="$D1"
 
 # `version` lists the backends the binary was built with. Until a GPU one appears, the two gates
 # below cannot run, and they say so rather than passing vacuously.
@@ -67,24 +81,33 @@ if ! "$BIN" version 2>&1 | grep -qi "$BACKEND"; then
   echo "[2/3] parity vs $BACKEND: SKIPPED, no $BACKEND backend in this binary"
   echo "[3/3] BWA4_GPU_SPLIT sweep:  SKIPPED, same reason"
   echo
-  echo "GPU PARITY GATE: reference md5 $REF (determinism only; the GPU arms are not built yet)"
+  echo "GPU PARITY GATE: reference md5 $REF (default band) / $REF_W5 (-w 5); determinism only, the GPU arms are not built yet"
   exit 0
 fi
 
 echo
-echo "[2/3] parity: BWA4_GPU=off vs BWA4_GPU=$BACKEND"
-G=$(body_md5 "BWA4_GPU=$BACKEND")
-echo "  cpu $REF"
-echo "  gpu $G"
-[ "$REF" = "$G" ] || { echo "PARITY: FAIL" >&2; exit 1; }
+echo "[2/3] parity: BWA4_GPU=off vs BWA4_GPU=$BACKEND, at both band widths"
+for EXTRA_ARM in "" "-w 5"; do
+  EXTRA="$EXTRA_ARM"
+  label="${EXTRA_ARM:-default band}"
+  want="$REF"; [ -n "$EXTRA_ARM" ] && want="$REF_W5"
+  G=$(body_md5 "BWA4_GPU=$BACKEND")
+  printf '  [%s] cpu %s  gpu %s\n' "$label" "$want" "$G"
+  [ "$want" = "$G" ] || { echo "PARITY: FAIL at $label" >&2; exit 1; }
+done
 echo "  parity: PASS"
 
 echo
-echo "[3/3] split invariance: BWA4_GPU_SPLIT in 0.0 0.25 0.5 0.75 1.0"
-for s in 0.0 0.25 0.5 0.75 1.0; do
-  M=$(body_md5 "BWA4_GPU=$BACKEND" "BWA4_GPU_SPLIT=$s")
-  printf '  split %-5s %s\n' "$s" "$M"
-  [ "$REF" = "$M" ] || { echo "SPLIT INVARIANCE: FAIL at $s" >&2; exit 1; }
+echo "[3/3] split invariance: BWA4_GPU_SPLIT in 0.0 0.25 0.5 0.75 1.0, at both band widths"
+for EXTRA_ARM in "" "-w 5"; do
+  EXTRA="$EXTRA_ARM"
+  label="${EXTRA_ARM:-default band}"
+  want="$REF"; [ -n "$EXTRA_ARM" ] && want="$REF_W5"
+  for sp in 0.0 0.25 0.5 0.75 1.0; do
+    M=$(body_md5 "BWA4_GPU=$BACKEND" "BWA4_GPU_SPLIT=$sp")
+    printf '  [%s] split %-5s %s\n' "$label" "$sp" "$M"
+    [ "$want" = "$M" ] || { echo "SPLIT INVARIANCE: FAIL at $sp, $label" >&2; exit 1; }
+  done
 done
 
 echo

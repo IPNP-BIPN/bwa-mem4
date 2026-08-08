@@ -1171,6 +1171,49 @@ Ce qui n'est PAS raccourci, et l'issue le disait deja : le DP lui-meme. `endsc =
 toujours (le `gmax` de la passe inverse vaut exactement `score`), donc la boucle de lignes s'arretait
 deja au gel. C'est du dimensionnement de tampon, pas des cellules en moins.
 
+## #54 pieges 3 et 5 : la frontiere de saturation, et un `max_off` qui ne decide jamais rien (2026-08-08)
+
+Les deux derniers pieges d'octet-identite testables sans GPU.
+
+### Piege 3, la frontiere u8 / i16
+
+`matesw_saturation_boundary_equals_scalar` construit des travaux qui se posent **exactement** sur le
+seuil au lieu de le longer : pour chaque bonus de correspondance `a` de {1, 2, 3, 5, 7}, les
+longueurs de requete sont choisies pour que le plafond `qlen * a` vaille 248, 249, 250, 251, 254, 255
+et 256, encadrant a la fois la limite `U8_SCORE_LIMIT` de 250 et le debordement propre a la voie u8 a
+255. Les `a` sont pris de part et d'autre de la divisibilite de 250 (2 et 5 la divisent, 3 et 7 non),
+de sorte que le seuil est atteint pile aussi bien qu'encadre. Un second balayage traverse l'autre
+precondition u8, `qlen < 250`, qui existe parce que la colonne d'argmax partage la voie avec le
+score.
+
+`score2` est compare autant que `score`, avec un `minsc` assez bas pour que la liste des rivaux soit
+reellement peuplee : un bug de saturation qui epargnerait le meilleur alignement mais ecreterait un
+second changerait le MAPQ et rien d'autre, ce qui est exactement le genre de divergence qui passe
+une revue et tombe sur un md5.
+
+### Piege 5, `max_off` et la boucle de rounds : il ne se declenche jamais
+
+C'est le resultat le plus utile de la paire, et il n'etait pas attendu. `BWA4_ALIGN_SPLIT` compte
+desormais les travaux entres dans chaque round de doublement de bande et ceux que le test
+d'acceptation renvoie au suivant :
+
+| jeu | bande | round 0 | requeues |
+|---|---|---|---|
+| 200 k paires 150 bp, `genome.fa` | `-w 100` (defaut) | 2 109 519 travaux | **0** |
+| 200 k paires 49 bp, chr21 | `-w 100` (defaut) | 510 344 travaux | **0** |
+| 200 k paires 150 bp | **`-w 5`** | 2 113 395 travaux | **29 710, soit 1,406 %** |
+
+**Aux reglages par defaut la boucle de doublement de bande ne tourne jamais.** Le test d'acceptation
+passe des le round 0 pour la totalite des travaux, donc `max_off` ne decide de rien et un GPU qui le
+calculerait faux serait **invisible** sur ces donnees. Ce n'est pas une raison de relacher le piege,
+c'est une raison de changer le gate : `scripts/gpu_parity.sh` execute maintenant **chacune de ses
+trois etapes deux fois**, a la bande par defaut puis a `-w 5`, et c'est le second bras qui met
+reellement le piege 5 sous test. Les deux references de determinisme sont vertes
+(`791c21c2…` et `78d44e0f…`).
+
+Cela dit aussi quelque chose du code CPU : le round 1 existe, il est correct, et il n'est
+pratiquement jamais emprunte en production.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

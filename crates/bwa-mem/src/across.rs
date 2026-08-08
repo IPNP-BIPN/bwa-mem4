@@ -576,6 +576,25 @@ pub mod align_split {
     /// Time inside `run_side`, the two extension drivers, kernel time included. Subtracting
     /// [`EXTEND_NS`] from it leaves the job collection, the length sort and the result scatter.
     pub static SIDE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Jobs the acceptance test sent into round `r`, and how many of those it REQUEUED for the next
+    /// one, indexed by round. Issue #54 trap 5: the GPU computes `max_off`, the CPU decides on it,
+    /// and a `max_off` off by one is not a score that changes, it is a job that is or is not replayed
+    /// at double the band, and therefore a different `reg.w` in the output. So the CPU and GPU
+    /// numbers have to be compared as EQUAL, not as close, and that needs them counted.
+    ///
+    /// `BWA4_ALIGN_SPLIT` gates them, like the timers above.
+    pub static ROUND_JOBS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    pub static ROUND_REQUEUED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    /// Record one round: `n` jobs entered it, `requeued` of them failed the acceptance test.
+    pub fn record_round(round: usize, n: usize, requeued: usize) {
+        if !enabled() || round >= ROUND_JOBS.len() {
+            return;
+        }
+        ROUND_JOBS[round].fetch_add(n as u64, Ordering::Relaxed);
+        ROUND_REQUEUED[round].fetch_add(requeued as u64, Ordering::Relaxed);
+    }
+
     /// Time inside `mem_chain_flt`, the chain filter.
     pub static CHAINFLT_NS: AtomicU64 = AtomicU64::new(0);
     /// Time materialising each chain's reference window from the packed reference. No longer
@@ -643,6 +662,21 @@ pub mod align_split {
             REFSEQ_NS.load(Ordering::Relaxed) as f64 / 1e9,
             total - seed - side - flt - REFSEQ_NS.load(Ordering::Relaxed) as f64 / 1e9,
         );
+        // Issue #54 trap 5. These are the numbers a GPU backend has to reproduce EXACTLY, not
+        // approximately: a `max_off` off by one moves a job between the two columns.
+        for r in 0..ROUND_JOBS.len() {
+            let (n, q) = (
+                ROUND_JOBS[r].load(Ordering::Relaxed),
+                ROUND_REQUEUED[r].load(Ordering::Relaxed),
+            );
+            if n == 0 {
+                continue;
+            }
+            eprintln!(
+                "[align-split] band round {r} (w = opt.w << {r}): {n} jobs, {q} requeued ({:.3}%)",
+                100.0 * q as f64 / n as f64
+            );
+        }
     }
 }
 
@@ -1414,6 +1448,8 @@ fn run_side<B: SwBackend>(
         });
 
         // ---- step 3: acceptance test, then scatter or requeue each job ----
+        // Counted for issue #54 trap 5; see `align_split::record_round`.
+        let mut requeued_this_round = 0usize;
         for (lane, &job_idx) in active_idxs.iter().enumerate() {
             // `res`: this lane's DP outcome (`score`, `qle`/`tle`, `gscore`/`gtle`, `max_off`; see
             // the module glossary). `prev`: the score this job reached in the previous round, or its
@@ -1448,6 +1484,7 @@ fn run_side<B: SwBackend>(
                 // C, which stores `a->score = sp->score` unconditionally before testing; that store
                 // is how the C carries `prev` forward, and we carry it in the job instead.
                 jobs[job_idx].prev = score;
+                requeued_this_round += 1;
                 continue;
             }
             jobs[job_idx].active = false;
@@ -1509,6 +1546,7 @@ fn run_side<B: SwBackend>(
             // (C: `a->w = max_(a->w, w)`, `bwamem.cpp:2505`).
             reg.w = reg.w.max(w);
         }
+        align_split::record_round(round as usize, active_idxs.len(), requeued_this_round);
     }
 }
 
