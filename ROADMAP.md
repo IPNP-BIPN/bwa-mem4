@@ -622,6 +622,73 @@ s'explique entierement par ce qu'il ne calcule pas.
 N'ouvre rien de neuf : le champ CPU s'est arrete vers 2018, l'essentiel de l'activite recente est
 GPU (CUDASW++ 4.0, 2024) et donc hors sujet pour une comparaison par coeur.
 
+## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
+
+Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
+« que vaut un GPU ici, et qu'est-ce que l'octet-identite en interdit ? ». Instruite le meme jour,
+consignee dans les issues #52 a #57.
+
+### Le plafond, calcule sur notre propre profil
+
+Le profil PE mesure le 2026-08-07 (section « Ou le fork est reellement moins cher ») donne
+**39,2 % de mate rescue + 20,0 % de DP principal = 59,2 % de Smith-Waterman entier**. Sur la course
+de reference (28,60 s de mur, 220,21 s de CPU, 1 M paires) cela fait **130,4 s CPU de DP** contre
+89,8 s pour tout le reste. Si le DP devient gratuit : **2,45x en CPU, mur de 28,60 s a ~11,7 s**.
+
+C'est le plafond absolu de la voie GPU. Il ne bouge qu'en attaquant aussi le tri (15,1 %, #38) et le
+seeding (6,7 %).
+
+### Le resultat qui n'etait pas attendu : il ne faut presque pas de GPU
+
+Pour absorber ces 130,4 s CPU pendant les ~11,7 s de mur restantes, il faut **33 a 116 Gcell/s**
+selon la convention de comptage (10,4 Gcell/s/thread donne ~1,3 T cellules ; #50 chiffre l'etage
+rescue seul a 381 G).
+
+| materiel | debit | ce qu'il calcule |
+|---|---|---|
+| notre CPU, M4 Max, 12 P-cores | ~125 Gcell/s | score, te, qe, score2, te2 |
+| GPU integre du M4 Max (40 coeurs, 5120 ALU, ~1,68 GHz) | ~8,6 T op/s, donc **~570 Gcell/s theoriques**, ~230 en tablant sur 40 % | a ecrire |
+| CUDASW++ 4.0 sur A100 (half2) | 1,94 TCUPS | **score seul** |
+| CUDASW++ 4.0 sur H100 (s16x2 + DPX) | **5,71 TCUPS** | score seul |
+
+Notre contrat coute ~1,6x le score seul (15,75 operations par ligne de 16 cellules contre les 10 de
+SWIPE). Meme en divisant encore par deux : H100 ~1,8 TCUPS, soit **15x le besoin**. Et le GPU
+integre du Mac est deja **2 a 7x le besoin**.
+
+**Il n'y a donc pas besoin d'un accelerateur de datacentre pour prendre les 2,45x.** Sur une machine
+a GPU discret, l'interet n'est plus la vitesse du DP mais le fait qu'il rende 59,2 % du CPU au
+seeding et au tri.
+
+### Ce que l'octet-identite autorise, et c'est plus large qu'attendu
+
+Chaque job de DP est une **fonction pure** de ses arguments. Donc n'importe quelle repartition des
+jobs entre CPU et GPU, y compris dynamique et dependante de la charge, **produit exactement la meme
+sortie**. Le co-ordonnancement opportuniste est gratuit en risque, ce qui est la difference entre ce
+projet et un ordonnancement classique.
+
+Interdits, en revanche : tout flottant (CUDASW++ 4.0 tire ses 5,01 TCUPS sur L40S en `half2` ; notre
+recurrence est en entiers satures), le tri des regions sur GPU (permutation observable), et toute
+inversion de l'egalite d'argmax (`>` strict, le premier maximum gagne).
+
+### La couture existe deja
+
+`SwBackend::extend_batch` est deja par lot et cite deja `"metal"` en exemple de `name()` ; `across.rs`
+batche deja a travers les reads avec des rounds `w` puis `2w` et une requeue ; `batched_ksw_align2`
+fait un appel par round pour tout le lot de paires. Il n'y a pas de refonte du pipeline a faire, il y
+a une couture a rendre asynchrone.
+
+### Ce que la concurrence fait, et pourquoi son levier principal ne nous est pas offert
+
+GPU-BWA-MEM (ICS 2023) tire **3,2 a 3,8x sur bwa-mem2** en portant tout le pipeline, dont **3,7x sur
+le seeding**. Notre seeding pese 6,7 % contre les 17,0 % du fork : ce levier vaut au mieux 6,7 % chez
+nous, leur gain venant en grande partie d'une base que nous avons deja battue. Leur noyau SW, un warp
+par read en front d'onde, ne rend que **2x** ; notre disposition inter-sequences donne un thread par
+alignement, sans communication ni divergence interne, ce qui est structurellement meilleur.
+
+Aucun de ces outils ne tient l'octet-identite comme critere eliminatoire : Parabricks la tient sous
+condition de `-K` egal, GPU-BWA-MEM l'affirme sans methode de validation publiee. **Notre argument
+reste « plus vite ET prouve identique ».**
+
 ## AVX-512 : correct, jamais chronometre, et pourquoi (2026-08-07)
 
 Etat separe en deux, parce que les deux reponses sont differentes.
