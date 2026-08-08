@@ -1271,6 +1271,46 @@ pas une derive subtile mais du grand n'importe quoi, que le premier cas des gate
 * et le gate qui compte : le binaire **x86_64 sous Rosetta** et le binaire **arm64** rendent le
   **meme md5** (`791c21c2…`) sur 200 k paires reelles, corps SAM complet.
 
+## #46C : le `rowmax` i32 des noyaux u8 x86 passe en u8 (2026-08-09)
+
+Dernier point ouvert de #46, et le seul des trois qui n'avait pas ete infirme par la mesure : les
+noyaux u8 x86 (AVX2, SSE4.1, AVX-512) portaient encore un `rowmax` en **i32** et publiaient la ligne
+avec 32 ou 64 ecritures scalaires gardees, la ou NEON stocke la ligne entiere en un `vst1q_u8` depuis
+longtemps. Aligne sur NEON.
+
+Ce que cela change en taille de tampon, a la forme moyenne (`tmax` = 1401 lignes) :
+
+| noyau | voies | `rowmax` i32 | `rowmax` u8 | ecritures par ligne |
+|---|---|---|---|---|
+| AVX-512 u8 | 64 | **350 KB par groupe** | **87,6 KB** | 64 -> **1** |
+| AVX2 u8 | 32 | 175 KB | 43,8 KB | 32 -> **1** |
+| SSE4.1 u8 | 16 | 87,6 KB | 21,9 KB | 16 -> **1** |
+
+Le cas AVX-512 est celui que l'issue designait : 350 KB par groupe sort de L1 et va en L2, et le
+parcours par voie de `extract_group` touchait alors une ligne de cache neuve a chaque chargement, en
+re-lisant chaque ligne une fois par voie. En u8 le pas est exactement une ligne de 64 octets par
+ligne de DP de 64 voies.
+
+L'ecriture est inconditionnelle, sur l'argument que NEON tient deja : les maxima de ligne d'une voie
+ne sont lus que pour les lignes `0..=limit[l]`, et `limit[l]` vaut `tlen[l] - 1` ou la ligne de gel,
+donc tout ce que cette ecriture depose au-dela de l'ancienne garde n'est lu par personne.
+
+### Mesure : aucune, et pour la meme raison que #48C
+
+Machine arm64. Le temps x86 doit venir d'un runner x86. Ce qui est verifiable ici l'a ete :
+
+* `check.sh` vert, dont la passe x86_64 sous Rosetta ou le test `avx2_matesw_u8_matches_scalar`
+  appelle le noyau AVX2 **directement**, donc le portage AVX2 est reellement execute et compare au
+  scalaire ;
+* le binaire **x86_64 sous Rosetta** et le binaire **arm64** rendent le meme md5 sur les **deux** jeux
+  reels (200 k paires 150 bp, `791c21c2…` ; 500 k paires 49 bp, `7178e85d…`). Sous Rosetta la
+  detection `avx2` est fausse, donc le noyau de rescue reellement emprunte de bout en bout est le
+  **SSE4.1**, qui est l'un des trois modifies ;
+* **le noyau AVX-512 u8 n'a aucune couverture ici** : son test s'arrete faute de `avx512bw`. Le
+  changement y est mecaniquement identique aux deux autres, mais c'est dit plutot que tu.
+
+#46 est donc close : A et B mesures a zero et retires, C livre.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

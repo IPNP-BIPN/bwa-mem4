@@ -2640,7 +2640,22 @@ unsafe fn fwd_local_sw_avx2_u8(
         let mut h_prev = vec![0u8; qmax * LANES32];
         let mut h_cur = vec![0u8; qmax * LANES32];
         let mut e = vec![0u8; qmax * LANES32];
-        let mut rowmax = vec![0i32; tmax * LANES32];
+        // ISSUE #46C. `rowmax` is u8, not i32, and the row is published with ONE vector store
+        // instead of `LANES` guarded scalar ones, exactly as `fwd_local_sw_neon_u8` already does.
+        // Two reasons, both structural rather than micro:
+        //
+        //  - size. At AVX-512's mean shape the i32 buffer was 359 KB per group, out of L1 and into
+        //    L2, and `extract_group`'s per-lane walk then touched a fresh cache line for every load,
+        //    re-fetching each line once per lane. As u8 it is 90 KB and the stride is exactly one
+        //    64-byte line per row of 64 lanes.
+        //  - stores. The scalar form issued one guarded store per live lane per row, 32 or 64 of
+        //    them; the vector form issues one.
+        //
+        // Writing it unconditionally is safe for the same reason it is on NEON: a lane's row maxima
+        // are read only for rows `0..=limit[l]`, and `limit[l]` is `tlen[l] - 1` or the freeze row,
+        // so every slot this writes beyond the old guard is one nothing reads. Values fit u8 because
+        // the caller proved the score ceiling is under `U8_SCORE_LIMIT`.
+        let mut rowmax = vec![0u8; tmax * LANES32];
         let mut gmax = [0i32; LANES32];
         let mut te = [-1i32; LANES32];
         let mut qe = [0i32; LANES32];
@@ -2669,13 +2684,17 @@ unsafe fn fwd_local_sw_avx2_u8(
                 let mut col_arr = [0u8; LANES32];
                 _mm256_storeu_si256(imax_arr.as_mut_ptr() as *mut __m256i, $imax);
                 _mm256_storeu_si256(col_arr.as_mut_ptr() as *mut __m256i, $col);
+                // The whole row, all lanes, one store. See the note on `rowmax`.
+                _mm256_storeu_si256(
+                    rowmax.as_mut_ptr().add(row * LANES32) as *mut __m256i,
+                    $imax,
+                );
                 for l in 0..n_lanes {
                     if row >= tlen[l] || frozen[l] {
                         continue;
                     }
                     // Job `l`'s best H anywhere in target row `row`, widened out of the lane.
                     let row_max = imax_arr[l] as i32;
-                    rowmax[row * LANES32 + l] = row_max;
                     if row_max > gmax[l] {
                         gmax[l] = row_max;
                         te[l] = row as i32;
@@ -3388,7 +3407,22 @@ unsafe fn fwd_local_sw_sse41_u8(
         let mut h_prev = vec![0u8; qmax * LANES16];
         let mut h_cur = vec![0u8; qmax * LANES16];
         let mut e = vec![0u8; qmax * LANES16];
-        let mut rowmax = vec![0i32; tmax * LANES16];
+        // ISSUE #46C. `rowmax` is u8, not i32, and the row is published with ONE vector store
+        // instead of `LANES` guarded scalar ones, exactly as `fwd_local_sw_neon_u8` already does.
+        // Two reasons, both structural rather than micro:
+        //
+        //  - size. At AVX-512's mean shape the i32 buffer was 359 KB per group, out of L1 and into
+        //    L2, and `extract_group`'s per-lane walk then touched a fresh cache line for every load,
+        //    re-fetching each line once per lane. As u8 it is 90 KB and the stride is exactly one
+        //    64-byte line per row of 64 lanes.
+        //  - stores. The scalar form issued one guarded store per live lane per row, 32 or 64 of
+        //    them; the vector form issues one.
+        //
+        // Writing it unconditionally is safe for the same reason it is on NEON: a lane's row maxima
+        // are read only for rows `0..=limit[l]`, and `limit[l]` is `tlen[l] - 1` or the freeze row,
+        // so every slot this writes beyond the old guard is one nothing reads. Values fit u8 because
+        // the caller proved the score ceiling is under `U8_SCORE_LIMIT`.
+        let mut rowmax = vec![0u8; tmax * LANES16];
         let mut gmax = [0i32; LANES16];
         let mut te = [-1i32; LANES16];
         let mut qe = [0i32; LANES16];
@@ -3417,13 +3451,17 @@ unsafe fn fwd_local_sw_sse41_u8(
                 let mut col_arr = [0u8; LANES16];
                 _mm_storeu_si128(imax_arr.as_mut_ptr() as *mut __m128i, $imax);
                 _mm_storeu_si128(col_arr.as_mut_ptr() as *mut __m128i, $col);
+                // The whole row, all lanes, one store. See the note on `rowmax`.
+                _mm_storeu_si128(
+                    rowmax.as_mut_ptr().add(row * LANES16) as *mut __m128i,
+                    $imax,
+                );
                 for l in 0..n_lanes {
                     if row >= tlen[l] || frozen[l] {
                         continue;
                     }
                     // Job `l`'s best H anywhere in target row `row`, widened out of the lane.
                     let row_max = imax_arr[l] as i32;
-                    rowmax[row * LANES16 + l] = row_max;
                     if row_max > gmax[l] {
                         gmax[l] = row_max;
                         te[l] = row as i32;
@@ -4018,7 +4056,22 @@ unsafe fn fwd_local_sw_avx512_u8(
         let mut h_prev = vec![0u8; qmax * LANES64];
         let mut h_cur = vec![0u8; qmax * LANES64];
         let mut e = vec![0u8; qmax * LANES64];
-        let mut rowmax = vec![0i32; tmax * LANES64];
+        // ISSUE #46C. `rowmax` is u8, not i32, and the row is published with ONE vector store
+        // instead of `LANES` guarded scalar ones, exactly as `fwd_local_sw_neon_u8` already does.
+        // Two reasons, both structural rather than micro:
+        //
+        //  - size. At AVX-512's mean shape the i32 buffer was 359 KB per group, out of L1 and into
+        //    L2, and `extract_group`'s per-lane walk then touched a fresh cache line for every load,
+        //    re-fetching each line once per lane. As u8 it is 90 KB and the stride is exactly one
+        //    64-byte line per row of 64 lanes.
+        //  - stores. The scalar form issued one guarded store per live lane per row, 32 or 64 of
+        //    them; the vector form issues one.
+        //
+        // Writing it unconditionally is safe for the same reason it is on NEON: a lane's row maxima
+        // are read only for rows `0..=limit[l]`, and `limit[l]` is `tlen[l] - 1` or the freeze row,
+        // so every slot this writes beyond the old guard is one nothing reads. Values fit u8 because
+        // the caller proved the score ceiling is under `U8_SCORE_LIMIT`.
+        let mut rowmax = vec![0u8; tmax * LANES64];
         let mut gmax = [0i32; LANES64];
         let mut te = [-1i32; LANES64];
         let mut qe = [0i32; LANES64];
@@ -4043,12 +4096,16 @@ unsafe fn fwd_local_sw_avx512_u8(
                 let mut col_arr = [0u8; LANES64];
                 _mm512_storeu_si512(imax_arr.as_mut_ptr() as *mut __m512i, $imax);
                 _mm512_storeu_si512(col_arr.as_mut_ptr() as *mut __m512i, $col);
+                // The whole row, all lanes, one store. See the note on `rowmax`.
+                _mm512_storeu_si512(
+                    rowmax.as_mut_ptr().add(row * LANES64) as *mut __m512i,
+                    $imax,
+                );
                 for l in 0..n_lanes {
                     if row >= tlen[l] || frozen[l] {
                         continue;
                     }
                     let row_max = imax_arr[l] as i32;
-                    rowmax[row * LANES64 + l] = row_max;
                     if row_max > gmax[l] {
                         gmax[l] = row_max;
                         te[l] = row as i32;
