@@ -464,6 +464,44 @@ est 0,4 %, pas l'estimation.
 
 Sortie octet-identique a chaque etape, sur GRCh38 et sur chr21.
 
+## Le plafond du noyau de rescue : 16 Gcell/s, pas 56 (2026-08-08)
+
+Le noyau imprimait depuis toujours `ISA ceiling: 16 u8 lanes x ~3.5 GHz = ~56 Gcell/s if 1
+cell/lane/cycle`, ce qui le faisait paraitre cinq fois pire qu'il n'est. **Le chiffre est faux comme
+objectif**, et voici ce qu'une mesure sur la machine de developpement (M4 Max) donne a la place.
+
+| | |
+|---|---|
+| pic d'operations NEON, sans dependance ni memoire | **16,63 G op/s**, ~3,8 par cycle |
+| la sequence d'operations par cellule du noyau, registres seuls | **16,04 Gcell/s**, 93 % de ce pic |
+| le noyau livre, donnees reelles | 10,39 Gcell/s, **64 % de ce plafond** |
+
+La reconciliation tient en une phrase : **une operation vectorielle fait avancer 16 cellules**, parce
+que la disposition est inter-sequence (seize voies = seize travaux differents). Une ligne coute ~15
+operations et couvre 16 cellules, donc le bon ratio est **~0,98 operation par cellule**, pas une
+cellule par voie et par cycle. Le "56" supposait implicitement une operation par cellule, ce qu'aucun
+Smith-Waterman a gaps affines ne fait.
+
+Le desassemblage du binaire livre confirme, boucle rapide du quadruplet a `0x10007ca08` :
+
+| | |
+|---|---|
+| instructions | 71 pour 64 cellules, soit **1,11 par cellule** |
+| dont vectorielles | 63, soit 0,98 par cellule |
+| memoire | 6 chargements, 2 ecritures, dont 3 de deversement |
+
+**L'arithmetique est donc finie.** Les 36 % restants ne sont pas dans le corps du DP mais autour :
+
+- la taxe de divergence de voie, **1,09x**, deja mesuree comme irrecuperable par tri ;
+- l'epilogue de ligne (`finish_row`), une boucle SCALAIRE sur seize voies par ligne, ~5 % ;
+- les colonnes de queue paddees, 1,42 instruction par cellule contre 1,11, ~2,6 % ;
+- l'empaquetage du groupe et `extract_group`.
+
+C'est la carte pour la suite. Ce qu'il ne faut PAS retenter : raccourcir la recurrence par cellule.
+Elle est a 0,98 operation par cellule contre un plafond machine de 0,97, et les trois candidats
+evidents sont deja fermes (argmax paresseux mesure 18 % plus lent, saut de la reparation du N 7 % plus
+lent, tri par longueur 0,0 %).
+
 ## AVX-512 : correct, jamais chronometre, et pourquoi (2026-08-07)
 
 Etat separe en deux, parce que les deux reponses sont differentes.

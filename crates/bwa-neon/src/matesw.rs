@@ -186,6 +186,30 @@ pub mod cells {
     /// Print the accumulated counters to stderr, once, at the end of a run. No-op unless
     /// [`enabled`]. Takes no parameters and reads the statics above with `Relaxed` ordering: the
     /// counts are diagnostics, so a slightly stale read from another thread is acceptable.
+    ///
+    /// # What the throughput figure should be compared against
+    ///
+    /// This line used to print "16 u8 lanes x ~3.5 GHz = ~56 Gcell/s if 1 cell/lane/cycle". That
+    /// number is a width bound, not an achievable one, and it made the kernel look five times worse
+    /// than it is. **Measured** on the M4 Max this was developed on:
+    ///
+    /// | | |
+    /// |---|---|
+    /// | peak NEON op throughput, no dependencies, no memory | 16.63 G ops/s, about 3.8 per cycle |
+    /// | the kernel's own per-cell op sequence, registers only | **16.04 Gcell/s**, 93% of that peak |
+    /// | the shipped kernel, real data | 10.34 Gcell/s, **64% of the ceiling above** |
+    ///
+    /// The reconciliation is that ONE vector operation advances 16 cells, because the layout is
+    /// inter-sequence: sixteen lanes are sixteen different jobs. A cell costs about 15 operations
+    /// per ROW, and a row covers 16 cells, so the true figure is ~0.98 operations per cell, not one
+    /// cell per lane per cycle. Disassembling the shipped binary confirms it: the quad fast-column
+    /// loop is 71 instructions for 64 cells, 63 of them vector, i.e. 1.11 instructions per cell.
+    ///
+    /// So the arithmetic is essentially done, and the remaining 36% is NOT in the DP body. It is in
+    /// the per-row and per-group work around it: the 1.09x lane-divergence tax, the row epilogue's
+    /// scalar sixteen-lane loop, the padded tail columns (1.42 instructions per cell against 1.11),
+    /// and the group pack/extract. Anyone chasing the next percent should start there and should not
+    /// try to shorten the cell recurrence.
     pub fn dump() {
         if !enabled() {
             return;
@@ -198,7 +222,7 @@ pub mod cells {
         let seconds = elapsed_ns as f64 / 1e9;
         eprintln!(
             "[matesw] {jobs} jobs, {cells} DP cells in {seconds:.2}s CPU -> {:.2} Gcell/s/thread\n\
-             [matesw] ISA ceiling: 16 u8 lanes x ~3.5 GHz = ~56 Gcell/s if 1 cell/lane/cycle",
+             [matesw] measured ceiling on an M4 Max: ~16 Gcell/s/thread (see the note above)",
             cells as f64 / seconds.max(1e-9) / 1e9
         );
         let (query_bases, target_bases) =
