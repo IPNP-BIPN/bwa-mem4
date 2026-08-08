@@ -828,6 +828,55 @@ par ligne, la ou NEON publie la ligne en un `vst1q_u8`. A la forme moyenne d'AVX
 359 KB par groupe, hors L1. Ce portage se mesure sur une machine x86, pas ici, et l'issue reste
 ouverte pour lui.
 
+## #48 : les deux leviers faisables ici etaient deja appliques par LLVM (2026-08-08)
+
+Deuxieme resultat **negatif**, et celui-la se demontre plutot qu'il ne se mesure. Sur les quatre
+leviers de l'issue, deux sont faisables sur cette machine (A, supprimer le `max(., 0)` redondant des
+chemins d'ouverture de gap ; D, reutiliser `j_v` au lieu de le rediffuser). C sont des compares x86,
+B est explicitement « a faire en dernier ».
+
+A et D ont ete ecrits, avec le parametre const `TUNE` sur le noyau genere et la fente de macro
+`clamp0` liee a une identite a deux arguments pour les huit instanciations u8. Puis :
+
+* **A/B du processus entier**, `-t4`, 500 k paires 150 bp, 11 courses entrelacees : **32,65 s contre
+  32,65 s**, exactement rien.
+* **microbenchmark du noyau seul**, 4096 travaux d'extension, un bras apres l'autre : +1,2 %, +1,3 %,
+  +4,1 %, +6,2 %. C'est ce qu'on aurait pu publier.
+* **le meme microbenchmark, bras alternes, medianes de 15 rondes** : **0,999x et 0,995x, 7 et 6
+  victoires sur 15**. Le +6 % etait un effet d'ordre, pas un levier. La discipline d'entrelacement
+  n'est pas une precaution de style, elle est ce qui separe les deux chiffres.
+
+La preuve arrive ensuite, et elle est sans appel. Dans le binaire livre il n'existe qu'**un seul
+symbole** pour le noyau :
+
+```
+batched_extend_neon_u8Kb0_EB6_      (Kb0_ = TUNE:bool = false)
+batched_extend_neon_i16Kb0_EB6_
+```
+
+La monomorphisation `TUNE = true` a ete **fusionnee avec la `false`** : les deux compilent vers un
+code machine identique. LLVM applique deja les deux reecritures. C'est evident a posteriori :
+`umax(x, 0)` sur un type **non signe** se replie en `x` sans meme regarder d'ou vient `x`, et une
+diffusion identique du meme scalaire est eliminee par CSE. L'issue comptait 33 operations ALU par
+colonne dans le source ; l'assembleur n'en a jamais eu 33.
+
+Le tout est revenu en arriere : `batched.rs` est intact.
+
+### Ce que ce resultat dit du reste de l'issue
+
+Le corps de colonne de `batched.rs` n'est pas limite par l'ALU vectorielle comme le noyau de rescue
+l'est. Deux consequences pour la suite :
+
+* le levier **C** (masque de bande en espace signe sur x86, +8 a +12 % annonce) est a re-instruire
+  avant d'etre code. Il compte lui aussi des uops de source ; `cge_epu8` compte pour 2 et `clt_epu8`
+  pour 3 chez l'agent, mais rien ne prouve que le compilateur ne les a pas deja arranges. **Compter
+  les instructions dans le desassemblage x86, pas dans le source**, avant d'ecrire une ligne ;
+* le levier **B** (replier la pre-passe de substitution dans la boucle principale) reste le seul
+  candidat serieux, parce que c'est le seul qui retire un **acces memoire** plutot que des operations
+  ALU : une ecriture pleine largeur et une lecture pleine largeur par colonne, dont le compilateur ne
+  peut pas se debarrasser tout seul puisqu'elles traversent deux boucles. Il reste aussi le plus
+  risque, pour la raison enumeree dans l'issue.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
