@@ -502,6 +502,51 @@ Elle est a 0,98 operation par cellule contre un plafond machine de 0,97, et les 
 evidents sont deja fermes (argmax paresseux mesure 18 % plus lent, saut de la reparation du N 7 % plus
 lent, tri par longueur 0,0 %).
 
+## Recherche multi-agents sur les noyaux SIMD (2026-08-08)
+
+32 agents, 24 leviers examines, **8 survivants** apres passage devant un contradicteur dont le verdict
+par defaut etait "refute". Tout est en issues GitHub, une par chantier, avec le detail technique
+complet (intrinseques, numeros de ligne, argument d'octet-identite, sources uops.info et SWOG Arm).
+
+**Index : issue nº51.** Plafond par classe de CPU et plan classe.
+
+| issue | chantier | gain |
+|---|---|---|
+| **nº43** | table XOR sur les noyaux u8 AVX2 / SSE4.1 | **+18 a +50 %** |
+| nº44 | idem AVX-512, plus reequilibrage de ports (a conditionner) | +11 a +40 % |
+| nº45 | `USQADD` fusionne, et `qsub(h, oe)` partage entre E et F (NEON) | +7,5 % mesure, +6 % |
+| nº46 | les deux passes scalaires, `finish_row` et `extract_group` | 2 a 7 % |
+| nº47 | les 12 colonnes de padding qui tournent dans le corps de queue | +2,8 a +7 % |
+| nº48 | `batched.rs`, 2,0 op/cellule contre 0,95, jamais regle par ISA | 1 a 12 % |
+| nº50 | le lemme de portee d'alignement : borner la passe inverse, partager le DP | +2,5 %, +15 % |
+| nº49 | **les 16 impasses**, avec leurs raisons | - |
+
+### Le resultat qui explique le 1,25x de l'AVX-512
+
+A 512 bits, chez Golden Cove (Sapphire/Emerald Rapids), **toutes** les operations entieres saturantes
+et tous les `max` retombent sur **le seul port 0** (uops.info : `VPMAXUB`/`VPSUBUSB`/`VPADDUSB` ZMM,
+1 uop, p0, debit 1,00), parce qu'a cette largeur l'unite vectorielle du port 1 est fusionnee dans p0.
+Le noyau devient donc borne par p0 pendant que p5 chome a ~75 %. La largeur n'achete rien : c'est la
+mesure du 8573C (10,39 contre 8,29 Gcell/s) expliquee.
+
+### Ce que la recherche a confirme, et qui clot un sujet
+
+**L'arithmetique par cellule est finie.** 0,98 operation par cellule contre un plafond machine de
+0,97, a 93 % du debit d'emission crete. Tout ce qui reste est hors du chemin critique (les epilogues
+scalaires), hors de l'ISA (la table XOR absente du x86), ou algorithmique (nº50). Quiconque propose de
+raccourcir la recurrence doit d'abord lire l'issue nº49.
+
+### Honnetete sur la couverture
+
+7 agents sur 32 sont tombes sur la limite de session, dont la synthese finale et les contradicteurs
+des domaines Apple, etat de l'art et algorithmique. Donc **nº50 n'a jamais ete relu par un lecteur
+hostile**, et les mesures de nº45 sont celles de l'agent lui-meme. nº43, nº44, nº46, nº47 et nº48 ont,
+eux, survecu a la verification.
+
+Question restee ouverte, faute d'avoir fini l'etat de l'art : **quelqu'un a-t-il publie un chiffre
+par coeur depassant 10,4 Gcell/s sur des voies de 128 bits, pour du Smith-Waterman local a gaps
+affines avec second meilleur score ?**
+
 ## AVX-512 : correct, jamais chronometre, et pourquoi (2026-08-07)
 
 Etat separe en deux, parce que les deux reponses sont differentes.
