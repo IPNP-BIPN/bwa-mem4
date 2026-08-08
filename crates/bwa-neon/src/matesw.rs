@@ -754,12 +754,10 @@ const ZPAD: u8 = 5;
 /// collides with the 0-7 range the real bases already use. Purely internal to that one kernel: it is
 /// written when the group is packed and never leaves it, so no caller and no other kernel sees it.
 ///
-/// NEON only, hence the `cfg`, and not because of the register file this time: the x86 u8 kernels
-/// never adopted the XOR-indexed table at all. They score with `n_mask = (t == 4) | (q == 4)` and a
-/// blend, so there is no table slot to give both-N and nothing here to reuse. Bringing them the same
-/// 7% would mean porting the table form first, which is a separate piece of work and one that cannot
-/// be measured on this host.
-#[cfg(target_arch = "aarch64")]
+/// Shared by the NEON u8 kernel and, since issue #43, by the AVX2 and SSE4.1 u8 kernels, which now
+/// use the same XOR-indexed table. `vpshufb` reads `tbl[idx & 15]` where `vqtbl1q_u8` zeroes any
+/// index >= 16, but the two agree over every index this encoding can produce; the argument is spelled
+/// out where the x86 table is built. The AVX-512 u8 kernel still scores with blends (issue #44).
 const N_TARGET: u8 = 12;
 
 /// Cell score written where a [`PAD`] position is scored, i.e. where the cell must come out dead.
@@ -2542,7 +2540,10 @@ const LANES32: usize = 32;
 #[allow(clippy::too_many_arguments)]
 unsafe fn fwd_local_sw_avx2_u8(
     jobs: &[FwdJob],
-    m: usize,
+    // Matrix dimension (5). No longer read now that dead-cell detection keys on the PAD
+    // byte's high bit rather than `>= m`, exactly as in `fwd_local_sw_neon_u8`; kept in the
+    // signature for parity with the other kernels.
+    _m: usize,
     mat: &[i8],
     o_del: i32,
     e_del: i32,
@@ -2586,11 +2587,52 @@ unsafe fn fwd_local_sw_avx2_u8(
     // Broadcast constants, scores held as *magnitudes* (subtracted, not added) so the whole kernel
     // stays unsigned; see the NEON u8 kernel's header for why that is what makes u8 viable.
     let zero = _mm256_setzero_si256();
-    let mtch_v = _mm256_set1_epi8(mtch as i8);
-    let mispen_v = _mm256_set1_epi8(mispen as i8);
+    // ISSUE #43: the XOR-indexed score table, ported from `fwd_local_sw_neon_u8`. See there for
+    // why the target N is re-encoded as `N_TARGET` (12) and what each of the 16 slots means. The
+    // saturation guard is the same, and it is a HARD assert because the release path depends on it.
+    assert!(
+        (U8_SCORE_LIMIT as u32) + mispen as u32 + mtch as u32 <= 256,
+        "u8 rescue score table would saturate: mispen {mispen} + mtch {mtch} + ceiling too large"
+    );
+    let bias = mispen;
+    let mut tbl = [0u8; 32];
+    for r in 0..2 {
+        let o = r * 16;
+        tbl[o] = bias + mtch; // match: +a
+                              // tbl[o + 1..=o + 3] = bias - b = 0 (mismatch), already zero
+        for k in 4..8 {
+            tbl[o + k] = bias - 1; // query N against a real base: bwa scores -1
+        }
+        tbl[o + 8] = bias - 1; // both N: N_TARGET XOR 4
+        for k in 12..16 {
+            tbl[o + k] = bias - 1; // target N against a real base
+        }
+    }
+    // `vpshufb` is IN-LANE on AVX2, so the 16-byte table is written into both 128-bit halves; on
+    // SSE4.1 there is a single lane and the loop above runs once.
+    let score_tbl = _mm256_loadu_si256(tbl.as_ptr() as *const __m256i);
+    let bias_v = _mm256_set1_epi8(bias as i8);
+    // `vpshufb` zeroes a lane whose index has bit 7 set and otherwise reads `tbl[idx & 15]`, where
+    // `vqtbl1q_u8` zeroes every index >= 16. They differ only on indices 16..127, and that range is
+    // UNREACHABLE here: the only alphabet byte with bit 7 set is `PAD`, `seq_q` holds
+    // {0,1,2,3,4,ZPAD=5,PAD} and `seq_t` holds {0,1,2,3,N_TARGET=12,PAD}, so with neither operand
+    // PAD both are <= 12 and `t ^ q <= 15` (the maximum is `3 ^ 12`); with exactly one PAD the xor
+    // has bit 7 set and both instructions give 0; with both PAD the xor is 0 and both give
+    // `tbl[0]`, a cell the pad blend overrides anyway. So the NEON byte-identity argument carries
+    // over unchanged.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn score_diag(
+        tbl: __m256i,
+        bias_v: __m256i,
+        t_v: __m256i,
+        q_v: __m256i,
+        d: __m256i,
+    ) -> __m256i {
+        let s = _mm256_shuffle_epi8(tbl, _mm256_xor_si256(t_v, q_v));
+        _mm256_subs_epu8(_mm256_adds_epu8(d, s), bias_v)
+    }
     let one_v = _mm256_set1_epi8(1); // N penalty
-    let four_v = _mm256_set1_epi8(4);
-    let m_v = _mm256_set1_epi8(m as i8);
     let zpad_v = _mm256_set1_epi8(ZPAD as i8);
     let e_del_v = _mm256_set1_epi8(e_del as i8);
     let oe_del_v = _mm256_set1_epi8(oe_del as i8);
@@ -2629,8 +2671,10 @@ unsafe fn fwd_local_sw_avx2_u8(
             for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
                 seq_q[c * LANES32 + l] = ZPAD;
             }
+            // The N re-encoding, applied once per target base so the column loops never pay for
+            // it (issue #43). See `fwd_local_sw_neon_u8`'s score-table comment.
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES32 + l] = b;
+                seq_t[r * LANES32 + l] = if b == 4 { N_TARGET } else { b };
             }
         }
 
@@ -2717,8 +2761,6 @@ unsafe fn fwd_local_sw_avx2_u8(
                 let t0_v = _mm256_loadu_si256(seq_t.as_ptr().add(i * LANES32) as *const __m256i);
                 let t1_v =
                     _mm256_loadu_si256(seq_t.as_ptr().add((i + 1) * LANES32) as *const __m256i);
-                let t0_is_n = _mm256_cmpeq_epi8(t0_v, four_v);
-                let t1_is_n = _mm256_cmpeq_epi8(t1_v, four_v);
                 let (mut f0, mut f1) = (zero, zero);
                 let (mut d0, mut d1) = (zero, zero);
                 let (mut imax0, mut imax1) = (zero, zero);
@@ -2728,14 +2770,7 @@ unsafe fn fwd_local_sw_avx2_u8(
                 for j in 0..n_fast {
                     let q_v = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
 
-                    let eq0 = _mm256_cmpeq_epi8(t0_v, q_v);
-                    let n0 = _mm256_or_si256(t0_is_n, _mm256_cmpeq_epi8(q_v, four_v));
-                    let mut diag0 = bsl(
-                        eq0,
-                        _mm256_adds_epu8(d0, mtch_v),
-                        _mm256_subs_epu8(d0, mispen_v),
-                    );
-                    diag0 = bsl(n0, _mm256_subs_epu8(d0, one_v), diag0);
+                    let diag0 = score_diag(score_tbl, bias_v, t0_v, q_v, d0);
                     let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES32) as *const __m256i);
                     let mfe0 = _mm256_max_epu8(diag0, e_v);
                     let h0 = _mm256_max_epu8(mfe0, f0);
@@ -2752,14 +2787,7 @@ unsafe fn fwd_local_sw_avx2_u8(
                     );
                     d0 = _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES32) as *const __m256i);
 
-                    let eq1 = _mm256_cmpeq_epi8(t1_v, q_v);
-                    let n1 = _mm256_or_si256(t1_is_n, _mm256_cmpeq_epi8(q_v, four_v));
-                    let mut diag1 = bsl(
-                        eq1,
-                        _mm256_adds_epu8(d1, mtch_v),
-                        _mm256_subs_epu8(d1, mispen_v),
-                    );
-                    diag1 = bsl(n1, _mm256_subs_epu8(d1, one_v), diag1);
+                    let diag1 = score_diag(score_tbl, bias_v, t1_v, q_v, d1);
                     let mfe1 = _mm256_max_epu8(diag1, e_mid);
                     let h1 = _mm256_max_epu8(mfe1, f1);
                     col1 = bsl(cgt_epu8(h1, imax1), j_v, col1);
@@ -2783,18 +2811,17 @@ unsafe fn fwd_local_sw_avx2_u8(
                 for j in n_fast..qmax {
                     let q_v = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
                     let zpad_mask = _mm256_cmpeq_epi8(q_v, zpad_v);
-                    let q_pad = cgt_epu8(q_v, zpad_v);
+                    // `q > ZPAD` is true only for `PAD`, so the high-bit test is the same mask in one
+                    // instruction instead of three (issue #43).
+                    let q_pad = _mm256_cmpgt_epi8(zero, q_v);
 
-                    let eq0 = _mm256_cmpeq_epi8(t0_v, q_v);
-                    let n0 = _mm256_or_si256(t0_is_n, _mm256_cmpeq_epi8(q_v, four_v));
-                    let mut diag0 = bsl(
-                        eq0,
-                        _mm256_adds_epu8(d0, mtch_v),
-                        _mm256_subs_epu8(d0, mispen_v),
-                    );
-                    diag0 = bsl(n0, _mm256_subs_epu8(d0, one_v), diag0);
+                    let mut diag0 = score_diag(score_tbl, bias_v, t0_v, q_v, d0);
                     diag0 = bsl(zpad_mask, d0, diag0);
-                    diag0 = bsl(_mm256_or_si256(cge_epu8(t0_v, m_v), q_pad), zero, diag0);
+                    diag0 = bsl(
+                        _mm256_or_si256(_mm256_cmpgt_epi8(zero, t0_v), q_pad),
+                        zero,
+                        diag0,
+                    );
                     let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES32) as *const __m256i);
                     let mfe0 = _mm256_max_epu8(diag0, e_v);
                     let h0 = _mm256_max_epu8(mfe0, f0);
@@ -2810,16 +2837,13 @@ unsafe fn fwd_local_sw_avx2_u8(
                     );
                     d0 = _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES32) as *const __m256i);
 
-                    let eq1 = _mm256_cmpeq_epi8(t1_v, q_v);
-                    let n1 = _mm256_or_si256(t1_is_n, _mm256_cmpeq_epi8(q_v, four_v));
-                    let mut diag1 = bsl(
-                        eq1,
-                        _mm256_adds_epu8(d1, mtch_v),
-                        _mm256_subs_epu8(d1, mispen_v),
-                    );
-                    diag1 = bsl(n1, _mm256_subs_epu8(d1, one_v), diag1);
+                    let mut diag1 = score_diag(score_tbl, bias_v, t1_v, q_v, d1);
                     diag1 = bsl(zpad_mask, d1, diag1);
-                    diag1 = bsl(_mm256_or_si256(cge_epu8(t1_v, m_v), q_pad), zero, diag1);
+                    diag1 = bsl(
+                        _mm256_or_si256(_mm256_cmpgt_epi8(zero, t1_v), q_pad),
+                        zero,
+                        diag1,
+                    );
                     let mfe1 = _mm256_max_epu8(diag1, e_mid);
                     let h1 = _mm256_max_epu8(mfe1, f1);
                     col1 = bsl(cgt_epu8(h1, imax1), j_v, col1);
@@ -2855,20 +2879,13 @@ unsafe fn fwd_local_sw_avx2_u8(
                                            // Carried column index (bumped by `one_v`, which is set1_epi8(1)) and the row-invariant
                                            // "target is N" mask. See `fwd_local_sw_neon_u8` for the reasoning.
                 let mut j_v = zero;
-                let t_is_n = _mm256_cmpeq_epi8(t_v, four_v);
 
                 // Padding-free column range: below `n_fast` no live lane shows ZPAD or PAD, so the two
                 // padding masks and their selects are not emitted. Identical argument to the NEON u8
                 // kernel, including why a dead target row may be left un-killed here.
                 for j in 0..n_fast {
                     let q_v = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
-                    let eq = _mm256_cmpeq_epi8(t_v, q_v);
-                    let n_mask = _mm256_or_si256(t_is_n, _mm256_cmpeq_epi8(q_v, four_v));
-                    let add_match = _mm256_adds_epu8(h_diag_v, mtch_v);
-                    let sub_mis = _mm256_subs_epu8(h_diag_v, mispen_v);
-                    let sub_n = _mm256_subs_epu8(h_diag_v, one_v);
-                    let mut diag_v = bsl(eq, add_match, sub_mis);
-                    diag_v = bsl(n_mask, sub_n, diag_v);
+                    let diag_v = score_diag(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES32) as *const __m256i);
                     let mfe = _mm256_max_epu8(diag_v, e_v);
                     let h_v = _mm256_max_epu8(mfe, f_v);
@@ -2894,24 +2911,14 @@ unsafe fn fwd_local_sw_avx2_u8(
                 for j in n_fast..qmax {
                     // Lane `l` = query base at column `j` of job `l`.
                     let q_v = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
-                    // Masks, all-ones per lane where they apply: `eq` the bases match, `n_mask` either is
-                    // N, `zpad_mask` the query column is ksw profile padding, `pad_mask` the cell is past
-                    // a real position (dead row, or query past the padded profile).
-                    let eq = _mm256_cmpeq_epi8(t_v, q_v);
-                    let n_mask = _mm256_or_si256(t_is_n, _mm256_cmpeq_epi8(q_v, four_v));
+                    // `zpad_mask`: the query column is ksw profile padding, so the cell carries the
+                    // diagonal through. `pad_mask`: the cell is dead, forced to 0. Both dead tests are
+                    // now the NEON high-bit form (`PAD` is the only byte with bit 7 set), because the
+                    // old `t >= m` test would kill every real N target once N is re-encoded as 12.
                     let zpad_mask = _mm256_cmpeq_epi8(q_v, zpad_v);
-                    let pad_mask = _mm256_or_si256(cge_epu8(t_v, m_v), cgt_epu8(q_v, zpad_v));
-                    // Each of the four cases is applied straight to `h_diag` as a saturating add or sub,
-                    // never as a signed score that is then added: a mismatch at h_diag = 2 with penalty 4
-                    // saturates to 0, which is `max(0, h_diag - 4)`, whereas a wrapping sub gives 254.
-                    let add_match = _mm256_adds_epu8(h_diag_v, mtch_v);
-                    let sub_mis = _mm256_subs_epu8(h_diag_v, mispen_v);
-                    // N scores -1 in bwa's matrix, not -b, hence a separate constant from `mispen_v`.
-                    let sub_n = _mm256_subs_epu8(h_diag_v, one_v);
-                    // Lane `l` = max(0, H(i-1, j-1) + S) for job `l` once the four selects resolve which
-                    // case this cell is.
-                    let mut diag_v = bsl(eq, add_match, sub_mis);
-                    diag_v = bsl(n_mask, sub_n, diag_v);
+                    let pad_mask =
+                        _mm256_or_si256(_mm256_cmpgt_epi8(zero, t_v), _mm256_cmpgt_epi8(zero, q_v));
+                    let mut diag_v = score_diag(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     diag_v = bsl(zpad_mask, h_diag_v, diag_v); // score 0: diagonal passes through
                                                                // Dead padding: force 0 outright, as in the NEON u8 kernel.
                     diag_v = bsl(pad_mask, zero, diag_v);
@@ -3309,7 +3316,10 @@ const LANES64: usize = 64;
 #[allow(clippy::too_many_arguments)]
 unsafe fn fwd_local_sw_sse41_u8(
     jobs: &[FwdJob],
-    m: usize,
+    // Matrix dimension (5). No longer read now that dead-cell detection keys on the PAD
+    // byte's high bit rather than `>= m`, exactly as in `fwd_local_sw_neon_u8`; kept in the
+    // signature for parity with the other kernels.
+    _m: usize,
     mat: &[i8],
     o_del: i32,
     e_del: i32,
@@ -3353,11 +3363,52 @@ unsafe fn fwd_local_sw_sse41_u8(
     // Broadcast constants, scores held as *magnitudes* (subtracted, not added) so the whole kernel
     // stays unsigned; see the NEON u8 kernel's header for why that is what makes u8 viable.
     let zero = _mm_setzero_si128();
-    let mtch_v = _mm_set1_epi8(mtch as i8);
-    let mispen_v = _mm_set1_epi8(mispen as i8);
+    // ISSUE #43: the XOR-indexed score table, ported from `fwd_local_sw_neon_u8`. See there for
+    // why the target N is re-encoded as `N_TARGET` (12) and what each of the 16 slots means. The
+    // saturation guard is the same, and it is a HARD assert because the release path depends on it.
+    assert!(
+        (U8_SCORE_LIMIT as u32) + mispen as u32 + mtch as u32 <= 256,
+        "u8 rescue score table would saturate: mispen {mispen} + mtch {mtch} + ceiling too large"
+    );
+    let bias = mispen;
+    let mut tbl = [0u8; 16];
+    for r in 0..1 {
+        let o = r * 16;
+        tbl[o] = bias + mtch; // match: +a
+                              // tbl[o + 1..=o + 3] = bias - b = 0 (mismatch), already zero
+        for k in 4..8 {
+            tbl[o + k] = bias - 1; // query N against a real base: bwa scores -1
+        }
+        tbl[o + 8] = bias - 1; // both N: N_TARGET XOR 4
+        for k in 12..16 {
+            tbl[o + k] = bias - 1; // target N against a real base
+        }
+    }
+    // `vpshufb` is IN-LANE on AVX2, so the 16-byte table is written into both 128-bit halves; on
+    // SSE4.1 there is a single lane and the loop above runs once.
+    let score_tbl = _mm_loadu_si128(tbl.as_ptr() as *const __m128i);
+    let bias_v = _mm_set1_epi8(bias as i8);
+    // `vpshufb` zeroes a lane whose index has bit 7 set and otherwise reads `tbl[idx & 15]`, where
+    // `vqtbl1q_u8` zeroes every index >= 16. They differ only on indices 16..127, and that range is
+    // UNREACHABLE here: the only alphabet byte with bit 7 set is `PAD`, `seq_q` holds
+    // {0,1,2,3,4,ZPAD=5,PAD} and `seq_t` holds {0,1,2,3,N_TARGET=12,PAD}, so with neither operand
+    // PAD both are <= 12 and `t ^ q <= 15` (the maximum is `3 ^ 12`); with exactly one PAD the xor
+    // has bit 7 set and both instructions give 0; with both PAD the xor is 0 and both give
+    // `tbl[0]`, a cell the pad blend overrides anyway. So the NEON byte-identity argument carries
+    // over unchanged.
+    #[target_feature(enable = "sse4.1")]
+    #[inline]
+    unsafe fn score_diag(
+        tbl: __m128i,
+        bias_v: __m128i,
+        t_v: __m128i,
+        q_v: __m128i,
+        d: __m128i,
+    ) -> __m128i {
+        let s = _mm_shuffle_epi8(tbl, _mm_xor_si128(t_v, q_v));
+        _mm_subs_epu8(_mm_adds_epu8(d, s), bias_v)
+    }
     let one_v = _mm_set1_epi8(1); // N penalty
-    let four_v = _mm_set1_epi8(4);
-    let m_v = _mm_set1_epi8(m as i8);
     let zpad_v = _mm_set1_epi8(ZPAD as i8);
     let e_del_v = _mm_set1_epi8(e_del as i8);
     let oe_del_v = _mm_set1_epi8(oe_del as i8);
@@ -3396,8 +3447,10 @@ unsafe fn fwd_local_sw_sse41_u8(
             for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
                 seq_q[c * LANES16 + l] = ZPAD;
             }
+            // The N re-encoding, applied once per target base so the column loops never pay for
+            // it (issue #43). See `fwd_local_sw_neon_u8`'s score-table comment.
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES16 + l] = b;
+                seq_t[r * LANES16 + l] = if b == 4 { N_TARGET } else { b };
             }
         }
 
@@ -3483,8 +3536,6 @@ unsafe fn fwd_local_sw_sse41_u8(
             if rows == 2 {
                 let t0_v = _mm_loadu_si128(seq_t.as_ptr().add(i * LANES16) as *const __m128i);
                 let t1_v = _mm_loadu_si128(seq_t.as_ptr().add((i + 1) * LANES16) as *const __m128i);
-                let t0_is_n = _mm_cmpeq_epi8(t0_v, four_v);
-                let t1_is_n = _mm_cmpeq_epi8(t1_v, four_v);
                 let (mut f0, mut f1) = (zero, zero);
                 let (mut d0, mut d1) = (zero, zero);
                 let (mut imax0, mut imax1) = (zero, zero);
@@ -3494,11 +3545,7 @@ unsafe fn fwd_local_sw_sse41_u8(
                 for j in 0..n_fast {
                     let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
 
-                    let eq0 = _mm_cmpeq_epi8(t0_v, q_v);
-                    let n0 = _mm_or_si128(t0_is_n, _mm_cmpeq_epi8(q_v, four_v));
-                    let mut diag0 =
-                        bsl(eq0, _mm_adds_epu8(d0, mtch_v), _mm_subs_epu8(d0, mispen_v));
-                    diag0 = bsl(n0, _mm_subs_epu8(d0, one_v), diag0);
+                    let diag0 = score_diag(score_tbl, bias_v, t0_v, q_v, d0);
                     let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
                     let mfe0 = _mm_max_epu8(diag0, e_v);
                     let h0 = _mm_max_epu8(mfe0, f0);
@@ -3510,11 +3557,7 @@ unsafe fn fwd_local_sw_sse41_u8(
                     f0 = _mm_max_epu8(_mm_subs_epu8(f0, e_ins_v), _mm_subs_epu8(mfe0, oe_ins_v));
                     d0 = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES16) as *const __m128i);
 
-                    let eq1 = _mm_cmpeq_epi8(t1_v, q_v);
-                    let n1 = _mm_or_si128(t1_is_n, _mm_cmpeq_epi8(q_v, four_v));
-                    let mut diag1 =
-                        bsl(eq1, _mm_adds_epu8(d1, mtch_v), _mm_subs_epu8(d1, mispen_v));
-                    diag1 = bsl(n1, _mm_subs_epu8(d1, one_v), diag1);
+                    let diag1 = score_diag(score_tbl, bias_v, t1_v, q_v, d1);
                     let mfe1 = _mm_max_epu8(diag1, e_mid);
                     let h1 = _mm_max_epu8(mfe1, f1);
                     col1 = bsl(cgt_epu8(h1, imax1), j_v, col1);
@@ -3532,15 +3575,13 @@ unsafe fn fwd_local_sw_sse41_u8(
                 for j in n_fast..qmax {
                     let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
                     let zpad_mask = _mm_cmpeq_epi8(q_v, zpad_v);
-                    let q_pad = cgt_epu8(q_v, zpad_v);
+                    // `q > ZPAD` is true only for `PAD`, so the high-bit test is the same mask in one
+                    // instruction instead of three (issue #43).
+                    let q_pad = _mm_cmpgt_epi8(zero, q_v);
 
-                    let eq0 = _mm_cmpeq_epi8(t0_v, q_v);
-                    let n0 = _mm_or_si128(t0_is_n, _mm_cmpeq_epi8(q_v, four_v));
-                    let mut diag0 =
-                        bsl(eq0, _mm_adds_epu8(d0, mtch_v), _mm_subs_epu8(d0, mispen_v));
-                    diag0 = bsl(n0, _mm_subs_epu8(d0, one_v), diag0);
+                    let mut diag0 = score_diag(score_tbl, bias_v, t0_v, q_v, d0);
                     diag0 = bsl(zpad_mask, d0, diag0);
-                    diag0 = bsl(_mm_or_si128(cge_epu8(t0_v, m_v), q_pad), zero, diag0);
+                    diag0 = bsl(_mm_or_si128(_mm_cmpgt_epi8(zero, t0_v), q_pad), zero, diag0);
                     let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
                     let mfe0 = _mm_max_epu8(diag0, e_v);
                     let h0 = _mm_max_epu8(mfe0, f0);
@@ -3551,13 +3592,9 @@ unsafe fn fwd_local_sw_sse41_u8(
                     f0 = _mm_max_epu8(_mm_subs_epu8(f0, e_ins_v), _mm_subs_epu8(mfe0, oe_ins_v));
                     d0 = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES16) as *const __m128i);
 
-                    let eq1 = _mm_cmpeq_epi8(t1_v, q_v);
-                    let n1 = _mm_or_si128(t1_is_n, _mm_cmpeq_epi8(q_v, four_v));
-                    let mut diag1 =
-                        bsl(eq1, _mm_adds_epu8(d1, mtch_v), _mm_subs_epu8(d1, mispen_v));
-                    diag1 = bsl(n1, _mm_subs_epu8(d1, one_v), diag1);
+                    let mut diag1 = score_diag(score_tbl, bias_v, t1_v, q_v, d1);
                     diag1 = bsl(zpad_mask, d1, diag1);
-                    diag1 = bsl(_mm_or_si128(cge_epu8(t1_v, m_v), q_pad), zero, diag1);
+                    diag1 = bsl(_mm_or_si128(_mm_cmpgt_epi8(zero, t1_v), q_pad), zero, diag1);
                     let mfe1 = _mm_max_epu8(diag1, e_mid);
                     let h1 = _mm_max_epu8(mfe1, f1);
                     col1 = bsl(cgt_epu8(h1, imax1), j_v, col1);
@@ -3587,20 +3624,13 @@ unsafe fn fwd_local_sw_sse41_u8(
                                            // Carried column index (bumped by `one_v`, which is set1_epi8(1)) and the row-invariant
                                            // "target is N" mask. See `fwd_local_sw_neon_u8` for the reasoning.
                 let mut j_v = zero;
-                let t_is_n = _mm_cmpeq_epi8(t_v, four_v);
 
                 // Padding-free column range: below `n_fast` no live lane shows ZPAD or PAD, so the two
                 // padding masks and their selects are not emitted. Identical argument to the NEON u8
                 // kernel, including why a dead target row may be left un-killed here.
                 for j in 0..n_fast {
                     let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
-                    let eq = _mm_cmpeq_epi8(t_v, q_v);
-                    let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi8(q_v, four_v));
-                    let add_match = _mm_adds_epu8(h_diag_v, mtch_v);
-                    let sub_mis = _mm_subs_epu8(h_diag_v, mispen_v);
-                    let sub_n = _mm_subs_epu8(h_diag_v, one_v);
-                    let mut diag_v = bsl(eq, add_match, sub_mis);
-                    diag_v = bsl(n_mask, sub_n, diag_v);
+                    let diag_v = score_diag(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
                     let mfe = _mm_max_epu8(diag_v, e_v);
                     let h_v = _mm_max_epu8(mfe, f_v);
@@ -3620,24 +3650,14 @@ unsafe fn fwd_local_sw_sse41_u8(
                 for j in n_fast..qmax {
                     // Lane `l` = query base at column `j` of job `l`.
                     let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
-                    // Masks, all-ones per lane where they apply: `eq` the bases match, `n_mask` either is
-                    // N, `zpad_mask` the query column is ksw profile padding, `pad_mask` the cell is past
-                    // a real position (dead row, or query past the padded profile).
-                    let eq = _mm_cmpeq_epi8(t_v, q_v);
-                    let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi8(q_v, four_v));
+                    // `zpad_mask`: the query column is ksw profile padding, so the cell carries the
+                    // diagonal through. `pad_mask`: the cell is dead, forced to 0. Both dead tests are
+                    // now the NEON high-bit form (`PAD` is the only byte with bit 7 set), because the
+                    // old `t >= m` test would kill every real N target once N is re-encoded as 12.
                     let zpad_mask = _mm_cmpeq_epi8(q_v, zpad_v);
-                    let pad_mask = _mm_or_si128(cge_epu8(t_v, m_v), cgt_epu8(q_v, zpad_v));
-                    // Each of the four cases is applied straight to `h_diag` as a saturating add or sub,
-                    // never as a signed score that is then added: a mismatch at h_diag = 2 with penalty 4
-                    // saturates to 0, which is `max(0, h_diag - 4)`, whereas a wrapping sub gives 254.
-                    let add_match = _mm_adds_epu8(h_diag_v, mtch_v);
-                    let sub_mis = _mm_subs_epu8(h_diag_v, mispen_v);
-                    // N scores -1 in bwa's matrix, not -b, hence a separate constant from `mispen_v`.
-                    let sub_n = _mm_subs_epu8(h_diag_v, one_v);
-                    // Lane `l` = max(0, H(i-1, j-1) + S) for job `l` once the four selects resolve which
-                    // case this cell is.
-                    let mut diag_v = bsl(eq, add_match, sub_mis);
-                    diag_v = bsl(n_mask, sub_n, diag_v);
+                    let pad_mask =
+                        _mm_or_si128(_mm_cmpgt_epi8(zero, t_v), _mm_cmpgt_epi8(zero, q_v));
+                    let mut diag_v = score_diag(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     diag_v = bsl(zpad_mask, h_diag_v, diag_v); // score 0: diagonal passes through
                                                                // Dead padding: force 0 outright, as in the NEON u8 kernel.
                     diag_v = bsl(pad_mask, zero, diag_v);
@@ -4690,13 +4710,25 @@ mod avx2_verify {
                     q[p] = (next() % 4) as u8;
                 }
             }
-            // Inject N bases (code 4) sometimes, in query and/or target.
-            if next() % 4 == 0 {
+            // ISSUE #43 strengthened this: EVERY job now carries an N in BOTH query and target,
+            // not one in four. The x86 kernels now score through the same XOR table as NEON, whose
+            // target N is re-encoded as `N_TARGET` (12), and the both-N cell is a slot of its own.
+            // A port that kept `t == 4` anywhere, or that left the old `t >= m` dead-cell test in
+            // place, breaks on exactly these bases and on nothing else. Extra draws stay random so
+            // N runs and adjacent Ns are covered too.
+            q[(next() as usize) % qlen] = 4;
+            t[(next() as usize) % tlen] = 4;
+            if next() % 3 == 0 {
                 q[(next() as usize) % qlen] = 4;
             }
-            if next() % 4 == 0 {
+            if next() % 3 == 0 {
                 t[(next() as usize) % tlen] = 4;
             }
+            // And a both-N cell on the diagonal of a planted copy, which is the index (`4 ^ 12 = 8`)
+            // the old blend form never had a slot for.
+            let at = (next() as usize) % qlen;
+            q[at] = 4;
+            t[at.min(tlen - 1)] = 4;
             qbufs.push(q);
             tbufs.push(t);
         }
@@ -5287,13 +5319,25 @@ mod tests {
                     q[p] = (next() % 4) as u8;
                 }
             }
-            // Inject N bases (code 4) sometimes, in query and/or target.
-            if next() % 4 == 0 {
+            // ISSUE #43 strengthened this: EVERY job now carries an N in BOTH query and target,
+            // not one in four. The x86 kernels now score through the same XOR table as NEON, whose
+            // target N is re-encoded as `N_TARGET` (12), and the both-N cell is a slot of its own.
+            // A port that kept `t == 4` anywhere, or that left the old `t >= m` dead-cell test in
+            // place, breaks on exactly these bases and on nothing else. Extra draws stay random so
+            // N runs and adjacent Ns are covered too.
+            q[(next() as usize) % qlen] = 4;
+            t[(next() as usize) % tlen] = 4;
+            if next() % 3 == 0 {
                 q[(next() as usize) % qlen] = 4;
             }
-            if next() % 4 == 0 {
+            if next() % 3 == 0 {
                 t[(next() as usize) % tlen] = 4;
             }
+            // And a both-N cell on the diagonal of a planted copy, which is the index (`4 ^ 12 = 8`)
+            // the old blend form never had a slot for.
+            let at = (next() as usize) % qlen;
+            q[at] = 4;
+            t[at.min(tlen - 1)] = 4;
             qbufs.push(q);
             tbufs.push(t);
         }

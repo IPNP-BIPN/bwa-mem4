@@ -1337,6 +1337,73 @@ l'extension, #48B, vaut -0,9 % a 150 bp et rien a 49 bp, exactement l'inverse.
 entier, avec 1,18x sur le noyau de rescue.** Les deux modifications x86 (#48C, #46C) ne sont dans
 aucune de ces colonnes : ce binaire est arm64.
 
+## #43 : la table de scores XOR portee sur AVX2 et SSE4.1, et le +18 a +50 % est a revoir (2026-08-09)
+
+Le plus gros levier annonce de toute la recherche. Porte : les noyaux u8 AVX2 et SSE4.1 du rescue
+scorent desormais par `vpshufb` sur la meme table 16 entrees indexee par `target XOR query` que NEON,
+avec le meme reencodage de la cible N en `N_TARGET = 12`. `N_TARGET` n'est plus `cfg`-limite a
+aarch64.
+
+Les deux choses que l'issue disait devoir arriver dans le meme commit y sont :
+
+* le test de cellule morte `cge_epu8(t_v, m_v)` (t >= 5) aurait tue **toutes** les vraies bases N de
+  la cible une fois celles-ci reencodees en 12. Remplace par le test de bit de poids fort de NEON,
+  `cmpgt_epi8(zero, t_v)`, `PAD` etant le seul octet de l'alphabet dont le bit 7 est mis. La meme
+  substitution ramene le test cote requete `cgt_epu8(q_v, zpad_v)` de trois instructions a une ;
+* la garde de saturation `U8_SCORE_LIMIT + mispen + mtch <= 256` est repliquee, en `assert!` dur.
+
+L'ecart `vpshufb` / `vqtbl1q_u8` est discharge par enumeration et le raisonnement est dans le code :
+`vpshufb` lit `tbl[idx & 15]` la ou `vqtbl1q_u8` rend 0 pour tout index >= 16, donc les deux ne
+different que sur 16..127, et cet intervalle est **inatteignable** (seul `PAD` a le bit 7 ; hors
+`PAD` les deux operandes valent au plus 12 donc `t ^ q <= 15`).
+
+### Ce que le desassemblage montre, et pourquoi il corrige la projection
+
+Corps de colonne u8 inline dans `fwd_local_sw_batch`, boucle deroulee sur deux colonnes de la paire
+de lignes (donc quatre cellules-lignes par iteration), AVX2 et SSE4.1 donnant les memes comptes :
+
+| | avant | apres |
+|---|---|---|
+| instructions | 246 | **248** |
+| **`VPBLENDVB`** | **14** | **6** |
+| **`VPCMPEQB`** | **17** | **5** |
+| `VPSHUFB` | 0 | 4 |
+| `VPOR` | 5 | 1 |
+| `VPSUBUSB` | 24 | 20 |
+| `VPMAXUB` | 22 | 20 |
+| `VPXOR` | 13 | 18 |
+
+**Le nombre d'instructions ne bouge pas** (+2). Ce qui bouge est le melange, et c'est bien la ou
+l'issue visait : moins 8 `VPBLENDVB` et moins 12 `VPCMPEQB` contre quatre `VPSHUFB` de plus. En
+comptant les uops publies : `VPBLENDVB` ymm vaut 2 uops de Haswell a Tiger Lake, 3 sur Emerald
+Rapids, environ 8 microcodes sur Gracemont, tout le reste ici valant 1.
+
+| classe | avant | apres | ecart |
+|---|---|---|---|
+| uops totaux, Haswell a Tiger Lake | 260 | 254 | -2,3 % |
+| uops totaux, Emerald Rapids | 274 | 260 | -5,1 % |
+| uops totaux, Gracemont | 344 | 290 | **-15,7 %** |
+| **uops p5, Haswell/Broadwell** (`VPBLENDVB` 2x p5, `VPSHUFB` 1x p5) | **28** | **16** | **-43 %** |
+| uops p01 (`cmpeq`, `max`, `adds`, `subs`) | 67 | 49 | -27 % |
+
+**Donc : le +18 a +50 % de l'issue n'est pas soutenu par le nombre d'instructions ni par le total
+d'uops sur un coeur grand public.** Il l'est par la pression de port, si p5 est bien ce qui lie sur
+Haswell/Broadwell, et par le cas Gracemont. Ces lignes restent des **projections a partir de tables
+publiees**, pas des mesures : le meme genre de raisonnement s'est deja trompe deux fois dans ce
+dossier (#48A et #48D). Le chiffre reel doit venir d'un runner x86.
+
+### Ce qui est verifie ici
+
+* `check.sh` vert, dont la passe x86_64 sous Rosetta ou `avx2_matesw_u8_matches_scalar` et son jumeau
+  SSE4.1 appellent les noyaux **directement** ;
+* generateurs renforces comme l'issue le demandait : **chaque** travail porte desormais un N dans la
+  requete **et** dans la cible, plus une cellule both-N sur la diagonale d'une copie plantee, qui est
+  exactement l'index `4 ^ 12 = 8` que la forme a blends n'avait pas ;
+* `oracle_diff.sh` vert ;
+* binaire **x86_64 sous Rosetta** et binaire **arm64** : meme md5 sur les deux jeux reels
+  (`791c21c2…` et `7178e85d…`). Sous Rosetta `avx2` n'est pas detecte, donc le noyau reellement
+  emprunte de bout en bout est le **SSE4.1**, l'un des deux portes.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
