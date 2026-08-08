@@ -622,6 +622,81 @@ s'explique entierement par ce qu'il ne calcule pas.
 N'ouvre rien de neuf : le champ CPU s'est arrete vers 2018, l'essentiel de l'activite recente est
 GPU (CUDASW++ 4.0, 2024) et donc hors sujet pour une comparaison par coeur.
 
+## #45 : `USQADD` et le `qsub(h, oe)` partage, +10,3 % de noyau, -2,7 % de CPU (2026-08-08)
+
+Premiere issue du backlog SIMD ouverte par la recherche multi-agents, et la premiere ou une
+projection annoncee tient a la mesure. Deux reecritures du corps de colonne du noyau de rescue u8
+NEON (`crates/bwa-neon/src/matesw.rs`), independantes, chacune derriere son propre commutateur pour
+un A/B a un seul levier :
+
+* **A, `BWA4_RESCUE_USQADD`** : la paire `vqsubq_u8(vqaddq_u8(d, s), bias_v)` devient un seul
+  `vsqaddq_u8(d, s)`, l'instruction `USQADD Vd.16B, Vn.16B` d'AArch64 (accumulation saturante NON
+  signee d'un addend SIGNE). La table de scores XOR est reconstruite en deltas signes, le biais
+  disparait entierement. Une operation de moins par cellule, et la chaine de dependance diagonale
+  passe de 6 cycles a 3.
+* **B, `BWA4_RESCUE_SHAREOE`** : quand `oe_del == oe_ins` (le `-O 6,6 -E 1,1` de bwa, c'est-a-dire le
+  cas qui selectionne ce noyau en pratique), `vqsubq_u8(h, oe)` est calcule une fois et alimente E et
+  F. Cinq operations la ou il y en avait six.
+
+Les deux formes sont **monomorphisees** en parametres const generiques, pas testees dans la boucle :
+le repli du N avait deja paye 7 % pour un `if` invariant que LLVM n'a pas sorti de la boucle.
+
+### Ce que la mesure donne
+
+A/B entrelace, meme binaire, `-t4`, 500 k paires GIAB contre l'index chr21, **medianes de 9 courses**,
+secondes CPU. Sonde noyau `BWA4_MATESW_TIME` (18,33 G cellules nominales) et CPU du processus entier :
+
+| levier | noyau (s CPU) | vs base | debit noyau | CPU total (s) | vs base | victoires |
+|---|---|---|---|---|---|---|
+| base (`USQADD=0 SHAREOE=0`) | 2,25 | | 8,15 Gcell/s | 7,39 | | |
+| A seul | 2,16 | **+4,2 %** | 8,49 Gcell/s | 7,31 | -1,1 % | 9/9 |
+| B seul | 2,15 | **+4,7 %** | 8,53 Gcell/s | 7,32 | -1,0 % | 9/9 |
+| A + B | **2,04** | **+10,3 %** | **8,99 Gcell/s** | **7,19** | **-2,7 %** | 9/9 |
+
+Les deux leviers s'additionnent presque exactement (4,2 + 4,7 = 8,9 attendu, 10,3 obtenu, le surplus
+venant des registres liberes, voir ci-dessous). L'issue annoncait +7,5 % et +6 % sur le corps du
+quadruplet seul, mesures en assembleur a la main ; la sonde couvre en plus les corps de queue,
+`finish_row`, `extract_group` et l'empaquetage des groupes, donc un rendement moindre sur le noyau
+entier etait attendu. L'ecart entre 2,7 % de CPU total et 10,3 % de noyau est simplement la part du
+rescue dans cette course : 2,25 s sur 7,39 s.
+
+### Le desassemblage, et les deversements qui disparaissent
+
+Boucle rapide du quadruplet, binaire livre, comparee au releve de la section « plafond du noyau » :
+
+| | avant | apres |
+|---|---|---|
+| instructions pour 64 cellules | 71 (1,11 / cellule) | **64 (1,00 / cellule)** |
+| operations vectorielles arithmetiques | 63 | **53 (0,83 / cellule)** |
+| chargements | 6, **dont 3 de deversement** | **3, aucun deversement** |
+| ecritures | 2 | 2 |
+
+Les trois deversements ont disparu : le jeu de constantes vivantes perd `bias_v` (levier A) et
+`oe_ins_v` (levier B), ce qui ramene le corps sous la limite des 32 registres. C'est le « benefice
+lateral » que l'issue annoncait sans le chiffrer, et il explique la super-additivite.
+
+### L'octet-identite
+
+Les deux leviers sont exacts, pas seulement egaux en score, et les preuves sont consignees aux points
+d'usage dans le code. Pour B : la soustraction saturante non signee est monotone et son ecretage a 0
+preserve l'ordre, donc `qsub(max(a, b), c) == max(qsub(a, c), qsub(b, c))` ; avec `h = max(mfe, f)` et
+`oe_ins >= e_ins`, le terme surnumeraire est absorbe.
+
+Pour A il reste **une** entree ou les deux formes different : une lecture de table hors plage, cas
+qui ne survient que dans le corps rapide pour une voie deja au-dela de son `tlen` alors que d'autres
+voies du meme groupe font tourner la boucle. `vqtbl1q` rend 0, donc la forme biaisee donne `d - bias`
+et `USQADD` donne `d`. Ces cellules sont mortes par construction. Cela n'a **pas** ete laisse a
+l'argument : `matesw_ragged_tlen_equals_scalar` construit deux groupes de seize fenetres de 100 a
+3200 bases (la plus longue tourne 15x plus longtemps que la plus courte) avec un `endsc` fini pour
+declencher aussi le gel, et compare **les quatre monomorphisations** au scalaire. Le
+`debug_assert!` sur la non-saturation de la table est promu en `assert!`, la correctness en release
+en dependant desormais.
+
+Gates : `check.sh` vert (fmt, clippy `-D warnings`, tests, plus la passe x86_64 sous Rosetta),
+`oracle_diff.sh` vert, et le corps SAM des 500 k paires PE **octet-identique a bwa-mem2 2.3** pour les
+quatre combinaisons de commutateurs (md5 `7178e85d…`, seule la ligne `@PG` differant de l'oracle,
+comme toujours).
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
