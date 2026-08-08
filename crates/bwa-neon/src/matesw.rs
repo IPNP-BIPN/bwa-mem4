@@ -488,11 +488,37 @@ pub fn batched_ksw_align2(
     // Byte-identical by construction: the same bytes in the same order, only their storage changes.
     // `qualifying` is computed first so the arena is sized exactly once and never reallocates
     // mid-fill, which is what would reintroduce the copying this removes.
+    //
+    // ISSUE #50A. The reverse target is `target[..=te]` reversed, `te + 1` rows, but the alignment
+    // it has to rediscover cannot span more than `rev_span_bound` of them (see there for the proof).
+    // Rows past that bound cannot participate in an alignment scoring `score`, so dropping them
+    // cannot change `rscore`/`rte`/`rqe` for any job whose reverse pass reaches the forward score,
+    // and that equality is the only thing the caller acts on. It shortens the arena, the SoA target
+    // scatter, `tmax`, and the `rowmax` allocation that is sized by it.
+    //
+    // What it does NOT shorten is the DP itself: `endsc = score` always fires (the reverse pass's
+    // `gmax` is exactly `score`, proved in the issue), so the row loop already stopped at the freeze.
+    // This is buffer sizing, not fewer cells.
+    let rev_bound = revbound_enabled();
+    let rev_tlen = |i: usize| -> usize {
+        let full = out[i].te as usize + 1;
+        if rev_bound {
+            full.min(rev_span_bound(
+                out[i].qe as usize + 1,
+                out[i].score,
+                max_sc,
+                o_del,
+                e_del,
+            ))
+        } else {
+            full
+        }
+    };
     let arena_bytes: usize = jobs
         .iter()
         .enumerate()
         .filter(|(i, _)| out[*i].score >= minsc && out[*i].qe >= 0)
-        .map(|(i, _)| (out[i].qe as usize + 1) + (out[i].te as usize + 1))
+        .map(|(i, _)| (out[i].qe as usize + 1) + rev_tlen(i))
         .sum();
     let mut rev_arena: Vec<u8> = Vec::with_capacity(arena_bytes);
     // `(q_off, q_len, t_off, t_len)` into `rev_arena` for the k-th qualifying job. Offsets, not
@@ -513,7 +539,15 @@ pub fn batched_ksw_align2(
             let q_off = rev_arena.len();
             rev_arena.extend(j.query[..=qe as usize].iter().rev().copied());
             let t_off = rev_arena.len();
-            rev_arena.extend(j.target[..=te as usize].iter().rev().copied());
+            // Reversed, so the FIRST `rev_tlen(i)` bytes of the reversed prefix are the ones nearest
+            // `te`, which is where the alignment ends and therefore where it must start being read.
+            rev_arena.extend(
+                j.target[..=te as usize]
+                    .iter()
+                    .rev()
+                    .take(rev_tlen(i))
+                    .copied(),
+            );
             rev_spans.push((q_off, t_off - q_off, t_off, rev_arena.len() - t_off));
             rev_of_job.push(i);
         }
@@ -553,6 +587,51 @@ pub fn batched_ksw_align2(
         );
     }
     out
+}
+
+/// Whether the reverse (`KSW_XSTART`) pass truncates its target by the alignment-span bound
+/// (issue #50A). `BWA4_RESCUE_REVBOUND=0` keeps the full `target[..=te]` prefix. Read once, cached.
+fn revbound_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_REVBOUND").is_none_or(|v| v != "0"))
+}
+
+/// The most target rows an alignment of at most `qlen` query bases can span while still scoring
+/// `score`. Issue #50A's lemma, and the whole of its correctness.
+///
+/// An alignment covering `T` target rows and `Q <= qlen` query columns has `T - Q` net unmatched
+/// target bases when `T > Q`. Those form at least one gap run in the query, so they cost at least
+/// `o_del + (T - Q) * e_del`, and no cell can earn more than `max_sc`:
+///
+/// ```text
+///   score <= max_sc * Q - o_del - (T - Q) * e_del
+///         <= max_sc * qlen - o_del - (T - qlen) * e_del
+///   =>  T <= qlen + (max_sc * qlen - score - o_del) / e_del
+/// ```
+///
+/// When the bracket is negative the second case of the lemma applies (`T <= Q <= qlen`), so the
+/// bound is `qlen` and the `max(0, .)` below is that case, not a defensive clamp. Integer division
+/// floors, which is the safe direction: `T` is an integer bounded above by a real quantity.
+///
+/// # Parameters
+/// - `qlen`: the reverse pass's query length, `qe + 1`, in bases.
+/// - `score`: the score the reverse pass must reach, i.e. the forward pass's own score. Using the
+///   job's score rather than `minsc` is what makes the bound tight; a higher score means a shorter
+///   possible span.
+/// - `max_sc`: the largest matrix entry, `> 0`. `o_del`, `e_del`: gap open and extend as positive
+///   magnitudes; `e_del >= 1`.
+///
+/// # Returns
+/// A row count `>= qlen`. Truncating the reverse target to it cannot remove any alignment that
+/// scores `score`, and therefore cannot change `rscore`, `rte` or `rqe` for any job whose reverse
+/// pass reaches the forward score, which is the only case the caller acts on.
+fn rev_span_bound(qlen: usize, score: i32, max_sc: i32, o_del: i32, e_del: i32) -> usize {
+    debug_assert!(max_sc > 0 && e_del >= 1);
+    let slack = (max_sc * qlen as i32)
+        .saturating_sub(score)
+        .saturating_sub(o_del);
+    qlen + (slack.max(0) / e_del) as usize
 }
 
 /// Whether the u8 rescue kernel may use its padding-free fast column range. `BWA4_RESCUE_FASTCOL=0`

@@ -1127,6 +1127,50 @@ croyable. Le meme harnais, un bras apres l'autre, avait attribue +6 % a un levie
 
 Le levier **C** (masque de bande en espace signe) reste ouvert et x86 uniquement.
 
+## #50A : la passe inverse bornee par le lemme, 55 a 74 % de lignes en moins pour 0,8 % (2026-08-08)
+
+La cible de la passe inverse est `target[..=te]` retournee, soit `te + 1` lignes, mais l'alignement
+qu'elle doit retrouver ne peut pas en couvrir plus que le lemme d'envergure n'autorise :
+
+```
+score <= max_sc * Q - o_del - (T - Q) * e_del
+  =>  T <= qlen + (max_sc * qlen - score - o_del) / e_del
+```
+
+avec `qlen = qe + 1` et `score` celui de la passe avant, pas `minsc` : c'est ce qui rend la borne
+serree, un score plus haut imposant une envergure plus courte. La division entiere tronque, et c'est
+le bon sens : `T` est un entier majore par une quantite reelle. Livre derriere
+`BWA4_RESCUE_REVBOUND`.
+
+Ce que la borne enleve, mesure :
+
+| jeu | lignes de cible inverse, sans borne | avec borne | enleve |
+|---|---|---|---|
+| 500 k paires 150 bp, `genome.fa` | 35 790 921 | 16 162 618 | **54,8 %** |
+| 500 k paires 49 bp, chr21 | 23 730 481 | 6 169 194 | **74,0 %** |
+
+Ce que cela rapporte, A/B entrelace sur la sonde `BWA4_MATESW_TIME`, 15 rondes :
+
+| jeu | sans borne | avec borne | ecart | victoires |
+|---|---|---|---|---|
+| 150 bp | 1,28 s | **1,27 s** | **-0,8 %** | 7 victoires, 1 defaite, 7 nuls |
+| 49 bp | 1,90 s | 1,90 s | 0,0 % | nul |
+
+**Enlever plus de la moitie des lignes de la cible inverse vaut 0,8 %.** C'est la meme lecon que
+#46B, et il faut la consigner comme telle : le travail par ligne autour du DP (le remplissage de
+l'arene, l'eparpillement SoA, l'allocation de `rowmax`) est bien moins cher que la recherche ne le
+supposait. Le +2,5 % annonce par l'issue supposait trois couts, dont l'un (`extract_group`) avait
+deja ete mesure a zero en #46B ; les deux autres valent ensemble 0,8 %.
+
+Garde malgre tout : la borne est prouvee, octet-identique sur les deux jeux, et l'ecart est
+consistant en signe (7 contre 1) meme s'il est a la resolution de la sonde. Elle divise aussi par
+deux a quatre le trafic memoire de cette passe, ce qui ne se voit pas a `-t4` sur une machine a
+546 GB/s mais n'est pas rien ailleurs.
+
+Ce qui n'est PAS raccourci, et l'issue le disait deja : le DP lui-meme. `endsc = score` se declenche
+toujours (le `gmax` de la passe inverse vaut exactement `score`), donc la boucle de lignes s'arretait
+deja au gel. C'est du dimensionnement de tampon, pas des cellules en moins.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
