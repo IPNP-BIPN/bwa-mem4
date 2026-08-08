@@ -535,6 +535,18 @@ fn rowquad_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_ROWQUAD").is_none_or(|v| v != "0"))
 }
 
+/// Whether the NEON u8 rescue kernel gives the all-ZPAD query columns their own third body.
+/// `BWA4_RESCUE_ZPADCOL=0` sends them back through the full tail body. Read once and cached.
+///
+/// Unlike the `USQADD` and `SHARE_OE` levers this is not a const parameter: it only moves the
+/// `n_pad` boundary, computed once per group outside every loop, exactly as `n_fast` already is.
+#[cfg(target_arch = "aarch64")]
+fn zpadcol_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_ZPADCOL").is_none_or(|v| v != "0"))
+}
+
 /// Whether the NEON u8 rescue kernel applies the substitution score with `USQADD` (`vsqaddq_u8`,
 /// unsigned-saturating accumulate of a SIGNED addend) instead of the biased `vqadd` + de-biasing
 /// `vqsub` pair. `BWA4_RESCUE_USQADD=0` restores the biased form. Read once and cached.
@@ -1770,6 +1782,35 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
         } else {
             0
         };
+        // First column from which EVERY live lane holds ZPAD, or `qmax` if no such column exists.
+        //
+        // The columns `[n_pad, qmax)` are the ksw profile padding, and `ksw_padded_qlen` rounds each
+        // query up to a whole vector, so there are 12 of them on the measured shape (148 real of 160
+        // padded). They are NOT dead: a ZPAD column scores 0 and therefore carries the diagonal, so
+        // its H can be the row maximum and set `qe` and `score2`. But when every live lane is showing
+        // ZPAD, `zpad_mask` is all-ones and the tail body's whole score computation folds away to
+        // `diag = d`: no query load, no `EOR`, no `TBL`, no substitution add, and none of the four
+        // pad blends. That is the third column regime run below (issue #47).
+        //
+        // The range is `[max qlen, min padded_qlen)`, and it is non-empty exactly when every live
+        // lane pads to the same `qmax`, which is the ordinary case of a batch of whole reads from one
+        // run. When it is empty this reduces to today's two regimes with `n_pad == qmax`.
+        let n_pad = if zpadcol_enabled()
+            && n_lanes > 0
+            && group
+                .iter()
+                .all(|j| ksw_padded_qlen(j.query.len(), max_sc) == qmax)
+        {
+            qlen[..n_lanes]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(qmax)
+                .max(n_fast)
+                .min(qmax)
+        } else {
+            qmax
+        };
 
         // =====================================================================================
         // Main DP. Two target rows per iteration when there are two left, one otherwise.
@@ -1906,7 +1947,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                 // `q_pad` is hoisted out of the four PAD tests: the pair body recomputes
                 // `vtstq_u8(vorrq_u8(t, q), high_bit)` per row, but the query half of that OR is the
                 // same for all four, so it is tested once and OR-ed with each row's target test.
-                for j in n_fast..qmax {
+                for j in n_fast..n_pad {
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
                     let zpad_mask = vceqq_u8(q_v, zpad_v);
                     let q_pad = vtstq_u8(q_v, high_bit_v);
@@ -1957,6 +1998,52 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     let mut diag3 = vbslq_u8(zpad_mask, d3, scored3);
                     diag3 = vbslq_u8(pad3, zero, diag3);
                     let mfe3 = vmaxq_u8(diag3, e3);
+                    let h3 = vmaxq_u8(mfe3, f3);
+                    col3 = vbslq_u8(vcgtq_u8(h3, imax3), j_v, col3);
+                    imax3 = vmaxq_u8(imax3, h3);
+                    let (e_out, f3_next) = ef!(e3, f3, mfe3, h3);
+                    vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_out);
+                    f3 = f3_next;
+                    d3 = h2;
+                    vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h3);
+                    j_v = vaddq_u8(j_v, one_v);
+                }
+
+                // ---- ksw profile padding: every live lane is ZPAD, so `diag = d` ---------------
+                // The tail body with a provably all-ones `zpad_mask` folded in: the query column is
+                // not even loaded, and `EOR`, `TBL`, the substitution add and the four pad blends
+                // all disappear. What survives is the H/E/F recurrence carrying the diagonal.
+                //
+                // The pad blend is dropped on the same argument the fast body already makes: a lane
+                // whose target is PAD here is a lane past its own `tlen`, every operation is
+                // lane-local, and `finish_row` and `extract_group` both stop at that lane's `limit`.
+                for j in n_pad..qmax {
+                    let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
+                    let mfe0 = vmaxq_u8(d0, e_v);
+                    let h0 = vmaxq_u8(mfe0, f0);
+                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
+                    imax0 = vmaxq_u8(imax0, h0);
+                    let (e1, f0_next) = ef!(e_v, f0, mfe0, h0);
+                    f0 = f0_next;
+                    d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
+
+                    let mfe1 = vmaxq_u8(d1, e1);
+                    let h1 = vmaxq_u8(mfe1, f1);
+                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
+                    imax1 = vmaxq_u8(imax1, h1);
+                    let (e2, f1_next) = ef!(e1, f1, mfe1, h1);
+                    f1 = f1_next;
+                    d1 = h0;
+
+                    let mfe2 = vmaxq_u8(d2, e2);
+                    let h2 = vmaxq_u8(mfe2, f2);
+                    col2 = vbslq_u8(vcgtq_u8(h2, imax2), j_v, col2);
+                    imax2 = vmaxq_u8(imax2, h2);
+                    let (e3, f2_next) = ef!(e2, f2, mfe2, h2);
+                    f2 = f2_next;
+                    d2 = h1;
+
+                    let mfe3 = vmaxq_u8(d3, e3);
                     let h3 = vmaxq_u8(mfe3, f3);
                     col3 = vbslq_u8(vcgtq_u8(h3, imax3), j_v, col3);
                     imax3 = vmaxq_u8(imax3, h3);
@@ -2019,7 +2106,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                 }
 
                 // ---- Tail: ZPAD / PAD possible, full logic, still two rows at a time -----------
-                for j in n_fast..qmax {
+                for j in n_fast..n_pad {
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
                     let zpad_mask = vceqq_u8(q_v, zpad_v);
 
@@ -2043,6 +2130,31 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     let mut diag1 = vbslq_u8(zpad_mask, d1, scored1);
                     diag1 = vbslq_u8(pad1, zero, diag1);
                     let mfe1 = vmaxq_u8(diag1, e_mid);
+                    let h1 = vmaxq_u8(mfe1, f1);
+                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
+                    imax1 = vmaxq_u8(imax1, h1);
+                    let (e_out, f1_next) = ef!(e_mid, f1, mfe1, h1);
+                    vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_out);
+                    f1 = f1_next;
+                    d1 = h0;
+                    vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h1);
+                    j_v = vaddq_u8(j_v, one_v);
+                }
+
+                // ---- ksw profile padding: every live lane is ZPAD, so `diag = d` ---------------
+                // See the quad body's version for why the score computation and the pad blend both
+                // fold away here.
+                for j in n_pad..qmax {
+                    let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
+                    let mfe0 = vmaxq_u8(d0, e_v);
+                    let h0 = vmaxq_u8(mfe0, f0);
+                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
+                    imax0 = vmaxq_u8(imax0, h0);
+                    let (e_mid, f0_next) = ef!(e_v, f0, mfe0, h0);
+                    f0 = f0_next;
+                    d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
+
+                    let mfe1 = vmaxq_u8(d1, e_mid);
                     let h1 = vmaxq_u8(mfe1, f1);
                     col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
                     imax1 = vmaxq_u8(imax1, h1);
@@ -2110,7 +2222,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                 }
 
                 // ---- Tail: the columns where ZPAD / PAD can appear, full logic ----------------
-                for j in n_fast..qmax {
+                for j in n_fast..n_pad {
                     // Lane `l` = query base at column `j` of job `l`.
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
                     // diag_v = max(0, h_diag + score). The substitution score comes from one table
@@ -2158,6 +2270,24 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     let (e_new, f_next) = ef!(e_v, f_v, mfe, h_v);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_new);
                     f_v = f_next;
+                    h_diag_v = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
+                    j_v = vaddq_u8(j_v, one_v);
+                }
+
+                // ---- ksw profile padding: every live lane is ZPAD, so `diag = h_diag` ----------
+                // See the quad body's version for why the score computation and the pad blend both
+                // fold away here.
+                for j in n_pad..qmax {
+                    let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
+                    let mfe = vmaxq_u8(h_diag_v, e_v);
+                    let h_v = vmaxq_u8(mfe, f_v);
+                    let is_new_row_max = vcgtq_u8(h_v, imax_v);
+                    imax_col_v = vbslq_u8(is_new_row_max, j_v, imax_col_v);
+                    imax_v = vmaxq_u8(imax_v, h_v);
+                    vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h_v);
+                    let (e_new2, f_next2) = ef!(e_v, f_v, mfe, h_v);
+                    vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_new2);
+                    f_v = f_next2;
                     h_diag_v = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
                     j_v = vaddq_u8(j_v, one_v);
                 }
@@ -5006,6 +5136,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The all-ZPAD third column regime (issue #47), on groups whose lanes have a UNIFORM query
+    /// length, which is the only shape that opens it.
+    ///
+    /// `matesw_ragged_tlen_equals_scalar` cannot reach this body: its query lengths differ, so
+    /// `n_pad == qmax` and the padded columns keep going through the tail. Here every lane is 147 bp
+    /// and pads to 160, so 13 of the 160 columns run the new body. Target lengths stay ragged, so a
+    /// lane can be past its `tlen` while the group runs on, which is the case where the dropped PAD
+    /// blend has to be provably invisible.
+    ///
+    /// What the padded columns can and cannot reach, which the first draft of this test got wrong:
+    /// they can NEVER move `score`/`te`/`qe`. A padded column copies the diagonal, so its H equals
+    /// some earlier row's H at a real column, which was already folded into `gmax` when that row
+    /// finished; the `>` in `finish_row` then rejects it. They CAN move `score2`/`te2`, because
+    /// those come from `rowmax`, which every column writes, and a padded column can raise a LATER
+    /// row's maximum. So `score2` is the field carrying the evidence here, and the assertion below
+    /// checks it is actually populated.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn matesw_uniform_qlen_pad_columns_equal_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let mat = scmat(1, 4);
+        let max_sc = 1i32;
+        // 147 pads to 160 at 16 lanes: 13 padded columns, right at the shape the issue measured.
+        const QLEN: usize = 147;
+        assert_eq!(ksw_padded_qlen(QLEN, max_sc), 160);
+
+        let mut state = 0xfeed_face_1234_5678u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+
+        let mut qbufs: Vec<Vec<u8>> = Vec::new();
+        let mut tbufs: Vec<Vec<u8>> = Vec::new();
+        for k in 1..=32usize {
+            let tlen = 200 + k * 90; // ragged, 290 to 3080
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+            let q: Vec<u8> = (0..QLEN).map(|_| (next() % 5) as u8).collect();
+            // Plant the query at the very end of the window, so the best alignment ends on the last
+            // real row and its H then walks diagonally through the padded columns.
+            let at = tlen - QLEN;
+            t[at..].copy_from_slice(&q);
+            qbufs.push(q);
+            tbufs.push(t);
+        }
+        let jobs: Vec<FwdJob> = qbufs
+            .iter()
+            .zip(tbufs.iter())
+            .map(|(q, t)| FwdJob {
+                query: q.as_slice(),
+                target: t.as_slice(),
+                minsc: 19,
+                endsc: i32::MAX,
+            })
+            .collect();
+
+        let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+        // SAFETY: neon detected above; 147 bp queries and a score ceiling of 147 both under 250;
+        // `scmat` is standard.
+        let got = unsafe {
+            fwd_local_sw_neon_u8_impl::<true, true>(
+                &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc,
+            )
+        };
+        assert_eq!(got, want);
+        // `score2` really is in play, so the `rowmax` the padded columns feed is being compared and
+        // not silently `-1` on every job.
+        assert!(
+            got.iter().filter(|r| r.3 >= 0).count() >= 8,
+            "score2 is unpopulated, so the rowmax path the padded columns feed is untested"
+        );
     }
 
     /// The four monomorphisations of the NEON u8 kernel, on groups with deliberately RAGGED target

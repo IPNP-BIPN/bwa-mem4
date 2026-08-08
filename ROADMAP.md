@@ -697,6 +697,75 @@ Gates : `check.sh` vert (fmt, clippy `-D warnings`, tests, plus la passe x86_64 
 quatre combinaisons de commutateurs (md5 `7178e85d…`, seule la ligne `@PG` differant de l'oracle,
 comme toujours).
 
+## #47 : les colonnes de bourrage ont leur propre corps, et le gain depend de la longueur de lecture (2026-08-08)
+
+`ksw_padded_qlen` arrondit chaque requete a un vecteur entier, donc les colonnes `[qlen, qmax)` sont
+du pur bourrage de profil ksw. Elles ne sont **pas mortes** : une colonne ZPAD score 0 et propage donc
+la diagonale, son H alimente `rowmax` et donc `score2`. Elles traversaient le corps de queue complet,
+le plus cher des deux.
+
+Option A de l'issue, livree : un **troisieme regime de colonnes**. Quand toutes les voies vivantes du
+groupe se bourrent jusqu'au meme `qmax` (le cas ordinaire d'un lot de lectures d'une meme course), les
+colonnes `[max qlen, qmax)` ont ZPAD sur **toutes** les voies vivantes, donc `zpad_mask` vaut
+tout-a-un et le calcul de score se replie sur `diag = d`. Le corps garde la recurrence H/E/F et perd
+tout le reste : pas de chargement de la colonne de requete, pas d'`EOR`, pas de `TBL`, pas d'addition
+de substitution, aucun des quatre melanges de bourrage. Le commutateur `BWA4_RESCUE_ZPADCOL=0`
+renvoie ces colonnes au corps de queue.
+
+La borne est calculee comme `[max qlen, min qlen_bourree)`, ce qui est plus general que l'egalite des
+`qlen` demandee par l'issue : deux lectures de 145 et 150 bases se bourrent toutes deux a 160 et
+partagent donc les colonnes 150 a 160. Quand la condition tombe, `n_pad == qmax` et le noyau est
+exactement celui d'avant.
+
+### Le gain n'est pas un nombre, c'est une fonction de la fraction bourree
+
+C'est le resultat principal de cette issue, et il n'etait pas dans l'enonce. A/B entrelace, meme
+binaire, `-t4`, sonde `BWA4_MATESW_TIME`, medianes :
+
+| jeu | longueur de lecture | colonnes bourrees | noyau base | noyau avec | gain noyau | victoires |
+|---|---|---|---|---|---|---|
+| GIAB `m1/m2` sur chr21, 500 k paires | 49 bp | 15 de 64, **23,4 %** | 2,04 s | **1,90 s** | **+7,4 %** | 9/9 (9 courses) |
+| `r1_500k/r2_500k` sur `genome.fa` | 150 bp | 10 de 160, **6,25 %** | 1,30 s | **1,28 s** | **+1,6 %** | 4/5, 1 nul (5 courses) |
+
+Sur le jeu 49 bp, le CPU du processus entier passe de **7,23 s a 7,07 s, -2,2 %**, 9 victoires sur 9.
+
+L'issue annoncait +2,8 % pour 12 colonnes bourrees sur 160, soit 7,5 % de bourrage. Notre point a
+6,25 % de bourrage donne +1,6 %, donc **legerement en dessous de la projection**, et le point a 23,4 %
+donne +7,4 %. Les deux sont coherents avec une loi a peu pres proportionnelle a la fraction bourree.
+La consequence pratique : **une lecture juste au-dessus d'un multiple de 16 paie beaucoup, une lecture
+pile sur le multiple ne paie rien**, et 150 bp, la longueur Illumina standard, est presque le meilleur
+cas possible. C'est le chiffre 1,6 % qui vaut pour un run de production typique.
+
+### Ce qui n'a pas ete fait
+
+* **Option B** (forme close supprimant les colonnes bourrees de la boucle, +7 % annonce) : non tentee.
+  Sa preuve n'est jamais passee par le verificateur adversaire de la recherche, et l'option A la
+  subsume deja pour la majeure partie du gain sur la forme de production.
+* **Les noyaux x86** (AVX2, AVX-512, SSE4.1) gardent leurs deux regimes. Le portage se mesure sur une
+  machine x86, pas ici.
+
+### L'octet-identite
+
+`diag = d` est exactement ce que le melange calcule quand `zpad_mask` vaut tout-a-un, donc le nouveau
+corps est l'ancien avec un masque prouve constant replie. Le melange de bourrage est abandonne sur
+l'argument que le corps rapide fait deja : une voie dont la cible est PAD ici est une voie au-dela de
+son propre `tlen`, toutes les operations sont locales a la voie, et `finish_row` comme
+`extract_group` s'arretent a `limit[l]`.
+
+Le test `matesw_uniform_qlen_pad_columns_equal_scalar` ouvre le regime expres : seize voies de 147 bp
+(bourrees a 160, donc 13 colonnes) avec des cibles de longueurs echelonnees de 290 a 3080. Une erreur
+de la premiere redaction du test, corrigee et consignee dans le code parce qu'elle est instructive :
+**les colonnes bourrees ne peuvent jamais deplacer `score`, `te` ni `qe`**. Une colonne bourree recopie
+la diagonale, donc son H egale le H d'une ligne anterieure a une colonne reelle, deja verse dans
+`gmax` quand cette ligne s'est terminee, et le `>` strict de `finish_row` le rejette. Elles peuvent en
+revanche deplacer `score2`/`te2`, qui viennent de `rowmax` que toute colonne ecrit. C'est donc
+`score2` qui porte la preuve, et le test verifie qu'il est bien peuple.
+
+Gates : `check.sh` vert, `oracle_diff.sh` vert, et le corps SAM PE **octet-identique a bwa-mem2 2.3**
+avec le commutateur dans les deux positions, sur les **deux** jeux (500 k paires 49 bp sur chr21,
+md5 `7178e85d…` ; 500 k paires 150 bp sur `genome.fa`, md5 `3a51acef…`, celui-la compare directement
+a la sortie de l'oracle).
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
