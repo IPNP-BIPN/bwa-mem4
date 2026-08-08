@@ -1311,6 +1311,32 @@ Machine arm64. Le temps x86 doit venir d'un runner x86. Ce qui est verifiable ic
 
 #46 est donc close : A et B mesures a zero et retires, C livre.
 
+## Le cumul du lot SIMD, mesure bout a bout (2026-08-09)
+
+Les sections precedentes donnent chacune leur levier. Voici le total, mesure et non additionne :
+**A/B entrelace de deux binaires**, `7428cd0` (avant #45) contre `615653c`, `-t4`, medianes de 9
+rondes, secondes CPU. Deux binaires plutot qu'un commutateur parce que la question porte sur le lot
+entier ; l'entrelacement annule quand meme la derive thermique, qui est la raison d'etre de la regle.
+
+| jeu | | avant | apres | rapport | gain | victoires |
+|---|---|---|---|---|---|---|
+| 500 k paires **150 bp**, `genome.fa` | CPU du processus | 33,06 s | **32,53 s** | **1,016x** | **-1,6 %** | **9/9** |
+| | noyau de rescue | 1,50 s | **1,27 s** | **1,181x** | **-15,3 %** | **9/9** |
+| 500 k paires **49 bp**, chr21 | CPU du processus | 7,64 s | **7,07 s** | **1,081x** | **-7,5 %** | **9/9** |
+| | noyau de rescue | 2,44 s | **1,91 s** | **1,277x** | **-21,7 %** | **9/9** |
+
+Les deux binaires rendent le meme corps SAM, `3a51acef…`, verifie avant de chronometrer.
+
+**Pourquoi les deux jeux different d'un facteur cinq.** Ce n'est pas du bruit, c'est la composition
+du travail. Le lot a surtout accelere le **noyau de rescue** (#45, #47, #50A), qui pese beaucoup plus
+lourd a 49 bases qu'a 150 : 2,44 s sur 7,64 s de CPU contre 1,50 s sur 33,06 s. Et #47 depend en plus
+de la fraction de colonnes bourrees, 23,4 % a 49 bp contre 6,25 % a 150 bp. Le seul levier qui vise
+l'extension, #48B, vaut -0,9 % a 150 bp et rien a 49 bp, exactement l'inverse.
+
+**Le chiffre a citer pour une course de production Illumina 2x150 est donc 1,016x sur le processus
+entier, avec 1,18x sur le noyau de rescue.** Les deux modifications x86 (#48C, #46C) ne sont dans
+aucune de ces colonnes : ce binaire est arm64.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
