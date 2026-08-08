@@ -1077,6 +1077,56 @@ tranche.
 3. mesurer les trois variantes (`uchar4` sature, `ushort4` emule, `int` une cellule par voie) et ne
    choisir l'architecture qu'ensuite.
 
+## #48B : la pre-passe de substitution repliee, +4 a +5 % de noyau, -0,9 % de CPU (2026-08-08)
+
+Suite de la section #48 : apres deux leviers nuls parce que LLVM les appliquait deja, le troisieme
+est le seul qui retire un **acces memoire** plutot que des operations ALU, et c'est celui qui paie.
+
+La pre-passe calculait le score de substitution de chaque colonne de la bande dans une boucle
+separee, l'ecrivait dans `sbt_buf`, et la boucle principale le rechargeait immediatement apres. Une
+ecriture pleine largeur et une lecture pleine largeur par colonne, plus une seconde traversee de la
+bande, pour transporter une valeur entre deux boucles de la meme iteration. Repliee dans la boucle de
+colonne, la meme expression sur les memes entrees, donc l'octet-identite est immediate.
+
+### La difference avec #48A et #48D se voit dans les symboles
+
+C'etait le test decisif de la section precedente, il est repasse ici :
+
+```
+batched_extend_neon_u8Kb0_EB6_     batched_extend_neon_i16Kb0_EB6_
+batched_extend_neon_u8Kb1_EB6_     batched_extend_neon_i16Kb1_EB6_
+```
+
+**Les deux monomorphisations existent**, la ou celles de #48A/D avaient fusionne. Le compilateur ne
+sait pas faire cette transformation, et c'etait la prediction.
+
+Boucle de colonne u8, desassemblage (identification par forme) :
+
+| | forme separee | forme repliee |
+|---|---|---|
+| instructions de la boucle principale | 41 | 40 |
+| chargements | 5 | **3** |
+| ecritures | 3 | **2** |
+| plus une boucle de pre-passe sur les memes colonnes | oui | **non** |
+
+### Mesure
+
+| mesure | separee | repliee | gain | victoires |
+|---|---|---|---|---|
+| microbenchmark du noyau, bras alternes, medianes de 15, deux executions | 9,87 / 9,79 ms | 9,47 / 9,28 ms | **+4,2 % et +5,5 %** | **15/15 et 15/15** |
+| CPU du processus, 500 k paires **150 bp**, 11 rondes entrelacees | 33,04 s | **32,74 s** | **-0,91 %** | **11/11** |
+| CPU du processus, 500 k paires **49 bp** | 7,09 s | 7,08 s | 0,0 % | nul |
+
+Le contraste entre les deux jeux n'est pas du bruit et se lit dans la sonde #53 : l'extension
+represente **24,0 G cellules nominales** sur le jeu 150 bp contre **278 M** sur le jeu 49 bp. Il n'y a
+tout simplement presque pas d'extension a accelerer quand les lectures font 49 bases. **-0,91 % est
+le chiffre pour un run de production.**
+
+Note de methode, la meme que pour #48A : le microbenchmark a bras alternes est ce qui rend ce +4,2 %
+croyable. Le meme harnais, un bras apres l'autre, avait attribue +6 % a un levier qui valait zero.
+
+Le levier **C** (masque de bande en espace signe) reste ouvert et x86 uniquement.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

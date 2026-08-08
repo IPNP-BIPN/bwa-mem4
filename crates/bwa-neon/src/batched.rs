@@ -361,14 +361,17 @@ fn calibrate(have_512: bool, have_2: bool, have_sse: bool) -> Tier {
     // SAFETY of each closure: the feature it needs was detected above, and the jobs are read-only
     // short sequences well inside the u8 kernel's value bounds (h0 = 10, query < 128 bases).
     let sse = time(&|| {
-        let _ = unsafe { sse41::batched_extend_sse41_u8(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100) };
+        let _ = unsafe {
+            sse41::batched_extend_sse41_u8::<true>(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100)
+        };
     });
     let mut best_tier = Tier::Sse41;
     let mut best_time = sse;
     if have_2 {
         let t = time(&|| {
-            let _ =
-                unsafe { avx2::batched_extend_avx2_u8(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100) };
+            let _ = unsafe {
+                avx2::batched_extend_avx2_u8::<true>(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100)
+            };
         });
         // 95%: the wider tier keeps the tie, see the doc comment.
         if t.as_secs_f64() < best_time.as_secs_f64() * 0.95 || best_tier == Tier::Sse41 && t <= sse
@@ -380,7 +383,7 @@ fn calibrate(have_512: bool, have_2: bool, have_sse: bool) -> Tier {
     if have_512 {
         let t = time(&|| {
             let _ = unsafe {
-                avx512::batched_extend_avx512_u8(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100)
+                avx512::batched_extend_avx512_u8::<true>(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100)
             };
         });
         if t.as_secs_f64() < best_time.as_secs_f64() * 0.95 {
@@ -395,7 +398,7 @@ fn calibrate(have_512: bool, have_2: bool, have_sse: bool) -> Tier {
 /// AVX2 is available; the AVX-512 branch additionally checks its own feature at run time.
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn sw_kernel_u8(
+unsafe fn sw_kernel_u8<const INL_SBT: bool>(
     jobs: &[ExtendJob],
     m: usize,
     mat: &[i8],
@@ -409,17 +412,17 @@ unsafe fn sw_kernel_u8(
 ) -> Vec<ExtendResult> {
     match extend_tier() {
         Tier::Avx512 => {
-            return avx512::batched_extend_avx512_u8(
+            return avx512::batched_extend_avx512_u8::<{ INL_SBT }>(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             )
         }
         Tier::Avx2 => {
-            return avx2::batched_extend_avx2_u8(
+            return avx2::batched_extend_avx2_u8::<{ INL_SBT }>(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             )
         }
         Tier::Sse41 => {
-            return sse41::batched_extend_sse41_u8(
+            return sse41::batched_extend_sse41_u8::<{ INL_SBT }>(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             )
         }
@@ -434,7 +437,7 @@ unsafe fn sw_kernel_u8(
 /// As [`sw_kernel_u8`], with the i16 bounds (`MAX_SEQ_LEN16`) instead.
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn sw_kernel_i16(
+unsafe fn sw_kernel_i16<const INL_SBT: bool>(
     jobs: &[ExtendJob],
     m: usize,
     mat: &[i8],
@@ -448,17 +451,17 @@ unsafe fn sw_kernel_i16(
 ) -> Vec<ExtendResult> {
     match extend_tier() {
         Tier::Avx512 => {
-            return avx512::batched_extend_avx512_i16(
+            return avx512::batched_extend_avx512_i16::<{ INL_SBT }>(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             )
         }
         Tier::Avx2 => {
-            return avx2::batched_extend_avx2_i16(
+            return avx2::batched_extend_avx2_i16::<{ INL_SBT }>(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             )
         }
         Tier::Sse41 => {
-            return sse41::batched_extend_sse41_i16(
+            return sse41::batched_extend_sse41_i16::<{ INL_SBT }>(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             )
         }
@@ -864,24 +867,46 @@ fn dispatch_bins(
         }
     }
 
+    // One place resolves the `INL_SBT` monomorphisation for the whole dispatch, so the switch is
+    // read once per batch and never inside a column loop.
+    let inl = inline_sbt_enabled();
+    macro_rules! run_u8 {
+        ($js:expr) => {
+            if inl {
+                sw_kernel_u8::<true>(
+                    $js, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            } else {
+                sw_kernel_u8::<false>(
+                    $js, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+        };
+    }
+    macro_rules! run_i16 {
+        ($js:expr) => {
+            if inl {
+                sw_kernel_i16::<true>(
+                    $js, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            } else {
+                sw_kernel_i16::<false>(
+                    $js, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+        };
+    }
+
     // Homogeneous fast path: whole batch in one bin -> run the kernel on `jobs` with no gather/scatter.
     // `n` is the batch size, so `x_idx.len() == n` means bin `x` took every job.
     let n = jobs.len();
     if u8_idx.len() == n {
         // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
-        return unsafe {
-            sw_kernel_u8(
-                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
-        };
+        return unsafe { run_u8!(jobs) };
     }
     if i16_idx.len() == n {
         // SAFETY: neon available; MAX_SEQ_LEN16 bounds keep all values inside i16.
-        return unsafe {
-            sw_kernel_i16(
-                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
-        };
+        return unsafe { run_i16!(jobs) };
     }
     if sc_idx.len() == n {
         return batched_extend_scalar(
@@ -906,15 +931,11 @@ fn dispatch_bins(
     };
     run_bin(&u8_idx, &|bin| unsafe {
         // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
-        sw_kernel_u8(
-            bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-        )
+        run_u8!(bin)
     });
     run_bin(&i16_idx, &|bin| unsafe {
         // SAFETY: neon available; MAX_SEQ_LEN16 bounds keep all values inside i16.
-        sw_kernel_i16(
-            bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-        )
+        run_i16!(bin)
     });
     run_bin(&sc_idx, &|bin| {
         batched_extend_scalar(
@@ -1270,6 +1291,17 @@ fn default_result() -> ExtendResult {
     }
 }
 
+/// Whether the extension kernels fold the substitution pre-pass into the column loop (issue #48B).
+/// `BWA4_EXTEND_SBT=0` keeps the separate pre-pass and its `sbt_buf` round trip. Read once, cached.
+///
+/// Unlike #48A and #48D, which turned out to be rewrites LLVM already performed, this one removes a
+/// full-width store and a full-width load per column that cross two loops, so no compiler can do it.
+fn inline_sbt_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_EXTEND_SBT").is_none_or(|v| v != "0"))
+}
+
 /// Per-lane band clamp, mirroring the `w` adjustments in `ksw_extend2` (`ksw.cpp:456-461`).
 ///
 /// A band wider than the longest gap that could ever pay for itself is wasted work, and bwa shrinks
@@ -1397,7 +1429,7 @@ macro_rules! define_sw_kernel {
         /// One `ExtendResult` per job in input order, byte-identical to `ksw_extend2` per job.
         #[target_feature(enable = $feat)]
         #[allow(clippy::too_many_arguments)]
-        pub unsafe fn $name(
+        pub unsafe fn $name<const INL_SBT: bool>(
             jobs: &[ExtendJob],
             m: usize,
             mat: &[i8],
@@ -1644,15 +1676,24 @@ macro_rules! define_sw_kernel {
                     // compute inline, and stash them. These ops depend only on `t_v` (fixed this row)
                     // and the column's query base, so they carry no DP dependency and the scheduler
                     // runs them at throughput here instead of braided into the H/E/F chain below.
-                    for j in gbeg..gend {
-                        let col_base = j as usize * LANES;
-                        let q_v = $lds(qcode.as_ptr().add(col_base));
-                        let is_eq = $ceq(t_v, q_v);
-                        let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                        // One biased value per cell: N wins over the equality test, exactly as the
-                        // split form's `is_n` blend sat outermost on both halves.
-                        let sbt = $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v));
-                        $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
+                    // Issue #48B: with `INL_SBT` the pre-pass does not run at all and its body moves
+                    // into the column loop below. It is the same expression on the same inputs, so
+                    // byte-identity is immediate; what it removes is one full-width STORE here and
+                    // one full-width LOAD there, per column, which exist only to shuttle a value
+                    // between two loops of the same iteration. That is the one thing the compiler
+                    // cannot do itself, unlike the ALU rewrites of #48A and #48D which it had
+                    // already done.
+                    if !INL_SBT {
+                        for j in gbeg..gend {
+                            let col_base = j as usize * LANES;
+                            let q_v = $lds(qcode.as_ptr().add(col_base));
+                            let is_eq = $ceq(t_v, q_v);
+                            let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                            // One biased value per cell: N wins over the equality test, exactly as
+                            // the split form's `is_n` blend sat outermost on both halves.
+                            let sbt = $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v));
+                            $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
+                        }
                     }
 
                     // The shared column loop over the union band. Every lane executes every column;
@@ -1679,7 +1720,14 @@ macro_rules! define_sw_kernel {
                         // load replaces the ~7 ALU ops that used to sit on the critical path here,
                         // and, since the pre-pass went from a pair of values to one, half the loads
                         // and half the stores the pre-pass form originally cost.
-                        let sbt = $lds(sbt_buf.as_ptr().add(col_base));
+                        let sbt = if INL_SBT {
+                            let q_v = $lds(qcode.as_ptr().add(col_base));
+                            let is_eq = $ceq(t_v, q_v);
+                            let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                            $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
+                        } else {
+                            $lds(sbt_buf.as_ptr().add(col_base))
+                        };
 
                         let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
                                                                      // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
@@ -2522,11 +2570,11 @@ mod avx2_verify {
                 // SAFETY: this test requires an AVX2-capable executor (native x86 CI or Rosetta).
                 let got = unsafe {
                     if big {
-                        super::avx2::batched_extend_avx2_i16(
+                        super::avx2::batched_extend_avx2_i16::<true>(
                             &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
                         )
                     } else {
-                        super::avx2::batched_extend_avx2_u8(
+                        super::avx2::batched_extend_avx2_u8::<true>(
                             &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
                         )
                     }
@@ -2539,11 +2587,11 @@ mod avx2_verify {
                 // SAFETY: SSE4.1 is present on any executor that has AVX2, which this test requires.
                 let got_sse = unsafe {
                     if big {
-                        super::sse41::batched_extend_sse41_i16(
+                        super::sse41::batched_extend_sse41_i16::<true>(
                             &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
                         )
                     } else {
-                        super::sse41::batched_extend_sse41_u8(
+                        super::sse41::batched_extend_sse41_u8::<true>(
                             &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
                         )
                     }
@@ -2629,6 +2677,115 @@ mod neon_verify {
         mat
     }
 
+    /// Isolated, interleaved A/B of the two `INL_SBT` monomorphisations (issue #48B).
+    ///
+    /// Calling the kernel directly is legitimate here, unlike in #46B: this is a
+    /// `#[target_feature]` boundary the shipped build also calls through, so the probe does not
+    /// keep alive anything production inlines away. Arms alternate and the report is a median over
+    /// 15 rounds, because the same harness run one-arm-after-the-other reported +6% for a lever
+    /// that turned out to be worth nothing (#48A).
+    #[test]
+    #[ignore = "throughput probe, run explicitly"]
+    fn extend_sbt_ab() {
+        let mat = scoring();
+        let mut state = 0x2468_ace0_1357_9bdfu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        // Seed-extension shapes as the aligner produces them: a 150 bp read seeded in the middle
+        // leaves 40 to 110 bases to extend on each side.
+        let mut queries: Vec<Vec<u8>> = Vec::new();
+        let mut targets: Vec<Vec<u8>> = Vec::new();
+        let mut h0s: Vec<i32> = Vec::new();
+        for _ in 0..4096 {
+            let qlen = 40 + (next() % 71) as usize;
+            let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            let tlen = qlen + (next() % 20) as usize;
+            let mut t: Vec<u8> = Vec::with_capacity(tlen);
+            let mut qi = 0usize;
+            while t.len() < tlen {
+                if qi < q.len() && next() % 100 >= 5 {
+                    t.push(q[qi]);
+                    qi += 1;
+                } else {
+                    t.push((next() % 4) as u8);
+                    if next() % 2 == 0 {
+                        qi += 1;
+                    }
+                }
+            }
+            queries.push(q);
+            targets.push(t);
+            h0s.push(20 + (next() % 20) as i32);
+        }
+        let jobs: Vec<ExtendJob> = (0..queries.len())
+            .map(|i| ExtendJob {
+                query: &queries[i],
+                target: &targets[i],
+                h0: h0s[i],
+            })
+            .collect();
+        let cells: u64 = jobs
+            .iter()
+            .map(|j| (j.query.len() * j.target.len()) as u64)
+            .sum();
+
+        let once = |inl: bool| -> f64 {
+            let t0 = std::time::Instant::now();
+            let out = unsafe {
+                if inl {
+                    batched_extend_neon_u8::<true>(
+                        &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
+                    )
+                } else {
+                    batched_extend_neon_u8::<false>(
+                        &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
+                    )
+                }
+            };
+            let dt = t0.elapsed().as_secs_f64();
+            std::hint::black_box(&out);
+            dt
+        };
+        once(true);
+        once(false);
+        let (mut fs, mut ss) = (Vec::new(), Vec::new());
+        let mut wins = 0;
+        for _ in 0..15 {
+            let sp = once(false);
+            let fo = once(true);
+            if fo < sp {
+                wins += 1;
+            }
+            ss.push(sp);
+            fs.push(fo);
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (ms, mf) = (median(&mut ss), median(&mut fs));
+        eprintln!(
+            "extend_sbt_ab: {} jobs, {cells} DP cells, 15 interleaved rounds",
+            jobs.len()
+        );
+        eprintln!(
+            "  pre-pass  {:>8.3} ms  {:>6.3} Gcell/s",
+            ms * 1e3,
+            cells as f64 / ms / 1e9
+        );
+        eprintln!(
+            "  folded    {:>8.3} ms  {:>6.3} Gcell/s",
+            mf * 1e3,
+            cells as f64 / mf / 1e9
+        );
+        eprintln!("  folded vs pre-pass: {:.3}x, {wins}/15 wins", ms / mf);
+    }
+
     #[test]
     fn neon_u8_and_i16_match_scalar() {
         let mat = scoring();
@@ -2707,16 +2864,31 @@ mod neon_verify {
                     })
                     .collect();
                 // SAFETY: this host has NEON (aarch64).
+                // Both `INL_SBT` monomorphisations run: issue #48B moves the same expression from
+                // the pre-pass into the column loop, so the folded body is the reference the
+                // separate one must equal, and both are then checked against `ksw_extend2` below.
                 let got = unsafe {
-                    if big {
-                        batched_extend_neon_i16(
-                            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                    let (folded, split) = if big {
+                        (
+                            batched_extend_neon_i16::<true>(
+                                &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                            ),
+                            batched_extend_neon_i16::<false>(
+                                &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                            ),
                         )
                     } else {
-                        batched_extend_neon_u8(
-                            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                        (
+                            batched_extend_neon_u8::<true>(
+                                &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                            ),
+                            batched_extend_neon_u8::<false>(
+                                &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                            ),
                         )
-                    }
+                    };
+                    assert_eq!(folded, split, "INL_SBT changed the result (big = {big})");
+                    folded
                 };
                 // `got[i]` is the kernel's result for job `i`; `expected` is the authoritative
                 // scalar `ksw_extend2` run on that same job alone. Every field must match exactly:
@@ -3003,11 +3175,11 @@ mod avx512_verify {
                 // SAFETY: `avx512bw` was checked above.
                 let got = unsafe {
                     if big {
-                        super::avx512::batched_extend_avx512_i16(
+                        super::avx512::batched_extend_avx512_i16::<true>(
                             &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
                         )
                     } else {
-                        super::avx512::batched_extend_avx512_u8(
+                        super::avx512::batched_extend_avx512_u8::<true>(
                             &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
                         )
                     }
