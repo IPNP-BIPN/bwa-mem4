@@ -1404,6 +1404,49 @@ dossier (#48A et #48D). Le chiffre reel doit venir d'un runner x86.
   (`791c21c2…` et `7178e85d…`). Sous Rosetta `avx2` n'est pas detecte, donc le noyau reellement
   emprunte de bout en bout est le **SSE4.1**, l'un des deux portes.
 
+## #44 : la meme table sur AVX-512, plus l'echange de port gratuit (2026-08-09)
+
+Partie A portee, partie B **a moitie**, et la moitie retenue est celle qui ne coute rien.
+
+**Partie A.** `fwd_local_sw_avx512_u8` score desormais par `_mm512_shuffle_epi8` sur la table 16
+entrees diffusee aux quatre voies de 128 bits par `_mm512_broadcast_i32x4` (`vpshufb` est in-lane),
+avec le meme `N_TARGET = 12`. Disparaissent : `mispen_v`, `four_v`, `m_v`, `mtch_v`, les
+`_mm512_cmpeq_epi8_mask` par ligne, le `korq` et les deux blends de score. Comme sur AVX2, le test de
+cellule morte `cmpge_epu8(t_v, m_v)` aurait tue toutes les vraies N de la cible : il devient
+`_mm512_movepi8_mask`, qui est aussi ce qui remplace `cmpgt_epu8(q_v, zpad_v)` cote requete. La garde
+de saturation est un `assert!` dur. `vpermb` n'a pas ete retenu, pour la raison de l'issue : une table
+de 16 entrees ne demande pas une permutation sur 64.
+
+**Partie B, seulement l'echange gratuit.** `imax = max_epu8(imax, h)` devient
+`mask_blend(gt, imax, h)` en **reutilisant** le masque `gt` que la mise a jour de `col` calcule une
+ligne plus haut. Aucune instruction nouvelle, et la max quitte p0, le port qui lie a 512 bits, pour
+p05 ou `VPBLENDMB` tourne a 2 par cycle. Octet-identique par definition de la max, et le `>` strict
+reutilise est exactement la regle d'egalite que le noyau applique deja.
+
+**Les echanges payants (points 2 et 3 de la partie B) ne sont PAS faits**, et c'est delibere.
+L'issue demande elle-meme de les conditionner, parce qu'ils **degradent sur Zen 5** ou les quatre
+pipes FP prennent `vpmaxub` a 0,25 de debit tandis que `vpcmpub` coute 6 de latence. Ecrire une
+porte dont le calibrage ne peut etre ni execute ni mesure sur cette machine reviendrait a livrer une
+heuristique non verifiee dans le noyau le plus chaud du programme. Le point 3 de l'issue interdit de
+toute maniere de toucher `mfe` et `h`, qui sont sur la chaine inter-lignes.
+
+### Le trou de couverture, qu'il faut dire
+
+**Le noyau AVX-512 u8 n'est execute nulle part ici.** `avx512_matesw_u8_matches_scalar` s'arrete
+faute de `avx512bw`, Rosetta ne l'expose pas, et le binaire x86 n'emprunte donc jamais ce chemin.
+Ce qui est verifiable a ete fait :
+
+* le generateur partage `rescue_jobs` est renforce comme l'issue le demande : **chaque** travail porte
+  desormais un N dans la requete **et** dans la cible, plus une cellule both-N, l'index `4 ^ 12 = 8`
+  que la forme a blends n'avait pas. Ce generateur alimente aussi le test AVX-512, donc le prochain
+  tirage Intel de la CI le verifiera reellement ;
+* `check.sh` vert, `oracle_diff.sh` vert, et md5 identique entre binaire arm64 et binaire x86 sous
+  Rosetta sur les jeux reels, ce qui prouve que le portage n'a rien casse **ailleurs** ;
+* aucun chiffre de temps, ici non plus.
+
+Autrement dit : ce commit est **ecrit et relu, pas execute**. C'est le seul du lot dans ce cas, et il
+ne doit pas etre traite comme les autres tant qu'un tirage CI avec `avx512bw` n'a pas tourne.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

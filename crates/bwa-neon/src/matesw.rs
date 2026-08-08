@@ -4009,7 +4009,9 @@ unsafe fn fwd_local_sw_sse41_i16(
 #[allow(clippy::too_many_arguments)]
 unsafe fn fwd_local_sw_avx512_u8(
     jobs: &[FwdJob],
-    m: usize,
+    // Matrix dimension (5). No longer read: dead cells are detected by the PAD byte's high
+    // bit, as in every other u8 kernel here. Kept for signature parity.
+    _m: usize,
     mat: &[i8],
     o_del: i32,
     e_del: i32,
@@ -4026,11 +4028,48 @@ unsafe fn fwd_local_sw_avx512_u8(
     let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
 
     let zero = _mm512_setzero_si512();
-    let mtch_v = _mm512_set1_epi8(mtch as i8);
-    let mispen_v = _mm512_set1_epi8(mispen as i8);
+    // ISSUE #44 part A: the same XOR-indexed score table as `fwd_local_sw_neon_u8` and, since #43,
+    // as the AVX2 and SSE4.1 kernels. `vpshufb` is IN-LANE, so the 16-byte table is broadcast to all
+    // four 128-bit lanes; `vpermb` was considered and rejected, a 16-entry table does not need a
+    // 64-entry lookup and `vpermb` costs more.
+    //
+    // Why it pays here specifically: on Golden Cove every 512-bit saturating-integer and max op is
+    // p0-only at throughput 1.00, because at 512 bits port 1's vector ALU folds into p0. The kernel's
+    // cost is then literally the count of p0-only ops, and this rewrite deletes two of them per row
+    // (the N-penalty `subs` and the `korq`, which is p0 on SKX/ICL/EMR) while moving work onto ports
+    // that sit idle: `vpxord` is p05 and `vpshufb` ZMM is p5.
+    assert!(
+        (U8_SCORE_LIMIT as u32) + mispen as u32 + mtch as u32 <= 256,
+        "u8 rescue score table would saturate: mispen {mispen} + mtch {mtch} + ceiling too large"
+    );
+    let bias = mispen;
+    let mut tbl = [0u8; 16];
+    tbl[0] = bias + mtch; // match: +a
+                          // tbl[1..=3] = bias - b = 0 (mismatch), already zero
+    for k in 4..8 {
+        tbl[k] = bias - 1; // query N against a real base: bwa scores -1
+    }
+    tbl[8] = bias - 1; // both N: N_TARGET XOR 4
+    for k in 12..16 {
+        tbl[k] = bias - 1; // target N against a real base
+    }
+    let score_tbl = _mm512_broadcast_i32x4(_mm_loadu_si128(tbl.as_ptr() as *const __m128i));
+    let bias_v = _mm512_set1_epi8(bias as i8);
+    // The `vpshufb` / `vqtbl1q_u8` reachable-index argument is the one spelled out in
+    // `fwd_local_sw_avx2_u8`; the encoding and therefore the argument are the same.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    #[inline]
+    unsafe fn score_diag(
+        tbl: __m512i,
+        bias_v: __m512i,
+        t_v: __m512i,
+        q_v: __m512i,
+        d: __m512i,
+    ) -> __m512i {
+        let s = _mm512_shuffle_epi8(tbl, _mm512_xor_si512(t_v, q_v));
+        _mm512_subs_epu8(_mm512_adds_epu8(d, s), bias_v)
+    }
     let one_v = _mm512_set1_epi8(1);
-    let four_v = _mm512_set1_epi8(4);
-    let m_v = _mm512_set1_epi8(m as i8);
     let zpad_v = _mm512_set1_epi8(ZPAD as i8);
     let e_del_v = _mm512_set1_epi8(e_del as i8);
     let oe_del_v = _mm512_set1_epi8(oe_del as i8);
@@ -4068,8 +4107,9 @@ unsafe fn fwd_local_sw_avx512_u8(
             for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
                 seq_q[c * LANES64 + l] = ZPAD;
             }
+            // The N re-encoding, once per target base (issue #44 part A).
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES64 + l] = b;
+                seq_t[r * LANES64 + l] = if b == 4 { N_TARGET } else { b };
             }
         }
 
@@ -4147,8 +4187,6 @@ unsafe fn fwd_local_sw_avx512_u8(
                 let t0_v = _mm512_loadu_si512(seq_t.as_ptr().add(i * LANES64) as *const __m512i);
                 let t1_v =
                     _mm512_loadu_si512(seq_t.as_ptr().add((i + 1) * LANES64) as *const __m512i);
-                let t0_is_n = _mm512_cmpeq_epi8_mask(t0_v, four_v);
-                let t1_is_n = _mm512_cmpeq_epi8_mask(t1_v, four_v);
                 let (mut f0, mut f1) = (zero, zero);
                 let (mut d0, mut d1) = (zero, zero);
                 let (mut imax0, mut imax1) = (zero, zero);
@@ -4157,24 +4195,18 @@ unsafe fn fwd_local_sw_avx512_u8(
 
                 for j in 0..n_fast {
                     let q_v = _mm512_loadu_si512(seq_q.as_ptr().add(j * LANES64) as *const __m512i);
-                    let q_is_n = _mm512_cmpeq_epi8_mask(q_v, four_v);
 
-                    let eq0 = _mm512_cmpeq_epi8_mask(t0_v, q_v);
-                    let mut diag0 = _mm512_mask_blend_epi8(
-                        eq0,
-                        _mm512_subs_epu8(d0, mispen_v),
-                        _mm512_adds_epu8(d0, mtch_v),
-                    );
-                    diag0 = _mm512_mask_blend_epi8(
-                        t0_is_n | q_is_n,
-                        diag0,
-                        _mm512_subs_epu8(d0, one_v),
-                    );
+                    let diag0 = score_diag(score_tbl, bias_v, t0_v, q_v, d0);
                     let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES64) as *const __m512i);
                     let mfe0 = _mm512_max_epu8(diag0, e_v);
                     let h0 = _mm512_max_epu8(mfe0, f0);
-                    col0 = _mm512_mask_blend_epi8(_mm512_cmpgt_epu8_mask(h0, imax0), col0, j_v);
-                    imax0 = _mm512_max_epu8(imax0, h0);
+                    // ISSUE #44 part B, the free swap: the strict `>` mask is already needed for `col0`, and
+                    // `max_epu8(a, b)` IS `mask_blend(cmpgt_epu8(b, a), a, b)`, so reusing it costs no new
+                    // instruction and moves the max off p0, which is the port that binds at 512 bits, onto
+                    // p05 where `VPBLENDMB` runs at 2/cycle. Byte-identical by definition of max.
+                    let gt = _mm512_cmpgt_epu8_mask(h0, imax0);
+                    col0 = _mm512_mask_blend_epi8(gt, col0, j_v);
+                    imax0 = _mm512_mask_blend_epi8(gt, imax0, h0);
                     // E(i+1, j), handed to row i+1 in a register rather than stored and reloaded.
                     let e_mid = _mm512_max_epu8(
                         _mm512_subs_epu8(e_v, e_del_v),
@@ -4186,21 +4218,16 @@ unsafe fn fwd_local_sw_avx512_u8(
                     );
                     d0 = _mm512_loadu_si512(h_prev.as_ptr().add(j * LANES64) as *const __m512i);
 
-                    let eq1 = _mm512_cmpeq_epi8_mask(t1_v, q_v);
-                    let mut diag1 = _mm512_mask_blend_epi8(
-                        eq1,
-                        _mm512_subs_epu8(d1, mispen_v),
-                        _mm512_adds_epu8(d1, mtch_v),
-                    );
-                    diag1 = _mm512_mask_blend_epi8(
-                        t1_is_n | q_is_n,
-                        diag1,
-                        _mm512_subs_epu8(d1, one_v),
-                    );
+                    let diag1 = score_diag(score_tbl, bias_v, t1_v, q_v, d1);
                     let mfe1 = _mm512_max_epu8(diag1, e_mid);
                     let h1 = _mm512_max_epu8(mfe1, f1);
-                    col1 = _mm512_mask_blend_epi8(_mm512_cmpgt_epu8_mask(h1, imax1), col1, j_v);
-                    imax1 = _mm512_max_epu8(imax1, h1);
+                    // ISSUE #44 part B, the free swap: the strict `>` mask is already needed for `col1`, and
+                    // `max_epu8(a, b)` IS `mask_blend(cmpgt_epu8(b, a), a, b)`, so reusing it costs no new
+                    // instruction and moves the max off p0, which is the port that binds at 512 bits, onto
+                    // p05 where `VPBLENDMB` runs at 2/cycle. Byte-identical by definition of max.
+                    let gt = _mm512_cmpgt_epu8_mask(h1, imax1);
+                    col1 = _mm512_mask_blend_epi8(gt, col1, j_v);
+                    imax1 = _mm512_mask_blend_epi8(gt, imax1, h1);
                     _mm512_storeu_si512(
                         e.as_mut_ptr().add(j * LANES64) as *mut __m512i,
                         _mm512_max_epu8(
@@ -4219,32 +4246,23 @@ unsafe fn fwd_local_sw_avx512_u8(
 
                 for j in n_fast..qmax {
                     let q_v = _mm512_loadu_si512(seq_q.as_ptr().add(j * LANES64) as *const __m512i);
-                    let q_is_n = _mm512_cmpeq_epi8_mask(q_v, four_v);
                     let zpad_mask = _mm512_cmpeq_epi8_mask(q_v, zpad_v);
-                    let q_pad = _mm512_cmpgt_epu8_mask(q_v, zpad_v);
+                    // `q > ZPAD` is true only for `PAD`, so the high-bit test is the same mask.
+                    let q_pad = _mm512_movepi8_mask(q_v);
 
-                    let eq0 = _mm512_cmpeq_epi8_mask(t0_v, q_v);
-                    let mut diag0 = _mm512_mask_blend_epi8(
-                        eq0,
-                        _mm512_subs_epu8(d0, mispen_v),
-                        _mm512_adds_epu8(d0, mtch_v),
-                    );
-                    diag0 = _mm512_mask_blend_epi8(
-                        t0_is_n | q_is_n,
-                        diag0,
-                        _mm512_subs_epu8(d0, one_v),
-                    );
+                    let mut diag0 = score_diag(score_tbl, bias_v, t0_v, q_v, d0);
                     diag0 = _mm512_mask_blend_epi8(zpad_mask, diag0, d0);
-                    diag0 = _mm512_mask_blend_epi8(
-                        _mm512_cmpge_epu8_mask(t0_v, m_v) | q_pad,
-                        diag0,
-                        zero,
-                    );
+                    diag0 = _mm512_mask_blend_epi8(_mm512_movepi8_mask(t0_v) | q_pad, diag0, zero);
                     let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES64) as *const __m512i);
                     let mfe0 = _mm512_max_epu8(diag0, e_v);
                     let h0 = _mm512_max_epu8(mfe0, f0);
-                    col0 = _mm512_mask_blend_epi8(_mm512_cmpgt_epu8_mask(h0, imax0), col0, j_v);
-                    imax0 = _mm512_max_epu8(imax0, h0);
+                    // ISSUE #44 part B, the free swap: the strict `>` mask is already needed for `col0`, and
+                    // `max_epu8(a, b)` IS `mask_blend(cmpgt_epu8(b, a), a, b)`, so reusing it costs no new
+                    // instruction and moves the max off p0, which is the port that binds at 512 bits, onto
+                    // p05 where `VPBLENDMB` runs at 2/cycle. Byte-identical by definition of max.
+                    let gt = _mm512_cmpgt_epu8_mask(h0, imax0);
+                    col0 = _mm512_mask_blend_epi8(gt, col0, j_v);
+                    imax0 = _mm512_mask_blend_epi8(gt, imax0, h0);
                     let e_mid = _mm512_max_epu8(
                         _mm512_subs_epu8(e_v, e_del_v),
                         _mm512_subs_epu8(h0, oe_del_v),
@@ -4255,27 +4273,18 @@ unsafe fn fwd_local_sw_avx512_u8(
                     );
                     d0 = _mm512_loadu_si512(h_prev.as_ptr().add(j * LANES64) as *const __m512i);
 
-                    let eq1 = _mm512_cmpeq_epi8_mask(t1_v, q_v);
-                    let mut diag1 = _mm512_mask_blend_epi8(
-                        eq1,
-                        _mm512_subs_epu8(d1, mispen_v),
-                        _mm512_adds_epu8(d1, mtch_v),
-                    );
-                    diag1 = _mm512_mask_blend_epi8(
-                        t1_is_n | q_is_n,
-                        diag1,
-                        _mm512_subs_epu8(d1, one_v),
-                    );
+                    let mut diag1 = score_diag(score_tbl, bias_v, t1_v, q_v, d1);
                     diag1 = _mm512_mask_blend_epi8(zpad_mask, diag1, d1);
-                    diag1 = _mm512_mask_blend_epi8(
-                        _mm512_cmpge_epu8_mask(t1_v, m_v) | q_pad,
-                        diag1,
-                        zero,
-                    );
+                    diag1 = _mm512_mask_blend_epi8(_mm512_movepi8_mask(t1_v) | q_pad, diag1, zero);
                     let mfe1 = _mm512_max_epu8(diag1, e_mid);
                     let h1 = _mm512_max_epu8(mfe1, f1);
-                    col1 = _mm512_mask_blend_epi8(_mm512_cmpgt_epu8_mask(h1, imax1), col1, j_v);
-                    imax1 = _mm512_max_epu8(imax1, h1);
+                    // ISSUE #44 part B, the free swap: the strict `>` mask is already needed for `col1`, and
+                    // `max_epu8(a, b)` IS `mask_blend(cmpgt_epu8(b, a), a, b)`, so reusing it costs no new
+                    // instruction and moves the max off p0, which is the port that binds at 512 bits, onto
+                    // p05 where `VPBLENDMB` runs at 2/cycle. Byte-identical by definition of max.
+                    let gt = _mm512_cmpgt_epu8_mask(h1, imax1);
+                    col1 = _mm512_mask_blend_epi8(gt, col1, j_v);
+                    imax1 = _mm512_mask_blend_epi8(gt, imax1, h1);
                     _mm512_storeu_si512(
                         e.as_mut_ptr().add(j * LANES64) as *mut __m512i,
                         _mm512_max_epu8(
@@ -4303,24 +4312,18 @@ unsafe fn fwd_local_sw_avx512_u8(
                 // Carried column index (bumped by `one_v` = set1_epi8(1)) and the row-invariant "target
                 // is N" mask; see `fwd_local_sw_neon_u8`.
                 let mut j_v = zero;
-                let t_is_n = _mm512_cmpeq_epi8_mask(t_v, four_v);
 
                 // Padding-free column range, same argument as every other kernel here.
                 for j in 0..n_fast {
                     let q_v = _mm512_loadu_si512(seq_q.as_ptr().add(j * LANES64) as *const __m512i);
-                    let eq = _mm512_cmpeq_epi8_mask(t_v, q_v);
-                    let n_mask = t_is_n | _mm512_cmpeq_epi8_mask(q_v, four_v);
-                    let add_match = _mm512_adds_epu8(h_diag_v, mtch_v);
-                    let sub_mis = _mm512_subs_epu8(h_diag_v, mispen_v);
-                    let sub_n = _mm512_subs_epu8(h_diag_v, one_v);
-                    let mut diag_v = _mm512_mask_blend_epi8(eq, sub_mis, add_match);
-                    diag_v = _mm512_mask_blend_epi8(n_mask, diag_v, sub_n);
+                    let diag_v = score_diag(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES64) as *const __m512i);
                     let mfe = _mm512_max_epu8(diag_v, e_v);
                     let h_v = _mm512_max_epu8(mfe, f_v);
+                    // Issue #44 part B, the free swap; see the pair body.
                     let is_new_row_max = _mm512_cmpgt_epu8_mask(h_v, imax_v);
                     imax_col_v = _mm512_mask_blend_epi8(is_new_row_max, imax_col_v, j_v);
-                    imax_v = _mm512_max_epu8(imax_v, h_v);
+                    imax_v = _mm512_mask_blend_epi8(is_new_row_max, imax_v, h_v);
                     _mm512_storeu_si512(h_cur.as_mut_ptr().add(j * LANES64) as *mut __m512i, h_v);
                     let e_new = _mm512_max_epu8(
                         _mm512_subs_epu8(e_v, e_del_v),
@@ -4341,19 +4344,12 @@ unsafe fn fwd_local_sw_avx512_u8(
                     let q_v = _mm512_loadu_si512(seq_q.as_ptr().add(j * LANES64) as *const __m512i);
                     // Same four masks as the AVX2 u8 kernel, now as `__mmask64`. Unsigned `>=` / `>` are
                     // native here, so no `max_epu8`-based recovery and no 127 hazard.
-                    let eq = _mm512_cmpeq_epi8_mask(t_v, q_v);
-                    let n_mask = t_is_n | _mm512_cmpeq_epi8_mask(q_v, four_v);
                     let zpad_mask = _mm512_cmpeq_epi8_mask(q_v, zpad_v);
-                    let pad_mask =
-                        _mm512_cmpge_epu8_mask(t_v, m_v) | _mm512_cmpgt_epu8_mask(q_v, zpad_v);
-
-                    let add_match = _mm512_adds_epu8(h_diag_v, mtch_v);
-                    let sub_mis = _mm512_subs_epu8(h_diag_v, mispen_v);
-                    let sub_n = _mm512_subs_epu8(h_diag_v, one_v);
-                    // `mask ? a : b` = `mask_blend(mask, b, a)`. Applied in increasing priority, exactly the
-                    // order the AVX2/NEON u8 kernels use.
-                    let mut diag_v = _mm512_mask_blend_epi8(eq, sub_mis, add_match);
-                    diag_v = _mm512_mask_blend_epi8(n_mask, diag_v, sub_n);
+                    // `PAD` is the only alphabet byte with bit 7 set, so the high-bit test replaces both
+                    // `t >= m` (which would now kill every real N target, re-encoded as 12) and
+                    // `q > ZPAD`.
+                    let pad_mask = _mm512_movepi8_mask(t_v) | _mm512_movepi8_mask(q_v);
+                    let mut diag_v = score_diag(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     diag_v = _mm512_mask_blend_epi8(zpad_mask, diag_v, h_diag_v);
                     diag_v = _mm512_mask_blend_epi8(pad_mask, diag_v, zero);
 
@@ -4361,9 +4357,10 @@ unsafe fn fwd_local_sw_avx512_u8(
                     let mfe = _mm512_max_epu8(diag_v, e_v);
                     let h_v = _mm512_max_epu8(mfe, f_v);
                     // Strict unsigned `>`, so a tie keeps the earlier column.
+                    // Issue #44 part B, the free swap; see the pair body.
                     let is_new_row_max = _mm512_cmpgt_epu8_mask(h_v, imax_v);
                     imax_col_v = _mm512_mask_blend_epi8(is_new_row_max, imax_col_v, j_v);
-                    imax_v = _mm512_max_epu8(imax_v, h_v);
+                    imax_v = _mm512_mask_blend_epi8(is_new_row_max, imax_v, h_v);
                     _mm512_storeu_si512(h_cur.as_mut_ptr().add(j * LANES64) as *mut __m512i, h_v);
 
                     let e_new = _mm512_max_epu8(
@@ -4812,12 +4809,21 @@ mod avx2_verify {
                     q[p] = (next() % 4) as u8;
                 }
             }
-            if next() % 4 == 0 {
+            // ISSUE #44 strengthened this, as #43 did for the AVX2/SSE4.1 generator: EVERY job now
+            // carries an N in BOTH query and target, plus a both-N cell, because the AVX-512 kernel
+            // now scores through the same XOR table with the target N re-encoded to `N_TARGET` (12)
+            // and the both-N index `4 ^ 12 = 8` is a slot the old blend form never had.
+            q[(next() as usize) % qlen] = 4;
+            t[(next() as usize) % tlen] = 4;
+            if next() % 3 == 0 {
                 q[(next() as usize) % qlen] = 4;
             }
-            if next() % 4 == 0 {
+            if next() % 3 == 0 {
                 t[(next() as usize) % tlen] = 4;
             }
+            let at = (next() as usize) % qlen;
+            q[at] = 4;
+            t[at.min(tlen - 1)] = 4;
             qbufs.push(q);
             tbufs.push(t);
         }
