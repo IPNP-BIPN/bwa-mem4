@@ -1029,6 +1029,54 @@ soit du code GPU, soit une sonde de plus, et restent ouverts dans l'issue. Le pi
 `N_TARGET = 12`) est deja couvert par les generateurs, qui tirent `% 5` et non `% 4`, et la nouvelle
 barriere d'ordre respecte la meme regle.
 
+## #55 etape 0 : bloquee, il n'y a pas de compilateur Metal sur cette machine (2026-08-08)
+
+L'issue interdit d'ecrire une ligne de Metal avant d'avoir repondu a une question : **MSL expose-t-il
+l'arithmetique entiere saturee ?** Le plafond annonce en depend directement, un `uchar4` a 4 cellules
+par thread donnant ~4 operations par cellule et ~2 Tcell/s, contre une emulation `min`/`max` qui en
+coute deux de plus par saturation.
+
+La question n'a pas pu etre tranchee ici, et c'est le resultat a consigner :
+
+* **le compilateur Metal n'est pas installe.** `xcrun -sdk macosx metal --version` rend
+  `unable to find utility "metal", not a developer tool or in PATH`, et il n'y a pas de
+  `/Applications/Xcode.app` : cette machine n'a que les Command Line Tools. Le microbenchmark MSL
+  autonome que l'issue demande **ne peut pas etre compile ici**, encore moins mesure. Installer Xcode
+  est donc le prealable materiel de toute la piste #55, au meme titre qu'une machine x86 l'est pour
+  #43 et #44 ;
+* **la specification n'a pas non plus tranche la question par la documentation.** Le miroir public de
+  la Metal Shading Language Specification atteignable d'ici est une traduction partielle : sa table
+  des fonctions entieres liste bien `addsat(T x, T y)` mais s'arrete avant `subsat`, et le PDF
+  officiel d'Apple depasse la taille que l'outil de recuperation accepte. **Donc : `addsat` semble
+  exister, `subsat` n'est pas confirme, et rien n'est confirme sur les types vectoriels comme
+  `uchar4`.** Cela s'affirme depuis un compilateur, pas depuis un moteur de recherche.
+
+### Ce qui change dans le calcul si `subsat` manque
+
+L'emulation existe et elle est exacte, ce n'est pas un obstacle de correction :
+
+```
+subsat_u(x, y) = x - min(x, y)          // non signe, exact
+addsat_u(x, y) = x + min(y, MAX - x)    // non signe, exact
+```
+
+Mais elle coute **une operation de plus par soustraction saturee**, et le corps de colonne du noyau
+de rescue en compte quatre par ligne sur un total de treize operations vectorielles (releve du
+desassemblage NEON, section #45). Une emulation ferait donc passer ce corps de 13 a 17 operations,
+soit **+31 %**, et le plafond de 2 Tcell/s annonce par l'issue tomberait dans la meme proportion. Ce
+n'est pas fatal (le besoin est de 33 a 116 Gcell/s), mais **le chiffre de l'issue est a corriger de
++31 % dans le pire cas**, et il ne peut pas etre publie tel quel avant que le microbenchmark
+tranche.
+
+### Le protocole exact a executer quand Xcode sera la
+
+1. compiler un `.metal` autonome qui utilise `addsat` et `subsat` sur `uchar4`, `ushort4` et `int` ;
+2. si la compilation echoue sur `subsat`, refaire la variante emulee et **compter les instructions
+   dans l'AIR / l'assembleur GPU**, pas dans le source : la lecon de #48 est que le compilateur
+   applique deja des reecritures que le comptage au niveau du source attribue au developpeur ;
+3. mesurer les trois variantes (`uchar4` sature, `ushort4` emule, `int` une cellule par voie) et ne
+   choisir l'architecture qu'ensuite.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
