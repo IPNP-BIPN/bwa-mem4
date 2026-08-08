@@ -837,6 +837,13 @@ fn dispatch_bins(
     const MAX_SEQ_LEN16: usize = 32768;
     // Largest single-cell score the matrix can award, feeding `cell_bound`'s worst case.
     let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
+    // Headroom the kernels' BIASED substitution form needs on top of the value ceiling. They compute
+    // `(m + (bias + score)) - bias`, so on the saturating u8 path the intermediate `m + bias + a`
+    // must not clip at 255 or the sub would take the bias off a saturated value and land low. `bias`
+    // is the larger penalty magnitude, exactly as the kernel derives it. Costs nothing in practice:
+    // for bwa's defaults it is 5 (bias 4, a 1), and a job whose cell bound is within 5 of 256 would
+    // need a ~250-base perfect match, which is far past where these bins already send work to i16.
+    let sbt_headroom = (-i32::from(mat[1])).max(-i32::from(mat[m - 1])).max(0) + max_sc;
 
     // Job indices per bin, in ascending order, partitioning `0..jobs.len()` exactly once.
     let (mut u8_idx, mut i16_idx, mut sc_idx) = (Vec::new(), Vec::new(), Vec::new());
@@ -845,9 +852,12 @@ fn dispatch_bins(
         // lengths (column and row indices are stored in lanes too).
         let minval = cell_bound(job, max_sc);
         let (qlen, tlen) = (job.query.len(), job.target.len());
-        if qlen < U8_LEN && tlen < U8_LEN && minval < U8_LEN as i32 {
+        if qlen < U8_LEN && tlen < U8_LEN && minval + sbt_headroom < U8_LEN as i32 {
             u8_idx.push(k);
-        } else if qlen < MAX_SEQ_LEN16 && tlen < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16 as i32 {
+        } else if qlen < MAX_SEQ_LEN16
+            && tlen < MAX_SEQ_LEN16
+            && minval + sbt_headroom < MAX_SEQ_LEN16 as i32
+        {
             i16_idx.push(k);
         } else {
             sc_idx.push(k);
@@ -1426,10 +1436,29 @@ macro_rules! define_sw_kernel {
             // via saturating add, `sbt_neg` (mismatch `|mm|` / ambiguous `|npen|`) via saturating
             // sub. For the signed kernels `(m + pos) - neg == m + score` exactly (no wrap), so this
             // is byte-identical; for u8 it is bwa-mem2's `MAIN_CODE8_CORE`.
-            let a_pos_v = $dup(mat[0] as $elem); // a >= 0
-            let mm_mag_v = $dup((-(i32::from(mat[1]))) as $elem); // |mm|
-            let npen_mag_v = $dup((-(i32::from(mat[m - 1]))) as $elem); // |npen|
             let amb_v = $dup(4); // code 4 = N; codes are 0..=4
+                                 // BIASED substitution scores, one value per case instead of a (positive, negative) pair.
+                                 // `bias` is the smallest shift making all three non-negative, i.e. the larger of the two
+                                 // penalties' magnitudes, so `bias + score` fits an unsigned lane and the recurrence is
+                                 // `(m + (bias + score)) - bias`. That is one buffer where the split form needed two: the
+                                 // pre-pass writes half as much and the DP body loads half as much.
+                                 //
+                                 // Byte-identical in both lane types. For the signed kernels the arithmetic is plain, so
+                                 // `(m + bias + score) - bias == m + score` outright. For u8 the ops saturate, and the
+                                 // identity needs `m + bias + a <= 255` so the add cannot clip before the sub takes the
+                                 // bias back off; `dispatch_bins` reserves exactly that headroom when it chooses the bin
+                                 // (see its `bias + max_sc` term), and the assert below is the other half of that contract.
+            let bias = (-i32::from(mat[1])).max(-i32::from(mat[m - 1])).max(0);
+            let sbt_bias_v = $dup(bias as $elem);
+            let sbt_match_v = $dup((bias + i32::from(mat[0])) as $elem); // bias + a
+            let sbt_mism_v = $dup((bias + i32::from(mat[1])) as $elem); // bias - |mm|
+            let sbt_npen_v = $dup((bias + i32::from(mat[m - 1])) as $elem); // bias - |npen|
+            debug_assert!(
+                bias + i32::from(mat[0]) >= 0
+                    && bias + i32::from(mat[1]) >= 0
+                    && bias + i32::from(mat[m - 1]) >= 0,
+                "biased substitution scores must be non-negative"
+            );
 
             // Per-chunk DP scratch, allocated once and reused across chunks (clear+resize keeps the
             // capacity, so it grows to the largest chunk's size then stops reallocating). Byte-safe:
@@ -1444,8 +1473,7 @@ macro_rules! define_sw_kernel {
             // separate per-row loop and loading it in the DP body lifts ~7 vector ALU ops off the
             // serial H/E/F critical path, where on x86 (fewer vector-ALU ports than lanes) they
             // otherwise contend with the recurrence. Byte-identical: same values, only reordered.
-            let mut sbt_pos_buf: Vec<$elem> = Vec::new();
-            let mut sbt_neg_buf: Vec<$elem> = Vec::new();
+            let mut sbt_buf: Vec<$elem> = Vec::new();
 
             // =======================================================================
             // One chunk = one register's worth of independent alignments.
@@ -1494,10 +1522,8 @@ macro_rules! define_sw_kernel {
                 tcode.clear();
                 tcode.resize((max_t + 1) * LANES, 0 as $elem);
                 // Same column layout as `qcode`; refilled per row by the substitution pre-pass.
-                sbt_pos_buf.clear();
-                sbt_pos_buf.resize(stride * LANES, 0 as $elem);
-                sbt_neg_buf.clear();
-                sbt_neg_buf.resize(stride * LANES, 0 as $elem);
+                sbt_buf.clear();
+                sbt_buf.resize(stride * LANES, 0 as $elem);
                 for l in 0..nlane {
                     for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
                         qcode[ju * LANES + l] = c as $elem;
@@ -1623,11 +1649,10 @@ macro_rules! define_sw_kernel {
                         let q_v = $lds(qcode.as_ptr().add(col_base));
                         let is_eq = $ceq(t_v, q_v);
                         let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                        // Byte-for-byte the expressions from the old inline block, unmoved.
-                        let sbt_pos = $bsl(is_n, zero_v, $bsl(is_eq, a_pos_v, zero_v));
-                        let sbt_neg = $bsl(is_n, npen_mag_v, $bsl(is_eq, zero_v, mm_mag_v));
-                        $sts(sbt_pos_buf.as_mut_ptr().add(col_base), sbt_pos);
-                        $sts(sbt_neg_buf.as_mut_ptr().add(col_base), sbt_neg);
+                        // One biased value per cell: N wins over the equality test, exactly as the
+                        // split form's `is_n` blend sat outermost on both halves.
+                        let sbt = $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v));
+                        $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
                     }
 
                     // The shared column loop over the union band. Every lane executes every column;
@@ -1650,10 +1675,11 @@ macro_rules! define_sw_kernel {
                         // per lane.
                         let band = $andu(active_v, $andu($cge(j_v, beg_v), $clt(j_v, end_v)));
 
-                        // Substitution scores for this column, precomputed by the pre-pass above.
-                        // Two loads replace the ~7 ALU ops that used to sit on the critical path here.
-                        let sbt_pos = $lds(sbt_pos_buf.as_ptr().add(col_base));
-                        let sbt_neg = $lds(sbt_neg_buf.as_ptr().add(col_base));
+                        // This column's biased substitution score, from the pre-pass above. One
+                        // load replaces the ~7 ALU ops that used to sit on the critical path here,
+                        // and, since the pre-pass went from a pair of values to one, half the loads
+                        // and half the stores the pre-pass form originally cost.
+                        let sbt = $lds(sbt_buf.as_ptr().add(col_base));
 
                         let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
                                                                      // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
@@ -1669,9 +1695,10 @@ macro_rules! define_sw_kernel {
                         // how an out-of-band lane is left untouched.
                         $sts(eh_h.as_mut_ptr().add(col_base), $bsl(band, h1_v, m_v));
 
-                        // M = ((m + sbt_pos) - sbt_neg); m==0 -> local restart (0). Saturating for
-                        // u8, plain for signed; identical either way in the guaranteed range.
-                        let bigm_pre = $sub($add(m_v, sbt_pos), sbt_neg);
+                        // M = ((m + (bias + score)) - bias); m==0 -> local restart (0). Saturating
+                        // for u8, plain for signed; identical either way in the guaranteed range,
+                        // which for u8 is what `dispatch_bins` reserves headroom for.
+                        let bigm_pre = $sub($add(m_v, sbt), sbt_bias_v);
                         // The local restart: `ceqz` finds the lanes whose diagonal predecessor was
                         // already 0 and forces M back to 0 there (`ksw.cpp:487`,
                         // `bandedSWA.cpp:334-335` which does the same `cmpeq h00, zero` + blend).
