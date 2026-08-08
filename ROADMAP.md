@@ -410,6 +410,60 @@ des quatre bases reelles. Le N etait couvert bout en bout (le genome en est plei
 unitaire, ce qui laissait un noyau oubliant la reparation echouer sur un md5 de genome entier plutot
 que dans `cargo test`.
 
+### Ce qui a bien mieux marche : supprimer la reparation au lieu de la sauter (2026-08-08)
+
+La bonne question n'etait pas "quand peut-on sauter le melange" mais "pourquoi la table se trompe".
+Elle se trompe sur une seule cellule, N contre N, parce que `4 XOR 4 = 0` tombe sur le creneau
+d'appariement. En **encodant le N de la cible comme 12** au moment de l'empaquetage, la collision
+disparait et chaque cas obtient son creneau :
+
+| index | cas |
+|---|---|
+| 0-3 | bases reelles : appariement / mesappariement |
+| 4-7 | N de requete contre base reelle |
+| **8** | **N contre N**, desormais son propre creneau |
+| 12-15 | N de cible contre base reelle |
+| 9 | ZPAD, ecrase par le melange zpad, indifferent |
+| >= 16 | PAD, `vqtbl1q` rend 0 |
+
+La table a 16 creneaux et six servaient. La reparation est supprimee des trois corps (quadruplet,
+paire, ligne seule), le cout part dans une comparaison par base de cible a l'empaquetage : 1400 fois
+par groupe au lieu de 1400 x 148 x 4.
+
+**-7,2 % sur le noyau** (14,90 s de CPU contre 16,05, trois repetitions, dispersion 0,3 %), soit 10,34
+Gcell/s contre 9,60. Pres de trois fois le quadruplet. NEON seulement : les noyaux u8 x86 n'ont jamais
+adopte la table indexee par XOR, ils scorent par `(t == 4) | (q == 4)` et un melange, donc il n'y a
+aucun creneau a donner au N contre N ni rien a reutiliser.
+
+### Le DP principal : la meme forme biaisee, et un resultat decevant
+
+Le DP bande gardait le score coupe en deux, partie positive par addition et negative par soustraction,
+parce qu'une voie u8 ne porte pas de negatif : deux tampons, deux ecritures dans la pre-passe, deux
+lectures dans le corps. La forme biaisee du rescue les ramene a un. Ecrit une fois dans
+`define_sw_kernel!`, donc les huit instanciations (NEON, AVX2, SSE4.1, AVX-512, en u8 et i16) en
+heritent. La contrainte u8 (`m + biais + a` ne doit pas plafonner a 255 avant que la soustraction
+reprenne le biais) est reservee par `dispatch_bins` au moment de choisir le bin ; elle vaut 5 pour les
+defauts de bwa et ne deplace aucun travail reel.
+
+Estimation avant mesure : ~12 % du noyau DP, soit ~2,4 % bout en bout. **Reel : 0,4 %, 5 victoires sur
+6.** Les operations retirees ne sont pas sur le chemin critique, c'est la chaine serie de F qui l'est,
+donc les enlever ne rend presque rien. Garde parce que c'est strictement moins de travail pour une
+sortie identique, et parce que la pre-passe existe justement a cause du x86 (moins de ports vectoriels
+que de voies), ou l'effet devrait etre plus grand et n'est pas mesurable ici. Mais le chiffre a citer
+est 0,4 %, pas l'estimation.
+
+### La serie complete, un seul banc
+
+`-t4`, 500k paires reelles contre GRCh38, secondes CPU, six repetitions entrelacees, dispersion 0,5 % :
+
+| binaire | medianes | contre le precedent |
+|---|---|---|
+| quadruplet seul | 105,24 s | reference |
+| + creneau N | **102,34 s** | **-2,76 %, 6 victoires sur 6** |
+| + DP biaise | **101,99 s** | -0,34 %, 5 victoires sur 6 |
+
+Sortie octet-identique a chaque etape, sur GRCh38 et sur chr21.
+
 ## AVX-512 : correct, jamais chronometre, et pourquoi (2026-08-07)
 
 Etat separe en deux, parce que les deux reponses sont differentes.
