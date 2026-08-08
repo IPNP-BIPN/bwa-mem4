@@ -547,6 +547,81 @@ Question restee ouverte, faute d'avoir fini l'etat de l'art : **quelqu'un a-t-il
 par coeur depassant 10,4 Gcell/s sur des voies de 128 bits, pour du Smith-Waterman local a gaps
 affines avec second meilleur score ?**
 
+## Etat de l'art : personne ne fait mieux a contrat de sortie egal (2026-08-08)
+
+Question laissee ouverte par la recherche multi-agents (son agent "etat de l'art" n'a pas fini) :
+**quelqu'un a-t-il publie un chiffre par coeur depassant nos 10,4 Gcell/s, pour du Smith-Waterman
+local a gaps affines ?** Recherche refaite a la main.
+
+La seule metrique qui permet de comparer des horloges et des largeurs de vecteur differentes est
+**cellules par cycle et par 128 bits**. Comparer des GCUPS bruts entre un KNL a 1,4 GHz et un M4 a
+4 GHz ne veut rien dire.
+
+| implementation | annee | disposition | largeur | cell/cycle/128 bits | ce qu'elle calcule |
+|---|---|---|---|---|---|
+| **SWIPE** (Rognes) | 2011 | inter-sequence | SSE 128 | **3,41** | **le score maximum, rien d'autre** |
+| **bwa-mem4**, plafond registres | 2026 | inter-sequence | NEON 128 | **4,00** | score, te, qe, score2, te2 |
+| **bwa-mem4**, livre | 2026 | inter-sequence | NEON 128 | **2,60** | score, te, qe, score2, te2 |
+| SWIMM 2.0 (Rucci), KNL | 2018 | inter-sequence | AVX-512 | ~1,34 | score maximum |
+| SWIMM 2.0, bi-Skylake | 2018 | inter-sequence | AVX-512 | ~1,3 | score maximum |
+| Parasail (Daily) | 2016 | **striped** | AVX2 256 | ~1,23 | score maximum |
+
+Incertitudes signalees : le nombre de coeurs et l'horloge de Parasail (bi-E5-2670 "24 coeurs",
+donc des v3 a 2,3 GHz) et le modele exact du serveur bi-Skylake de SWIMM 2.0 sont deduits, pas
+confirmes. Les autres chiffres sont dans les papiers.
+
+### Le seul qui nous depasse, et pourquoi ca ne compte pas tel quel
+
+**SWIPE : 9,1 GCUPS mono-thread a 2,67 GHz, soit 3,41 cellules/cycle en 128 bits.** Le papier
+l'ecrit lui-meme : "more than 3.3 cells per physical core in each clock cycle". Boucle interne de
+**10 instructions** contre nos ~15,75 par ligne de 16 cellules.
+
+Mais SWIPE **ne calcule que le score maximum**. Le papier est explicite : *"a later version that at
+least computes the actual alignments (not just the alignment score) [...] is planned"*. Ni
+coordonnees de fin, ni colonne d'argmax, ni second meilleur score.
+
+Nos ~5,75 operations de plus par ligne sont exactement ce que ce contrat de sortie coute : le suivi
+de l'argmax par cellule (3 operations), la publication du maximum de ligne pour `score2`, et la
+retenue E qui passe par la memoire. Ce sont des sorties dont `mem_matesw` a besoin, pas du gras.
+
+**A contrat de sortie egal, aucun chiffre publie ne nous depasse.** Et notre propre plafond registres
+mesure, 4,00 cellules/cycle, est **au-dessus** des 3,41 de SWIPE tout en produisant cinq sorties au
+lieu d'une.
+
+### Corroboration inattendue, vieille de quinze ans
+
+SWIPE calcule en **7 bits biaises de 128, avec des operations signees saturantes** (`paddsb`,
+`psubsb`, `pmaxub`) et extrait le score de substitution par **`pshufb` sur un profil temporaire**.
+C'est trait pour trait la representation "bias-128 signed-8" plus table XOR que la recherche a
+proposee pour le portage x86 (issue nº43), trouvee independamment. Rognes avait raison en 2011 et nos
+noyaux x86 ne l'ont jamais fait.
+
+### Le comparatif le plus direct qui existe : le BSW de bwa-mem2 lui-meme
+
+Le papier IPDPS 2019 de Vasimuddin, Misra, Li et Aluru donne, pour **le meme algorithme et le meme
+contrat de sortie que nous**, sur Xeon Platinum 8180 en AVX-512 8 bits :
+
+| | bwa-mem2 BSW | bwa-mem4 |
+|---|---|---|
+| IPC | 2,17 (limite par 2 ports SIMD, effet p0 documente plus haut) | 3,8 op/cycle mesure |
+| part du temps en calcul de cellules | **43 %** | la sonde ne mesure que le noyau |
+| cellules utiles / cellules calculees | **~50 %**, soit une taxe de divergence de **2x** | **1,04x** (`batched`), **1,09x** (`matesw`) |
+| part du temps en cellules utiles | **21,5 %** | |
+
+Leur pre-traitement AoS vers SoA pese 33 % du temps du noyau et leurs deux ajustements de bande 24 %.
+Autrement dit, la reference dont nous devons reproduire la sortie octet pour octet passe **quatre
+cinquiemes de son temps de BSW ailleurs que dans des cellules utiles**. Notre taxe de divergence est
+deux fois plus faible que la leur d'un facteur ~2.
+
+### Ce que ca ferme, et ce que ca n'ouvre pas
+
+Ferme : la question de savoir si nous laissons un facteur connu sur la table. Non. Sur 128 bits, a
+sorties egales, la litterature ne fait pas mieux, et l'ecart avec le seul chiffre superieur (SWIPE)
+s'explique entierement par ce qu'il ne calcule pas.
+
+N'ouvre rien de neuf : le champ CPU s'est arrete vers 2018, l'essentiel de l'activite recente est
+GPU (CUDASW++ 4.0, 2024) et donc hors sujet pour une comparaison par coeur.
+
 ## AVX-512 : correct, jamais chronometre, et pourquoi (2026-08-07)
 
 Etat separe en deux, parce que les deux reponses sont differentes.
