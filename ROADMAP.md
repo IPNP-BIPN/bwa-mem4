@@ -877,6 +877,51 @@ l'est. Deux consequences pour la suite :
   peut pas se debarrasser tout seul puisqu'elles traversent deux boucles. Il reste aussi le plus
   risque, pour la raison enumeree dans l'issue.
 
+## #50B : les fenetres de rescue ne se chevauchent pas, le 15 % n'existe pas (2026-08-08)
+
+L'issue demandait explicitement de **mesurer avant d'implementer**. C'est fait, avec une sonde
+permanente, `BWA4_RESCUE_CLUSTER`, et la reponse est nette : la distribution est fine, donc le levier
+n'a pas de matiere.
+
+La sonde prend, par appel de noyau, les coordonnees de reference de toutes les fenetres de rescue,
+les trie, forme les grappes de chevauchement sur un meme contig, et facture la contre-proposition de
+l'issue (`W + A * 271` lignes par grappe de `A` fenetres couvrant `W` bases) contre les lignes que le
+noyau parcourt reellement.
+
+| | 500 k paires 150 bp, `genome.fa` | 500 k paires 49 bp, chr21 |
+|---|---|---|
+| fenetres | 144 617 | 647 290 |
+| grappes de chevauchement | 133 591 | 589 292 |
+| **A moyen** | **1,08** | **1,10** |
+| A maximal | 14 | 192 |
+| fenetres seules dans leur grappe | **86,5 %** | **84,8 %** |
+| fenetres dans une grappe de A >= 4 | 1,7 % | 2,8 % |
+
+Le plafond du levier, calcule en n'appliquant le partage qu'aux grappes de `A >= 2` et en laissant
+les solitaires sur le chemin actuel :
+
+| | 150 bp | 49 bp |
+|---|---|---|
+| lignes dans des grappes A >= 2 | 13,5 % du total | 15,2 % |
+| lignes du noyau apres partage | **1,0120x** | **0,9993x** |
+
+Donc **+1,2 % de lignes de noyau au mieux, et -0,07 % sur l'autre jeu**, avant tout cout
+d'implementation, sur un noyau qui represente lui-meme 10 a 25 % de la course. Le +15 % annonce
+supposait `A = 50` dans une grappe de 3 kb ; cette forme existe (le A maximal est 192 sur chr21) mais
+elle concerne moins de 1 % des fenetres. Applique a tout le monde, le partage serait **plus cher** que
+le code actuel (0,72x), parce qu'une grappe solitaire paierait `W + 271` lignes la ou elle en paie
+`W`.
+
+Rien n'est implemente, et c'est le resultat attendu de l'issue. Seule la sonde est livree.
+
+**Le levier #50A reste ouvert** et n'a rien a voir avec le chevauchement : la passe inverse
+(`KSW_XSTART`) dimensionne son `rowmax`, son eparpillement scalaire et son `extract_group` sur
+`te + 1` alors que son `endsc` se declenche toujours (la preuve de l'issue est correcte : le `gmax`
+de la passe inverse vaut exactement `score`, donc elle gele toujours). C'est un travail de
+dimensionnement de tampon, mesurable independamment, et il faudra le confronter au resultat de #46B :
+`extract_group` ne coute rien une fois incorpore, donc sur les trois couts que #50A cite, le
+troisieme est deja nul et il reste l'allocation et l'eparpillement.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

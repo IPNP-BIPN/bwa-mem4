@@ -902,6 +902,145 @@ pub mod rescue_rounds {
         }
     }
 
+    /// Rescue windows seen, and rows the kernel actually walked for them.
+    pub static WIN_COUNT: AtomicU64 = AtomicU64::new(0);
+    pub static WIN_ROWS: AtomicU64 = AtomicU64::new(0);
+    /// Rows a window-sharing kernel would walk instead: per overlap cluster, `W + A * T_BOUND`.
+    pub static SHARED_ROWS: AtomicU64 = AtomicU64::new(0);
+    /// Overlap clusters, and the histogram of their size `A` (windows per cluster).
+    pub static CLUSTERS: AtomicU64 = AtomicU64::new(0);
+    pub static CLUSTER_A: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    /// Windows lying in a cluster of each size, so the histogram can be weighted by work.
+    pub static CLUSTER_A_WIN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    pub static CLUSTER_A_MAX: AtomicU64 = AtomicU64::new(0);
+    /// The same two totals restricted to clusters of `A >= 2`, i.e. the only ones a shared DP could
+    /// help. Singletons are left on today's path in that accounting.
+    pub static WIN_ROWS_MULTI: AtomicU64 = AtomicU64::new(0);
+    pub static SHARED_ROWS_MULTI: AtomicU64 = AtomicU64::new(0);
+
+    /// Upper edges of the cluster-size histogram: 1, 2-3, 4-7, 8-15, 16-31, 32+.
+    pub const A_EDGES: [u64; 6] = [1, 3, 7, 15, 31, u64::MAX];
+
+    /// The alignment-span bound of issue #50: an alignment reaching `minsc` cannot span more than
+    /// this many target rows under bwa's defaults. Used here only to price the counterfactual, never
+    /// to truncate anything.
+    pub const T_BOUND: u64 = 271;
+
+    /// Whether `BWA4_RESCUE_CLUSTER` is set. Read once and cached.
+    pub fn cluster_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_CLUSTER").is_some())
+    }
+
+    /// Record one kernel call's rescue windows as `(rid, begin, end)` on the reference, and price
+    /// the window-sharing counterfactual of issue #50B against them.
+    ///
+    /// Windows are clustered by overlap on the same contig: sorted by `(rid, begin)`, a window joins
+    /// the running cluster when it starts at or before the cluster's current end. For a cluster of
+    /// `A` windows spanning `W` reference bases, today's kernel walks the sum of the windows' own
+    /// lengths, while a shared-DP kernel would walk `W + A * T_BOUND` rows. The ratio of the two
+    /// totals is the ceiling on what #50B could win, before any implementation cost.
+    pub fn record_windows(win: &mut Vec<(i32, i64, i64)>) {
+        if !cluster_enabled() || win.is_empty() {
+            return;
+        }
+        win.sort_unstable();
+        WIN_COUNT.fetch_add(win.len() as u64, Ordering::Relaxed);
+        WIN_ROWS.fetch_add(
+            win.iter().map(|&(_, b, e)| (e - b).max(0) as u64).sum(),
+            Ordering::Relaxed,
+        );
+        let (mut c_rid, mut c_beg, mut c_end, mut c_a) = (win[0].0, win[0].1, win[0].2, 0u64);
+        let mut c_rows = 0u64;
+        let flush = |rid: i32, beg: i64, end: i64, a: u64, rows: u64| {
+            let _ = rid;
+            CLUSTERS.fetch_add(1, Ordering::Relaxed);
+            let shared = (end - beg).max(0) as u64 + a * T_BOUND;
+            SHARED_ROWS.fetch_add(shared, Ordering::Relaxed);
+            if a >= 2 {
+                WIN_ROWS_MULTI.fetch_add(rows, Ordering::Relaxed);
+                SHARED_ROWS_MULTI.fetch_add(shared, Ordering::Relaxed);
+            }
+            let b = A_EDGES.iter().position(|&e| a <= e).unwrap_or(5);
+            CLUSTER_A[b].fetch_add(1, Ordering::Relaxed);
+            CLUSTER_A_WIN[b].fetch_add(a, Ordering::Relaxed);
+            CLUSTER_A_MAX.fetch_max(a, Ordering::Relaxed);
+        };
+        for &(rid, beg, end) in win.iter() {
+            if rid == c_rid && beg <= c_end {
+                c_end = c_end.max(end);
+                c_a += 1;
+                c_rows += (end - beg).max(0) as u64;
+            } else {
+                flush(c_rid, c_beg, c_end, c_a, c_rows);
+                c_rid = rid;
+                c_beg = beg;
+                c_end = end;
+                c_a = 1;
+                c_rows = (end - beg).max(0) as u64;
+            }
+        }
+        flush(c_rid, c_beg, c_end, c_a, c_rows);
+    }
+
+    /// Print the clustering result, once, after the workers have joined. No-op unless enabled.
+    pub fn dump_clusters() {
+        if !cluster_enabled() {
+            return;
+        }
+        let (w, rows, shared, cl) = (
+            WIN_COUNT.load(Ordering::Relaxed),
+            WIN_ROWS.load(Ordering::Relaxed),
+            SHARED_ROWS.load(Ordering::Relaxed),
+            CLUSTERS.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "[rescue-cluster] {w} windows in {cl} overlap clusters, mean A = {:.2}, largest A = {}",
+            w as f64 / cl.max(1) as f64,
+            CLUSTER_A_MAX.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "[rescue-cluster] rows walked {rows}, shared-DP counterfactual {shared} \
+             (W + A*{T_BOUND} per cluster) -> {:.2}x",
+            rows as f64 / shared.max(1) as f64
+        );
+        let (rm, sm) = (
+            WIN_ROWS_MULTI.load(Ordering::Relaxed),
+            SHARED_ROWS_MULTI.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "[rescue-cluster] restricted to A >= 2 clusters: rows {rm} ({:.1}% of all), shared {sm} \
+             -> whole-kernel rows {:.4}x",
+            100.0 * rm as f64 / rows.max(1) as f64,
+            rows as f64 / (rows - rm + sm).max(1) as f64
+        );
+        eprintln!(
+            "[rescue-cluster] {:>10}  {:>10}  {:>12}  {:>7}",
+            "A", "clusters", "windows", "%_win"
+        );
+        let mut lo = 1u64;
+        for b in 0..A_EDGES.len() {
+            let (c, j) = (
+                CLUSTER_A[b].load(Ordering::Relaxed),
+                CLUSTER_A_WIN[b].load(Ordering::Relaxed),
+            );
+            let label = if A_EDGES[b] == u64::MAX {
+                format!("{lo}+")
+            } else if A_EDGES[b] == lo {
+                format!("{lo}")
+            } else {
+                format!("{lo}-{}", A_EDGES[b])
+            };
+            if c != 0 {
+                eprintln!(
+                    "[rescue-cluster] {label:>10}  {c:>10}  {j:>12}  {:>6.1}%",
+                    100.0 * j as f64 / w.max(1) as f64
+                );
+            }
+            lo = A_EDGES[b].saturating_add(1);
+        }
+    }
+
     /// Record one chunk's round depth.
     pub fn record_chunk(max_rounds: usize) {
         if !enabled() {
@@ -1086,6 +1225,19 @@ pub fn batch_mate_rescue(
         // tests; it has not been re-derived here.
         // The number this probe exists for: how many jobs this round's single kernel call carries.
         rescue_rounds::record_call(round, jobs.len());
+        // Issue #50B asks whether the rescue windows of one kernel call overlap enough for a shared
+        // DP to be worth writing. That is a property of the data, so it gets measured before
+        // anything is implemented. Reference coordinates come from the `Orient`s, not from the jobs,
+        // which carry only slices.
+        if rescue_rounds::cluster_enabled() {
+            let mut win: Vec<(i32, i64, i64)> = Vec::with_capacity(jobs.len());
+            for (_, _, call) in &calls {
+                for o in call.per_r.iter().flatten() {
+                    win.push((call.rid, o.rb, o.rb + o.target.len() as i64));
+                }
+            }
+            rescue_rounds::record_windows(&mut win);
+        }
         // `alns`: one result per job, index-aligned with `jobs`.
         let alns = batched_ksw_align2(
             &jobs,
