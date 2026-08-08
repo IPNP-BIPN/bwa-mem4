@@ -1381,7 +1381,10 @@ fn clamp_band(
 ///   `$ldu` load a vector of `$umask` (mask arrays); `$add`/`$sub` lane-wise add/subtract
 ///   (**saturating for u8**, wrapping for i16, see the invariants below); `$max` lane-wise maximum
 ///   (unsigned for u8, signed for i16); `$ceqz` "lane == 0" to an all-ones/all-zero mask;
-///   `$cge`/`$clt`/`$ceq` the >=, <, == compares in the element's signedness; `$orru`/`$andu`
+///   `$cge`/`$ceq` the >= and == compares in the element's signedness; `$band` the fused
+///   `(j >= beg) & (j < end)` band test, per ISA because its best spelling differs (issue #48C),
+///   and `$bbias` the constant XOR-ed into `j`/`beg`/`end` to make that spelling legal (0x80 for
+///   the AVX2 and SSE4.1 u8 kernels, 0 everywhere else); `$orru`/`$andu`
 ///   bitwise or/and on masks; `$bsl(mask, a, b)` = per-lane `mask ? a : b`.
 ///
 /// # Invariants the caller must uphold
@@ -1404,9 +1407,10 @@ macro_rules! define_sw_kernel {
             $name:ident, $elem:ty, $umask:ty, $lanes:expr, feat = $feat:literal,
             dup = $dup:path, lds = $lds:path, sts = $sts:path, ldu = $ldu:path,
             add = $add:path, sub = $sub:path, max = $max:path,
-            ceqz = $ceqz:path, cge = $cge:path, clt = $clt:path,
+            ceqz = $ceqz:path, cge = $cge:path,
             ceq = $ceq:path, orru = $orru:path,
-            andu = $andu:path, bsl = $bsl:path
+            andu = $andu:path, bsl = $bsl:path,
+            band = $band:path, band_bias = $bbias:expr
         ) => {
         /// # Safety
         /// Requires the `$feat` target feature; all vector loads/stores use fixed-size
@@ -1659,8 +1663,10 @@ macro_rules! define_sw_kernel {
                     let mut active_lane = [0 as $umask; LANES];
                     for l in 0..nlane {
                         if active[l] {
-                            beg_lane[l] = beg[l] as $elem;
-                            end_lane[l] = end[l] as $elem;
+                            // XOR-ed into signed space when `$bbias` is non-zero (issue #48C).
+                            // Free here: these two scalar stores happen once per row anyway.
+                            beg_lane[l] = (beg[l] as $elem) ^ ($bbias as $elem);
+                            end_lane[l] = (end[l] as $elem) ^ ($bbias as $elem);
                             // All-ones = "true" in the blend/and convention used throughout.
                             active_lane[l] = <$umask>::MAX;
                         }
@@ -1714,7 +1720,19 @@ macro_rules! define_sw_kernel {
                         // band = active && beg <= j < end, as an all-ones/all-zero mask per lane.
                         // Two compares rather than a shift-based window because `beg`/`end` differ
                         // per lane.
-                        let band = $andu(active_v, $andu($cge(j_v, beg_v), $clt(j_v, end_v)));
+                        //
+                        // ISSUE #48C. `$band` is the per-ISA spelling of `(j >= beg) & (j < end)`,
+                        // because the good spelling is not the same everywhere and the disassembly
+                        // says so: AVX2 and SSE4.1 have no unsigned byte compare, so the portable
+                        // form is emulated as two `vpmaxub` plus two `vpcmpeqb` plus an `vpandn`,
+                        // about 6 of the 54 instructions in their column loop. XOR-ing `j`, `beg`
+                        // and `end` by 0x80 (an order-preserving bijection between u8 and i8) makes
+                        // the native signed `vpcmpgtb` legal and takes it to two compares and one
+                        // `vpandn`. AVX-512 needs none of this: it has `vpcmpltub` and LLVM already
+                        // emits it, which is why its column loop is 38 instructions and its
+                        // `band_bias` is 0. NEON likewise has native `vcgeq_u8`/`vcltq_u8`.
+                        let j_band_v = $dup((j as $elem) ^ ($bbias as $elem));
+                        let band = $andu(active_v, $band(j_band_v, beg_v, end_v));
 
                         // This column's biased substitution score, from the pre-pass above. One
                         // load replaces the ~7 ALU ops that used to sit on the critical path here,
@@ -1767,7 +1785,7 @@ macro_rules! define_sw_kernel {
                         // two blends below should replace.
                         let upd = $andu(band, $cge(h_v, rowmax_v));
                         rowmax_v = $bsl(upd, h_v, rowmax_v);
-                        mj_v = $bsl(upd, $dup(j as $elem), mj_v);
+                        mj_v = $bsl(upd, j_v, mj_v);
 
                         // e = max(e - e_del, max(M - oe_del, 0)); bandedSWA's MAIN_CODE16 opens the
                         // gap from `m11`, not `h11` (`bandedSWA.cpp:342-345`). The explicit
@@ -1891,6 +1909,20 @@ macro_rules! define_sw_kernel {
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use super::{clamp_band, default_result};
+
+    /// `(j >= beg) & (j < end)` for the NEON u8 kernel. NEON has native UNSIGNED byte compares, so
+    /// the portable form is already one instruction each and `band_bias` is 0: the signed rewrite of
+    /// issue #48C is an x86 fix, not a portable one.
+    #[target_feature(enable = "neon")]
+    unsafe fn band_u8(j: uint8x16_t, beg: uint8x16_t, end: uint8x16_t) -> uint8x16_t {
+        vandq_u8(vcgeq_u8(j, beg), vcltq_u8(j, end))
+    }
+
+    /// `(j >= beg) & (j < end)` for the NEON i16 kernel. Native signed compares, `band_bias` 0.
+    #[target_feature(enable = "neon")]
+    unsafe fn band_s16(j: int16x8_t, beg: int16x8_t, end: int16x8_t) -> uint16x8_t {
+        vandq_u16(vcgeq_s16(j, beg), vcltq_s16(j, end))
+    }
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::aarch64::*;
 
@@ -1915,11 +1947,12 @@ mod neon {
         max = vmaxq_s16,
         ceqz = vceqzq_s16,
         cge = vcgeq_s16,
-        clt = vcltq_s16,
         ceq = vceqq_s16,
         orru = vorrq_u16,
         andu = vandq_u16,
-        bsl = vbslq_s16
+        bsl = vbslq_s16,
+        band = band_s16,
+        band_bias = 0
     );
 
     // 8-bit kernel: **unsigned** u8 [0,255] with saturating add/sub, so a local extension whose score
@@ -1950,11 +1983,12 @@ mod neon {
         max = vmaxq_u8,
         ceqz = vceqzq_u8,
         cge = vcgeq_u8,
-        clt = vcltq_u8,
         ceq = vceqq_u8,
         orru = vorrq_u8,
         andu = vandq_u8,
-        bsl = vbslq_u8
+        bsl = vbslq_u8,
+        band = band_u8,
+        band_bias = 0
     );
 }
 
@@ -2050,15 +2084,32 @@ mod avx2 {
     // All four take `a` and `b`, two vectors of the same lane type (in the kernel: a broadcast
     // column index against a per-lane band bound, or an H against the running row max), and return
     // an all-ones/all-zero mask per lane. `cge` is `a >= b`, `clt` is `a < b`.
+    /// `(j >= beg) & (j < end)` for the AVX2 u8 kernel, in SIGNED space (issue #48C).
+    ///
+    /// The three operands arrive XOR-ed by 0x80, the order-preserving bijection between u8 and i8
+    /// (`(a ^ 0x80) >s (b ^ 0x80)` iff `a >u b`), so the native `vpcmpgtb` is exact here. Two
+    /// compares and one `vpandn`, against the unsigned emulation's two `vpmaxub`, two `vpcmpeqb`,
+    /// one `vpandn` and one `vpand`.
+    ///
+    /// `andnot(x, y)` is `!x & y`, so this is `!(beg > j) & (end > j)` = `(j >= beg) & (j < end)`.
+    /// Forgetting to bias one of the three operands produces total garbage rather than a subtle
+    /// drift, which `assert_backend_matches_scalar` catches on its first case.
+    #[target_feature(enable = "avx2")]
+    unsafe fn band_epi8(j: __m256i, beg: __m256i, end: __m256i) -> __m256i {
+        _mm256_andnot_si256(_mm256_cmpgt_epi8(beg, j), _mm256_cmpgt_epi8(end, j))
+    }
+
+    /// `(j >= beg) & (j < end)` for the AVX2 i16 kernel: its compares are already native and signed,
+    /// so this is the portable form and `band_bias` is 0.
+    #[target_feature(enable = "avx2")]
+    unsafe fn band_epi16(j: __m256i, beg: __m256i, end: __m256i) -> __m256i {
+        _mm256_and_si256(cge_epi16(j, beg), clt_epi16(j, end))
+    }
+
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn cge_epu8(a: __m256i, b: __m256i) -> __m256i {
         _mm256_cmpeq_epi8(_mm256_max_epu8(a, b), a)
-    }
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn clt_epu8(a: __m256i, b: __m256i) -> __m256i {
-        _mm256_xor_si256(cge_epu8(a, b), _mm256_set1_epi8(-1))
     }
     #[target_feature(enable = "avx2")]
     #[inline]
@@ -2098,11 +2149,12 @@ mod avx2 {
         max = _mm256_max_epi16,
         ceqz = ceqz16,
         cge = cge_epi16,
-        clt = clt_epi16,
         ceq = _mm256_cmpeq_epi16,
         orru = _mm256_or_si256,
         andu = _mm256_and_si256,
-        bsl = bsl256
+        bsl = bsl256,
+        band = band_epi16,
+        band_bias = 0
     );
 
     define_sw_kernel!(
@@ -2120,11 +2172,12 @@ mod avx2 {
         max = _mm256_max_epu8,
         ceqz = ceqz8,
         cge = cge_epu8,
-        clt = clt_epu8,
         ceq = _mm256_cmpeq_epi8,
         orru = _mm256_or_si256,
         andu = _mm256_and_si256,
-        bsl = bsl256
+        bsl = bsl256,
+        band = band_epi8,
+        band_bias = 0x80
     );
 }
 
@@ -2215,15 +2268,22 @@ mod sse41 {
     // AVX2 module documents: x86 offers only SIGNED integer compares, which would misread any u8
     // lane above 127 as negative, while `max_epu8` is a true unsigned max. The `xor` with
     // `set1_epi8(-1)` is mask negation (that constant is 0xFF in every byte, an all-ones vector).
+    /// `(j >= beg) & (j < end)` in SIGNED space for the SSE4.1 u8 kernel. See the AVX2 twin.
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn band_epi8(j: __m128i, beg: __m128i, end: __m128i) -> __m128i {
+        _mm_andnot_si128(_mm_cmpgt_epi8(beg, j), _mm_cmpgt_epi8(end, j))
+    }
+
+    /// `(j >= beg) & (j < end)` for the SSE4.1 i16 kernel: native signed compares, `band_bias` 0.
+    #[target_feature(enable = "sse4.1")]
+    unsafe fn band_epi16(j: __m128i, beg: __m128i, end: __m128i) -> __m128i {
+        _mm_and_si128(cge_epi16(j, beg), clt_epi16(j, end))
+    }
+
     #[target_feature(enable = "sse4.1")]
     #[inline]
     unsafe fn cge_epu8(a: __m128i, b: __m128i) -> __m128i {
         _mm_cmpeq_epi8(_mm_max_epu8(a, b), a)
-    }
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    unsafe fn clt_epu8(a: __m128i, b: __m128i) -> __m128i {
-        _mm_xor_si128(cge_epu8(a, b), _mm_set1_epi8(-1))
     }
     #[target_feature(enable = "sse4.1")]
     #[inline]
@@ -2261,11 +2321,12 @@ mod sse41 {
         max = _mm_max_epi16,
         ceqz = ceqz16,
         cge = cge_epi16,
-        clt = clt_epi16,
         ceq = _mm_cmpeq_epi16,
         orru = _mm_or_si128,
         andu = _mm_and_si128,
-        bsl = bsl128
+        bsl = bsl128,
+        band = band_epi16,
+        band_bias = 0
     );
 
     define_sw_kernel!(
@@ -2283,11 +2344,12 @@ mod sse41 {
         max = _mm_max_epu8,
         ceqz = ceqz8,
         cge = cge_epu8,
-        clt = clt_epu8,
         ceq = _mm_cmpeq_epi8,
         orru = _mm_or_si128,
         andu = _mm_and_si128,
-        bsl = bsl128
+        bsl = bsl128,
+        band = band_epi8,
+        band_bias = 0x80
     );
 }
 
@@ -2375,6 +2437,21 @@ mod avx512 {
     /// Unsigned `a >= b`. Native here, unlike AVX2 where it has to be recovered from `max`.
     #[target_feature(enable = "avx512bw")]
     #[inline]
+    /// `(j >= beg) & (j < end)` for the AVX-512 u8 kernel. AVX-512BW HAS native unsigned compares
+    /// (`vpcmpltub`, `vpcmpnltub`), and the disassembly confirms LLVM emits them from `cge_epu8` /
+    /// `clt_epu8` rather than the max/cmpeq emulation AVX2 gets, so there is nothing to rewrite here
+    /// and `band_bias` is 0. That is why its column loop is 38 instructions against AVX2's 54.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn band_epu8(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
+        _mm512_and_si512(cge_epu8(j, beg), clt_epu8(j, end))
+    }
+
+    /// `(j >= beg) & (j < end)` for the AVX-512 i16 kernel. Native signed compares, `band_bias` 0.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn band_epi16(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
+        _mm512_and_si512(cge_epi16(j, beg), clt_epi16(j, end))
+    }
+
     unsafe fn cge_epu8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpge_epu8_mask(a, b))
     }
@@ -2418,11 +2495,12 @@ mod avx512 {
         max = _mm512_max_epi16,
         ceqz = ceqz16,
         cge = cge_epi16,
-        clt = clt_epi16,
         ceq = ceq16,
         orru = _mm512_or_si512,
         andu = _mm512_and_si512,
-        bsl = bsl512
+        bsl = bsl512,
+        band = band_epi16,
+        band_bias = 0
     );
 
     define_sw_kernel!(
@@ -2440,11 +2518,12 @@ mod avx512 {
         max = _mm512_max_epu8,
         ceqz = ceqz8,
         cge = cge_epu8,
-        clt = clt_epu8,
         ceq = ceq8,
         orru = _mm512_or_si512,
         andu = _mm512_and_si512,
-        bsl = bsl512
+        bsl = bsl512,
+        band = band_epu8,
+        band_bias = 0
     );
 }
 

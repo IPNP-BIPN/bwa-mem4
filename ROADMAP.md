@@ -1214,6 +1214,63 @@ reellement le piege 5 sous test. Les deux references de determinisme sont vertes
 Cela dit aussi quelque chose du code CPU : le round 1 existe, il est correct, et il n'est
 pratiquement jamais emprunte en production.
 
+## #48C : le masque de bande en espace signe, et ce que le desassemblage x86 dit vraiment (2026-08-09)
+
+Apres #48A et #48D, la regle etait posee : **compter les instructions dans le desassemblage x86, pas
+dans le source**, avant d'ecrire une ligne. C'est ce qui a ete fait, et le comptage a la fois
+confirme et corrige l'issue.
+
+Binaire x86_64 construit ici (`cargo build --target x86_64-apple-darwin`), boucle de colonne du
+noyau d'extension u8, avant tout changement :
+
+| noyau | instructions de la boucle | `vpmaxub` | `vpcmpeqb` | `vpcmpgtb` |
+|---|---|---|---|---|
+| AVX2 u8 | 54 | 8 | 6 | 0 |
+| SSE4.1 u8 | 54 | 8 | 6 | 0 |
+| **AVX-512 u8** | **38** | 4 | **0** | 0 |
+
+L'issue avait raison pour AVX2 et SSE4.1 : faute de comparaison entiere non signee, le test de bande
+est emule en deux `vpmaxub` + deux `vpcmpeqb` + un `vpandn` + un `vpand`, six instructions sur 54.
+**Elle avait tort pour AVX-512**, qui possede `vpcmpltub` / `vpcmpnltub` et dont LLVM les emet deja
+depuis le meme code source : d'ou ses 38 instructions et zero `vpcmpeqb`. Un rewrite signe n'y aurait
+rien apporte. NEON est dans le meme cas, avec ses `vcgeq_u8` / `vcltq_u8` natifs.
+
+Livre : une fente de macro `band` (l'expression fusionnee `(j >= beg) & (j < end)`, une par ISA) et
+une constante `band_bias` XOR-ee dans `j`, `beg` et `end`. `0x80` pour les deux noyaux u8 x86,
+**0 partout ailleurs**, ce qui laisse NEON et AVX-512 exactement comme ils etaient. Le biais sur
+`beg`/`end` est applique dans le prologue de ligne, ou ces deux tableaux scalaires sont remplis de
+toute façon, donc il est gratuit. La fente `clt` disparait du macro : le test de bande etait son seul
+usage.
+
+Resultat, meme mesure :
+
+| noyau | avant | apres | `vpmaxub` | `vpcmpeqb` | `vpcmpgtb` |
+|---|---|---|---|---|---|
+| AVX2 u8 | 54 | **51** | 8 -> **6** | 6 -> **4** | 0 -> 2 |
+| SSE4.1 u8 | 54 | **51** | 8 -> **6** | 6 -> **4** | 0 -> 2 |
+| AVX-512 u8 | 38 | 38 | 4 | 0 | 0 |
+
+Trois instructions de moins par colonne, dont **deux `vpmaxub`**, qui sont precisement la classe p01
+que l'issue designait comme liante sur Skylake et Zen 2.
+
+### Ce qui n'est PAS mesure, et il faut le dire
+
+**Il n'y a pas de chiffre de temps.** Cette machine est arm64 ; le binaire x86 ne tourne ici que sous
+Rosetta, ou les rapports de vitesse ne se conservent pas. Le comptage ci-dessus est un comptage
+d'**assembleur emis**, ce qui est une bien meilleure preuve qu'un comptage de source (c'est
+exactement ce qui manquait a #48A et #48D), mais **ce n'est pas une mesure**. Le A/B doit venir d'un
+runner x86, via `.github/workflows/bench-x86.yml`.
+
+### L'octet-identite, elle, est verifiee ici
+
+Le XOR par 0x80 est la bijection croissante entre u8 et i8 (`(a ^ 0x80) >s (b ^ 0x80)` ssi
+`a >u b`), donc les compares signes sont exacts. Oublier de biaiser un des trois operandes ne donne
+pas une derive subtile mais du grand n'importe quoi, que le premier cas des gates attrape. Verifie :
+
+* `check.sh` vert, y compris la passe x86_64 sous Rosetta ou **les noyaux AVX2 s'executent vraiment** ;
+* et le gate qui compte : le binaire **x86_64 sous Rosetta** et le binaire **arm64** rendent le
+  **meme md5** (`791c21c2…`) sur 200 k paires reelles, corps SAM complet.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
