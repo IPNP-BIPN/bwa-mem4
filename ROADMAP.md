@@ -766,6 +766,68 @@ avec le commutateur dans les deux positions, sur les **deux** jeux (500 k paires
 md5 `7178e85d…` ; 500 k paires 150 bp sur `genome.fa`, md5 `3a51acef…`, celui-la compare directement
 a la sortie de l'oracle).
 
+## #46 : les deux passes scalaires ne coutent rien, et pourquoi le microbenchmark disait le contraire (2026-08-08)
+
+Resultat **negatif**, les deux leviers ecrits, mesures, et retires. L'issue les presentait comme la
+plus grosse part identifiee des 36 % d'ecart au plafond. Sur cette machine et sur les deux jeux de
+lectures presents sur le disque, ils valent **0,0 %**.
+
+### A, la porte vectorielle sur `finish_row`
+
+L'epilogue de ligne est du code scalaire seize voies execute une fois par ligne cible. La porte
+proposee tient en une comparaison : `hit = imax > gmax_v` avec `gmax_v` a 255 dans les voies mortes,
+ce qui est exactement la condition sous laquelle le corps scalaire modifie quelque chose. Ecrite avec
+le miroir u8 de `gmax`, le maintien des voies mortes dans le balayage de sortie anticipee (deja
+present, une fois par groupe de lignes) et le commutateur `BWA4_RESCUE_ROWGATE`.
+
+| jeu | noyau porte off | porte on | ecart |
+|---|---|---|---|
+| chr21, 49 bp | 1,90 s | 1,90 s | **0,0 %**, 9 courses |
+| genome, 150 bp | 1,28 s | 1,27 s | -0,8 %, 5 victoires 2 nuls sur 7 |
+
+La raison est mesurable et a ete mesuree : **la porte s'ouvre 20,3 % du temps sur le jeu 49 bp et
+61,8 % sur le jeu 150 bp** (compteur temporaire sur 23,9 M et 6,9 M de lignes). L'issue supposait un
+`gmax` qui se stabilise en quelques dizaines de lignes ; c'est vrai par voie, mais la porte est
+l'union de seize voies, et une seule voie qui progresse suffit a l'ouvrir. Sauter 80 % des epilogues
+ne rapporte rien, donc l'epilogue lui-meme est deja quasi gratuit : ses deux branches sont
+parfaitement predites, contrairement au microbenchmark `bench3.c` qui les mesurait a 21,93 cycles.
+
+### B, le pre-filtre vectoriel de `extract_group`, et le piege de mesure
+
+Meme conclusion, avec une explication plus interessante. La version livree parcourt `rowmax` une fois
+**par voie**, a pas de 16 octets. La version ecrite ici le parcourt une fois par **ligne**, une charge
+de 16 octets et un `UMAXV` decidant les seize suivis a la fois, et ne descend en scalaire que sur les
+lignes qui passent `minsc`. Sur la forme reelle, `minsc = 19` et 492 lignes par voie, il y a de
+l'ordre de zero a trois lignes qualifiantes.
+
+Les trois mesures, dans l'ordre ou elles ont ete faites :
+
+| mesure | ancien | nouveau | rapport |
+|---|---|---|---|
+| microbenchmark isole, `tmax = 600` | 5,94 us/groupe | 0,86 us/groupe | **6,9x** |
+| idem, `tmax = 1401` (la forme de la recherche) | 13,06 | 1,79 | **7,3x** |
+| chronometre **autour de l'appel**, en situation, 48 098 groupes | 0,227 s CPU | 0,055 s CPU | **4,1x** |
+| **noyau complet, binaire propre, A/B entrelace** | **1,77 s** | **1,78 s** | **0,0 %** |
+
+Les trois premieres lignes disent 4x a 7x, la quatrieme dit rien. Ce n'est pas une contradiction,
+c'est un artefact de mesure, et il a ete isole : **poser `#[inline(never)]` sur `extract_group` dans
+le binaire propre, sans aucun chronometre, reproduit exactement l'ecart** (1,89 s contre 1,72 s). Le
+chronometre `Instant::now()` autour de l'appel est une barriere d'optimisation ; il empeche LLVM
+d'incorporer `extract_group` dans la boucle de groupes du noyau, ou le balayage sous-`minsc` devient
+aussi bon marche que le pre-filtre vectoriel. Le 7,6x « pas croise contre sequentiel » de la recherche
+est reel sur une fonction isolee et **ne survit pas a l'incorporation**.
+
+C'est la lecon a retenir de cette issue : ici, chronometrer une sous-partie d'un noyau chaud la rend
+plus chere. La seule mesure qui compte reste l'A/B entrelace du binaire livre.
+
+### Ce qui reste ouvert
+
+Le point **C** de l'issue est intact et n'a rien a voir avec ce qui precede : les noyaux u8 x86
+(AVX2, SSE4.1, AVX-512) gardent un `rowmax` en **i32** et font 32 ou 64 ecritures scalaires gardees
+par ligne, la ou NEON publie la ligne en un `vst1q_u8`. A la forme moyenne d'AVX-512 le tampon fait
+359 KB par groupe, hors L1. Ce portage se mesure sur une machine x86, pas ici, et l'issue reste
+ouverte pour lui.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
