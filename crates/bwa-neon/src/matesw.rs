@@ -156,6 +156,35 @@ pub mod cells {
     /// Number of rescue jobs submitted to [`super::batched_ksw_align2`], forward pass only. The
     /// divisor for the per-job means printed by [`dump`].
     pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    /// Kernel calls, and the power-of-two histogram of `jobs.len()` per call (issue #53 step 0).
+    /// A GPU launch only amortises from a few thousand jobs up, so this distribution, not the job
+    /// total, decides whether a GPU backend can be one launch per call or needs a cross-thread
+    /// aggregation queue. Counted here rather than at the call site so every caller is covered.
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub const BUCKETS: usize = 16;
+    pub static CALL_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
+    pub static JOB_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
+    pub static CALL_MAX: AtomicU64 = AtomicU64::new(0);
+
+    /// Bucket index of a batch size: `floor(log2(n))`, saturated at the last bucket.
+    pub fn bucket(n: u64) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        (63 - n.leading_zeros() as usize).min(BUCKETS - 1)
+    }
+
+    /// Record one kernel call carrying `n` jobs. No-op unless the probe is enabled.
+    pub fn record_call(n: usize) {
+        if !enabled() {
+            return;
+        }
+        let n = n as u64;
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        CALL_HIST[bucket(n)].fetch_add(1, Ordering::Relaxed);
+        JOB_HIST[bucket(n)].fetch_add(n, Ordering::Relaxed);
+        CALL_MAX.fetch_max(n, Ordering::Relaxed);
+    }
     /// Summed wall time in nanoseconds spent inside [`super::batched_ksw_align2`], across all
     /// threads, so it is CPU time rather than elapsed time when `-t > 1`.
     pub static NS: AtomicU64 = AtomicU64::new(0);
@@ -225,6 +254,35 @@ pub mod cells {
              [matesw] measured ceiling on an M4 Max: ~16 Gcell/s/thread (see the note above)",
             cells as f64 / seconds.max(1e-9) / 1e9
         );
+        let calls = CALLS.load(Ordering::Relaxed);
+        eprintln!(
+            "[matesw] {calls} kernel calls, mean {:.1} jobs/call, largest {}",
+            jobs as f64 / calls.max(1) as f64,
+            CALL_MAX.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "[matesw] {:>12}  {:>10}  {:>12}  {:>7}",
+            "jobs/call", "calls", "jobs", "%_jobs"
+        );
+        for b in 0..BUCKETS {
+            let (c, j) = (
+                CALL_HIST[b].load(Ordering::Relaxed),
+                JOB_HIST[b].load(Ordering::Relaxed),
+            );
+            if c == 0 {
+                continue;
+            }
+            let lo = 1u64 << b;
+            let label = if b == BUCKETS - 1 {
+                format!("{lo}+")
+            } else {
+                format!("{lo}-{}", (lo << 1) - 1)
+            };
+            eprintln!(
+                "[matesw] {label:>12}  {c:>10}  {j:>12}  {:>6.1}%",
+                100.0 * j as f64 / jobs.max(1) as f64
+            );
+        }
         let (query_bases, target_bases) =
             (QLEN.load(Ordering::Relaxed), TLEN.load(Ordering::Relaxed));
         eprintln!(
@@ -314,6 +372,7 @@ pub fn batched_ksw_align2(
     // would corrupt the very number it exists to explain.
     let probing = cells::enabled();
     if probing {
+        cells::record_call(jobs.len());
         use std::sync::atomic::Ordering::Relaxed;
         // The DP is query x target per job; that is the work the kernel must actually do.
         let cell_count: u64 = jobs

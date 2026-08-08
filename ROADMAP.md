@@ -922,6 +922,57 @@ dimensionnement de tampon, mesurable independamment, et il faudra le confronter 
 `extract_group` ne coute rien une fois incorpore, donc sur les trois couts que #50A cite, le
 troisieme est deja nul et il reste l'allocation et l'eparpillement.
 
+## #53 etape 0 : la taille des lots, et elle repond deux choses differentes (2026-08-08)
+
+L'issue interdisait de decider quoi que ce soit de l'architecture GPU avant ce chiffre. Il est
+mesure. `BWA4_EXTEND_SHAPE` et `BWA4_MATESW_TIME` comptent desormais les **appels** de noyau et
+publient un histogramme en puissances de deux de `jobs.len()`, cote extension comme cote rescue.
+
+200 k paires, `-t8`, deux jeux :
+
+### Extension (`batched_extend`, la couture `SwBackend`)
+
+| | 49 bp, chr21 | **150 bp, `genome.fa`** |
+|---|---|---|
+| appels | 392 | 392 |
+| **moyenne jobs/appel** | 1 302 | **5 381** |
+| plus gros appel | 3 263 | 7 284 |
+| ou sont les jobs | 80,3 % dans 1024-2047 | **99,7 % dans 4096-8191** |
+| cellules nominales | 278 M | 24,0 G |
+
+A la longueur de lecture de production, **les lots d'extension font plus de 4 000 jobs**, ce qui est
+le seuil que l'issue posait. Donc : **un lancement de noyau par appel suffit**, la couture reste
+quasi synchrone, et le travail est le petit des deux scenarios. C'est aussi le cote qui porte les
+cellules : 24 G cellules nominales pour 200 k paires.
+
+### Mate rescue (`batched_ksw_align2`)
+
+| | 49 bp, chr21 | **150 bp, `genome.fa`** |
+|---|---|---|
+| appels | 800 | 800 |
+| **moyenne jobs/appel** | 328 | **72** |
+| plus gros appel | 2 031 | **275** |
+| ou sont les jobs | 34 % dans 512-1023 | 36 % dans 32-63, rien au-dessus de 511 |
+| cellules nominales | 7,3 G | 5,4 G |
+
+**C'est l'inverse.** A 150 bp le rescue soumet des lots de quelques dizaines de jobs, deux ordres de
+grandeur sous le seuil. Meme en agregeant les huit threads d'un `-t8`, on serait a environ 576 jobs,
+toujours en dessous. Un backend GPU pour le rescue demande donc bien la **file d'agregation
+inter-threads** que l'issue decrivait comme « nettement plus gros », et elle change le contrat de
+`SwBackend`.
+
+### Ce que ce chiffre decide
+
+1. **L'extension d'abord, le rescue ensuite.** L'ordre inverse de l'intuition, qui mettait le rescue
+   en premier parce qu'il est le plus gros poste CPU. C'est le lot, pas le poste, qui decide.
+2. La couture asynchrone de l'etape 1 (`submit`/`collect`) reste utile pour recouvrir, mais elle
+   n'est **pas** un prealable cote extension : a 5 381 jobs par appel un lancement synchrone est
+   deja rentable.
+3. Cote rescue, tant que la file inter-threads n'existe pas, il n'y a rien a porter. Note toutefois
+   que le rescue a **93 900 cellules par job** contre 11 400 pour l'extension : peu de jobs, mais
+   chacun est gros, donc le parallelisme intra-lot n'est pas si maigre qu'il en a l'air. C'est a
+   re-instruire avec le modele de cout d'un noyau GPU, pas avec le seuil « nombre de jobs ».
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

@@ -2771,6 +2771,25 @@ pub mod extend_shape {
     pub static EXEC_SORTED: AtomicU64 = AtomicU64::new(0);
     /// Jobs counted.
     pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    /// Kernel calls, and the power-of-two histogram of `jobs.len()` per call. Issue #53 step 0:
+    /// a GPU launch only amortises from a few thousand jobs up, so the batch-size DISTRIBUTION,
+    /// not the job total, is what decides whether a GPU backend can be a per-call launch or needs
+    /// a cross-thread aggregation queue.
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Bucket `b` counts calls with `jobs.len()` in `[2^b, 2^(b+1))`, last bucket open-ended.
+    pub const BUCKETS: usize = 16;
+    pub static CALL_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
+    /// Jobs carried by the calls of each bucket, so the histogram can be weighted by work.
+    pub static JOB_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
+    pub static CALL_MAX: AtomicU64 = AtomicU64::new(0);
+
+    /// Bucket index of a batch size: `floor(log2(n))`, saturated at the last bucket.
+    pub fn bucket(n: u64) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        (63 - n.leading_zeros() as usize).min(BUCKETS - 1)
+    }
     /// Whether `BWA4_EXTEND_SHAPE` is set; read once and cached.
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -2803,6 +2822,11 @@ pub mod extend_shape {
         let (qs, ts): (Vec<usize>, Vec<usize>) = ord.iter().map(|&i| (q[i], t[i])).unzip();
         EXEC_SORTED.fetch_add(cost(&qs, &ts), Relaxed);
         JOBS.fetch_add(jobs.len() as u64, Relaxed);
+        let n = jobs.len() as u64;
+        CALLS.fetch_add(1, Relaxed);
+        CALL_HIST[bucket(n)].fetch_add(1, Relaxed);
+        JOB_HIST[bucket(n)].fetch_add(n, Relaxed);
+        CALL_MAX.fetch_max(n, Relaxed);
     }
     /// Print the accumulated counters once at end of run. No-op unless [`enabled`].
     pub fn dump() {
@@ -2822,6 +2846,32 @@ pub mod extend_shape {
             sorted as f64 / cells.max(1) as f64,
             100.0 * (exec as f64 - sorted as f64) / exec.max(1) as f64,
         );
+        let calls = CALLS.load(Relaxed);
+        eprintln!(
+            "[extend-shape] {calls} kernel calls, mean {:.1} jobs/call, largest {}",
+            jobs as f64 / calls.max(1) as f64,
+            CALL_MAX.load(Relaxed)
+        );
+        eprintln!(
+            "[extend-shape] {:>12}  {:>10}  {:>12}  {:>7}",
+            "jobs/call", "calls", "jobs", "%_jobs"
+        );
+        for b in 0..BUCKETS {
+            let (c, j) = (CALL_HIST[b].load(Relaxed), JOB_HIST[b].load(Relaxed));
+            if c == 0 {
+                continue;
+            }
+            let lo = 1u64 << b;
+            let label = if b == BUCKETS - 1 {
+                format!("{lo}+")
+            } else {
+                format!("{lo}-{}", (lo << 1) - 1)
+            };
+            eprintln!(
+                "[extend-shape] {label:>12}  {c:>10}  {j:>12}  {:>6.1}%",
+                100.0 * j as f64 / jobs.max(1) as f64
+            );
+        }
     }
 }
 
