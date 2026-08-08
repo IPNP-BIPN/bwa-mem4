@@ -543,6 +543,24 @@ const PAD: u8 = 255;
 /// base and from [`PAD`], which is what the three-way select in the kernels keys on.
 const ZPAD: u8 = 5;
 
+/// Code the NEON u8 rescue kernel substitutes for a TARGET N (bwa's code 4) inside its packed
+/// `seq_t`, so that `target XOR query` lands on a table slot of its own in every case, including
+/// both-N. See the score-table comment in `fwd_local_sw_neon_u8` for the full index map and for why
+/// this removes four vector operations per column of a row quad.
+///
+/// 12 rather than any other free code because `12 XOR 0..3` is 12-15 and `12 XOR 4` is 8, so all
+/// five reachable indices stay inside the 16-entry table `vqtbl1q_u8` can address, and none of them
+/// collides with the 0-7 range the real bases already use. Purely internal to that one kernel: it is
+/// written when the group is packed and never leaves it, so no caller and no other kernel sees it.
+///
+/// NEON only, hence the `cfg`, and not because of the register file this time: the x86 u8 kernels
+/// never adopted the XOR-indexed table at all. They score with `n_mask = (t == 4) | (q == 4)` and a
+/// blend, so there is no table slot to give both-N and nothing here to reuse. Bringing them the same
+/// 7% would mean porting the table form first, which is a separate piece of work and one that cannot
+/// be measured on this host.
+#[cfg(target_arch = "aarch64")]
+const N_TARGET: u8 = 12;
+
 /// Cell score written where a [`PAD`] position is scored, i.e. where the cell must come out dead.
 ///
 /// Chosen to satisfy three constraints at once: negative enough to drive any reachable `H` to 0
@@ -1501,7 +1519,6 @@ unsafe fn fwd_local_sw_neon_u8(
     // which is what lets the whole kernel stay unsigned.
     let zero = vdupq_n_u8(0);
     let one_v = vdupq_n_u8(1);
-    let four_v = vdupq_n_u8(4);
     let zpad_v = vdupq_n_u8(ZPAD);
     let e_del_v = vdupq_n_u8(e_del as u8);
     let oe_del_v = vdupq_n_u8(oe_del as u8);
@@ -1512,9 +1529,22 @@ unsafe fn fwd_local_sw_neon_u8(
     // is a non-negative magnitude: one saturating add then one de-biasing saturating subtract
     // reproduce `max(0, h_diag + S)` exactly, replacing the split form's three candidate adds and
     // four selects. Real base codes are 0-3, so a real-vs-real XOR is 0 (match, +a) or 1-3
-    // (mismatch, -b); an XOR of 4-7 means exactly one operand is N (code 4), scoring bwa's -1. XOR
-    // >= 8 only arises from a PAD byte (255) and is masked out below, so those slots are don't-care.
-    // The both-N cell reads XOR 0 (a false match) and is corrected by the `t == 4` blend in the loop.
+    // (mismatch, -b); a query N (code 4) against a real base gives 4-7, scoring bwa's -1.
+    //
+    // TARGET N IS RE-ENCODED AS [`N_TARGET`] (12) WHEN `seq_t` IS FILLED, and that is what lets the
+    // loop have no N repair at all. With target N left at 4 the both-N cell reads XOR 0, which is
+    // the match slot, so every row needed a `t == 4` blend to put bwa's -1 back: four vector
+    // operations per column of a quad, about 6% of the kernel. Re-encoded, the reachable indices are
+    //
+    //   t 0-3 vs q 0-3  -> 0-3    match / mismatch
+    //   t 0-3 vs q 4    -> 4-7    one N
+    //   t 12  vs q 0-3  -> 12-15  one N
+    //   t 12  vs q 4    -> 8      both N, previously the wrong slot, now its own
+    //   t 12  vs q 5    -> 9      ZPAD, overridden by the zpad blend, so a don't-care
+    //   anything vs PAD -> >= 16  `vqtbl1q` returns 0 there, and the pad blend overrides anyway
+    //
+    // so slots 8 and 12-15 carry the N score alongside 4-7, and 10-11 are unreachable. The trick is
+    // available because the table has 16 slots and only six were in use.
     //
     // The bias is `mispen`, the smallest value making the mismatch entry (bias - b) non-negative.
     // Correctness needs the biased add not to saturate early: `max h_diag + bias + mtch < 256`. The
@@ -1530,11 +1560,14 @@ unsafe fn fwd_local_sw_neon_u8(
     tbl[0] = bias + mtch; // match: +a
                           // tbl[1..=3] = bias - b = 0 (mismatch), already zero
     for e in tbl.iter_mut().take(8).skip(4) {
-        *e = bias - 1; // exactly one N (code 4): bwa scores -1
+        *e = bias - 1; // query N (code 4) against a real base: bwa scores -1
+    }
+    tbl[8] = bias - 1; // both N: N_TARGET XOR 4
+    for e in tbl.iter_mut().take(16).skip(12) {
+        *e = bias - 1; // target N against a real base: N_TARGET XOR 0-3
     }
     let score_tbl = vld1q_u8(tbl.as_ptr());
     let bias_v = vdupq_n_u8(bias);
-    let n_score_v = vdupq_n_u8(bias - 1);
     let high_bit_v = vdupq_n_u8(0x80);
 
     // Group setup is identical to `fwd_local_sw_scalar` at 16 lanes; see there for each variable.
@@ -1569,8 +1602,10 @@ unsafe fn fwd_local_sw_neon_u8(
             for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
                 seq_q[c * LANES16 + l] = ZPAD;
             }
+            // The N re-encoding, applied once per target base here so the column loops never pay
+            // for it. See the score-table comment above.
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES16 + l] = b;
+                seq_t[r * LANES16 + l] = if b == 4 { N_TARGET } else { b };
             }
         }
 
@@ -1669,10 +1704,6 @@ unsafe fn fwd_local_sw_neon_u8(
                 let t1_v = vld1q_u8(seq_t.as_ptr().add((i + 1) * LANES16));
                 let t2_v = vld1q_u8(seq_t.as_ptr().add((i + 2) * LANES16));
                 let t3_v = vld1q_u8(seq_t.as_ptr().add((i + 3) * LANES16));
-                let t0_is_n = vceqq_u8(t0_v, four_v);
-                let t1_is_n = vceqq_u8(t1_v, four_v);
-                let t2_is_n = vceqq_u8(t2_v, four_v);
-                let t3_is_n = vceqq_u8(t3_v, four_v);
                 // Four independent sets of row accumulators. `d0` is the only diagonal that comes
                 // from memory; `d1`/`d2`/`d3` are the previous column's H from the row above, handed
                 // over in a register.
@@ -1688,8 +1719,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
 
                     // Row i. `e_v` is E(i, j), the only E that comes from memory.
-                    let mut s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
-                    s0 = vbslq_u8(t0_is_n, n_score_v, s0);
+                    let s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
                     let diag0 = vqsubq_u8(vqaddq_u8(d0, s0), bias_v);
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(diag0, e_v);
@@ -1702,8 +1732,7 @@ unsafe fn fwd_local_sw_neon_u8(
 
                     // Row i+1, whose diagonal H(i, j-1) is the previous column's `h0` and whose E
                     // carry row i just produced in a register.
-                    let mut s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
-                    s1 = vbslq_u8(t1_is_n, n_score_v, s1);
+                    let s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
                     let diag1 = vqsubq_u8(vqaddq_u8(d1, s1), bias_v);
                     let mfe1 = vmaxq_u8(diag1, e1);
                     let h1 = vmaxq_u8(mfe1, f1);
@@ -1714,8 +1743,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     d1 = h0;
 
                     // Row i+2.
-                    let mut s2 = vqtbl1q_u8(score_tbl, veorq_u8(t2_v, q_v));
-                    s2 = vbslq_u8(t2_is_n, n_score_v, s2);
+                    let s2 = vqtbl1q_u8(score_tbl, veorq_u8(t2_v, q_v));
                     let diag2 = vqsubq_u8(vqaddq_u8(d2, s2), bias_v);
                     let mfe2 = vmaxq_u8(diag2, e2);
                     let h2 = vmaxq_u8(mfe2, f2);
@@ -1726,8 +1754,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     d2 = h1;
 
                     // Row i+3, the only one of the four whose H and E reach memory.
-                    let mut s3 = vqtbl1q_u8(score_tbl, veorq_u8(t3_v, q_v));
-                    s3 = vbslq_u8(t3_is_n, n_score_v, s3);
+                    let s3 = vqtbl1q_u8(score_tbl, veorq_u8(t3_v, q_v));
                     let diag3 = vqsubq_u8(vqaddq_u8(d3, s3), bias_v);
                     let mfe3 = vmaxq_u8(diag3, e3);
                     let h3 = vmaxq_u8(mfe3, f3);
@@ -1752,8 +1779,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     let zpad_mask = vceqq_u8(q_v, zpad_v);
                     let q_pad = vtstq_u8(q_v, high_bit_v);
 
-                    let mut s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
-                    s0 = vbslq_u8(t0_is_n, n_score_v, s0);
+                    let s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
                     let scored0 = vqsubq_u8(vqaddq_u8(d0, s0), bias_v);
                     let pad0 = vorrq_u8(q_pad, vtstq_u8(t0_v, high_bit_v));
                     let mut diag0 = vbslq_u8(zpad_mask, d0, scored0);
@@ -1767,8 +1793,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     f0 = vmaxq_u8(vqsubq_u8(f0, e_ins_v), vqsubq_u8(mfe0, oe_ins_v));
                     d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
 
-                    let mut s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
-                    s1 = vbslq_u8(t1_is_n, n_score_v, s1);
+                    let s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
                     let scored1 = vqsubq_u8(vqaddq_u8(d1, s1), bias_v);
                     let pad1 = vorrq_u8(q_pad, vtstq_u8(t1_v, high_bit_v));
                     let mut diag1 = vbslq_u8(zpad_mask, d1, scored1);
@@ -1781,8 +1806,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     f1 = vmaxq_u8(vqsubq_u8(f1, e_ins_v), vqsubq_u8(mfe1, oe_ins_v));
                     d1 = h0;
 
-                    let mut s2 = vqtbl1q_u8(score_tbl, veorq_u8(t2_v, q_v));
-                    s2 = vbslq_u8(t2_is_n, n_score_v, s2);
+                    let s2 = vqtbl1q_u8(score_tbl, veorq_u8(t2_v, q_v));
                     let scored2 = vqsubq_u8(vqaddq_u8(d2, s2), bias_v);
                     let pad2 = vorrq_u8(q_pad, vtstq_u8(t2_v, high_bit_v));
                     let mut diag2 = vbslq_u8(zpad_mask, d2, scored2);
@@ -1795,8 +1819,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     f2 = vmaxq_u8(vqsubq_u8(f2, e_ins_v), vqsubq_u8(mfe2, oe_ins_v));
                     d2 = h1;
 
-                    let mut s3 = vqtbl1q_u8(score_tbl, veorq_u8(t3_v, q_v));
-                    s3 = vbslq_u8(t3_is_n, n_score_v, s3);
+                    let s3 = vqtbl1q_u8(score_tbl, veorq_u8(t3_v, q_v));
                     let scored3 = vqsubq_u8(vqaddq_u8(d3, s3), bias_v);
                     let pad3 = vorrq_u8(q_pad, vtstq_u8(t3_v, high_bit_v));
                     let mut diag3 = vbslq_u8(zpad_mask, d3, scored3);
@@ -1823,8 +1846,6 @@ unsafe fn fwd_local_sw_neon_u8(
             } else if rows == 2 {
                 let t0_v = vld1q_u8(seq_t.as_ptr().add(i * LANES16));
                 let t1_v = vld1q_u8(seq_t.as_ptr().add((i + 1) * LANES16));
-                let t0_is_n = vceqq_u8(t0_v, four_v);
-                let t1_is_n = vceqq_u8(t1_v, four_v);
                 // Two independent sets of row accumulators, one per row of the pair. `d0`/`d1` are
                 // the diagonals: `d0` comes from `h_prev`, `d1` from the previous column's `h0`.
                 let (mut f0, mut f1) = (zero, zero);
@@ -1839,8 +1860,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
 
                     // Row i.
-                    let mut s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
-                    s0 = vbslq_u8(t0_is_n, n_score_v, s0);
+                    let s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
                     let diag0 = vqsubq_u8(vqaddq_u8(d0, s0), bias_v);
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(diag0, e_v);
@@ -1854,8 +1874,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
 
                     // Row i+1, whose diagonal H(i, j-1) is the previous column's `h0`.
-                    let mut s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
-                    s1 = vbslq_u8(t1_is_n, n_score_v, s1);
+                    let s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
                     let diag1 = vqsubq_u8(vqaddq_u8(d1, s1), bias_v);
                     let mfe1 = vmaxq_u8(diag1, e_mid);
                     let h1 = vmaxq_u8(mfe1, f1);
@@ -1876,8 +1895,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
                     let zpad_mask = vceqq_u8(q_v, zpad_v);
 
-                    let mut s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
-                    s0 = vbslq_u8(t0_is_n, n_score_v, s0);
+                    let s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
                     let scored0 = vqsubq_u8(vqaddq_u8(d0, s0), bias_v);
                     let pad0 = vtstq_u8(vorrq_u8(t0_v, q_v), high_bit_v);
                     let mut diag0 = vbslq_u8(zpad_mask, d0, scored0);
@@ -1891,8 +1909,7 @@ unsafe fn fwd_local_sw_neon_u8(
                     f0 = vmaxq_u8(vqsubq_u8(f0, e_ins_v), vqsubq_u8(mfe0, oe_ins_v));
                     d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
 
-                    let mut s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
-                    s1 = vbslq_u8(t1_is_n, n_score_v, s1);
+                    let s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
                     let scored1 = vqsubq_u8(vqaddq_u8(d1, s1), bias_v);
                     let pad1 = vtstq_u8(vorrq_u8(t1_v, q_v), high_bit_v);
                     let mut diag1 = vbslq_u8(zpad_mask, d1, scored1);
@@ -1936,7 +1953,6 @@ unsafe fn fwd_local_sw_neon_u8(
                 let mut j_v = zero;
                 // Hoisted out of the column loop: "is this row's target base an N", which depends
                 // only on `i`. It was recomputed for all `qmax` columns of every row.
-                let t_is_n = vceqq_u8(t_v, four_v);
 
                 // ---- Fast column range: no padding of any kind can appear ---------------------
                 // For `j < n_fast` every live lane holds a real base (`n_fast` is the shortest live
@@ -1951,8 +1967,7 @@ unsafe fn fwd_local_sw_neon_u8(
                 // which WOULD read a false match at `xor == 0`, cannot occur below `n_fast`.
                 for j in 0..n_fast {
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
-                    let mut sbt = vqtbl1q_u8(score_tbl, veorq_u8(t_v, q_v));
-                    sbt = vbslq_u8(t_is_n, n_score_v, sbt);
+                    let sbt = vqtbl1q_u8(score_tbl, veorq_u8(t_v, q_v));
                     let diag_v = vqsubq_u8(vqaddq_u8(h_diag_v, sbt), bias_v);
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe = vmaxq_u8(diag_v, e_v);
@@ -1977,12 +1992,11 @@ unsafe fn fwd_local_sw_neon_u8(
                     // single saturating add followed by a de-biasing saturating subtract. Both
                     // saturations floor the result at 0, so no explicit `max(0, .)` is needed.
                     let xor_v = veorq_u8(t_v, q_v);
-                    let mut sbt = vqtbl1q_u8(score_tbl, xor_v);
+                    let sbt = vqtbl1q_u8(score_tbl, xor_v);
                     // A target N (code 4) scores -1, including the both-N cell the table read as a
                     // match (XOR 0). Only the target can be a real code XOR-ing to 0 with an N, so
                     // `t == 4` alone catches every case the table gets wrong; a query-side N
                     // already lands on a 4-7 slot and needs no fix.
-                    sbt = vbslq_u8(t_is_n, n_score_v, sbt);
                     let scored = vqsubq_u8(vqaddq_u8(h_diag_v, sbt), bias_v);
                     // `zpad_mask`: the query column is ksw profile padding (score 0), so the cell
                     // carries the diagonal through unchanged. `pad_mask`: the cell is dead (a PAD
