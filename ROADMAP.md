@@ -973,6 +973,62 @@ inter-threads** que l'issue decrivait comme « nettement plus gros », et elle c
    chacun est gros, donc le parallelisme intra-lot n'est pas si maigre qu'il en a l'air. C'est a
    re-instruire avec le modele de cout d'un noyau GPU, pas avec le seuil « nombre de jobs ».
 
+## #54 : la barriere d'octet-identite GPU, ecrite avant le premier noyau (2026-08-08)
+
+Le precedent de l'issue est le bon argument : GPU-BWA-MEM (ICS 2023) affirme rendre les memes
+resultats que BWA-MEM et **ne publie aucune methode de validation**. Voici la methode, ecrite avant
+qu'il y ait une ligne de Metal ou de CUDA, et deja verte sur les backends CPU.
+
+### Deux barrieres generiques sur `SwBackend`
+
+Ecrites contre le trait, pas contre NEON, donc un futur backend GPU les passe **sans modification**.
+Elles ciblent les deux pieges que les balayages aleatoires existants ne peuvent pas atteindre.
+
+* `assert_backend_tie_rule_matches_scalar` (**piege 2**). Le noyau de rescue garde le **premier**
+  maximum (`vcgtq_u8`, `>` strict) et le noyau d'extension garde le **dernier** (`$cge`, non strict,
+  `ksw.cpp:491`). Les deux sont opposes expres. Un portage qui les intervertit rend le bon `score` et
+  des `te`/`qe` differents, uniquement sur des egalites, que la sequence aleatoire ne produit
+  presque jamais. La barriere les fabrique : cibles periodiques (periodes 1, 2, 3, 4, 7) contre des
+  requetes en phase, ou toutes les cellules d'une ligne sont a egalite. La periode 7 est la parce
+  qu'elle n'a de facteur commun avec aucune largeur SIMD du projet, donc une egalite ne peut pas
+  coincider avec une frontiere de voie par chance.
+* `assert_backend_batch_order_invariant` (**piege 6**). Un noyau GPU voudra regrouper par longueur.
+  C'est legal tant que le remplissage des voies mortes n'influence pas les voies vivantes. La
+  barriere passe **les memes 200 jobs dans dix permutations tirees au hasard** et exige que le
+  resultat de chaque job soit identique dans les dix, et egal au `extend` job par job.
+
+Une troisieme, cote rescue, vit dans `matesw.rs` : `matesw_tie_rule_equals_scalar`, meme generateur
+periodique, compare a `ksw_align2`.
+
+Les trois sont vertes sur le backend scalaire et sur NEON. Sur le scalaire elles ne peuvent pas
+echouer utilement, et c'est le but : cela prouve que les **generateurs** sont bien formes (des
+entrees periodiques qui produisent vraiment des egalites, des permutations qui permutent vraiment)
+avant qu'un backend GPU soit juge par elles.
+
+### Le gate d'integration, `scripts/gpu_parity.sh`
+
+Trois etapes, dans cet ordre :
+
+1. **determinisme** : trois courses du chemin CPU doivent rendre **trois md5 egaux**. C'est ce qui
+   attrape une erreur memoire non corrigee ou un pilote qui reordonne, et rien de ce qui suit n'a de
+   sens si la reference n'est pas reproductible. **Cette etape tourne des aujourd'hui et passe**
+   (md5 `791c21c2…` sur 200 k paires 150 bp, `-t8`) ;
+2. **parite** `BWA4_GPU=off` contre `BWA4_GPU=<backend>`, meme binaire ;
+3. **invariance au partage** (piege 7) : `BWA4_GPU_SPLIT` balaye 0,0 / 0,25 / 0,5 / 0,75 / 1,0 et les
+   cinq md5 doivent etre egaux. Si cette etape passe, le co-ordonnancement dynamique est sur par
+   construction et n'a plus a etre re-prouve.
+
+Les etapes 2 et 3 **sautent bruyamment** tant qu'aucun backend GPU n'est compile dans le binaire :
+elles annoncent le saut plutot que de passer a vide.
+
+### Ce qui reste des sept pieges
+
+Les pieges 1 (aucun flottant, a verifier en relisant le PTX ou l'IR Metal), 3 (le seuil de
+saturation a 255 et le repli i16) et 5 (`max_off` et le compte de jobs requeues par round) demandent
+soit du code GPU, soit une sonde de plus, et restent ouverts dans l'issue. Le piege 4 (le codage
+`N_TARGET = 12`) est deja couvert par les generateurs, qui tirent `% 5` et non `% 4`, et la nouvelle
+barriere d'ordre respecte la meme regle.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

@@ -396,6 +396,178 @@ fn fill_scmat_vec(a: i8, b: i8) -> Vec<i8> {
     }
     mat
 }
+/// GPU-readiness barrier 1 (issue #54, trap 2): the argmax tie rule, on inputs where ties are the
+/// norm rather than an accident.
+///
+/// The rescue kernel keeps the FIRST maximum (`vcgtq_u8`, strict `>`) and the extension kernel keeps
+/// the LAST one (`$cge`, non-strict, mirroring `ksw.cpp:491`). The two are opposite on purpose, and a
+/// port that picks the wrong one still produces the right SCORE. It produces different `qe`/`te`, and
+/// only on inputs where two cells tie, which random sequence almost never generates.
+///
+/// So this gate generates them deliberately: periodic targets (`ACGTACGT...` at several periods)
+/// against queries in phase with them, where every period offset scores identically. Any backend
+/// that gets the tie rule backwards fails here and passes every random sweep.
+///
+/// # Parameters
+/// `backend`: the implementation under test. Only `extend` and `extend_batch` are called.
+///
+/// # Panics
+/// On the first job whose result differs from [`ksw_extend2`] in any field.
+pub fn assert_backend_tie_rule_matches_scalar<B: SwBackend>(backend: &B) {
+    let (a, b) = (1i8, 4i8);
+    let mat = fill_scmat_vec(a, b);
+    let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+
+    // Owned storage for the batch, since `ExtendJob` borrows.
+    let mut queries: Vec<Vec<u8>> = Vec::new();
+    let mut targets: Vec<Vec<u8>> = Vec::new();
+    let mut h0s: Vec<i32> = Vec::new();
+    // Period 1 is a homopolymer, where EVERY cell of a row ties; 2, 3, 4 and 7 give repeats whose
+    // phase offsets tie in blocks. `7` is there because it shares no factor with the SIMD widths,
+    // so a tie can never coincide with a lane or chunk boundary.
+    for &period in &[1usize, 2, 3, 4, 7] {
+        for &qlen in &[8usize, 31, 64, 97, 150] {
+            for &extra in &[0usize, 1, 5, 40] {
+                let q: Vec<u8> = (0..qlen).map(|i| (i % period) as u8 % 4).collect();
+                let t: Vec<u8> = (0..qlen + extra).map(|i| (i % period) as u8 % 4).collect();
+                queries.push(q);
+                targets.push(t);
+                h0s.push(1 + (period as i32));
+            }
+        }
+    }
+    let jobs: Vec<ExtendJob> = (0..queries.len())
+        .map(|i| ExtendJob {
+            query: &queries[i],
+            target: &targets[i],
+            h0: h0s[i],
+        })
+        .collect();
+
+    for &w in &[1i32, 8, 33, 200] {
+        for &zdrop in &[0i32, 100] {
+            let got = backend.extend_batch(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, 5, zdrop);
+            assert_eq!(got.len(), jobs.len());
+            for (k, j) in jobs.iter().enumerate() {
+                let want = ksw_extend2(
+                    j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, w, 5, zdrop, j.h0,
+                );
+                assert_eq!(
+                    got[k],
+                    want,
+                    "{}: tie-rule job {k} (qlen {}, tlen {}, w {w}, zdrop {zdrop})",
+                    backend.name(),
+                    j.query.len(),
+                    j.target.len()
+                );
+            }
+        }
+    }
+}
+
+/// GPU-readiness barrier 2 (issue #54, trap 6): batching must not make a job's result depend on the
+/// company it keeps.
+///
+/// A vector or GPU backend groups jobs into fixed-width lanes and pads the tail, so a job's result
+/// could in principle be perturbed by its neighbours: a cross-lane reduction, a shared maximum, a
+/// dead lane carrying something other than a neutral. Every such bug is invisible when the batch is
+/// always presented in the same order, and every GPU port will want to re-bucket by length.
+///
+/// The gate runs the SAME jobs through `extend_batch` in ten different pseudo-random orders and
+/// requires each job's result to be identical in all of them, and equal to the single-job `extend`.
+///
+/// # Parameters
+/// `backend`: the implementation under test.
+///
+/// # Panics
+/// On the first job whose result depends on the permutation, naming the round and the job.
+pub fn assert_backend_batch_order_invariant<B: SwBackend>(backend: &B) {
+    let (a, b) = (1i8, 4i8);
+    let mat = fill_scmat_vec(a, b);
+    let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+    let (w, end_bonus, zdrop) = (100i32, 5i32, 100i32);
+
+    let mut rng_state = 0x0DDB_A11C_0FFE_E511u64;
+    let mut next_random = move || {
+        rng_state = rng_state
+            .wrapping_mul(LCG_MULTIPLIER)
+            .wrapping_add(LCG_INCREMENT);
+        rng_state >> 33
+    };
+
+    // Deliberately ragged lengths, spanning the u8/i16 dispatch boundary, so re-bucketing by length
+    // actually changes which jobs share a vector.
+    let mut queries: Vec<Vec<u8>> = Vec::new();
+    let mut targets: Vec<Vec<u8>> = Vec::new();
+    let mut h0s: Vec<i32> = Vec::new();
+    for k in 0..200usize {
+        let qlen = if k % 5 == 0 {
+            200 + (next_random() % 300) as usize
+        } else {
+            1 + (next_random() % 120) as usize
+        };
+        // `% 5`, not `% 4`: code 4 is N. See the note in `assert_backend_matches_scalar`; a GPU port
+        // must never narrow this back to the four concrete bases.
+        let q: Vec<u8> = (0..qlen).map(|_| (next_random() % 5) as u8).collect();
+        let tlen = qlen + (next_random() % 40) as usize;
+        let mut t: Vec<u8> = Vec::with_capacity(tlen);
+        let mut qi = 0usize;
+        while t.len() < tlen {
+            if qi < q.len() && next_random() % 100 >= 5 {
+                t.push(q[qi]);
+                qi += 1;
+            } else {
+                t.push((next_random() % 5) as u8);
+                if next_random() % 2 == 0 {
+                    qi += 1;
+                }
+            }
+        }
+        queries.push(q);
+        targets.push(t);
+        h0s.push(1 + (next_random() % 30) as i32);
+    }
+    let n = queries.len();
+    let job = |i: usize| ExtendJob {
+        query: &queries[i],
+        target: &targets[i],
+        h0: h0s[i],
+    };
+
+    // Reference: every job on its own, so the batch cannot be self-consistently wrong.
+    let single: Vec<ExtendResult> = (0..n)
+        .map(|i| {
+            let j = job(i);
+            backend.extend(
+                j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, j.h0,
+            )
+        })
+        .collect();
+
+    for round in 0..10 {
+        // Fisher-Yates over the job indices, so every round presents a different lane packing.
+        let mut ord: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let s = (next_random() as usize) % (i + 1);
+            ord.swap(i, s);
+        }
+        let jobs: Vec<ExtendJob> = ord.iter().map(|&i| job(i)).collect();
+        let got = backend.extend_batch(
+            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+        );
+        assert_eq!(got.len(), n);
+        for (slot, &i) in ord.iter().enumerate() {
+            assert_eq!(
+                got[slot],
+                single[i],
+                "{}: round {round}, job {i} changed with the batch order (qlen {}, tlen {})",
+                backend.name(),
+                queries[i].len(),
+                targets[i].len()
+            );
+        }
+    }
+}
 
 /// Batch-mode acceptance gate: assert `backend.extend_batch` returns, for every job, exactly the
 /// [`ksw_extend2`] result. Batches share scoring/band (as the API requires) and vary in
@@ -531,6 +703,12 @@ mod tests {
         // acceptance gate). ScalarBackend delegates, so this also self-checks the harness runs.
         assert_backend_matches_scalar(&ScalarBackend);
         assert_backend_batch_matches_scalar(&ScalarBackend);
+        // The two issue #54 barriers, run against the reference itself. They cannot fail here in a
+        // useful way, which is the point: it proves the GENERATORS are well formed (periodic inputs
+        // that really do tie, permutations that really do permute) before a GPU backend is judged
+        // by them.
+        assert_backend_tie_rule_matches_scalar(&ScalarBackend);
+        assert_backend_batch_order_invariant(&ScalarBackend);
         assert_eq!(ScalarBackend.name(), "scalar");
     }
 }

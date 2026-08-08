@@ -5197,6 +5197,55 @@ mod tests {
         }
     }
 
+    /// The rescue kernel's argmax tie rule, on inputs where ties are the norm (issue #54, trap 2).
+    ///
+    /// `matesw.rs` keeps the FIRST maximum (`vcgtq_u8`, strict `>`), the opposite of the extension
+    /// kernel, which keeps the last. A port that swaps them still returns the right `score`; it
+    /// returns different `te`/`qe`, and only on inputs where cells tie, which random sequence
+    /// almost never produces. So this generates them: periodic targets against queries in phase.
+    ///
+    /// Written now, before any GPU kernel exists, because that is the point of #54.
+    #[test]
+    fn matesw_tie_rule_equals_scalar() {
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let mat = scmat(1, 4);
+        let mut qbufs: Vec<Vec<u8>> = Vec::new();
+        let mut tbufs: Vec<Vec<u8>> = Vec::new();
+        // Period 1 is a homopolymer, where every cell of a row ties. 7 shares no factor with any
+        // SIMD width here, so a tie can never coincide with a lane boundary by luck.
+        for &period in &[1usize, 2, 3, 4, 7] {
+            for &qlen in &[9usize, 32, 63, 100, 149] {
+                for &tlen in &[qlen, qlen + 1, qlen * 3, qlen * 3 + 5] {
+                    qbufs.push((0..qlen).map(|i| (i % period) as u8 % 4).collect());
+                    tbufs.push((0..tlen).map(|i| (i % period) as u8 % 4).collect());
+                }
+            }
+        }
+        let jobs: Vec<KswJob> = qbufs
+            .iter()
+            .zip(tbufs.iter())
+            .map(|(q, t)| KswJob {
+                query: q.as_slice(),
+                target: t.as_slice(),
+            })
+            .collect();
+        for &minsc in &[1i32, 19, 100] {
+            let batched = batched_ksw_align2(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, 1);
+            for (i, j) in jobs.iter().enumerate() {
+                let want = ksw_align2(
+                    j.query, j.target, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, 1, 16,
+                );
+                assert_eq!(
+                    batched[i],
+                    want,
+                    "tie job {i} (qlen {}, tlen {}, minsc {minsc})",
+                    j.query.len(),
+                    j.target.len()
+                );
+            }
+        }
+    }
+
     /// The all-ZPAD third column regime (issue #47), on groups whose lanes have a UNIFORM query
     /// length, which is the only shape that opens it.
     ///

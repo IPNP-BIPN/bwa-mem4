@@ -260,7 +260,10 @@ impl SwBackend for NeonBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bwa_extend::{assert_backend_batch_matches_scalar, assert_backend_matches_scalar};
+    use bwa_extend::{
+        assert_backend_batch_matches_scalar, assert_backend_batch_order_invariant,
+        assert_backend_matches_scalar, assert_backend_tie_rule_matches_scalar,
+    };
 
     /// The two shared acceptance gates from `bwa-extend`, run against this backend. They take no
     /// arguments: each generates its own fixed-seed sweep and panics on the first field-level
@@ -270,6 +273,15 @@ mod tests {
         // The shared gate (qlen/tlen <= 80). Exercises the NEON int16 kernel on aarch64.
         assert_backend_matches_scalar(&NeonBackend);
         assert_backend_batch_matches_scalar(&NeonBackend);
+    }
+
+    /// The two GPU-readiness barriers of issue #54, run against the NEON backend today so they are
+    /// known to hold for the reference implementation before any GPU backend exists. A GPU backend
+    /// must pass these unchanged: they are written against `SwBackend`, not against NEON.
+    #[test]
+    fn neon_backend_passes_gpu_readiness_barriers() {
+        assert_backend_tie_rule_matches_scalar(&NeonBackend);
+        assert_backend_batch_order_invariant(&NeonBackend);
         assert_eq!(NeonBackend.name(), "neon");
     }
 
