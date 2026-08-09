@@ -47,6 +47,14 @@ on:
         type: boolean
         default: false
         required: false
+      # 17 consecutive `ubuntu-22.04` draws on 2026-08-09 all returned the same AMD EPYC 7763, so on
+      # that image the Intel lottery is not a lottery. The image label is an input so a different
+      # pool can be tried (`ubuntu-24.04`, `ubuntu-latest`) without editing this file, which is the
+      # only remaining lever for getting #44's AVX-512 kernel executed at all.
+      runner:
+        description: "Runner image for the kernel job (ubuntu-22.04 | ubuntu-24.04 | ubuntu-latest)"
+        default: "ubuntu-22.04"
+        required: false
   schedule:
     # Mondays 05:00 UTC, offset from the parity/CI schedules.
     - cron: "0 5 * * 1"
@@ -68,7 +76,7 @@ env:
 jobs:
   kernel-ab:
     name: kernel probes (rescue + extension, vs base_ref)
-    runs-on: ubuntu-22.04
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 60
     steps:
       # Full history: the base-ref comparison below checks the base out as a worktree.
