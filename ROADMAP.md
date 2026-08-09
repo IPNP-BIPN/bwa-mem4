@@ -2753,6 +2753,46 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## Le plafond reel de la machine, mesure (2026-08-09)
+
+Demande : approcher 100 % d'efficacite a 16 cœurs, et par extension a 32. Le plafond a donc ete
+mesure au lieu d'etre suppose, avec une sonde purement ALU (aucun acces memoire, donc tout ce qu'elle
+perd est de l'horloge ou de l'heterogeneite) :
+
+| threads | 1 | 4 | 8 | 12 | 14 | 16 |
+|---|---|---|---|---|---|---|
+| Giter/s | 2,7 | 10,7 | 21,7 | 31,6 | 33,7 | 35,3 |
+| efficacite | 100 % | 99 % | **100 %** | **97,5 %** | 89 % | **82 %** |
+
+Deux faits en decoulent. **La frequence n'est pas en cause** : jusqu'a 12 threads la machine rend
+97,5 % en calcul pur, il n'y a pas de perte d'horloge tous-cœurs a recuperer. Et **100 % a 16 est
+physiquement inatteignable ici** : les 4 cœurs E ne valent que 1,4x a eux quatre, donc le plafond est
+82 % quel que soit le code. La cible honnete a `-t16` sur cette machine est 82 %, pas 100 %.
+
+**L'origine de l'ecart restant est la memoire, par elimination.** Le meme aligneur sur un index de
+6 Mo (tenant en cache) au lieu de 15,9 GB voit son inflation CPU a `-t12` tomber de **+21 % a +10 %**.
+La moitie de la contention est donc directement imputable au trafic vers le BWT.
+
+**Hypotheses testees et rejetees**, dans l'ordre :
+
+| hypothese | verdict | mesure |
+|---|---|---|
+| desequilibre de charge | non | occupancy 97,7 %, queue 0,3 % |
+| cout de demarrage | non | 0,23 s, 0,5 % du mur sur 2 M paires |
+| lecture FASTQ serialisee par `-K` | non | `-K 400000000` et le defaut donnent le meme mur |
+| frequence tous-cœurs | non | sonde ALU a 97,5 % a `-t12` |
+| retrogradation vers les cœurs E | non | QoS `USER_INTERACTIVE` sur les travailleurs rayon : 1,32 contre 1,32 a `-t12`, 1,28 contre 1,28 a `-t16`, CPU identique. Retire |
+| reglage du parallelisme memoire | non | N16 et N32 a egalite a `-t12` et `-t16` |
+| pre-reservation des allocations | non, **negatif** | +0,35 % de CPU dans deux variantes |
+
+**Ce qui reste est le trafic lui-meme**, et c'est la seule voie vers une meilleure efficacite a
+n'importe quel nombre de cœurs, sur arm comme sur x86 : deux acces aleatoires de 64 octets par
+extension de base sur un BWT de 9,4 GB. Sur une machine homogene a 32 cœurs le plafond ALU
+remonterait vers 100 %, mais notre courbe se degraderait davantage, puisque 32 cœurs se disputeraient
+la meme DRAM. Autrement dit le probleme ne se dilue pas avec plus de cœurs, il s'aggrave, et la
+reponse est la meme dans les deux cas : toucher moins de memoire. C'est un changement de structure
+d'index, pas un reglage, et il devra passer la porte d'identite octet comme le reste.
+
 ## Scalabilite : ou passent les 24 % manquants a `-t12` (2026-08-09)
 
 Question posee : obtenir une scalabilite proportionnelle. Reponse mesuree : impossible par
