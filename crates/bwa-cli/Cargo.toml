@@ -22,9 +22,6 @@ bwa-io = { workspace = true }
 bwa-index = { workspace = true }
 bwa-mem = { workspace = true }
 bwa-neon = { workspace = true }
-bwa-metal = { package = "bwa-mem4-metal", path = "../bwa-metal", version = "4.3.1", optional = true, features = [
-    "metal",
-] }
 clap = { workspace = true }
 mimalloc = { workspace = true }
 anyhow = { workspace = true }
@@ -37,10 +34,6 @@ rammap-core = "1.1.2"
 # Per-stage timing counters in bwa-mem4-mem. Off by default: the wrapper is a barrier the inliner
 # does not always see through, and it costs measurable CPU even with BWA4_ALIGN_SPLIT unset.
 align-split = ["bwa-mem/align-split"]
-# Seed extension on the GPU (issue #55). Off by default and off at run time unless BWA4_GPU=metal:
-# the kernel is byte-identical but it only pays when it overlaps CPU work, which is a scheduling
-# property of the host, not of the kernel.
-metal = ["dep:bwa-metal"]
 # Passthrough for `bwa-io`'s multi-format FASTQ input (bzip2, xz, zstd). Off by default: +11 s of
 # build time, +3.5% of binary, and three more C libraries in the supply chain, for formats bwa-mem2
 # does not read. NOT because it introduces a C toolchain requirement: this binary already has one,

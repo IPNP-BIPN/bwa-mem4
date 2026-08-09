@@ -2792,6 +2792,18 @@ cinquieme du travail CPU. Sur une machine dediee ou seul le mur compte, cela ne 
 Parite verifiee sur les deux jeux reels, a `-t3` et `-t8`, pour chaque taille de chunk : la taille de
 chunk n'est que de l'ordonnancement, et les regions par lecture n'en dependent pas.
 
+**Decision (2026-08-09) : le GPU est abandonne sur `dev`.** Le meilleur point absolu de la machine
+reste le CPU seul a `-t16`, 1,38 s ; le meilleur point GPU, tous `-t` confondus, est 1,54 s, parce
+que son mur plafonne la. Le GPU ne payait que dans trois cas etroits (`-t` plafonne a 4, facturation
+au coeur-heure, machine partagee), et aucun n'est le cas d'usage vise. Les crates `bwa-metal` et
+`bwa-gpu`, les scripts `gpu_parity.sh` / `msl_probe.sh` et le branchement CLI sont retires de `dev`.
+
+Le travail n'est pas perdu : il est **entier sur la branche `gpu`** (`6553a3d`), noyaux MSL, gate de
+parite et mesures compris. Ce qui reste sur `dev` est la couture `SwBackendAsync` de #53 et les
+barrieres de #54, gardees parce qu'elles sont agnostiques du backend, testees sur CPU, et que ce sont
+elles qui rendraient un retour en arriere possible. Ce qu'il faudrait pour que ce retour vaille le
+coup est ecrit ci-dessus : le paquetage `uchar4`, pas une taille de lot.
+
 ## Phase 9b (GPU) : abandonnee, backend retire
 
 Un backend Metal a existe et a ete **supprime** (`c20867d`). Raison : sur un genome entier le kernel
