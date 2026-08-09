@@ -1798,6 +1798,62 @@ lectures, ce qui touche l'ordonnancement du pipeline et pas seulement la couture
 Et le calcul de rentabilite reste celui de la section precedente : sur cette course, le mate rescue
 pese **1,25 s sur 27,5 s de CPU, soit 4,5 %**. Meme un GPU parfait plafonne la.
 
+## Le noyau d'extension Metal : ecrit, octet-identique, 6,4x un coeur (2026-08-09)
+
+La suite immediate de la section ci-dessous : l'etage designe par la mesure est porte.
+`crates/bwa-metal/src/extend.metal` implemente `ksw_extend2`, un travail par thread, avec la bande,
+le z-drop, `max_off`, `gscore`, le resserrement de bande par ligne et son epilogue.
+
+### Ce qui a rendu la validation gratuite
+
+Le backend implemente **`SwBackend`**, donc **toute la batterie d'acceptation du projet s'applique
+sans une ligne de nouveau harnais**, et elle est passee du premier coup :
+
+| gate | ce qu'elle couvre |
+|---|---|
+| `assert_backend_matches_scalar` | le balayage complet : scorings, largeurs de bande, z-drop, formes |
+| `assert_backend_batch_matches_scalar` | les lots, avec les rounds `w` / `2w` |
+| `assert_backend_tie_rule_matches_scalar` | #54 piege 2, entrees ou toutes les cellules d'une ligne sont a egalite |
+| `assert_backend_batch_order_invariant` | #54 piege 6, dix permutations |
+
+La derniere est plus qu'un test ici : **c'est la preuve que regrouper les travaux de plusieurs
+threads CPU dans un seul lancement GPU ne peut pas changer une reponse.** Elle avait ete ecrite pour
+un futur backend GPU sans savoir qu'elle certifierait exactement ce regroupement.
+
+Deux choses sont deliberement restees sur l'hote : le **serrage de bande** (`clamp_band`), parce que
+le contrat `SwBackend` l'exige et parce qu'il est en `f64` alors qu'aucun noyau DP de ce projet ne
+contient de flottant ; et le **profil de requete**, le noyau indexant directement la matrice `m * m`,
+ce qui evite un tampon et garde le noyau general au lieu de supposer la forme ADN uniforme que les
+noyaux SIMD exigent.
+
+### Les chiffres
+
+Formes d'extension reelles (requetes 40-110 bases, cibles legerement plus longues), meilleur de 5 :
+
+| travaux | CPU NEON, 1 thread | **Metal** | rapport |
+|---|---|---|---|
+| **10 800** (la taille de production a `-t4`) | 3,61 Gcell/s | **9,08** | **2,5x** |
+| **32 768** (saturation) | 3,52 | **22,4** | **6,4x** |
+| 65 536 | 3,49 | 22,1 | 6,3x |
+
+Meme courbe d'occupancy que le noyau de rescue, meme genou : le lot **est** le nombre de threads.
+L'empaquetage coute 0,3 ms sur 8, soit 4 % — la memoire unifiee tient toujours sa promesse.
+
+**A la taille de lot que la production soumet deja, sans aucune file d'agregation, le GPU fait 2,5x
+un coeur.** En agregeant les quatre threads d'un chunk a `-t4` (4 x 10 800 = 43 000), il fait 6,4x.
+
+### Ce que cela vaudrait, et ce qui manque
+
+L'extension est 30 % de la course. Le CPU y met 8,0 s sur 27,5 s a `-t4`, soit 2,0 s par thread. Un
+GPU a 6,4x un coeur absorberait le travail des quatre threads en ~1,25 s **pendant** que le CPU fait
+autre chose, mais l'aligneur n'a aujourd'hui rien a faire d'autre a ce moment-la : il faudrait
+recouvrir avec le seeding du chunk suivant, ce qui est la couture asynchrone de #53 etape 1, deja
+ecrite mais sans consommateur.
+
+Ce qui manque est donc l'**integration**, pas le noyau : agreger les travaux des threads d'un chunk,
+lancer, redistribuer. Le noyau existe, il est prouve, et la barriere qui autorise le regroupement
+aussi.
+
 ## Le chemin GPU est l'extension, pas le rescue, et les chiffres le disent (2026-08-09)
 
 Suite directe du balayage d'occupancy. La question posee etait « comment atteindre 32 000 travaux par

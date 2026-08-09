@@ -32,6 +32,8 @@
 #[cfg(feature = "metal")]
 use bwa_mem4_extend::SuboptimalTracker;
 
+pub mod extend;
+
 /// The MSL source, compiled by the driver at run time. See the file for the kernel's contract.
 pub const KERNEL_SRC: &str = include_str!("kernel.metal");
 

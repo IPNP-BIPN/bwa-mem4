@@ -22,6 +22,10 @@ bwa-mem4-gpu = { path = "../bwa-gpu", version = "4.3.1" }
 # and `MetalRescue::new` returns `None`, which is the fallback path the aligner already handles.
 metal = { version = "0.33", optional = true }
 
+[dev-dependencies]
+# The CPU backend the probe compares against.
+bwa-neon = { package = "bwa-mem4-neon", path = "../bwa-neon", version = "4.3.1" }
+
 [features]
 default = []
 metal = ["dep:metal"]
