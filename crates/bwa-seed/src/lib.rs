@@ -234,6 +234,58 @@ fn prefetch_ahead() -> usize {
 /// arithmetic must stay `f32`.
 const SPLIT_LEN_ROUNDING: f32 = 0.499;
 
+/// Measure this machine's memory-level parallelism and return the lockstep width to use.
+///
+/// # Why this is measured rather than hard-coded
+///
+/// The lockstep width should equal the number of independent cache-line fetches one core can keep
+/// in flight, and that number is not a property of the architecture. Published pointer-chase
+/// measurements on current server CPUs (Lemire, 2026): **Graviton 5 sustains 19 concurrent
+/// fetches, Apple M4 28, Intel Granite Rapids 30, AMD Zen 5 Turin 58**, and AMD's own progression
+/// runs Naples 15 -> Milan 22 -> Turin 58. A constant cannot track a factor of three between
+/// contemporary machines, and this file previously carried two constants that were each measured on
+/// exactly one host.
+///
+/// So the width is measured here, in about 15 ms at startup, by the same experiment those numbers
+/// come from: chase `k` independent random cycles at once and see where adding lanes stops paying.
+///
+/// # Method
+///
+/// A pointer cycle over a buffer far larger than any cache, walked with `k` independent chains.
+/// Time per access falls as `k` rises while the machine still has miss slots, and flattens once it
+/// does not. The knee is taken as the smallest `k` within 5% of the best time, so a flat top picks
+/// the cheaper width rather than the widest one.
+///
+/// Scheduling only, and it cannot move a byte of output: the value chooses how many FM walks are
+/// interleaved, never which rows any walk visits.
+fn probe_lockstep_width(fm: &FmIndex) -> usize {
+    /// Candidate widths, spanning the published range from Graviton 5 (19) to Zen 5 Turin (58) with
+    /// headroom at both ends.
+    const CANDIDATES: [usize; 7] = [8, 12, 16, 24, 32, 48, 64];
+    /// Accesses per candidate. Equal across widths, so no candidate is measured warmer than another.
+    const ACCESSES: usize = 200_000;
+
+    let times = fm.probe_concurrency(&CANDIDATES, ACCESSES);
+    let best = times.iter().cloned().fold(f64::MAX, f64::min);
+    // Smallest width within 5% of the best: on a flat top, fewer slots means less scratch memory and
+    // less bookkeeping for the same latency hiding.
+    let width = CANDIDATES
+        .iter()
+        .zip(&times)
+        .find(|(_, &ns)| ns <= best * 1.05)
+        .map(|(k, _)| *k)
+        .unwrap_or(DEFAULT_LOCKSTEP_WIDTH);
+
+    if std::env::var_os("BWA4_LOCKSTEP_PROBE").is_some() {
+        eprintln!("[lockstep-probe] ns/access by width, chasing this index's cp_occ:");
+        for (k, ns) in CANDIDATES.iter().zip(&times) {
+            eprintln!("[lockstep-probe]   {k:>3} -> {ns:6.2} ns");
+        }
+        eprintln!("[lockstep-probe] chosen width {width}");
+    }
+    width
+}
+
 /// Lockstep width: how many independent FM walks are kept in flight, so each slot's `cp_occ`
 /// prefetch has a full cycle to land before the block is used. **This is the aligner's
 /// memory-level-parallelism knob**: N slots means at most N outstanding DRAM misses per core.
@@ -246,7 +298,7 @@ const SPLIT_LEN_ROUNDING: f32 = 0.499;
 /// # Returns
 /// The number of lockstep slots, always `>= 1`. Read once from the environment and cached for the
 /// process, so all three batched rounds agree and the value cannot change mid-run.
-fn lockstep_width() -> usize {
+fn lockstep_width(fm: &FmIndex) -> usize {
     // Process-wide cache of the parsed width. `OnceLock` because the value must be identical for
     // every thread and every batch: a mid-run change would not corrupt results (scheduling only) but
     // would make benchmarks meaningless.
@@ -258,7 +310,15 @@ fn lockstep_width() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_LOCKSTEP_WIDTH)
+            // Measured, not assumed: see `probe_lockstep_width`. `BWA4_LOCKSTEP_NO_PROBE` falls back
+            // to the compiled-in constant, for a machine too noisy to measure on.
+            .unwrap_or_else(|| {
+                if std::env::var_os("BWA4_LOCKSTEP_NO_PROBE").is_some() {
+                    DEFAULT_LOCKSTEP_WIDTH
+                } else {
+                    probe_lockstep_width(fm)
+                }
+            })
     })
 }
 
@@ -333,7 +393,7 @@ pub fn collect_smems_batched(
     // Lockstep width: independent walks kept in flight so each slot's prefetch has a full cycle to
     // land before the block is used. 16 measured ~2.8% faster than 8 on a genome-scale index (M4 Max,
     // SE); 24 ties it and 32 regresses, so 16 is the knee. Shared by all three batched seeding rounds.
-    let lockstep_slots = lockstep_width();
+    let lockstep_slots = lockstep_width(fm);
 
     // The index's C array, hoisted once: `counts[b]` is the number of reference bases strictly
     // smaller than `b`, so it is also the first BWT ROW whose suffix begins with `b`. Copied out of
@@ -1323,7 +1383,7 @@ fn bwt_seed_strategy_batched(
     min_seed_len: i32,
     out: &mut [Vec<Smem>],
 ) {
-    let lockstep_slots = lockstep_width();
+    let lockstep_slots = lockstep_width(fm);
     if reads.is_empty() {
         return;
     }
@@ -1563,7 +1623,7 @@ struct ReseedJob {
 ///   `ridx` indexes both). Round-2 SMEMs are appended in place. Jobs are enumerated from the entry
 ///   contents, so the SMEMs appended here are never themselves re-seeded.
 fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &mut [Vec<Smem>]) {
-    let lockstep_slots = lockstep_width();
+    let lockstep_slots = lockstep_width(fm);
     // Same threshold as `smem_round_2`, in bases: 28 with the defaults. The `f32` arithmetic must
     // stay identical to the per-read path or the two would select different SMEMs.
     let split_len = (opt.min_seed_len as f32 * opt.split_factor + SPLIT_LEN_ROUNDING) as i32;

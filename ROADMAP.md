@@ -2753,6 +2753,52 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## La largeur lockstep est maintenant mesuree au demarrage (2026-08-09)
+
+Deuxieme round de recherche, hors bioinfo. Le chiffre qui declenche ce changement vient de mesures
+publiees de pointer-chasing sur les CPU serveurs actuels ([Lemire, 2026](https://lemire.me/blog/2026/07/25/memory-level-parallelism-amd-is-the-king/)) :
+
+| CPU | latence | debit 1 cœur | **acces concurrents** |
+|---|---|---|---|
+| Graviton 5 (2026) | 96 ns | 12,0 GiB/s | **19** |
+| Apple M4 | | | **28** |
+| Xeon Granite Rapids (2025) | 133 ns | 13,3 GiB/s | **30** |
+| **EPYC Zen 5 Turin (2025)** | 142 ns | 24,5 GiB/s | **58** |
+
+Progression AMD : Naples 15 -> Milan 22 -> Turin 58. Intel : Broadwell 10 -> Ice Lake 20 ->
+Granite Rapids 30. **Un facteur trois entre CPU contemporains.**
+
+Or la largeur lockstep doit valoir ce nombre : c'est le nombre de defauts de cache qu'un cœur peut
+garder en vol. Nos deux constantes (32 sur aarch64, 16 ailleurs) avaient chacune ete mesurees sur
+**une seule** machine, et sur Zen 5 la valeur x86 est **3,6x trop petite**. Aucune constante ne peut
+suivre ça.
+
+**Elle est donc mesuree au demarrage**, par l'experience meme dont ces chiffres proviennent : des
+chaines de pointeurs dependantes, `k` a la fois, et on regarde ou ajouter des voies cesse de payer.
+
+**La sonde chasse dans `cp_occ`, pas dans un tampon neuf**, et c'est la seule version qui marche.
+Une premiere sonde sur 64 Mio alloues rendait une courbe non monotone et choisissait 64 : ce tampon
+tient dans le cache systeme de cette machine, elle mesurait donc du cache. L'index fait des
+gigaoctets, il est deja resident, il porte le meme comportement TLB, et c'est exactement la memoire
+que le seeding va marteler.
+
+Resultat sur cette machine, trois lancements sur trois :
+
+```
+  8 -> 14,6 ns    24 ->  4,3 ns    64 ->  2,7 ns
+ 12 ->  5,9 ns    32 ->  2,7 ns    largeur choisie : 32
+ 16 ->  4,6 ns    48 ->  3,0 ns
+```
+
+La courbe suit `latence / k` jusqu'a ~28 voies puis plafonne, ce qui est le comportement attendu, et
+elle retombe sur **32**, exactement la valeur trouvee ce matin par balayage bout-en-bout. Sur une
+machine Zen 5 elle choisirait plus large sans qu'on ait a le savoir.
+
+Cout : **+10 ms** (0,24 s contre 0,23 s de demarrage), CPU inchange. Octet-identique sur les deux
+jeux, `check.sh` et `oracle_diff.sh` vertes. `BWA4_LOCKSTEP_N` force toujours une valeur, et
+`BWA4_LOCKSTEP_NO_PROBE` revient a la constante compilee pour une machine trop bruyante pour etre
+mesuree.
+
 ## Un modele qui predit la scalabilite a 5 points pres (2026-08-09)
 
 Revue de litterature hors bioinfo (architecture, bases de donnees en memoire, capacity planning) plus

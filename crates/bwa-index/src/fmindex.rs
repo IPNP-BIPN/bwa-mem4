@@ -594,6 +594,56 @@ impl FmIndex {
         })
     }
 
+    /// Measure how many independent cache-line fetches this core can keep in flight, by chasing
+    /// dependent random addresses **inside this index's own checkpoint array**.
+    ///
+    /// # Why the index and not a scratch buffer
+    ///
+    /// A probe over a freshly allocated buffer measures whatever that buffer fits in. A 64 MiB one
+    /// sits inside this machine's system-level cache and reports 2.7 ns per access, four times
+    /// faster than DRAM, which then picks the widest candidate for the wrong reason. `cp_occ` is
+    /// gigabytes, already resident, already the array the seeding walk will hammer, and it carries
+    /// the same TLB behaviour. Probing it costs no allocation and measures the real thing.
+    ///
+    /// # Method
+    ///
+    /// Each chain reads a word from a block, mixes it, and derives its next block index from the
+    /// value read, so the address genuinely depends on the load and no prefetcher can run ahead.
+    /// `k` chains advance in lockstep, which is the aligner's own access shape. The reported time
+    /// per access falls while the core still has miss slots to spare and flattens when it does not.
+    ///
+    /// # Returns
+    /// Nanoseconds per access for each width in `widths`, in order.
+    pub fn probe_concurrency(&self, widths: &[usize], accesses_per_width: usize) -> Vec<f64> {
+        let n_blocks = self.cp_occ.len();
+        assert!(n_blocks > 1024, "index too small to probe");
+        let mut out = Vec::with_capacity(widths.len());
+        for &k in widths {
+            // Chains start spread across the array so they do not share lines.
+            let mut cur: Vec<usize> = (0..k).map(|i| i * (n_blocks / k.max(1))).collect();
+            let steps = accesses_per_width / k.max(1);
+            // One untimed pass, so every width starts from the same cache and TLB state.
+            for _ in 0..64 {
+                for c in cur.iter_mut() {
+                    let v = self.cp_occ[*c % n_blocks].one_hot[0] ^ (*c as u64);
+                    *c = (v.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 24) as usize % n_blocks;
+                }
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..steps {
+                for c in cur.iter_mut() {
+                    // The load's VALUE decides the next address: a true dependency, not a stride.
+                    let v = self.cp_occ[*c].one_hot[0] ^ (*c as u64);
+                    *c = (v.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 24) as usize % n_blocks;
+                }
+            }
+            let ns = t0.elapsed().as_secs_f64() * 1e9 / (steps * k) as f64;
+            std::hint::black_box(&cur);
+            out.push(ns);
+        }
+        out
+    }
+
     /// Prefetch the two checkpoint blocks a future [`backward_ext`] on an interval `[sp, ep)` will
     /// touch (`cp_occ[sp>>6]` and `cp_occ[ep>>6]`). Issued one SMEM step ahead in the seeding walk to
     /// hide the DRAM latency of the data-dependent block loads, exactly as bwa-mem2's / nh13's
