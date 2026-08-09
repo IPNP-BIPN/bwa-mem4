@@ -43,6 +43,7 @@ pub const EXTEND_SRC: &str = include_str!("extend.metal");
 ///
 /// # Returns
 /// The band half-width the DP must use, never larger than `w0`.
+#[allow(clippy::too_many_arguments)]
 pub fn clamp_band(
     w0: i32,
     qlen: usize,
