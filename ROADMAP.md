@@ -2775,6 +2775,31 @@ systeme memoire M4 et ne peut pas repondre a une question de parallelisme memoir
 7,7 % ; rescue 6,2 %. C'est la reponse a « quel est le `p` d'Amdahl du GPU » : porter l'extension
 entiere plafonne a 23 %.
 
+### Contre le fork fg-labs/bwa-mem3 v0.9.0 (sorti le 2026-08-07)
+
+La release n'apporte rien de performance : `--compat=bwa-mem` (octet-identique a bwa 0.7.19 en plus
+de bwa-mem2), la derivation du FLAG 0x2 depuis la region de meilleur score, `pa:f` unifie entre les
+ecrivains SAM et BAM, et la detection des echecs d'ajout de tag BAM. Les trois correctifs ne touchent
+que les runs ALT-aware.
+
+Verifie avant de chronometrer : `--compat=bwa-mem2` sort **exactement notre md5** (`791c21c2...`),
+donc les deux binaires produisent le meme fichier et la comparaison porte sur le meme travail. Son
+mode natif coute la meme chose que son mode compat, a 0,3 % pres.
+
+| murs, medianes de 3 | `-t1` | `-t4` | `-t16` |
+|---|---|---|---|
+| fork v0.9.0 (compat) | 13,19 | 3,55 | 1,38 |
+| **bwa-mem4** | **12,11** | **3,34** | **1,31** |
+| avance | **1,089x** | **1,063x** | **1,053x** |
+
+En CPU-s nous gagnons a `-t1` (12,17 contre 13,17) et `-t4` (12,82 contre 13,66) et nous **perdons**
+a `-t16` (17,38 contre 16,69, +4,1 %) : le fork scale un peu mieux en fin de courbe et nous ne
+gardons le mur que grace a l'avance accumulee plus bas. C'est le seul endroit ou il nous passe
+devant, et c'est donc la que se trouve la prochaine question.
+
+A ne pas superposer au 0,981x du 2026-07-29 : celui-la etait mesure sur donnees GIAB reelles et
+**avec PGO** des deux cotes, celui-ci sur les 500 k paires **sans PGO**.
+
 ### Contre bwa-mem2 2.3 et contre minibwa
 
 Meme machine (M4 Max), memes 500 k paires, entrelace, medianes de 3, murs en secondes :
