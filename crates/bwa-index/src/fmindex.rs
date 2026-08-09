@@ -753,6 +753,7 @@ impl FmIndex {
         // ROW, `ep` the first row past it. Both are rows, not reference positions.
         let sp = smem.k;
         let ep = smem.k + smem.s;
+        #[cfg(feature = "traffic")]
         if traffic::enabled() {
             // Two 64B blocks share one 128B line, and for a small interval sp>>6 == ep>>6, so calls
             // are a bad proxy for traffic. Count distinct LINES.
@@ -854,6 +855,7 @@ impl FmIndex {
         let mut offset = 0i64;
         let mut sp = pos;
         loop {
+            #[cfg(feature = "traffic")]
             if traffic::enabled() {
                 // One line per step (one_hot and get_occ hit the same 64B block).
                 traffic::SA_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1040,6 +1042,7 @@ impl FmIndex {
                     let spi = sp[j];
                     let occ_id = (spi >> CP_SHIFT) as usize;
                     let y = CP_BLOCK_SIZE - (spi & CP_MASK) - 1;
+                    #[cfg(feature = "traffic")]
                     if traffic::enabled() {
                         traffic::SA_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }

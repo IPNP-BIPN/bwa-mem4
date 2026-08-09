@@ -48,6 +48,12 @@ libsais = { version = "0.2", optional = true, default-features = false }
 caps-sa = { version = "0.6", optional = true }
 
 [features]
+# `BWA4_TRAFFIC` cache-line counters in `backward_ext`, `get_sa` and `get_sa_batch`. OFF by default,
+# and compiled out entirely rather than merely branch-predicted away: these three sites sit on the
+# hottest path in the crate (`backward_ext` alone runs ~1e9 times per 500k pairs), and the identical
+# pattern in `bwa-seed` measured ~3% of CPU when it was an unconditional runtime check. Turn it on to
+# size a memory-traffic question, never for production.
+traffic = []
 # libsais is ON by default: it builds the suffix array via libsais-rs (a pure-Rust, Apache-2.0
 # translation of Ilya Grebnov's libsais), ~3x faster to build than the in-tree SA-IS and BYTE-IDENTICAL
 # (a suffix array is unique; gated by scripts/index_diff.sh). `--no-default-features` falls back to the
