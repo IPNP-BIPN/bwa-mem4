@@ -2753,6 +2753,45 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## Scalabilite : ou passent les 24 % manquants a `-t12` (2026-08-09)
+
+Question posee : obtenir une scalabilite proportionnelle. Reponse mesuree : impossible par
+l'ordonnancement, le manque est du trafic memoire. Le detail, parce que la conclusion negative n'a
+de valeur qu'avec les chiffres qui l'excluent.
+
+**Mesure de reference**, 2 M paires (le plancher de demarrage y pese 0,5 % au lieu de 18 %) :
+
+| | `-t1` | `-t4` | `-t8` | `-t12` | `-t16` |
+|---|---|---|---|---|---|
+| mur | 45,36 | 12,11 | 6,61 | 4,97 | 4,77 |
+| acceleration | 1x | 3,75x (94 %) | 6,86x (86 %) | 9,13x (**76 %**) | 9,51x (59 %) |
+| CPU-s | 45,6 | 47,8 | 50,2 | 55,1 | 65,1 |
+
+**Trois causes eliminees par la mesure.**
+
+1. *L'equilibrage.* `BWA4_BARRIER_TIME` donne pour la region `align` a `-t16` une occupancy de
+   **97,7 %** et une queue de **0,3 %** (95,1 % / 3,9 % pour `sam_emit`). Il n'y a pas de travailleur
+   qui attend : les regions paralleles sont deja pleines.
+2. *Le demarrage.* Un run de 1000 paires coute **0,23 s de mur et 2,45 s de CPU** : c'est le
+   chargement des 15,9 GB d'index (9,4 BWT + 5,8 `.0123` + 0,7 pac), lu en tampons alignes et non
+   mmap. Sur 500 k paires cela fait 18 % du mur et explique pourquoi ce jeu-la exagerait le probleme ;
+   sur 2 M paires c'est 0,5 %, et la degradation reste entiere.
+3. *Le reglage du parallelisme memoire.* La largeur lockstep a ete re-balayee **a `-t12` et `-t16`** :
+   N16 et N32 se tiennent dans le bruit (4,53 / 4,66 contre 4,61 / 4,64 a `-t16`), le genou mesure a
+   `-t4` s'aplatit des que les threads se disputent le controleur. Faire dependre la largeur du
+   nombre de threads ne rendrait rien.
+
+**Ce qui reste, et c'est la cause.** A `-t12`, c'est-a-dire **avant que l'ordonnanceur ne place quoi
+que ce soit sur les 4 cœurs E**, le meme travail coute deja **+21 % de CPU** (55,1 contre 45,6). A
+`-t16` l'inflation monte a +43 %, l'ecart supplementaire etant l'heterogeneite P/E. Les 21 % sont de
+la contention du systeme memoire : le seeding fait deux acces aleatoires de 64 octets par extension
+de base sur un BWT de 9,4 GB, et douze cœurs qui font ça saturent la file de misses.
+
+**Consequence.** Rendre la scalabilite proportionnelle demande de **reduire le trafic**, pas de mieux
+ordonnancer : une structure d'index plus compacte ou plus locale (le `bwa_index::lisa::LearnedSa`
+present dans l'arbre en est une piste), pas un knob. Note pratique en attendant : **`-t12` donne
+96 % du mur de `-t16` pour 15 % de CPU en moins**, et sur le petit jeu il donne meme le meme mur.
+
 ## Campagne perf CPU et classement contre minibwa (2026-08-09)
 
 Trois leviers mesures, tous octet-identiques, tous gardes :
