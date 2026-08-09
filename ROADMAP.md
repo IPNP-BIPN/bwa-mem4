@@ -2753,6 +2753,33 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## Aucun aligneur de cette classe ne scale mieux, mesure (2026-08-09)
+
+Objection legitime : « il y a des aligneurs qui scalent ». Verifie sur cette machine, meme jeu de
+2 M paires, memes conditions, plutot que discute :
+
+| | `-t1` | `-t4` | `-t16` | efficacite a `-t16` |
+|---|---|---|---|---|
+| **bwa-mem4** | 46,79 | 12,37 (95 %) | 4,58 | **64 %** |
+| fork v0.9.0 (compat) | 50,43 | 13,08 (96 %) | 4,67 | **67 %** |
+| minibwa 0.7 | 38,90 | 10,33 (94 %) | 3,94 | **62 %** |
+
+Les trois tombent entre 62 % et 67 %, soit 5 points d'ecart sur une machine dont la derive thermique
+vaut 15 %. **minibwa, le plus rapide des trois en absolu, scale moins bien que nous.** Ce qu'il gagne,
+il le gagne en faisant moins de travail (38,6 CPU-s contre nos 46,8 a `-t1`, via un autre algorithme
+SMEM et des heuristiques qui changent la sortie), pas en scalant mieux.
+
+Rapportes au plafond materiel mesure (82 % a `-t16`, sonde ALU), les trois rendent **78 % de ce que
+la machine peut donner**, et c'est le meme 78 % a `-t12`. La taxe memoire est donc une constante
+d'environ 22 % a haut compte de threads, **independante de l'implementation**. Le papier bwa-mem2 le
+dit depuis 2019 avec ses propres chiffres : 3,5x mono-thread mais **2,4x mono-socket**.
+
+Conclusion : il n'y a pas de scalabilite a recuperer contre la concurrence, parce que la concurrence
+ne l'a pas non plus. Il y a du **travail absolu** a recuperer, et c'est la que minibwa nous devance.
+Le seul chemin restant vers une meilleure efficacite est celui que la revue de litterature designe :
+des pages de 1 GB sur x86 (+10,9 points mesures par BWA-MEM-SCALE), ce qui est un levier de
+deploiement, pas d'algorithme, et qui n'existe pas sur macOS.
+
 ## Le plafond reel de la machine, mesure (2026-08-09)
 
 Demande : approcher 100 % d'efficacite a 16 cœurs, et par extension a 32. Le plafond a donc ete
