@@ -411,8 +411,12 @@ Same reads, same index, same `-K`, same interleaved harness, our arm rebuilt wit
 us vs fork: **0.981x wall**, 0.985x RSS. Per rep the arms alternate (fork by 0.3%, us by 0.8%, fork
 by 1.9%), so this is a **tie** inside the 3% floor, and we are the byte-identical one.
 
-**PGO is worth 12.4% on real paired-end data** (32.28s -> 28.71s), against the 8.5% previously
-recorded on wgsim. Like everything else in this section, the wgsim figure understated the lever that
+**PGO was worth 12.4% on real paired-end data** (32.28s -> 28.71s), against the 8.5% previously
+recorded on wgsim. **Superseded 2026-08-09: it is now 3.0%** (28.76 -> 27.91 CPU-s, -t4, 5/5, and
+2.5% when the profile is trained on the very data being measured). The lever shrank because the
+optimisations PGO used to find have since been made by hand: const-generic monomorphisation of the
+kernels, `#[inline(always)]` on `backward_ext`, the statistics branches compiled out of the hot
+paths, and the `OnceLock` reads hoisted out of the loops. See ROADMAP.md, section of that date. Like everything else in this section, the wgsim figure understated the lever that
 matters, because it understates the stage that dominates.
 
 ### Tested and dead: flattening the rescue rounds (the fork's shape)

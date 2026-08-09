@@ -2753,6 +2753,37 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## Le PGO ne vaut plus 12,4 %, il vaut 3 % (2026-08-09)
+
+Le dossier portait le PGO a **+12,4 % sur du reel** et +8,5 % sur wgsim, et s'en servait pour
+expliquer une partie de l'ecart contre le fork. Re-mesure aujourd'hui sur `dev`, `cargo pgo build`,
+un run de profilage, `cargo pgo optimize build`, binaire **octet-identique** sur les deux jeux :
+
+| jeu | entrainement | CPU sans PGO | avec PGO | gain | victoires |
+|---|---|---|---|---|---|
+| reel (ERR356372) | wgsim | 28,76 | 27,91 | **-3,0 %** | 5/5 |
+| reel (ERR356372) | le meme reel | 28,75 | 28,02 | **-2,5 %** | 5/5 |
+| wgsim (500 k paires) | wgsim | 12,88 | 12,80 | -0,6 % | 5/5 |
+
+Deux choses a en tirer.
+
+**Le regime d'entrainement ne compte quasiment pas** : entrainer sur le jeu exact qu'on mesure donne
+-2,5 %, entrainer sur wgsim donne -3,0 %, l'inverse de ce qu'on attendrait. Le profil n'est donc pas
+le facteur limitant.
+
+**Le lever a fondu parce que le code a ete optimise a la main depuis.** Le PGO gagne surtout par
+l'inlining et la disposition des branches ; or la campagne a monomorphise les noyaux par const
+generics, force `#[inline(always)]` sur `backward_ext`, supprime les branches de statistiques des
+chemins chauds et sorti les lectures de `OnceLock` des boucles. Ce sont exactement les decisions que
+le PGO prenait a notre place. Le profil `release` fait deja `lto = "fat"`, `codegen-units = 1` et
+`panic = "abort"`.
+
+**Consequence pratique** : le binaire livre gagne 3 %, pas 12,4 %, et le classement de cette campagne
+reste juste puisque les trois concurrents etaient eux aussi sans PGO. La question ouverte du dossier
+(« pourquoi nh13 mesure -0,4 % sur Graviton la ou nous mesurons +12,4 % ») **perd l'essentiel de son
+objet** : l'ecart a expliquer n'est plus de 12,8 points mais de 3,4, ce qui est l'ordre de grandeur
+d'une difference de microarchitecture ordinaire.
+
 ## Aucun aligneur de cette classe ne scale mieux, mesure (2026-08-09)
 
 Objection legitime : « il y a des aligneurs qui scalent ». Verifie sur cette machine, meme jeu de
