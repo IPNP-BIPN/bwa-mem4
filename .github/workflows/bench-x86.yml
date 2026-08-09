@@ -339,3 +339,64 @@ jobs:
           echo "base ${bb}s | head ${hh}s | bwa-mem2 canary ${mm}s | head wins ${wins}/3"
           awk -v b="$bb" -v h="$hh" 'BEGIN{printf "head vs base: %.4fx  (%+.2f%%)\n", b/h, 100*(b-h)/b}'
           echo "NOTE: shared-runner VM, single chromosome. Not the headline ratio; see README."
+
+  # Can a hosted runner even get 1 GB pages? BWA-MEM-SCALE (ICPP'22) measures +10.9 percentage points
+  # from HugeTLB with 1 GB pages, and `crates/bwa-index/src/hugepage.rs` already establishes that
+  # 2 MiB THP is worth ~1.7x on the seeding stage AND that mimalloc already obtains it. So the only
+  # unpaid part of that lever is the step from 2 MiB to 1 GB, which mimalloc does not take.
+  #
+  # This job answers "is it reachable" before any allocation code is written for it. Writing an
+  # mmap(MAP_HUGETLB | MAP_HUGE_1GB) path first, on a machine that cannot run it, would be building
+  # on a guess. It runs in about a minute and is independent of the two benchmark jobs.
+  hugepage-probe:
+    name: are 1 GB pages obtainable on a hosted runner
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: What the kernel offers
+        run: |
+          echo "== CPU support (pdpe1gb means 1 GB pages exist in silicon) =="
+          grep -o -E 'pdpe1gb|pse' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo
+          echo "== page sizes the kernel exposes =="
+          ls -1 /sys/kernel/mm/hugepages/ 2>/dev/null || echo "(no hugepages sysfs)"
+          echo
+          for d in /sys/kernel/mm/hugepages/hugepages-*; do
+            [ -d "$d" ] || continue
+            echo "$(basename "$d"): nr=$(cat "$d/nr_hugepages") free=$(cat "$d/free_hugepages")"
+          done
+          echo
+          echo "== THP =="
+          cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo "(none)"
+          echo
+          echo "== boot cmdline (hugepagesz= here means 1 GB was reserved at boot) =="
+          cat /proc/cmdline
+
+      - name: Try to reserve at runtime
+        run: |
+          # 2 MiB first, as the control: if even this fails the runner forbids reservation outright
+          # rather than 1 GB being special.
+          for sz in 2048kB 1048576kB; do
+            d=/sys/kernel/mm/hugepages/hugepages-$sz
+            [ -d "$d" ] || { echo "$sz: not exposed by this kernel"; continue; }
+            want=4
+            echo "$want" | sudo tee "$d/nr_hugepages" >/dev/null 2>&1 || echo "$sz: write refused"
+            got=$(cat "$d/nr_hugepages")
+            echo "$sz: asked $want, got $got"
+          done
+          echo
+          echo "== can we mount hugetlbfs =="
+          sudo mkdir -p /mnt/huge && sudo mount -t hugetlbfs none /mnt/huge 2>&1 \
+            && { echo "mounted"; mount | grep hugetlbfs; sudo umount /mnt/huge; } \
+            || echo "mount refused"
+
+      - name: Verdict
+        run: |
+          d=/sys/kernel/mm/hugepages/hugepages-1048576kB
+          if [ -d "$d" ] && [ "$(cat $d/nr_hugepages)" -gt 0 ]; then
+            echo "1 GB pages ARE obtainable here: the lever is testable in CI."
+          else
+            echo "1 GB pages are NOT obtainable on this runner."
+            echo "That does not kill the lever, it kills testing it here: it stays a deployment"
+            echo "note for users with a tuned host, not something this repo can measure or ship on."
+          fi
