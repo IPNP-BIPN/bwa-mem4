@@ -1503,6 +1503,42 @@ secondes quand le tirage n'a pas `avx512bw`. **Sept tirages consecutifs ont donn
 seule raison. Le harnais est pret : un tirage Intel suffira a faire tourner
 `avx512_matesw_u8_matches_scalar` et a imprimer la ligne `avx512_u8` des deux sondes.
 
+## Le processus entier sur x86 : +1,33 %, et deux choses vues au passage (2026-08-09)
+
+Les sondes de noyau repondaient « les noyaux ont-ils accelere ». Elles ne repondent pas « le binaire
+a-t-il accelere », qui est ce que les issues x86 devaient vraiment. Le job bout-en-bout de
+`bench-x86.yml` construit desormais le ref de base **sur le meme runner**, verifie que les deux
+binaires s'accordent sur le corps SAM, puis les entrelace sur le meme index et les memes lectures,
+avec **bwa-mem2 chronometre a cote comme canari de derive**.
+
+Runner AMD EPYC 7763 (Zen 3), chr21, 500 k paires simulees, 8 threads :
+
+| | |
+|---|---|
+| md5 du corps SAM, base et HEAD | **identiques**, `c32c321f…` |
+| base | 53,58 / 53,90 / 54,02 s |
+| HEAD | 52,97 / 52,87 / 53,15 s |
+| canari bwa-mem2 | 79,45 / 79,43 / 79,54 s (dispersion 0,14 %, la machine n'a pas derive) |
+| **resultat** | **1,0134x, +1,33 %, 3 victoires sur 3** |
+
+**Donc non, on ne perd pas sur x86 : +1,33 % sur le processus entier.** Le chiffre colle a celui
+d'arm64 sur la meme longueur de lecture (+1,6 % a 150 bp), ce qui est rassurant : les deux
+plateformes voient le meme lot de leviers produire le meme ordre de grandeur.
+
+Le -0,9 % du noyau d'extension AVX2 (#48B) existe toujours, il est simplement noye : le rescue prend
++17 % sur la meme machine et pese davantage.
+
+### Deux choses vues au passage, qui ne sont pas de ce lot
+
+1. **Contre le fork, sur x86, nous perdons : 0,71x** (bwa-mem3 37,69 s contre nos 53,30 s ; bwa-mem2
+   79,62 s, donc 1,49x pour nous contre l'oracle). C'est le sujet des issues #20, #27 et du jalon
+   v4.3.2, pas de la campagne SIMD, et le chiffre est ici confirme sur un runner neutre. A 150 bp sur
+   Apple Silicon le rapport contre le fork etait de 0,98x ; sur Zen 3 il est de 0,71x. **L'ecart x86
+   est reel et il est gros.**
+2. **La sonde de tier confirme la lecture du runner** : `scalar` 486,93 s, `avx2` 53,11 s,
+   `avx512` 484,58 s. Le tier `avx512` force retombe en scalaire faute de `avx512bw`, exactement le
+   comportement documente, et cela redit que rien d'AVX-512 n'a tourne.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
