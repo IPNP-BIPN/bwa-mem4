@@ -109,6 +109,22 @@ mod backend {
         /// u8 rails, for jobs whose score ceiling fits a byte. Same control flow, a quarter of the
         /// device-memory traffic; the host picks between them per job, as `fwd_local_sw_batch` does.
         pipeline_u8: metal::ComputePipelineState,
+        /// Nanoseconds of the last `forward_batch`, split three ways: filling the shared buffers,
+        /// the submitted work, and the CPU-side `score2` pass.
+        ///
+        /// This exists because the throughput probe used to time `forward_batch` WHOLE, and that
+        /// number is the sum of three unrelated things. A `uchar4` experiment was abandoned on the
+        /// strength of a comparison that measurement could not distinguish (see ROADMAP.md), so the
+        /// split comes before any further kernel work.
+        ///
+        /// The middle figure is wall time around `commit`/`wait_until_completed`, not the driver's
+        /// own GPU counters: `metal` 0.33 does not expose `GPUStartTime`, and adding an Objective-C
+        /// runtime dependency to read them is not worth it for a probe. It therefore includes
+        /// submission and scheduling latency, which is the honest reading of "what the GPU arm
+        /// costs the caller".
+        last_pack_ns: std::sync::atomic::AtomicU64,
+        last_gpu_ns: std::sync::atomic::AtomicU64,
+        last_post_ns: std::sync::atomic::AtomicU64,
     }
 
     impl MetalRescue {
@@ -127,7 +143,24 @@ mod backend {
                 queue,
                 pipeline,
                 pipeline_u8,
+                last_pack_ns: std::sync::atomic::AtomicU64::new(0),
+                last_gpu_ns: std::sync::atomic::AtomicU64::new(0),
+                last_post_ns: std::sync::atomic::AtomicU64::new(0),
             })
+        }
+
+        /// The last `forward_batch` split into `(pack, submitted, score2)` seconds.
+        ///
+        /// Only the middle one is affected by a change to the kernel. The other two are the price of
+        /// the seam itself, and knowing them is what stops a host-side regression from being read as
+        /// a kernel result, which is exactly what happened to the `uchar4` attempt.
+        pub fn last_phases(&self) -> (f64, f64, f64) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (
+                self.last_pack_ns.load(Relaxed) as f64 / 1e9,
+                self.last_gpu_ns.load(Relaxed) as f64 / 1e9,
+                self.last_post_ns.load(Relaxed) as f64 / 1e9,
+            )
         }
 
         /// The device's name, for a startup line if a caller wants one.
@@ -160,6 +193,7 @@ mod backend {
             if jobs.is_empty() {
                 return Vec::new();
             }
+            let t_pack = std::time::Instant::now();
             let mtch = mat[0] as i32;
             let mispen = -(mat[1] as i32);
             let npen = -(mat[m - 1] as i32);
@@ -291,8 +325,11 @@ mod backend {
                 );
                 enc.end_encoding();
             }
+            let t_gpu = std::time::Instant::now();
             cb.commit();
             cb.wait_until_completed();
+            let gpu_ns = t_gpu.elapsed().as_nanos() as u64;
+            let t_post = std::time::Instant::now();
 
             // SAFETY: both buffers are shared, sized above, and the command buffer has completed, so
             // the GPU is no longer writing them.
@@ -306,7 +343,8 @@ mod backend {
             // `score2` on the CPU, through the shared tracker. The GPU produced the row maxima; the
             // subtle part (merging consecutive rows, then excluding everything within
             // `ceil(score / max_sc)` of `te`) stays in the one implementation all three backends use.
-            jobs.iter()
+            let out: Vec<(i32, i32, i32, i32, i32)> = jobs
+                .iter()
                 .enumerate()
                 .map(|(k, j)| {
                     let r = res[k];
@@ -321,7 +359,19 @@ mod backend {
                     let (score2, te2) = b.finish(r.score, r.te, max_sc);
                     (r.score, r.te, r.qe, score2, te2)
                 })
-                .collect()
+                .collect();
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                // `t_pack` covers everything before the submission, so the pack figure is its
+                // elapsed time minus the two later phases.
+                let total = t_pack.elapsed().as_nanos() as u64;
+                let post = t_post.elapsed().as_nanos() as u64;
+                self.last_pack_ns
+                    .store(total.saturating_sub(gpu_ns + post), Relaxed);
+                self.last_gpu_ns.store(gpu_ns, Relaxed);
+                self.last_post_ns.store(post, Relaxed);
+            }
+            out
         }
     }
 }
@@ -633,12 +683,28 @@ mod tests {
             std::hint::black_box(&out);
             best = best.min(dt);
         }
+        let (pack, sub, post) = gpu.last_phases();
         eprintln!(
-            "metal rescue_fwd: {} jobs, {cells} cells in {:.4} s -> {:.2} Gcell/s (device {})",
+            "metal rescue_fwd: {} jobs, {cells} cells, device {}",
             jobs.len(),
-            best,
-            cells as f64 / best / 1e9,
             gpu.device_name()
+        );
+        eprintln!(
+            "  whole call   {:>8.4} s   {:>6.2} Gcell/s",
+            best,
+            cells as f64 / best / 1e9
+        );
+        // The split that the uchar4 experiment lacked: only the middle line moves when the kernel
+        // changes. Reported from the last rep, which is the one the best-of picked often enough for
+        // the shares to be representative; the absolute times of the three add up to that rep, not
+        // to `best`.
+        eprintln!(
+            "  of which     pack {:.4} s | submitted {:.4} s | score2 {:.4} s",
+            pack, sub, post
+        );
+        eprintln!(
+            "  submitted-only throughput: {:.2} Gcell/s",
+            cells as f64 / sub.max(1e-9) / 1e9
         );
     }
 
