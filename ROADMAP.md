@@ -2798,6 +2798,33 @@ que son mur plafonne la. Le GPU ne payait que dans trois cas etroits (`-t` plafo
 au coeur-heure, machine partagee), et aucun n'est le cas d'usage vise. Les crates `bwa-metal` et
 `bwa-gpu`, les scripts `gpu_parity.sh` / `msl_probe.sh` et le branchement CLI sont retires de `dev`.
 
+**Pourquoi Parabricks n'est pas un contre-exemple (2026-08-09).** Le resultat ci-dessus (-20 % de
+CPU, bascule vers `-t8`) est ce qu'on attend d'un GPU **integre** avec **un seul etage porte**, et il
+ne contredit pas les 20-25 min par genome 30x annoncees sur 8x A100 :
+
+1. **Materiel.** Memoire unifiee et pas de tensor core utile en DP entier, contre du HBM a 2-3 TB/s.
+   L'ecart de debit brut est d'un a deux ordres de grandeur, donc leur bascule n'existe pas.
+2. **Amdahl.** Ici seule l'extension part sur le GPU ; seeding FM, chaining et sortie SAM restent
+   CPU. Le profil dit que le seeding pese **41 %** du busy et l'extension 23 % : meme une extension
+   gratuite ne rendrait que 23 %. Parabricks porte la chaine entiere (alignement, tri, duplicats,
+   BQSR) en VRAM sans aller-retour disque, et une bonne part de leur gain vient de la fusion des
+   etages, pas du noyau.
+3. **Ce qu'ils vendent** est le delai de restitution, pas le debit par dollar. Une machine a 200 k$
+   perd souvent en $/genome et gagne en heures, ce qui est le bon arbitrage en clinique.
+4. **Occupancy.** Leur lot est de l'ordre du million de lectures. Le notre est dimensionne par
+   l'ordonnanceur de l'hote, ce qui est precisement le plafond mesure ci-dessus.
+5. **La contrainte qu'ils n'ont pas.** Parabricks est *equivalent* a BWA-MEM, pas *identique* : ils
+   divergent sur les egalites de score. Nous n'avons pas cette liberte, ce qui interdit la
+   reassociation, les heuristiques approchees et la demi-precision. Elle vaut cher en perf.
+
+S'en approcher demanderait de porter aussi le chaining et le seeding et d'accepter du
+non-determinisme, c'est-a-dire de renoncer au critere d'acceptation du projet. Ce n'est pas un
+arbitrage de performance, c'est un changement de projet.
+
+Un chiffre manque pour completer le dossier : le debit d'**un cœur NEON** sur le noyau d'extension.
+On a 22,4 Gcell/s GPU a saturation et 9,08 en lot de production, mais pas le denominateur, donc le
+ratio GPU/cœur n'est connu que pour le rescue, ou il vaut **1x** (10,95 Gcell/s, `0638990`).
+
 Le travail n'est pas perdu : il est **entier sur la branche `gpu`** (`6553a3d`), noyaux MSL, gate de
 parite et mesures compris. Ce qui reste sur `dev` est la couture `SwBackendAsync` de #53 et les
 barrieres de #54, gardees parce qu'elles sont agnostiques du backend, testees sur CPU, et que ce sont
