@@ -1798,6 +1798,48 @@ lectures, ce qui touche l'ordonnancement du pipeline et pas seulement la couture
 Et le calcul de rentabilite reste celui de la section precedente : sur cette course, le mate rescue
 pese **1,25 s sur 27,5 s de CPU, soit 4,5 %**. Meme un GPU parfait plafonne la.
 
+## L'extension sur GPU, branchee et mesuree : -22 % de CPU, et une bascule a -t8 (2026-08-09)
+
+Le noyau de la section suivante est desormais **branche dans l'aligneur**. `BWA4_GPU=metal` avec la
+feature `metal` route toute l'extension de graines sur le GPU ; le mate rescue reste sur le CPU,
+comme la mesure des tailles de lot le commandait.
+
+Le branchement tient en une fonction : `align_chunk` choisit le backend, et comme `MetalExtend`
+implemente `SwBackend`, `align_reads_batched` ne sait rien de tout cela. Une poignee de device par
+worker rayon (`thread_local`), donc une compilation de noyau par thread au demarrage et aucun partage
+entre threads. Repli CPU silencieux si la machine n'a pas de Metal utilisable.
+
+**Octet-identique de bout en bout**, sur les deux jeux reels (`791c21c2…` et `7178e85d…`), avec toute
+la programmation dynamique d'extension executee sur le GPU.
+
+### La mesure, et elle corrige ma propre prediction
+
+| | mur, CPU seul | mur, GPU | **CPU seul** | **CPU avec GPU** |
+|---|---|---|---|---|
+| `-t4` | 8,23 s | **7,82 s (-5,0 %)** | 32,26 s | **25,21 s (-21,9 %)** |
+| `-t8` | 4,51 s | 4,63 s (+2,7 %) | 34,54 s | 26,59 s (-23,0 %) |
+| `-t16` | **3,15 s** | 4,69 s (**+49 %**) | 43,45 s | 28,72 s (-33,9 %) |
+
+Le GPU absorbe **22 a 34 % du travail CPU a tous les regimes**. Mais le mur ne gagne qu'a `-t4`, et
+la bascule est entre `-t4` et `-t8`, **pas vers `-t12` comme je l'avais annonce**. L'erreur est
+identifiee : j'avais raisonne avec le debit **a saturation** (22,4 Gcell/s, atteint a 32 000 travaux)
+alors que la production soumet **10 800 travaux par appel**, ou le noyau ne fait que **9,08**. La
+demande d'extension a `-t16` est de 19,1 Gcell/s : le GPU devient le goulot, et le mur de la variante
+GPU plafonne vers 4,7 s quel que soit `-t`.
+
+### Ce que cela dit de la suite
+
+L'agregation inter-threads n'etait pas une optimisation de confort, c'est **la** condition pour que
+le GPU serve au-dela de `-t4` : agreger les quatre travailleurs d'un chunk (4 x 10 800 = 43 000)
+porte le noyau de 9,08 a 22,4 Gcell/s, ce qui couvre la demande de `-t16`. Et la barriere qui
+l'autorise existe deja et est verte (#54 piege 6, dix permutations).
+
+### Quand c'est utile aujourd'hui
+
+Tel quel, a `-t4` : **-5 % de mur et -22 % de CPU**. Le second chiffre est le vrai : sur une machine
+partagee, rendre un cinquieme du CPU a d'autres travaux pour un mur equivalent est un gain qui ne se
+lit pas dans un `time`. A `-t16` sur cette machine, il ne faut pas l'activer.
+
 ## Le noyau d'extension Metal : ecrit, octet-identique, 6,4x un coeur (2026-08-09)
 
 La suite immediate de la section ci-dessous : l'etage designe par la mesure est porte.

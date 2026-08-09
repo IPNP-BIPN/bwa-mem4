@@ -189,6 +189,7 @@ dependencies = [
  "bwa-mem4-index",
  "bwa-mem4-io",
  "bwa-mem4-mem",
+ "bwa-mem4-metal",
  "bwa-mem4-neon",
  "clap",
  "mimalloc",

@@ -2211,12 +2211,62 @@ fn batched_regs(
         codes
             .par_chunks(reads_per_chunk)
             .flat_map(|chunk| {
-                crate::stage_time::barrier::worker(|| {
-                    align_reads_batched(fm, bns, opt, chunk, &NeonBackend)
-                })
+                crate::stage_time::barrier::worker(|| align_chunk(fm, bns, opt, chunk))
             })
             .collect()
     })
+}
+
+/// Align one chunk with whichever seed-extension backend this build and this runselected.
+///
+/// Split out of the `par_chunks` closure so the backend choice is a function rather than a branch
+/// inside a hot iterator, and so the GPU arm can hold per-thread state.
+///
+/// # Why the GPU arm is per THREAD rather than shared
+///
+/// `align_reads_batched` is called from a rayon worker, one chunk at a time, and each call submits
+/// its side's ~10 800 extension jobs and waits. A thread waiting on the GPU is not idle work for the
+/// process: the other workers keep computing on the CPU, which is the whole overlap. Giving each
+/// worker its own device handle costs one kernel compile per thread at startup and avoids sharing a
+/// backend across threads.
+///
+/// The choice is byte-identical either way; `BWA4_GPU=metal` changes speed only, and the acceptance
+/// harness in `bwa-metal` is what says so.
+fn align_chunk(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    chunk: &[Vec<u8>],
+) -> Vec<Vec<bwa_mem::MemAlnReg>> {
+    #[cfg(feature = "metal")]
+    {
+        if gpu_extend_requested() {
+            thread_local! {
+                /// One device handle per rayon worker, built on first use. `None` when this machine
+                /// has no usable Metal device, which is the silent CPU fallback the GPU seam
+                /// promises.
+                static GPU: Option<bwa_metal::extend::MetalExtend> =
+                    bwa_metal::extend::MetalExtend::new();
+            }
+            return GPU.with(|g| match g {
+                Some(gpu) => align_reads_batched(fm, bns, opt, chunk, gpu),
+                None => align_reads_batched(fm, bns, opt, chunk, &NeonBackend),
+            });
+        }
+    }
+    align_reads_batched(fm, bns, opt, chunk, &NeonBackend)
+}
+
+/// Whether `BWA4_GPU=metal` asked for seed extension on the GPU. Read once and cached.
+///
+/// Anything else, including an unrecognised value, means the CPU: this variable will outlive any one
+/// version of this binary in job scripts, and a typo that silently produces the right answer on the
+/// CPU is a better failure than a run that dies at hour six of a WGS.
+#[cfg(feature = "metal")]
+fn gpu_extend_requested() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BWA4_GPU").ok().as_deref() == Some("metal"))
 }
 
 /// Env-gated (`BWA4_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
