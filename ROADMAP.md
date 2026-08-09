@@ -1761,6 +1761,43 @@ inter-threads de #53, ou la couture d'extension et ses **5 381 travaux par appel
 Verifie : `check.sh` vert, `cargo tree` sans la feature ne montre aucune dependance nouvelle, avec la
 feature il montre `metal 0.33`, et le md5 du binaire est inchange.
 
+## Pourquoi le GPU semblait lent : ce n'etait pas le noyau, c'etait le lot (2026-08-09)
+
+Le noyau Metal mesurait 14,08 Gcell/s contre 10,78 pour **un** thread CPU, ce qui se lisait comme
+« le GPU vaut a peine un coeur ». C'etait une conclusion tiree a une seule taille de lot. Balayee,
+sonde decoupee, temps GPU seul :
+
+| travaux soumis | debit du noyau |
+|---|---|
+| 2 048 | 3,63 Gcell/s |
+| 8 192 | 14,06 |
+| **32 768** | **46,2 / 46,8 / 46,8** |
+| 65 536 | 44,5 / 45,0 |
+| 131 072 | 45,5 |
+
+**C'est de l'occupancy, pas de la lenteur.** Un travail par thread veut dire que la taille du lot
+**est** le nombre de threads : a 8 192 les 40 coeurs GPU sont a jeun, et le debit monte quasi
+lineairement (12,7x pour 16x de threads entre 2 048 et 32 768) jusqu'a saturer vers **46 Gcell/s**.
+
+A ce regime le noyau vaut **4,3 coeurs CPU**, soit environ **37 % du CPU entier**, et il atteint
+14 % de son propre plafond registres-seuls (le reste etant les rails en memoire et une cellule par
+voie au lieu de quatre).
+
+### Ce que cela dit du branchement
+
+Le probleme n'a jamais ete la vitesse du noyau, il est la **taille des lots** : la production soumet
+**180 travaux par appel** en moyenne (72 a 150 bp `-t8`), et il en faut **~32 000** pour remplir la
+machine. C'est un facteur **180**.
+
+L'etape 0 de #53 avait pose l'alternative dans les bons termes (« si les lots font quelques
+centaines, il faut une file d'agregation inter-threads ») ; ce balayage donne enfin la taille que
+cette file doit atteindre. Agreger les huit threads d'un `-t8` donne ~1 400 travaux, encore **20x
+trop peu** : il faudrait accumuler sur plusieurs chunks, donc retarder le rescue de plusieurs lots de
+lectures, ce qui touche l'ordonnancement du pipeline et pas seulement la couture.
+
+Et le calcul de rentabilite reste celui de la section precedente : sur cette course, le mate rescue
+pese **1,25 s sur 27,5 s de CPU, soit 4,5 %**. Meme un GPU parfait plafonne la.
+
 ## Le `uchar4` sur Metal : tente, non concluant, retire (2026-08-09)
 
 Suite annoncee de la section precedente : quatre travaux par thread dans un `uchar4`, la

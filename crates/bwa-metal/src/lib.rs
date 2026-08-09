@@ -651,7 +651,11 @@ mod tests {
         // The shape the probe in ROADMAP.md reports for a 150 bp run: 150 bp reads against ~620 bp
         // windows.
         let (mut qs, mut ts) = (Vec::new(), Vec::new());
-        for _ in 0..8192 {
+        let n: usize = std::env::var("BWA4_METAL_JOBS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        for _ in 0..n {
             let qlen = 150usize;
             let tlen = 600 + (next() % 50) as usize;
             let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
