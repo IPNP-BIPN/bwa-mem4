@@ -88,7 +88,10 @@ jobs:
         shell: bash
         run: |
           echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
-          echo -n "simd: "; grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          # NOT `-m1`: with `-o`, GNU grep's `-m1` stops after the FIRST MATCH, not the first
+          # matching line, so this printed a bare "avx2" even where avx512f and avx512bw were both
+          # present on the same flags line. It has been lying in every run of this workflow.
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
 
       # Fails the job on an AMD draw when the dispatch asked for AVX-512, so re-dispatching is the
       # whole recovery. Without this the AVX-512 arms self-skip and the run looks green while having
@@ -161,7 +164,10 @@ jobs:
         shell: bash
         run: |
           echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
-          echo -n "simd: "; grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          # NOT `-m1`: with `-o`, GNU grep's `-m1` stops after the FIRST MATCH, not the first
+          # matching line, so this printed a bare "avx2" even where avx512f and avx512bw were both
+          # present on the same flags line. It has been lying in every run of this workflow.
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           echo "nproc: $(nproc)"
 
       - name: Install Rust
