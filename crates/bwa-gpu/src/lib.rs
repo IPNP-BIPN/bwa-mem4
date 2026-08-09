@@ -100,6 +100,25 @@ impl JobArena {
         }
     }
 
+    /// Copy bare `(query, target)` pairs in, with `h0 = 0`.
+    ///
+    /// The rescue kernel's jobs have no `h0`: they carry `minsc`/`endsc` instead, which are scalars
+    /// the caller passes alongside rather than sequence to be flattened. Rather than invent a second
+    /// arena for a layout that is byte-for-byte the same, that case fills `h0` with zeros and ignores
+    /// it. Documented here because a reader finding `h0 == 0` in a rescue batch should know it is
+    /// meaningless rather than suspicious.
+    pub fn fill_pairs(&mut self, pairs: &[(&[u8], &[u8])]) {
+        let jobs: Vec<ExtendJob> = pairs
+            .iter()
+            .map(|&(q, t)| ExtendJob {
+                query: q,
+                target: t,
+                h0: 0,
+            })
+            .collect();
+        self.fill(&jobs);
+    }
+
     /// Jobs currently loaded.
     pub fn len(&self) -> usize {
         self.spans.len()

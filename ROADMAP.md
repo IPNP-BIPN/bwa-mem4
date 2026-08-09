@@ -1678,6 +1678,61 @@ atteignable pour des operations sur octets empaquetes avec une chaine de dependa
 **Conclusion pour la suite : la voie Metal est ouverte, son plafond est confortable, et l'etape 0 est
 close sans qu'aucun logiciel n'ait ete installe.**
 
+## #55 : le backend Metal existe, il est octet-identique, et il perd contre un coeur (2026-08-09)
+
+Le premier noyau GPU du projet. `crates/bwa-metal`, feature `metal` **desactivee par defaut**, MSL
+compile a l'execution donc **aucune chaine Metal au build**, ni pour ce crate ni pour le binaire.
+
+### Ce qu'il fait
+
+`ksw_local_fwd`, la passe avant du mate rescue, **un travail par thread**. Ce choix n'est pas
+paresseux : il supprime toute communication inter-thread, donc il n'existe aucun `simd_shuffle`,
+aucune reduction de groupe, rien par quoi les donnees d'un travail pourraient atteindre le resultat
+d'un autre. C'est ce qui rend l'argument d'octet-identite court.
+
+Les sequences arrivent dans un `MTLBuffer` **partage** que le CPU remplit sur place : sur memoire
+unifiee, **rien n'est copie** pour atteindre le GPU. `score2`/`te2` ne sont pas calcules sur le GPU :
+le noyau rend les maxima de ligne et le CPU les passe au `SuboptimalTracker` que le scalaire et NEON
+utilisent deja, pour que la regle de fusion et la fenetre d'exclusion existent une fois et non trois.
+
+### Les barrieres, appliquees au GPU
+
+| gate | resultat |
+|---|---|
+| contre `ksw_local_fwd`, 2000 travaux de forme reelle, N des deux cotes, cellule both-N, moitie du lot avec `endsc` fini | **octet-identique** |
+| #54 piege 2, regle d'egalite d'argmax sur cibles periodiques (periodes 1, 2, 3, 4, 7) | **vert** |
+| #54 piege 6, dix permutations du meme lot | **vert** |
+
+### Le chiffre, et il n'est pas bon
+
+| | debit |
+|---|---|
+| plafond mesure du GPU, registres seuls (`msl_probe.sh`) | ~330 Gcell/s |
+| **noyau livre, formes reelles 150 bp x 620 bp, 8192 travaux** | **7,66 Gcell/s** |
+| un seul thread CPU (`BWA4_MATESW_TIME`) | ~10,6 Gcell/s |
+
+**Le GPU perd contre un coeur CPU**, et realise 2,3 % de son propre plafond. La cause est identifiee
+et une partie a deja ete corrigee : les rails H/E sont en memoire de peripherique, 3 lectures et 2
+ecritures de 32 bits par cellule. La disposition **par travail** (`rail[gid * qmax + c]`) mettait les
+32 threads d'un groupe SIMD sur 32 lignes de cache differentes ; la disposition **par colonne**
+(`rail[c * n_jobs + gid]`) les met sur 128 octets consecutifs. Mesure, meme noyau, memes donnees :
+**2,30 Gcell/s contre 7,66, soit 3,3x pour un changement d'indexation seul.**
+
+Ce qui reste des 40x manquants est du meme ordre : passer les rails en `uchar` (u8) les fait tenir en
+**memoire de groupe** (160 colonnes x 32 threads x 3 rails = 15 KB, sous les 32 KB disponibles, ce
+qui est impossible en 32 bits ou il en faudrait 61), et le `uchar4` donne quatre cellules par voie.
+Les deux vont ensemble et c'est la prochaine etape, avec son plafond deja mesure.
+
+### Pourquoi il n'est pas branche dans l'aligneur
+
+Parce que l'etape 0 de #53 a compte **72 travaux par appel de rescue** a 150 bp. Un lancement de
+noyau ne s'amortit pas sur 72 travaux, et le noyau perd deja contre un coeur a 8192. Le brancher
+aujourd'hui serait une regression sur les deux tableaux. Ce qui ouvre la voie est la file
+inter-threads de #53, ou la couture d'extension et ses **5 381 travaux par appel**.
+
+Verifie : `check.sh` vert, `cargo tree` sans la feature ne montre aucune dependance nouvelle, avec la
+feature il montre `metal 0.33`, et le md5 du binaire est inchange.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

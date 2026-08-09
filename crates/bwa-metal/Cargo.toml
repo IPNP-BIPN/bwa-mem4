@@ -1,0 +1,27 @@
+[package]
+name = "bwa-mem4-metal"
+description = "Metal backend for bwa-mem4's mate-rescue forward pass. Apple Silicon only, off by default, run-time MSL compilation."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "gpu", "metal"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bwa-mem4-extend = { path = "../bwa-extend", version = "4.3.1" }
+bwa-mem4-gpu = { path = "../bwa-gpu", version = "4.3.1" }
+# The only third-party dependency, and it is OPTIONAL and OFF by default, exactly as `libsais-rs`
+# and `caps-sa` are for the indexer. Without the `metal` feature this crate has no system dependency
+# and `MetalRescue::new` returns `None`, which is the fallback path the aligner already handles.
+metal = { version = "0.33", optional = true }
+
+[features]
+default = []
+metal = ["dep:metal"]
