@@ -644,6 +644,16 @@ pub mod align_split {
         if !enabled() {
             return;
         }
+        // Without the feature, `measure` is the identity and every per-stage counter stays at zero
+        // while `TOTAL_NS` (which is not gated) keeps counting. Printing that table anyway produces
+        // a row of zeros that reads exactly like a measurement saying "seeding is free", which is
+        // the kind of output that sends someone optimising the wrong thing. Say it instead.
+        if !cfg!(feature = "align-split") {
+            eprintln!(
+                "[align-split] per-stage timers are compiled out; rebuild with \
+                 `--features bwa-mem4-mem/align-split` to get them. Only the totals below are real."
+            );
+        }
         let (seed, ext, total) = (
             SEED_NS.load(Ordering::Relaxed) as f64 / 1e9,
             EXTEND_NS.load(Ordering::Relaxed) as f64 / 1e9,

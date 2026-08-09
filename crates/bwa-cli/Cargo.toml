@@ -31,6 +31,9 @@ rust-htslib = { workspace = true }
 rammap-core = "1.1.2"
 
 [features]
+# Per-stage timing counters in bwa-mem4-mem. Off by default: the wrapper is a barrier the inliner
+# does not always see through, and it costs measurable CPU even with BWA4_ALIGN_SPLIT unset.
+align-split = ["bwa-mem/align-split"]
 # Passthrough for `bwa-io`'s multi-format FASTQ input (bzip2, xz, zstd). Off by default: +11 s of
 # build time, +3.5% of binary, and three more C libraries in the supply chain, for formats bwa-mem2
 # does not read. NOT because it introduces a C toolchain requirement: this binary already has one,
