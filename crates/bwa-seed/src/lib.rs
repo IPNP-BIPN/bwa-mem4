@@ -183,9 +183,27 @@ const MAX_BASE: usize = 3;
 
 /// Default lockstep width when `BWA4_LOCKSTEP_N` is unset: how many independent FM walks are kept in
 /// flight per lockstep driver, i.e. the ceiling on outstanding DRAM misses per core. Units: slots.
-/// Any value `>= 1` is correct; 16 is the measured knee (8 is ~2.8% slower, 24 ties, 32 regresses).
+/// Any value `>= 1` is correct. **32 is the knee on a real index**, measured on `work/genome.fa`
+/// at -t4: medians of 6 give 13.00 CPU-s at 16 and 12.835 at 32, -1.27%, and 32 wins all 6 rounds
+/// (24 and 28 land between, 48 and 64 regress). The previous default of 16 was the knee on
+/// `work/region.fa`, whose BWT is cache-resident: with no DRAM latency to hide, extra slots are pure
+/// overhead and the knee necessarily lands low, which is why that measurement did not transfer.
+///
+/// **aarch64 only.** It is a memory-level-parallelism knob, so the knee is a property of the machine
+/// rather than of the code, and 32 was measured on an M4 Max. x86 keeps 16 because no x86 machine
+/// has measured this: the only x86 instrument available here is Rosetta, which is 2.4x slower than
+/// native and runs on this same M4 memory system, so it cannot answer a memory-parallelism question
+/// (it put 16 ahead by 0.5%, one round out of three, which is noise from a translated binary).
+/// Raising x86 to 32 on the strength of an arm64 measurement would be exactly the kind of projection
+/// this file exists to avoid. `BWA4_LOCKSTEP_N` re-sweeps it, and the CI x86 job can settle it.
+///
 /// Changing it changes only speed and peak scratch memory (each slot owns a `prev` buffer sized to
 /// the batch's longest read), never the SMEMs produced. See [`lockstep_width`].
+#[cfg(target_arch = "aarch64")]
+const DEFAULT_LOCKSTEP_WIDTH: usize = 32;
+/// See the aarch64 arm above: 16 is the value x86 has always run, and no x86 measurement exists to
+/// move it.
+#[cfg(not(target_arch = "aarch64"))]
 const DEFAULT_LOCKSTEP_WIDTH: usize = 16;
 
 /// How many of a backward round's live candidates get their checkpoint blocks prefetched before the
@@ -220,9 +238,9 @@ const SPLIT_LEN_ROUNDING: f32 = 0.499;
 /// prefetch has a full cycle to land before the block is used. **This is the aligner's
 /// memory-level-parallelism knob**: N slots means at most N outstanding DRAM misses per core.
 ///
-/// The default 16 was tuned on `work/region.fa`, whose BWT is cache-resident -- i.e. on an index
-/// with no DRAM latency to hide, where extra slots are pure overhead and the knee necessarily lands
-/// low. `BWA4_LOCKSTEP_N` re-sweeps it on a real index. Scheduling only: every slot walks its own
+/// The default is 32 on aarch64, the knee measured on a real index, and 16 elsewhere (see
+/// [`DEFAULT_LOCKSTEP_WIDTH`]).
+/// `BWA4_LOCKSTEP_N` re-sweeps it on another machine. Scheduling only: every slot walks its own
 /// read deterministically, so N cannot change a result.
 ///
 /// # Returns
