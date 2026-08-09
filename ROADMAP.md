@@ -1539,6 +1539,37 @@ Le -0,9 % du noyau d'extension AVX2 (#48B) existe toujours, il est simplement no
    `avx512` 484,58 s. Le tier `avx512` force retombe en scalaire faute de `avx512bw`, exactement le
    comportement documente, et cela redit que rien d'AVX-512 n'a tourne.
 
+## AVX-512 : ce n'est pas une loterie, la fonctionnalite n'est pas exposee (2026-08-09)
+
+#44 attendait « un tirage Intel ». Ce n'en est pas un, et la conclusion est plus utile que ce qu'on
+cherchait.
+
+**23 dispatches, 3 images de runner** (`ubuntu-22.04`, `ubuntu-24.04`, `ubuntu-latest`), **2 modeles
+de CPU** : AMD EPYC 7763 (Zen 3) et AMD EPYC 9V74 (Zen 4). **Zero avec `avx512bw`.**
+
+Le second modele est celui qui tranche : **Zen 4 possede AVX-512 dans le silicium**. Si un 9V74 ne
+montre pas le drapeau, ce n'est pas le tirage qui est malchanceux, ce sont les machines virtuelles
+Azure derriere les runners heberges de GitHub qui **ne l'exposent pas a l'invite**. Continuer a
+relancer des tirages ne peut donc rien donner.
+
+**#44 n'est pas verifiable sur un runner heberge par GitHub.** Il faut un SKU de runner plus gros
+(payant), un runner auto-heberge, ou une machine Intel. C'est ecrit dans l'issue.
+
+### Et un bug de sonde, qui mentait depuis toujours
+
+En cherchant cela, la ligne de journal des fonctionnalites SIMD s'est revelee fausse :
+
+```
+grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo
+```
+
+Avec `-o`, le `-m1` de GNU grep compte les **correspondances**, pas les lignes correspondantes. La
+ligne `flags` contient les trois, mais la sonde n'en imprimait qu'une : « `simd: avx2` », **meme sur
+une machine qui aurait eu AVX-512**. Elle a menti dans toutes les executions de ce workflow. Corrigee
+(sans `-m1`, plus `avx512vl`). Ici cela ne changeait rien, la porte `require_avx512` interrogeant
+`/proc/cpuinfo` directement, mais sur une future machine Intel la ligne aurait cache le fait meme
+qu'on cherchait.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
