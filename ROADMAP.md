@@ -1447,6 +1447,62 @@ Ce qui est verifiable a ete fait :
 Autrement dit : ce commit est **ecrit et relu, pas execute**. C'est le seul du lot dans ce cas, et il
 ne doit pas etre traite comme les autres tant qu'un tirage CI avec `avx512bw` n'a pas tourne.
 
+## Les chiffres x86, enfin mesures : +17 % sur le noyau de rescue (2026-08-09)
+
+Tout le travail x86 (#43, #44, #46C, #48C) avait ete ecrit et verrouille sur une machine arm64, donc
+**sans aucune mesure**. Le harnais CI est desormais la et la dette est payee, sauf pour AVX-512.
+
+`bench-x86.yml` prend trois entrees de plus : `base_ref` (le job construit et sonde le ref courant
+**et** celui-la sur le **meme runner**, coup sur coup), `require_avx512` (echec immediat si le tirage
+n'est pas Intel) et une nouvelle sonde `x86_extend_ab` pour les noyaux d'**extension**, qui n'en
+avaient aucune. Deux branches de mesure existent pour cela : `bench-base-x86` (pre-#43) et
+`bench-base-48b` (post-#48B), portant la meme sonde retro-portee.
+
+Runner **AMD EPYC 7763 (Zen 3)**, `avx2` sans `avx512bw`.
+
+### Noyau de rescue, `rescue_kernel_ab`, AVX2 u8
+
+| | debit |
+|---|---|
+| base pre-#43 | 9,545 / 9,550 / 9,556 Gcell/s |
+| HEAD | 11,129 / 11,170 / 11,241 Gcell/s |
+| **ecart** | **+16,6 %, +17,0 %, +17,6 %** sur trois courses |
+
+**+17 % sur le noyau de rescue AVX2**, c'est-a-dire l'effet de **#43 (table XOR) plus #46C
+(`rowmax` en u8)**. L'issue #43 projetait +31 % pour Zen 2/3 ; le reel est un peu plus de la moitie,
+et il est solide (trois courses, dispersion 1 point).
+
+Note au passage : mon propre comptage d'uops depuis le desassemblage annoncait -2,3 % d'uops totaux
+sur un coeur grand public et -43 % sur p5. Le vrai chiffre est +17 % de debit. **Le comptage
+d'instructions, meme d'assembleur emis, ne predit pas le temps.** C'est la troisieme fois dans ce
+dossier.
+
+### Noyaux d'extension, `x86_extend_ab`
+
+Trois points, ce qui permet de separer les deux leviers :
+
+| | SSE4.1 u8 | AVX2 u8 |
+|---|---|---|
+| base pre-#43 | 1,582 Gcell/s | 2,215 |
+| apres **#48B** (pre-passe repliee) | **1,675** | **2,195** |
+| HEAD, apres **#48C** (masque signe) | 1,670 | 2,201 |
+
+* **#48B** : **+5,9 % sur SSE4.1**, **-0,9 % sur AVX2**. Le levier qui retire un aller-retour
+  memoire paie sur le noyau etroit et coute un point sur le large. Il reste garde : il gagne sur deux
+  ISA sur trois (NEON +4 a +5 % de noyau, SSE4.1 +5,9 %) et perd 0,9 % sur la troisieme.
+* **#48C** : **-0,3 % et +0,3 %**, donc **plat**. Les +8 a +12 % projetes ne se materialisent pas sur
+  Zen 3. L'issue les argumentait sur la pression p5 de Skylake/Haswell, que ce runner n'est pas ; le
+  chiffre reste donc a prendre sur un coeur Intel. En attendant, le changement est conserve parce
+  qu'il est neutre en vitesse ici et strictement moins d'instructions.
+
+### #44 reste non verifie, et le tirage est une loterie
+
+`require_avx512` fonctionne exactement comme prevu : il fait echouer le job en une trentaine de
+secondes quand le tirage n'a pas `avx512bw`. **Sept tirages consecutifs ont donne le meme AMD EPYC
+7763.** Le noyau AVX-512 u8 n'a donc toujours ete execute nulle part, et #44 reste ouverte pour cette
+seule raison. Le harnais est pret : un tirage Intel suffira a faire tourner
+`avx512_matesw_u8_matches_scalar` et a imprimer la ligne `avx512_u8` des deux sondes.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
