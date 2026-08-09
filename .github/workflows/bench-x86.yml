@@ -133,18 +133,21 @@ jobs:
             || echo "(base ref has no x86_extend_ab probe; rescue numbers above are the comparison)"
 
   endtoend-smallref:
-    name: end-to-end vs bwa-mem2 (single chromosome, cloud-noisy)
+    name: end-to-end vs bwa-mem2 + whole-process A/B vs base_ref
     # Skipped when the dispatch asked for a kernel-A/B-only re-draw. The condition is written against
     # the string 'true' because a workflow_dispatch input arrives as a string even when typed boolean,
     # and it must stay true for the weekly schedule, where `inputs` is empty.
     if: github.event.inputs.kernel_ab_only != 'true'
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash -el {0} # login shell so the micromamba env is active
     steps:
+      # Full history: the whole-process A/B below checks the base ref out as a worktree.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Log CPU SIMD features
         shell: bash
@@ -277,4 +280,48 @@ jobs:
           awk -v m2="$best_m2" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs bwa-mem2: %.2fx\n", m2/m4}'
           # The number #20/#27 care about: us vs the fork on x86. >1 means bwa-mem4 wins.
           awk -v fk="$best_fk" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs fork (bwa-mem3): %.2fx  (>1 = we win)\n", fk/m4}'
+
+      # The measurement the x86 issues actually owe: not "how do we compare to bwa-mem2", but "did
+      # our own changes make the WHOLE PROCESS faster on x86". The kernel probes answer it per
+      # kernel; this answers it for the binary.
+      #
+      # Both binaries run on the same runner, on the same index and the same reads, INTERLEAVED, and
+      # bwa-mem2 is timed alongside as a drift canary: if the machine slows down mid-run, its number
+      # moves too and the comparison is discarded rather than believed.
+      - name: Whole-process A/B vs base_ref
+        if: github.event.inputs.base_ref != ''
+        run: |
+          base="${{ github.event.inputs.base_ref || '7428cd0' }}"
+          git worktree add ../base "$base"
+          (cd ../base && cargo build --release -p bwa-mem4)
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          HEAD_BIN=../target/release/bwa-mem4
+          BASE_BIN=../../base/target/release/bwa-mem4
+          M2=bwa-mem2
+          echo "base=$base threads=$T"
+          # Byte-identity first. A speed comparison between two binaries that do not agree on the
+          # output is meaningless, and this is also a real gate: the whole batch claims identity.
+          "$BASE_BIN" mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@' | md5sum > base.md5
+          "$HEAD_BIN" mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@' | md5sum > head.md5
+          echo "base md5: $(cat base.md5)"
+          echo "head md5: $(cat head.md5)"
+          cmp -s base.md5 head.md5 || { echo "::error::base and HEAD disagree on the SAM body"; exit 1; }
+
+          t_of() { /usr/bin/time -f '%e' -o w.txt "$@" >/dev/null 2>/dev/null; cat w.txt; }
+          bb=""; hh=""; mm=""; wins=0
+          for rep in 1 2 3; do
+            b=$(t_of "$BASE_BIN" mem -t "$T" chr21.fa r1.fq r2.fq)
+            h=$(t_of "$HEAD_BIN" mem -t "$T" chr21.fa r1.fq r2.fq)
+            m=$(t_of $M2 mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: base=${b}s head=${h}s (bwa-mem2 canary ${m}s)"
+            awk -v a="$h" -v b="$b" 'BEGIN{exit !(a<b)}' && wins=$((wins+1))
+            bb=$(awk -v a="$bb" -v b="$b" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
+            hh=$(awk -v a="$hh" -v b="$h" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
+            mm=$(awk -v a="$mm" -v b="$m" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
+          done
+          echo
+          echo "== whole-process A/B, best of 3, same runner =="
+          echo "base ${bb}s | head ${hh}s | bwa-mem2 canary ${mm}s | head wins ${wins}/3"
+          awk -v b="$bb" -v h="$hh" 'BEGIN{printf "head vs base: %.4fx  (%+.2f%%)\n", b/h, 100*(b-h)/b}'
           echo "NOTE: shared-runner VM, single chromosome. Not the headline ratio; see README."
