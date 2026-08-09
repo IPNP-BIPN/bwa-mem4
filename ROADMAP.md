@@ -1621,6 +1621,63 @@ selectionner. Le `BWA4_GPU=metal` d'un binaire actuel est donc simplement ignore
 que l'on obtient ne prouve rien de plus que cela ; c'est le test du crate qui exerce reellement le
 repli. Le branchement se fera dans le meme commit que le premier backend, ou il aura un sens.
 
+## #55 etape 0 : debloquee sans Xcode, et le GPU tient 330 Gcell/s (2026-08-09)
+
+**Correction de la section « #55 etape 0 : bloquee » ci-dessus.** Elle concluait qu'il fallait Xcode
+et que le chiffre de l'issue pouvait devoir etre corrige de +31 % si `subsat` manquait. Les deux
+points tombent.
+
+**Xcode n'est pas necessaire.** L'issue supposait le compilateur `metal` hors ligne, qui vient avec
+Xcode. Mais MSL se compile **a l'execution** via `newLibraryWithSource:`, et `Metal.framework` fait
+partie de macOS. Il ne faut donc que `clang`, que les Command Line Tools fournissent. C'est
+`scripts/msl_probe.sh`, deux sondes de quelques dizaines de lignes en Objective-C.
+
+### Ce que MSL expose reellement
+
+| forme | resultat |
+|---|---|
+| `addsat(uchar4)`, `subsat(uchar4)` | **existent** |
+| `addsat(uchar)`, `addsat(ushort4)`, `subsat(ushort4)` | existent |
+| `add_sat` / `sub_sat` (l'orthographe OpenCL de l'issue) | **n'existent pas** : « use of undeclared identifier 'add_sat'; did you mean 'addsat'? » |
+
+Donc **l'arithmetique entiere saturee est la**, sous le nom `addsat`/`subsat`. Le repli par `min`/`max`
+n'a pas lieu d'etre, et la correction de +31 % que la section precedente reservait **n'est pas due**.
+
+La semantique est verifiee sur l'appareil, pas seulement a la compilation :
+
+```
+addsat(250,3,0,255 + 10,0,0,1) = 255,3,0,255
+subsat(3,255,0,10 - 4,1,7,10)  = 0,254,0,0
+```
+
+Ecretage a 255 et a 0, par voie, exactement ce dont la recurrence u8 a besoin.
+
+### Le plafond, mesure au lieu d'etre projete
+
+Seconde sonde : une colonne de la recurrence de rescue en `uchar4` (4 cellules par voie), 13
+operations vectorielles, **registres seuls, aucun acces memoire dans la boucle**, meme discipline que
+la mesure du plafond NEON. 1 M de threads, 4096 colonnes chacun, meilleur de 5, quatre executions :
+
+| | |
+|---|---|
+| **plafond mesure** | **320,7 / 327,0 / 330,3 / 332,9 Gcell/s** |
+| besoin, selon le cadrage de #52 | 33 a 116 Gcell/s |
+| **marge** | **2,8x a 10x** |
+| plafond CPU entier (12 P-cores x ~10,4) | ~125 Gcell/s |
+
+**Le GPU integre vaut donc environ 2,6x le CPU entier sur cet etage**, ce que l'issue affirmait et
+qui est maintenant mesure sur la machine.
+
+Un ecart avec l'issue subsiste et vaut d'etre note : elle projetait ~570 Gcell/s theoriques, ~230 a
+40 % d'efficacite, et **~2 Tcell/s** dans le cas ou `uchar4` saturee existerait. Elle existe, et le
+reel est **330**, donc au-dessus de l'estimation a 40 % mais **six fois sous le 2 Tcell/s**. Ce
+dernier supposait ~4 operations par cellule ; notre sequence en fait 13 par `uchar4`, soit 3,25 par
+cellule, donc ce n'est pas l'arithmetique qui manque : c'est que le pic de 8,6 T op/s n'est pas
+atteignable pour des operations sur octets empaquetes avec une chaine de dependance serielle.
+
+**Conclusion pour la suite : la voie Metal est ouverte, son plafond est confortable, et l'etape 0 est
+close sans qu'aucun logiciel n'ait ete installe.**
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
