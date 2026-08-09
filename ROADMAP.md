@@ -2787,6 +2787,26 @@ que ce soit sur les 4 cœurs E**, le meme travail coute deja **+21 % de CPU** (5
 la contention du systeme memoire : le seeding fait deux acces aleatoires de 64 octets par extension
 de base sur un BWT de 9,4 GB, et douze cœurs qui font ça saturent la file de misses.
 
+**Trois leviers essayes ensuite, tous negatifs, tous mesures a `-t16` ou apparies.**
+
+- *Profondeur de prefetch du seeding* (`BWA4_SEED_PREFETCH`). A `-t16`, P8 bat P0 sur **5 paires sur
+  5** : le prefetch reste rentable sous contention, il ne l'aggrave pas. Defaut inchange a 8.
+- *Fenetre de `get_sa_batch`* (`BWA4_SA_WINDOW`). 128 gagne les deux series contre 64 et 32
+  (4,87 / 4,74 contre 5,03 / 4,97). Defaut inchange, et 128 est deja le plafond compile.
+- *Faconnage des allocations dans la construction de chaines*. `chains` demarre a capacite nulle et
+  chaque chaine alloue ses seeds a capacite 1, donc realloue a 2, 4, 8. Reserver (32 chaines /
+  4 seeds) coute **+0,35 %** de CPU, 5 defaites sur 8 ; la variante sobre (8 / 2) coute exactement
+  autant, 5 defaites sur 6. mimalloc sert ces petites allocations mieux qu'une pre-reservation, qui
+  ne fait que changer de classe de taille et toucher plus de memoire. Retire.
+
+Au passage, verifie : la sortie reste **octet-identique a `-t24`, `-t32` et `-t48`**, et au-dela de
+16 threads sur cette machine il n'y a que de la sur-souscription (`-t16` 4,38 s, `-t24` 4,61,
+`-t32` 4,64), ce qui est attendu et non un defaut.
+
+Avertissement de methode, paye deux fois dans cette section : sur le jeu de 2 M paires a `-t16`, la
+derive thermique atteint **15 %** en dix runs consecutifs. Un balayage lu ligne par ligne y montre
+une fausse monotonie decroissante en performance. Seul l'appariement A/B est lisible a ce regime.
+
 **Consequence.** Rendre la scalabilite proportionnelle demande de **reduire le trafic**, pas de mieux
 ordonnancer : une structure d'index plus compacte ou plus locale (le `bwa_index::lisa::LearnedSa`
 present dans l'arbre en est une piste), pas un knob. Note pratique en attendant : **`-t12` donne
