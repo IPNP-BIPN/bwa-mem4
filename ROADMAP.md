@@ -1798,6 +1798,48 @@ lectures, ce qui touche l'ordonnancement du pipeline et pas seulement la couture
 Et le calcul de rentabilite reste celui de la section precedente : sur cette course, le mate rescue
 pese **1,25 s sur 27,5 s de CPU, soit 4,5 %**. Meme un GPU parfait plafonne la.
 
+## Le chemin GPU est l'extension, pas le rescue, et les chiffres le disent (2026-08-09)
+
+Suite directe du balayage d'occupancy. La question posee etait « comment atteindre 32 000 travaux par
+lancement ». La reponse n'est pas une file d'agregation pour le rescue : c'est de changer d'etage.
+
+### Les deux coutures, mesurees en production, meme course
+
+| | mate rescue | **extension** |
+|---|---|---|
+| part de la course CPU | 4,5 % | **30 %** |
+| travaux par appel, `-t4` | 181 | **10 779** (99,7 % dans 8k-16k, plus gros 13 499) |
+| travaux par appel, `-t8` | 72 | 5 401 |
+| facteur manquant pour saturer (~32 768) | **180x** | **3x** |
+| plafond de gain si le GPU etait gratuit | 4,5 % | **30 %** |
+
+Le rescue demande d'accumuler sur plusieurs chunks de lectures, donc de retarder un etage dont les
+insertions dans `ma` sont **observables** dans la sortie (la permutation de `ks_introsort`, voir #38).
+L'extension demande d'agreger les threads **d'un meme chunk** : 4 x 10 779 = 43 000, au-dessus de la
+saturation, sans decaler quoi que ce soit dans le temps.
+
+### Et l'agregation inter-threads y est deja prouvee sure
+
+Deux proprietes que ce depot a etablies pour d'autres raisons se rejoignent ici :
+
+1. le resultat d'un travail d'extension ne depend que de son propre `(query, target, h0, w)`, ce qui
+   est l'invariant central de `across.rs` et ce qui autorise deja le tri par longueur ;
+2. **la barriere #54 piege 6** (`assert_backend_batch_order_invariant`) l'exige et le verifie : les
+   memes travaux passes dans dix permutations aleatoires doivent rendre le meme resultat, travail par
+   travail. Elle a ete ecrite pour un futur backend GPU ; elle certifie exactement le regroupement
+   inter-threads dont ce chemin a besoin.
+
+3. et la boucle de rounds ne complique rien : #54 piege 5 a mesure **0 requeue sur 5 281 833 travaux**
+   aux reglages par defaut. En pratique l'extension est un round unique.
+
+### Ce qui manque, et sa taille
+
+Le noyau. Le rescue portait une recurrence de 13 operations ; l'extension porte la bande, le z-drop,
+`max_off`, `gscore`, le resserrement de bande par ligne et son epilogue scalaire. C'est le noyau de
+700 lignes de macro, pas la recurrence. C'est le vrai chantier, et il est maintenant **designe par la
+mesure** plutot que par l'intuition qui visait le rescue parce qu'il etait le plus gros poste CPU sur
+un profil GIAB 30x a `-t8` que cette course ne reproduit pas.
+
 ## Le `uchar4` sur Metal : tente, non concluant, retire (2026-08-09)
 
 Suite annoncee de la section precedente : quatre travaux par thread dans un `uchar4`, la
