@@ -59,3 +59,44 @@ benchmark, so the two regimes must be reported separately.
 - **Better thread scaling.** No implementation in this table claims it, and the two we could measure
   (the fork, minibwa) land within 5 points of us, which
   [`scaling-model.md`](scaling-model.md) predicts from the machine alone.
+
+## Implementation attempt: QuadRank against `cp_occ`, measured (2026-08-09)
+
+Attempted, and stopped on a measurement rather than on an opinion.
+
+**Blocker.** QuadRank's DNA path is **x86_64 only**: `src/quad/count4.rs` (1652 lines) and
+`src/quad/blocks.rs` use `_mm256_shuffle_epi8` (32 sites), `_mm256_sad_epu8` (18) and
+`_mm_sign_epi32` (7), with no NEON path, so the crate does not compile on aarch64 at all. Its
+`perfcnt` dependency is also x86-only and is used solely by an example. The port is not hopeless
+(the `wide` crate is already used, and `_mm_sign_epi32` here is only a conditional negation) but the
+transposed counting kernels are the structure's core.
+
+**So it was benchmarked under Rosetta instead**, against a faithful replica of bwa-mem2's `cp_occ`
+block (four `i64` counts plus four one-hot `u64`, 64 bytes, one cache line), in one binary, over one
+random text, from the same random positions, with the same 16-lane batch and prefetch.
+
+| `cp_occ` size | `cp_occ` | QuadRank | ratio |
+|---|---|---|---|
+| 0,27 GB (2^28 symbols) | 13,0 ns/query | 23,4 ns | 0,55x |
+| 1,07 GB (2^30) | 13,5 ns | 25,5 ns | 0,53x |
+| **8,59 GB (2^33)** | **15,4 ns** | 26,4 ns | 0,58x |
+
+**Confirmed, and not distorted by emulation:** QuadRank is **2,29 bits/base against 8,00**, i.e.
+**3,50x smaller**, exactly the paper's figure. And it is **correct**: 100 000 random positions agree
+with `cp_occ` on all four symbols, so substituting it cannot move a byte of SAM.
+
+**Not concluded from these timings:** the speed column. QuadRank is SIMD-heavy and `cp_occ` is scalar
+popcount, so Rosetta penalises the two arms very unequally.
+
+**What does conclude, and it is the reason to stop.** Look at the `cp_occ` column alone, where both
+sizes run identical code: growing the structure **32x, from 0,27 GB to 8,59 GB, costs +2,4 ns per
+query** (13,0 -> 15,4), single-threaded with 16-lane batching. 8,59 GB brackets our real 6,2 GB
+`cp_occ`. So **the entire footprint advantage a 3,5x smaller structure could win is at most 2,4 ns of
+15,4, about 16% of the rank query**, and only if a NEON port matched the popcount path's compute
+cost. With seeding at ~41% of busy, that caps the end-to-end gain near **6%**, against 1652 lines of
+AVX2 to port on the core of a structure where an error yields wrong ranks.
+
+**What would change the verdict**, and the only thing that should: running these same two arms
+**natively on x86**, at 1 and at 12 threads. The multi-threaded case is the one this bench does not
+cover, and it is precisely where shared TLB and page-walker pressure could make the footprint worth
+much more than 2,4 ns. Until that number exists, the port is not justified.
