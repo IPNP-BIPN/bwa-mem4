@@ -30,6 +30,23 @@ on:
         type: boolean
         default: false
         required: false
+      # The x86 work of issues #43, #44, #46C and #48C was written and gated on an arm64 machine,
+      # where the x86 binary only runs under Rosetta and speed ratios do not hold. Every one of those
+      # issues therefore owes a NUMBER. This input is how it is paid: the kernel job builds and probes
+      # the current ref AND this base ref on the same runner, back to back, and prints both.
+      base_ref:
+        description: "Commit/tag to compare the kernel probes against (empty = skip the comparison)"
+        default: "7428cd0"
+        required: false
+      # A GitHub ubuntu-22.04 draw is either Intel (has avx512bw) or AMD (does not), and which one is
+      # luck. The AVX-512 u8 rescue kernel of #44 was written with NO executed coverage at all, so its
+      # close condition is one green run on an Intel draw. Setting this makes an AMD draw fail fast
+      # and loudly instead of self-skipping, so "dispatch again" is a one-minute loop.
+      require_avx512:
+        description: "Fail the kernel job unless the runner has avx512bw (re-draw until Intel)"
+        type: boolean
+        default: false
+        required: false
   schedule:
     # Mondays 05:00 UTC, offset from the parity/CI schedules.
     - cron: "0 5 * * 1"
@@ -50,17 +67,31 @@ env:
 
 jobs:
   kernel-ab:
-    name: rescue kernel A/B (scalar vs AVX2 vs AVX-512)
+    name: kernel probes (rescue + extension, vs base_ref)
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
+      # Full history: the base-ref comparison below checks the base out as a worktree.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Log CPU SIMD features
         shell: bash
         run: |
           echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
           echo -n "simd: "; grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+
+      # Fails the job on an AMD draw when the dispatch asked for AVX-512, so re-dispatching is the
+      # whole recovery. Without this the AVX-512 arms self-skip and the run looks green while having
+      # tested nothing of #44.
+      - name: Require AVX-512 (when asked)
+        if: github.event.inputs.require_avx512 == 'true'
+        run: |
+          grep -q avx512bw /proc/cpuinfo || {
+            echo "::error::this draw has no avx512bw; re-dispatch with require_avx512 until an Intel runner comes up"
+            exit 1
+          }
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -69,11 +100,37 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The kernel bench is an `#[ignore]`d in-crate test; `--ignored --nocapture` runs it and prints
-      # the scalar/AVX2/AVX-512 table. Where the runner lacks avx512bw the AVX-512 line self-skips
-      # (the "Log CPU SIMD features" step above shows whether that happened).
-      - name: Rescue kernel A/B
-        run: cargo test --release -p bwa-mem4-neon rescue_kernel_ab -- --ignored --nocapture
+      # The byte-identity gate for the x86 kernels, on real x86 rather than under Rosetta. On an
+      # Intel draw this is what actually executes `avx512_matesw_u8_matches_scalar` and
+      # `avx512_u8_and_i16_match_scalar`, which is the close condition of issue #44: that kernel is
+      # reachable on no other machine available to this project.
+      - name: Byte-identity tests (x86 kernels, native)
+        run: cargo test --release -p bwa-mem4-neon
+
+      # The probes are `#[ignore]`d in-crate tests; `--ignored --nocapture` runs them and prints their
+      # tables. Where the runner lacks avx512bw the AVX-512 lines self-skip (the SIMD-features step
+      # above shows whether that happened).
+      - name: Kernel probes, current ref
+        run: |
+          echo "=== HEAD ($(git rev-parse --short HEAD)) ==="
+          cargo test --release -p bwa-mem4-neon rescue_kernel_ab -- --ignored --nocapture
+          cargo test --release -p bwa-mem4-neon x86_extend_ab -- --ignored --nocapture
+
+      # Same runner, same toolchain, back to back: the only fair way to give the x86 issues a number
+      # when the changes are compile-time choices with no in-binary switch left. Read it as a
+      # two-binary comparison, which is what it is, not as an interleaved A/B.
+      - name: Kernel probes, base ref
+        if: github.event.inputs.base_ref != ''
+        run: |
+          base="${{ github.event.inputs.base_ref || '7428cd0' }}"
+          git worktree add ../base "$base"
+          cd ../base
+          echo "=== BASE ($base) ==="
+          cargo test --release -p bwa-mem4-neon rescue_kernel_ab -- --ignored --nocapture
+          # The extension probe does not exist before the commit that added it; that is expected on
+          # an old base and is not a failure of the run.
+          cargo test --release -p bwa-mem4-neon x86_extend_ab -- --ignored --nocapture \
+            || echo "(base ref has no x86_extend_ab probe; rescue numbers above are the comparison)"
 
   endtoend-smallref:
     name: end-to-end vs bwa-mem2 (single chromosome, cloud-noisy)
