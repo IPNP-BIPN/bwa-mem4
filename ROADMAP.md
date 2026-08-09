@@ -2753,6 +2753,45 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## GPU : la taille de lot, et pourquoi elle ne suffit pas (2026-08-09)
+
+L'extension tourne sur le GPU depuis la section precedente, octet-identique, mais elle ne gagnait le
+mur qu'a `-t4`. Le diagnostic ecrit alors etait que le noyau recevait des lots trop petits : le
+budget de chunk est dimensionne en RAM (`INFLIGHT_READS / worker_count`), donc `-t16` distribue
+1 024 lectures par chunk, soit ~2 700 travaux d'extension par lancement, la ou le noyau ne sature
+qu'a ~32 000. Ce diagnostic est confirme. La conclusion qu'on en tirait ne l'est pas.
+
+**Le levier.** `BWA4_GPU_CHUNK` fixe la taille de chunk. **Absolue et non un multiplicateur** :
+un balayage de multiplicateur place l'optimum a 4x a `-t4` et 16x a `-t16`, et ces deux points sont
+la meme valeur, 16 384 lectures. La grandeur qui compte est la taille du lot, et elle ne depend pas
+du nombre de travailleurs qui l'ont produit. Le defaut est 16 384 des que `BWA4_GPU=metal`, parce que
+sans lui le GPU **perd** le mur a tout `-t` > 4.
+
+**Mesure** (jeu h, 500 k paires, medianes de 3, entrelace, `/usr/bin/time -l`) :
+
+| | CPU seul (mur / CPU-s) | meilleur GPU | mur | CPU-s | RSS |
+|---|---|---|---|---|---|
+| `-t4`  | 3,40 / 13,09 | 32768 : 3,03 / 10,29 | **-10,9 %** | -21,4 % | +0,4 GB |
+| `-t8`  | 1,90 / 14,21 | 16384 : 1,90 / 11,34 | **0 %**     | -20,2 % | +0,3 GB |
+| `-t16` | 1,38 / 19,06 | 32768 : 1,54 / 15,30 | +11,6 %     | -19,7 % | +1,8 GB |
+
+Le levier est reel : `-t8` passe de +9,5 % a l'egalite, `-t16` de +52 % a +12 %.
+
+**Ce qui est infirme.** La section precedente annoncait que l'agregation « couvre la demande de
+`-t16` ». Elle ne la couvre pas. Le mur de la variante GPU plafonne autour de 1,54 s **quel que
+soit** `-t` : au-dela de `-t8` c'est le GPU qui est le chemin critique, et lui donner des lots plus
+gros deplace le plafond sans le lever. La projection etait faite a partir du debit a saturation
+(22,4 Gcell/s) sans tenir compte du fait que saturer le noyau et saturer la machine sont deux
+choses. Ce qui leverait le plafond est le paquetage `uchar4` (plafond mesure ~330 Gcell/s), pas la
+taille de lot.
+
+**Le chiffre a retenir** est la colonne CPU-s, stable a **-20 % a tous les `-t`** : le GPU prend un
+cinquieme du travail CPU. Sur une machine dediee ou seul le mur compte, cela ne vaut que jusqu'a
+`-t8`. Sur une machine partagee, c'est un cinquieme de coeurs rendus.
+
+Parite verifiee sur les deux jeux reels, a `-t3` et `-t8`, pour chaque taille de chunk : la taille de
+chunk n'est que de l'ordonnancement, et les regions par lecture n'en dependent pas.
+
 ## Phase 9b (GPU) : abandonnee, backend retire
 
 Un backend Metal a existe et a ete **supprime** (`c20867d`). Raison : sur un genome entier le kernel

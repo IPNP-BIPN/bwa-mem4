@@ -2205,7 +2205,20 @@ fn batched_regs(
     // per-worker share. Scheduling only -- the per-read regions do not depend on the chunk size.
     const INFLIGHT_READS: usize = 16384; // total reads' intermediates resident at once, all workers
     const MIN_CHUNK: usize = 512; // lockstep floor: enough reads in flight to hide FM latency
-    let budget_chunk = (INFLIGHT_READS / worker_count).max(MIN_CHUNK);
+                                  // With extension on the GPU the chunk is no longer only a RAM knob: it is the BATCH SIZE, and
+                                  // the batch size is the GPU's thread count. At `-t16` the default budget gives 1024 reads per
+                                  // chunk, hence ~2 700 extension jobs per launch, where the kernel needs ~32 000 to fill the
+                                  // machine; that is why the GPU variant loses at high `-t`. `BWA4_GPU_CHUNK` multiplies the
+                                  // budget so the trade can be measured rather than guessed. It costs proportionally more reads
+                                  // resident at once, which is exactly the flat-RAM property the default was chosen to protect,
+                                  // so it is opt-in and not implied by `BWA4_GPU=metal`.
+                                  //
+                                  // Scheduling only: the per-read regions do not depend on the chunk size, and the md5 gate says
+                                  // so on both read sets.
+    let budget_chunk = match gpu_chunk_reads() {
+        Some(n) => n,
+        None => (INFLIGHT_READS / worker_count).max(MIN_CHUNK),
+    };
     let reads_per_chunk = codes.len().div_ceil(worker_count).min(budget_chunk).max(1);
     crate::stage_time::barrier::region(crate::stage_time::Stage::Align, || {
         codes
@@ -2267,6 +2280,43 @@ fn gpu_extend_requested() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("BWA4_GPU").ok().as_deref() == Some("metal"))
+}
+
+/// `BWA4_GPU_CHUNK`, an ABSOLUTE per-chunk read count that replaces the in-flight budget.
+///
+/// `None` unless set or the GPU backend is active, which leaves the default
+/// `INFLIGHT_READS / worker_count` untouched.
+///
+/// Absolute and not a multiplier because that is what the measurement said: sweeping a multiplier
+/// at `-t4` and `-t16` put the optimum at 4x and 16x respectively, and both are the same 16 384
+/// reads per chunk. The quantity the GPU cares about is the batch size, which is the chunk, and it
+/// does not care how many workers produced it. Expressing it as a multiplier of a per-worker budget
+/// would have hidden that behind a knob that has to be retuned for every `-t`.
+///
+/// The cost is that reads resident at once become `value * worker_count` instead of a constant, so
+/// this is opt-in and not implied by `BWA4_GPU=metal`. Bounded to 64..=1 Mi so a typo cannot
+/// ask for the whole file at once.
+fn gpu_chunk_reads() -> Option<usize> {
+    use std::sync::OnceLock;
+    static M: OnceLock<Option<usize>> = OnceLock::new();
+    *M.get_or_init(|| {
+        let explicit = std::env::var("BWA4_GPU_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (64..=1 << 20).contains(n));
+        // Defaulted rather than left off when the GPU is on: without it the GPU LOSES on wall time
+        // at every thread count above 4, because the default budget hands `-t16` chunks of 1024
+        // reads and the kernel needs a batch two orders of magnitude larger to fill the machine.
+        // 16 384 is the measured compromise, not a round number: 32 768 is 2% faster at -t4 and -t16
+        // and 14% slower at -t8, and costs 1.8 GB more resident at -t16 against 0.3 GB here.
+        #[cfg(feature = "metal")]
+        let fallback = gpu_extend_requested().then_some(16_384);
+        // Without the backend compiled in there is no batch to feed, so `BWA4_GPU=metal` left over
+        // in a job script must not silently change the memory profile of a CPU-only binary.
+        #[cfg(not(feature = "metal"))]
+        let fallback = None;
+        explicit.or(fallback)
+    })
 }
 
 /// Env-gated (`BWA4_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
