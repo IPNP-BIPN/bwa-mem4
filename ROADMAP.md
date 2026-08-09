@@ -2753,6 +2753,42 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## Pages de 1 GB : atteignables, mais pas mesurables sur un runner (2026-08-09)
+
+BWA-MEM-SCALE mesure **+10,9 points** grace au HugeTLB en pages de 1 GB. `hugepage.rs` etablit deja
+que les pages de **2 MiB valent ~1,7x sur l'etage seeding** et que **mimalloc les obtient toute
+seule**, donc la seule part non payee de ce levier est le pas de 2 MiB a 1 GB, que mimalloc ne fait
+pas. Avant d'ecrire un chemin `mmap(MAP_HUGETLB | MAP_HUGE_1GB)` sur une machine incapable de
+l'executer, une sonde CI a demande si c'etait seulement atteignable (job `hugepage-probe`).
+
+**Reponse : oui.** Sur `ubuntu-22.04` heberge (Azure westus, noyau 6.8) :
+
+```
+pdpe1gb pse                          <- 1 GB existe dans le silicium
+hugepages-1048576kB, hugepages-2048kB <- les deux tailles sont exposees
+2048kB: asked 4, got 4
+1048576kB: asked 4, got 4             <- 4 GB de pages de 1 GB reservees a l'execution
+mounted                               <- hugetlbfs monte
+THP: [always]                         <- ce que mimalloc exploite deja
+```
+
+Rien dans `/proc/cmdline` ne reserve quoi que ce soit au boot : la reservation marche a chaud.
+
+**Et pourtant le levier n'est pas mesurable ici**, pour une raison que la sonde met au jour : le
+runner standard a **16 GB de RAM**, l'index GRCh38 en fait **15,9**, et loger `cp_occ` (6,2 GB) dans
+des pages de 1 GB en demande 7 de plus. Le job bout-en-bout tourne donc sur chr21, dont le `cp_occ`
+tient dans une seule page de 1 GB et ne fait subir aucune pression de TLB : on mesurerait zero, et ce
+zero ne dirait rien.
+
+**Etat du levier** : mecanisme atteignable et verifie, effet non mesurable sans un hote d'au moins
+32 GB. Il reste donc une note de deploiement documentee, pas du code livre, tant qu'une machine
+capable de le juger n'existe pas dans ce projet. Ecrire l'allocateur maintenant reviendrait a livrer
+un chemin dont personne ne peut dire s'il gagne, ce que ce fichier interdit partout ailleurs.
+
+**Erreur de methode a noter** : ce workflow porte `concurrency: group: bench-x86-<ref>`, donc
+dispatcher la sonde a **annule le job bout-en-bout d'une heure** lance quelques minutes plus tot. Un
+dispatch de plus sur la meme ref tue celui d'avant.
+
 ## Le PGO ne vaut plus 12,4 %, il vaut 3 % (2026-08-09)
 
 Le dossier portait le PGO a **+12,4 % sur du reel** et +8,5 % sur wgsim, et s'en servait pour
