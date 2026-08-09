@@ -2753,6 +2753,56 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## Campagne perf CPU et classement contre minibwa (2026-08-09)
+
+Trois leviers mesures, tous octet-identiques, tous gardes :
+
+| levier | effet (CPU-s, `-t4`, medianes) | victoires |
+|---|---|---|
+| Compteurs `traffic` compiles hors du binaire (`backward_ext`, `get_sa`, `get_sa_batch`) | 13,34 → 13,21, **-0,97 %** | 6/7 |
+| `prefetch_ahead()` sorti de la boucle de `LsSlot::step` | 13,11 → 13,03, **-0,61 %** | 11/15 |
+| Largeur lockstep 16 → 32 sur aarch64 | 13,00 → 12,835, **-1,27 %** | 6/6 |
+
+Les deux premiers sont le meme defaut : une lecture de `OnceLock` (charge acquire) laissee sur un
+chemin appele ~1e9 fois par lot de 500 k paires. Le troisieme etait une dette ecrite dans le code :
+le defaut de 16 avait ete regle sur `work/region.fa`, dont le BWT tient en cache, donc sur un index
+sans latence DRAM a masquer, ou des voies supplementaires sont du pur surcout. Sur un vrai index le
+genou est a 32. La valeur reste a 16 sur x86, faute d'instrument : Rosetta tourne sur ce meme
+systeme memoire M4 et ne peut pas repondre a une question de parallelisme memoire.
+
+**Profil apres coup** (`-t8`, donnees reelles, part du busy) : seeding `LsSlot::step` 22,3 % +
+`get_sa_batch` 13,6 % + `mem_collect_smem_batched` 5,3 % = **41 %** ; extension 22,9 % ; chaining
+7,7 % ; rescue 6,2 %. C'est la reponse a « quel est le `p` d'Amdahl du GPU » : porter l'extension
+entiere plafonne a 23 %.
+
+### Contre bwa-mem2 2.3 et contre minibwa
+
+Meme machine (M4 Max), memes 500 k paires, entrelace, medianes de 3, murs en secondes :
+
+| | `-t1` | `-t4` | `-t16` |
+|---|---|---|---|
+| bwa-mem2 2.3 | 43,04 | 13,36 | 5,81 |
+| **bwa-mem4** | 12,34 | 3,38 | **1,27** |
+| minibwa 0.7-r421 | **10,05** | **3,17** | 1,52 |
+
+En CPU-s : bwa-mem2 41,8 / 44,9 / 52,2 ; bwa-mem4 12,4 / 12,9 / 16,8 ; minibwa 10,0 / 10,3 / 11,9.
+
+**Lecture.** minibwa est **plus efficace en CPU partout** (-20 a -29 %), nous **scalons mieux** :
+9,6x de `-t1` a `-t16` contre 6,6x pour lui, ce qui nous donne le mur a `-t16` (1,27 contre 1,52).
+Son CPU-s ne monte presque pas pendant que son mur plafonne, ce qui pointe une partie serielle chez
+lui plutot qu'une saturation memoire.
+
+La comparaison est legitime et non un artefact de travail non fait : 400 000 enregistrements de part
+et d'autre, aucun non-mappe, aucun secondaire, **99,948 %** de positions primaires identiques
+(99,963 % a ±5 bp), MAPQ different sur 1,74 %.
+
+Deux reserves. (1) bwa-mem2 sur Apple Silicon est le portage SSE2NEON de noyaux ecrits pour
+AVX2/AVX-512 : le facteur 3,5x que nous obtenons et le 4,3x de minibwa sont gonfles dans la meme
+direction, et le classement x86 reste a mesurer. (2) minibwa a un **algorithme different** (seeds
+BWT facon bwa-mem, chaining et SIMD facon minimap2) et n'est pas octet-identique a bwa-mem2 ; il est
+libre de tout ce que notre critere d'acceptation interdit. Le titre vise reste « le plus rapide des
+aligneurs octet-identiques a bwa-mem2 », et sur ce terrain minibwa n'est pas un concurrent.
+
 ## GPU : la taille de lot, et pourquoi elle ne suffit pas (2026-08-09)
 
 L'extension tourne sur le GPU depuis la section precedente, octet-identique, mais elle ne gagnait le
