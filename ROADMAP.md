@@ -2792,10 +2792,32 @@ mode natif coute la meme chose que son mode compat, a 0,3 % pres.
 | **bwa-mem4** | **12,11** | **3,34** | **1,31** |
 | avance | **1,089x** | **1,063x** | **1,053x** |
 
-En CPU-s nous gagnons a `-t1` (12,17 contre 13,17) et `-t4` (12,82 contre 13,66) et nous **perdons**
-a `-t16` (17,38 contre 16,69, +4,1 %) : le fork scale un peu mieux en fin de courbe et nous ne
-gardons le mur que grace a l'avance accumulee plus bas. C'est le seul endroit ou il nous passe
-devant, et c'est donc la que se trouve la prochaine question.
+En CPU-s nous gagnons a `-t1` (12,17 contre 13,17) et `-t4` (12,82 contre 13,66) et nous perdons a
+`-t16` (17,35 contre 16,99 sur 5 tirages, **+2,1 %**).
+
+**Ce n'est pas un defaut de scalabilite, contrairement a ce que cette section affirmait d'abord.**
+Verifie en balayant la frontiere P/E de la machine (12 cœurs P, 4 cœurs E) :
+
+| CPU-s | `-t8` | `-t12` | `-t14` | `-t16` |
+|---|---|---|---|---|
+| bwa-mem4 | 13,47 | 14,28 | 16,18 | 17,24 |
+| fork v0.9.0 | 14,19 | 14,52 | 16,12 | 17,03 |
+
+Les deux courbes sont plates jusqu'a `-t12` et cassent entre `-t12` et `-t14`, c'est-a-dire quand
+l'ordonnanceur commence a placer des threads sur les cœurs E, qui consomment plus de secondes CPU
+pour le meme travail. Le fork gonfle de +17 % sur ce segment, nous de +21 %. L'ecart apparent
+(+27 % contre +43 %) etait un artefact de normalisation : notre `-t1` etant meilleur d'une seconde,
+la meme inflation absolue devient un plus gros pourcentage. Note pratique au passage : `-t12` donne
+deja le mur de `-t16` (1,30 contre 1,31), donc les quatre cœurs E n'apportent rien ici.
+
+**Levier essaye et retire.** Le chunk tombe de 4096 lectures a `-t4` a 1024 a `-t16`, ce qui laissait
+soupconner un cout fixe par chunk. Il existe : a `-t16`, un chunk de 16 384 vaut **-5,3 % de CPU**
+(16,84 → 15,95). Mais il coute **+12,5 % de mur** (1,28 → 1,44), 30 chunks pour 16 travailleurs
+desequilibrant la queue. Et il n'explique pas l'inflation : a taille de chunk **identique** (4096),
+le CPU-s passe quand meme de 12,82 a `-t4` a 16,63 a `-t16`. Le knob `BWA4_CHUNK_READS` a donc ete
+retire. Ce que les profils montrent au passage, c'est que les etages par lots (`get_sa_batch` -11 %,
+`build_chains_from_resolved` -15 %) profitent de lots plus gros : le gain est dans le remplissage des
+lots, pas dans les allocations.
 
 A ne pas superposer au 0,981x du 2026-07-29 : celui-la etait mesure sur donnees GIAB reelles et
 **avec PGO** des deux cotes, celui-ci sur les 500 k paires **sans PGO**.
