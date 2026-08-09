@@ -2753,6 +2753,47 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## Un modele qui predit la scalabilite a 5 points pres (2026-08-09)
+
+Revue de litterature hors bioinfo (architecture, bases de donnees en memoire, capacity planning) plus
+trois mesures sur la machine. Resultat : la scalabilite de cet aligneur est le **produit de deux
+grandeurs materielles**, toutes deux mesurables en deux minutes sur n'importe quelle machine.
+
+```
+efficacite(N) = ALU(N) x DEBIT_ALEATOIRE(N)
+```
+
+| threads | debit aleatoire | part memoire | plafond ALU | **predit** | **mesure** | ecart |
+|---|---|---|---|---|---|---|
+| 4 | 23,3 GB/s | 97 % | 99 % | **96 %** | 94 % | 2 pts |
+| 8 | 43,8 GB/s | 91 % | 100 % | **91 %** | 86 % | 5 pts |
+| 12 | 59,9 GB/s | 83 % | 97,5 % | **81 %** | 76 % | 5 pts |
+| 16 | 69,7 GB/s | 73 % | 82 % | **60 %** | **59 %** | 1 pt |
+
+Le chiffre qui manquait a toute la campagne : **le debit ALEATOIRE de la machine, pas le sequentiel**.
+A 12 threads, 284,6 GB/s en sequentiel contre **59,9 en aleatoire**, soit 4,75x moins, et surtout il
+**ne scale pas** : 97 / 91 / 83 / 73 % a 4 / 8 / 12 / 16 threads. Notre courbe est la sienne.
+
+Deux autres mesures locales completent le tableau. Le **TLB de cette machine** porte 56 Mio
+(~3200 entrees de 16 Kio) contre un `cp_occ` de **9,4 Go**, soit 168x trop peu, pour un surcout mesure
+cache-chaud de **+10,7 ns par acces**. Et notre trafic reel, via `BWA4_TRAFFIC` : **858,6 M lignes de
+128 octets** pour 500 k paires, 8,9 GB/s sur un seul thread.
+
+**Ce que le modele interdit** : esperer qu'un changement de code depasse ce produit. Equilibrage,
+taille de lots, allocateur, affinite, ordonnancement : tous mesures a 0 % ici, et c'est le resultat
+correct, pas un echec des tentatives. **Ce qu'il autorise**, dans l'ordre : agrandir la page (seul
+terme logiciel qui bouge le debit aleatoire, d'ou les 1,7x de THP sur Linux et l'interet des pages de
+1 Gio), puis reduire le nombre d'acces, c'est-a-dire l'algorithme, ce qui est exactement d'ou vient
+l'avance de minibwa.
+
+**Corollaire sur la largeur lockstep** : Cimple (PACT'18) etablit que le plafond de MLP d'un cœur est
+son nombre de MSHR, et Lemire mesure **28 voies soutenues sur un M4**. Notre largeur de 32 est donc
+juste au-dessus du plafond materiel, ce qui explique le +1,27 % en passant de 16 a 32 et le genou
+plat a `-t12`.
+
+Le tout, avec la methode de mesure sur une machine neuve et les sources, est dans
+[`docs/scaling-model.md`](docs/scaling-model.md).
+
 ## Pages de 1 GB : atteignables, mais pas mesurables sur un runner (2026-08-09)
 
 BWA-MEM-SCALE mesure **+10,9 points** grace au HugeTLB en pages de 1 GB. `hugepage.rs` etablit deja
