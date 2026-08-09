@@ -1742,6 +1742,50 @@ inter-threads de #53, ou la couture d'extension et ses **5 381 travaux par appel
 Verifie : `check.sh` vert, `cargo tree` sans la feature ne montre aucune dependance nouvelle, avec la
 feature il montre `metal 0.33`, et le md5 du binaire est inchange.
 
+## Le `uchar4` sur Metal : tente, non concluant, retire (2026-08-09)
+
+Suite annoncee de la section precedente : quatre travaux par thread dans un `uchar4`, la
+decomposition des noyaux CPU un cran plus bas. Ecrit en entier (noyau `rescue_fwd_u8x4`, empaquetage
+des quadruplets avec PAD/ZPAD cote hote, troisieme pipeline, fusion des resultats), **octet-identique
+aux trois gates**, puis **retire**. Voici pourquoi, parce que le chemin compte plus que le verdict.
+
+### Ce qui a ete appris en route, et qui reste vrai
+
+**Un piege de disposition memoire qu'aucun compilateur ne signale.** MSL aligne un type vectoriel sur
+sa propre taille : un `int4` sur 16 octets, un `ushort4` sur 8. Rust aligne `[i32; 4]` sur 4. La
+premiere version de la structure `Quad` melangeait les deux conventions, les champs tombaient a des
+decalages differents des deux cotes, et **chaque quadruplet revenait a zero** sans le moindre
+avertissement. Corrige en n'utilisant que des **tableaux scalaires** des deux cotes, dont
+l'alignement naturel coincide. C'est la deuxieme fois de la journee qu'une disposition `repr(C)`
+positionnelle mord (la premiere etait le renommage `rail` -> `kind`), et les deux fois **c'est le
+gate d'octet-identite qui a attrape la chose, pas un test de layout**.
+
+### Pourquoi c'est retire
+
+| | 8192 travaux | 65536 travaux |
+|---|---|---|
+| quadruplets actifs | 4,58 Gcell/s | 23,25 |
+| quadruplets desactives (meme arbre) | 4,57 | 23,20 |
+| **version livree, sans tout cela** | **12,0** | |
+
+Les deux bras donnent le meme chiffre a 0,2 % pres, ce qui veut dire que **la comparaison ne mesure
+pas le levier** : le travail d'hote que la branche ajoute domine les deux. Et il coute cher, puisque
+le meme noyau u8 fait 12,0 Gcell/s dans la version livree contre 4,6 avec cette branche presente,
+meme quand elle est inactive. Une premiere piste, un `Box<dyn Fn>` choisi par travail et appele par
+ligne (5 millions d'appels virtuels dans la region chronometree), a ete corrigee et n'a rien change.
+
+**Un levier qu'on ne sait pas mesurer proprement ne se garde pas.** Le code est retire plutot que
+laisse en place « au cas ou » : il ajoutait un troisieme noyau, une quatrieme structure partagee, et
+un surcout non explique, pour un gain non demontre.
+
+### Ce qui reste vrai pour la suite
+
+Le plafond du `uchar4` reste mesure a ~330 Gcell/s par `scripts/msl_probe.sh`, et le noyau livre est
+a 12. L'ecart n'est donc pas referme, mais la prochaine tentative doit commencer par **isoler le
+temps GPU du temps hote** dans la sonde, ce que la sonde actuelle ne fait pas : elle chronometre
+`forward_batch` en entier, empaquetage et calcul de `score2` compris. C'est exactement le genre de
+mesure qui a induit en erreur ici, et c'est reparable avant d'ecrire une ligne de noyau.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
