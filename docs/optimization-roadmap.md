@@ -403,3 +403,58 @@ above. Strobealign/Accel-Align win by *fuzzy seeding* (fewer SW calls) but chang
 Sources: Suzuki-Kasahara 2018; Rognes SWIPE 2011; Marco-Sola WFA 2021 / BiWFA 2023; Dougall Johnson
 M1 Firestorm SIMD tables; Hajime Suzuki M1 notes; minibwa 2026; ERT ISCA 2021; strobealign 2022;
 Accel-Align 2021; mm2-fast 2022.
+
+## Revue de litterature : comment les autres accelerent BWA-MEM (2026-08-09)
+
+Faite apres que la mesure locale a montre que la perte de scalabilite n'est ni de l'ordonnancement ni
+du demarrage, mais du trafic memoire. Objet : savoir ce qui a deja ete essaye ailleurs, avec quels
+chiffres, avant de construire quoi que ce soit.
+
+| source | ce qui nous concerne |
+|---|---|
+| [BWA-MEM-SCALE, ICPP'22](https://dl.acm.org/doi/fullHtml/10.1145/3545008.3545033) | **HugeTLB en pages de 1 GB : +10,9 points**, jusqu'a +35,7 avec de gros index. **1,97-2,03x par la seule refonte du pipeline et des I/O, sans un octet de RAM en plus.** Leur EMF exploite que **66-76 % des lectures matchent la reference exactement sur toute leur longueur**, mais demande un index de 54 GB. Total 3,19-3,32x sur bwa-mem2 avec +104 GB de RAM |
+| [Vasimuddin et al., arXiv:1907.12931](https://arxiv.org/abs/1907.12931) | le papier bwa-mem2 lui-meme : **3,5x mono-thread mais 2,4x mono-socket**. L'ecart entre les deux EST le mur multicœur, et il est visible des l'article fondateur |
+| [Langmead, Bioinformatics 2019](https://academic.oup.com/bioinformatics/article/35/3/421/5055585) | ce qui casse le scaling des aligneurs a haut compte de threads : verrous du parseur FASTQ, **type de verrou** (spinlock qui inonde le bus contre MCS), **contention de l'ecriture** (corrigee en striping sur 16 fichiers), allocations, NUMA |
+| [BWA-FastAlign](https://github.com/zzhofict/BWA-FastAlign) | 2,85x en moyenne, **sortie 100 % identique a BWA-MEM**, index hybride multi-etage pour le seeding (Kmer + FMT + Direct), parallelisme **intra-requete** dans l'extension, regime vise 32-128 threads |
+| [minibwa](https://arxiv.org/pdf/2606.15357) | son avance vient d'un **nouvel algorithme SMEM** (ropebwt3), d'un recours accru a l'alignement sans gap et d'un prefiltre q-mer au mate rescue. Ce sont des heuristiques : elles changent la sortie. Pas un meilleur scaling |
+| [ERT, biorxiv 2020](https://www.biorxiv.org/content/10.1101/2020.03.23.003897.full.pdf) | deja evalue ici et ecarte (60 GB) ; la litterature mesure que le seeding n'utilise que **11,7 % de la bande passante DRAM crete a 48 threads**, avec ~40 % des cycles en attente memoire |
+
+**Le chiffre qui recadre notre diagnostic.** 11,7 % de la bande passante crete signifie que nous ne
+sommes **pas** limites par la bande passante mais par la latence et les page-walks. Nos +21 % de CPU a
+`-t12` sont donc une histoire de TLB et de latence servie en parallele, pas de tuyau sature. C'est
+coherent avec tout ce que ce fichier a deja mesure, et ça disqualifie les leviers « moins d'octets ».
+
+**Ce que ça rouvre pour x86, et seulement pour x86.** Ce fichier a classe le TLB mort, mais la mesure
+etait faite sous Linux avec des pages de **2 MiB deja posees par mimalloc**. BWA-MEM-SCALE mesure ses
++10,9 points avec des pages de **1 GB**, que mimalloc ne pose pas et qui demandent un hugetlbfs
+explicite. C'est une piste x86 rouverte par la litterature, elle ne demande aucun materiel ARM, et
+elle est deployable (montage hugetlbfs + allocation dediee pour `cp_occ`) plutot qu'algorithmique.
+Sur macOS elle n'existe pas : pages de 16 KiB, pas de THP, pas d'API de superpage sur Apple Silicon.
+
+**Ce que ça ne rouvre pas.** L'EMF de BWA-MEM-SCALE (54 GB) et l'index hybride de BWA-FastAlign sont
+des structures **ajoutees**, du meme genre que LISA, le SA plat et le cache 10-mers, tous les trois
+deja mesures morts ici parce que notre lockstep + prefetch recouvre deja les acces qu'ils suppriment.
+Le gain de minibwa passe par des heuristiques qui changent la sortie, donc hors de notre contrat.
+
+### Levier essaye a la suite de cette revue, et negatif
+
+*Co-localiser le tableau de suffixes echantillonne.* `sa_ms_byte` (1 octet) et `sa_ls_word` (4 octets)
+sont deux tableaux separes, donc chaque lecture SA coute **deux lignes et deux entrees de TLB**. Ce
+fichier notait deja ce layout comme « un vrai avantage » avant de l'ecarter sur une mesure a `-t1`,
+ou le second acces est masque par la latence. La litterature ci-dessus disant que le probleme est
+justement le TLB, il fallait le rejuger a haut compte de threads. Implemente derriere `BWA4_SA_PACKED`
+(5 octets par entree, lecture par un load 8 octets non aligne, tableau pade de 3 octets),
+**octet-identique sur les deux jeux et sur les deux chemins**.
+
+Cout de construction, mesure a part sur 1000 paires : **+0,50 s de mur, +0,60 s de CPU**. Resultat net
+sur 2 M paires, apres soustraction de ce cout fixe :
+
+| | mur off | mur packed | CPU off | CPU packed |
+|---|---|---|---|---|
+| `-t16` | 4,57 | 4,41 | 61,1 | 62,0 |
+| `-t8` | 6,81 | 6,80 | 51,5 | 52,0 |
+
+Egalite exacte a `-t8`, bruit a `-t16` sur une serie qui derive, CPU pire des deux cotes. Le biais
+joue **en faveur** du levier, les deux bras partageant le binaire et donc le branchement. Retire.
+C'est le **sixieme** levier de trafic memoire tue par le meme mecanisme : le second acces etait deja
+gratuit, y compris a 16 threads.
