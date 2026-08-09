@@ -1570,6 +1570,57 @@ une machine qui aurait eu AVX-512**. Elle a menti dans toutes les executions de 
 `/proc/cpuinfo` directement, mais sur une future machine Intel la ligne aurait cache le fait meme
 qu'on cherchait.
 
+## #53 etapes 1 et 2 : la couture asynchrone et le crate `bwa-gpu` (2026-08-09)
+
+L'etape 0 avait mesure les lots. Voici le contrat et le crate, tous deux sans une ligne de code GPU
+et sans une dependance systeme.
+
+### Etape 1, le contrat non bloquant
+
+`SwBackendAsync` dans `bwa-extend` : `submit` rend la main tout de suite, `collect` bloque jusqu'au
+resultat, `queue_depth` dit combien de lots il vaut la peine de garder en vol. `BatchTicket` n'est ni
+`Clone` ni `Copy`, donc un lot ne peut pas etre recolte deux fois.
+
+**Les backends CPU ne changent pas d'une ligne.** L'adaptateur `SyncAsAsync<B>` donne le contrat
+asynchrone a n'importe quel `SwBackend` bloquant : `submit` fait le travail et gare le resultat,
+`collect` le reprend. `queue_depth` y vaut **1**, ce qui est la reponse honnete pour un CPU et fait
+qu'un appelant qui pipeline jusqu'a `queue_depth()` se comporte exactement comme aujourd'hui.
+
+L'invariant qui compte, et qui est teste : `collect(submit(..))` **egale** `extend_batch(..)`. Les
+barrieres d'acceptation existantes restent donc valides telles quelles.
+
+### Etape 2, le crate
+
+`crates/bwa-gpu`, trois choses communes a tout GPU dont aucune n'est du GPU :
+
+* **`JobArena`** : met a plat les `&[u8]` empruntes des `ExtendJob` en **une** allocation avec table
+  d'offsets, et **reutilise** cette allocation d'un lot a l'autre. C'est le point « persistance » de
+  l'issue : allouer et liberer par lot couterait plus que le lancement que cela doit amortir. Sur
+  memoire unifiee, ce tampon plat peut **etre** le `MTLBuffer`, ecrit sur place, zero copie.
+* **`select()`** : lit `BWA4_GPU=metal|cuda|off` et rend le backend plus la **raison** du repli
+  (`NotRequested`, `NotCompiledIn`, `NoDevice`). Une valeur inconnue n'est pas une erreur, expres :
+  cette variable vivra dans des scripts qui survivront a ce binaire, et une faute de frappe qui
+  produit silencieusement le bon resultat sur CPU vaut mieux qu'une course qui meurt a la sixieme
+  heure d'un WGS.
+* les features `metal` et `cuda`, **declarees et vides**, pour que `--features metal` sur une machine
+  sans GPU compile et emprunte le repli, ce qui est testable et teste des maintenant.
+
+### Les trois criteres d'acceptation
+
+| critere | resultat |
+|---|---|
+| `cargo build` sans feature GPU : rien ne change, aucune dependance nouvelle | **vert**, `cargo tree` ne montre que `bwa-mem4-extend` |
+| `--features metal` sans GPU utilisable : repli CPU, meme md5, aucune erreur bloquante | **vert**, 5 tests dont le balayage des cinq valeurs de `BWA4_GPU` |
+| histogramme de taille de lot publie dans le ROADMAP | **fait** (section #53 etape 0) |
+
+### La limite, dite plutot que tue
+
+**L'aligneur ne consomme pas encore ce crate.** Brancher `select()` dans `across.rs` aujourd'hui
+ajouterait une indirection au chemin chaud pour zero benefice, puisqu'il n'existe aucun backend a
+selectionner. Le `BWA4_GPU=metal` d'un binaire actuel est donc simplement ignore, et le md5 identique
+que l'on obtient ne prouve rien de plus que cela ; c'est le test du crate qui exerce reellement le
+repli. Le branchement se fera dans le meme commit que le premier backend, ou il aura un sens.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient

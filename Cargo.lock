@@ -223,6 +223,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bwa-mem4-gpu"
+version = "4.3.1"
+dependencies = [
+ "bwa-mem4-extend",
+]
+
+[[package]]
 name = "bwa-mem4-index"
 version = "4.3.1"
 dependencies = [

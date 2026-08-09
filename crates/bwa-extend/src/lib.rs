@@ -196,6 +196,191 @@ pub struct ExtendJob<'a> {
 
 /// The authoritative scalar backend: `extend` delegates straight to [`ksw_extend2`]. Every other
 /// backend is validated against this one.
+/// A batch submitted to a backend and not yet collected (issue #53, step 1).
+///
+/// Opaque and backend-scoped: a ticket means nothing to a backend other than the one that issued it,
+/// and handing it to the wrong one is a programming error rather than a recoverable condition. It is
+/// deliberately not `Clone`, so a batch cannot be collected twice.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct BatchTicket(pub u64);
+
+/// The non-blocking form of [`SwBackend::extend_batch`], split into a submit and a collect.
+///
+/// # Why this exists
+///
+/// [`SwBackend::extend_batch`] returns the results, so the caller is stopped for as long as the
+/// batch takes. That is exactly right for a CPU backend, where the caller's thread IS the compute.
+/// It is wrong for a GPU, where the point is to overlap: hand the work over, do something else, come
+/// back for it. The contract has to allow that before any GPU kernel is written, which is why this
+/// lands before #55 and #56 rather than after.
+///
+/// # What it does NOT change
+///
+/// `extend_batch` keeps its meaning and its signature. For every backend, `extend_batch(jobs, ..)`
+/// must equal `collect(submit(jobs, ..))`, and [`SyncAsAsync`] gives any existing blocking backend
+/// that property with no change to the backend itself. The acceptance gates
+/// ([`assert_backend_matches_scalar`], [`assert_backend_batch_matches_scalar`]) therefore stay valid
+/// as written, and remain the definition of correctness for both forms.
+///
+/// # What an implementation owes
+///
+/// - `submit` returns promptly and does not borrow `jobs` beyond the call: a GPU backend flattens
+///   the borrowed slices into its own buffer *inside* `submit`, because the caller is free to drop
+///   the job slices afterwards. That flattening belongs in the backend, not in the caller, so the
+///   caller never has to know whether the target wants an arena.
+/// - `collect` blocks until that batch is ready and returns one [`ExtendResult`] per job, in job
+///   order, integer-identical to what `extend_batch` would have returned.
+/// - tickets may be collected in any order; a backend whose queue is strictly FIFO must still not
+///   deadlock when they are not, which in practice means it collects out-of-order tickets by
+///   draining until it finds the one asked for.
+pub trait SwBackendAsync: SwBackend {
+    /// Hand a batch over and return immediately. Parameters as [`SwBackend::extend_batch`].
+    #[allow(clippy::too_many_arguments)]
+    fn submit(
+        &self,
+        jobs: &[ExtendJob],
+        m: usize,
+        mat: &[i8],
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        w: i32,
+        end_bonus: i32,
+        zdrop: i32,
+    ) -> BatchTicket;
+
+    /// Block until `ticket`'s batch is done and take its results.
+    ///
+    /// # Panics
+    /// If the ticket was not issued by this backend, or has already been collected.
+    fn collect(&self, ticket: BatchTicket) -> Vec<ExtendResult>;
+
+    /// How many batches this backend can usefully hold in flight. `1` means "no overlap available",
+    /// which is the honest answer for a CPU backend and is why that is the default: a caller that
+    /// pipelines to `queue_depth()` then behaves exactly as it does today.
+    fn queue_depth(&self) -> usize {
+        1
+    }
+}
+
+/// Gives any blocking [`SwBackend`] the [`SwBackendAsync`] contract, by doing the work in `submit`
+/// and handing the stored result back in `collect`.
+///
+/// This is what keeps the CPU backends untouched by issue #53: they gain the async seam without a
+/// line of change, and without pretending to an overlap they do not have ([`queue_depth`] stays 1).
+/// The results are parked in a map rather than returned because `submit`'s signature must be the
+/// same for the CPU and the GPU: the caller has to be writable against one contract.
+///
+/// [`queue_depth`]: SwBackendAsync::queue_depth
+#[derive(Debug, Default)]
+pub struct SyncAsAsync<B: SwBackend> {
+    /// The blocking backend doing the actual work.
+    inner: B,
+    /// Submitted-and-not-yet-collected results, keyed by ticket. A `Mutex` and not a `RefCell`
+    /// because `SwBackend` is shared across worker threads by reference.
+    pending: std::sync::Mutex<std::collections::HashMap<u64, Vec<ExtendResult>>>,
+    /// Monotonic ticket source. `Relaxed` is enough: it is only ever compared for equality, never
+    /// used to order anything.
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl<B: SwBackend> SyncAsAsync<B> {
+    /// Wrap a blocking backend.
+    pub fn new(inner: B) -> Self {
+        Self {
+            inner,
+            pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The wrapped backend, for callers that still want the blocking form.
+    pub fn inner(&self) -> &B {
+        &self.inner
+    }
+}
+
+impl<B: SwBackend> SwBackend for SyncAsAsync<B> {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn extend(
+        &self,
+        query: &[u8],
+        target: &[u8],
+        m: usize,
+        mat: &[i8],
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        w: i32,
+        end_bonus: i32,
+        zdrop: i32,
+        h0: i32,
+    ) -> ExtendResult {
+        self.inner.extend(
+            query, target, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, h0,
+        )
+    }
+
+    fn extend_batch(
+        &self,
+        jobs: &[ExtendJob],
+        m: usize,
+        mat: &[i8],
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        w: i32,
+        end_bonus: i32,
+        zdrop: i32,
+    ) -> Vec<ExtendResult> {
+        self.inner.extend_batch(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+        )
+    }
+}
+
+impl<B: SwBackend> SwBackendAsync for SyncAsAsync<B> {
+    fn submit(
+        &self,
+        jobs: &[ExtendJob],
+        m: usize,
+        mat: &[i8],
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        w: i32,
+        end_bonus: i32,
+        zdrop: i32,
+    ) -> BatchTicket {
+        // The work happens here, which is the whole point of the adapter: a CPU backend has nowhere
+        // else to do it, so "submit" is a synonym for "run" and `collect` is a lookup.
+        let out = self.inner.extend_batch(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+        );
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending
+            .lock()
+            .expect("pending map poisoned")
+            .insert(id, out);
+        BatchTicket(id)
+    }
+
+    fn collect(&self, ticket: BatchTicket) -> Vec<ExtendResult> {
+        self.pending
+            .lock()
+            .expect("pending map poisoned")
+            .remove(&ticket.0)
+            .expect("ticket was not issued by this backend, or was already collected")
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ScalarBackend;
 
