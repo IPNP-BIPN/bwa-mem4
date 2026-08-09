@@ -1855,25 +1855,43 @@ le prologue de ligne qui remplit deja `beg_lane`/`end_lane`, donc elles coutent 
 
 | | |
 |---|---|
-| colonnes prenant le regime rapide | **12,8 %** |
-| lignes dont toutes les voies sont actives | **19,7 %** |
-| **noyaux d'extension** (`EXTEND_NS`, 7 rondes) | **8,399 s -> 8,279 s, -1,43 %, 7 victoires sur 7** |
-| CPU du processus entier | 32,60 -> 32,41 s, -0,58 %, 5 victoires sur 9 |
+| colonnes prenant le regime rapide, **premiere forme** | 12,8 % |
+| colonnes prenant le regime rapide, **forme livree** | **43,1 %** |
+| **noyaux d'extension**, premiere forme (`EXTEND_NS`, 7 rondes) | 8,399 -> 8,279 s, -1,43 %, 7/7 |
+| **noyaux d'extension, forme livree** | **8,182 -> 7,767 s, -5,07 %, 7 victoires sur 7** |
+| **CPU du processus entier, forme livree** | **32,26 -> 31,83 s, -1,33 %, 9 victoires sur 9** |
 
-Les deux dernieres lignes sont coherentes : l'extension pese 30 % de la course, donc -1,43 % du
-noyau fait **-0,44 % du processus**, ce qui est sous la resolution d'un A/B de CPU total. **C'est la
-mesure au niveau du noyau qui tranche, et c'est elle qu'il faut citer.** Le gain attendu du comptage
-d'operations etait 4,5 % ; le reel est 1,43 %, parce que les operations repliees sont des melanges
-bon marche sur des pipes vectorielles qui ont du mou.
+Les deux dernieres lignes sont coherentes : l'extension pese 30 % de la course, donc -5,07 % du
+noyau fait bien **-1,5 % du processus**, et le A/B de CPU total en mesure -1,33 % avec 9 victoires
+sur 9. La premiere forme, elle, valait -0,44 % du processus, c'est-a-dire sous la resolution de ce
+meme A/B, ou elle n'avait obtenu que 5 victoires sur 9 : **il a fallu mesurer au niveau du noyau pour
+la voir du tout.**
 
-### La suite identifiee
+Le gain reste sous le comptage d'operations (4,5 % attendus pour 1,43 % obtenus dans la premiere
+forme, meme facteur d'un tiers ensuite) : les operations repliees sont des melanges bon marche sur
+des pipes vectorielles qui ont du mou.
 
-Le regime rapide exige que **toutes** les voies soient actives, et seules 19,7 % des lignes le sont.
-Or une voie inactive a `beg = end = 0`, donc sa bande est deja vide sans le `active_v` : le masque
-`active_v` est probablement redondant. S'il l'est, la condition tombe a « toutes les voies **actives**
-partagent une plage », et les 12,8 % de colonnes montent nettement. Ce n'est pas fait ici parce que
-le commentaire d'origine affirme que `active_v` empeche la reecriture de l'etat d'une voie terminee :
-c'est une question de correctness a prouver, pas a supposer.
+### La preuve qui a triple sa portee
+
+La premiere forme exigeait que **toutes** les voies soient actives, et seules 19,7 % des lignes le
+sont, d'ou 12,8 % de colonnes seulement. Le commentaire d'origine du noyau affirmait que le masque
+`active_v` empeche la reecriture de l'etat d'une voie terminee, ce qui interdisait d'ignorer les
+voies inactives. C'etait une question de correctness, donc elle a ete tranchee dans le code plutot
+que supposee. Les trois points, verifies :
+
+1. **Une voie ne se reactive jamais.** `active` est un local reconstruit a chaque ligne par
+   `!done[l] && i < tlen[l]`, et `done[l]` comme `i >= tlen[l]` sont monotones en `i`.
+2. **Rien ne relit ses rails.** Le seul lecteur de `eh_h`/`eh_e` hors de la boucle de colonnes est le
+   resserrement de bande en tete de ligne (`first_live`/`last_live`), et il est a l'interieur de
+   `if !active[l] { continue }`. L'epilogue de ligne aussi.
+3. **Rien ne survit dans les registres.** `h1_v` est recharge depuis le tableau scalaire `h1[]` au
+   debut de chaque ligne et `f_v` est remis a zero, et l'epilogue ne recrit `h1[l]` que pour les
+   voies actives.
+
+Donc une voie inactive peut voir ses rails, ses voies de registre et son `rowmax`/`mj` ecrits avec
+des valeurs calculees : personne ne les lit. La condition tombe a « les voies **actives** partagent
+une plage », et les colonnes rapides passent de **12,8 % a 43,1 %**, pour **-5,07 %** de noyau au
+lieu de -1,43 %.
 
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 

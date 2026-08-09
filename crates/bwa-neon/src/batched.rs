@@ -1669,15 +1669,31 @@ macro_rules! define_sw_kernel {
                     let mut beg_lane = [0 as $elem; LANES];
                     let mut end_lane = [0 as $elem; LANES];
                     let mut active_lane = [0 as $umask; LANES];
-                    // The band range every live lane shares, for the unmasked column regime below.
+                    // The band range every ACTIVE lane shares, for the unmasked column regime below.
                     // Computed here because this loop already visits every lane once per row, so it
                     // costs nothing beyond a max and a min.
-                    let mut all_active = nlane > 0;
+                    //
+                    // Inactive lanes are ignored, and that is a proof rather than an optimism. In
+                    // the unmasked range their `eh_h`/`eh_e` slots, their `h1`/`f` register lanes and
+                    // their `rowmax`/`mj` lanes are all written with computed values instead of
+                    // being held at their old ones. None of it is ever read again:
+                    //
+                    //  - a lane never REACTIVATES. `active` is rebuilt per row as
+                    //    `!done[l] && i < tlen[l]`, and both `done[l]` and `i >= tlen[l]` are
+                    //    monotone in `i`;
+                    //  - the band-tightening scan at the top of the row (`first_live`/`last_live`,
+                    //    which is the only reader of `eh_h`/`eh_e` outside the column loop) runs
+                    //    inside `if !active[l] { continue }`, as does the row epilogue;
+                    //  - `h1_v` is reloaded from the scalar `h1[]` at the start of every row and
+                    //    `f_v` is zeroed, so a garbage register lane cannot survive the row, and the
+                    //    epilogue writes `h1[l]` back for active lanes only.
+                    //
+                    // Requiring every lane to be active instead cost the regime most of its reach:
+                    // only 19.7% of rows have all sixteen live, against 12.8% of columns taking the
+                    // fast path.
                     let (mut fast_lo_raw, mut fast_hi_raw) = (i32::MIN, i32::MAX);
                     for l in 0..nlane {
-                        if !active[l] {
-                            all_active = false;
-                        } else {
+                        if active[l] {
                             fast_lo_raw = fast_lo_raw.max(beg[l]);
                             fast_hi_raw = fast_hi_raw.min(end[l]);
                         }
@@ -1859,7 +1875,7 @@ macro_rules! define_sw_kernel {
                     // `[fast_lo, fast_hi)` is where every lane is active and in band, so the mask is all-ones.
                     // Empty the moment one lane has finished, which is why it is recomputed per row rather than
                     // assumed: `run_side` re-collects active jobs per ROUND, but a lane can go inactive mid-DP.
-                    let (fast_lo, fast_hi) = if super::band_fast_enabled() && all_active {
+                    let (fast_lo, fast_hi) = if super::band_fast_enabled() {
                         (fast_lo_raw.max(gbeg), fast_hi_raw.min(gend))
                     } else {
                         (gbeg, gbeg)
