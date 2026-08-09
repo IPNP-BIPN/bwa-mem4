@@ -357,6 +357,9 @@ pub fn collect_smems_batched(
     // `next_read..` have not been started. Progress is guaranteed because every `step` either
     // advances a cursor or moves the phase forward.
     let mut live = slots.iter().filter(|s| s.is_some()).count();
+    // Hoisted out of the round loop: `step` runs on the order of 1e9 times per 500k pairs, and a
+    // `OnceLock` read there is an acquire load per step.
+    let pf_ahead = prefetch_ahead();
     while live > 0 {
         // Rust: `.iter_mut()` walks the slot table yielding an exclusive borrow of each entry, so
         // each in-flight read can be advanced in place. `.as_mut()` on the `Option` turns "maybe a
@@ -366,7 +369,7 @@ pub fn collect_smems_batched(
             let Some(slot) = slot_opt.as_mut() else {
                 continue;
             };
-            slot.step(fm, reads[slot.ridx], min_seed_len, &counts);
+            slot.step(fm, reads[slot.ridx], min_seed_len, &counts, pf_ahead);
             if slot.phase == LsPhase::Done {
                 // Rust: this is the move-out problem and its sanctioned solution. `slot.out` is a
                 // vector owned by a struct that is still in use, so it cannot simply be handed over.
@@ -554,16 +557,23 @@ impl LsSlot {
     /// - `min_seed_len`: emission length floor in bases (same value for the whole batch).
     /// - `counts`: the index's C array, hoisted by the driver. `counts[b]` is the first BWT ROW whose
     ///   suffix starts with base `b`; `counts[4]` is the total row count.
-    fn step(&mut self, fm: &FmIndex, codes: &[u8], min_seed_len: i32, counts: &[i64; 5]) {
+    /// `pf_ahead` is [`prefetch_ahead`], passed in rather than read here: this function is the
+    /// aligner's hottest loop body, and reading a `OnceLock` per step is an acquire load the
+    /// compiler is not free to hoist out of the driver's round loop across the call.
+    fn step(
+        &mut self,
+        fm: &FmIndex,
+        codes: &[u8],
+        min_seed_len: i32,
+        counts: &[i64; 5],
+        pf_ahead: usize,
+    ) {
         // Read once per call rather than per extension, and compiled out entirely unless the
         // `seed-stats` feature is on: this sits on a path that runs 1.7 billion times per 500k
         // pairs, where even a predictable branch is measurable (it cost about 3% of CPU when it
         // was unconditional).
         #[cfg(feature = "seed-stats")]
         let stats_on = seed_stats::enabled();
-        // Read once per call, not once per backward round: the round loop runs often enough that
-        // even a `OnceLock` load in its header showed up against the pre-prefetch baseline.
-        let pf_ahead = prefetch_ahead();
         // Per-walk occurrence floor: round 1 shares one value, round 2 carries the parent's `s + 1`.
         let min_intv = self.min_intv;
         // Length of this read in bases; the exclusive upper bound of every READ offset below.
@@ -1591,12 +1601,15 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
     // job named by its `job_id`, jobs `next_job..` are unstarted, and `results[..]` holds output only
     // for jobs already completed. A slot retires only when both are exhausted.
     let mut live = slots.iter().filter(|s| s.is_some()).count();
+    // Hoisted out of the round loop: `step` runs on the order of 1e9 times per 500k pairs, and a
+    // `OnceLock` read there is an acquire load per step.
+    let pf_ahead = prefetch_ahead();
     while live > 0 {
         for slot_opt in slots.iter_mut() {
             let Some((job_id, slot)) = slot_opt.as_mut() else {
                 continue;
             };
-            slot.step(fm, reads[slot.ridx], opt.min_seed_len, &counts);
+            slot.step(fm, reads[slot.ridx], opt.min_seed_len, &counts, pf_ahead);
             if slot.phase == LsPhase::Done {
                 results[*job_id] = std::mem::take(&mut slot.out);
                 if next_job < jobs.len() {
