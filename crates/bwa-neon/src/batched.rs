@@ -3054,6 +3054,136 @@ pub mod extend_shape {
 /// kernels directly (bypassing detection), which is how the port is validated on this Apple-Silicon
 /// host via `cargo test --target x86_64-apple-darwin` (Rosetta). On a native x86 CI runner (which has
 /// AVX2) it validates the real path. Requires an AVX2-capable executor.
+/// Throughput probe for the x86 EXTENSION kernels, the counterpart of `matesw`'s
+/// `rescue_kernel_ab`.
+///
+/// It exists because the x86 work of issues #48B, #48C and #46C has no measurement: this machine is
+/// arm64, and under Rosetta speed ratios do not hold. The CI job in `.github/workflows/bench-x86.yml`
+/// runs this at HEAD and at a base commit on the same runner, which is how those issues get a number
+/// instead of a projection.
+///
+/// Absolute throughput, not an in-binary A/B: the levers it covers are compile-time choices with no
+/// switch left, so the comparison is between two checkouts on one runner rather than two arms in one
+/// process. Best-of-N, which is the least noisy statistic on a shared cloud runner.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_extend_bench {
+    use super::{batched_extend_scalar, ExtendJob};
+    use std::time::Instant;
+
+    /// bwa's default DNA matrix, as `bwa_fill_scmat` builds it.
+    fn scoring() -> Vec<i8> {
+        let (a, b) = (1i8, 4i8);
+        let mut mat = vec![0i8; 25];
+        let mut k = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                mat[k] = if i == j { a } else { -b };
+                k += 1;
+            }
+            mat[k] = -1;
+            k += 1;
+        }
+        for _ in 0..5 {
+            mat[k] = -1;
+            k += 1;
+        }
+        mat
+    }
+
+    #[test]
+    #[ignore = "throughput probe, run explicitly by the bench-x86 workflow (base-ref copy, #48B only)"]
+    fn x86_extend_ab() {
+        let mat = scoring();
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let mut state = 0x2468_ace0_1357_9bdfu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        // Seed-extension shapes as the aligner produces them: a 150 bp read seeded in the middle
+        // leaves 40 to 110 bases to extend on each side.
+        let (mut queries, mut targets, mut h0s) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..8192 {
+            let qlen = 40 + (next() % 71) as usize;
+            let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            let tlen = qlen + (next() % 20) as usize;
+            let mut t: Vec<u8> = Vec::with_capacity(tlen);
+            let mut qi = 0usize;
+            while t.len() < tlen {
+                if qi < q.len() && next() % 100 >= 5 {
+                    t.push(q[qi]);
+                    qi += 1;
+                } else {
+                    t.push((next() % 4) as u8);
+                    if next() % 2 == 0 {
+                        qi += 1;
+                    }
+                }
+            }
+            queries.push(q);
+            targets.push(t);
+            h0s.push(20 + (next() % 20) as i32);
+        }
+        let jobs: Vec<ExtendJob> = (0..queries.len())
+            .map(|i| ExtendJob {
+                query: &queries[i],
+                target: &targets[i],
+                h0: h0s[i],
+            })
+            .collect();
+        let cells: u64 = jobs
+            .iter()
+            .map(|j| (j.query.len() * j.target.len()) as u64)
+            .sum();
+
+        let bench = |label: &str, run: &dyn Fn() -> Vec<super::ExtendResult>| {
+            let _ = run();
+            let mut best = f64::INFINITY;
+            for _ in 0..7 {
+                let t0 = Instant::now();
+                let out = run();
+                let dt = t0.elapsed().as_secs_f64();
+                std::hint::black_box(&out);
+                best = best.min(dt);
+            }
+            eprintln!(
+                "  {label:<12} {:>8.3} ms   {:>6.3} Gcell/s",
+                best * 1e3,
+                cells as f64 / best / 1e9
+            );
+        };
+
+        eprintln!("x86_extend_ab: {} jobs, {cells} DP cells", jobs.len());
+        bench("scalar", &|| {
+            batched_extend_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100)
+        });
+        // Called directly rather than through the dispatch, so the kernels are exercised even where
+        // feature detection is unavailable; on a native runner this is the same code the dispatch
+        // selects.
+        bench("sse41_u8", &|| unsafe {
+            super::sse41::batched_extend_sse41_u8::<true>(
+                &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
+            )
+        });
+        bench("avx2_u8", &|| unsafe {
+            super::avx2::batched_extend_avx2_u8::<true>(
+                &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
+            )
+        });
+        if std::arch::is_x86_feature_detected!("avx512bw") {
+            bench("avx512_u8", &|| unsafe {
+                super::avx512::batched_extend_avx512_u8::<true>(
+                    &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
+                )
+            });
+        } else {
+            eprintln!("  avx512_u8    skipped (no avx512bw on this runner)");
+        }
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 mod avx512_verify {
     use bwa_extend::{ksw_extend2, ExtendJob};
