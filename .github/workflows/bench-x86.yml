@@ -340,6 +340,35 @@ jobs:
           awk -v b="$bb" -v h="$hh" 'BEGIN{printf "head vs base: %.4fx  (%+.2f%%)\n", b/h, 100*(b-h)/b}'
           echo "NOTE: shared-runner VM, single chromosome. Not the headline ratio; see README."
 
+      # Does SMT pay for a memory-latency-bound aligner? This is the one machine question this repo
+      # cannot ask at home: Apple Silicon has no SMT, every x86 server does, and the mechanism is
+      # exactly our bottleneck (one thread computes while the other waits on DRAM). Published
+      # pointer-chase concurrency is 30 on Granite Rapids and 58 on Zen 5 against 28 on an M4, so the
+      # per-core miss capacity an SMT sibling shares is larger here than anything measured locally.
+      #
+      # Appended to this job rather than given its own, because the index and the reads are already
+      # built by the steps above and rebuilding them would cost another hour.
+      - name: SMT probe (physical cores vs all hardware threads)
+        shell: bash
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket'
+          TPC=$(lscpu | awk -F: '/Thread\(s\) per core/{gsub(/ /,"",$2); print $2}')
+          LOG=$(nproc)
+          PHYS=$(( LOG / TPC ))
+          echo "logical=$LOG threads_per_core=$TPC physical=$PHYS"
+          if [ "$TPC" -lt 2 ]; then
+            echo "This runner reports one thread per core, so SMT cannot be measured here."
+            exit 0
+          fi
+          t_of() { /usr/bin/time -f '%e %U %S' -o w.txt "$@" >/dev/null 2>/dev/null; cat w.txt; }
+          # Interleaved, three pairs, so a drifting shared VM cannot fake a winner.
+          for rep in 1 2 3; do
+            p=$(t_of "$HEAD_BIN" mem -t "$PHYS" chr21.fa r1.fq r2.fq)
+            l=$(t_of "$HEAD_BIN" mem -t "$LOG" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: -t$PHYS -> ${p}   -t$LOG -> ${l}   (wall user sys)"
+          done
+          echo "Read the wall column: if -t$LOG beats -t$PHYS, SMT is hiding memory latency for us."
+
   # Can a hosted runner even get 1 GB pages? BWA-MEM-SCALE (ICPP'22) measures +10.9 percentage points
   # from HugeTLB with 1 GB pages, and `crates/bwa-index/src/hugepage.rs` already establishes that
   # 2 MiB THP is worth ~1.7x on the seeding stage AND that mimalloc already obtains it. So the only

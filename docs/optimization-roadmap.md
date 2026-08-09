@@ -458,3 +458,26 @@ Egalite exacte a `-t8`, bruit a `-t16` sur une serie qui derive, CPU pire des de
 joue **en faveur** du levier, les deux bras partageant le binaire et donc le branchement. Retire.
 C'est le **sixieme** levier de trafic memoire tue par le meme mecanisme : le second acces etait deja
 gratuit, y compris a 16 threads.
+
+### Tested by reasoning, not built: helper-thread / inter-core prefetching (2026-08-09)
+
+The literature is strong: inter-core prefetching reports **up to 2.8x on memory-bound workloads** and
+**2x on irregular ones** (Skylake), and [Ghost Threading](https://dl.acm.org/doi/10.1145/3725843.3756106)
+(MICRO 2025) revives the idea on idle SMT contexts. The mechanism is real and would apply to us in
+principle: MSHRs are **per core**, so a helper on another core adds outstanding misses beyond the
+requesting core's ceiling, and its fills land in the shared cache where our core then hits instead of
+going to DRAM. On this machine the four E cores at `-t12` are exactly the "cores that return little
+compute" such a scheme wants.
+
+**It does not apply, for a structural reason.** A helper must know the address before the main thread
+does. The FM walk is a dependent chain: `backward_ext` derives `sp`/`ep` from the previous step's
+result, so a helper cannot produce the next address without performing the same work, and an E core
+at a third of a P core's speed cannot get ahead of it. This is the same property that already limits
+our own prefetch to exactly one step of lookahead, and the same one that rules out Apple's DMP
+(`docs/optimization-roadmap.md`, "Try to engage Apple's DMP").
+
+The one address stream we do know in advance is `get_sa_batch`'s `positions` array, and prefetching
+it further was **built and measured at 0%** (see the entry above). So the only place a helper could
+legitimately run is the one place where the accesses are already covered.
+
+Recorded so the 2.8x headline does not send someone down this path again.
