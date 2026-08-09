@@ -1805,6 +1805,76 @@ temps GPU du temps hote** dans la sonde, ce que la sonde actuelle ne fait pas : 
 `forward_batch` en entier, empaquetage et calcul de `score2` compris. C'est exactement le genre de
 mesure qui a induit en erreur ici, et c'est reparable avant d'ecrire une ligne de noyau.
 
+## Le regime de colonnes pleinement en bande, trouve par la mesure (2026-08-09)
+
+Le backlog d'issues etant epuise pour cette machine, ce levier vient d'un profil, pas d'une liste.
+
+### Le profil qui l'a designe
+
+Il a d'abord fallu **reparer la sonde** : les compteurs par etage sont derriere la feature Cargo
+`align-split`, desactivee par defaut, mais `TOTAL_NS` ne l'est pas, donc `BWA4_ALIGN_SPLIT=1` sur un
+binaire ordinaire imprimait `total=30,5s seeding=0,000s side=0,000s [...] rest=30,5s`. Une ligne de
+zeros qui se lit exactement comme une mesure disant « le seeding est gratuit ». Elle dit maintenant
+que les compteurs sont compiles hors du binaire, et la CLI expose la feature.
+
+Avec la feature, 500 k paires 150 bp, `-t4`, secondes CPU cumulees :
+
+| etage | s | part |
+|---|---|---|
+| seeding | 9,19 | 33 % |
+| **extension** | **8,31** | **30 %** (dont noyaux 8,01) |
+| chain_flt | 0,77 | 3 % |
+| reste | 9,21 | 34 % |
+
+Dans le reste, `BWA4_CHAIN_TIME` attribue **42,6 M de recherches SA a 103 ns** = 4,39 s, 16 % de la
+course. **Deja au genou** : `get_sa_batch` tourne une fenetre logicielle de 128, dont le balayage est
+consigne dans la source (152 ns a `-t16` sur GRCh38, plat au-dela de 128), et 103 ns a `-t4` fait
+mieux. Moins de recherches demanderait un changement algorithmique, pas une acceleration.
+
+### Le comptage qui a designe le levier
+
+Boucle de colonne du noyau d'extension NEON u8, **desassemblage du binaire livre** :
+
+| | extension | rescue |
+|---|---|---|
+| instructions par colonne de 16 cellules | 35 | |
+| **operations vectorielles par cellule** | **1,63** | **0,83** |
+
+L'ecart de 2x que #48 annonçait existe donc bien, meme si aucun de ses leviers ne l'expliquait. Neuf
+de ces 26 operations vectorielles sont le **masque de bande** et les melanges qu'il pilote : deux
+compares et deux `and` pour le construire, puis cinq `bsl`/`and` qui l'appliquent aux deux ecritures
+gardees, a `h1`, a `f` et a l'argmax.
+
+### Le levier
+
+Dans les colonnes ou **toutes** les voies vivantes sont en bande, ce masque vaut tout-a-un et les
+neuf operations se replient. Trois regimes de colonnes, exactement la forme de #47 :
+`gbeg..fast_lo` masque, `fast_lo..fast_hi` **non masque**, `fast_hi..gend` masque, ou
+`[fast_lo, fast_hi)` = `[max(beg), min(end))` sur les voies actives. Les bornes sont calculees dans
+le prologue de ligne qui remplit deja `beg_lane`/`end_lane`, donc elles coutent un `max` et un `min`.
+
+| | |
+|---|---|
+| colonnes prenant le regime rapide | **12,8 %** |
+| lignes dont toutes les voies sont actives | **19,7 %** |
+| **noyaux d'extension** (`EXTEND_NS`, 7 rondes) | **8,399 s -> 8,279 s, -1,43 %, 7 victoires sur 7** |
+| CPU du processus entier | 32,60 -> 32,41 s, -0,58 %, 5 victoires sur 9 |
+
+Les deux dernieres lignes sont coherentes : l'extension pese 30 % de la course, donc -1,43 % du
+noyau fait **-0,44 % du processus**, ce qui est sous la resolution d'un A/B de CPU total. **C'est la
+mesure au niveau du noyau qui tranche, et c'est elle qu'il faut citer.** Le gain attendu du comptage
+d'operations etait 4,5 % ; le reel est 1,43 %, parce que les operations repliees sont des melanges
+bon marche sur des pipes vectorielles qui ont du mou.
+
+### La suite identifiee
+
+Le regime rapide exige que **toutes** les voies soient actives, et seules 19,7 % des lignes le sont.
+Or une voie inactive a `beg = end = 0`, donc sa bande est deja vide sans le `active_v` : le masque
+`active_v` est probablement redondant. S'il l'est, la condition tombe a « toutes les voies **actives**
+partagent une plage », et les 12,8 % de colonnes montent nettement. Ce n'est pas fait ici parce que
+le commentaire d'origine affirme que `active_v` empeche la reecriture de l'etat d'une voie terminee :
+c'est une question de correctness a prouver, pas a supposer.
+
 ## La voie GPU : le plafond est 2,45x, et le GPU integre suffit deja (2026-08-08)
 
 Suite directe de la section precedente : puisque l'activite recente est GPU, la question devient
