@@ -33,6 +33,8 @@ int main(void) {
           "#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device uchar*o[[buffer(0)]]){o[0]=addsat(o[1],o[2]);}");
         try_src(dev, "max(uchar4)",
           "#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device uchar4*o[[buffer(0)]]){o[0]=max(o[1],o[2]);}");
+        try_src(dev, "subsat(uchar) scalar",
+          "#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device uchar*o[[buffer(0)]]){o[0]=subsat(o[1],o[2]);}");
         try_src(dev, "addsat(ushort4)",
           "#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device ushort4*o[[buffer(0)]]){o[0]=addsat(o[1],o[2]);}");
         try_src(dev, "subsat(ushort4)",

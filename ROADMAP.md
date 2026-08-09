@@ -1708,20 +1708,29 @@ utilisent deja, pour que la regle de fusion et la fenetre d'exclusion existent u
 | | debit |
 |---|---|
 | plafond mesure du GPU, registres seuls (`msl_probe.sh`) | ~330 Gcell/s |
-| **noyau livre, formes reelles 150 bp x 620 bp, 8192 travaux** | **7,66 Gcell/s** |
+| **noyau livre, formes reelles 150 bp x 620 bp, 8192 travaux** | **10,95 Gcell/s** |
 | un seul thread CPU (`BWA4_MATESW_TIME`) | ~10,6 Gcell/s |
 
-**Le GPU perd contre un coeur CPU**, et realise 2,3 % de son propre plafond. La cause est identifiee
-et une partie a deja ete corrigee : les rails H/E sont en memoire de peripherique, 3 lectures et 2
-ecritures de 32 bits par cellule. La disposition **par travail** (`rail[gid * qmax + c]`) mettait les
-32 threads d'un groupe SIMD sur 32 lignes de cache differentes ; la disposition **par colonne**
-(`rail[c * n_jobs + gid]`) les met sur 128 octets consecutifs. Mesure, meme noyau, memes donnees :
-**2,30 Gcell/s contre 7,66, soit 3,3x pour un changement d'indexation seul.**
+**Le GPU fait donc jeu egal avec UN coeur CPU**, et realise 3,3 % de son propre plafond. La cause est
+la memoire : les rails H/E vivent en memoire de peripherique, 3 lectures et 2 ecritures par cellule,
+la ou la sonde de plafond garde tout en registres. Deux corrections ont deja ete faites, chacune
+mesuree sur la meme sonde :
 
-Ce qui reste des 40x manquants est du meme ordre : passer les rails en `uchar` (u8) les fait tenir en
-**memoire de groupe** (160 colonnes x 32 threads x 3 rails = 15 KB, sous les 32 KB disponibles, ce
-qui est impossible en 32 bits ou il en faudrait 61), et le `uchar4` donne quatre cellules par voie.
-Les deux vont ensemble et c'est la prochaine etape, avec son plafond deja mesure.
+| version | debit |
+|---|---|
+| rails 32 bits, disposition **par travail** | 2,30 Gcell/s |
+| rails 32 bits, disposition **par colonne** | **7,66** (3,3x) |
+| rails **u8**, disposition par colonne | **10,95** (+43 %) |
+
+La disposition par travail (`rail[gid * qmax + c]`) mettait les 32 threads d'un groupe SIMD sur 32
+lignes de cache differentes ; par colonne (`rail[c * n_jobs + gid]`) elle les met sur 128 octets
+consecutifs. Les rails u8 divisent ensuite le trafic par quatre. Les travaux dont le plafond de score
+depasse `U8_SCORE_LIMIT` prennent le noyau 32 bits, exactement le meme binning que
+`fwd_local_sw_batch` fait sur le CPU.
+
+Ce qui reste des 30x manquants est le **`uchar4`** : quatre travaux par voie, c'est ce que la sonde de
+plafond mesure reellement, et c'est une decomposition differente (quatre travaux par thread, avec
+leurs geometries inegales a masquer) plutot qu'un changement de type. C'est la prochaine etape.
 
 ### Pourquoi il n'est pas branche dans l'aligneur
 

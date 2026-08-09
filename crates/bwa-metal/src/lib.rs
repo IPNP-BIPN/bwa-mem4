@@ -41,6 +41,10 @@ pub const KERNEL_SRC: &str = include_str!("kernel.metal");
 /// This is **observable**: the padding columns score 0, carry the diagonal, and therefore feed
 /// `score2`. It is a property of the JOB, not of whatever width the backend happens to use, which is
 /// why the GPU has to reproduce it even though it has no lanes at all.
+/// Score ceiling under which the u8 rails are exact, mirroring `bwa-neon`'s constant of the same
+/// name. A job at or above it takes the 32-bit kernel.
+pub const U8_SCORE_LIMIT: i32 = 250;
+
 pub fn padded_qlen(qlen: usize, max_sc: i32) -> usize {
     let lanes = if (qlen as i32) * max_sc < 250 { 16 } else { 8 };
     qlen.div_ceil(lanes) * lanes
@@ -71,7 +75,7 @@ struct GpuJob {
     t_off: u32,
     t_len: u32,
     endsc: i32,
-    rail: u32,
+    kind: u32,
     _pad: u32,
 }
 
@@ -100,7 +104,11 @@ mod backend {
     pub struct MetalRescue {
         device: Device,
         queue: metal::CommandQueue,
+        /// 32-bit rails, correct for every job.
         pipeline: metal::ComputePipelineState,
+        /// u8 rails, for jobs whose score ceiling fits a byte. Same control flow, a quarter of the
+        /// device-memory traffic; the host picks between them per job, as `fwd_local_sw_batch` does.
+        pipeline_u8: metal::ComputePipelineState,
     }
 
     impl MetalRescue {
@@ -111,11 +119,14 @@ mod backend {
             let lib = device.new_library_with_source(KERNEL_SRC, &opts).ok()?;
             let f = lib.get_function("rescue_fwd", None).ok()?;
             let pipeline = device.new_compute_pipeline_state_with_function(&f).ok()?;
+            let f8 = lib.get_function("rescue_fwd_u8", None).ok()?;
+            let pipeline_u8 = device.new_compute_pipeline_state_with_function(&f8).ok()?;
             let queue = device.new_command_queue();
             Some(Self {
                 device,
                 queue,
                 pipeline,
+                pipeline_u8,
             })
         }
 
@@ -153,6 +164,14 @@ mod backend {
             let mispen = -(mat[1] as i32);
             let npen = -(mat[m - 1] as i32);
             let (oe_del, oe_ins) = (o_del + e_del, o_ins + e_ins);
+
+            // The same score-ceiling test the CPU dispatch uses: a local alignment can match at
+            // most `min(qlen, tlen)` bases and only loses score from there, so `min(len) * max_sc`
+            // bounds every H/E/F cell. Under `U8_SCORE_LIMIT` the u8 rails are exact; at or above it
+            // they would saturate, so those jobs take the 32-bit kernel.
+            let fits_u8 = |j: &RescueJob| {
+                (j.query.len().min(j.target.len()) as i32) * max_sc < U8_SCORE_LIMIT
+            };
 
             // One flat sequence buffer, written straight into shared memory: the CPU fills the
             // `MTLBuffer`'s own storage, and the GPU reads the same bytes. No staging copy exists.
@@ -195,7 +214,7 @@ mod backend {
                         t_off: t_off as u32,
                         t_len: j.target.len() as u32,
                         endsc: j.endsc,
-                        rail: k as u32,
+                        kind: u32::from(fits_u8(j)),
                         _pad: 0,
                     };
                 }
@@ -211,6 +230,7 @@ mod backend {
                 MTLResourceOptions::StorageModeShared,
             );
             let rail_bytes = (jobs.len() * rail_qmax * 4) as u64;
+            let rail_bytes_u8 = (jobs.len() * rail_qmax) as u64;
             let h_prev = self
                 .device
                 .new_buffer(rail_bytes, MTLResourceOptions::StorageModePrivate);
@@ -220,6 +240,16 @@ mod backend {
             let e_rail = self
                 .device
                 .new_buffer(rail_bytes, MTLResourceOptions::StorageModePrivate);
+            // The u8 kernel's rails: a quarter of the bytes, which is the point of it.
+            let h_prev8 = self
+                .device
+                .new_buffer(rail_bytes_u8, MTLResourceOptions::StorageModePrivate);
+            let h_cur8 = self
+                .device
+                .new_buffer(rail_bytes_u8, MTLResourceOptions::StorageModePrivate);
+            let e_rail8 = self
+                .device
+                .new_buffer(rail_bytes_u8, MTLResourceOptions::StorageModePrivate);
             let rowmax = self.device.new_buffer(
                 (jobs.len() * rail_tmax * 4) as u64,
                 MTLResourceOptions::StorageModeShared,
@@ -229,31 +259,38 @@ mod backend {
             let dims: [u32; 3] = [rail_qmax as u32, rail_tmax as u32, jobs.len() as u32];
 
             let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.pipeline);
-            enc.set_buffer(0, Some(&seqs), 0);
-            enc.set_buffer(1, Some(&jobs_buf), 0);
-            enc.set_buffer(2, Some(&res_buf), 0);
-            enc.set_buffer(3, Some(&h_prev), 0);
-            enc.set_buffer(4, Some(&h_cur), 0);
-            enc.set_buffer(5, Some(&e_rail), 0);
-            enc.set_buffer(6, Some(&rowmax), 0);
-            for (i, v) in scalars.iter().enumerate() {
-                enc.set_bytes(7 + i as u64, 4, v as *const i32 as *const std::ffi::c_void);
+            // Two dispatches in one command buffer, one per rail width. Each kernel returns
+            // immediately for the jobs that are not its kind, so the split costs one extra launch
+            // and no host bookkeeping, and the two write disjoint entries of `res_buf`.
+            for (pipe, hp, hc, ev) in [
+                (&self.pipeline, &h_prev, &h_cur, &e_rail),
+                (&self.pipeline_u8, &h_prev8, &h_cur8, &e_rail8),
+            ] {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&seqs), 0);
+                enc.set_buffer(1, Some(&jobs_buf), 0);
+                enc.set_buffer(2, Some(&res_buf), 0);
+                enc.set_buffer(3, Some(hp), 0);
+                enc.set_buffer(4, Some(hc), 0);
+                enc.set_buffer(5, Some(ev), 0);
+                enc.set_buffer(6, Some(&rowmax), 0);
+                for (i, v) in scalars.iter().enumerate() {
+                    enc.set_bytes(7 + i as u64, 4, v as *const i32 as *const std::ffi::c_void);
+                }
+                for (i, v) in dims.iter().enumerate() {
+                    enc.set_bytes(14 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+                }
+                let tg = pipe
+                    .max_total_threads_per_threadgroup()
+                    .min(jobs.len() as u64)
+                    .max(1);
+                enc.dispatch_threads(
+                    MTLSize::new(jobs.len() as u64, 1, 1),
+                    MTLSize::new(tg, 1, 1),
+                );
+                enc.end_encoding();
             }
-            for (i, v) in dims.iter().enumerate() {
-                enc.set_bytes(14 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
-            }
-            let tg = self
-                .pipeline
-                .max_total_threads_per_threadgroup()
-                .min(jobs.len() as u64)
-                .max(1);
-            enc.dispatch_threads(
-                MTLSize::new(jobs.len() as u64, 1, 1),
-                MTLSize::new(tg, 1, 1),
-            );
-            enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
 
