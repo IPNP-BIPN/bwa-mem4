@@ -75,6 +75,15 @@
 //!
 //! hyalite carries a single gap-penalty pair, so it cannot express `o_del != o_ins`. The test
 //! therefore runs symmetric penalties, which is bwa's default (`-O 6 -E 1`).
+//!
+//! Still true as of hyalite **0.3.0** (2026-08-09): `Scoring::new(alphabet_len, matrix, gap_open,
+//! gap_ext)` remains the only constructor, so asymmetric penalties are not expressible and this
+//! test's scope is unchanged. What 0.3.0 did bring is the two documentation corrections this
+//! project asked for upstream (`Psy-Fer/hyalite#2`): that the substitution matrix is indexed
+//! `[query][target]` rather than bwa's `[target][query]`, and that agreement with bwa's own
+//! `score2` holds only when the query length is a multiple of the SIMD width, because bwa's per-row
+//! maximum is not the DP's per-column maximum once the query profile is padded. Both are things
+//! this file had to discover the hard way; they are now stated in the dependency itself.
 
 /// ksw's SIMD width for the u8 kernel, and the modulus that decides whether a query needs padding.
 /// Not a tuning knob here: it is the number `ksw_qinit` rounds the profile up to.

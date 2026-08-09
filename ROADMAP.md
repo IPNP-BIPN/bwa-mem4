@@ -94,6 +94,25 @@ pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
 (upstream `bwa-mem2#297`, ouvert depuis ce projet).
 
+## hyalite 0.3.0 : nos deux corrections sont remontees en amont (2026-08-09)
+
+Mise a jour de la section ci-dessous. Le pin de developpement passe de `0.2` a **`0.3.0`**, et
+l'oracle independant reste vert sans modification.
+
+Ce que 0.3.0 apporte pour nous : les **deux corrections de documentation** que ce projet avait
+demandees en amont (`Psy-Fer/hyalite#2`) sont dedans, de l'aveu du mainteneur. Ce sont exactement les
+deux choses que `third_party_oracle.rs` avait du decouvrir a la main :
+
+* la matrice de substitution s'indexe `[requete][cible]` et non `[cible][requete]` comme chez bwa ;
+* l'accord avec le `score2` de bwa **ne tient que si la longueur de requete est un multiple de la
+  largeur SIMD**, parce que le maximum par ligne de bwa n'est pas le maximum par colonne du DP une
+  fois le profil de requete bourre. C'est la meme observation que la section #47 fait de l'interieur.
+
+Ce que 0.3.0 n'apporte pas : les **penalites de gap asymetriques**. `Scoring::new(alphabet_len,
+matrix, gap_open, gap_ext)` reste le seul constructeur, donc `o_del != o_ins` reste inexprimable et
+la portee de notre oracle est inchangee : il tourne en penalites symetriques, ce qui est le defaut de
+bwa (`-O 6 -E 1`). La demande principale de l'issue reste ouverte en amont.
+
 ## hyalite comme noyau de production : non (2026-08-05)
 
 hyalite 0.2 sert d'oracle independant (voir `crates/bwa-extend/tests/third_party_oracle.rs`). Question
