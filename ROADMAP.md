@@ -3557,6 +3557,117 @@ Le plancher du lecteur est maintenant le **parseur** : ~926 Mo/s par fichier, tr
 enregistrement (`name`, `seq`, `qual`). C'est le prochain levier, pas le decodeur. Et l'ecart a `-t4`
 (2,6 % de mur, 1,5 % de CPU, lecteur totalement recouvert) est un probleme distinct, non localise.
 
+## Le lecteur n'est plus le goulot, et la sonde mentait (2026-08-11)
+
+### `Record` : trois allocations par read, devenues une
+
+`Record` etait `String` + `Vec<u8>` + `Option<Vec<u8>>` + `Option<String>` : trois allocations et
+trois copies par read, 96 octets de structure. Il est maintenant **un seul tampon**
+`name | seq | qual | comment` plus trois longueurs et un drapeau : **une allocation, 32 octets**, avec
+accesseurs.
+
+Le decoupage qui a designe ce levier, 1 M reads, 352 Mo, un fichier :
+
+| | temps |
+|---|---|
+| needletail, zero copie | 0,048-0,056 s |
+| seq_io, zero copie | 0,049-0,050 s |
+| **+ notre `Record` possede** | **0,113-0,114 s** |
+| + une arene | 0,067-0,068 s |
+
+**Changer de bibliotheque ne rendait rien** : needletail et seq_io sont a egalite, et paraseq annonce
+lui-meme « matches the performance of the zero-copy parsers », son gain portant sur les parseurs
+*une-copie*, ce que notre `Record` etait. Le cout etait notre representation.
+
+Lecteur isole, 1 M paires, via `PairedFastqReader::next_batch` :
+
+| | avant | apres |
+|---|---|---|
+| plain, 1 lot | 0,360 s | **0,192 s** (-47 %) |
+| plain, 2 lots | 0,302 s | 0,188 s |
+| plain, 8 lots | 0,234 s | 0,139 s |
+| gzip, 1 lot | 0,355 s | 0,270 s |
+
+Plus que les 0,046 s que la sonde predisait : la structure divisee par trois allege aussi les **deux
+deplacements** par enregistrement (canal de chunks, puis vecteur de lot) et la pression allocateur.
+
+Bout en bout a `-t4`, 8 rondes appariees : **CPU median -0,75 s sur 194, 6/8 en faveur**. Petit, parce
+qu'a `-t4` le lecteur est integralement recouvert (`wait_read` = 0,000) : ce qui reste visible est le
+calcul economise, pas le mur. Une ronde a donne -25 % de CPU, ce qu'aucun changement de representation
+ne peut produire ; **ecartee**, cause inconnue.
+
+Parite verifiee sur les trois chemins que la nouvelle representation encode differemment : GIAB gzip
+`968a2331...`, `-C` avec commentaires `a16e64eb...`, FASTA sans qualites `578281f3...`, les trois
+identiques a bwa-mem2.
+
+### Deux zeros, consignes
+
+**Reserver le `Vec` de lot.** L'isole montrait 1 lot a 0,360 s contre 8 lots a 0,234 s, ce qui
+ressemblait a de la croissance par doublement. Apres reservation : 0,368 s. Sur le binaire reel,
+`wait_read` median 0,332 contre 0,342. **Retire.** La difference 1-lot/8-lots vient des defauts de
+page sur de la memoire fraiche, que l'allocateur recycle quand les lots sont petits.
+
+**Deplacer au lieu de cloner dans `PrepPair`.** Six clones par paire supprimes (~376 Mo par lot de
+1 M), dans un etage parallele : mur median +0,03 s, CPU median +0,1 s sur 190. **Zero.** Garde
+malgre tout, parce que c'est du code en moins qui ne peut pas etre plus lent, mais compte comme nul.
+
+### rapidgzip redevient utile apres coup
+
+Avant l'arene, le lecteur isole donnait gzip 0,355 s contre plain 0,360 : le gzip etait **gratuit**,
+masque par le parsing, et le balayage `BWA4_GZIP_THREADS` etait plat. Apres l'arene, gzip 0,270 contre
+plain 0,192, et le balayage repond :
+
+| threads | lecteur isole, gzip |
+|---|---|
+| 1 | 0,469 s |
+| 4 | 0,357 s |
+| **8** | **0,280 s** |
+| 16 | 0,294 s |
+| plain (plancher) | 0,167 s |
+
+**-40 %**, et notre defaut (`-t`/2, soit 8 a `-t16`) est exactement l'optimum. Lecon generale :
+optimiser le consommateur **redonne du travail au producteur**, et un levier juge nul peut redevenir
+utile une fois corrige ce qui le masquait. Un zero est date, pas definitif.
+
+### La sonde `stage_time` cachait 95 % du run
+
+`NS` etait un `thread_local`, sur la croyance que seul le thread principal enregistre. Faux :
+`run_pipeline` execute chaque `process` sur un thread `scope.spawn`, donc **tous les etages entre
+`encode` et `sam_emit` etaient credites a un thread qui mourait ensuite**. La table ne montrait que
+`wait_read`, `wait_write` et un enorme « unaccounted » etiquete « index load, header, teardown ».
+Passe en `AtomicU64` globaux.
+
+Profil enfin visible, `-t16`, GIAB, ms par lot : rescue 7287, align 5058, encode 1808, sam_emit 467,
+wait_read 138, dedup_prep 105, pestat 21, deinterleave 4. Reserve : `encode`, `dedup_prep` et
+`sam_emit` appellent `barrier::worker` **par read**, donc leurs chiffres sont gonfles par
+l'instrument ; `rescue` est instrumente par chunk et `align` pas du tout.
+
+Deux consequences a noter dans la table : les etages **recouvrent** `wait_read` (le pipeline lance
+`process` du lot N puis attend le lot N+1), et deux `process` sont en vol a la fois, donc la colonne
+`%_run` peut depasser 100 % et le reste est signe.
+
+### Ou est vraiment le temps, hors sonde
+
+`sample` sur un run `-t4`, feuilles seulement, normalise au busy :
+
+| symbole | % du busy |
+|---|---|
+| `fwd_local_sw_neon_u8` (SW du mate rescue) | **18,0 %** |
+| `batched_extend_neon_u8` (extension) | **15,6 %** |
+| `mem_sort_dedup_patch` | **11,7 %** |
+| `LsSlot::step` | 5,4 % |
+| `align_reads_batched` | 3,8 % |
+| `get_sa_batch` | 3,6 % |
+| `build_chains_from_resolved` | 3,1 % |
+| `mem_chain_flt` | 2,5 % |
+| `batch_mate_rescue` | 2,2 % |
+| `gen_cigar2` | 2,1 % |
+
+**Le mate rescue et ce qu'il declenche font ~29 % du busy** : son noyau SW, sa boucle, et l'essentiel
+de `mem_sort_dedup_patch`, qui existe surtout parce que le rescue reinsere une region puis retrie tout
+le vecteur. Le seeding, suspect principal de toute la campagne precedente, ne fait que **12,8 %** en
+cumule. C'est la cible du prochain lot, et elle est enfin chiffree plutot que supposee.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en

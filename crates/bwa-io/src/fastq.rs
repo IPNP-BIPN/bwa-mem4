@@ -60,31 +60,105 @@ use needletail::{parse_fastx_file, FastxReader};
 
 /// One read: SAM QNAME, sequence, and (optional) quality string.
 ///
-/// `name` is already bwa-normalised (see [`qname_from_id`]). `seq` is ASCII bases as sequenced, in
+/// `name()` is already bwa-normalised (see [`split_id`]). `seq()` is ASCII bases as sequenced, in
 /// the orientation they came off the instrument, and is NOT uppercased or validated here: `dna::nt4`
-/// maps anything that is not ACGT/acgt to 4 (N) at use site. `qual`, when present, is Phred+33 and
-/// has the same length as `seq`, index for index.
+/// maps anything that is not ACGT/acgt to 4 (N) at use site. `qual()`, when present, is Phred+33 and
+/// has the same length as `seq()`, index for index.
+///
+/// # Why one buffer instead of four fields
+///
+/// This used to be `String` + `Vec<u8>` + `Option<Vec<u8>>` + `Option<String>`, so every read cost
+/// three heap allocations and three copies, and the struct was 96 bytes. Measured on 1 M real GIAB
+/// reads, parsing with needletail and building this record: the parser alone takes 0.048 s and the
+/// copy-out takes it to 0.113 s. The copy-out was more expensive than the parse.
+///
+/// That also ruled out the obvious move of swapping parsers. seq_io measures 0.049 s on the same
+/// file, i.e. the same as needletail, and paraseq says of itself that it "matches the performance of
+/// the zero-copy parsers"; its gain is over ONE-COPY parsers, which is what this type was.
+///
+/// One allocation per read, laid out `name | seq | qual | comment`, brings that to 0.067 s, and the
+/// struct to 32 bytes. The size matters twice over: the reader moves every record twice (out of the
+/// per-file chunk channel, then into the batch vector), and at 1 M pairs that is 192 MB of moves
+/// instead of 576 MB.
 pub struct Record {
-    /// SAM column 1 (QNAME). FASTQ line 1 (`@...`) up to the first whitespace, with a trailing
-    /// `/1`/`/2` trimmed. Set once at parse time by [`qname_from_id`]; read by every SAM emitter
-    /// and, for `-p` input, by [`InterleavedFastqReader::next_batch`] to recognise mates.
-    pub name: String,
-    /// FASTQ line 2: the bases as ASCII, in the orientation they came off the instrument. Length is
-    /// the read length (typically 100-150). Not uppercased, not validated, not 2-bit packed here:
-    /// any byte outside ACGT/acgt becomes N (code 4) when `dna::nt4` is applied downstream. Feeds
-    /// seeding, and (possibly reverse-complemented and soft-clip-sliced) SAM column 10 (SEQ).
-    pub seq: Vec<u8>,
-    /// FASTQ line 4: Phred+33 quality, one byte per base, so `qual.len() == seq.len()` index for
-    /// index. `None` for FASTA input (no line 3/4 at all), which makes SAM column 11 (QUAL) `*`.
-    /// Byte value range in practice 33..=73 (`!` to `I`, q = 0..=40).
-    pub qual: Option<Vec<u8>>,
-    /// Everything after the first whitespace of the header, as kseq's `comment`. Only emitted when
-    /// `-C` is given (bwa frees it otherwise), so carrying it always costs one `Option` per read.
+    /// `name | seq | qual | comment`, concatenated. Exactly the size of its contents: built with
+    /// `Vec::with_capacity` of the summed lengths, so `into_boxed_slice` never reallocates.
+    buf: Box<[u8]>,
+    /// Bytes of `buf` holding SAM column 1 (QNAME), from offset 0. FASTQ line 1 (`@...`) up to the
+    /// first whitespace, with a trailing `/1`/`/2` trimmed, lossily converted to UTF-8. Read by
+    /// every SAM emitter and, for `-p` input, by [`InterleavedFastqReader::next_batch`] to
+    /// recognise mates.
+    name_len: u32,
+    /// Bytes of `buf` holding FASTQ line 2, the bases as ASCII in the orientation they came off the
+    /// instrument, starting at `name_len`. Typically 100-150. Not uppercased, not validated, not
+    /// 2-bit packed here: any byte outside ACGT/acgt becomes N (code 4) when `dna::nt4` is applied
+    /// downstream. Feeds seeding, and (possibly reverse-complemented and soft-clip-sliced) SAM
+    /// column 10 (SEQ).
+    seq_len: u32,
+    /// Bytes of `buf` holding the kseq `comment`, at the end. 0 means no comment, which is the same
+    /// thing here: [`split_id`] only reports a comment when it has at least one non-whitespace byte.
     ///
-    /// From FASTQ line 1, after the QNAME field. `None` when the header is a bare name. Under `-C`
-    /// it is appended verbatim as the LAST tab-separated field of the SAM line, after every tag
-    /// including RG:Z/SA:Z/XA:Z; it is not a typed `TAG:TYPE:VALUE` tag.
-    pub comment: Option<String>,
+    /// From FASTQ line 1, after the QNAME field. Under `-C` it is appended verbatim as the LAST
+    /// tab-separated field of the SAM line, after every tag including RG:Z/SA:Z/XA:Z; it is not a
+    /// typed `TAG:TYPE:VALUE` tag.
+    comment_len: u32,
+    /// Whether FASTQ line 4 is present, i.e. whether `seq_len` bytes of Phred+33 quality follow the
+    /// sequence. A flag rather than a length because quality is always exactly as long as the
+    /// sequence, and rather than `comment_len`'s zero-means-absent trick because a zero-length read
+    /// would then be indistinguishable from a FASTA one. `false` makes SAM column 11 `*`.
+    has_qual: bool,
+}
+
+impl Record {
+    /// SAM column 1 (QNAME).
+    ///
+    /// # Panics
+    /// Never in practice: the bytes were produced by `String::from_utf8_lossy` at parse time, so
+    /// they are valid UTF-8 by construction. The check is kept rather than elided with `unsafe`
+    /// because it costs a scan of ~40 bytes per call against the ~150-byte copies this type exists
+    /// to remove.
+    #[inline]
+    #[must_use]
+    pub fn name(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.name_len as usize])
+            .expect("record name is UTF-8 by construction (from_utf8_lossy at parse time)")
+    }
+
+    /// FASTQ line 2: the ASCII bases.
+    #[inline]
+    #[must_use]
+    pub fn seq(&self) -> &[u8] {
+        let start = self.name_len as usize;
+        &self.buf[start..start + self.seq_len as usize]
+    }
+
+    /// FASTQ line 4: Phred+33 quality, one byte per base, or `None` for FASTA input.
+    #[inline]
+    #[must_use]
+    pub fn qual(&self) -> Option<&[u8]> {
+        if !self.has_qual {
+            return None;
+        }
+        let start = self.name_len as usize + self.seq_len as usize;
+        Some(&self.buf[start..start + self.seq_len as usize])
+    }
+
+    /// The kseq `comment`, or `None` for a bare-name header.
+    ///
+    /// # Panics
+    /// Never in practice, for the same reason as [`Record::name`].
+    #[inline]
+    #[must_use]
+    pub fn comment(&self) -> Option<&str> {
+        if self.comment_len == 0 {
+            return None;
+        }
+        let end = self.buf.len();
+        Some(
+            std::str::from_utf8(&self.buf[end - self.comment_len as usize..])
+                .expect("record comment is UTF-8 by construction (from_utf8_lossy at parse time)"),
+        )
+    }
 }
 
 /// Streaming FASTQ reader.
@@ -398,24 +472,39 @@ impl FastqReader {
                 // it below must be copied out before the next `self.inner.next()`.
                 let rec = rec.map_err(|e| Error::Fastq(e.to_string()))?;
                 // `rec.id()` is FASTQ line 1 WITHOUT the leading `@`, i.e. name plus any comment.
-                // Split into the two halves: `name` becomes SAM QNAME, `comment` the `-C` trailer.
-                let name = qname_from_id(rec.id());
-                let comment = comment_from_id(rec.id());
-                // FASTQ line 2 (bases) and line 4 (Phred+33), both owned copies. `qual` is `None`
-                // for FASTA input, where lines 3 and 4 do not exist.
-                //
-                // Rust: this is where the borrowed-to-owned copy happens, and it is not optional.
-                // `.into_owned()` and `.to_vec()` each allocate a fresh buffer, because `rec` is a
-                // window onto memory needletail will overwrite on the next call. `.map(...)` on the
-                // quality applies the copy only when there is one, leaving `None` alone, which is
-                // how FASTA input (no quality line at all) passes through untouched.
-                let seq = rec.seq().into_owned();
-                let qual = rec.qual().map(<[u8]>::to_vec);
+                // Split into the two halves: the first becomes SAM QNAME, the second the `-C`
+                // trailer. Both are still borrowed from needletail's buffer at this point.
+                let (name_bytes, comment_bytes) = split_id(rec.id());
+                // Lossy UTF-8, as before, and free in the normal case: `from_utf8_lossy` borrows
+                // when the bytes are already valid and only allocates for a header with a stray
+                // byte, which is the rare path this tolerates rather than rejecting the file over.
+                let name = String::from_utf8_lossy(name_bytes);
+                let comment = comment_bytes.map(String::from_utf8_lossy);
+                // FASTQ line 2 (bases) and line 4 (Phred+33). `qual` is `None` for FASTA input,
+                // where lines 3 and 4 do not exist.
+                let seq = rec.seq();
+                let qual = rec.qual();
+                // The copy out of needletail's buffer is not optional (it reuses that buffer for the
+                // next record), but it is ONE allocation sized exactly right, not three. See the
+                // type's own docs for what that is worth.
+                let comment_len = comment.as_ref().map_or(0, |c| c.len());
+                let mut buf = Vec::with_capacity(
+                    name.len() + seq.len() + qual.map_or(0, <[u8]>::len) + comment_len,
+                );
+                buf.extend_from_slice(name.as_bytes());
+                buf.extend_from_slice(&seq);
+                if let Some(q) = qual {
+                    buf.extend_from_slice(q);
+                }
+                if let Some(c) = &comment {
+                    buf.extend_from_slice(c.as_bytes());
+                }
                 Ok(Some(Record {
-                    name,
-                    seq,
-                    qual,
-                    comment,
+                    name_len: name.len() as u32,
+                    seq_len: seq.len() as u32,
+                    comment_len: comment_len as u32,
+                    has_qual: qual.is_some(),
+                    buf: buf.into_boxed_slice(),
                 }))
             }
         }
@@ -448,7 +537,7 @@ impl FastqReader {
             match self.next_record()? {
                 None => break,
                 Some(rec) => {
-                    bases_so_far += rec.seq.len();
+                    bases_so_far += rec.seq().len();
                     batch.push(rec);
                 }
             }
@@ -647,7 +736,7 @@ impl PairedFastqReader {
                 // Both files yielded: `mate1` is the R1 read, `mate2` the R2 read of one fragment.
                 // They are paired by POSITION; their names are not compared here.
                 (Some(mate1), Some(mate2)) => {
-                    bases_so_far += mate1.seq.len() + mate2.seq.len();
+                    bases_so_far += mate1.seq().len() + mate2.seq().len();
                     batch.push((mate1, mate2));
                 }
                 // Clean EOF: both files ended on the same record boundary.
@@ -713,111 +802,65 @@ impl InterleavedFastqReader {
                 return Err(Error::Fastq(format!(
                     "-p: interleaved input ended on an unpaired read ('{}'). bwa would realign it \
                      single-end (bseq_classify); bwa-mem4 refuses rather than mis-pair it.",
-                    mate1.name
+                    mate1.name()
                 )));
             };
             // `qname_from_id` already stripped any `/1`/`/2`, so genuine mates compare equal here.
-            if mate1.name != mate2.name {
+            if mate1.name() != mate2.name() {
                 return Err(Error::Fastq(format!(
                     "-p: consecutive reads '{}' and '{}' are not mates. bwa would split these into \
                      a single-end pass (bseq_classify); bwa-mem4 refuses rather than mis-pair them.",
-                    mate1.name, mate2.name
+                    mate1.name(), mate2.name()
                 )));
             }
-            bases_so_far += mate1.seq.len() + mate2.seq.len();
+            bases_so_far += mate1.seq().len() + mate2.seq().len();
             batch.push((mate1, mate2));
         }
         Ok(batch)
     }
 }
 
-/// Derive the SAM QNAME from a FASTQ id line, mirroring bwa: take the field up to the first
-/// whitespace, then trim a trailing `/<digit>` (bwa's `trim_readno`).
-/// kseq's `comment`: everything after the first run of whitespace in the header, or `None` when the
-/// header is just a name. bwa appends it verbatim at the very end of the SAM record under `-C`.
+/// Both halves of a FASTQ header at once, as BORROWED slices of it.
 ///
-/// `id` is the header line WITHOUT its leading `@`. Returns `None` when there is no whitespace, or
-/// only trailing whitespace, so a header of `read1` and one of `read1   ` both yield no comment.
+/// The record builder needs the two together and must not allocate for either: it copies them
+/// straight into [`Record`]'s single buffer. [`qname_from_id`] and [`comment_from_id`] are thin
+/// owned-string wrappers over this, kept for the tests and for callers outside the hot path.
 ///
 /// # Parameters
 ///
 /// - `id`: FASTQ line 1 minus the `@`, exactly as needletail hands it over (name plus comment, no
-///   trailing newline). Not required to be valid UTF-8: invalid bytes are lossily replaced.
+///   trailing newline). Not required to be valid UTF-8; that is the caller's problem.
 ///
 /// # Returns
 ///
-/// The comment, which under `-C` becomes the final field of the SAM line. `None` means no comment.
-fn comment_from_id(id: &[u8]) -> Option<String> {
-    // Byte offset of the first whitespace, i.e. one past the end of the QNAME field. `?` returns
-    // `None` for a bare-name header, which has no comment by definition.
-    //
-    // Rust: `.position(...)` walks until the test passes and yields that index, or `None` if it
-    // never does. The method is passed by name rather than wrapped in a closure. The trailing `?`
-    // turns "no whitespace anywhere" into an immediate `None` return from this function.
-    let first_space = id.iter().position(u8::is_ascii_whitespace)?;
-    // The tail starting AT that whitespace, so offsets found in it are relative to `first_space`.
-    let after_name = &id[first_space..];
-    // Skip the whole run of whitespace, not just one byte; `None` here means the header ended in
-    // whitespace and so carries no comment.
-    // Absolute offset into `id` of the comment's first non-whitespace byte; everything from there
-    // to the end of the line, whitespace included, is the comment.
-    //
-    // Rust: the `.map(...)` in the middle is a coordinate fix, not a search. `.position` measured
-    // from the start of `after_name`, but the slice on the next line indexes into `id`, so the two
-    // origins have to be reconciled. Getting this wrong would silently truncate every comment by
-    // the length of the read name. The `?` after it returns `None` for a header that was nothing
-    // but trailing whitespace.
-    let comment_start = after_name
-        .iter()
-        .position(|c| !c.is_ascii_whitespace())
-        .map(|offset| first_space + offset)?;
-    // Copy the tail out as owned text. `from_utf8_lossy` tolerates invalid bytes rather than
-    // rejecting the record, and `.into_owned()` makes the result independent of `id`.
-    Some(String::from_utf8_lossy(&id[comment_start..]).into_owned())
-}
-
-/// The QNAME half of the split described above: header up to the first whitespace, minus a trailing
-/// `/1` or `/2`.
-///
-/// Stripping the read-number suffix is what makes the two mates of a pair share one QNAME, as SAM
-/// requires, and it is also what lets [`InterleavedFastqReader`] recognise mates by name equality.
-/// The `s.len() > 2` guard means a read literally named `/1` keeps its name rather than becoming
-/// empty. Note the test is on the LAST two bytes only, so `read/12` is left alone (bwa behaves the
-/// same way: `trim_readno` checks a single digit).
-///
-/// # Parameters
-///
-/// - `id`: FASTQ line 1 minus the `@`, the same slice [`comment_from_id`] is given.
-///
-/// # Returns
-///
-/// The string written as SAM column 1 (QNAME) on every record for this read, and (for `-p` input)
-/// compared against the neighbouring record's to confirm the two are mates.
-fn qname_from_id(id: &[u8]) -> String {
+/// `(name, comment)`. `name` is the header up to the first whitespace with a trailing `/<digit>`
+/// trimmed, which is what makes the two mates of a pair share one QNAME. `comment` is everything
+/// from the first non-whitespace byte after that field to the end of the line, or `None` when the
+/// header is a bare name or ends in whitespace.
+fn split_id(id: &[u8]) -> (&[u8], Option<&[u8]>) {
     // One past the last QNAME byte: the first whitespace, or the whole slice for a bare-name
     // header (which is the common case for simulated reads).
-    //
-    // Rust: `.unwrap_or(v)` supplies a fallback when the search found nothing, so "no whitespace"
-    // becomes "the name runs to the end of the line" instead of an error. This is the common case
-    // for simulated reads, not an edge case.
     let name_end = id
         .iter()
         .position(u8::is_ascii_whitespace)
         .unwrap_or(id.len());
-    // The QNAME candidate, narrowed by the read-number trim below before being copied out.
-    //
-    // Rust: `mut` here makes the BORROW re-pointable, not the bytes writable. The line below can
-    // therefore aim `name` at a shorter window of the same buffer, and `id` itself is never
-    // modified. No copy happens until the `from_utf8_lossy` at the end.
     let mut name = &id[..name_end];
-    // Trailing `/<digit>` (bwa's `trim_readno`). READNO_SUFFIX_LEN is the `/` plus the digit.
+    // Trailing `/<digit>` (bwa's `trim_readno`). READNO_SUFFIX_LEN is the `/` plus the digit. The
+    // length guard means a read literally named `/1` keeps its name rather than becoming empty, and
+    // the test is on the LAST two bytes only, so `read/12` is left alone exactly as bwa leaves it.
     if name.len() > READNO_SUFFIX_LEN
         && name[name.len() - 2] == b'/'
         && name[name.len() - 1].is_ascii_digit()
     {
         name = &name[..name.len() - READNO_SUFFIX_LEN];
     }
-    String::from_utf8_lossy(name).into_owned()
+    // Skip the whole run of whitespace after the name, not just one byte. Nothing left means the
+    // header ended in whitespace and so carries no comment.
+    let comment = id[name_end..]
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .map(|offset| &id[name_end + offset..]);
+    (name, comment)
 }
 
 /// Length of the read-number suffix bwa trims: the `/` and the single digit after it.
@@ -872,7 +915,11 @@ mod multi_format_tests {
             let mut r = FastqReader::from_path(p).unwrap();
             let mut out = Vec::new();
             while let Some(rec) = r.next_record().unwrap() {
-                out.push((rec.name.clone(), rec.seq.clone(), rec.qual.clone()));
+                out.push((
+                    rec.name().to_owned(),
+                    rec.seq().to_vec(),
+                    rec.qual().map(<[u8]>::to_vec),
+                ));
             }
             out
         };
@@ -892,7 +939,7 @@ mod multi_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{qname_from_id, FastqReader, PairedFastqReader};
+    use super::{split_id, FastqReader, PairedFastqReader};
     use std::io::Write;
 
     /// Build a FASTQ of `n` records named `<prefix><i>` with a 4-base sequence, and return its path.
@@ -940,8 +987,8 @@ mod tests {
                 );
             }
             for (k, (m1, m2)) in batch.iter().enumerate() {
-                assert_eq!(m1.name, format!("read{}", seen + k));
-                assert_eq!(m2.name, format!("read{}", seen + k));
+                assert_eq!(m1.name(), format!("read{}", seen + k));
+                assert_eq!(m2.name(), format!("read{}", seen + k));
             }
             seen += batch.len();
         }
@@ -1007,7 +1054,7 @@ mod tests {
         let mut r = FastqReader::from_path(&fifo).unwrap();
         let mut n = 0usize;
         while let Some(rec) = r.next_record().unwrap() {
-            assert_eq!(rec.name, format!("read{n}"));
+            assert_eq!(rec.name(), format!("read{n}"));
             n += 1;
         }
         writer.join().unwrap();
@@ -1015,14 +1062,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The header split, on the four shapes that matter: a comment, both read-number suffixes, and
+    /// a bare name full of the punctuation simulated reads use.
     #[test]
-    fn qname_strips_comment_and_readno() {
-        assert_eq!(qname_from_id(b"read1 some comment"), "read1");
-        assert_eq!(qname_from_id(b"read1/1"), "read1");
-        assert_eq!(qname_from_id(b"read1/2 desc"), "read1");
+    fn split_id_strips_comment_and_readno() {
         assert_eq!(
-            qname_from_id(b"20:2000000-2200000_50861_51313_0:0:0_0:1:0_0"),
-            "20:2000000-2200000_50861_51313_0:0:0_0:1:0_0"
+            split_id(b"read1 some comment"),
+            (&b"read1"[..], Some(&b"some comment"[..]))
         );
+        assert_eq!(split_id(b"read1/1"), (&b"read1"[..], None));
+        assert_eq!(
+            split_id(b"read1/2 desc"),
+            (&b"read1"[..], Some(&b"desc"[..]))
+        );
+        assert_eq!(
+            split_id(b"20:2000000-2200000_50861_51313_0:0:0_0:1:0_0"),
+            (&b"20:2000000-2200000_50861_51313_0:0:0_0:1:0_0"[..], None)
+        );
+        // Trailing whitespace is not a comment, and `/12` is not a read number.
+        assert_eq!(split_id(b"read1   "), (&b"read1"[..], None));
+        assert_eq!(split_id(b"read/12"), (&b"read/12"[..], None));
     }
 }
