@@ -3833,9 +3833,11 @@ libsais est un SA-IS lineaire, la longueur des repetitions ne le concerne pas.
 
 **Consequence pour la question « rayon plutot qu'OpenMP ».** `openmp-sys` recommande rayon, et la
 recommandation vise l'usage de pragmas OpenMP depuis du Rust, qui est impossible ; notre cas est
-l'autre, activer OpenMP *dans une bibliotheque C vendoree*, ce pour quoi le crate existe. Sur le fond
-la question reste legitime, mais **il n'existe pas aujourd'hui de SACA rayon utilisable sur ce
-texte** : le seul candidat present dans l'arbre est 130x trop lent, pour une raison d'algorithme.
+l'autre, activer OpenMP *dans une bibliotheque C vendoree*, ce pour quoi le crate existe.
+
+J'ai d'abord conclu qu'**aucun SACA rayon n'etait utilisable sur ce texte**. **Faux, et corrige
+ci-dessous** : je n'avais regarde que `caps-sa`, et j'avais mesure `libsais-rs` dans sa version
+publiee, dont le chemin parallele ne scale pas.
 
 ### Ce qui est livre
 
@@ -3853,6 +3855,45 @@ Le meme tri par longueur qui rend -3,5 % sur le batch de rescue mesure **+0,63 %
 sur 4**, sur les bins de l'extension. Contrairement au rescue, le contrefactuel `EXEC_SORTED` (0,4 %)
 disait vrai ici : les jobs d'extension sont courts et homogenes, la taxe de lanes n'est que de
 1,04-1,05x, et le gather/scatter impose a un lot autrement homogene coute plus qu'il ne rend. Retire.
+
+## Le SACA rayon existe, et il change le defaut (2026-08-11)
+
+Correction de la section precedente. `libsais-rs` **0.2 publie** n'est pas la mesure de ce que le Rust
+peut faire ici : son chemin parallele ne scale pas, et son prefetch logiciel etait compile
+**uniquement pour x86_64**, donc tout le port tournait **sans prefetch sur arm64** la ou le C emet
+`prfm`. Mes 226,9 s sur le genome mesuraient cela, pas une limite du langage.
+
+Teste sur la branche `perf/omp-scaling` de `BenjaminDEMAILLE/libsais-rs` (PR #2 en amont), appelee via
+`libsais64_omp` a 8 threads. Genome humain entier, index **octet-identique a l'index de reference du
+depot** :
+
+| backend | mur | CPU | pic RSS | dependance systeme |
+|---|---|---|---|---|
+| `libsais-rs` 0.2 publie | 226,9 s | 453,8 s | 76,9 Go | aucune |
+| C libsais serial (defaut actuel) | 150,6 s | 301,2 s | 92,6 Go | aucune |
+| **`libsais-rs` PR, 8 threads** | **103,9 s** | **207,8 s** | **77,3 Go** | **aucune** |
+| C libsais + OpenMP, 8 threads | 87,9 s | 175,8 s | 95,0 Go | `libomp` |
+
+**2,18x plus rapide que la version publiee, 1,45x plus rapide que notre defaut**, et 1,18x derriere le
+C+OpenMP. Sur chr21 l'ecart disparait: 1,15 s contre 1,14 s.
+
+Le chiffre que la comparaison en temps masque est le RSS : **17,7 Go de moins que le C+OpenMP**
+(77,3 contre 95,0). Sur une machine qui n'a pas 137 Go, c'est ce chiffre qui decide si l'index se
+construit.
+
+### Ce qui n'est PAS fait, et pourquoi
+
+Rien n'est bascule. Deux raisons, la seconde mesuree :
+
+1. La branche est une **dependance git**, pas une version publiee. Un defaut ne peut pas pointer sur
+   une branche.
+2. **Sur la 0.2 publiee, appeler l'entree `omp` est une REGRESSION** : chr21 passe de 2,80 s / 4,20 s
+   (entree serie) a 3,61 s / 6,10 s a 8 threads. Le changement d'appel doit donc accompagner le bump
+   0.3, jamais le preceder.
+
+Action a la sortie de 0.3.0 : bumper `libsais-rs`, remplacer `libsais64` par `libsais64_omp` avec le
+meme knob `BWA4_SA_THREADS`, remettre `default = ["libsais"]`, et **retirer le passthrough
+`libsais-c-omp`** livre plus haut, qui n'aura plus d'objet. Le gate est `scripts/index_diff.sh`.
 
 ## Ce qui reste
 
