@@ -23,8 +23,9 @@
 //! | Phred+33 | quality as one ASCII character per base: `chr(33 + q)`, where q is `-10 log10(P(wrong))` |
 //! | `-K` | batch size in BASES (not reads), because that is bwa's unit |
 //!
-//! Reading order: [`Record`] (what comes out), [`FastqReader`] (one file), then the two paired
-//! variants, then the two private header-splitting helpers at the bottom.
+//! Reading order: [`Record`] (what comes out), [`FastqReader`] (one file), then `RecordStream`
+//! (one file on its own thread) and the two paired variants, then the two private header-splitting
+//! helpers at the bottom.
 //!
 //! # Rust mechanics used in this file
 //!
@@ -236,18 +237,145 @@ impl FastqReader {
     }
 }
 
+/// How many records one background mate-reader hands over per channel message.
+///
+/// Big enough that the channel is touched once per few thousand reads instead of once per read
+/// (about 2 MB of records at 150 bp), small enough that the two streams stay within a few
+/// milliseconds of each other rather than one running a whole batch ahead of the other.
+const STREAM_CHUNK_RECORDS: usize = 8192;
+
+/// Chunks a mate reader may have ready before it blocks. One in flight plus one being consumed is
+/// double buffering; deeper only buys memory, exactly as for the batch queue in `cmd_mem`.
+const STREAM_CHUNK_DEPTH: usize = 2;
+
+/// One FASTQ file being parsed on its own thread, delivered in chunks.
+///
+/// This exists because a paired-end run reads two INDEPENDENT files, and doing so on one thread
+/// makes their decompression and parsing add up on the serial path in front of the aligner. Under
+/// the default `-K` (10 M bases per thread) a 500k-pair run is a single batch, so that serial time
+/// is not overlapped with anything at all: measured at `-t16` on chr21, `wait_read` is 0.428 s for
+/// gzipped input against 0.153 s for plain, and every millisecond of it is wall clock the sixteen
+/// workers spend idle.
+///
+/// Splitting per file cannot move a byte of output: the records are the same records in the same
+/// order, and the batch boundary is still decided by the consumer applying the same cumulative-base
+/// rule to the same interleaved sequence.
+struct RecordStream {
+    /// Chunks from the reader thread, or the first error it hit. `None` once dropped, which is how
+    /// [`Drop`] releases the thread before joining it.
+    rx: Option<std::sync::mpsc::Receiver<Result<Vec<Record>>>>,
+    /// The chunk currently being handed out, record by record.
+    cur: std::vec::IntoIter<Record>,
+    /// Set once the stream has yielded its last record or reported its error, so a second call
+    /// cannot block on a channel whose sender is gone.
+    done: bool,
+    /// The reader thread, joined on drop after `rx` is released.
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RecordStream {
+    /// Open `path` on a fresh thread and start filling the channel.
+    ///
+    /// Opening happens on the thread too, so an unreadable file surfaces as the stream's first
+    /// item rather than at construction; the caller sees it on the first [`Self::next_record`].
+    fn spawn(path: std::path::PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<Record>>>(STREAM_CHUNK_DEPTH);
+        let handle = std::thread::spawn(move || {
+            let mut reader = match FastqReader::from_path(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            loop {
+                let mut chunk = Vec::with_capacity(STREAM_CHUNK_RECORDS);
+                let mut failed = None;
+                while chunk.len() < STREAM_CHUNK_RECORDS {
+                    match reader.next_record() {
+                        Ok(Some(rec)) => chunk.push(rec),
+                        Ok(None) => break,
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                // A short chunk means the file ended or the parse failed; either way this is the
+                // last message. Send what was parsed first so a mid-file error still reports the
+                // records before it, which is what makes the pair-length check meaningful.
+                let last = chunk.len() < STREAM_CHUNK_RECORDS;
+                if !chunk.is_empty() && tx.send(Ok(chunk)).is_err() {
+                    return; // consumer went away
+                }
+                if let Some(e) = failed {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+                if last {
+                    return;
+                }
+            }
+        });
+        Self {
+            rx: Some(rx),
+            cur: Vec::new().into_iter(),
+            done: false,
+            handle: Some(handle),
+        }
+    }
+
+    /// The next record of this file, or `None` at end of file.
+    fn next_record(&mut self) -> Result<Option<Record>> {
+        loop {
+            if let Some(rec) = self.cur.next() {
+                return Ok(Some(rec));
+            }
+            if self.done {
+                return Ok(None);
+            }
+            // `recv` failing means every sender is gone, i.e. the thread returned: end of file.
+            match self.rx.as_ref().map(std::sync::mpsc::Receiver::recv) {
+                Some(Ok(Ok(chunk))) => self.cur = chunk.into_iter(),
+                Some(Ok(Err(e))) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                _ => {
+                    self.done = true;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RecordStream {
+    fn drop(&mut self) {
+        // Order matters: releasing the receiver is what unblocks a thread parked in `send`, so it
+        // has to happen before the join or an early return from `next_batch` would deadlock.
+        self.rx = None;
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// Streaming reader over a pair of FASTQ files (R1, R2) advanced in lockstep.
 ///
 /// The standard paired-end layout: the same fragment sequenced from both ends, with the two reads
 /// at the same ordinal position in the two files. Pairing is therefore POSITIONAL, not by name; the
 /// only name check is the length mismatch caught in [`Self::next_batch`]. That matches bwa, which
 /// also trusts file order here.
+///
+/// Each file is parsed on its own thread ([`RecordStream`]); this struct is the consumer that
+/// interleaves them and applies the `-K` rule. See [`RecordStream`] for why.
 pub struct PairedFastqReader {
     /// The R1 (first-in-pair, SAM FLAG 0x40) file. Read one record per pair.
-    r1: FastqReader,
+    r1: RecordStream,
     /// The R2 (second-in-pair, SAM FLAG 0x80) file. Advanced in lockstep with `r1`: the two are
     /// always at the same ordinal record, which is the only thing that makes the pairing correct.
-    r2: FastqReader,
+    r2: RecordStream,
 }
 
 impl PairedFastqReader {
@@ -258,10 +386,16 @@ impl PairedFastqReader {
     /// - `p1`: path to the R1 FASTQ, `p2`: path to the R2 FASTQ, both from argv in that order.
     ///   They must hold the same number of records, in the same order; nothing is checked here
     ///   (the length mismatch surfaces later, in [`Self::next_batch`]).
+    ///
+    /// # Errors
+    ///
+    /// Never fails here: each file is opened on its reader thread, so a missing or malformed file
+    /// is reported by the first [`Self::next_batch`] instead. The `Result` is kept so callers do
+    /// not have to change and so the signature can go back to eager opening.
     pub fn from_paths<P: AsRef<std::path::Path>>(p1: P, p2: P) -> Result<Self> {
         Ok(Self {
-            r1: FastqReader::from_path(p1)?,
-            r2: FastqReader::from_path(p2)?,
+            r1: RecordStream::spawn(p1.as_ref().to_path_buf()),
+            r2: RecordStream::spawn(p2.as_ref().to_path_buf()),
         })
     }
 
@@ -538,7 +672,89 @@ mod multi_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::qname_from_id;
+    use super::{qname_from_id, PairedFastqReader};
+    use std::io::Write;
+
+    /// Build a FASTQ of `n` records named `<prefix><i>` with a 4-base sequence, and return its path.
+    fn write_fastq(
+        dir: &std::path::Path,
+        file: &str,
+        prefix: &str,
+        n: usize,
+    ) -> std::path::PathBuf {
+        let p = dir.join(file);
+        let mut f = std::fs::File::create(&p).unwrap();
+        for i in 0..n {
+            writeln!(f, "@{prefix}{i}\nACGT\n+\nIIII").unwrap();
+        }
+        p
+    }
+
+    /// The two mate files are parsed on separate threads, so the property that matters is that the
+    /// consumer still sees exactly the same interleaving: pair `i` is record `i` of each file, in
+    /// order, with the `-K` boundary falling on the same cumulative base count as a one-thread read
+    /// would put it. A chunk boundary is crossed on purpose (more records than
+    /// `STREAM_CHUNK_RECORDS`) so the refill path is exercised rather than a single chunk.
+    #[test]
+    fn paired_reader_preserves_order_and_batch_boundaries() {
+        let dir = std::env::temp_dir().join(format!("bwa4_pe_order_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = super::STREAM_CHUNK_RECORDS * 2 + 17;
+        let p1 = write_fastq(&dir, "r1.fq", "read", n);
+        let p2 = write_fastq(&dir, "r2.fq", "read", n);
+
+        let mut r = PairedFastqReader::from_paths(&p1, &p2).unwrap();
+        // 8 bases per pair (4 per mate), so a 800-base batch is exactly 100 pairs.
+        let mut seen = 0usize;
+        loop {
+            let batch = r.next_batch(800).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            if seen + batch.len() <= n {
+                // Every full batch lands on the same boundary a single-threaded read would pick.
+                assert!(
+                    batch.len() == 100 || seen + batch.len() == n,
+                    "batch {} at {seen}",
+                    batch.len()
+                );
+            }
+            for (k, (m1, m2)) in batch.iter().enumerate() {
+                assert_eq!(m1.name, format!("read{}", seen + k));
+                assert_eq!(m2.name, format!("read{}", seen + k));
+            }
+            seen += batch.len();
+        }
+        assert_eq!(seen, n);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Files of different lengths must still be refused rather than mis-paired, which is the one
+    /// safety property the split could plausibly have broken: the two threads reach end of file
+    /// independently, so the check has to live in the consumer.
+    #[test]
+    fn paired_reader_refuses_unequal_files() {
+        let dir = std::env::temp_dir().join(format!("bwa4_pe_uneven_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p1 = write_fastq(&dir, "r1.fq", "read", 10);
+        let p2 = write_fastq(&dir, "r2.fq", "read", 7);
+        let mut r = PairedFastqReader::from_paths(&p1, &p2).unwrap();
+        assert!(r.next_batch(usize::MAX).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing file is now reported by the first read rather than by `from_paths`, since opening
+    /// moved onto the reader thread. It still has to be an error and not a silent empty run.
+    #[test]
+    fn paired_reader_reports_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("bwa4_pe_missing_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p1 = write_fastq(&dir, "r1.fq", "read", 4);
+        let p2 = dir.join("nope.fq");
+        let mut r = PairedFastqReader::from_paths(&p1, &p2).unwrap();
+        assert!(r.next_batch(usize::MAX).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn qname_strips_comment_and_readno() {

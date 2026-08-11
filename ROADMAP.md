@@ -3309,6 +3309,91 @@ DRAGEN. La voie GPU est fermee pour une raison independante de DRAGEN : le kerne
 du temps genome, donc il n'y a rien a offloader (voir phase 9b). Une « classe DRAGEN » exigerait de
 porter le **seeding** sur accelerateur, ce qui est un autre projet.
 
+## Les deux fichiers d'une paire sont lus en parallele (2026-08-11)
+
+Suite directe de la conclusion thread-broker : l'inflation ne pese que 0,6 % du CPU, mais elle apparait
+1:1 dans le mur parce qu'elle est sur le chemin **serie** du lecteur. Le correctif n'est ni un pool de
+decodeurs ni un broker, c'est du recouvrement. Mesure d'abord, avec `BWA4_STAGE_TIME=1` :
+
+Le probleme est plus grand que l'inflation seule. `-K` vaut par defaut 10 M bases **par thread**, donc
+a `-t16` le lot fait 160 M bases et un run de 500 k paires (151 M bases) tient **dans un seul lot**.
+Un seul lot veut dire zero recouvrement possible avec le calcul : la lecture entiere precede
+l'alignement entier. C'est un terme d'Amdahl qui **grandit avec `-t`**, puisque `-K` grandit avec `-t`.
+
+Or `PairedFastqReader` lisait ses deux fichiers, independants, sur un seul thread. Chaque fichier a
+maintenant son `RecordStream` : un thread, un parseur, des paquets de 8192 records sur un canal borne a
+2. Le consommateur entrelace et applique la meme regle `-K` sur la meme sequence, donc **la frontiere de
+lot ne bouge pas** et rien n'est visible en sortie.
+
+chr21, 500 k paires, `-t16`, `wait_read` (le temps ou le thread principal est bloque sur le lecteur),
+3 runs par bras :
+
+| entree | avant | apres | |
+|---|---|---|---|
+| gzip | 0,415 / 0,436 / 0,428 s | **0,217 / 0,203 / 0,209 s** | **-51 %** |
+| plain | 0,160 / 0,151 / 0,150 s | **0,070 / 0,065 / 0,069 s** | **-55 %** |
+
+Les deux distributions ne se recouvrent pas. En bout de chaine, A/B entrelace 7 rondes, gzip, `-t16` :
+mediane 18,63 s contre 18,57 s, **B gagne 5/7** (5/6 en ecartant la premiere ronde, froide). C'est
+0,22 s de chemin serie retire pour ~0,1 s de mur mesure, **au plancher de bruit de ce banc** : je le
+consigne comme tel, la mesure fiable est `wait_read`. Le gain est maximal quand `-K` est grand et les
+lots peu nombreux, c'est-a-dire exactement au `-K` par defaut a haut `-t`.
+
+Portee : paired-end deux fichiers. Le mono-fichier (SE, `-p`) ne gagne rien ainsi, son lecteur a deja
+un thread a lui ; il faudrait y separer inflation et parsing, ce qui n'est pas fait.
+
+Gates : `check.sh` vert, `oracle_diff.sh` PASS (5000/5000 `all_fields_match`), md5 inchange sur deux
+points de la grille (`-t8 -K 10M` gzip et `-t3 -K 7M` plain, 500 k paires). Trois tests ajoutes :
+ordre et frontieres de lot a travers une frontiere de paquet, fichiers de longueurs differentes
+toujours refuses, fichier manquant toujours signale (l'ouverture est passee sur le thread lecteur,
+donc l'erreur remonte au premier `next_batch` et plus a `from_paths`).
+
+## Le raisonnement salmon (piscem-rs), applique a nos chiffres (2026-08-11)
+
+Salmon 1.11 introduit un budget de slots unique partage entre decodage gzip et mapping, pilote par
+`thread-broker`, avec un seuil d'engagement **mesure par mode** :
+
+| mode salmon | engage le decodeur parallele a partir de |
+|---|---|
+| selective alignment | `-p` >= 50 |
+| sketch | `-p` >= 10 |
+
+et un encadrement empirique sur 26 M paires : a `-p 64` le decodeur **serie** gagne de 12 %, a `-p 128`
+le parallele gagne de 7 %. Leur propre conclusion : « serial decoding is simply the right choice for SA
+at most real budgets ».
+
+**Notre seuil, calcule avec leur loi.** `d* = N x busy_p/(busy_p + busy_c)` ; `d* >= 1` demande
+`N >= 1 + busy_c/busy_p`. Avec `busy_p` = 0,096 s CPU (2 x 72 Mo a 1500 Mo/s, backend reel) et
+`busy_c` = 16,9 s CPU a `-t16` : **N >= 177 threads**. Nous sommes 3,5x plus loin du seuil que leur mode
+selective alignment, ce qui est coherent : une paire BWA-MEM coute plus de calcul par octet d'entree
+qu'un fragment de selective alignment. A 16 cœurs la question ne se pose pas.
+
+**Le budget partage teste quand meme.** Leur reformulation la plus interessante (`-p` nomme un budget
+de slots, pas un compte de threads de mapping) vaut a tout `N`, et chez nous `-t16` signifie 16 workers
+**plus** un lecteur **plus** un writer sur une machine a 16 cœurs. Teste, 5 rondes entrelacees, gzip :
+
+| | mediane |
+|---|---|
+| `-t15` (un cœur laisse au producteur) | 18,68 s |
+| `-t16` | **18,47 s** |
+
+`-t16` gagne 4/5. Reserver un slot au producteur **coute** 1,1 %, parce que le producteur a un taux
+d'occupation de 1,1 % (0,209 s de lecture sur 18,4 s de run) : le controleur de salmon lui accorderait
+0,18 slot, et un slot entier est trop.
+
+**Ce qui est transferable et a ete pris.** Leur decision est **par fichier d'entree**. Nous l'avons
+appliquee dans l'autre sens, et c'est le bon sens pour nous : pas un decodeur parallele par fichier,
+mais un decodeur **serie par fichier**, deux fichiers, deux threads (section precedente). Meme
+observation de depart, remede oppose, parce que le rapport calcul/octet n'est pas le meme.
+
+**Ce qui est un argument de plus pour s'abstenir.** Leurs notes signalent une course dans le pool
+partage de rapidgzip (reveil perdu dans la liberation de permis) capable de **bloquer un run**, corrigee
+en rapidgzip-core 0.3.1. Prendre ce risque pour un composant a 0,6 % du CPU serait un mauvais echange.
+
+**Reserve sur leurs propres chiffres.** Le seuil annonce (50) et l'encadrement empirique (serie gagnant
+encore a 64) ne sont pas coherents entre eux dans les notes de version ; le seuil vient sans doute de la
+politique et l'encadrement d'un jeu precis. Cela ne change pas notre conclusion, qui est a 177.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
