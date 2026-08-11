@@ -3460,6 +3460,103 @@ mais 2,47x est trop gros pour etre range sous « il fait moins de travail » san
 non-mappe**. Un banc dont les lectures ne viennent pas de la reference ne mesure pas l'alignement, et
 il peut inverser un classement sans qu'aucune mesure individuelle soit fausse.
 
+## Le chemin critique du lecteur, et ce que rapidgzip y change (2026-08-11)
+
+Suite de la correction du classement : contre le fork, notre CPU est a egalite et tout l'ecart est
+dans l'occupation des cœurs. En chiffres, avec `occupation = (t_serie + T_par) / (t_serie + T_par/N)`
+a N=16 : lui 14,36 cœurs occupes donc **0,77 %** de serie, nous 13,67 donc **1,15 %**. Il faut
+recuperer **0,4 point de serie**, pas optimiser un noyau.
+
+### Ou est le serie, mesure
+
+`BWA4_STAGE_TIME=1`, 1 M paires GIAB reelles contre GRCh38 :
+
+| | `wait_read` | ecart au fork (mur) |
+|---|---|---|
+| `-t4` | **0,000 s** | 2,6 % |
+| `-t16` | **0,682 s, 4,2 % du run** | 4,3 % |
+
+A `-t4` le lecteur est integralement recouvert et le fork gagne quand meme : cet ecart-la est
+ailleurs, et il prend aussi 1,5 % de CPU. A `-t16` le lecteur explique presque tout le surplus.
+
+La cause n'est pas le debit mais la **granularite** : `-K` vaut `10M x -t`, donc a `-t16` le lot fait
+160 M bases et 1 M paires (302 M bases) tiennent en **deux lots**. Le premier est expose
+integralement, il n'a pas de predecesseur avec quoi se recouvrir. Le chargement d'index, la seule
+autre chose derriere quoi il pourrait se cacher, dure 0,28 s en cache chaud et est deja recouvert.
+
+| `-K` | lots | `wait_read` gzip | plain |
+|---|---|---|---|
+| 20 M | 15 | 0,097 s | 0,000 s |
+| 40 M | 8 | 0,184 s | |
+| 160 M (defaut `-t16`) | 2 | 0,682 s | 0,219 s |
+
+**Correction d'une erreur de raisonnement au passage.** J'ai d'abord ecrit que les boucles serie de
+`process` s'allongent proportionnellement a `-t` parce que `-K` grandit avec `-t`. Faux : elles sont
+O(paires), donc si `-K` double il y a deux fois moins de lots et le produit est constant. Seul
+`mem_pestat` bouge, en `n log(n/B)`, un facteur logarithmique. Ce qui grandit avec N est la **part de
+mur** que le serie represente, ce qui est Amdahl ordinaire. Le raisonnement `-K` ne vaut que pour le
+lecteur, dont le premier lot grossit bien avec `-K`. Le commentaire de `Stage::Encode` dans
+`stage_time.rs` portait deja cette erreur, et `Encode` n'est plus serie depuis longtemps.
+
+### Deux correctifs, mesures
+
+**Un : l'inflation sur son propre thread.** `parse_fastx_file` construit `MultiGzDecoder` *dans* le
+parseur, donc un thread alterne inflation et parsing et un fichier coute `inflate + parse` au lieu de
+`max(inflate, parse)`. Un thread d'inflation par fichier, blocs de 4 Mio, canal borne a 3.
+
+**Deux : rapidgzip-core 0.3.1**, qui decode UN flux sur plusieurs threads. Debit mesure isolement sur
+`r1_1m.fq.gz`, octets de sortie par seconde :
+
+| decodeur | debit |
+|---|---|
+| zlib-rs (l'actuel) | 823-876 Mo/s |
+| rapidgzip 1 thread | 917-937 Mo/s |
+| rapidgzip 4 | ~1240 Mo/s |
+| rapidgzip 8 | ~2240 Mo/s |
+| rapidgzip 12 | **2863-2999 Mo/s** |
+
+`wait_read` a `-t16`, `-K` par defaut :
+
+| version | `wait_read` |
+|---|---|
+| lecteur d'origine | 0,682 s |
+| + inflation sur son thread | 0,531 s |
+| + rapidgzip | **0,458 s** |
+| plancher, entree plain | 0,219 s |
+
+**-33 % au total, dont -11 % pour rapidgzip seul.** Beaucoup moins que le 3,4x isole, et la raison
+est mesuree : un balayage `BWA4_GZIP_THREADS` de 1 a 16 est **plat** (0,377 / 0,374 / 0,383 / 0,210
+sur fichier entier). L'inflation n'est plus le goulot une fois sur son thread ; ce qui reste
+au-dessus du plain est la copie a travers son `Read` et la latence de demarrage, pas le debit.
+
+Garde quand meme : 0,2 % de CPU, 23 crates transitifs tous en Rust pur dont les runtime (`zlib-rs`,
+`crossbeam-deque`) sont deja dans le graphe, et ca supprime une classe de goulot plutot qu'un reglage
+valable pour ce fichier-ci. `BWA4_GZIP_THREADS` permet de rebalayer sur une autre machine, et
+`--no-default-features` retombe sur l'inflateur mono-thread, lui-meme toujours sur son thread.
+
+**Ce que thread-broker ne peut pas voir.** Sa loi alloue d'apres le temps occupe cumule, donc elle
+optimise le regime permanent et repond 0,09 thread. C'est juste pour sa question. Notre probleme est
+une **latence de remplissage de pipeline** : un thread inutile 99 % du run et decisif pendant 0,4 s.
+Les deux outils de Patro ne sont pas interchangeables, et c'est rapidgzip qui correspond ici.
+
+### Un bug trouve en chemin, et repare
+
+`open_reader` lisait deux octets de magie puis **rouvrait le fichier par son chemin**. Sur un tube,
+une substitution de processus (`<(zcat r1.gz)`) ou un FIFO, ces deux octets ne reviennent jamais : le
+parseur voyait un flux deja entame et rendait **zero enregistrement, sans erreur**. `bwa-mem4 mem ref
+<(zcat r1.fq.gz)` ecrivait un en-tete SAM et aucun alignement. bwa-mem2 lit cette entree, donc
+c'etait aussi un ecart de parite. Pre-existant, verifie sur le binaire d'avant ce lot.
+
+Repare : une entree non-seekable garde ses deux octets (chainage `Cursor` + fichier) et n'est jamais
+rouverte. Verifie, meme corps SAM `61af65ce...` pour fichier regulier, FIFO gzip, FIFO plain **et
+bwa-mem2 sur FIFO**. Un test cree un vrai FIFO avec `mkfifo` et lit 2500 enregistrements a travers.
+
+### Ce qui reste sur ce chemin
+
+Le plancher du lecteur est maintenant le **parseur** : ~926 Mo/s par fichier, trois allocations par
+enregistrement (`name`, `seq`, `qual`). C'est le prochain levier, pas le decodeur. Et l'ecart a `-t4`
+(2,6 % de mur, 1,5 % de CPU, lecteur totalement recouvert) est un probleme distinct, non localise.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en

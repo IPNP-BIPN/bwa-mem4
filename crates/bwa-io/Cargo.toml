@@ -43,6 +43,35 @@ niffler = { version = "3", optional = true }
 flate2 = { version = "1.1", optional = true, default-features = false, features = [
     "zlib-rs",
 ] }
+# Parallel inflate for gzipped FASTQ input, ON by default via bwa-cli's `default` feature.
+#
+# Why a second gzip dependency when `zlib-rs` is already fast. The reader's exposure is a LATENCY
+# problem, not a throughput one: the first batch of a run has no predecessor to overlap with, and
+# under the default `-K = 10M * threads` that first batch grows with `-t`. Measured on 1M real GIAB
+# pairs at `-t16`, one batch covering the whole file, `wait_read` is 0.414s gzipped against 0.107s
+# plain, and a whole-file single-stream inflate is 0.392s: after the inflater moved to its own
+# thread (see `spawn_inflate`), the gzip reader is almost entirely inflate, and the parser waits.
+#
+# Measured decode rate on that file, output bytes per second:
+#
+#   zlib-rs             823-876 MB/s
+#   rapidgzip 1 thread  917-937 MB/s
+#   rapidgzip 4         ~1240 MB/s
+#   rapidgzip 8         ~2240 MB/s
+#   rapidgzip 12        2863-2999 MB/s
+#
+# So it is faster even single-threaded, and 3.4x at 12. The threads it spends are free where they
+# matter: during the first batch every aligner worker is idle by construction.
+#
+# It cannot affect output for the same reason every other backend cannot: inflate is a bijection.
+# Verified, `-K 20M` on GIAB, gzipped input and the same reads uncompressed produce the same SAM.
+#
+# No C toolchain: 23 transitive crates, all pure Rust, and the runtime ones (`zlib-rs`,
+# `crossbeam-deque`) are already in this graph via `flate2` and rayon. `bon` is build-time only.
+#
+# 0.3.1 is a floor, not a preference: 0.3.0 carries a lost-wakeup race in the shared decoder pool
+# that hangs a run outright on paired gzip input at higher thread counts.
+rapidgzip-core = { version = "0.3.1", optional = true }
 
 [features]
 # NOT defaulted here on purpose: the binary crate (bwa-cli) owns the default, so that a
@@ -51,6 +80,9 @@ flate2 = { version = "1.1", optional = true, default-features = false, features 
 # default features.
 # Swap the gzip decompressor for zlib-rs. Additive and code-free; see the dependency comment above.
 fast-gzip = ["dep:flate2"]
+# Decode gzipped FASTQ in parallel (rapidgzip-core). Implies `fast-gzip`, which stays the fallback
+# for non-seekable input and for a build that turns this off.
+parallel-gzip = ["dep:rapidgzip-core", "fast-gzip"]
 # Accept bzip2, xz and zstd FASTQ input as well as plain and gzip. OFF by default, for three reasons
 # that are worth stating precisely, because the obvious one is wrong.
 #

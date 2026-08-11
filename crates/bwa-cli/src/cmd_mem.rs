@@ -1936,6 +1936,12 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // The channel is bounded at the same readahead depth as before, so the reader still cannot
     // accumulate batches while the index loads: it fills the queue and blocks. Output is unaffected,
     // since the batches, their order and their base ids are identical either way.
+    // Decoder budget for gzipped input, set from `-t` before the first file is opened. Halved per
+    // file inside, since a paired-end run opens two. Spending threads here is free where it counts:
+    // during the first batch no worker has anything to do yet.
+    #[cfg(feature = "parallel-gzip")]
+    bwa_io::fastq::set_gzip_threads(pool_threads);
+
     let paired = args.reads2.is_some() || args.smart_pairing;
     let (pe_batch_rx, se_batch_rx, reader) = if paired {
         let (rx, h) = spawn_reader(pe_read_batches(

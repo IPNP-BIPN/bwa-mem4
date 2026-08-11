@@ -115,15 +115,25 @@ pub struct FastqReader {
 /// recognises. The message names the path, since a user who passed the wrong file gets nothing else
 /// to go on.
 fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
+    // Whether the path can be opened a second time and read from the start. A regular file can; a
+    // FIFO, a process substitution (`<(zcat r1.gz)`) or a character device cannot, because the two
+    // magic bytes read below are consumed from the stream and never come back.
+    //
+    // This distinction used to be missing, and the consequence was silent: sniffing consumed two
+    // bytes, `parse_fastx_file` reopened the path, the parser saw a stream already past its header
+    // and produced NO records, so `bwa-mem4 mem ref <(zcat r1.gz)` wrote a header and zero
+    // alignments with no error at all. bwa-mem2 reads that input, so this was a parity gap as well
+    // as a wrong answer. Non-seekable input now keeps its first two bytes and never reopens.
+    let seekable = std::fs::metadata(path).is_ok_and(|m| m.is_file());
+    let mut opened =
+        std::fs::File::open(path).map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
     // The first two bytes decide: 0x1f 0x8b is gzip, and needletail handles both that and plain
-    // text. Read them without consuming the file, since needletail opens it again by path.
+    // text.
     let magic = {
         use std::io::Read;
-        let mut f = std::fs::File::open(path)
-            .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
         let mut buf = [0u8; 2];
         // A file shorter than two bytes cannot be a FASTQ; let needletail produce that error.
-        let n = f.read(&mut buf).unwrap_or(0);
+        let n = opened.read(&mut buf).unwrap_or(0);
         if n == 2 {
             Some(buf)
         } else {
@@ -132,6 +142,40 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     };
     let is_gzip = magic == Some([0x1f, 0x8b]);
     let looks_like_text = magic.is_some_and(|m| m[0] == b'@' || m[0] == b'>');
+
+    // Non-seekable: hand needletail the bytes already taken, chained back in front of the rest, and
+    // let it sniff compression itself. Sequential by construction, which is also what any parallel
+    // decoder would have to fall back to on a stream it cannot seek in.
+    if !seekable {
+        let head = std::io::Cursor::new(magic.map(Vec::from).unwrap_or_default());
+        let stream = std::io::Read::chain(head, opened);
+        return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
+    }
+
+    // Gzipped input, parallel path: rapidgzip decodes ONE stream on several threads and hands back
+    // a `Read`, so needletail parses plain text exactly as it would from an uncompressed file. A
+    // pipe or FIFO is not seekable and the crate falls back to sequential decoding on its own, so
+    // there is no input to special-case here. See `gzip_threads` for the budget.
+    #[cfg(feature = "parallel-gzip")]
+    if is_gzip {
+        let dec = rapidgzip_core::Decoder::builder()
+            .decoder_threads(gzip_threads())
+            .build()
+            .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+        let stream = dec
+            .open(path)
+            .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+        return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
+    }
+
+    // Gzipped input, single-thread fallback: inflate on a thread of its own and hand needletail the
+    // decompressed bytes, so that inflating block N+1 overlaps parsing block N instead of following
+    // it. See [`spawn_inflate`] for the measurement that motivates it.
+    #[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
+    if is_gzip {
+        let blocks = spawn_inflate(path)?;
+        return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
+    }
 
     if is_gzip || looks_like_text || cfg!(not(feature = "multi-format")) {
         return parse_fastx_file(path).map_err(|e| Error::Fastq(e.to_string()));
@@ -147,6 +191,182 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     }
     #[cfg(not(feature = "multi-format"))]
     unreachable!("the branch above returns when the feature is off")
+}
+
+/// Decoder threads per gzipped input file, as set by the binary from `-t`. `None` until then.
+#[cfg(feature = "parallel-gzip")]
+static GZIP_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Tell the reader how many threads one gzipped file's decoder may use.
+///
+/// Called once by the binary before any input is opened, with `-t`. The value is halved because a
+/// paired-end run opens TWO files and each gets its own decoder, so the two together stay inside
+/// the thread budget the user asked for. It is not a throughput decision: the decoders matter
+/// during the FIRST batch, when every aligner worker is idle because no batch has arrived yet.
+///
+/// # Parameters
+/// * `threads`: the run's `-t`. 0 is treated as 1.
+#[cfg(feature = "parallel-gzip")]
+pub fn set_gzip_threads(threads: usize) {
+    let _ = GZIP_THREADS.set(threads.max(1).div_ceil(2));
+}
+
+/// Threads for one file's decoder: what the binary set, overridden by `BWA4_GZIP_THREADS`.
+///
+/// `BWA4_GZIP_THREADS` exists so the budget can be swept on a new machine rather than argued about;
+/// 1 reproduces the single-thread inflater's throughput without rebuilding. A value that does not
+/// parse, or 0, is ignored rather than clamped silently, so a typo in a benchmark script cannot
+/// quietly change what is being measured.
+#[cfg(feature = "parallel-gzip")]
+fn gzip_threads() -> usize {
+    if let Ok(s) = std::env::var("BWA4_GZIP_THREADS") {
+        if let Ok(n) = s.trim().parse::<usize>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+    }
+    // No setter call (a library user, or a unit test): fall back to the machine rather than to 1,
+    // since the whole point is not to leave the decoder single-threaded by accident.
+    *GZIP_THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .div_ceil(2)
+    })
+}
+
+/// Decompressed bytes handed over per channel message. 4 MiB is about 12 000 reads at 150 bp, so
+/// the channel is touched ~90 times for a 1 M-pair mate file, and three of them in flight cost
+/// 12 MiB, which is noise next to a batch of records.
+#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
+const INFLATE_BLOCK: usize = 4 << 20;
+
+/// Blocks the inflater may run ahead. One in flight plus one being parsed is the double buffering
+/// that makes the overlap work; the third absorbs a slow parse without stalling the inflater.
+#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
+const INFLATE_DEPTH: usize = 3;
+
+/// The decompressed side of a gzipped FASTQ, as a plain [`std::io::Read`] fed by an inflater thread.
+///
+/// Why this exists. `parse_fastx_file` builds `MultiGzDecoder` INSIDE the parser, so one thread
+/// alternates between inflating and parsing: a file's reader time is `inflate + parse` rather than
+/// `max(inflate, parse)`. That difference is invisible when the run has many batches (the reader is
+/// then fully hidden behind the aligner) and expensive when it does not. Measured on 1 M real GIAB
+/// pairs against GRCh38, `wait_read` (the main thread blocked on the reader) is:
+///
+/// | `-K` | batches | `wait_read` gzipped | plain |
+/// |---|---|---|---|
+/// | 20 M | 15 | 0.097 s | 0.000 s |
+/// | 40 M | 8 | 0.184 s | |
+/// | 160 M (the `-t16` default) | 2 | **0.682 s, 4.2 % of the run** | 0.219 s |
+///
+/// The default `-K` is `10M * threads`, so the batch grows with `-t` while the file does not: at
+/// `-t16` a 1 M-pair run is two batches and the FIRST one is exposed in full, since it has no
+/// predecessor to overlap with. The index load, the other thing it could hide behind, is 0.28 s on
+/// a warm page cache and is already overlapped.
+///
+/// This cannot move a byte of output: inflate is a bijection, so the parser sees the same bytes in
+/// the same order, hence the same records and the same `-K` boundaries.
+///
+/// Not a parallel decoder. One stream is still inflated by one thread, at the 898 MB/s this
+/// machine measures for `zlib-rs` (`gzcat` on Apple's zlib does 1137 MB/s on the same file). What
+/// is bought here is the overlap, not the throughput.
+#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
+struct InflatedBlocks {
+    /// Blocks from the inflater thread, or the first I/O error it hit.
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    /// The block currently being handed out.
+    cur: Vec<u8>,
+    /// How much of `cur` has already been returned by `read`.
+    pos: usize,
+    /// Set once the stream has ended or reported its error, so a later `read` cannot block on a
+    /// channel whose sender is gone.
+    done: bool,
+}
+
+#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
+impl std::io::Read for InflatedBlocks {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.pos < self.cur.len() {
+                let n = (self.cur.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            if self.done {
+                return Ok(0);
+            }
+            match self.rx.recv() {
+                Ok(Ok(block)) => {
+                    self.cur = block;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                // Every sender gone: the inflater returned, which is end of file.
+                Err(_) => {
+                    self.done = true;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+/// Open `path`, inflate it on a fresh thread, and return the decompressed stream.
+///
+/// The thread is not joined: dropping the returned value drops the receiver, the next `send` fails
+/// and the thread returns. That is the whole shutdown protocol, and it is why no handle is kept.
+#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
+fn spawn_inflate(path: &std::path::Path) -> Result<InflatedBlocks> {
+    use std::io::Read;
+    let file =
+        std::fs::File::open(path).map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(INFLATE_DEPTH);
+    std::thread::spawn(move || {
+        // `MultiGzDecoder`, not `GzDecoder`: a FASTQ may be several gzip members concatenated, and
+        // stopping at the first one would silently truncate the file. Same choice needletail makes.
+        let mut dec =
+            flate2::read::MultiGzDecoder::new(std::io::BufReader::with_capacity(1 << 20, file));
+        loop {
+            let mut block = vec![0u8; INFLATE_BLOCK];
+            // Fill the block completely unless the stream ends, so the parser is not handed a
+            // trickle of short reads at whatever size the decoder felt like returning.
+            let mut filled = 0;
+            let mut failed = None;
+            while filled < INFLATE_BLOCK {
+                match dec.read(&mut block[filled..]) {
+                    Ok(0) => break,
+                    Ok(k) => filled += k,
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            let last = filled < INFLATE_BLOCK;
+            block.truncate(filled);
+            if filled > 0 && tx.send(Ok(block)).is_err() {
+                return; // consumer went away
+            }
+            if let Some(e) = failed {
+                let _ = tx.send(Err(e));
+                return;
+            }
+            if last {
+                return;
+            }
+        }
+    });
+    Ok(InflatedBlocks {
+        rx,
+        cur: Vec::new(),
+        pos: 0,
+        done: false,
+    })
 }
 
 impl FastqReader {
@@ -672,7 +892,7 @@ mod multi_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{qname_from_id, PairedFastqReader};
+    use super::{qname_from_id, FastqReader, PairedFastqReader};
     use std::io::Write;
 
     /// Build a FASTQ of `n` records named `<prefix><i>` with a 4-base sequence, and return its path.
@@ -753,6 +973,45 @@ mod tests {
         let p2 = dir.join("nope.fq");
         let mut r = PairedFastqReader::from_paths(&p1, &p2).unwrap();
         assert!(r.next_batch(usize::MAX).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A named pipe is not seekable, so the two magic bytes read for format sniffing can never be
+    /// re-read. Before the `seekable` split in [`super::open_reader`] the sniff consumed them and
+    /// the parser then reopened the path, which on a FIFO yielded a stream already past its header
+    /// and therefore ZERO records, silently: `bwa-mem4 mem ref <(zcat r1.gz)` wrote a SAM header
+    /// and no alignments, with no error. bwa-mem2 reads that input, so it was a parity gap too.
+    #[test]
+    #[cfg(unix)]
+    fn reads_from_a_non_seekable_fifo() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("bwa4_fifo_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("reads.fq");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(made, "mkfifo failed");
+
+        // The writer must run concurrently: opening a FIFO for reading blocks until a writer
+        // appears, and opening it for writing blocks until a reader does.
+        let w = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let mut f = std::fs::File::create(&w).unwrap();
+            for i in 0..2500 {
+                writeln!(f, "@read{i}\nACGTACGTAC\n+\nIIIIIIIIII").unwrap();
+            }
+        });
+
+        let mut r = FastqReader::from_path(&fifo).unwrap();
+        let mut n = 0usize;
+        while let Some(rec) = r.next_record().unwrap() {
+            assert_eq!(rec.name, format!("read{n}"));
+            n += 1;
+        }
+        writer.join().unwrap();
+        assert_eq!(n, 2500, "records read from a FIFO");
         std::fs::remove_dir_all(&dir).ok();
     }
 

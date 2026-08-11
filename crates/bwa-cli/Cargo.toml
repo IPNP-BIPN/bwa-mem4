@@ -60,8 +60,12 @@ capsa = ["bwa-index/capsa"]
 #     cargo build --release -p bwa-mem4 --no-default-features
 #
 # No external build tool: the backend is `zlib-rs`, pure Rust. See crates/bwa-io/Cargo.toml.
-default = ["fast-gzip"]
+default = ["fast-gzip", "parallel-gzip"]
 fast-gzip = ["bwa-io/fast-gzip"]
+# Parallel inflate for gzipped FASTQ, ON by default. Turning it off falls back to the single-thread
+# zlib-rs inflater, which is still on its own thread. See crates/bwa-io/Cargo.toml for the measured
+# decode rates and for why this is a latency lever rather than a throughput one.
+parallel-gzip = ["bwa-io/parallel-gzip"]
 
 [lints]
 workspace = true
