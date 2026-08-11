@@ -3135,6 +3135,11 @@ entiere plafonne a 23 %.
 
 ### Contre le fork fg-labs/bwa-mem3 v0.9.0 (sorti le 2026-08-07)
 
+> **Corrige le 2026-08-11 : les chiffres de cette sous-section sont invalides.** Le jeu de lectures
+> utilise etait simule depuis **chr20** alors que l'index est **chr21**, d'ou 65 a 69 % de non-mappe :
+> on y mesurait surtout la vitesse de rejet. Sur un jeu correct, le classement s'inverse. Voir
+> « Le piege de jeu de donnees, et le classement refait » plus bas.
+
 La release n'apporte rien de performance : `--compat=bwa-mem` (octet-identique a bwa 0.7.19 en plus
 de bwa-mem2), la derivation du FLAG 0x2 depuis la region de meilleur score, `pa:f` unifie entre les
 ecrivains SAM et BAM, et la detection des echecs d'ajout de tag BAM. Les trois correctifs ne touchent
@@ -3393,6 +3398,67 @@ en rapidgzip-core 0.3.1. Prendre ce risque pour un composant a 0,6 % du CPU sera
 **Reserve sur leurs propres chiffres.** Le seuil annonce (50) et l'encadrement empirique (serie gagnant
 encore a 64) ne sont pas coherents entre eux dans les notes de version ; le seuil vient sans doute de la
 politique et l'encadrement d'un jeu precis. Cela ne change pas notre conclusion, qui est a 177.
+
+## Le piege de jeu de donnees, et le classement refait (2026-08-11)
+
+Le classement publie contre le fork (« nous menons 1,089x / 1,063x / 1,053x ») **est faux**, et la
+cause n'est pas une erreur de mesure : c'est le jeu de donnees.
+
+`work/r1_500k.fq` porte des noms de la forme `20:2000000-4000000_...` : ces lectures sont simulees
+depuis **chr20**. L'index de banc est **chr21**. Sur cette combinaison, 65 a 69 % des enregistrements
+sortent non mappes, et ce qui est chronometre est en grande partie la vitesse a **rejeter** des
+lectures qui n'appartiennent pas a la reference. Ce n'est pas un banc d'alignement.
+
+Le bon jeu existait a cote : `work/chr21arm/r{1,2}.fq`, 1 M paires simulees depuis chr21, dont
+**0 % de non-mappe**. Verifie avant de chronometrer : bwa-mem2 2.3, le fork `--compat=bwa-mem2` et
+bwa-mem4 sortent le **meme corps SAM** (`c833bb42...`), donc les trois comparent bien le meme fichier.
+
+### La discipline, d'abord
+
+Un premier passage a `-t16` sans refroidissement a donne, pour le **meme binaire**, des murs de 15,98
+a 45,95 s selon la ronde, et bwa-mem2 plus lent en entree plain (87,02 s) qu'en gzip (57,67 s), ce qui
+n'a aucun sens physique. Quatre binaires lourds enchaines sur 16 cœurs, plus 690 Mo de FASTQ plain
+relus a chaque ronde : derive thermique et page cache. **Inexploitable, et jete.**
+
+La regle du projet le disait deja (`-t4` pour du pourcentage, la derive atteint 10 % a `-t8`). Avec
+`-t4`, 500 k paires, gzip seul et **10 s de refroidissement entre chaque run**, la dispersion tombe
+sous 1 % et les six rondes sont interchangeables.
+
+### `-t4`, 500 k paires chr21, gzip, 6 rondes, medianes
+
+| | mur | CPU | cœurs occupes |
+|---|---|---|---|
+| bwa-mem2 2.3 | 58,99 s | 230,9 s | 3,91 |
+| fork bwa-mem3 v0.9.0 | **18,05 s** | 71,7 s | 3,97 |
+| bwa-mem4 | 18,24 s | 71,8 s | 3,93 |
+| minibwa 0.7-r424 | **7,56 s** | **29,1 s** | 3,85 |
+
+### `-t16`, meme jeu, meme discipline, 6 rondes
+
+| | mur | CPU | cœurs occupes |
+|---|---|---|---|
+| fork v0.9.0 | **5,95 s** | 85,4 s | 14,36 |
+| bwa-mem4 | 6,36 s | 87,0 s | 13,67 |
+
+### Ce que ca dit
+
+**Contre le fork : egalite en calcul, retard en remplissage.** Les ratios CPU par ronde a `-t4` sont
+0,996 / 1,001 / 1,001 / 1,000 / 1,000 / 0,998, c'est-a-dire le meme travail au millieme pres. Le fork
+prend **1,0 %** sur le mur a `-t4` et **4,3 %** a `-t16`, en gagnant 6/6 dans les deux cas. Traduit en
+efficacite de `-t4` vers `-t16` : **fork 76 %, nous 72 %**. Notre retard est entierement dans
+l'occupation des cœurs, et pas du tout dans le noyau.
+
+**Contre bwa-mem2 : 3,22x en CPU et 3,23x en mur** a `-t4`. C'est l'ordre de grandeur deja publie.
+
+**Contre minibwa : 2,47x en sa faveur en CPU.** Le ROADMAP portait 1,21x (38,6 contre 46,8 CPU-s).
+L'ecart s'est creuse et deux choses ont change en meme temps : minibwa est passe de r411 a r424, et
+le banc precedent etait le jeu chr20-sur-chr21. Sa sortie n'est pas identique a la notre (autre algo
+SMEM, plus d'alignement sans gap, prefiltre q-mer sur le mate rescue), donc c'est un autre produit,
+mais 2,47x est trop gros pour etre range sous « il fait moins de travail » sans le chiffrer.
+
+**La regle qui en sort**, et qui manquait a ce depot : avant de chronometrer, verifier le **taux de
+non-mappe**. Un banc dont les lectures ne viennent pas de la reference ne mesure pas l'alignement, et
+il peut inverser un classement sans qu'aucune mesure individuelle soit fausse.
 
 ## Ce qui reste
 
