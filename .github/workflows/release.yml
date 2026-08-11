@@ -182,8 +182,28 @@ jobs:
           # is untouched: the byte-identity gate below rebuilds it again and must not find leftovers.
           cp testdata/tiny/tiny.fa "$PROFDIR/train/"
           python3 scripts/make_test_reads.py testdata/tiny/tiny.fa "$PROFDIR/train/r" --n 8000
-          ./target/release/bwa-mem4 index "$PROFDIR/train/tiny.fa"
-          ./target/release/bwa-mem4 mem -t 2 "$PROFDIR/train/tiny.fa" \
+          # DIAGNOSTIC (temporary, see PR #60): `index` segfaults here on macos-14 arm64 and only
+          # there, on every run since 2026-08-11 while every run up to the v4.3.0 tag passed. Exit
+          # 139 with no stack tells us nothing, so print what macOS already recorded before failing.
+          run_step() {
+            if "$@"; then return 0; fi
+            rc=$?
+            echo "::group::diagnostic for exit $rc"
+            uname -a; sw_vers 2>/dev/null || true
+            echo "--- ulimit"; ulimit -a
+            echo "--- crash reports"
+            sleep 5
+            for d in "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports; do
+              [ -d "$d" ] || continue
+              for f in $(ls -t "$d" 2>/dev/null | head -3); do
+                echo "===== $d/$f"; head -c 8000 "$d/$f"; echo
+              done
+            done
+            echo "::endgroup::"
+            return $rc
+          }
+          run_step ./target/release/bwa-mem4 index "$PROFDIR/train/tiny.fa"
+          run_step ./target/release/bwa-mem4 mem -t 2 "$PROFDIR/train/tiny.fa" \
               "$PROFDIR/train/r_1.fq" "$PROFDIR/train/r_2.fq" > /dev/null
 
           PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)
