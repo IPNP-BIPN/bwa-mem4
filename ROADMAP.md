@@ -2753,6 +2753,56 @@ bandwidth-bound » a ete retractee** apres mesure : le M4 sert des gathers aleat
 `-t12` est le genou (= le nombre de P-cores ; le pipeline prend 2 threads de plus, lecteur +
 ecrivain).
 
+## Entree gzip : ou est le mur, et a combien de cœurs il tombe (2026-08-11)
+
+Rob Patro publie un resultat qui vise exactement une fraction serielle que **tous nos bancs ont
+manquee** : ils utilisent du FASTQ non compresse, alors que tout utilisateur reel a du `.fq.gz`. Son
+diagnostic : l'inflation gzip est serielle (un decodeur par flux), donc un mappeur rapide affame ses
+threads. Chiffres annonces : le split producteur/consommateur vaut **5,75x** a 64 threads sur
+150 M paires, la ou doubler le budget de threads ne vaut que 9 %. Son correctif est en deux morceaux,
+`rapidgzip-core` (inflation parallele, algorithme marqueur/fenetre de Knespel & Brunst) et
+[`thread-broker`](https://crates.io/crates/thread-broker), qui **resout** le split au lieu de le
+chercher : `d* = N * busy_producteur / (busy_producteur + busy_consommateur)`, mesure en temps **CPU**
+et non en temps mur, parce que le temps mur contient le blocage et que le blocage depend du split.
+
+**Mesure chez nous**, memes lectures, compressees contre non compressees :
+
+| | mur non compresse | mur gzip | delta |
+|---|---|---|---|
+| `-t1` | 12,30 s | 12,11 | **0 %** |
+| `-t8` | 1,86 | 1,90 | +2 % |
+| `-t16` | 1,345 | 1,415 | **+5 %** |
+
+Le probleme existe donc, et il **grandit avec les cœurs**, ce qui est la forme d'Amdahl attendue.
+Mais il ne mord pas encore, et l'arithmetique dit a quelle distance il mord :
+
+- notre demande a `-t16` est de **49 Mo/s par flux** (68 Mo en 1,4 s) ;
+- un seul flux d'inflation tient **~1900 Mo/s** avec le gzip systeme de cette machine, et de l'ordre
+  de 300-500 Mo/s avec notre `flate2`/`zlib-rs` ;
+- il faudrait donc environ **6x notre debit d'alignement actuel**, soit de l'ordre de **100 cœurs**,
+  avant que l'inflation elle-meme devienne le goulot.
+
+Les +5 % mesures ne sont donc **pas** de l'inflation : c'est le **thread lecteur unique**, qui inflate
+ET parse le FASTQ, et qui devient etroit quand seize travailleurs le sollicitent.
+
+**Pourquoi le meme probleme vaut 5,75x chez lui et 5 % chez nous** : piscem mappe **20 M paires/s**,
+nous faisons **0,37 M paires/s** a `-t16`. Un consommateur cinquante fois plus rapide par unite
+d'entree atteint la limite du decodeur cinquante fois plus tot. Le levier est reel, il est bien
+concu, et notre regime n'y est pas encore.
+
+**Retenu comme dette datee, pas comme travail immediat** : le jour ou ce depot vise des machines a
+64 cœurs et plus, `rapidgzip-core` puis `thread-broker` sont la bonne sequence, dans cet ordre
+(le broker n'a rien a repartir tant que le producteur est fige a un thread par flux). Et le premier
+geste sera de reparer le banc, pas le code : mesurer sur `.fq.gz`, puisque c'est ce que les
+utilisateurs alignent.
+
+### hyalite 0.4.0
+
+L'oracle tiers de `bwa-extend` passe de 0.3 a 0.4. C'est une **dev-dependency**, donc rien du binaire
+livre ne bouge. Amont apporte `per-position maxima + bwa-compatible score2` et les maxima SIMD de
+`align_pair_position_max`, c'est-a-dire exactement les deux points ou notre test documentait des
+divergences de convention. Test `third_party_oracle` vert avec la nouvelle version.
+
 ## La largeur lockstep est maintenant mesuree au demarrage (2026-08-09)
 
 Deuxieme round de recherche, hors bioinfo. Le chiffre qui declenche ce changement vient de mesures

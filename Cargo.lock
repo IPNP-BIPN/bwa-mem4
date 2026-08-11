@@ -655,9 +655,9 @@ dependencies = [
 
 [[package]]
 name = "hyalite"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70933c34c3259c9383e6f6b7a290fe531c24af6a4fc2368b3fa9f3b03779844e"
+checksum = "91cea2b143816728d6547acd03c0b3617b7231d573a82cf6f4646db8548b88b3"
 
 [[package]]
 name = "icu_collections"

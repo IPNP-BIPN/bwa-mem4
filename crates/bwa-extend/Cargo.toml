@@ -15,4 +15,4 @@ repository.workspace = true
 workspace = true
 
 [dev-dependencies]
-hyalite = "0.3"
+hyalite = "0.4"
