@@ -2790,11 +2790,39 @@ nous faisons **0,37 M paires/s** a `-t16`. Un consommateur cinquante fois plus r
 d'entree atteint la limite du decodeur cinquante fois plus tot. Le levier est reel, il est bien
 concu, et notre regime n'y est pas encore.
 
-**Retenu comme dette datee, pas comme travail immediat** : le jour ou ce depot vise des machines a
-64 cœurs et plus, `rapidgzip-core` puis `thread-broker` sont la bonne sequence, dans cet ordre
-(le broker n'a rien a repartir tant que le producteur est fige a un thread par flux). Et le premier
-geste sera de reparer le banc, pas le code : mesurer sur `.fq.gz`, puisque c'est ce que les
-utilisateurs alignent.
+### Correction, apres avoir applique la loi de `thread-broker` a nos chiffres
+
+Ce qui precede concluait « `rapidgzip-core` puis `thread-broker` le jour ou on vise 64 cœurs ».
+**C'est faux**, et la mesure qui le montre a pris dix minutes.
+
+Notre propre chemin de decompression (`flate2` + `zlib-rs`, celui que le lecteur recoit) fait
+**~1500 Mo/s sur un flux**, et non les 300-500 supposes plus haut. Donc, sur un lot de 500 k paires :
+
+- `busy_p` = 2 flux x 72 Mo / 1500 Mo/s = **0,096 s de CPU**
+- `busy_c` = **16,9 s de CPU** a `-t16`
+- **`d* = N * busy_p / (busy_p + busy_c) = 16 * 0,096 / 16,996 = 0,09 thread`**
+
+Sa propre loi de commande alloue donc **un dixieme de thread** au decodage ; il faudrait `-t256`
+pour qu'elle en demande 1,4. Et sa `EngagementPolicy` par defaut exige **8 threads par flux
+producteur**, soit 16 pour nos deux, precisement parce qu'en dessous *« an inline, work-conserving
+producer wins »*. Les deux verdicts concordent et ils viennent de son outil.
+
+**L'inflation pese 0,6 % de notre CPU total.** La paralleliser ne rendrait rien, meme a 100 cœurs.
+
+**D'ou viennent alors les +5 % ?** De l'arithmetique du lecteur : il paie ~0,048 s d'inflation par
+fichier contre ~0,007 s de copie en clair, soit **+0,08 s pour deux fichiers**, contre un delta de
+mur mesure de **+0,07 s** a `-t16`. C'est donc bien l'inflation, mais elle se voit **1:1 dans le mur
+parce qu'elle est sur le chemin serie d'un lecteur unique**, pendant que seize travailleurs
+consomment plus vite qu'un lecteur ne produit.
+
+**Le correctif n'est donc ni un pool de decodeurs ni un broker**, c'est un recouvrement plus profond
+de la lecture avec l'alignement (double buffering du lecteur). Meme cause qu'Amdahl, autre remede.
+Et le premier geste reste de reparer le banc, pas le code : mesurer sur `.fq.gz`, puisque c'est ce
+que les utilisateurs alignent.
+
+Le crate reste juste pour le probleme qu'il vise. Son 5,75x est reel dans un regime ou le
+consommateur est cinquante fois plus rapide que le notre par unite d'entree ; le notre n'y est pas,
+et sa politique d'engagement le dit avant nous.
 
 ### hyalite 0.4.0
 
