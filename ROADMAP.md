@@ -3668,6 +3668,107 @@ de `mem_sort_dedup_patch`, qui existe surtout parce que le rescue reinsere une r
 le vecteur. Le seeding, suspect principal de toute la campagne precedente, ne fait que **12,8 %** en
 cumule. C'est la cible du prochain lot, et elle est enfin chiffree plutot que supposee.
 
+## Le mate rescue, six angles, et le seul qui paie (2026-08-11)
+
+Le profil hors sonde designait le mate rescue : **~29 % du busy**, son noyau SW a 18,0 %,
+`mem_sort_dedup_patch` a 11,7 %. Six leviers testes, un seul rend.
+
+### Ce que la sonde `BWA4_MATESW_TIME` dit du noyau
+
+3,68 M jobs, 760 Gcellules, 61,8 s CPU sur ~194, soit **32 % du run**. Requete moyenne 148 pb pour
+une fenetre cible de 1396 pb : 206 537 cellules par job.
+
+| angle | resultat |
+|---|---|
+| debit du noyau | **13,4 Gcell/s sur les cellules executees**, plafond machine ~16, donc **84 %** |
+| taxe de divergence de lanes | 1,09x |
+| tri par longueur (lectures a 151 pb) | **-0,0 %** |
+| jobs dupliques dans un appel | **0,0 %** |
+| partage des fenetres qui se recouvrent (#50B) | **0,87x, donc plus cher** : 87,9 % des fenetres sont isolees, A moyen 1,08 |
+| pre-filtre sur avant le DP | plafonne a **7 %** : 78,1 % des DP sont acceptes |
+
+Cinq zeros, chacun avec son chiffre. Le noyau n'a rien a rendre.
+
+### Le dedup incremental : prouve, octet-identique, et nul
+
+Deux proprietes rendent le scan arriere theoriquement O(n log n) au lieu de O(n²). Le tableau est
+trie par `re` **croissant** et le scan va vers l'arriere, donc la condition d'arret est **monotone** :
+atteindre une position coute **un test**, pas un parcours. Et le rescue insere dans un tableau deja
+dedupe, ou aucune paire ne passait le test de redondance, donc seules les paires impliquant une
+nouvelle region peuvent tuer. Marqueur gratuit : `n_comp` vaut 0 a la construction et 1 apres chaque
+passe.
+
+**Un trou trouve par la mesure, pas par le raisonnement.** La premiere version changeait le md5
+(`c03b89c5...` contre `968a2331...`). Cause : quand la fusion collineaire est active, `mem_patch_reg`
+reecrit les coordonnees de `p` **en cours de scan** et les paires deja depassees ne sont jamais
+retestees, donc une passe **avec** fusion peut laisser deux survivants atteignables redondants. Le
+premier dedup du rescue suit `DedupPrep`, qui fusionne. Corrige en portant la precondition en
+parametre explicite ; md5 redevenu identique.
+
+Puis **A/B : zero.** Delta CPU moyen -0,01 s sur 194, 5 rondes, `-t4`. ~9000 operations par appel
+ramenees a ~800 ne se voient pas. **Retire**, la preuve conservee ici.
+
+### Le tri par longueur du batch de rescue : +3,5 %, et pourquoi il etait nul le matin
+
+Le meme levier, mesure **-0,0 %** le matin, vaut **-3,5 %** l'apres-midi. Rien n'a change dans le
+code : le jeu de donnees est passe par **fastp**.
+
+| entree, meme nombre de lectures | taxe de lanes | gain d'un tri |
+|---|---|---|
+| non trimmee, toutes a 151 pb | 1,09x | **0,0 %** |
+| trimmee par fastp, longueurs variables | **1,15x** | **4,5 %** |
+
+Des lectures toutes de meme longueur n'ont rien a trier. **Les donnees reelles sont trimmees.** Un
+banc sur du non-trimme avait donc rendu ce levier invisible, exactement comme le banc chr20-sur-chr21
+avait inverse le classement contre le fork.
+
+Implemente sur la passe avant du noyau (`batched_ksw_align2`), tri par `(longueur cible, longueur de
+requete padee)`, dispersion des resultats vers l'ordre d'appel. Result-preserving par l'argument deja
+ecrit dans l'en-tete du module : un job ne depend que de ses propres entrees, l'ordre ne decide que
+du remplissage des lanes. `BWA4_MATESW_SORT=0` restaure l'ordre d'appel.
+
+A/B, `-t4`, 2 M paires GIAB trimmees, genome entier, 5 rondes :
+
+| ronde | mur | CPU |
+|---|---|---|
+| r1 | 96,15 -> 93,12 (-3,2 %) | 379,8 -> 370,0 (-2,6 %) |
+| r2 | 96,84 -> 92,60 (-4,4 %) | 386,7 -> 369,8 (-4,4 %) |
+| r3 | 96,57 -> 92,89 (-3,8 %) | 383,4 -> 368,8 (-3,8 %) |
+| r4 | 95,98 -> 92,63 (-3,5 %) | 380,0 -> 368,5 (-3,0 %) |
+| r5 | 96,12 -> 93,29 (-2,9 %) | 384,1 -> 369,8 (-3,7 %) |
+| **mediane** | **-3,55 %** | **-3,50 %** |
+
+**5/5.** Et le gain mesure est **plus du double du contrefactuel** : 4,5 % d'un noyau a 34 % du CPU
+predisait 1,5 %. Le tri achete donc autre chose que l'occupation des lanes, vraisemblablement de la
+localite memoire. Le contrefactuel `EXEC_SORTED` est un plancher, pas une estimation.
+
+Parite : `a8d54127...` identique avec et sans tri sur 2 M paires trimmees, et `6b3bfc2c...` contre
+bwa-mem2 sur une tranche de 200 k.
+
+### Classement sur echantillon complet apres fastp
+
+10 813 312 paires trimmees (fastp `--detect_adapter_for_pe`, 3,19 Gbases, Q20 98,7 %/96,4 %),
+GRCh38 entier, `-t16`, **une seule ronde**, donc a confirmer :
+
+| | mur | CPU | cœurs |
+|---|---|---|---|
+| bwa-mem2 2.3 | 601,65 s | 7292,0 s | 12,12 |
+| fork v0.9.0 | 231,39 s | 2780,0 s | 12,01 |
+| bwa-mem4 (avant le tri) | 242,02 s | 3027,8 s | 12,51 |
+| minibwa 0.7-r424 | 159,88 s | 1371,6 s | 8,58 |
+| minimap2 2.31 `-ax sr` | 176,39 s | 2272,8 s | 12,88 |
+
+**2,49x contre bwa-mem2 en mur.** Deux corrections a des affirmations plus tot dans la journee :
+minimap2 nous **repasse devant** sur ce banc (176 s contre 242), alors qu'on le battait sur 1 M paires
+non trimmees a `-t4` ; et l'ecart de CPU au fork passe de 1,5 % a **8,2 %**, sans que ce soit de
+l'occupation puisqu'on tient 12,51 cœurs contre ses 12,01. Le tri en reprend 3,5.
+
+### Une anomalie non expliquee
+
+Le debit du noyau de rescue tombe de **12,27 a 10,16 Gcell/s** entre non trimme et trimme, soit
+-17 %, alors que la divergence de lanes n'en explique que 5,5 points. **Onze points manquent**, et
+c'est la piste ouverte la plus prometteuse.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en

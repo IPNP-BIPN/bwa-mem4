@@ -203,6 +203,23 @@ pub mod cells {
     /// Jobs inside one kernel call whose `(query, target)` byte slices are exactly equal to an
     /// earlier job's in the same call, hence recomputed for nothing.
     pub static DUP_JOBS: AtomicU64 = AtomicU64::new(0);
+    /// Rescue DPs whose result was ACCEPTED (`score >= min_seed_len` and `qb >= 0`), and the total
+    /// scored. The kernel is ~32% of a paired-end run's CPU; the ratio says how much of it produces
+    /// nothing, which is the ceiling on what a sound pre-filter could remove.
+    pub static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+    pub static SCORED: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one rescue DP's outcome. No-op unless `BWA4_MATESW_TIME` is set.
+    pub fn count_outcome(accepted: bool) {
+        if !enabled() {
+            return;
+        }
+        SCORED.fetch_add(1, Ordering::Relaxed);
+        if accepted {
+            ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Whether `BWA4_MATESW_TIME` is set in the environment. Read once and cached, so setting the
     /// variable after the first call has no effect and the hot path pays only an atomic load.
     ///
@@ -281,6 +298,17 @@ pub mod cells {
             eprintln!(
                 "[matesw] {label:>12}  {c:>10}  {j:>12}  {:>6.1}%",
                 100.0 * j as f64 / jobs.max(1) as f64
+            );
+        }
+        let (acc, sc) = (
+            ACCEPTED.load(Ordering::Relaxed),
+            SCORED.load(Ordering::Relaxed),
+        );
+        if sc > 0 {
+            eprintln!(
+                "[matesw] accepted {acc} of {sc} scored rescue DPs ({:.1}%); {:.1}% produced nothing",
+                100.0 * acc as f64 / sc as f64,
+                100.0 * (sc - acc) as f64 / sc as f64
             );
         }
         let (query_bases, target_bases) =
@@ -444,7 +472,44 @@ pub fn batched_ksw_align2(
         })
         .collect();
     // One `(score, te, qe, score2, te2)` per job, in job order.
-    let fwd_results = fwd_local_sw_batch(&fwd_jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc);
+    //
+    // Length-sorted before the kernel sees it. The kernel takes `jobs.chunks(LANES)` in caller
+    // order and runs each group to `max(padded qlen) x max(tlen)` over its lanes, so one long
+    // window in a group is paid for by every lane of that group. Grouping jobs of similar shape
+    // together is the whole fix, and it is result-preserving for the reason stated in this crate's
+    // module docs: a job's alignment depends only on its own `(query, target, minsc, endsc)`, so
+    // the order decides lane occupancy and nothing else.
+    //
+    // Measured with `BWA4_MATESW_TIME` on 2 M real GIAB pairs, whole genome:
+    //
+    // | input | lane tax | sorting saves |
+    // |---|---|---|
+    // | untrimmed, all 151 bp | 1.09x | 0.0% |
+    // | fastp-trimmed, variable lengths | 1.15x | 4.5% |
+    //
+    // Which is why it was measured as worthless the first time and is worth taking now: with reads
+    // all one length there is nothing to sort. Real input is trimmed.
+    let fwd_results = if sort_jobs_enabled() && fwd_jobs.len() > LANES {
+        // `ord[k]` is the original index of the job the kernel will run in slot `k`. Sorted by
+        // target length first because it dominates the cell count (~1400 rows against ~150
+        // columns), then by the PADDED query length, which is what the kernel actually walks.
+        let mut ord: Vec<u32> = (0..fwd_jobs.len() as u32).collect();
+        ord.sort_unstable_by_key(|&i| {
+            let j = &fwd_jobs[i as usize];
+            (j.target.len(), ksw_padded_qlen(j.query.len(), max_sc))
+        });
+        let sorted: Vec<FwdJob> = ord.iter().map(|&i| fwd_jobs[i as usize]).collect();
+        let got = fwd_local_sw_batch(&sorted, m, mat, o_del, e_del, o_ins, e_ins, max_sc);
+        // Scatter back to caller order: every downstream index (`out`, pass 2, the caller's
+        // orientation cursor) is in job order and must stay that way.
+        let mut back = vec![(0i32, 0i32, 0i32, 0i32, 0i32); got.len()];
+        for (slot, &i) in ord.iter().enumerate() {
+            back[i as usize] = got[slot];
+        }
+        back
+    } else {
+        fwd_local_sw_batch(&fwd_jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+    };
 
     // The final answers, complete except for the start coordinates: `qb`/`tb` stay at the -1 sentinel
     // until pass 2 fills them, and stay -1 forever for jobs pass 2 skips or disagrees with.
@@ -809,6 +874,13 @@ const I16_SCORE_LIMIT: i32 = 30_000;
 /// `qlen` rounded up to a multiple of 16 (if `qlen * max_sc < 250`) or of 8 (otherwise). This is the
 /// number of DP columns the pass must actually run: the extra columns score 0 rather than being
 /// skipped, and they are observable in `score2`.
+/// Whether to length-sort the rescue batch before the forward kernel. Default ON; set
+/// `BWA4_MATESW_SORT=0` to compare against the caller-order grouping.
+fn sort_jobs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_MATESW_SORT").is_none_or(|v| v != "0"))
+}
+
 fn ksw_padded_qlen(qlen: usize, max_sc: i32) -> usize {
     // Deliberately bwa's choice, not ours: this is `mem_matesw`'s `l_ms * opt->a < 250` test, and
     // the width it yields decides how much zero padding the query gets, which is observable.
