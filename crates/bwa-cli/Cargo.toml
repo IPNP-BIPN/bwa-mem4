@@ -52,6 +52,20 @@ multi-format = ["bwa-io/multi-format"]
 # by being mutually exclusive with it. Byte-identical either way (a suffix array is unique); only
 # index build speed and peak build RAM change, never `mem` output.
 capsa = ["bwa-index/capsa"]
+# OpenMP passthrough for the C libsais suffix-array build (`bwa-mem4 index` only, never `mem`).
+# Off by default because it is the one feature here that needs a SYSTEM package: `openmp-sys` wants
+# an OpenMP runtime at build time (`brew install libomp`, or libgomp from the distro's gcc), which
+# the vendored C source cannot supply. Everything else in this manifest builds from the crates.io
+# tarball alone, and a release artifact that silently gained a dylib dependency would be worse than
+# a slower index build.
+#
+# A suffix array is UNIQUE, so this cannot move a byte of any index or any SAM record; only the
+# build's wall time and thread count change. Thread count comes from `BWA4_SA_THREADS`, defaulting
+# to `min(rayon threads, 8)` because libsais's own parallel sections start losing past that.
+#
+#     brew install libomp
+#     cargo build --release -p bwa-mem4 --features libsais-c-omp
+libsais-c-omp = ["bwa-index/libsais-c-omp"]
 
 # Fast gzip input passthrough. ON by default through `bwa-io`'s own default; this entry exists so
 # the binary's build line can still name it, and so `--no-default-features` has something to turn

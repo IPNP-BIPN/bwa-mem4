@@ -3769,6 +3769,91 @@ Le debit du noyau de rescue tombe de **12,27 a 10,16 Gcell/s** entre non trimme 
 -17 %, alors que la divergence de lanes n'en explique que 5,5 points. **Onze points manquent**, et
 c'est la piste ouverte la plus prometteuse.
 
+## Les quatre backends de tableau des suffixes, mesures (2026-08-11)
+
+`bwa-mem4 index` sur le genome humain entier (GRCh38, 2L = 6,2 G symboles), cache de pages chaud,
+mesures appariees. **L'index produit est octet-identique dans les quatre cas**, et identique a
+l'index de reference du depot : un tableau des suffixes est unique, donc ce choix ne peut pas toucher
+la sortie de `mem`, seulement le temps de construction.
+
+| backend | mur | CPU | pic RSS | dependance systeme |
+|---|---|---|---|---|
+| `libsais-rs` (Rust pur) | 226,9 s | 453,8 s | 76,9 Go | aucune |
+| **C libsais serial (defaut actuel)** | 150,6 s | 301,2 s | 92,6 Go | aucune |
+| **C libsais + OpenMP, 8 threads** | **87,9 s** | **175,8 s** | 95,0 Go | `libomp` |
+| CaPS-SA (rayon) | voir plus bas | | | aucune |
+
+### Paralleliser divise le CPU total, et ce n'est pas une erreur de mesure
+
+Le premier chiffre OpenMP paraissait faux : le mur ET le CPU divises par 1,70. Paralleliser ne reduit
+pas le travail. Deux verifications :
+
+1. **Cache chaud, deux rondes appariees** : C serial 153,3/150,6 s de mur pour 306,6/301,2 s de CPU ;
+   OpenMP 8 threads 92,5/87,9 s pour 185,0/175,8 s. L'effet tient.
+2. **Le meme binaire OpenMP force a 1 thread** : 153,8 s de mur, 307,6 s de CPU, c'est-a-dire
+   **exactement le bras serial**. Donc pas de mauvais routage FFI : le gain vient bien du threading.
+
+L'explication est celle de `scaling-model.md`. La construction SA-IS sur 6,2 G symboles est **liee a
+la memoire aleatoire** ; partitionner divise le working set de chaque thread, ce qui ameliore assez le
+cache et le TLB pour reduire le **nombre de cycles**, pas seulement le temps mur.
+
+**Et le signe s'inverse selon la taille.** Sur chr21 (46 Mb), OpenMP fait *monter* le CPU :
+
+| threads, chr21 | mur | CPU |
+|---|---|---|
+| C serial | 1,85 s | 3,24 s |
+| 1 | 2,15 s | 3,21 s |
+| 4 | 1,30 s | 3,98 s |
+| **8** | **1,14 s** | 4,48 s |
+| 16 | 1,11 s | 4,98 s |
+
+Un banc sur chr21 aurait conclu « la parallelisation coute 38 % de CPU pour 1,6x de mur ». Sur le
+genome elle en rend 42 %. Troisieme fois de la journee qu'un banc trop petit inverse une conclusion,
+apres le jeu chr20-sur-chr21 et le tri du batch de rescue sur lectures non trimmees.
+
+### CaPS-SA : inutilisable ici, pour une raison algorithmique
+
+| variante | chr21, mur | chr21, CPU |
+|---|---|---|
+| memoire externe (`build_ext_mem`, le cablage en place) | 50,5 s | 553 s |
+| en memoire (`build_in_memory`) | 242 s | 455 s |
+| libsais C serial | **1,85 s** | **3,24 s** |
+
+Index octet-identique dans les deux cas, donc correct, mais **27x a 130x plus lent**. J'ai d'abord cru
+a un miscablage : on appelait la construction a **memoire externe**, qui deverse ses phases dans
+`temp_dir()`, alors que tous les autres backends materialisent le `Vec` entier de toute facon.
+Corrige en `build_in_memory`, c'est **cinq fois pire en mur**.
+
+La cause est plus profonde. CaPS-SA est un SACA **par comparaison** et son `max_context` vaut
+`usize::MAX`, ce que le crate documente comme *« required for full lexicographic correctness when the
+caller's text doesn't guarantee comparisons terminate via sentinels within a known window »*. Notre
+`bref` est un texte de **4 symboles sans sentinelle interne** : les LCP y sont enormes et chaque
+comparaison degenere. Borner `max_context` produirait un tableau **faux**, pas seulement different.
+libsais est un SA-IS lineaire, la longueur des repetitions ne le concerne pas.
+
+**Consequence pour la question « rayon plutot qu'OpenMP ».** `openmp-sys` recommande rayon, et la
+recommandation vise l'usage de pragmas OpenMP depuis du Rust, qui est impossible ; notre cas est
+l'autre, activer OpenMP *dans une bibliotheque C vendoree*, ce pour quoi le crate existe. Sur le fond
+la question reste legitime, mais **il n'existe pas aujourd'hui de SACA rayon utilisable sur ce
+texte** : le seul candidat present dans l'arbre est 130x trop lent, pour une raison d'algorithme.
+
+### Ce qui est livre
+
+Un passthrough `libsais-c-omp` dans `bwa-cli`, OFF par defaut. C'est la seule feature du manifeste
+qui exige un **paquet systeme** (`brew install libomp`, ou libgomp) : tout le reste se construit
+depuis la tarball crates.io, et un artefact de release qui gagnerait silencieusement une dependance
+dylib serait pire qu'un index plus lent a construire.
+
+    brew install libomp
+    cargo build --release -p bwa-mem4 --features libsais-c-omp
+
+### Un zero de plus
+
+Le meme tri par longueur qui rend -3,5 % sur le batch de rescue mesure **+0,63 % de CPU, 2 victoires
+sur 4**, sur les bins de l'extension. Contrairement au rescue, le contrefactuel `EXEC_SORTED` (0,4 %)
+disait vrai ici : les jobs d'extension sont courts et homogenes, la taxe de lanes n'est que de
+1,04-1,05x, et le gather/scatter impose a un lot autrement homogene coute plus qu'il ne rend. Retire.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
