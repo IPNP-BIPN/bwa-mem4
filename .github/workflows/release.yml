@@ -174,7 +174,13 @@ jobs:
           rm -rf "$PROFDIR"
           mkdir -p "$PROFDIR/train"
 
-          RUSTFLAGS="-Cprofile-generate=$PROFDIR" cargo build --release --locked
+          # `--no-default-features --features fast-gzip,parallel-gzip` is the default set MINUS
+          # mimalloc: an instrumented build with it segfaults on macOS 14 arm64 inside the arena
+          # allocator. The profile is unaffected in substance, since PGO records which branches this
+          # crate's code takes and the hot loops do not allocate; the optimised build below keeps
+          # mimalloc and consumes that profile.
+          RUSTFLAGS="-Cprofile-generate=$PROFDIR" cargo build --release --locked \
+              --no-default-features --features fast-gzip,parallel-gzip
 
           # Training workload, from committed data only: build the index, then align paired reads
           # simulated from it. Both halves matter, since `index` and `mem` share the FM code but
