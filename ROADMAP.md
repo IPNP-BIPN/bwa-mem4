@@ -3886,14 +3886,67 @@ construit.
 Rien n'est bascule. Deux raisons, la seconde mesuree :
 
 1. La branche est une **dependance git**, pas une version publiee. Un defaut ne peut pas pointer sur
-   une branche.
+   une branche. Note : notre contrainte est `version = "0.2"`, donc 0.2.3 sera prise
+   **automatiquement** des sa publication, et le correctif de prefetch ARM s'applique aussi au
+   chemin serie (2,03 s -> 1,32 s sur chr21 d'apres la PR). Le gain arrive sans rien changer ; seul
+   le passage a `libsais64_omp` demande un minimum explicite.
 2. **Sur la 0.2 publiee, appeler l'entree `omp` est une REGRESSION** : chr21 passe de 2,80 s / 4,20 s
    (entree serie) a 3,61 s / 6,10 s a 8 threads. Le changement d'appel doit donc accompagner le bump
    0.3, jamais le preceder.
 
-Action a la sortie de 0.3.0 : bumper `libsais-rs`, remplacer `libsais64` par `libsais64_omp` avec le
+Action a la sortie de **0.2.3** (la PR est mergee en amont le 2026-08-11, `main` porte deja
+0.2.3, mais crates.io s'arrete a 0.2.2) : bumper `libsais-rs`, remplacer `libsais64` par `libsais64_omp` avec le
 meme knob `BWA4_SA_THREADS`, remettre `default = ["libsais"]`, et **retirer le passthrough
 `libsais-c-omp`** livre plus haut, qui n'aura plus d'objet. Le gate est `scripts/index_diff.sh`.
+
+## L'oracle tiers couvre enfin les penalites de gap asymetriques (2026-08-12)
+
+`hyalite` 0.4.0 (2026-08-10) ajoute `Scoring::new_asymmetric`, ce qui leve une limitation que
+`tests/third_party_oracle.rs` documentait depuis sa creation :
+
+> *« hyalite carries a single gap-penalty pair, so it cannot express `o_del != o_ins`. The test
+> therefore runs symmetric penalties, which is bwa's default (`-O 6 -E 1`). »*
+
+Consequence : les bras **asymetriques** de `ksw_extend2` et du noyau de rescue n'avaient **aucun
+controle par un tiers**, alors que ce noyau fait 32 % du CPU d'un run paired-end et que `-O 6,7 -E 1,2`
+les atteint. Ils n'etaient valides que contre notre propre reference scalaire, c'est-a-dire contre du
+code qui partagerait une eventuelle mauvaise lecture de `ksw.cpp`, ce qui est precisement le trou que
+ce fichier existe pour fermer.
+
+Le risque de cet elargissement etait la **convention de direction** : se tromper de sens entre
+deletion et insertion ne casse que les schemas asymetriques, donc exactement ceux qu'on ajoute. La
+0.4 l'ecrit elle-meme, il n'y a rien a deviner : *« This maps onto bwa's `-O del,ins -E del,ins`
+(`ksw_extend2`): the `E` chain charges `(open_del, ext_del)`, the `F` chain `(open_ins, ext_ins)`. »*
+
+Le balayage passe de deux schemas a quatre, dont deux asymetriques (`(1,4,6,1,7,2)` et
+`(2,3,7,2,5,1)`), 300 paires chacun. **Le score concorde sur les quatre.**
+
+### Ce que l'elargissement a trouve, et qui n'est pas un bug
+
+Sur `A=2 B=3 O=7,5 E=2,1`, round 165 :
+
+| | score | qb | qe | tb | te |
+|---|---|---|---|---|---|
+| nous | 205 | **3** | 111 | **5** | 112 |
+| hyalite | 205 | **0** | 111 | **0** | 112 |
+
+Meme score, memes extremites de **fin**, debuts differents. Deux alignements locaux de score egal,
+celui de hyalite s'etendant plus a gauche. bwa recupere le debut par sa passe inverse `KSW_XSTART`,
+qui s'arrete des que le score avant est atteint ; une traceback ordinaire peut continuer a travers des
+cellules qui ne contribuent rien. Les penalites asymetriques creent ces egalites la ou le cas
+symetrique n'en produisait pas.
+
+Asserter l'egalite la-dessus testerait une **convention**, pas un calcul. Les spans et le quadruplet
+`(score, te, score2, te2)` restent donc compares sur les schemas **symetriques** seulement, ou ils
+etaient verifies 499/499 ; le **score** l'est sur les quatre, et c'est lui qui pilote `csub`, la MAPQ
+et chaque acceptation dans `mem_matesw`.
+
+### Verifie que le nouveau bras est vivant
+
+Une premiere tentative de mutation ne prouvait rien : changer le schema des deux cotes a la fois ne
+peut pas creer de desaccord. La bonne mutation perturbe **un seul** cote, `o_ins + 1` sur le notre :
+le test echoue alors des le round 58. Et l'echec de span cite plus haut porte sur le quatrieme
+schema, ce qui montre que les schemas asymetriques sont bien atteints.
 
 ## Ce qui reste
 
