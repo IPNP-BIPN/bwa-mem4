@@ -3135,6 +3135,11 @@ entiere plafonne a 23 %.
 
 ### Contre le fork fg-labs/bwa-mem3 v0.9.0 (sorti le 2026-08-07)
 
+> **Corrige le 2026-08-11 : les chiffres de cette sous-section sont invalides.** Le jeu de lectures
+> utilise etait simule depuis **chr20** alors que l'index est **chr21**, d'ou 65 a 69 % de non-mappe :
+> on y mesurait surtout la vitesse de rejet. Sur un jeu correct, le classement s'inverse. Voir
+> « Le piege de jeu de donnees, et le classement refait » plus bas.
+
 La release n'apporte rien de performance : `--compat=bwa-mem` (octet-identique a bwa 0.7.19 en plus
 de bwa-mem2), la derivation du FLAG 0x2 depuis la region de meilleur score, `pa:f` unifie entre les
 ecrivains SAM et BAM, et la detection des echecs d'ajout de tag BAM. Les trois correctifs ne touchent
@@ -3393,6 +3398,555 @@ en rapidgzip-core 0.3.1. Prendre ce risque pour un composant a 0,6 % du CPU sera
 **Reserve sur leurs propres chiffres.** Le seuil annonce (50) et l'encadrement empirique (serie gagnant
 encore a 64) ne sont pas coherents entre eux dans les notes de version ; le seuil vient sans doute de la
 politique et l'encadrement d'un jeu precis. Cela ne change pas notre conclusion, qui est a 177.
+
+## Le piege de jeu de donnees, et le classement refait (2026-08-11)
+
+Le classement publie contre le fork (« nous menons 1,089x / 1,063x / 1,053x ») **est faux**, et la
+cause n'est pas une erreur de mesure : c'est le jeu de donnees.
+
+`work/r1_500k.fq` porte des noms de la forme `20:2000000-4000000_...` : ces lectures sont simulees
+depuis **chr20**. L'index de banc est **chr21**. Sur cette combinaison, 65 a 69 % des enregistrements
+sortent non mappes, et ce qui est chronometre est en grande partie la vitesse a **rejeter** des
+lectures qui n'appartiennent pas a la reference. Ce n'est pas un banc d'alignement.
+
+Le bon jeu existait a cote : `work/chr21arm/r{1,2}.fq`, 1 M paires simulees depuis chr21, dont
+**0 % de non-mappe**. Verifie avant de chronometrer : bwa-mem2 2.3, le fork `--compat=bwa-mem2` et
+bwa-mem4 sortent le **meme corps SAM** (`c833bb42...`), donc les trois comparent bien le meme fichier.
+
+### La discipline, d'abord
+
+Un premier passage a `-t16` sans refroidissement a donne, pour le **meme binaire**, des murs de 15,98
+a 45,95 s selon la ronde, et bwa-mem2 plus lent en entree plain (87,02 s) qu'en gzip (57,67 s), ce qui
+n'a aucun sens physique. Quatre binaires lourds enchaines sur 16 cœurs, plus 690 Mo de FASTQ plain
+relus a chaque ronde : derive thermique et page cache. **Inexploitable, et jete.**
+
+La regle du projet le disait deja (`-t4` pour du pourcentage, la derive atteint 10 % a `-t8`). Avec
+`-t4`, 500 k paires, gzip seul et **10 s de refroidissement entre chaque run**, la dispersion tombe
+sous 1 % et les six rondes sont interchangeables.
+
+### `-t4`, 500 k paires chr21, gzip, 6 rondes, medianes
+
+| | mur | CPU | cœurs occupes |
+|---|---|---|---|
+| bwa-mem2 2.3 | 58,99 s | 230,9 s | 3,91 |
+| fork bwa-mem3 v0.9.0 | **18,05 s** | 71,7 s | 3,97 |
+| bwa-mem4 | 18,24 s | 71,8 s | 3,93 |
+| minibwa 0.7-r424 | **7,56 s** | **29,1 s** | 3,85 |
+
+### `-t16`, meme jeu, meme discipline, 6 rondes
+
+| | mur | CPU | cœurs occupes |
+|---|---|---|---|
+| fork v0.9.0 | **5,95 s** | 85,4 s | 14,36 |
+| bwa-mem4 | 6,36 s | 87,0 s | 13,67 |
+
+### Ce que ca dit
+
+**Contre le fork : egalite en calcul, retard en remplissage.** Les ratios CPU par ronde a `-t4` sont
+0,996 / 1,001 / 1,001 / 1,000 / 1,000 / 0,998, c'est-a-dire le meme travail au millieme pres. Le fork
+prend **1,0 %** sur le mur a `-t4` et **4,3 %** a `-t16`, en gagnant 6/6 dans les deux cas. Traduit en
+efficacite de `-t4` vers `-t16` : **fork 76 %, nous 72 %**. Notre retard est entierement dans
+l'occupation des cœurs, et pas du tout dans le noyau.
+
+**Contre bwa-mem2 : 3,22x en CPU et 3,23x en mur** a `-t4`. C'est l'ordre de grandeur deja publie.
+
+**Contre minibwa : 2,47x en sa faveur en CPU.** Le ROADMAP portait 1,21x (38,6 contre 46,8 CPU-s).
+L'ecart s'est creuse et deux choses ont change en meme temps : minibwa est passe de r411 a r424, et
+le banc precedent etait le jeu chr20-sur-chr21. Sa sortie n'est pas identique a la notre (autre algo
+SMEM, plus d'alignement sans gap, prefiltre q-mer sur le mate rescue), donc c'est un autre produit,
+mais 2,47x est trop gros pour etre range sous « il fait moins de travail » sans le chiffrer.
+
+**La regle qui en sort**, et qui manquait a ce depot : avant de chronometrer, verifier le **taux de
+non-mappe**. Un banc dont les lectures ne viennent pas de la reference ne mesure pas l'alignement, et
+il peut inverser un classement sans qu'aucune mesure individuelle soit fausse.
+
+## Le chemin critique du lecteur, et ce que rapidgzip y change (2026-08-11)
+
+Suite de la correction du classement : contre le fork, notre CPU est a egalite et tout l'ecart est
+dans l'occupation des cœurs. En chiffres, avec `occupation = (t_serie + T_par) / (t_serie + T_par/N)`
+a N=16 : lui 14,36 cœurs occupes donc **0,77 %** de serie, nous 13,67 donc **1,15 %**. Il faut
+recuperer **0,4 point de serie**, pas optimiser un noyau.
+
+### Ou est le serie, mesure
+
+`BWA4_STAGE_TIME=1`, 1 M paires GIAB reelles contre GRCh38 :
+
+| | `wait_read` | ecart au fork (mur) |
+|---|---|---|
+| `-t4` | **0,000 s** | 2,6 % |
+| `-t16` | **0,682 s, 4,2 % du run** | 4,3 % |
+
+A `-t4` le lecteur est integralement recouvert et le fork gagne quand meme : cet ecart-la est
+ailleurs, et il prend aussi 1,5 % de CPU. A `-t16` le lecteur explique presque tout le surplus.
+
+La cause n'est pas le debit mais la **granularite** : `-K` vaut `10M x -t`, donc a `-t16` le lot fait
+160 M bases et 1 M paires (302 M bases) tiennent en **deux lots**. Le premier est expose
+integralement, il n'a pas de predecesseur avec quoi se recouvrir. Le chargement d'index, la seule
+autre chose derriere quoi il pourrait se cacher, dure 0,28 s en cache chaud et est deja recouvert.
+
+| `-K` | lots | `wait_read` gzip | plain |
+|---|---|---|---|
+| 20 M | 15 | 0,097 s | 0,000 s |
+| 40 M | 8 | 0,184 s | |
+| 160 M (defaut `-t16`) | 2 | 0,682 s | 0,219 s |
+
+**Correction d'une erreur de raisonnement au passage.** J'ai d'abord ecrit que les boucles serie de
+`process` s'allongent proportionnellement a `-t` parce que `-K` grandit avec `-t`. Faux : elles sont
+O(paires), donc si `-K` double il y a deux fois moins de lots et le produit est constant. Seul
+`mem_pestat` bouge, en `n log(n/B)`, un facteur logarithmique. Ce qui grandit avec N est la **part de
+mur** que le serie represente, ce qui est Amdahl ordinaire. Le raisonnement `-K` ne vaut que pour le
+lecteur, dont le premier lot grossit bien avec `-K`. Le commentaire de `Stage::Encode` dans
+`stage_time.rs` portait deja cette erreur, et `Encode` n'est plus serie depuis longtemps.
+
+### Deux correctifs, mesures
+
+**Un : l'inflation sur son propre thread.** `parse_fastx_file` construit `MultiGzDecoder` *dans* le
+parseur, donc un thread alterne inflation et parsing et un fichier coute `inflate + parse` au lieu de
+`max(inflate, parse)`. Un thread d'inflation par fichier, blocs de 4 Mio, canal borne a 3.
+
+**Deux : rapidgzip-core 0.3.1**, qui decode UN flux sur plusieurs threads. Debit mesure isolement sur
+`r1_1m.fq.gz`, octets de sortie par seconde :
+
+| decodeur | debit |
+|---|---|
+| zlib-rs (l'actuel) | 823-876 Mo/s |
+| rapidgzip 1 thread | 917-937 Mo/s |
+| rapidgzip 4 | ~1240 Mo/s |
+| rapidgzip 8 | ~2240 Mo/s |
+| rapidgzip 12 | **2863-2999 Mo/s** |
+
+`wait_read` a `-t16`, `-K` par defaut :
+
+| version | `wait_read` |
+|---|---|
+| lecteur d'origine | 0,682 s |
+| + inflation sur son thread | 0,531 s |
+| + rapidgzip | **0,458 s** |
+| plancher, entree plain | 0,219 s |
+
+**-33 % au total, dont -11 % pour rapidgzip seul.** Beaucoup moins que le 3,4x isole, et la raison
+est mesuree : un balayage `BWA4_GZIP_THREADS` de 1 a 16 est **plat** (0,377 / 0,374 / 0,383 / 0,210
+sur fichier entier). L'inflation n'est plus le goulot une fois sur son thread ; ce qui reste
+au-dessus du plain est la copie a travers son `Read` et la latence de demarrage, pas le debit.
+
+Garde quand meme : 0,2 % de CPU, 23 crates transitifs tous en Rust pur dont les runtime (`zlib-rs`,
+`crossbeam-deque`) sont deja dans le graphe, et ca supprime une classe de goulot plutot qu'un reglage
+valable pour ce fichier-ci. `BWA4_GZIP_THREADS` permet de rebalayer sur une autre machine, et
+`--no-default-features` retombe sur l'inflateur mono-thread, lui-meme toujours sur son thread.
+
+**Ce que thread-broker ne peut pas voir.** Sa loi alloue d'apres le temps occupe cumule, donc elle
+optimise le regime permanent et repond 0,09 thread. C'est juste pour sa question. Notre probleme est
+une **latence de remplissage de pipeline** : un thread inutile 99 % du run et decisif pendant 0,4 s.
+Les deux outils de Patro ne sont pas interchangeables, et c'est rapidgzip qui correspond ici.
+
+### Un bug trouve en chemin, et repare
+
+`open_reader` lisait deux octets de magie puis **rouvrait le fichier par son chemin**. Sur un tube,
+une substitution de processus (`<(zcat r1.gz)`) ou un FIFO, ces deux octets ne reviennent jamais : le
+parseur voyait un flux deja entame et rendait **zero enregistrement, sans erreur**. `bwa-mem4 mem ref
+<(zcat r1.fq.gz)` ecrivait un en-tete SAM et aucun alignement. bwa-mem2 lit cette entree, donc
+c'etait aussi un ecart de parite. Pre-existant, verifie sur le binaire d'avant ce lot.
+
+Repare : une entree non-seekable garde ses deux octets (chainage `Cursor` + fichier) et n'est jamais
+rouverte. Verifie, meme corps SAM `61af65ce...` pour fichier regulier, FIFO gzip, FIFO plain **et
+bwa-mem2 sur FIFO**. Un test cree un vrai FIFO avec `mkfifo` et lit 2500 enregistrements a travers.
+
+### Ce qui reste sur ce chemin
+
+Le plancher du lecteur est maintenant le **parseur** : ~926 Mo/s par fichier, trois allocations par
+enregistrement (`name`, `seq`, `qual`). C'est le prochain levier, pas le decodeur. Et l'ecart a `-t4`
+(2,6 % de mur, 1,5 % de CPU, lecteur totalement recouvert) est un probleme distinct, non localise.
+
+## Le lecteur n'est plus le goulot, et la sonde mentait (2026-08-11)
+
+### `Record` : trois allocations par read, devenues une
+
+`Record` etait `String` + `Vec<u8>` + `Option<Vec<u8>>` + `Option<String>` : trois allocations et
+trois copies par read, 96 octets de structure. Il est maintenant **un seul tampon**
+`name | seq | qual | comment` plus trois longueurs et un drapeau : **une allocation, 32 octets**, avec
+accesseurs.
+
+Le decoupage qui a designe ce levier, 1 M reads, 352 Mo, un fichier :
+
+| | temps |
+|---|---|
+| needletail, zero copie | 0,048-0,056 s |
+| seq_io, zero copie | 0,049-0,050 s |
+| **+ notre `Record` possede** | **0,113-0,114 s** |
+| + une arene | 0,067-0,068 s |
+
+**Changer de bibliotheque ne rendait rien** : needletail et seq_io sont a egalite, et paraseq annonce
+lui-meme « matches the performance of the zero-copy parsers », son gain portant sur les parseurs
+*une-copie*, ce que notre `Record` etait. Le cout etait notre representation.
+
+Lecteur isole, 1 M paires, via `PairedFastqReader::next_batch` :
+
+| | avant | apres |
+|---|---|---|
+| plain, 1 lot | 0,360 s | **0,192 s** (-47 %) |
+| plain, 2 lots | 0,302 s | 0,188 s |
+| plain, 8 lots | 0,234 s | 0,139 s |
+| gzip, 1 lot | 0,355 s | 0,270 s |
+
+Plus que les 0,046 s que la sonde predisait : la structure divisee par trois allege aussi les **deux
+deplacements** par enregistrement (canal de chunks, puis vecteur de lot) et la pression allocateur.
+
+Bout en bout a `-t4`, 8 rondes appariees : **CPU median -0,75 s sur 194, 6/8 en faveur**. Petit, parce
+qu'a `-t4` le lecteur est integralement recouvert (`wait_read` = 0,000) : ce qui reste visible est le
+calcul economise, pas le mur. Une ronde a donne -25 % de CPU, ce qu'aucun changement de representation
+ne peut produire ; **ecartee**, cause inconnue.
+
+Parite verifiee sur les trois chemins que la nouvelle representation encode differemment : GIAB gzip
+`968a2331...`, `-C` avec commentaires `a16e64eb...`, FASTA sans qualites `578281f3...`, les trois
+identiques a bwa-mem2.
+
+### Deux zeros, consignes
+
+**Reserver le `Vec` de lot.** L'isole montrait 1 lot a 0,360 s contre 8 lots a 0,234 s, ce qui
+ressemblait a de la croissance par doublement. Apres reservation : 0,368 s. Sur le binaire reel,
+`wait_read` median 0,332 contre 0,342. **Retire.** La difference 1-lot/8-lots vient des defauts de
+page sur de la memoire fraiche, que l'allocateur recycle quand les lots sont petits.
+
+**Deplacer au lieu de cloner dans `PrepPair`.** Six clones par paire supprimes (~376 Mo par lot de
+1 M), dans un etage parallele : mur median +0,03 s, CPU median +0,1 s sur 190. **Zero.** Garde
+malgre tout, parce que c'est du code en moins qui ne peut pas etre plus lent, mais compte comme nul.
+
+### rapidgzip redevient utile apres coup
+
+Avant l'arene, le lecteur isole donnait gzip 0,355 s contre plain 0,360 : le gzip etait **gratuit**,
+masque par le parsing, et le balayage `BWA4_GZIP_THREADS` etait plat. Apres l'arene, gzip 0,270 contre
+plain 0,192, et le balayage repond :
+
+| threads | lecteur isole, gzip |
+|---|---|
+| 1 | 0,469 s |
+| 4 | 0,357 s |
+| **8** | **0,280 s** |
+| 16 | 0,294 s |
+| plain (plancher) | 0,167 s |
+
+**-40 %**, et notre defaut (`-t`/2, soit 8 a `-t16`) est exactement l'optimum. Lecon generale :
+optimiser le consommateur **redonne du travail au producteur**, et un levier juge nul peut redevenir
+utile une fois corrige ce qui le masquait. Un zero est date, pas definitif.
+
+### La sonde `stage_time` cachait 95 % du run
+
+`NS` etait un `thread_local`, sur la croyance que seul le thread principal enregistre. Faux :
+`run_pipeline` execute chaque `process` sur un thread `scope.spawn`, donc **tous les etages entre
+`encode` et `sam_emit` etaient credites a un thread qui mourait ensuite**. La table ne montrait que
+`wait_read`, `wait_write` et un enorme « unaccounted » etiquete « index load, header, teardown ».
+Passe en `AtomicU64` globaux.
+
+Profil enfin visible, `-t16`, GIAB, ms par lot : rescue 7287, align 5058, encode 1808, sam_emit 467,
+wait_read 138, dedup_prep 105, pestat 21, deinterleave 4. Reserve : `encode`, `dedup_prep` et
+`sam_emit` appellent `barrier::worker` **par read**, donc leurs chiffres sont gonfles par
+l'instrument ; `rescue` est instrumente par chunk et `align` pas du tout.
+
+Deux consequences a noter dans la table : les etages **recouvrent** `wait_read` (le pipeline lance
+`process` du lot N puis attend le lot N+1), et deux `process` sont en vol a la fois, donc la colonne
+`%_run` peut depasser 100 % et le reste est signe.
+
+### Ou est vraiment le temps, hors sonde
+
+`sample` sur un run `-t4`, feuilles seulement, normalise au busy :
+
+| symbole | % du busy |
+|---|---|
+| `fwd_local_sw_neon_u8` (SW du mate rescue) | **18,0 %** |
+| `batched_extend_neon_u8` (extension) | **15,6 %** |
+| `mem_sort_dedup_patch` | **11,7 %** |
+| `LsSlot::step` | 5,4 % |
+| `align_reads_batched` | 3,8 % |
+| `get_sa_batch` | 3,6 % |
+| `build_chains_from_resolved` | 3,1 % |
+| `mem_chain_flt` | 2,5 % |
+| `batch_mate_rescue` | 2,2 % |
+| `gen_cigar2` | 2,1 % |
+
+**Le mate rescue et ce qu'il declenche font ~29 % du busy** : son noyau SW, sa boucle, et l'essentiel
+de `mem_sort_dedup_patch`, qui existe surtout parce que le rescue reinsere une region puis retrie tout
+le vecteur. Le seeding, suspect principal de toute la campagne precedente, ne fait que **12,8 %** en
+cumule. C'est la cible du prochain lot, et elle est enfin chiffree plutot que supposee.
+
+## Le mate rescue, six angles, et le seul qui paie (2026-08-11)
+
+Le profil hors sonde designait le mate rescue : **~29 % du busy**, son noyau SW a 18,0 %,
+`mem_sort_dedup_patch` a 11,7 %. Six leviers testes, un seul rend.
+
+### Ce que la sonde `BWA4_MATESW_TIME` dit du noyau
+
+3,68 M jobs, 760 Gcellules, 61,8 s CPU sur ~194, soit **32 % du run**. Requete moyenne 148 pb pour
+une fenetre cible de 1396 pb : 206 537 cellules par job.
+
+| angle | resultat |
+|---|---|
+| debit du noyau | **13,4 Gcell/s sur les cellules executees**, plafond machine ~16, donc **84 %** |
+| taxe de divergence de lanes | 1,09x |
+| tri par longueur (lectures a 151 pb) | **-0,0 %** |
+| jobs dupliques dans un appel | **0,0 %** |
+| partage des fenetres qui se recouvrent (#50B) | **0,87x, donc plus cher** : 87,9 % des fenetres sont isolees, A moyen 1,08 |
+| pre-filtre sur avant le DP | plafonne a **7 %** : 78,1 % des DP sont acceptes |
+
+Cinq zeros, chacun avec son chiffre. Le noyau n'a rien a rendre.
+
+### Le dedup incremental : prouve, octet-identique, et nul
+
+Deux proprietes rendent le scan arriere theoriquement O(n log n) au lieu de O(n²). Le tableau est
+trie par `re` **croissant** et le scan va vers l'arriere, donc la condition d'arret est **monotone** :
+atteindre une position coute **un test**, pas un parcours. Et le rescue insere dans un tableau deja
+dedupe, ou aucune paire ne passait le test de redondance, donc seules les paires impliquant une
+nouvelle region peuvent tuer. Marqueur gratuit : `n_comp` vaut 0 a la construction et 1 apres chaque
+passe.
+
+**Un trou trouve par la mesure, pas par le raisonnement.** La premiere version changeait le md5
+(`c03b89c5...` contre `968a2331...`). Cause : quand la fusion collineaire est active, `mem_patch_reg`
+reecrit les coordonnees de `p` **en cours de scan** et les paires deja depassees ne sont jamais
+retestees, donc une passe **avec** fusion peut laisser deux survivants atteignables redondants. Le
+premier dedup du rescue suit `DedupPrep`, qui fusionne. Corrige en portant la precondition en
+parametre explicite ; md5 redevenu identique.
+
+Puis **A/B : zero.** Delta CPU moyen -0,01 s sur 194, 5 rondes, `-t4`. ~9000 operations par appel
+ramenees a ~800 ne se voient pas. **Retire**, la preuve conservee ici.
+
+### Le tri par longueur du batch de rescue : +3,5 %, et pourquoi il etait nul le matin
+
+Le meme levier, mesure **-0,0 %** le matin, vaut **-3,5 %** l'apres-midi. Rien n'a change dans le
+code : le jeu de donnees est passe par **fastp**.
+
+| entree, meme nombre de lectures | taxe de lanes | gain d'un tri |
+|---|---|---|
+| non trimmee, toutes a 151 pb | 1,09x | **0,0 %** |
+| trimmee par fastp, longueurs variables | **1,15x** | **4,5 %** |
+
+Des lectures toutes de meme longueur n'ont rien a trier. **Les donnees reelles sont trimmees.** Un
+banc sur du non-trimme avait donc rendu ce levier invisible, exactement comme le banc chr20-sur-chr21
+avait inverse le classement contre le fork.
+
+Implemente sur la passe avant du noyau (`batched_ksw_align2`), tri par `(longueur cible, longueur de
+requete padee)`, dispersion des resultats vers l'ordre d'appel. Result-preserving par l'argument deja
+ecrit dans l'en-tete du module : un job ne depend que de ses propres entrees, l'ordre ne decide que
+du remplissage des lanes. `BWA4_MATESW_SORT=0` restaure l'ordre d'appel.
+
+A/B, `-t4`, 2 M paires GIAB trimmees, genome entier, 5 rondes :
+
+| ronde | mur | CPU |
+|---|---|---|
+| r1 | 96,15 -> 93,12 (-3,2 %) | 379,8 -> 370,0 (-2,6 %) |
+| r2 | 96,84 -> 92,60 (-4,4 %) | 386,7 -> 369,8 (-4,4 %) |
+| r3 | 96,57 -> 92,89 (-3,8 %) | 383,4 -> 368,8 (-3,8 %) |
+| r4 | 95,98 -> 92,63 (-3,5 %) | 380,0 -> 368,5 (-3,0 %) |
+| r5 | 96,12 -> 93,29 (-2,9 %) | 384,1 -> 369,8 (-3,7 %) |
+| **mediane** | **-3,55 %** | **-3,50 %** |
+
+**5/5.** Et le gain mesure est **plus du double du contrefactuel** : 4,5 % d'un noyau a 34 % du CPU
+predisait 1,5 %. Le tri achete donc autre chose que l'occupation des lanes, vraisemblablement de la
+localite memoire. Le contrefactuel `EXEC_SORTED` est un plancher, pas une estimation.
+
+Parite : `a8d54127...` identique avec et sans tri sur 2 M paires trimmees, et `6b3bfc2c...` contre
+bwa-mem2 sur une tranche de 200 k.
+
+### Classement sur echantillon complet apres fastp
+
+10 813 312 paires trimmees (fastp `--detect_adapter_for_pe`, 3,19 Gbases, Q20 98,7 %/96,4 %),
+GRCh38 entier, `-t16`, **une seule ronde**, donc a confirmer :
+
+| | mur | CPU | cœurs |
+|---|---|---|---|
+| bwa-mem2 2.3 | 601,65 s | 7292,0 s | 12,12 |
+| fork v0.9.0 | 231,39 s | 2780,0 s | 12,01 |
+| bwa-mem4 (avant le tri) | 242,02 s | 3027,8 s | 12,51 |
+| minibwa 0.7-r424 | 159,88 s | 1371,6 s | 8,58 |
+| minimap2 2.31 `-ax sr` | 176,39 s | 2272,8 s | 12,88 |
+
+**2,49x contre bwa-mem2 en mur.** Deux corrections a des affirmations plus tot dans la journee :
+minimap2 nous **repasse devant** sur ce banc (176 s contre 242), alors qu'on le battait sur 1 M paires
+non trimmees a `-t4` ; et l'ecart de CPU au fork passe de 1,5 % a **8,2 %**, sans que ce soit de
+l'occupation puisqu'on tient 12,51 cœurs contre ses 12,01. Le tri en reprend 3,5.
+
+### Une anomalie non expliquee
+
+Le debit du noyau de rescue tombe de **12,27 a 10,16 Gcell/s** entre non trimme et trimme, soit
+-17 %, alors que la divergence de lanes n'en explique que 5,5 points. **Onze points manquent**, et
+c'est la piste ouverte la plus prometteuse.
+
+## Les quatre backends de tableau des suffixes, mesures (2026-08-11)
+
+`bwa-mem4 index` sur le genome humain entier (GRCh38, 2L = 6,2 G symboles), cache de pages chaud,
+mesures appariees. **L'index produit est octet-identique dans les quatre cas**, et identique a
+l'index de reference du depot : un tableau des suffixes est unique, donc ce choix ne peut pas toucher
+la sortie de `mem`, seulement le temps de construction.
+
+| backend | mur | CPU | pic RSS | dependance systeme |
+|---|---|---|---|---|
+| `libsais-rs` (Rust pur) | 226,9 s | 453,8 s | 76,9 Go | aucune |
+| **C libsais serial (defaut actuel)** | 150,6 s | 301,2 s | 92,6 Go | aucune |
+| **C libsais + OpenMP, 8 threads** | **87,9 s** | **175,8 s** | 95,0 Go | `libomp` |
+| CaPS-SA (rayon) | voir plus bas | | | aucune |
+
+### Paralleliser divise le CPU total, et ce n'est pas une erreur de mesure
+
+Le premier chiffre OpenMP paraissait faux : le mur ET le CPU divises par 1,70. Paralleliser ne reduit
+pas le travail. Deux verifications :
+
+1. **Cache chaud, deux rondes appariees** : C serial 153,3/150,6 s de mur pour 306,6/301,2 s de CPU ;
+   OpenMP 8 threads 92,5/87,9 s pour 185,0/175,8 s. L'effet tient.
+2. **Le meme binaire OpenMP force a 1 thread** : 153,8 s de mur, 307,6 s de CPU, c'est-a-dire
+   **exactement le bras serial**. Donc pas de mauvais routage FFI : le gain vient bien du threading.
+
+L'explication est celle de `scaling-model.md`. La construction SA-IS sur 6,2 G symboles est **liee a
+la memoire aleatoire** ; partitionner divise le working set de chaque thread, ce qui ameliore assez le
+cache et le TLB pour reduire le **nombre de cycles**, pas seulement le temps mur.
+
+**Et le signe s'inverse selon la taille.** Sur chr21 (46 Mb), OpenMP fait *monter* le CPU :
+
+| threads, chr21 | mur | CPU |
+|---|---|---|
+| C serial | 1,85 s | 3,24 s |
+| 1 | 2,15 s | 3,21 s |
+| 4 | 1,30 s | 3,98 s |
+| **8** | **1,14 s** | 4,48 s |
+| 16 | 1,11 s | 4,98 s |
+
+Un banc sur chr21 aurait conclu « la parallelisation coute 38 % de CPU pour 1,6x de mur ». Sur le
+genome elle en rend 42 %. Troisieme fois de la journee qu'un banc trop petit inverse une conclusion,
+apres le jeu chr20-sur-chr21 et le tri du batch de rescue sur lectures non trimmees.
+
+### CaPS-SA : inutilisable ici, pour une raison algorithmique
+
+| variante | chr21, mur | chr21, CPU |
+|---|---|---|
+| memoire externe (`build_ext_mem`, le cablage en place) | 50,5 s | 553 s |
+| en memoire (`build_in_memory`) | 242 s | 455 s |
+| libsais C serial | **1,85 s** | **3,24 s** |
+
+Index octet-identique dans les deux cas, donc correct, mais **27x a 130x plus lent**. J'ai d'abord cru
+a un miscablage : on appelait la construction a **memoire externe**, qui deverse ses phases dans
+`temp_dir()`, alors que tous les autres backends materialisent le `Vec` entier de toute facon.
+Corrige en `build_in_memory`, c'est **cinq fois pire en mur**.
+
+La cause est plus profonde. CaPS-SA est un SACA **par comparaison** et son `max_context` vaut
+`usize::MAX`, ce que le crate documente comme *« required for full lexicographic correctness when the
+caller's text doesn't guarantee comparisons terminate via sentinels within a known window »*. Notre
+`bref` est un texte de **4 symboles sans sentinelle interne** : les LCP y sont enormes et chaque
+comparaison degenere. Borner `max_context` produirait un tableau **faux**, pas seulement different.
+libsais est un SA-IS lineaire, la longueur des repetitions ne le concerne pas.
+
+**Consequence pour la question « rayon plutot qu'OpenMP ».** `openmp-sys` recommande rayon, et la
+recommandation vise l'usage de pragmas OpenMP depuis du Rust, qui est impossible ; notre cas est
+l'autre, activer OpenMP *dans une bibliotheque C vendoree*, ce pour quoi le crate existe.
+
+J'ai d'abord conclu qu'**aucun SACA rayon n'etait utilisable sur ce texte**. **Faux, et corrige
+ci-dessous** : je n'avais regarde que `caps-sa`, et j'avais mesure `libsais-rs` dans sa version
+publiee, dont le chemin parallele ne scale pas.
+
+### Ce qui est livre
+
+Un passthrough `libsais-c-omp` dans `bwa-cli`, OFF par defaut. C'est la seule feature du manifeste
+qui exige un **paquet systeme** (`brew install libomp`, ou libgomp) : tout le reste se construit
+depuis la tarball crates.io, et un artefact de release qui gagnerait silencieusement une dependance
+dylib serait pire qu'un index plus lent a construire.
+
+    brew install libomp
+    cargo build --release -p bwa-mem4 --features libsais-c-omp
+
+### Un zero de plus
+
+Le meme tri par longueur qui rend -3,5 % sur le batch de rescue mesure **+0,63 % de CPU, 2 victoires
+sur 4**, sur les bins de l'extension. Contrairement au rescue, le contrefactuel `EXEC_SORTED` (0,4 %)
+disait vrai ici : les jobs d'extension sont courts et homogenes, la taxe de lanes n'est que de
+1,04-1,05x, et le gather/scatter impose a un lot autrement homogene coute plus qu'il ne rend. Retire.
+
+## Le SACA rayon existe, et il change le defaut (2026-08-11)
+
+Correction de la section precedente. `libsais-rs` **0.2 publie** n'est pas la mesure de ce que le Rust
+peut faire ici : son chemin parallele ne scale pas, et son prefetch logiciel etait compile
+**uniquement pour x86_64**, donc tout le port tournait **sans prefetch sur arm64** la ou le C emet
+`prfm`. Mes 226,9 s sur le genome mesuraient cela, pas une limite du langage.
+
+Teste sur la branche `perf/omp-scaling` de `BenjaminDEMAILLE/libsais-rs` (PR #2 en amont), appelee via
+`libsais64_omp` a 8 threads. Genome humain entier, index **octet-identique a l'index de reference du
+depot** :
+
+| backend | mur | CPU | pic RSS | dependance systeme |
+|---|---|---|---|---|
+| `libsais-rs` 0.2 publie | 226,9 s | 453,8 s | 76,9 Go | aucune |
+| C libsais serial (defaut actuel) | 150,6 s | 301,2 s | 92,6 Go | aucune |
+| **`libsais-rs` PR, 8 threads** | **103,9 s** | **207,8 s** | **77,3 Go** | **aucune** |
+| C libsais + OpenMP, 8 threads | 87,9 s | 175,8 s | 95,0 Go | `libomp` |
+
+**2,18x plus rapide que la version publiee, 1,45x plus rapide que notre defaut**, et 1,18x derriere le
+C+OpenMP. Sur chr21 l'ecart disparait: 1,15 s contre 1,14 s.
+
+Le chiffre que la comparaison en temps masque est le RSS : **17,7 Go de moins que le C+OpenMP**
+(77,3 contre 95,0). Sur une machine qui n'a pas 137 Go, c'est ce chiffre qui decide si l'index se
+construit.
+
+### Ce qui n'est PAS fait, et pourquoi
+
+Rien n'est bascule. Deux raisons, la seconde mesuree :
+
+1. La branche est une **dependance git**, pas une version publiee. Un defaut ne peut pas pointer sur
+   une branche. Note : notre contrainte est `version = "0.2"`, donc 0.2.3 sera prise
+   **automatiquement** des sa publication, et le correctif de prefetch ARM s'applique aussi au
+   chemin serie (2,03 s -> 1,32 s sur chr21 d'apres la PR). Le gain arrive sans rien changer ; seul
+   le passage a `libsais64_omp` demande un minimum explicite.
+2. **Sur la 0.2 publiee, appeler l'entree `omp` est une REGRESSION** : chr21 passe de 2,80 s / 4,20 s
+   (entree serie) a 3,61 s / 6,10 s a 8 threads. Le changement d'appel doit donc accompagner le bump
+   0.3, jamais le preceder.
+
+Action a la sortie de **0.2.3** (la PR est mergee en amont le 2026-08-11, `main` porte deja
+0.2.3, mais crates.io s'arrete a 0.2.2) : bumper `libsais-rs`, remplacer `libsais64` par `libsais64_omp` avec le
+meme knob `BWA4_SA_THREADS`, remettre `default = ["libsais"]`, et **retirer le passthrough
+`libsais-c-omp`** livre plus haut, qui n'aura plus d'objet. Le gate est `scripts/index_diff.sh`.
+
+## L'oracle tiers couvre enfin les penalites de gap asymetriques (2026-08-12)
+
+`hyalite` 0.4.0 (2026-08-10) ajoute `Scoring::new_asymmetric`, ce qui leve une limitation que
+`tests/third_party_oracle.rs` documentait depuis sa creation :
+
+> *« hyalite carries a single gap-penalty pair, so it cannot express `o_del != o_ins`. The test
+> therefore runs symmetric penalties, which is bwa's default (`-O 6 -E 1`). »*
+
+Consequence : les bras **asymetriques** de `ksw_extend2` et du noyau de rescue n'avaient **aucun
+controle par un tiers**, alors que ce noyau fait 32 % du CPU d'un run paired-end et que `-O 6,7 -E 1,2`
+les atteint. Ils n'etaient valides que contre notre propre reference scalaire, c'est-a-dire contre du
+code qui partagerait une eventuelle mauvaise lecture de `ksw.cpp`, ce qui est precisement le trou que
+ce fichier existe pour fermer.
+
+Le risque de cet elargissement etait la **convention de direction** : se tromper de sens entre
+deletion et insertion ne casse que les schemas asymetriques, donc exactement ceux qu'on ajoute. La
+0.4 l'ecrit elle-meme, il n'y a rien a deviner : *« This maps onto bwa's `-O del,ins -E del,ins`
+(`ksw_extend2`): the `E` chain charges `(open_del, ext_del)`, the `F` chain `(open_ins, ext_ins)`. »*
+
+Le balayage passe de deux schemas a quatre, dont deux asymetriques (`(1,4,6,1,7,2)` et
+`(2,3,7,2,5,1)`), 300 paires chacun. **Le score concorde sur les quatre.**
+
+### Ce que l'elargissement a trouve, et qui n'est pas un bug
+
+Sur `A=2 B=3 O=7,5 E=2,1`, round 165 :
+
+| | score | qb | qe | tb | te |
+|---|---|---|---|---|---|
+| nous | 205 | **3** | 111 | **5** | 112 |
+| hyalite | 205 | **0** | 111 | **0** | 112 |
+
+Meme score, memes extremites de **fin**, debuts differents. Deux alignements locaux de score egal,
+celui de hyalite s'etendant plus a gauche. bwa recupere le debut par sa passe inverse `KSW_XSTART`,
+qui s'arrete des que le score avant est atteint ; une traceback ordinaire peut continuer a travers des
+cellules qui ne contribuent rien. Les penalites asymetriques creent ces egalites la ou le cas
+symetrique n'en produisait pas.
+
+Asserter l'egalite la-dessus testerait une **convention**, pas un calcul. Les spans et le quadruplet
+`(score, te, score2, te2)` restent donc compares sur les schemas **symetriques** seulement, ou ils
+etaient verifies 499/499 ; le **score** l'est sur les quatre, et c'est lui qui pilote `csub`, la MAPQ
+et chaque acceptation dans `mem_matesw`.
+
+### Verifie que le nouveau bras est vivant
+
+Une premiere tentative de mutation ne prouvait rien : changer le schema des deux cotes a la fois ne
+peut pas creer de desaccord. La bonne mutation perturbe **un seul** cote, `o_ins + 1` sur le notre :
+le test echoue alors des le round 58. Et l'echec de span cite plus haut porte sur le quatrieme
+schema, ce qui montre que les schemas asymetriques sont bien atteints.
 
 ## Ce qui reste
 

@@ -45,7 +45,8 @@
 //! | `OnceLock<bool>` + `.get_or_init(...)` | a slot filled at most once, on first use, from any thread. It is what turns the environment lookup into a single read for the whole process, so a disabled probe costs a cached bool load rather than a `getenv` at every stage boundary. |
 //! | `const { ... }` in an array repeat | forces the repeated element to be built at compile time. It is what allows an array of `Cell`s to be declared, since `Cell` cannot be cloned the way an ordinary repeated initialiser would require. |
 
-use std::cell::Cell;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -102,13 +103,21 @@ const NAMES: [&str; N_STAGES] = [
 /// that forgets to add its name fails to compile rather than printing a wrong label.
 const N_STAGES: usize = 9;
 
-thread_local! {
-    /// Nanoseconds accumulated per stage, for THIS thread. Only the main thread ever writes here
-    /// (see the module docs), so a `Cell` is enough and there is no synchronization at all.
-    static NS: [Cell<u64>; N_STAGES] = const { [const { Cell::new(0) }; N_STAGES] };
-    /// Batches this thread has seen, so the table can print a per-batch mean.
-    static BATCHES: Cell<u64> = const { Cell::new(0) };
-}
+/// Nanoseconds accumulated per stage, across every thread.
+///
+/// This used to be a `thread_local`, on the belief that only the main thread records. That was
+/// wrong and it silently lost almost everything: `run_pipeline` runs each batch's `process` on a
+/// `scope.spawn`ed thread, so every stage between `encode` and `sam_emit` was credited to a thread
+/// that then died, and the table showed only `wait_read`, `wait_write` and a giant `unaccounted`.
+/// A run that spent 95% of its time somewhere reported that somewhere as "index load, header,
+/// teardown".
+///
+/// Atomics rather than a lock: the probe is off unless `BWA4_STAGE_TIME` is set, and when it is on
+/// each stage costs one relaxed add per batch, not per read.
+static NS: [AtomicU64; N_STAGES] = [const { AtomicU64::new(0) }; N_STAGES];
+
+/// Batches processed, so the table can print a per-batch mean.
+static BATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether `BWA4_STAGE_TIME` is set. Read once and cached, matching `chain_time::enabled`: the
 /// variable cannot be toggled mid-process and the disabled path is one atomic load.
@@ -133,11 +142,7 @@ pub fn add(stage: Stage, elapsed: Duration) {
     if !enabled() {
         return;
     }
-    let idx = stage as usize;
-    NS.with(|ns| {
-        let cell = &ns[idx];
-        cell.set(cell.get().saturating_add(elapsed.as_nanos() as u64));
-    });
+    NS[stage as usize].fetch_add(elapsed.as_nanos() as u64, Relaxed);
 }
 
 /// Time `f` and credit it to `stage`, returning whatever `f` returned.
@@ -172,7 +177,7 @@ pub fn count_batch() {
     if !enabled() {
         return;
     }
-    BATCHES.with(|b| b.set(b.get().saturating_add(1)));
+    BATCHES.fetch_add(1, Relaxed);
 }
 
 /// Print the per-stage table to stderr, once, at the end of a run. A no-op unless [`enabled`].
@@ -190,8 +195,8 @@ pub fn dump(total_wall: Duration) {
         return;
     }
     // Per-stage seconds, snapshotted together so the table is internally consistent.
-    let secs: [f64; N_STAGES] = NS.with(|ns| std::array::from_fn(|i| ns[i].get() as f64 / 1e9));
-    let batches = BATCHES.with(Cell::get).max(1);
+    let secs: [f64; N_STAGES] = std::array::from_fn(|i| NS[i].load(Relaxed) as f64 / 1e9);
+    let batches = BATCHES.load(Relaxed).max(1);
     let wall = total_wall.as_secs_f64().max(1e-9);
     // Everything the batch loop accounted for; the remainder is startup (index load) and teardown.
     let accounted: f64 = secs.iter().sum();
@@ -215,8 +220,12 @@ pub fn dump(total_wall: Duration) {
             1e3 * secs[i] / batches as f64,
         );
     }
+    // Stages OVERLAP `wait_read`: the pipeline spawns batch N's `process` and immediately waits
+    // for batch N+1, so the two run at once and the column can sum past 100%. The remainder is
+    // therefore signed: positive means startup and teardown (chiefly the index load), negative
+    // means the overlap exceeded them.
     eprintln!(
-        "[stage-time] {:>13}  {:>9.3}  {:>6.1}%  (index load, header, teardown)",
+        "[stage-time] {:>13}  {:>9.3}  {:>6.1}%  (index load, header, teardown, minus overlap)",
         "unaccounted",
         wall - accounted,
         100.0 * (wall - accounted) / wall,

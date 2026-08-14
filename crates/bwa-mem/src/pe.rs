@@ -2351,7 +2351,7 @@ pub fn mem_sam_pe<W: Write>(
     opt: &MemOpt,
     pes: &[PeStat; 4],
     id: u64,
-    names: &[String; 2],
+    names: &[&str; 2],
     seqs: &[&[u8]; 2],
     quals: &[Option<&[u8]>; 2],
     comments: &[Option<&str>; 2],
@@ -2639,7 +2639,7 @@ pub fn mem_sam_pe<W: Write>(
                 for which in 0..aa0.len() {
                     mem_aln2sam(
                         bns,
-                        &names[0],
+                        names[0],
                         seqs[0],
                         quals[0],
                         comments[0],
@@ -2654,7 +2654,7 @@ pub fn mem_sam_pe<W: Write>(
                 for which in 0..aa1.len() {
                     mem_aln2sam(
                         bns,
-                        &names[1],
+                        names[1],
                         seqs[1],
                         quals[1],
                         comments[1],
@@ -2748,7 +2748,7 @@ pub fn mem_sam_pe<W: Write>(
         fm,
         bns,
         opt,
-        &names[0],
+        names[0],
         seqs[0],
         quals[0],
         comments[0],
@@ -2762,7 +2762,7 @@ pub fn mem_sam_pe<W: Write>(
         fm,
         bns,
         opt,
-        &names[1],
+        names[1],
         seqs[1],
         quals[1],
         comments[1],

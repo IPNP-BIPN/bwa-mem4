@@ -73,23 +73,49 @@
 //!    bwa's DNA matrix is symmetric, so the transposition is a no-op here; it is written out anyway
 //!    so a future asymmetric matrix does not silently transpose.
 //!
-//! hyalite carries a single gap-penalty pair, so it cannot express `o_del != o_ins`. The test
-//! therefore runs symmetric penalties, which is bwa's default (`-O 6 -E 1`).
+//! 3. **Gap direction.** bwa charges deletions (a gap in the query) with `o_del`/`e_del` and
+//!    insertions (a gap in the target) with `o_ins`/`e_ins`. hyalite 0.4 states the correspondence
+//!    itself, which is why this test can rely on it rather than guess: "This maps onto bwa's
+//!    `-O del,ins -E del,ins` (`ksw_extend2`): the `E` chain charges `(open_del, ext_del)`, the `F`
+//!    chain `(open_ins, ext_ins)`." Getting that backwards would fail only on asymmetric schemes,
+//!    which is exactly what this test now covers.
 //!
-//! Still true as of hyalite **0.3.0** (2026-08-09): `Scoring::new(alphabet_len, matrix, gap_open,
-//! gap_ext)` remains the only constructor, so asymmetric penalties are not expressible and this
-//! test's scope is unchanged. What 0.3.0 did bring is the two documentation corrections this
-//! project asked for upstream (`Psy-Fer/hyalite#2`): that the substitution matrix is indexed
-//! `[query][target]` rather than bwa's `[target][query]`, and that agreement with bwa's own
-//! `score2` holds only when the query length is a multiple of the SIMD width, because bwa's per-row
-//! maximum is not the DP's per-column maximum once the query profile is padded. Both are things
-//! this file had to discover the hard way; they are now stated in the dependency itself.
+//! **Asymmetric penalties are covered as of hyalite 0.4.0** (2026-08-10), which added
+//! `Scoring::new_asymmetric`. Until then the crate carried a single gap-penalty pair and could not
+//! express `o_del != o_ins`, so this test ran symmetric schemes only, which is bwa's default
+//! (`-O 6 -E 1`) but NOT what `-O 6,7 -E 1,2` reaches. That left the asymmetric arms of
+//! `ksw_extend2` and of the rescue kernel with no independent check at all, on a path measured at
+//! 32% of a paired-end run's CPU. The third scheme in the sweep below closes that hole.
+//!
+//! hyalite 0.3.0 had brought the two documentation corrections this project asked for upstream
+//! (`Psy-Fer/hyalite#2`): that the substitution matrix is indexed `[query][target]` rather than
+//! bwa's `[target][query]`, and that agreement with bwa's own `score2` holds only when the query
+//! length is a multiple of the SIMD width, because bwa's per-row maximum is not the DP's
+//! per-column maximum once the query profile is padded. Both are things this file had to discover
+//! the hard way; they are now stated in the dependency itself.
 
 /// ksw's SIMD width for the u8 kernel, and the modulus that decides whether a query needs padding.
 /// Not a tuning knob here: it is the number `ksw_qinit` rounds the profile up to.
 const LANES: usize = 16;
 
 use bwa_mem4_extend::ksw_align2;
+
+/// hyalite's scoring scheme for bwa's four gap penalties.
+///
+/// One place builds it so the `open = o + e` translation and the del/ins mapping are stated once.
+/// Both are load-bearing: the first is the Opal-vs-ksw gap convention, the second is upstream's
+/// documented correspondence between its `E`/`F` chains and bwa's `-O del,ins`.
+fn hyalite_scoring(mat: &[i8], o_del: i32, e_del: i32, o_ins: i32, e_ins: i32) -> Scoring {
+    Scoring::new_asymmetric(
+        5,
+        to_hyalite_matrix(mat, 5),
+        o_del + e_del,
+        e_del,
+        o_ins + e_ins,
+        e_ins,
+    )
+    .expect("bwa's matrix and penalties are a valid hyalite scoring scheme")
+}
 use hyalite::{align, align_pair, align_pair_position_max, Mode, Scoring, SearchType};
 
 /// bwa's default DNA matrix, built as `bwa_fill_scmat` does.
@@ -143,7 +169,16 @@ fn to_hyalite_matrix(mat: &[i8], m: usize) -> Vec<i32> {
 ///
 /// # Returns
 /// `KswAlignResult::score`, the only field this test compares.
-fn our_score(query: &[u8], target: &[u8], mat: &[i8], o: i32, e: i32) -> i32 {
+#[allow(clippy::too_many_arguments)]
+fn our_score(
+    query: &[u8],
+    target: &[u8],
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+) -> i32 {
     // `minsc = i32::MAX` suppresses the 2nd-best tracker (nothing can clear it), and `lanes` only
     // sets the query-profile padding, which is observable in `score2` and never in `score`.
     ksw_align2(
@@ -151,10 +186,10 @@ fn our_score(query: &[u8], target: &[u8], mat: &[i8], o: i32, e: i32) -> i32 {
         target,
         5,
         mat,
-        o,
-        e,
-        o,
-        e,
+        o_del,
+        e_del,
+        o_ins,
+        e_ins,
         i32::MAX,
         i32::from(mat[0]),
         16,
@@ -167,10 +202,19 @@ fn our_score(query: &[u8], target: &[u8], mat: &[i8], o: i32, e: i32) -> i32 {
 /// # Returns
 /// `BestHit::score` from `Mode::Sw` (the only local mode it offers), under the translated gap
 /// convention described in the module docs.
-fn oracle_score(query: &[u8], target: &[u8], mat: &[i8], o: i32, e: i32) -> i32 {
-    // `open = o + e` and `ext = e`: hyalite charges `open + (n-1)*ext` where we charge `o + n*e`.
-    let scoring = Scoring::new(5, to_hyalite_matrix(mat, 5), o + e, e)
-        .expect("bwa's matrix and penalties are a valid hyalite scoring scheme");
+#[allow(clippy::too_many_arguments)]
+fn oracle_score(
+    query: &[u8],
+    target: &[u8],
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+) -> i32 {
+    // `open = o + e` and `ext = e`, PER DIRECTION: hyalite charges `open + (n-1)*ext` where we
+    // charge `o + n*e`, and its `(open_del, ext_del)` drives the same `E` chain as bwa's `-O del`.
+    let scoring = hyalite_scoring(mat, o_del, e_del, o_ins, e_ins);
     align_pair(query, target, &scoring, Mode::Sw, SearchType::Score)
         .expect("codes are all inside the 5-symbol alphabet")
         .score
@@ -185,12 +229,15 @@ fn oracle_score(query: &[u8], target: &[u8], mat: &[i8], o: i32, e: i32) -> i32 
 ///
 /// # Returns
 /// `(score, te, score2, te2)`, the four fields hyalite 0.2 can now be asked about.
+#[allow(clippy::too_many_arguments)]
 fn ours_with_score2(
     query: &[u8],
     target: &[u8],
     mat: &[i8],
-    o: i32,
-    e: i32,
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
     minsc: i32,
 ) -> (i32, i32, i32, i32) {
     let r = ksw_align2(
@@ -198,10 +245,10 @@ fn ours_with_score2(
         target,
         5,
         mat,
-        o,
-        e,
-        o,
-        e,
+        o_del,
+        e_del,
+        o_ins,
+        e_ins,
         minsc,
         i32::from(mat[0]),
         16,
@@ -214,16 +261,18 @@ fn ours_with_score2(
 /// # Returns
 /// `(score, te, score2, te2)` in our conventions: `te`/`te2` are 0-based target columns, and a
 /// missing second-best is `-1` in both fields, which is what `ksw_align2` reports.
+#[allow(clippy::too_many_arguments)]
 fn oracle_with_score2(
     query: &[u8],
     target: &[u8],
     mat: &[i8],
-    o: i32,
-    e: i32,
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
     minsc: i32,
 ) -> (i32, i32, i32, i32) {
-    let scoring = Scoring::new(5, to_hyalite_matrix(mat, 5), o + e, e)
-        .expect("bwa's matrix and penalties are a valid hyalite scoring scheme");
+    let scoring = hyalite_scoring(mat, o_del, e_del, o_ins, e_ins);
     // `colmax[t]` = best local score ending at target column `t`, from hyalite's own DP.
     let mut colmax: Vec<i32> = Vec::new();
     let hit = align_pair_position_max(query, target, &scoring, &mut colmax)
@@ -254,9 +303,15 @@ fn oracle_with_score2(
 /// the matrix are covered.
 #[test]
 fn local_sw_score_matches_independent_implementation() {
-    // bwa's `-A 1 -B 4 -O 6 -E 1`, plus a second scheme so the check is not tied to one point in
-    // parameter space.
-    for &(a, b, o, e) in &[(1i8, 4i8, 6i32, 1i32), (2, 3, 5, 2)] {
+    // bwa's `-A 1 -B 4 -O 6 -E 1`, a second symmetric scheme so the check is not tied to one point
+    // in parameter space, and two ASYMMETRIC ones (`o_del != o_ins`, `e_del != e_ins`), which no
+    // third party could check before hyalite 0.4.0 and which `-O 6,7 -E 1,2` reaches in practice.
+    for &(a, b, o_del, e_del, o_ins, e_ins) in &[
+        (1i8, 4i8, 6i32, 1i32, 6i32, 1i32),
+        (2, 3, 5, 2, 5, 2),
+        (1, 4, 6, 1, 7, 2),
+        (2, 3, 7, 2, 5, 1),
+    ] {
         let mat = bwa_matrix(a, b);
         // Deterministic LCG (Numerical Recipes 64-bit constants), top 31 bits taken so the
         // low-order-bit weakness never reaches the small moduli below. Fixed seed: a failure is
@@ -307,14 +362,28 @@ fn local_sw_score_matches_independent_implementation() {
                 }
             }
 
-            let ours = our_score(&q, &t, &mat, o, e);
-            let theirs = oracle_score(&q, &t, &mat, o, e);
+            let ours = our_score(&q, &t, &mat, o_del, e_del, o_ins, e_ins);
+            let theirs = oracle_score(&q, &t, &mat, o_del, e_del, o_ins, e_ins);
             assert_eq!(
                 ours, theirs,
-                "local SW score disagrees with hyalite at A={a} B={b} O={o} E={e} round {round}, \
-                 qlen={qlen} tlen={tlen}"
+                "local SW score disagrees with hyalite at A={a} B={b} \
+                 O={o_del},{o_ins} E={e_del},{e_ins} round {round}, qlen={qlen} tlen={tlen}"
             );
 
+            // Spans and the second-best quadruple are compared on SYMMETRIC schemes only.
+            //
+            // Not a limitation of hyalite 0.4 but of what "the" alignment means: with `o_del !=
+            // o_ins` two alignments of equal score can differ in where they START, and the two
+            // implementations then pick different ones. Observed at `A=2 B=3 O=7,5 E=2,1`, round
+            // 165: both report score 205 and the same ENDS (qe=111, te=112), ours starting at
+            // (qb=3, tb=5) and hyalite's at (0, 0). bwa recovers the start with the `KSW_XSTART`
+            // reverse pass, which stops as soon as the forward score is reached; a plain traceback
+            // may keep walking through cells that contribute nothing. Asserting equality there
+            // would test a convention, not a computation.
+            //
+            // The SCORE is compared on all four schemes, which is the coverage this widening was
+            // for: it is what drives `csub`, MAPQ and every accept/reject in `mem_matesw`.
+            let symmetric = o_del == o_ins && e_del == e_ins;
             // The mate-rescue quadruple, on the lane-aligned queries only (see the module docs for
             // why ragged ones are not comparable). `minsc` is bwa's own threshold for a rescue to
             // count, `min_seed_len * a` at the defaults, so the second-best tracker is exercised in
@@ -322,11 +391,22 @@ fn local_sw_score_matches_independent_implementation() {
             let minsc = 19 * i32::from(a);
             // Span endpoints, on every length. `qb == -1` means the start-recovery pass did not run
             // (score below `minsc`), which is bwa's own behaviour and leaves nothing to compare.
-            {
-                let r = ksw_align2(&q, &t, 5, &mat, o, e, o, e, minsc, i32::from(mat[0]), 16);
+            if symmetric {
+                let r = ksw_align2(
+                    &q,
+                    &t,
+                    5,
+                    &mat,
+                    o_del,
+                    e_del,
+                    o_ins,
+                    e_ins,
+                    minsc,
+                    i32::from(mat[0]),
+                    16,
+                );
                 if r.qb >= 0 {
-                    let scoring = Scoring::new(5, to_hyalite_matrix(&mat, 5), o + e, e)
-                        .expect("bwa's matrix and penalties are a valid hyalite scoring scheme");
+                    let scoring = hyalite_scoring(&mat, o_del, e_del, o_ins, e_ins);
                     // `1 << 30` is the traceback's memory ceiling: generous, since these are test
                     // sized pairs, and an error here would mean the pair was too big rather than
                     // that anything disagreed.
@@ -341,29 +421,29 @@ fn local_sw_score_matches_independent_implementation() {
                             al.target_start as i32,
                             al.target_end as i32 - 1
                         ),
-                        "alignment span disagrees with hyalite at A={a} B={b} O={o} E={e} \
+                        "alignment span disagrees with hyalite at A={a} B={b} O={o_del},{o_ins} E={e_del},{e_ins} \
                          round {round}, qlen={qlen} tlen={tlen}"
                     );
                     checked_spans += 1;
                 }
             }
-            if qlen.is_multiple_of(LANES) {
-                let ours4 = ours_with_score2(&q, &t, &mat, o, e, minsc);
-                let theirs4 = oracle_with_score2(&q, &t, &mat, o, e, minsc);
+            if symmetric && qlen.is_multiple_of(LANES) {
+                let ours4 = ours_with_score2(&q, &t, &mat, o_del, e_del, o_ins, e_ins, minsc);
+                let theirs4 = oracle_with_score2(&q, &t, &mat, o_del, e_del, o_ins, e_ins, minsc);
                 assert_eq!(
                     ours4, theirs4,
-                    "(score, te, score2, te2) disagrees with hyalite at A={a} B={b} O={o} E={e} \
+                    "(score, te, score2, te2) disagrees with hyalite at A={a} B={b} O={o_del},{o_ins} E={e_del},{e_ins} \
                      round {round}, qlen={qlen} tlen={tlen}"
                 );
                 checked_quadruples += 1;
             }
         }
         assert!(
-            checked_quadruples > 0,
+            !(o_del == o_ins && e_del == e_ins) || checked_quadruples > 0,
             "no lane-aligned query was generated at A={a} B={b}, so score2 went unchecked"
         );
         assert!(
-            checked_spans > 0,
+            !(o_del == o_ins && e_del == e_ins) || checked_spans > 0,
             "no pair cleared minsc at A={a} B={b}, so the span endpoints went unchecked"
         );
     }

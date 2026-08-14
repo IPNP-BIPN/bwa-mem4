@@ -165,7 +165,7 @@ pub fn run(
         loop {
             let more = match reader.next_record()? {
                 Some(rec) => {
-                    batch_bases += rec.seq.len();
+                    batch_bases += rec.seq().len();
                     batch.push(rec);
                     batch_bases < BATCH_BASES
                 }
@@ -225,15 +225,12 @@ fn map_batch(
                 // path); rammap's formatter wants `&str`. FASTQ quality is printable ASCII by
                 // definition, so this is lossless; a malformed file that is not gets its QUAL
                 // dropped rather than the run aborted.
-                let qual = rec
-                    .qual
-                    .as_deref()
-                    .and_then(|q| std::str::from_utf8(q).ok());
+                let qual = rec.qual().and_then(|q| std::str::from_utf8(q).ok());
                 let read = ReadInfo {
-                    qname: &rec.name,
-                    qseq: &rec.seq,
+                    qname: rec.name(),
+                    qseq: rec.seq(),
                     qual,
-                    comment: rec.comment.as_deref(),
+                    comment: rec.comment(),
                     n_seg: 1,
                     seg_idx: 0,
                 };

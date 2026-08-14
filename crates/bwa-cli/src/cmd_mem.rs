@@ -1936,6 +1936,12 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // The channel is bounded at the same readahead depth as before, so the reader still cannot
     // accumulate batches while the index loads: it fills the queue and blocks. Output is unaffected,
     // since the batches, their order and their base ids are identical either way.
+    // Decoder budget for gzipped input, set from `-t` before the first file is opened. Halved per
+    // file inside, since a paired-end run opens two. Spending threads here is free where it counts:
+    // during the first batch no worker has anything to do yet.
+    #[cfg(feature = "parallel-gzip")]
+    bwa_io::fastq::set_gzip_threads(pool_threads);
+
     let paired = args.reads2.is_some() || args.smart_pairing;
     let (pe_batch_rx, se_batch_rx, reader) = if paired {
         let (rx, h) = spawn_reader(pe_read_batches(
@@ -2122,7 +2128,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         let all_codes: Vec<Vec<u8>> = stage_time::measure(Stage::Encode, || {
             batch
                 .par_iter()
-                .map(|rec| rec.seq.iter().map(|&base| dna::nt4(base)).collect())
+                .map(|rec| rec.seq().iter().map(|&base| dna::nt4(base)).collect())
                 .collect()
         });
         // Per-read candidate alignments BEFORE dedup and primary marking, also parallel to `batch`.
@@ -2265,7 +2271,7 @@ fn finish_se(
 ) -> Vec<u8> {
     // ---- Deduplicate overlapping candidate regions, then mark which is primary ----
     if dump_regs_enabled() {
-        eprintln!("=== read {} ===", rec.name);
+        eprintln!("=== read {} ===", rec.name());
         bwa_mem::dump_regs(bns, "pre-dedup", &regs_pre);
     }
     // The read's regions after redundant ones have been merged away, sorted, and then annotated by
@@ -2362,14 +2368,8 @@ fn finish_se(
     // This read's SAM text, the function's return value.
     let mut buf = Vec::new();
     if alns.is_empty() {
-        sam::write_unmapped(
-            &mut buf,
-            &rec.name,
-            &rec.seq,
-            rec.qual.as_deref(),
-            rec.comment.as_deref(),
-        )
-        .expect("write to Vec");
+        sam::write_unmapped(&mut buf, rec.name(), rec.seq(), rec.qual(), rec.comment())
+            .expect("write to Vec");
         return buf;
     }
     for which in 0..alns.len() {
@@ -2486,7 +2486,7 @@ fn write_aln_se(
     // and any soft-clipping record, stores all of it) and is narrowed below only when hard clipping
     // applies. Invariant: `0 <= qb <= qe <= rec.seq.len()`, and it indexes `rec.seq`/`rec.qual`
     // BEFORE any reverse-complementing.
-    let (mut qb, mut qe) = (0usize, rec.seq.len());
+    let (mut qb, mut qe) = (0usize, rec.seq().len());
     if clip_ends {
         // The two end ops. For a single-op cigar these are the same entry, and the two `if`s below
         // would both fire on it; that mirrors the C.
@@ -2588,7 +2588,7 @@ fn write_aln_se(
     }
     // `-C`: bwa appends the FASTQ comment after everything else.
     if bwa_core::rg::copy_comment() {
-        if let Some(comment) = &rec.comment {
+        if let Some(comment) = rec.comment() {
             tags.push('\t');
             tags.push_str(comment);
         }
@@ -2611,21 +2611,21 @@ fn write_aln_se(
         (b"*".to_vec(), None)
     } else if aln.is_rev {
         // Reversed but NOT complemented: a Phred score has no complement.
-        let reversed_qual = rec.qual.as_ref().map(|quals| {
+        let reversed_qual = rec.qual().map(|quals| {
             let mut sliced = quals[qb..qe].to_vec();
             sliced.reverse();
             sliced
         });
-        (dna::revcomp_ascii(&rec.seq[qb..qe]), reversed_qual)
+        (dna::revcomp_ascii(&rec.seq()[qb..qe]), reversed_qual)
     } else {
         (
-            rec.seq[qb..qe].to_vec(),
-            rec.qual.as_ref().map(|quals| quals[qb..qe].to_vec()),
+            rec.seq()[qb..qe].to_vec(),
+            rec.qual().map(|quals| quals[qb..qe].to_vec()),
         )
     };
     sam::write_mapped_se(
         buf,
-        &rec.name,
+        rec.name(),
         flag,
         rname,
         aln.pos + 1,
@@ -2756,7 +2756,7 @@ fn run_pe(
                     .map(|i| {
                         stage_time::barrier::worker(|| {
                             let (rec1, rec2) = &batch[i >> 1];
-                            let seq = if i & 1 == 0 { &rec1.seq } else { &rec2.seq };
+                            let seq = if i & 1 == 0 { rec1.seq() } else { rec2.seq() };
                             seq.iter().map(|&base| dna::nt4(base)).collect()
                         })
                     })
@@ -2796,8 +2796,13 @@ fn run_pe(
         // because mate rescue writes new regions into it and `mem_sam_pe` then rewrites them again.
         let mut prepared: Vec<PrepPair> = stage_time::measure(Stage::DedupPrep, || {
             stage_time::barrier::region(Stage::DedupPrep, || {
+                // `into_par_iter`, not `par_iter`: `batch` is dead after this stage, so the six
+                // per-pair fields below are MOVED out of the records instead of cloned. At 1M pairs
+                // that is six million allocations and about 376 MB of copying removed from a
+                // parallel stage. Indexed either way, so the order is unchanged and so is the
+                // output.
                 batch
-                    .par_iter()
+                    .into_par_iter()
                     .zip(paired.into_par_iter())
                     .map(
                         |((rec1, rec2), ((codes1, codes2), (regs_pre1, regs_pre2)))| {
@@ -2812,12 +2817,8 @@ fn run_pe(
                                     codes2,
                                     regs1,
                                     regs2,
-                                    name1: rec1.name.clone(),
-                                    name2: rec2.name.clone(),
-                                    qual1: rec1.qual.clone(),
-                                    qual2: rec2.qual.clone(),
-                                    comment1: rec1.comment.clone(),
-                                    comment2: rec2.comment.clone(),
+                                    rec1,
+                                    rec2,
                                 }
                             })
                         },
@@ -2902,10 +2903,10 @@ fn run_pe(
                         stage_time::barrier::worker(|| {
                             // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
                             // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
-                            let names = [pair.name1.clone(), pair.name2.clone()];
+                            let names = [pair.rec1.name(), pair.rec2.name()];
                             let seqs = [pair.codes1.as_slice(), pair.codes2.as_slice()];
-                            let quals = [pair.qual1.as_deref(), pair.qual2.as_deref()];
-                            let comments = [pair.comment1.as_deref(), pair.comment2.as_deref()];
+                            let quals = [pair.rec1.qual(), pair.rec2.qual()];
+                            let comments = [pair.rec1.comment(), pair.rec2.comment()];
                             // This pair's SAM text.
                             let mut buf = Vec::new();
                             mem_sam_pe(
@@ -3056,17 +3057,20 @@ struct PrepPair {
     /// more: mate rescue may append to them, then `mem_sam_pe` marks primaries and pairs them.
     regs1: Vec<MemAlnReg>,
     regs2: Vec<MemAlnReg>,
-    /// Each mate's QNAME, cloned from the FASTQ record. bwa emits the SAME name on both records of
-    /// a pair, so any `/1`, `/2` suffix has already been stripped by the reader.
-    name1: String,
-    name2: String,
-    /// Each mate's per-base ASCII qualities, or `None` for FASTA input (SAM column 11 becomes `*`).
-    /// Always the same length as the corresponding `codes` when present.
-    qual1: Option<Vec<u8>>,
-    qual2: Option<Vec<u8>>,
-    /// `-C`: the FASTQ comment of each mate, appended at the end of its record.
-    comment1: Option<String>,
-    comment2: Option<String>,
+    /// The two input records, MOVED out of the batch rather than copied field by field.
+    ///
+    /// This used to be six owned fields (`name1/2`, `qual1/2`, `comment1/2`) cloned out of the
+    /// records, which is six allocations per pair. Since `Record` became one buffer plus offsets
+    /// the whole record is 32 bytes and moving it is strictly cheaper than copying any one of its
+    /// parts. `seq` rides along unused here (the stage works on `codes`), which costs nothing: the
+    /// bytes were going to be freed at the end of the batch either way.
+    ///
+    /// `name()` is the QNAME: bwa emits the SAME name on both records of a pair, so any `/1`, `/2`
+    /// suffix has already been stripped by the reader. `qual()` is the per-base ASCII quality, or
+    /// `None` for FASTA input (SAM column 11 becomes `*`), always as long as the corresponding
+    /// `codes`. `comment()` is the `-C` trailer.
+    rec1: Record,
+    rec2: Record,
 }
 
 #[cfg(test)]
