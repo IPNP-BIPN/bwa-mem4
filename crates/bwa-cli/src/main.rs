@@ -27,9 +27,9 @@ use clap::{Parser, Subcommand};
 // `-Cprofile-generate` on macOS 14 arm64. The instrumented binary segfaults inside mimalloc's arena
 // allocator on a spawned thread (`mi_bchunk_try_find_and_clearNX`, EXC_BAD_ACCESS), which broke the
 // release workflow's PGO training step on every run from 2026-08-11. The SHIPPED artefact is not
-// affected: the same fixture through the plain build passes on the same runner, which is what
-// `release.yml` now checks before the instrumented one. mimalloc 0.1.49 is the latest published, so
-// there is no upgrade to take.
+// affected: a temporary diagnostic in that job ran the same fixture through the plain build on the
+// same runner and it passed, so the fault needs `-Cprofile-generate`. mimalloc 0.1.49 is the latest
+// published, so there is no upgrade to take.
 //
 // Turning it off for the TRAINING build only is sound: PGO records which branches this crate's own
 // code takes, and the hot loops (seeding, chaining, the DP kernels) do not allocate. The final

@@ -188,47 +188,8 @@ jobs:
           # is untouched: the byte-identity gate below rebuilds it again and must not find leftovers.
           cp testdata/tiny/tiny.fa "$PROFDIR/train/"
           python3 scripts/make_test_reads.py testdata/tiny/tiny.fa "$PROFDIR/train/r" --n 8000
-          # DIAGNOSTIC (temporary, see PR #60): `index` segfaults here on macos-14 arm64 and only
-          # there, on every run since 2026-08-11 while every run up to the v4.3.0 tag passed. The
-          # crash report named the fault: mimalloc's arena allocator,
-          # `mi_bchunk_try_find_and_clearNX`, EXC_BAD_ACCESS on a spawned thread. mimalloc itself is
-          # unchanged since v4.3.0 (libmimalloc-sys 0.1.49 in both lockfiles), so the trigger is
-          # elsewhere and the question that matters is no longer about CI: does the SHIPPED,
-          # uninstrumented binary crash on macOS 14 too? The step below answers it before the PGO
-          # build so a failure cannot hide behind instrumentation.
-          run_step() {
-            "$@" && return 0
-            rc=$?
-            echo "::group::diagnostic for exit $rc"
-            uname -a; sw_vers 2>/dev/null || true
-            echo "--- ulimit"; ulimit -a
-            echo "--- crash reports"
-            sleep 5
-            for d in "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports; do
-              [ -d "$d" ] || continue
-              for f in $(ls -t "$d" 2>/dev/null | head -3); do
-                echo "===== $d/$f"; head -c 8000 "$d/$f"; echo
-              done
-            done
-            echo "::endgroup::"
-            return $rc
-          }
-          # Is the plain release binary affected, or only the instrumented one? This is the
-          # artefact users get, so a crash here is a shipping defect rather than a CI annoyance.
-          echo "::group::plain (uninstrumented) build, same fixture"
-          cargo build --release --locked
-          cp testdata/tiny/tiny.fa "$PROFDIR/plain_tiny.fa"
-          if ./target/release/bwa-mem4 index "$PROFDIR/plain_tiny.fa"; then
-            echo "PLAIN BINARY: index OK"
-          else
-            echo "PLAIN BINARY: index FAILED with $?  <-- the shipped artefact is affected"
-          fi
-          echo "::endgroup::"
-
-          # Rebuild instrumented, since the plain build above overwrote the binary.
-          RUSTFLAGS="-Cprofile-generate=$PROFDIR" cargo build --release --locked
-          run_step ./target/release/bwa-mem4 index "$PROFDIR/train/tiny.fa"
-          run_step ./target/release/bwa-mem4 mem -t 2 "$PROFDIR/train/tiny.fa" \
+          ./target/release/bwa-mem4 index "$PROFDIR/train/tiny.fa"
+          ./target/release/bwa-mem4 mem -t 2 "$PROFDIR/train/tiny.fa" \
               "$PROFDIR/train/r_1.fq" "$PROFDIR/train/r_2.fq" > /dev/null
 
           PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)
