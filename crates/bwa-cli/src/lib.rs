@@ -9,11 +9,17 @@
 //! use bwa_mem4::cmd_mem::{run, MemArgs};
 //!
 //! let args = MemArgs {
-//!     index: "hg38".into(),
-//!     reads: vec!["R1.fq.gz".into(), "R2.fq.gz".into()],
+//!     // The prefix passed to `bwa-mem4 index`, i.e. the FASTA path itself.
+//!     index_prefix: "hg38.fa".into(),
+//!     reads: "R1.fq.gz".into(),
+//!     // Present means paired-end, exactly as a second positional does on the
+//!     // command line. Leave it `None` for single-end.
+//!     reads2: Some("R2.fq.gz".into()),
 //!     threads: 8,
 //!     ..Default::default()
 //! };
+//! // `argv` is what lands in the SAM `@PG CL:` record, nothing more: it is
+//! // provenance for the file, not a second source of options.
 //! run(args, &["bwa-mem4".to_string(), "mem".to_string()])?;
 //! # Ok::<(), anyhow::Error>(())
 //! ```

@@ -174,7 +174,14 @@ const CIGAR_LEN_SHIFT: u32 = 4;
 ///
 /// Two accepted options are inert and marked NO-OP at their fields: `-j` and `-v`. Both are inert
 /// for reasons that cannot affect SAM bytes, explained there.
-#[derive(Args)]
+// `Default` is for embedders, not for the CLI: clap fills every field from the command line, but a
+// caller using this crate as a library has no command line and would otherwise have to name all
+// forty-odd fields to set two of them. The only field carrying a clap default is `-t`
+// (`default_value_t = 1`), and `Default` gives 0 there rather than 1; that is harmless because
+// `run` clamps with `args.threads.max(1)`, so both routes start one thread when nothing asks for
+// more. Every other field's clap behaviour when absent IS its `Default`, since they are `Option`
+// or `bool`.
+#[derive(Args, Default)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
 pub struct MemArgs {
     // `-t INT` -> `opt->n_threads` (`fastmap.cpp:672`). Default 1, clamped to >= 1 by both
