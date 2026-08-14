@@ -168,19 +168,27 @@ jobs:
           # whichever runner image happens to be current. It reaches the vendored htslib C build
           # too, which is the part that would otherwise silently follow the host.
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+          # Keeps the PGO flags away from the C compiler, in both directions. `cc` inherits
+          # `-Cprofile-generate` / `-Cprofile-use` out of CARGO_ENCODED_RUSTFLAGS and forwards them
+          # to the C toolchain on purpose, reasoning that "clang and rustc both internally use
+          # llvm". That holds only while the two LLVMs agree, and here they do not: the profile
+          # runtime linked into the binary is rustc's (LLVM 22.1 at 1.96.1) while the counters in
+          # the C objects are the runner's Apple clang (15.0 on the macos-14 image). The result was
+          # a SIGSEGV in `__llvm_profile_instrument_target`, reached from the vendored C libsais
+          # during `index`, and before that from mimalloc's arena allocator: any C dependency will
+          # do, the victim is whichever one allocates first. `cc` appends the environment's CFLAGS
+          # last, "to allow these to override everything else", so these cancel the flags it
+          # inserted. Nothing about the Rust instrumentation changes, and the profile is for this
+          # project's Rust code, which is the only code PGO here is meant to speed up.
+          CFLAGS: -fno-profile-generate -fno-profile-use
+          CXXFLAGS: -fno-profile-generate -fno-profile-use
         run: |
           set -euo pipefail
           PROFDIR="$PWD/target/pgo"
           rm -rf "$PROFDIR"
           mkdir -p "$PROFDIR/train"
 
-          # `--no-default-features --features fast-gzip,parallel-gzip` is the default set MINUS
-          # mimalloc: an instrumented build with it segfaults on macOS 14 arm64 inside the arena
-          # allocator. The profile is unaffected in substance, since PGO records which branches this
-          # crate's code takes and the hot loops do not allocate; the optimised build below keeps
-          # mimalloc and consumes that profile.
-          RUSTFLAGS="-Cprofile-generate=$PROFDIR" cargo build --release --locked \
-              --no-default-features --features fast-gzip,parallel-gzip
+          RUSTFLAGS="-Cprofile-generate=$PROFDIR" cargo build --release --locked
 
           # Training workload, from committed data only: build the index, then align paired reads
           # simulated from it. Both halves matter, since `index` and `mem` share the FM code but
