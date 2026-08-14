@@ -74,6 +74,12 @@ flate2 = { version = "1.1", optional = true, default-features = false, features 
 rapidgzip-core = { version = "0.3.1", optional = true }
 
 [features]
+# xz-compressed FASTQ input, through needletail. ON by default, so the binary
+# reads exactly what it read before. Turning default features off drops the
+# `liblzma` dependency and with it the `links = "lzma"` clash against `lzma-sys`
+# (`zip`/`xz2`, `hts-sys`), which is what lets a library consumer that already
+# links one of those depend on this crate at all.
+xz-input = ["needletail/xz2"]
 # NOT defaulted here on purpose: the binary crate (bwa-cli) owns the default, so that a
 # `cargo build -p bwa-mem4 --no-default-features` can actually reach back and turn it off. A default
 # here would be un-disableable from the binary's build line, since bwa-cli takes bwa-io with its
