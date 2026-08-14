@@ -11,6 +11,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[lib]
+name = "bwa_mem4"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bwa-mem4"
 path = "src/main.rs"

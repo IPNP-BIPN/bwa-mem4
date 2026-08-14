@@ -25,10 +25,10 @@ use clap::{Parser, Subcommand};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod cmd_index;
-mod cmd_longread;
-mod cmd_mem;
-mod stage_time;
+// The command implementations live in the library target so an embedder can
+// call them without spawning this binary. Declared there, used here, so there
+// is exactly one copy of each.
+use bwa_mem4::{cmd_index, cmd_mem};
 
 // Top-level parsed command line. Holds nothing but the chosen subcommand: every real option lives
 // on `cmd_index::IndexArgs` or `cmd_mem::MemArgs`.
