@@ -3,7 +3,7 @@
 Une phase = une branche. Commits frequents ; PR vers `dev`, `dev` promu sur `main` a la release.
 Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.3 patche (oracle).
 
-**Version courante : 4.3.1.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
+**Version courante : 4.3.2.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
 mesures : chaque phase garde son resultat, y compris les negatifs, pour ne pas re-instruire deux fois
 la meme idee.
 
@@ -26,7 +26,7 @@ rapprochees.
 | 9b | `phase9b-gpu` | backend Metal du SW | **abandonnee**, backend retire (voir plus bas) |
 | 9c-9e | | recurrence bandedSWA, prefetch de seeding, vague perf | fait |
 | 10 | | ALT contigs, BAM/CRAM, CI, packaging, release 4.0.0 | fait |
-| 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | a faire, jalon v4.3.3 |
+| 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | a faire, jalon v4.3.4 |
 
 ## Releases
 
@@ -36,21 +36,26 @@ rapprochees.
 | 4.1.0 / 4.1.1 | 2026-07-23 | correctifs de release |
 | 4.2.0 | 2026-07-30 | vague perf (mate rescue, dedup, `.pac` vectorise, CaPS-SA), sonde par etage |
 | 4.3.0 | 2026-07-31 | `-x` route vers rammap, sous-commande `version`, credits bwa-mem3 / @nh13 |
-| 4.3.1 | 2026-08-04 | passe de documentation : couche mecanique Rust sur les 10 crates ; aucun changement de comportement |
+| 4.3.1 | 2026-08-14 | couche mecanique Rust sur les 10 crates (preparee le 2026-08-04, publiee ici) ; lecteur hors du chemin critique et entree FIFO reparee, lecture parallele des deux fichiers de mates, une allocation par read au lieu de trois, tri par longueur du lot de rescue, backend C libsais par defaut (+ OpenMP en option), PGO reparee sur macos-14 |
+| 4.3.2 | 2026-08-14 | cible bibliotheque : les implementations de commandes sont appelables sans sous-processus, et `MemArgs` derive `Default` pour etre constructible par un embarqueur |
 
 ## Jalons ouverts (GitHub Projects nº3)
 
 | Jalon | Contenu | Etat |
 |---|---|---|
-| v4.3.2 | parite perf x86_64 (issues #20, #25, #27, #32, #33) | ouvert |
-| v4.3.3 | phase 11, gate GIAB `hap.py`/`vcfeval` ; suivi upstream `bwa-mem2#297` | ouvert |
-| v4.3.4 | SA-IS parallele (l'indexeur reste mono-thread sur le tableau de suffixes), structure de dedup incrementale | ouvert |
+| v4.3.3 | parite perf x86_64 (issues #20, #25, #27, #32, #33) | ouvert |
+| v4.3.4 | phase 11, gate GIAB `hap.py`/`vcfeval` ; suivi upstream `bwa-mem2#297` | ouvert |
+| v4.3.5 | SA-IS parallele (l'indexeur reste mono-thread sur le tableau de suffixes), structure de dedup incrementale | ouvert |
+
+Les trois jalons ont recule d'un cran : 4.3.2 portait le nom du jalon perf x86_64 et a ete publiee
+avant lui, pour la cible bibliotheque. **Les milestones GitHub Projects portent encore les anciens
+numeros et restent a renommer a la main**, ce fichier ne les renomme pas.
 
 Les jalons avancent d'un cran sur le troisieme chiffre : une release courte et frequente plutot
 qu'un saut de version mineure a chaque lot. Le jalon perf x86_64 demande une machine x86_64 et un
 WGS complet, pas une mesure sur Apple Silicon.
 
-## Statut (4.3.1)
+## Statut (4.3.2)
 
 Parite mesuree sur un **WGS humain reel 32,9x** (GIAB HG002, 2x150), genome entier, pas un
 sous-echantillon, les deux aligneurs lisant le meme index sur disque (`scripts/giab30x_pe.sh`) :
@@ -204,7 +209,7 @@ backend de repli sans compilateur C.
 
 Tout le reste de `bwa-mem4 index` est deja parallele (rayon) : le pack `.pac`, la moitie complement
 inverse du `.0123`, la BWT, les blocs de checkpoints, le one-hot. Il ne restait que la construction
-du tableau de suffixes, qui est l'issue #37 et le jalon v4.3.4.
+du tableau de suffixes, qui est l'issue #37 et le jalon v4.3.5.
 
 `libsais-rs` expose `libsais64_omp(t, sa, fs, freq, threads)`, un point d'entree parallele backe par
 rayon. Cable, verifie octet-identique (un tableau de suffixes est UNIQUE : une construction parallele
@@ -1551,7 +1556,7 @@ Le -0,9 % du noyau d'extension AVX2 (#48B) existe toujours, il est simplement no
 
 1. **Contre le fork, sur x86, nous perdons : 0,71x** (bwa-mem3 37,69 s contre nos 53,30 s ; bwa-mem2
    79,62 s, donc 1,49x pour nous contre l'oracle). C'est le sujet des issues #20, #27 et du jalon
-   v4.3.2, pas de la campagne SIMD, et le chiffre est ici confirme sur un runner neutre. A 150 bp sur
+   v4.3.3, pas de la campagne SIMD, et le chiffre est ici confirme sur un runner neutre. A 150 bp sur
    Apple Silicon le rapport contre le fork etait de 0,98x ; sur Zen 3 il est de 0,71x. **L'ecart x86
    est reel et il est gros.**
 2. **La sonde de tier confirme la lecture du runner** : `scalar` 486,93 s, `avx2` 53,11 s,
