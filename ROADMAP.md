@@ -4046,6 +4046,53 @@ pages liberees reviennent, pour savoir si l'ecart de 1,27x contre le fork est un
 artefact de comptage macOS. Tant que ce point n'est pas tranche, aucun chiffre de RAM de ce projet
 sur macOS ne doit etre lu comme « memoire necessaire ».
 
+## Linux tranche #25 : la RAM revient, l'ecart est reel, et l'allocateur n'y est pour rien (2026-08-15)
+
+La section precedente montrait que la RSS de pointe sur macOS est un plafond d'allocation et non une
+mesure de memoire. Restaient deux questions, et une machine Linux les tranche toutes les deux :
+chr21, 2M paires simulees (`wgsim -S 11`), runner heberge 4 coeurs, index construit par
+`bwa-mem2 index` et lu par les trois aligneurs.
+
+**La memoire revient.** Chronologie echantillonnee a 0,5 s, `-K 100M` : 1,72 GB, montee a 4,54,
+**chute a 1,87**, remontee a 4,20, **chute a 1,33**, remontee. Une dent de scie par batch, la
+signature que macOS n'a jamais montree. Le plafond macOS etait bien de la comptabilite.
+
+**Mais l'ecart contre le fork est reel, et plus grand que l'estimation macOS.** Meme machine, meme
+entree, meme index, deux repetitions :
+
+| | bwa-mem4 | `bwa-mem3` (fork) | ratio |
+|---|---|---|---|
+| `-K` par defaut | 2,00 / 2,00 GB | 1,18 / 1,16 GB | **1,71x** |
+| `-K` epingle a 100M | 4,28 / 4,56 GB | 2,29 / 2,28 GB | **1,93x** |
+
+A batch identique nous prenons donc pres du double. Ce n'etait pas un artefact de plateforme : c'est
+le sujet d'origine de #25, cette fois avec un repere fiable.
+
+**Et l'allocateur n'y est pour rien.** jemalloc (`tikv-jemallocator` 0.7) branche derriere une
+feature temporaire, meme entree, batch epingle :
+
+| bras | wall | peak RSS |
+|---|---|---|
+| mimalloc | 201,8 / 201,6 s | 4,58 / 4,28 GB |
+| jemalloc | 207,7 / 207,5 s | 4,47 / 4,47 GB |
+| jemalloc `dirty_decay_ms:0,muzzy_decay_ms:0` | 246,6 / 245,9 s | 4,12 / 4,13 GB |
+| `bwa-mem3` | 150,4 / 150,5 s | 2,30 / 2,27 GB |
+
+**mimalloc reste.** jemalloc coute 2,9 % de wall dans les deux repetitions pour une RSS equivalente,
+et sa restitution forcee rend 8 % de RAM contre 22 % de wall. Les corps SAM des deux allocateurs
+sont identiques (seul `@PG CL` differe, il porte `argv[0]`). Sur macOS le meme A/B donnait jemalloc
+gagnant de 0,7 GB, ce qui etait une lecture du plafond et non de la memoire, et ses wall allaient de
+67 a 373 s : cette mesure-la ne valait rien, celle-ci vaut.
+
+**Troisieme resultat, non demande.** Le wall du meme tableau donne **0,75x contre le fork** (202 s
+contre 150 s), l'ecart x86 de #20 reproduit sur runner heberge, sur lectures simulees et 4 coeurs.
+Ce n'est pas le WGS que #32 demande, mais c'est le premier chiffre x86 de ce projet obtenu sans
+machine dediee, et il est du meme ordre que le 0,71x mesure sur Zen 3.
+
+Ce qui reste pour #25 est donc etroit et bien pose : nos structures par batch, pas l'allocateur, pas
+la plateforme, pas les files. La cible chiffree est de rendre ~2x moins de memoire par base a batch
+egal, et la mesure de reference est desormais ce job Linux plutot qu'un chiffre macOS.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
