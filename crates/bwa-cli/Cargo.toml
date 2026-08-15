@@ -27,7 +27,7 @@ bwa-index = { workspace = true }
 bwa-mem = { workspace = true }
 bwa-neon = { workspace = true }
 clap = { workspace = true }
-mimalloc = { workspace = true }
+mimalloc = { workspace = true, optional = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 bgzf = { workspace = true }
@@ -78,7 +78,13 @@ libsais-c-omp = ["bwa-index/libsais-c-omp"]
 #     cargo build --release -p bwa-mem4 --no-default-features
 #
 # No external build tool: the backend is `zlib-rs`, pure Rust. See crates/bwa-io/Cargo.toml.
-default = ["fast-gzip", "parallel-gzip"]
+default = ["fast-gzip", "parallel-gzip", "mimalloc"]
+# mimalloc as the binary's global allocator. In the default set, so `bwa-mem4`
+# is built exactly as before. It exists as a feature because a
+# `#[global_allocator]` is a whole-program decision and this crate now has a
+# library target: an embedder that links `bwa_mem4` should not have one chosen
+# for it. Nothing in the library uses it.
+mimalloc = ["dep:mimalloc"]
 fast-gzip = ["bwa-io/fast-gzip"]
 # Parallel inflate for gzipped FASTQ, ON by default. Turning it off falls back to the single-thread
 # zlib-rs inflater, which is still on its own thread. See crates/bwa-io/Cargo.toml for the measured

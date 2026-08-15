@@ -23,6 +23,10 @@ use clap::{Parser, Subcommand};
 // query/target buffers, per-chunk DP scratch, per-read region vectors); a fast allocator with good
 // locality cuts wall time noticeably. Does not affect output bytes (byte-identity preserved).
 //
+// Behind a feature because a global allocator is a whole-program decision and
+// this crate is also a library now; see Cargo.toml. On by default, so this
+// binary is unchanged.
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
