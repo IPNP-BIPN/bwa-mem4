@@ -27,7 +27,7 @@ bwa-index = { workspace = true }
 bwa-mem = { workspace = true }
 bwa-neon = { workspace = true }
 clap = { workspace = true }
-mimalloc = { workspace = true }
+mimalloc = { workspace = true, optional = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 bgzf = { workspace = true }
@@ -83,13 +83,19 @@ libsais-c-omp = ["bwa-index/libsais-c-omp"]
 #     cargo build --release -p bwa-mem4 --no-default-features
 #
 # No external build tool: the backend is `zlib-rs`, pure Rust. See crates/bwa-io/Cargo.toml.
-default = ["fast-gzip", "parallel-gzip", "xz-input", "hts-output"]
+default = ["fast-gzip", "parallel-gzip", "xz-input", "hts-output", "mimalloc"]
 # Binary BAM/CRAM output (`-o out.bam`, `-o out.cram`), through rust-htslib. In
 # the default set, so the binary is unchanged. Turning it off drops `rust-htslib`
 # and with it `hts-sys`, bindgen, clang and the C toolchain they need, which is
 # most of what a library consumer pays for when it only ever asks for SAM. SAM
 # and BGZF output are unaffected either way; both are pure Rust.
 hts-output = ["dep:rust-htslib"]
+# mimalloc as the binary's global allocator. In the default set, so `bwa-mem4`
+# is built exactly as before. It exists as a feature because a
+# `#[global_allocator]` is a whole-program decision and this crate now has a
+# library target: an embedder that links `bwa_mem4` should not have one chosen
+# for it. Nothing in the library uses it.
+mimalloc = ["dep:mimalloc"]
 fast-gzip = ["bwa-io/fast-gzip"]
 # Parallel inflate for gzipped FASTQ, ON by default. Turning it off falls back to the single-thread
 # zlib-rs inflater, which is still on its own thread. See crates/bwa-io/Cargo.toml for the measured
