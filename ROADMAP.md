@@ -3975,6 +3975,77 @@ peut pas creer de desaccord. La bonne mutation perturbe **un seul** cote, `o_ins
 le test echoue alors des le round 58. Et l'echec de span cite plus haut porte sur le quatrieme
 schema, ce qui montre que les schemas asymetriques sont bien atteints.
 
+## La RAM par batch (#25) : le modele, trois suspects innocentes, deux correctifs nuls (2026-08-15)
+
+Protocole : 4M paires GIAB, GRCh38 entier, M4 Max 16 coeurs / 128 GB, `/usr/bin/time -l`. Le
+plancher est l'index seul, 9,39 GB, mesure sur un run qui echoue juste apres le chargement.
+
+| `-t` | `-K` | RSS | dont batch |
+|---|---|---|---|
+| 8 | 10M | 11,14 GB | 1,75 GB |
+| 8 | 80M (defaut) | 14,88 GB | 5,49 GB |
+| 8 | 160M | 19,15 GB | 9,76 GB |
+| 16 | 10M | 11,37 GB | 1,98 GB |
+| 16 | 80M | 15,14 GB | 5,75 GB |
+| 16 | 160M (defaut) | 19,45 GB | 10,06 GB |
+| 16 | 320M | 27,49 GB | 18,10 GB |
+
+**Le modele.** Les deux droites, prises a `-t` fixe, donnent la meme pente : **52 a 53 octets
+residents par base d'entree**, socle de 1,2 a 1,4 GB, et **+0,25 GB par doublement de threads**. La
+RSS est donc gouvernee par `-K` SEUL ; `-t` n'y entre que parce qu'il multiplie le `-K` par defaut.
+Ce qui verrouille la sortie evidente : ce defaut vaut `chunk_size * n_threads` pour reproduire
+`aux.task_size` (`fastmap.cpp:964`), et le baisser deplacerait les frontieres de batch, donc le
+modele d'insert, donc les octets. Il faut reduire les 53 octets, pas le batch.
+
+**L'hypothese centrale de l'issue est fausse.** « La RAM tire le wall » ne tient pas : a `-t16`,
+63,33 s a K=160M, 64,47 s a 80M, 65,52 s a 320M, 66,28 s a 10M. Diviser le batch par seize rend
+8,1 GB et COUTE 4,7 % de wall. Les 10 % d'ecart a `-t16` sont un autre dossier, a ne pas chercher ici.
+
+**Trois suspects innocentes, chacun par une mesure.**
+
+* Les files : (1,1) 19,45 GB, (2,2) 19,77, (3,3) 20,35. Un batch de plus en vol coute ~0,3 GB sur
+  10, pas la moitie. Le correctif `68a92bc` avait bien ferme cette part, et son commentaire qui dit
+  « c'etait tout l'ecart » est trop genereux : l'ecart est passe de 1,5x a 1,27x le fork, il n'a pas
+  disparu.
+* Les intermediaires de seeding : deja plafonnes a `INFLIGHT_READS = 16384` reads quel que soit `-t`.
+* mimalloc : `MIMALLOC_PURGE_DELAY=0` donne 19,42 GB, avec arenes non pre-engagees 19,40, contre
+  19,45. Et l'allocateur systeme, teste en retirant le `#[global_allocator]`, donne **21,27 GB et
+  67,35 s** contre 19,45 GB et 63,33 s. mimalloc ECONOMISE ici, il ne thesaurise pas.
+
+**Ou vont les octets.** Sonde temporaire, un batch de 160M bases (540 541 paires) juste apres
+l'alignement : records 344 MB, codes 153 MB plus 25 MB d'en-tetes, regions 14,1 M vivantes pour
+**24,0 M d'emplacements** soit 1287 MB utiles dans 2196 MB alloues, a 96 octets la region (88 utiles,
+8 de padding). Total comptabilise **2741 MB, soit 18 octets par base**, sur les 53 mesures. Apres
+rescue les regions montent a 15,6 M vivantes dans 27,6 M d'emplacements. Le reste n'est donc pas
+vivant entre les etages : il est transitoire A L'INTERIEUR d'un etage.
+
+**Ce que la courbe dit.** Echantillonnee toutes les 2 s, la RSS monte a 17,4 GB en 8 s puis derive
+lentement jusqu'a 19,34 et **ne redescend jamais**, sans dent de scie par batch, avec les deux
+allocateurs. Sur macOS les pages rendues par `madvise(MADV_FREE)` restent comptees tant que le
+systeme n'en a pas besoin : **la RSS de pointe mesure le plafond de tout ce qui a ete alloue, pas ce
+qui est vivant.** C'est la cle du dossier, et elle explique les deux echecs qui suivent.
+
+**Correctif 1, rendre la capacite : negatif.** `shrink_to_fit` sur les listes de regions dont le
+slack depasse 16 emplacements, ce qui visait les 909 MB de headroom par batch. A/B entrelace, deux
+repetitions : **+0,94 et +0,95 GB de RSS**, wall inchange. Le gain vise etait de 909 MB et la perte
+est de 950 MB : la capacite liberee n'est pas rendue, et les copies neuves montent le plafond
+d'autant. Reverte.
+
+**Correctif 2, ne jamais allouer le slack : nul.** `reserve_exact` sur les quatre listes paralleles
+(`regs`, `reg_chain`, `reg_meta`, `reg_preskip`), le compte de seeds etant connu avant la premiere
+poussee, ce qui remplace l'echelle 1, 2, 4, 8 par une allocation unique. A/B entrelace, cinq paires :
+RSS 19,10 / 19,13 / 19,26 / 19,26 / 18,92 contre 19,00 / 19,43 / 19,29 / 19,13 / 18,86, et wall
+gagnant **3 fois sur 5**, medianes 67,8 contre 67,5 s. Un nul des deux cotes. SAM octet-identique
+verifie sur les 3,4 GB de sortie. Reverte, comme le fast-path d'epilogue avant lui.
+
+**Ce qui reste ouvert, et sous quelle forme.** La cible n'est pas la memoire vivante mais le VOLUME
+TOTAL alloue pendant un batch, puisque c'est lui qui fixe le plafond sur cette plateforme. Deux
+suites possibles : instrumenter l'allocation par etage (compteur d'octets alloues, pas des
+snapshots, ceux-ci ayant deja montre qu'ils ratent le pic), ou refaire la mesure sous Linux, ou les
+pages liberees reviennent, pour savoir si l'ecart de 1,27x contre le fork est un ecart de code ou un
+artefact de comptage macOS. Tant que ce point n'est pas tranche, aucun chiffre de RAM de ce projet
+sur macOS ne doit etre lu comme « memoire necessaire ».
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
