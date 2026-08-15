@@ -3,7 +3,7 @@
 Une phase = une branche. Commits frequents ; PR vers `dev`, `dev` promu sur `main` a la release.
 Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.3 patche (oracle).
 
-**Version courante : 4.3.2.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
+**Version courante : 4.3.3.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
 mesures : chaque phase garde son resultat, y compris les negatifs, pour ne pas re-instruire deux fois
 la meme idee.
 
@@ -38,6 +38,7 @@ rapprochees.
 | 4.3.0 | 2026-07-31 | `-x` route vers rammap, sous-commande `version`, credits bwa-mem3 / @nh13 |
 | 4.3.1 | 2026-08-14 | couche mecanique Rust sur les 10 crates (preparee le 2026-08-04, publiee ici) ; lecteur hors du chemin critique et entree FIFO reparee, lecture parallele des deux fichiers de mates, une allocation par read au lieu de trois, tri par longueur du lot de rescue, backend C libsais par defaut (+ OpenMP en option), PGO reparee sur macos-14 |
 | 4.3.2 | 2026-08-14 | cible bibliotheque : les implementations de commandes sont appelables sans sous-processus, et `MemArgs` derive `Default` pour etre constructible par un embarqueur |
+| 4.3.3 | 2026-08-15 | le crate est enfin dependable : xz de needletail, sortie BAM/CRAM et mimalloc passent en features, donc la cible bibliotheque se compile sans toolchain C, sans conflit de lien lzma et sans allocateur global impose (#62, #63, #64) |
 
 ## Jalons ouverts (GitHub Projects nº3)
 
@@ -55,7 +56,7 @@ Les jalons avancent d'un cran sur le troisieme chiffre : une release courte et f
 qu'un saut de version mineure a chaque lot. Le jalon perf x86_64 demande une machine x86_64 et un
 WGS complet, pas une mesure sur Apple Silicon.
 
-## Statut (4.3.2)
+## Statut (4.3.3)
 
 Parite mesuree sur un **WGS humain reel 32,9x** (GIAB HG002, 2x150), genome entier, pas un
 sous-echantillon, les deux aligneurs lisant le meme index sur disque (`scripts/giab30x_pe.sh`) :
