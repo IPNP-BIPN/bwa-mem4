@@ -55,7 +55,20 @@ bwa-neon = { package = "bwa-mem4-neon", path = "crates/bwa-neon", version = "4.3
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
-needletail = "0.6"
+# FASTQ/FASTA reading. NOT default features: needletail's `compression` set pulls
+# `liblzma`, which declares `links = "lzma"`. So does `lzma-sys`, which is what
+# `zip`/`xz2` and `hts-sys` use, and cargo refuses a graph containing two crates
+# that link the same native library. That makes bwa-mem4 impossible to depend on
+# from anything already using one of those, which since 4.3.2 exposes a library
+# target is a real constraint rather than a theoretical one. xz-compressed FASTQ
+# stays available through the `xz-input` feature, which is on by default, so the
+# binary is unchanged and only an embedder that turns default features off gives
+# it up.
+needletail = { version = "0.6", default-features = false, features = [
+    "flate2",
+    "bzip2",
+    "zstd",
+] }
 memmap2 = "0.9"
 rayon = "1"
 bgzf = { version = "0.4", features = ["multithreading-simple"] }

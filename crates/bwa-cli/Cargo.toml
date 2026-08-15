@@ -43,6 +43,11 @@ align-split = ["bwa-mem/align-split"]
 # does not read. NOT because it introduces a C toolchain requirement: this binary already has one,
 # for `rust-htslib` and for the C libsais. See crates/bwa-io/Cargo.toml.
 multi-format = ["bwa-io/multi-format"]
+# Passthrough for `bwa-io`'s xz-compressed FASTQ input. In the default set, so
+# the binary is unchanged; `default-features = false` drops it, and with it the
+# `links = "lzma"` collision that otherwise makes this crate impossible to
+# depend on alongside `zip` or `hts-sys`. See crates/bwa-io/Cargo.toml.
+xz-input = ["bwa-io/xz-input"]
 # Suffix-array backend passthrough for `bwa-mem4 index`. `bwa-index` owns the actual choice (see
 # crates/bwa-index/Cargo.toml); this exists so the streaming CaPS-SA backend can be selected when
 # building the BINARY, which is the only way a user reaches `bwa-mem4 index`:
@@ -78,7 +83,7 @@ libsais-c-omp = ["bwa-index/libsais-c-omp"]
 #     cargo build --release -p bwa-mem4 --no-default-features
 #
 # No external build tool: the backend is `zlib-rs`, pure Rust. See crates/bwa-io/Cargo.toml.
-default = ["fast-gzip", "parallel-gzip"]
+default = ["fast-gzip", "parallel-gzip", "xz-input"]
 fast-gzip = ["bwa-io/fast-gzip"]
 # Parallel inflate for gzipped FASTQ, ON by default. Turning it off falls back to the single-thread
 # zlib-rs inflater, which is still on its own thread. See crates/bwa-io/Cargo.toml for the measured
