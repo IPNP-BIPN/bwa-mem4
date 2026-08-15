@@ -88,9 +88,11 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use rayon::prelude::*;
+#[cfg(feature = "hts-output")]
 use rust_htslib::bam;
 // The raw htslib C bindings, re-exported by rust-htslib (so this is not an extra dependency). Used
 // only by `HtsWriter`, which needs an ordering its safe `bam::Writer` cannot express; see there.
+#[cfg(feature = "hts-output")]
 use rust_htslib::htslib;
 
 use bwa_core::opt::flags;
@@ -1041,9 +1043,11 @@ enum Output {
     Bgzf(Box<bgzf::MultithreadedWriter<Box<dyn Write + Send>>>),
     /// Binary BAM, selected by a `.bam` suffix on `-o`. Boxed because a `bam::Writer` plus the
     /// transcoder's line buffers dwarf the other variants' two pointers.
+    #[cfg(feature = "hts-output")]
     Bam(Box<HtsTranscoder>),
     /// CRAM, selected by a `.cram` suffix on `-o`. Identical machinery to `Bam` (only the htslib
     /// format flag and the mandatory `--reference` differ), which is why both hold the same type.
+    #[cfg(feature = "hts-output")]
     Cram(Box<HtsTranscoder>),
 }
 
@@ -1066,6 +1070,7 @@ enum Output {
 /// Opening lazily (step 3) is what lets the header be written verbatim, as one blob of the exact
 /// bytes `sam::write_header` produced, instead of being rebuilt tag by tag from `sqs` and risking a
 /// divergence from the SAM path.
+#[cfg(feature = "hts-output")]
 struct HtsTranscoder {
     /// Where to open, kept because the open is deferred to the first record line.
     path: PathBuf,
@@ -1086,6 +1091,7 @@ struct HtsTranscoder {
     writer: Option<HtsWriter>,
 }
 
+#[cfg(feature = "hts-output")]
 impl HtsTranscoder {
     /// Feed one complete line, without its trailing `\n`. Header lines are buffered; the first
     /// record line opens the file, and every record line is parsed and written.
@@ -1159,6 +1165,7 @@ impl HtsTranscoder {
 /// what `samtools view -T ref.fa -C` does (`sam_view.c` sets the reference before writing the
 /// header). Everything else still comes from rust-htslib: the header parse (`HeaderView`) and the
 /// SAM-to-record parse (`Record::from_sam`) are its types, and we only borrow their raw pointers.
+#[cfg(feature = "hts-output")]
 struct HtsWriter {
     /// The htslib file. Non-null for the whole life of the value; nulled by `close` so that `Drop`
     /// does not double-close.
@@ -1171,8 +1178,10 @@ struct HtsWriter {
 // SAFETY: `htsFile` is not shared, only moved: the sink is created on the main thread and handed to
 // the writer thread, which is then the only thread that touches it. This is the same reasoning (and
 // the same guarantee) as rust-htslib's own `unsafe impl Send for Writer`.
+#[cfg(feature = "hts-output")]
 unsafe impl Send for HtsWriter {}
 
+#[cfg(feature = "hts-output")]
 impl HtsWriter {
     /// Open `path` for writing in `mode`, install `reference` if given, then write `header_text`
     /// verbatim as the file header. The order of those three steps is load-bearing; see the type
@@ -1252,6 +1261,7 @@ impl HtsWriter {
     }
 }
 
+#[cfg(feature = "hts-output")]
 impl Drop for HtsWriter {
     fn drop(&mut self) {
         // Only reached on an error path, since `finish` closes explicitly. The file still has to be
@@ -1290,6 +1300,7 @@ impl Write for Output {
             Output::Bgzf(w) => w.write(buf),
             // Both binary variants consume the whole buffer or fail: a partial count would leave the
             // transcoder's line state and the caller's cursor disagreeing about what was consumed.
+            #[cfg(feature = "hts-output")]
             Output::Bam(t) | Output::Cram(t) => {
                 // Split on `\n`, carrying an unterminated tail into `pending` for the next call.
                 // `rest` shrinks to the not-yet-dispatched remainder of `buf`.
@@ -1325,6 +1336,7 @@ impl Write for Output {
             Output::Bgzf(w) => w.flush(),
             // htslib buffers internally and offers no flush short of closing the file, which
             // `finish` does. Nothing here can be forced out, so this is honestly a no-op.
+            #[cfg(feature = "hts-output")]
             Output::Bam(_) | Output::Cram(_) => Ok(()),
         }
     }
@@ -1350,7 +1362,12 @@ impl Output {
     /// `--reference`, or if the compile-time compression level is somehow out of the `bgzf` crate's
     /// accepted range. Note the binary variants do not touch the filesystem here: htslib opens the
     /// file only once the header text has streamed through (see [`HtsTranscoder`]).
-    fn open(path: Option<&Path>, threads: usize, reference: Option<&Path>) -> anyhow::Result<Self> {
+    fn open(
+        path: Option<&Path>,
+        threads: usize,
+        // Only CRAM reads it, so without `hts-output` there is nothing to read it.
+        #[cfg_attr(not(feature = "hts-output"), allow(unused_variables))] reference: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         match path {
             None => Ok(Output::Plain(Box::new(BufWriter::with_capacity(
                 PLAIN_SINK_BUFFER_BYTES,
@@ -1364,9 +1381,20 @@ impl Output {
                         .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
                 };
                 if ext_is("bam") || ext_is("cram") {
+                    // Refused rather than quietly written as SAM text under a binary name, which
+                    // would hand back a file every downstream tool rejects.
+                    #[cfg(not(feature = "hts-output"))]
+                    anyhow::bail!(
+                        "-o {}: this build has no BAM/CRAM writer. Rebuild with \
+                         `--features hts-output`, or write SAM (`-o out.sam`) or BGZF \
+                         (`-o out.sam.gz`), which every samtools reads.",
+                        path.display()
+                    );
+                    #[cfg(feature = "hts-output")]
                     let want_cram = ext_is("cram");
                     // Refused up front rather than at the first record: CRAM stores SEQ as a diff
                     // against the reference, so without one there is nothing to write.
+                    #[cfg(feature = "hts-output")]
                     if want_cram && reference.is_none() {
                         anyhow::bail!(
                             "-o {}: CRAM output needs the reference FASTA, pass --reference <FASTA> \
@@ -1374,6 +1402,7 @@ impl Output {
                             path.display()
                         );
                     }
+                    #[cfg(feature = "hts-output")]
                     let transcoder = Box::new(HtsTranscoder {
                         path: path.to_path_buf(),
                         // htslib's write modes: `w` plus `b` for BAM or `c` for CRAM.
@@ -1386,6 +1415,7 @@ impl Output {
                         pending: Vec::new(),
                         writer: None,
                     });
+                    #[cfg(feature = "hts-output")]
                     return Ok(if want_cram {
                         Output::Cram(transcoder)
                     } else {
@@ -1434,6 +1464,7 @@ impl Output {
             Output::Bgzf(mut w) => {
                 w.finish()?;
             }
+            #[cfg(feature = "hts-output")]
             Output::Bam(t) | Output::Cram(t) => t.finish()?,
         }
         Ok(())
