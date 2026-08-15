@@ -1519,13 +1519,35 @@ Trois points, ce qui permet de separer les deux leviers :
   chiffre reste donc a prendre sur un coeur Intel. En attendant, le changement est conserve parce
   qu'il est neutre en vitesse ici et strictement moins d'instructions.
 
-### #44 reste non verifie, et le tirage est une loterie
+### #44 reste non verifie, et ce n'est pas une loterie (2026-08-15)
 
 `require_avx512` fonctionne exactement comme prevu : il fait echouer le job en une trentaine de
-secondes quand le tirage n'a pas `avx512bw`. **Sept tirages consecutifs ont donne le meme AMD EPYC
-7763.** Le noyau AVX-512 u8 n'a donc toujours ete execute nulle part, et #44 reste ouverte pour cette
-seule raison. Le harnais est pret : un tirage Intel suffira a faire tourner
-`avx512_matesw_u8_matches_scalar` et a imprimer la ligne `avx512_u8` des deux sondes.
+secondes quand le tirage n'a pas `avx512bw`. Sept tirages consecutifs, puis dix-sept le 2026-08-09,
+ont donne le meme AMD EPYC 7763, ce qui se lisait alors comme de la malchance. Ce n'en est pas :
+**aucun runner accessible a ce projet n'expose `avx512bw`**, et deux d'entre eux ne le feront jamais.
+
+| label | CPU | `avx512bw` |
+|---|---|---|
+| `ubuntu-22.04` | AMD EPYC 7763 (Zen 3), 17 tirages | non |
+| `ubuntu-latest` | AMD EPYC 7763 (Zen 3) | non |
+| `ubuntu-24.04` | AMD EPYC 9V74 (Zen 4) | non |
+| `macos-15-intel` | Intel Core i7-8700B | non |
+| `macos-26-intel` | Intel Core i7-8700B | non |
+| `macos-13` | label retire, job jamais planifie | — |
+
+Deux lectures a en tirer. Les runners Intel de macOS sont des Mac mini 2018 en Coffee Lake, une
+generation grand public qui n'a jamais porte AVX-512 : cette piste est fermee par construction, pas
+par le sort, et il est inutile de la retenter. Et `ubuntu-24.04` tourne sur du Zen 4, qui a bien
+AVX-512 en silicium : c'est l'hyperviseur qui le masque, donc meme le materiel capable ne l'expose
+pas. Retirer davantage ne changera rien.
+
+Le harnais reste pret et il n'a pas de defaut : `avx512_matesw_u8_matches_scalar`,
+`avx512_u8_and_i16_match_scalar` et la ligne `avx512_u8` des deux sondes attendent une machine, pas
+du code. Condition de fermeture de #44, desormais precise : un coeur Intel Ice Lake ou Sapphire
+Rapids (AWS `c6i`/`c7i`, Azure Dv5) le temps d'un `cargo test --release -p bwa-mem4-neon`, soit une
+dizaine de minutes, ou un larger runner GitHub dont il faudra d'abord verifier le CPU de la meme
+maniere. Tant que cette machine n'est pas louee, le noyau AVX-512 u8 reste du code jamais execute et
+l'issue doit le dire ainsi plutot que d'attendre un tirage qui n'arrivera pas.
 
 ## Le processus entier sur x86 : +1,33 %, et deux choses vues au passage (2026-08-09)
 
