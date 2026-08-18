@@ -4219,6 +4219,50 @@ La suite immediate est donc de relancer exactement cette sonde sur le job Linux 
 pages reviennent, pour savoir laquelle des deux moities de l'ecart de 1,71x contre le fork est
 vivante et laquelle est de la retention.
 
+## #25 tranche : le resident EST le vivant sous Linux, et le 2x est le double batch en vol (2026-08-18)
+
+La sonde par etage, rejouee la ou les pages reviennent. Protocole ROADMAP Linux : chr21, `wgsim -S 11`,
+2M paires, index `bwa-mem2`, runner heberge 4 coeurs, `-K` epingle a 100M pour que le fork et nous
+voyions le meme batch. Workflow `alloc-probe.yml`, run 32143186293.
+
+**Premiere ligne, celle qui ferme la piste macOS.**
+
+| | RSS de pointe | vivant de pointe | dont index | batch RSS | batch vivant | resident/vivant |
+|---|---|---|---|---|---|---|
+| pipeline livre (`overlap`) | 4,553 GB | 4,461 GB | 0,181 GB | 4,372 GB | 4,280 GB | **1,02x** |
+| un batch en vol (serialise) | 2,680 GB | 2,587 GB | 0,188 GB | 2,492 GB | 2,399 GB | **1,04x** |
+
+**Sous Linux le resident est le vivant.** Le 1,41x macOS etait de la comptabilite, entierement. Il
+n'y a rien a recuperer du cote de l'allocateur, et le 1,4x de retention annonce comme « la moitie du
+dossier » deux sections plus haut n'existe pas sur la plateforme ou les utilisateurs tournent.
+
+**Deuxieme ligne, celle qui ferme #25.** Meme job, memes reads, memes index :
+
+| | wall | RSS de pointe |
+|---|---|---|
+| bwa-mem4 | 201,71 / 202,09 s | 4,78 / 4,78 GB |
+| `bwa-mem3` (fork) | 150,74 / 151,55 s | 2,36 / 2,39 GB |
+| bwa-mem4, **un batch en vol** | | **2,49 GB** |
+
+Contre le fork : **2,02x en RSS avec le recouvrement, 1,05x sans**. Notre batch n'est donc pas deux
+fois plus gros que le sien, et nos structures ne sont pas en cause : nous en tenons deux a la fois.
+`run_pipeline` lance le batch N+1 avant de retirer le N pour que la queue peu occupee du N (dedup a
+69 %, encode a 29 %) tourne contre l'`align` du N+1, qui est la seule etape capable de remplir le
+pool. Le commentaire du site disait deja « le cout est un batch resident de plus » ; ce qui manquait
+etait son prix, et le prix est exactement l'ecart de l'issue.
+
+**`BWA4_NO_BATCH_OVERLAP=1`** rend cette moitie. Sortie inchangee : l'ordre de sortie vient du join
+avant l'envoi, pas du nombre de batchs en vol. Verifie `cmp`-propre sur 500k paires GIAB en local et
+sur chr21 en CI. Sur macOS, `-t8`, 500k paires GIAB : 14,72 GB contre 13,28 GB de RSS de pointe, soit
+la part batch de 4,25 a 2,81 GB, pour 1,4 % de wall sur un jeu a deux batchs, ou le recouvrement n'a
+presque rien a recouvrir.
+
+**Ce qui reste a decider est donc un arbitrage, pas une enquete** : ce que le recouvrement vaut en
+wall quand il a de quoi recouvrir. Indice deja au dossier, a confirmer sans instrumentation : les
+deux modes instrumentes du run Linux finissent a 214,52 s et 214,83 s, six batchs et quatre coeurs,
+soit un ecart nul. Si cela tient sur le binaire livre, le defaut lui-meme est a rediscuter, et #25 se
+fermerait en rendant la moitie de notre RAM pour rien.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
