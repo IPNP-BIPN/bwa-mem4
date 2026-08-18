@@ -4367,6 +4367,38 @@ artefact de release qui gagnerait silencieusement une dylib serait pire qu'un in
 `crates/bwa-cli/Cargo.toml` disait deja. Le vrai reste de #37 est donc une question de packaging, pas
 de parallelisation.
 
+## Le dossier x86 : ou nous perdons, mesure sur le meme hote (2026-08-18)
+
+Toutes les mesures de ce projet contre `bwa-mem2` etaient arm64. Voici les deux architectures cote a
+cote, chr21 wgsim, `-t4`, chaque ratio pris **a l'interieur d'un seul hote** pour qu'aucune
+comparaison de machines n'y entre :
+
+| hote | bwa-mem4 | `bwa-mem3` (fork) | `bwa-mem2` | nous / mem2 | fork / mem2 | nous / fork |
+|---|---|---|---|---|---|---|
+| M4 Max (1M paires) | 36,55 / 36,54 s | parite (0,981x, GIAB) | 129,84 / 116,86 s | **3,20x** | ~3,2x | **1,00x** |
+| EPYC 7763, Zen 3 (2M paires) | 205,4 / 208,0 s | 150,9 / 151,1 s | 321,7 / 324,6 s | **1,57x** | **2,13x** | **0,74x** |
+
+**Les deux aligneurs perdent en passant sur x86, et c'est attendu** : `bwa-mem2` y est chez lui,
+avec ses noyaux AVX2/AVX-512 ecrits pour Intel, tandis que sur arm64 il tourne a travers une couche
+d'emulation SSE. Un ratio contre `bwa-mem2` mesure donc en partie le handicap de `bwa-mem2`, ce qui
+est une raison de plus de citer le fork comme reference.
+
+**Mais nous perdons deux fois plus.** Le fork passe de ~3,2x a 2,13x contre `bwa-mem2` ; nous
+passons de 3,20x a 1,57x. La difference entre ces deux chutes EST l'ecart de 1,36x que nous avons
+contre lui sur x86, et c'est le seul chiffre de ce tableau qui decrit du code a nous.
+
+Deux causes possibles, et elles se separent par la mesure :
+
+1. **Nos noyaux AVX2 sont plus faibles, relativement, que nos noyaux NEON.** Le kernel d'extension
+   pese 56 % du CPU d'`align` sur ARM (profil `align-split` sur ces memes donnees), donc un deficit
+   de kernel s'y verrait.
+2. **Notre code SCALAIRE x86 est compile en baseline.** `bwa-mem2` livre un binaire par jeu
+   d'instructions (`bwa-mem2.avx2`, `bwa-mem2.avx512bw`) et choisit a l'exec ; nous livrons un
+   binaire baseline et ne selectionnons au runtime que les noyaux vectoriels. Toutes nos boucles
+   scalaires de seeding, de chainage et de resolution SA sont donc compilees pour un CPU de 2003.
+   Sur ARM ce choix ne coute rien, la baseline aarch64 contenant deja NEON : controle mesure ici,
+   `target-cpu=native` contre baseline donne 36,35 s contre 36,48 s, un nul.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
