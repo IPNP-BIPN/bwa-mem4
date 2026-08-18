@@ -108,3 +108,27 @@ From earlier sessions, still valid and still not to be retried:
 
 ---
 Index of the surviving work: #43 #44 #45 #46 #47 #48 #49
+
+## Part three: dead ends found after the file was written
+
+### The two `max(., 0)` clamps in the extension kernel's gap opens (2026-08-19)
+
+The inner loop reads, for both the deletion and the insertion open:
+
+```rust
+let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
+```
+
+and its own comment says the clamp "is redundant for the u8 kernel (saturating `sub` already floors
+at 0) but free". Two vector operations of roughly sixteen in the body, on the kernel that is half of
+`align`'s CPU, looked like it was worth deleting on the u8 path. It was implemented behind a macro
+parameter, so each instantiation kept only what its subtraction type needs.
+
+**Measured: exactly nothing.** Five interleaved repetitions of the `align` stage, minima 24.516 s
+against 24.521 s. The reason is that the comment was literally true: `max(x, 0)` on an UNSIGNED
+vector is the identity, LLVM knows it, and it had already been folding both of them away. The
+"optimisation" removed source, not instructions.
+
+Worth knowing generally, and the reason this entry exists: an op count read off the source is not an
+op count. Before deleting arithmetic that the type system makes trivial, check whether the compiler
+has already deleted it.
