@@ -23,7 +23,11 @@ on:
 jobs:
   avx512-emulated:
     name: AVX-512 kernels under qemu, byte-identity only
-    runs-on: ubuntu-22.04
+    # 24.04, not 22.04, and it is not cosmetic: 22.04 ships qemu 6.2, which ADVERTISES avx512 in
+    # CPUID under `-cpu max` and then faults on the first such instruction. The first attempt died
+    # with "uncaught target signal 4 (Illegal instruction)" for exactly that reason. AVX-512
+    # emulation arrived in qemu 7.2; 24.04 ships 8.2.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -46,7 +50,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install qemu-user
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user
+          # Printed because the whole job depends on it: below 7.2 there is no AVX-512 emulation and
+          # the run can only fail with SIGILL.
+          qemu-x86_64 --version | head -1
 
       - name: Build the test binaries
         env:

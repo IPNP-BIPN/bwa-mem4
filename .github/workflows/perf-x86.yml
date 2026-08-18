@@ -145,6 +145,13 @@ jobs:
           run_probe "rescue kernel cells (BWA4_MATESW_TIME)"        env $NOOV BWA4_MATESW_TIME=1 $M4
           run_probe "align internals (BWA4_ALIGN_SPLIT, split build)" env $NOOV BWA4_ALIGN_SPLIT=1 $SP
 
+          # A fifth of the reads for every sweep below. Sweeps compare arms against each other, so
+          # they need a workload big enough to be steady and no bigger; the forced-scalar arms are an
+          # order of magnitude slower than the vector ones, and at full size they alone put this job
+          # past its 120-minute ceiling. The head-to-head above keeps the full set.
+          head -n 800000 <(zcat -f r1.fq) > s1.fq; head -n 800000 <(zcat -f r2.fq) > s2.fq
+          echo "sweeps run on $(( $(wc -l < s1.fq) / 4 )) pairs"
+
           echo
           echo "===== SA prefetch window sweep (BWA4_SA_WINDOW) ====="
           # The window is the count of LF-walks kept in flight, i.e. how many DRAM misses are
@@ -153,7 +160,7 @@ jobs:
           # compile-time ceiling, so this can only narrow: a wider optimum would show up as a curve
           # still falling at 128, and would need a rebuild to confirm.
           for w in 16 32 64 96 128; do
-            s=$( { /usr/bin/time -f '%e' -o w.txt env BWA4_NO_BATCH_OVERLAP=1 BWA4_SA_WINDOW=$w $M4 mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null; } 2>/dev/null; cat w.txt)
+            s=$( { /usr/bin/time -f '%e' -o w.txt env BWA4_NO_BATCH_OVERLAP=1 BWA4_SA_WINDOW=$w $M4 mem -t "$T" chr21.fa s1.fq s2.fq >/dev/null; } 2>/dev/null; cat w.txt)
             echo "  W=$w: ${s}s"
           done
 
@@ -201,9 +208,12 @@ jobs:
           cd work
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
           M4=../bwa-mem4-shipped
+          # Same fifth-sized set as the window sweep, rebuilt here because steps do not share a shell.
+          [ -s s1.fq ] || { head -n 800000 r1.fq > s1.fq; head -n 800000 r2.fq > s2.fq; }
+          echo "sweeps run on $(( $(wc -l < s1.fq) / 4 )) pairs"
           echo "== batched extension tier (BWA4_EXTEND_TIER) =="
           for tier in scalar sse41 avx2 avx512; do
-            if timeout 1800 /usr/bin/time -f '%e' -o et.txt env BWA4_EXTEND_TIER="$tier" $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2>/dev/null; then
+            if timeout 900 /usr/bin/time -f '%e' -o et.txt env BWA4_EXTEND_TIER="$tier" $M4 mem -t "$T" chr21.fa s1.fq s2.fq > /dev/null 2>/dev/null; then
               echo "  extend tier=$tier: $(cat et.txt)s"
             else
               echo "  extend tier=$tier: timed out or unavailable"
@@ -213,7 +223,7 @@ jobs:
           # A forced tier the host lacks falls back to scalar, and forced scalar is legitimately an
           # order of magnitude slower on this stage, so a timeout here is reported and not fatal.
           for tier in scalar avx2 avx512; do
-            if timeout 1800 /usr/bin/time -f '%e' -o tt.txt env BWA4_RESCUE_TIER="$tier" $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2>/dev/null; then
+            if timeout 900 /usr/bin/time -f '%e' -o tt.txt env BWA4_RESCUE_TIER="$tier" $M4 mem -t "$T" chr21.fa s1.fq s2.fq > /dev/null 2>/dev/null; then
               echo "tier=$tier: $(cat tt.txt)s"
             else
               echo "tier=$tier: timed out or unavailable"

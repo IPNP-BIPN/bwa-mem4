@@ -1025,17 +1025,26 @@ impl FmIndex {
         // Width changes how many walks overlap, never which rows are visited or in what order a
         // given walk proceeds, so it cannot move a byte of output. `BWA4_SA_WINDOW` narrows it at
         // run time for sweeping on another machine.
-        const W: usize = 128;
-        // Slots actually kept in flight this call. `W` is the compile-time ceiling (the arrays are
-        // fixed-size), `BWA4_SA_WINDOW` narrows it so the width can be swept on a machine without
-        // rebuilding. Width changes how many misses overlap, never which rows are visited, so it
-        // cannot move a byte of output.
+        // Compile-time CEILING on the window, and the size of the per-call stack arrays. Raised
+        // from 128 to 256 so the width can be swept ABOVE the default as well as below it: the knee
+        // was found on an M4 (W=32 costs 18%, 64 and 128 tie), and a core with more outstanding-miss
+        // slots could want more than 128, which no environment variable could previously ask for.
+        // Only the ceiling moves; the default below is unchanged, and the unused tail of the arrays
+        // is never touched, so nothing about a default run changes.
+        const W_MAX: usize = 256;
+        /// Default width, i.e. what a run uses unless `BWA4_SA_WINDOW` says otherwise. The measured
+        /// knee, and deliberately not `W_MAX`: past 128 the M4 curve is flat and the per-call arrays
+        /// (`sp`/`off`/`slot`, 13 bytes a slot) start crowding L1.
+        const W_DEFAULT: usize = 128;
+        // Slots actually kept in flight this call. `BWA4_SA_WINDOW` sets it anywhere in
+        // `1..=W_MAX`, so the width can be swept on a machine without rebuilding. Width changes how
+        // many misses overlap, never which rows are visited, so it cannot move a byte of output.
         let width = *SA_WINDOW.get_or_init(|| {
             std::env::var("BWA4_SA_WINDOW")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .filter(|w| (1..=W).contains(w))
-                .unwrap_or(W)
+                .filter(|w| (1..=W_MAX).contains(w))
+                .unwrap_or(W_DEFAULT)
         });
         // Read one SAMPLED suffix-array entry: `p` is a BWT row that is a multiple of 8, and the
         // result is a 2L-space reference position reassembled from its split 8+32-bit storage.
@@ -1051,12 +1060,12 @@ impl FmIndex {
             // Per-slot walk state, indexed by the LOCAL index `j` in `0..w` (global index is
             // `base + j`). `sp[j]` is slot `j`'s current BWT ROW, `off[j]` its LF step count, so
             // the same invariant as `get_sa` holds per slot: answer == sa[sp[j]] + off[j].
-            let mut sp = [0i64; W];
-            let mut off = [0i32; W];
+            let mut sp = [0i64; W_MAX];
+            let mut off = [0i32; W_MAX];
             // Compaction list: `slot[0..nact]` holds the local indices still walking, in no
             // particular order. Slots that finish are dropped from it, so the inner loops stay
             // dense as the window drains.
-            let mut slot = [0u8; W]; // still-walking local indices [0, w)
+            let mut slot = [0u8; W_MAX]; // still-walking local indices [0, w)
             let mut nact = 0usize;
             for j in 0..w {
                 // The BWT row this slot must resolve.
