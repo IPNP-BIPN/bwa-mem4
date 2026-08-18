@@ -4497,6 +4497,29 @@ Au passage, les balayages de tiers sur le meme runner, 400k paires : extension `
 `sse41` 37,39, `avx2` 33,76 ; rescue `scalar` 306,99 s, `avx2` 34,19. Les noyaux portent bien ce
 qu'on croyait qu'ils portaient.
 
+### Deux corrections sur mes propres chiffres du jour (2026-08-18)
+
+Consignees parce qu'un chiffre flatteur non corrige est pire que pas de chiffre.
+
+**L'emetteur SAM ne gagne rien, sur aucune des deux plateformes.** Le commit qui l'a introduit
+annoncait -4,3 % sur `sam_emit` a partir d'UNE mesure. Cinq repetitions entrelacees donnent 2,641
+contre 2,637 s aux minima sur ARM, et le profil x86 refait donne **28,736 contre 28,530 s**, -0,7 %,
+le run entier restant dans son propre bruit.
+
+La raison merite d'etre sue avant que quelqu'un ne recommence : **a la baseline x86-64, une table de
+256 entrees ne se vectorise pas du tout**, `pshufb` etant SSSE3. La boucle par blocs fait donc
+toujours un chargement de table par base et n'economise que la verification de capacite. La version
+du fork est rapide parce que TOUT leur binaire est compile en AVX2, et la notre le devient dans
+l'artefact `x86-64-v3` que nous livrons maintenant, dont les 5,6-6,8 % mesures incluent ce que ce
+fichier y apporte. Ce qu'il vaut aujourd'hui n'est donc pas du wall : c'est une allocation de moins
+par champ entier de chaque enregistrement, 40 par read au compteur de la sonde, et une forme que le
+compilateur vectorisera des qu'on l'y autorisera.
+
+**Le profil par etage etait illisible avec le recouvrement.** La premiere table `BWA4_STAGE_TIME`
+prise ce jour donnait `encode` a 29,8 % et une somme a 197 %. Les accumulateurs sont globaux au
+processus, donc deux batchs en vol creditent les memes compteurs. Toutes les parts citees ici sont
+prises avec `BWA4_NO_BATCH_OVERLAP=1`, et le workflow le fait desormais pour chaque sonde.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
