@@ -115,7 +115,10 @@ jobs:
           M4=../bwa-mem4-shipped
           P4=../bwa-mem4-probe
           FORK=bwa-mem3
-          echo "threads=$T  batch=${KARG:-<each tool's default>}"
+          # No apostrophe in the default text: inside "${var:-word}" a single quote still opens a quoted
+          # section, and the one in "each tool's default" swallowed the next twenty lines, which bash
+          # reported as a syntax error twenty lines later.
+          echo "threads=$T  batch=${KARG:-per-tool default}"
 
           # Runs one aligner under /usr/bin/time and prints "wall_s maxrss_kb". Stderr is kept, so a
           # probe run's table survives; a hang fails the step in minutes instead of eating the budget.
