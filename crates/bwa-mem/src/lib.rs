@@ -114,6 +114,7 @@ use bwa_index::{BntSeq, FmIndex};
 pub mod across;
 pub mod alt;
 pub mod cigar;
+pub mod emit;
 pub mod pe;
 pub mod primary;
 pub use across::align_reads_batched;
