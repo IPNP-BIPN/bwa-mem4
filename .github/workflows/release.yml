@@ -116,6 +116,14 @@ jobs:
             # 107.36 / 108.15 / 108.24 s with it. It COSTS 3.3% here. An independent arm using
             # cargo-pgo and a different training set agreed at -4.1%. See #33.
             pgo: false
+            # And a SECOND binary in the same tarball, compiled for AVX2. Measured on the same Zen 3
+            # runner, byte-identical output (md5 6b084cb8...): baseline 32.99 / 33.42 s against
+            # 31.42 / 31.15 s, i.e. 5.6% to 6.8% for free on any host from 2013 on. This is the
+            # lever docs/fork-teardown.md identified: fg-labs/bwa-mem3 compiles its whole non-kernel
+            # codebase at AVX2 (`BASELINE_ARCH ?= avx2`) while we ship one baseline binary and
+            # dispatch only hand-written kernels, which leaves every scalar loop built for a 2003
+            # CPU. The default artefact stays baseline so it runs everywhere.
+            variant_cpu: "x86-64-v3"
           - os: ubuntu-24.04-arm
             target_id: linux-aarch64
             # Same story on non-Apple ARM: -0.6% on hosted Ampere Altra, three reps, matching
@@ -143,6 +151,9 @@ jobs:
             # measured on this exact runner; off, because two of two non-Apple architectures lose
             # and shipping a slower binary on an unmeasured guess is the wrong default.
             pgo: false
+            # Same AVX2 variant as the Linux x86_64 artefact: every Intel Mac that can run this is
+            # from 2013 or later and has AVX2.
+            variant_cpu: "x86-64-v3"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -304,6 +315,39 @@ jobs:
           [ "$RECORDS" -eq 1000 ]
           grep -q '^@SQ' /tmp/relcheck/out.sam
 
+      # The AVX2 variant, for the x86_64 targets only. Built AFTER the gates above have passed on the
+      # baseline binary, and put through the same two gates itself: an artefact that ships a second
+      # executable has to prove that one rebuilds the committed index and aligns, or the second
+      # executable is untested bytes with a helpful name.
+      - name: Build the AVX2 variant
+        if: matrix.variant_cpu != ''
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+          RUSTFLAGS: -C target-cpu=${{ matrix.variant_cpu }}
+        run: cargo build --release --locked --target-dir target-variant
+
+      - name: The variant rebuilds the committed index byte-identically, and aligns
+        if: matrix.variant_cpu != ''
+        run: |
+          set -euo pipefail
+          # A different instruction set must not move a byte: same gate as the baseline binary, on a
+          # clean directory so a leftover cannot make it pass.
+          rm -rf /tmp/relcheck-variant && mkdir -p /tmp/relcheck-variant
+          cp testdata/tiny/tiny.fa /tmp/relcheck-variant/tiny.fa
+          ./target-variant/release/bwa-mem4 index /tmp/relcheck-variant/tiny.fa
+          for ext in pac ann amb bwt.2bit.64 0123; do
+            cmp -s "/tmp/relcheck-variant/tiny.fa.$ext" "testdata/tiny/tiny.fa.$ext" \
+              || { echo "::error::variant .$ext differs on ${{ matrix.target_id }}"; exit 1; }
+          done
+          ./target-variant/release/bwa-mem4 mem -t2 -K 10000000 testdata/tiny/tiny.fa \
+            /tmp/relcheck/r_1.fq /tmp/relcheck/r_2.fq > /tmp/relcheck-variant/out.sam
+          [ "$(grep -vc '^@' /tmp/relcheck-variant/out.sam)" -eq 1000 ]
+          # And the two binaries must agree with each other, which is the property that makes
+          # shipping both safe: same records, only the @PG CL path differs.
+          diff <(grep -v '^@PG' /tmp/relcheck/out.sam) <(grep -v '^@PG' /tmp/relcheck-variant/out.sam) \
+            || { echo "::error::variant output differs from baseline on ${{ matrix.target_id }}"; exit 1; }
+          echo "variant: index identical, 1000 records, output identical to the baseline binary"
+
       - name: Package
         id: pkg
         run: |
@@ -311,6 +355,30 @@ jobs:
           NAME="bwa-mem4-${{ needs.check-version.outputs.tag }}-${{ matrix.target_id }}"
           mkdir -p "dist/$NAME"
           cp target/release/bwa-mem4 "dist/$NAME/"
+          # The AVX2 variant, where there is one. Named after the instruction set it needs rather
+          # than after a marketing tier, and accompanied by a note, because a second executable in a
+          # tarball with no explanation is a support ticket.
+          if [ -x target-variant/release/bwa-mem4 ]; then
+            cp target-variant/release/bwa-mem4 "dist/$NAME/bwa-mem4-${{ matrix.variant_cpu }}"
+            {
+              printf '%s\n' '# `bwa-mem4-x86-64-v3`'
+              printf '%s\n' ''
+              printf '%s\n' 'The second binary in this archive is the same source compiled for **x86-64-v3** (AVX2, i.e. Intel'
+              printf '%s\n' 'Haswell 2013 and AMD Excavator 2015 onwards). It produces **identical output**: the release job'
+              printf '%s\n' 'rebuilds the committed index with it and diffs a full alignment against the baseline binary'\''s,'
+              printf '%s\n' 'byte for byte, before either is packaged.'
+              printf '%s\n' ''
+              printf '%s\n' 'It is **5.6% to 6.8% faster**, measured on an AMD EPYC 7763 over interleaved repetitions'
+              printf '%s\n' '(32.99 / 33.42 s against 31.42 / 31.15 s on 400k simulated pairs against chr21).'
+              printf '%s\n' ''
+              printf '%s\n' 'Use it if your CPU has AVX2, which every x86 server bought in the last decade does:'
+              printf '%s\n' ''
+              printf '%s\n' '    grep -q avx2 /proc/cpuinfo && ./bwa-mem4-x86-64-v3 mem ...'
+              printf '%s\n' ''
+              printf '%s\n' '`bwa-mem4` itself stays compiled at the x86-64 baseline so that it runs anywhere, including hosts'
+              printf '%s\n' 'where the variant would die with an illegal instruction. Nothing chooses between them for you.'
+            } > "dist/$NAME/AVX2-VARIANT.md"
+          fi
           # LICENSE travels with the binary: this is a derivative work of bwa-mem2 and the MIT terms
           # require the notice to accompany every distributed copy, source or not.
           cp LICENSE README.md "dist/$NAME/"
