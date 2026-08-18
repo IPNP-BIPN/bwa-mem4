@@ -106,6 +106,31 @@ jobs:
           wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
           echo "simulated $n pairs"
 
+      # The measurement the section above turned into a question. If resident is live on Linux and
+      # one batch in flight lands on the fork's RSS, then our 2x is the batch overlap, and the only
+      # thing left to know is what that overlap is worth in wall clock. Both arms are the SHIPPED
+      # binary, interleaved on one host, with the fork timed alongside as a drift canary.
+      - name: Batch overlap A/B (what the second resident batch buys)
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          K="${{ github.event.inputs.k_batch || '100000000' }}"
+          KARG=""; [ -n "$K" ] && KARG="-K $K"
+          M4=../bwa-mem4-shipped
+          timed() { /usr/bin/time -f '%e %M' -o tt.txt "$@" > /dev/null 2>/dev/null; cat tt.txt; }
+          echo "threads=$T  batch=${KARG:-per-tool default}"
+          $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq > /dev/null 2>/dev/null   # warm
+          for rep in 1 2 3; do
+            on=$(timed $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+            off=$(timed env BWA4_NO_BATCH_OVERLAP=1 $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+            fk=$(timed bwa-mem3 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+            echo "rep $rep: overlap ${on} | no-overlap ${off} | fork ${fk}   (wall_s maxrss_kb)"
+          done
+          echo "== the switch must not move a byte =="
+          $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum > c.md5
+          BWA4_NO_BATCH_OVERLAP=1 $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum > d.md5
+          if cmp -s c.md5 d.md5; then echo "identical apart from @PG ($(cut -d' ' -f1 c.md5))"; else echo "OVERLAP SWITCH CHANGED THE OUTPUT" >&2; exit 1; fi
+
       - name: Resident vs live, ours against the fork
         run: |
           cd work

@@ -1630,6 +1630,23 @@ fn spawn_reader<B: Send + 'static>(
     )
 }
 
+/// Whether `BWA4_NO_BATCH_OVERLAP` asks the pipeline to hold ONE batch at a time.
+///
+/// The default (unset, so overlap on) is the shipped behaviour and the faster one on a machine with
+/// cores to spare: batch N's thin, low-occupancy tail runs against batch N+1's `align`, which is the
+/// one stage that can fill the pool. Setting it trades that back for half the resident memory, which
+/// the Linux measurement in `run_pipeline` shows is the whole of our gap against the fork.
+///
+/// Read once and cached: it cannot change mid-process, and the batch loop consults it per batch.
+///
+/// # Returns
+///
+/// True when the variable is set to anything at all, including the empty string.
+fn no_batch_overlap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_NO_BATCH_OVERLAP").is_some())
+}
+
 fn run_pipeline<B: Send>(
     out: Output,
     // Already produced by a reader the CALLER started, so that reading and inflating the first
@@ -1751,6 +1768,14 @@ fn run_pipeline<B: Send>(
         // The cost is one more resident batch: records and regions for two batches instead of one,
         // on top of the reader's queue. That is the same currency `queue_depths` spends, and it is
         // spent here because this is where it buys wall clock rather than latency tolerance.
+        //
+        // And that cost turned out to BE issue #25. Measured on Linux with the allocation probe
+        // (chr21, 2M pairs, `-K` 100M, 4 threads): resident memory is live memory there, 1.02x, so
+        // the 2.02x we carry against fg-labs/bwa-mem3 (4.78 GB against 2.36 GB) is not allocator
+        // retention and not a fatter batch. It is THIS line: with one batch in flight the same run
+        // takes 2.49 GB, which is 1.05x the fork rather than 2.02x. `BWA4_NO_BATCH_OVERLAP=1` is
+        // how that half of the memory is handed back, for a caller who would rather have it than
+        // the overlap.
         let mut inflight: Option<std::thread::ScopedJoinHandle<'_, Vec<Vec<u8>>>> = None;
         loop {
             // Blocked here == starved by the reader. Charged to `wait_read`, which is the one
@@ -1771,13 +1796,16 @@ fn run_pipeline<B: Send>(
             // between the two batches in flight, so it is borrowed and must be `Sync`.
             let process_ref = &process;
             let started = scope.spawn(move || process_ref(batch, base_id));
-            // `BWA4_STAGE_ALLOC` tags allocations with a PROCESS-WIDE stage, so two batches in
-            // flight would each overwrite the other's tag and every per-stage byte count would be a
-            // blend of two stages. Retire this batch before reading the next one while the probe is
-            // armed. Output is untouched (batch order is already guaranteed below); only the
-            // overlap is lost, so an instrumented run's wall time means nothing, which it did not
-            // anyway at four atomics per allocation.
-            let started = if crate::stage_alloc::serialize_batches() {
+            // Two reasons to retire this batch before reading the next one, and they meet here.
+            // `BWA4_NO_BATCH_OVERLAP` is the user-facing one: it halves resident memory (see the
+            // block above). `BWA4_STAGE_ALLOC` is the probe's: it tags allocations with a
+            // PROCESS-WIDE stage, so two batches in flight would each overwrite the other's tag and
+            // every per-stage byte count would be a blend of two stages.
+            //
+            // Output is untouched either way. Batch order is guaranteed below by joining before
+            // sending, not by how many batches are in flight, and no batch's result depends on
+            // another's.
+            let started = if no_batch_overlap() || crate::stage_alloc::serialize_batches() {
                 let buf = started.join().expect("batch worker panicked");
                 let t_send = std::time::Instant::now();
                 let sent = sam_tx.send(buf);
