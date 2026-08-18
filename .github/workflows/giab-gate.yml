@@ -21,6 +21,9 @@ on:
   # name once its file is on the default branch).
   push:
     branches: [perf/alloc-probe]
+    # Only when this file changes. Without the path filter every commit on the branch relaunches an
+    # hour of CI, which happened three times before the filter was added.
+    paths: [".github/workflows/giab-gate.yml"]
   workflow_dispatch:
     inputs:
       region:

@@ -22,6 +22,9 @@ on:
   # push on the branch that introduces it.
   push:
     branches: [perf/alloc-probe]
+    # Only when this file changes. Without the path filter every commit on the branch relaunches an
+    # hour of CI, which happened three times before the filter was added.
+    paths: [".github/workflows/perf-x86.yml"]
   workflow_dispatch:
     inputs:
       read_pairs:
