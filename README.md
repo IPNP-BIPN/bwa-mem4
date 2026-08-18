@@ -322,6 +322,9 @@ A read of fg-labs/bwa-mem3's source, asking why it is faster than us on x86_64 w
 parity on Apple Silicon, is in [docs/fork-teardown.md](docs/fork-teardown.md). The short answer is
 its build: their whole non-kernel codebase is compiled at AVX2 and ours at the x86-64 baseline.
 
+What is left to try, and what the 2026 literature does and does not offer under byte-identity, is in
+[docs/whats-left-2026.md](docs/whats-left-2026.md).
+
 ## Licence
 
 MIT, in [LICENSE](LICENSE). This is a derivative work of
