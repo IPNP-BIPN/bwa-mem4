@@ -49,10 +49,15 @@ ARM the same choice costs nothing, because the aarch64 baseline already includes
 | Zen 3, AVX2 u8 | 11.27 Gcell/s | 4.56 | **40%** |
 | M4 Max, NEON u8 | ~16 Gcell/s | 10.03 | **63%** |
 
-Same code, same probe, two platforms: the glue around the kernel (job collection, the `finish_row`
-and `extract_group` scalar passes, the memory traffic) eats a third more of the budget on x86 than
-on ARM. #46 tuned those scalar passes on NEON only. This is the same root cause as (1) seen from the
-other end, and it is worth about 8% of the x86 wall on its own.
+Same code, same probe, two platforms: the glue around the kernel (job collection, the per-row
+extraction, the memory traffic) eats a third more of the budget on x86 than on ARM.
+
+And it is **not** the kernel-adjacent scalar passes, which is the first place to look: #46's work on
+those is already on the AVX2 path and was measured there, +17% on the AVX2 u8 rescue kernel together
+with #43's XOR table (9.55 -> 11.17 Gcell/s on this same Zen 3). Those +17% are inside the 11.27
+figure above. So what the pipeline loses is outside the kernel and outside its tuned scalar passes,
+which points back at (1): everything else in that path is compiled for a 2003 CPU. Worth about 8% of
+the x86 wall.
 
 ### 3. The extension kernel costs 2.0 operations per cell, the rescue kernel 0.95
 
@@ -70,14 +75,11 @@ one kernel where byte-identity constrains the recurrence itself.
 
 1. **Ship per-ISA x86 artefacts** once the baseline/v2/v3 arm reports. Packaging, no algorithm risk,
    and it addresses (1) and part of (2).
-2. **Port #46's scalar-pass work to the x86 kernels** (vector-gated `finish_row`, vector `minsc`
-   pre-filter in `extract_group`). It was measured on NEON and never applied to AVX2/SSE4.1, and (2)
-   is exactly the shape of a gap that leaves.
-3. **The SAM emitters**, continued: the integer and SEQ/QUAL work landed today; the CIGAR and tag
-   builders have not been audited.
-4. **A sort-free adjacent-SMEM dedup**, from the fork's `smem_dedup.cpp`: 34 lines, no allocation,
+2. **The SAM emitters**, continued: the integer and SEQ/QUAL work landed today; the CIGAR and tag
+   builders have not been audited, and `sam_emit` is the worst-scaling stage on x86.
+3. **A sort-free adjacent-SMEM dedup**, from the fork's `smem_dedup.cpp`: 34 lines, no allocation,
    and it attacks the 86.5M SA lookups per million pairs directly. Byte-identity is the open
    question, and it is a measurement.
-5. **The extension kernel's 2.0 ops/cell**, as a spike with a real design, not as tuning.
+4. **The extension kernel's 2.0 ops/cell**, as a spike with a real design, not as tuning.
 
 Everything else surveyed this year is either already measured here or changes the output.
