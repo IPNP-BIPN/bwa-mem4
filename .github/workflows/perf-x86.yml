@@ -130,11 +130,63 @@ jobs:
             "$@" mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2> probe.err || { echo "FAILED"; tail -5 probe.err; return; }
             grep -E '^\[(stage-time|barrier|align-split|chain-time|matesw|traffic|seed)' probe.err || tail -20 probe.err
           }
-          run_probe "per-stage wall (BWA4_STAGE_TIME)"      env BWA4_STAGE_TIME=1 $M4
-          run_probe "pool occupancy per region (BWA4_BARRIER_TIME)" env BWA4_BARRIER_TIME=1 $M4
-          run_probe "chaining and SA resolution (BWA4_CHAIN_TIME)"  env BWA4_CHAIN_TIME=1 $M4
-          run_probe "rescue kernel cells (BWA4_MATESW_TIME)"        env BWA4_MATESW_TIME=1 $M4
-          run_probe "align internals (BWA4_ALIGN_SPLIT, split build)" env BWA4_ALIGN_SPLIT=1 $SP
+          # Every probe below runs with ONE batch in flight. `BWA4_STAGE_TIME`'s accumulators are
+          # process-wide, so with the overlap on, two batches credit the same stage counters and the
+          # table sums past 100% (measured on ARM: encode reads 29.8% and the total 197%). The stage
+          # SHARES are the whole point here, so they are taken where they are exact. It costs 1.1%
+          # of wall, which no share in this step is sensitive to.
+          NOOV="BWA4_NO_BATCH_OVERLAP=1"
+          run_probe "per-stage wall (BWA4_STAGE_TIME)"      env $NOOV BWA4_STAGE_TIME=1 $M4
+          run_probe "pool occupancy per region (BWA4_BARRIER_TIME)" env $NOOV BWA4_BARRIER_TIME=1 $M4
+          run_probe "chaining and SA resolution (BWA4_CHAIN_TIME)"  env $NOOV BWA4_CHAIN_TIME=1 $M4
+          run_probe "rescue kernel cells (BWA4_MATESW_TIME)"        env $NOOV BWA4_MATESW_TIME=1 $M4
+          run_probe "align internals (BWA4_ALIGN_SPLIT, split build)" env $NOOV BWA4_ALIGN_SPLIT=1 $SP
+
+          echo
+          echo "===== SA prefetch window sweep (BWA4_SA_WINDOW) ====="
+          # The window is the count of LF-walks kept in flight, i.e. how many DRAM misses are
+          # outstanding at once, and it was swept to 128 on an M4. Zen 3 and M4 do not have the same
+          # number of outstanding-miss slots, so the knee need not be in the same place. 128 is the
+          # compile-time ceiling, so this can only narrow: a wider optimum would show up as a curve
+          # still falling at 128, and would need a rebuild to confirm.
+          for w in 16 32 64 96 128; do
+            s=$( { /usr/bin/time -f '%e' -o w.txt env BWA4_NO_BATCH_OVERLAP=1 BWA4_SA_WINDOW=$w $M4 mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null; } 2>/dev/null; cat w.txt)
+            echo "  W=$w: ${s}s"
+          done
+
+      # bwa-mem2, and the fork with it, SHIP one binary per instruction set (`bwa-mem2.avx2`,
+      # `bwa-mem2.avx512bw`) and pick at exec time. We ship one baseline binary and select only the
+      # rescue and extension kernels at runtime, which leaves every scalar loop in seeding, chaining
+      # and SA resolution compiled for a 2003 CPU. That is a plausible slice of the x86 deficit and
+      # it has never been measured, so here it is measured: same source, three instruction-set
+      # levels, one host.
+      - name: What the instruction set is worth (baseline vs v2 vs v3)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          for lvl in "" "x86-64-v2" "x86-64-v3"; do
+            name="${lvl:-baseline}"
+            if [ -z "$lvl" ]; then export RUSTFLAGS=""; else export RUSTFLAGS="-C target-cpu=$lvl"; fi
+            cargo build --release -p bwa-mem4 --target-dir "target-$name" 2>/dev/null | tail -1
+            cp "target-$name/release/bwa-mem4" "./bwa-mem4-$name"
+          done
+          unset RUSTFLAGS
+          cd work
+          for name in baseline x86-64-v2 x86-64-v3; do
+            ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null   # warm
+          done
+          for rep in 1 2; do
+            line="rep $rep:"
+            for name in baseline x86-64-v2 x86-64-v3; do
+              s=$( { /usr/bin/time -f '%e' -o b.txt ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null; } 2>/dev/null; cat b.txt)
+              line="$line $name ${s}s |"
+            done
+            echo "$line"
+          done
+          echo "== and they must all produce the same bytes =="
+          for name in baseline x86-64-v2 x86-64-v3; do
+            ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+          done
 
       - name: Rescue kernel tier sweep (is AVX2 actually carrying it)
         run: |

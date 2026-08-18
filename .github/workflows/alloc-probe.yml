@@ -14,13 +14,6 @@
 name: alloc-probe
 
 on:
-  # TEMPORARY, and removed before this branch merges: a `workflow_dispatch` workflow is only
-  # reachable by name once its file exists on the DEFAULT branch, so the first run of a brand-new
-  # one cannot be dispatched from the branch that introduces it. This trigger, scoped to this branch
-  # alone, is how that first run happens. Once the file is on `main`, dispatch is the only entry
-  # point, as the header says.
-  push:
-    branches: [perf/alloc-probe]
   workflow_dispatch:
     inputs:
       read_pairs:
