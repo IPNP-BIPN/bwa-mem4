@@ -262,7 +262,8 @@ mod tests {
     use super::*;
     use bwa_extend::{
         assert_backend_batch_matches_scalar, assert_backend_batch_order_invariant,
-        assert_backend_matches_scalar, assert_backend_tie_rule_matches_scalar,
+        assert_backend_matches_scalar, assert_backend_saturation_boundary_matches_scalar,
+        assert_backend_tie_rule_matches_scalar,
     };
 
     /// The two shared acceptance gates from `bwa-extend`, run against this backend. They take no
@@ -282,6 +283,9 @@ mod tests {
     fn neon_backend_passes_gpu_readiness_barriers() {
         assert_backend_tie_rule_matches_scalar(&NeonBackend);
         assert_backend_batch_order_invariant(&NeonBackend);
+        // The u8 saturation boundary and the i16 replay it triggers. Engineered scores around 255,
+        // which random sweeps never produce, so this is the only gate that exercises the replay.
+        assert_backend_saturation_boundary_matches_scalar(&NeonBackend);
         assert_eq!(NeonBackend.name(), "neon");
     }
 

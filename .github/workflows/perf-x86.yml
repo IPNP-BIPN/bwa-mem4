@@ -309,3 +309,93 @@ jobs:
           echo "== PGO changes instruction selection, never output =="
           ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
           ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+
+  # wgsim hides mate rescue, and this repo has already been burned by that: bwa-mem2's own
+  # paired-end-specific work is 0.49 us/read on wgsim and 15.37 us/read on real GIAB, 31x more
+  # (docs/perf-levers.md). @nh13's x86 table is real WGS and real WES, where we are 1.27x and 1.50x
+  # slower; every x86 number this repo has produced so far is simulated. So this job repeats the
+  # head-to-head on REAL HG002 reads, sliced out of GIAB's own BAM the way the giab-gate workflow
+  # does, and takes the stage profile there too.
+  real-reads-x86:
+    name: the gap on REAL reads, and where it goes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + bwa-mem3 + samtools (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3
+            samtools
+          init-shell: bash
+
+      - name: Build bwa-mem4
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+        run: cargo build --release -p bwa-mem4
+
+      - name: Reference and index
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          sed -i '1s/.*/>chr21/' chr21.fa
+          bwa-mem2 index chr21.fa
+
+      - name: Real HG002 reads
+        run: |
+          cd work
+          bam="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG002.GRCh38.300x.bam"
+          # Same slice as the gate, at a fifth of the subsampling, so the benchmark has a few million
+          # pairs rather than one: a 30-second run measures start-up, not alignment.
+          samtools view -@ 4 -b -s 0.5 "$bam" chr21:20000000-30000000 > slice.bam
+          samtools collate -@ 4 -u -O slice.bam \
+            | samtools fastq -@ 4 -1 g1.fq.gz -2 g2.fq.gz -0 /dev/null -s /dev/null -n
+          echo "pairs: $(( $(zcat g1.fq.gz | wc -l) / 4 ))"
+
+      - name: Head-to-head on real reads
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../target/release/bwa-mem4
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          $M4 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz >/dev/null 2>/dev/null   # warm
+          for rep in 1 2 3; do
+            m4=$(timed $M4 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
+            fk=$(timed bwa-mem3 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
+            m2=$(timed bwa-mem2 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
+            echo "rep $rep: bwa-mem4 ${m4}s | bwa-mem3 ${fk}s | bwa-mem2 ${m2}s"
+          done
+
+      - name: Where our wall goes on real reads
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../target/release/bwa-mem4
+          # One batch in flight, so the stage shares are exact rather than two batches' counters
+          # added together.
+          for probe in BWA4_STAGE_TIME BWA4_BARRIER_TIME BWA4_CHAIN_TIME BWA4_MATESW_TIME; do
+            echo; echo "===== $probe ====="
+            env BWA4_NO_BATCH_OVERLAP=1 "$probe=1" $M4 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz \
+              > /dev/null 2> p.err || { echo FAILED; tail -5 p.err; continue; }
+            grep -E '^\[(stage-time|barrier|chain-time|matesw)' p.err || tail -10 p.err
+          done

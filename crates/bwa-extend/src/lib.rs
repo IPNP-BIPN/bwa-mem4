@@ -650,6 +650,167 @@ pub fn assert_backend_tie_rule_matches_scalar<B: SwBackend>(backend: &B) {
     }
 }
 
+/// GPU-readiness barrier 3 (issue #54, trap 3): the u8 saturation boundary, and the i16 replay it
+/// triggers.
+///
+/// The batched extension kernel works in biased, saturating `u8`. When a cell would exceed the type
+/// it saturates, and the pipeline REPLAYS the whole job in `i16`. Correctness therefore depends on
+/// the backend detecting saturation at exactly the same score as the reference: one off, and it
+/// returns a clipped score where the CPU would have replayed, or replays where the CPU did not,
+/// which is slower but still correct. Only the first of those is a bug, and it is invisible on
+/// random data, where scores of 250-260 essentially never occur.
+///
+/// So this gate manufactures them. With a match score of `a` and a perfect match of length `L`, an
+/// extension from `h0` scores exactly `h0 + a * L`, so sweeping `L` around `255 / a` walks the score
+/// through the boundary one step at a time, in both the `a = 1` regime (every integer is visited)
+/// and `a = 2` (the boundary is stepped over rather than landed on, which is the case a threshold
+/// written as `==` gets wrong).
+///
+/// A second family carries a mismatch tail, so `score2` and `te2` cross the boundary while `score`
+/// is already past it: a backend that tracks the two maxima in different widths fails here and
+/// nowhere else.
+///
+/// # Parameters
+/// `backend`: the implementation under test. Both `extend` and `extend_batch` are exercised, since
+/// the replay lives on the batched path.
+///
+/// # Panics
+/// On the first job whose result differs from [`ksw_extend2`] in any field, naming the score it was
+/// engineered to land on.
+pub fn assert_backend_saturation_boundary_matches_scalar<B: SwBackend>(backend: &B) {
+    let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+    // Wide enough that the band never bites: this gate is about the value domain, not the geometry.
+    let w = 400;
+    // Off, so no job can exit early and skip the region of interest.
+    let zdrop = 0;
+    let end_bonus = 0;
+
+    // Owned storage, since `ExtendJob` borrows its sequences.
+    let mut queries: Vec<Vec<u8>> = Vec::new();
+    let mut targets: Vec<Vec<u8>> = Vec::new();
+    let mut h0s: Vec<i32> = Vec::new();
+    let mut mats: Vec<Vec<i8>> = Vec::new();
+    let mut wanted: Vec<i32> = Vec::new();
+
+    // A deterministic, non-repeating base sequence to build perfect matches from. NOT a homopolymer:
+    // a run of one base is also the tie-heavy case that barrier 1 already covers, and mixing the two
+    // would make a failure here ambiguous.
+    let base: Vec<u8> = (0..600u32).map(|i| ((i * 7 + i / 4) % 4) as u8).collect();
+
+    for &(a, b) in &[(1i8, 4i8), (2i8, 5i8)] {
+        let mat = fill_scmat_vec(a, b);
+        for h0 in [1i32, 2, 3] {
+            // Target scores from well below the boundary to well above it, so the sweep contains the
+            // last score the u8 path can represent, the first it cannot, and their neighbours.
+            for target_score in 248..=264i32 {
+                // Length that lands the score exactly there, when the arithmetic allows it.
+                let len = (target_score - h0) / i32::from(a);
+                if len <= 0 || (len * i32::from(a)) + h0 != target_score {
+                    continue;
+                }
+                let len = len as usize;
+                if len > base.len() {
+                    continue;
+                }
+                queries.push(base[..len].to_vec());
+                targets.push(base[..len].to_vec());
+                h0s.push(h0);
+                mats.push(mat.clone());
+                wanted.push(target_score);
+
+                // Same again with a mismatched tail: the best score still peaks at `target_score`,
+                // but the second maximum and its coordinates now sit near the boundary too.
+                let mut q = base[..len].to_vec();
+                let mut t = base[..len].to_vec();
+                for i in (len.saturating_sub(8))..len {
+                    // Rotate the query base so the tail mismatches while staying a valid code.
+                    q[i] = (q[i] + 1) % 4;
+                }
+                t.extend_from_slice(&base[len..(len + 8).min(base.len())]);
+                queries.push(q);
+                targets.push(t);
+                h0s.push(h0);
+                mats.push(mat.clone());
+                wanted.push(target_score);
+                let _ = b;
+            }
+        }
+    }
+
+    assert!(
+        !queries.is_empty(),
+        "the saturation sweep generated no cases, which would make this gate vacuous"
+    );
+
+    // Single-job path first, so a failure names one job rather than a batch.
+    for (i, ((q, t), (&h0, (mat, &want)))) in queries
+        .iter()
+        .zip(targets.iter())
+        .zip(h0s.iter().zip(mats.iter().zip(wanted.iter())))
+        .enumerate()
+    {
+        let expected = ksw_extend2(
+            q, t, 5, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, h0,
+        );
+        let got = backend.extend(
+            q, t, 5, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, h0,
+        );
+        assert_eq!(
+            got,
+            expected,
+            "{} diverged from scalar on saturation case {i} (engineered score {want}, qlen {}, \
+             tlen {}, h0 {h0})",
+            backend.name(),
+            q.len(),
+            t.len(),
+        );
+    }
+
+    // Then the batched path, which is where the u8 kernel and its i16 replay actually live. One
+    // scoring matrix per batch, so the jobs are grouped by the `(a, b)` they were built with.
+    for mat in [fill_scmat_vec(1, 4), fill_scmat_vec(2, 5)] {
+        let mut jobs: Vec<ExtendJob> = Vec::new();
+        let mut expected: Vec<_> = Vec::new();
+        for (i, m) in mats.iter().enumerate() {
+            if *m != mat {
+                continue;
+            }
+            jobs.push(ExtendJob {
+                query: &queries[i],
+                target: &targets[i],
+                h0: h0s[i],
+            });
+            expected.push(ksw_extend2(
+                &queries[i],
+                &targets[i],
+                5,
+                &mat,
+                o_del,
+                e_del,
+                o_ins,
+                e_ins,
+                w,
+                end_bonus,
+                zdrop,
+                h0s[i],
+            ));
+        }
+        let got = backend.extend_batch(
+            &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                g,
+                e,
+                "{} diverged from scalar in a saturation BATCH at job {i} (qlen {}), which the \
+                 single-job path got right: the u8 kernel's saturation replay is the suspect",
+                backend.name(),
+                jobs[i].query.len(),
+            );
+        }
+    }
+}
+
 /// GPU-readiness barrier 2 (issue #54, trap 6): batching must not make a job's result depend on the
 /// company it keeps.
 ///
