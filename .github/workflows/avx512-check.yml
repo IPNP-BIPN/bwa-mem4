@@ -59,8 +59,12 @@ jobs:
           # `--message-format=json` names the executables cargo built, which is the only reliable way
           # to find them: the hash suffix is not predictable, and a `find` over target/release/deps
           # picks up whatever else is lying there (the first attempt at this step ran `rustc`).
+          #
+          # `.target.test == true` is load-bearing and cost a run: without it the first executable
+          # cargo reports is the `bench_batch` EXAMPLE, which runs happily under qemu, prints a
+          # throughput table, and proves nothing about any kernel's correctness.
           cargo test -p bwa-mem4-neon --release --no-run --message-format=json \
-            | jq -r 'select(.executable != null) | .executable' | tee /tmp/testbins
+            | jq -r 'select(.executable != null and .target.test == true) | .executable' | tee /tmp/testbins
           test -s /tmp/testbins || { echo "cargo built no test binary" >&2; exit 1; }
 
       - name: Run them under an emulated AVX-512 CPU
