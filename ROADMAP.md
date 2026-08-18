@@ -4269,6 +4269,20 @@ regime : ce qu'il rend est UN batch, donc son gain est proportionnel a `-K`. A `
 rend 1,44 GB, a `-K` 10M presque rien. Le wall de ce meme jeu n'est pas exploitable, l'hote allant de
 13,4 a 20,3 s d'une repetition a l'autre.
 
+### Et le churn ne coute pas de wall non plus : l'arene par worker est morte des deux cotes
+
+La section precedente concluait que les 452 octets alloues par base appelaient une arene par worker.
+Le resultat Linux lui retire sa raison memoire : ce volume transitoire ne fait pas de resident, la
+RSS du batch etant son vivant a 1,02x pres. Restait sa raison wall, et un profil `sample` la retire
+aussi. macOS, `-t8`, 500k paires GIAB, 6 s de profil en regime : **651 echantillons self dans
+l'allocateur sur 55 299**, dont 18 876 en attente (`psynch_cvwait`, `ulock_wait`, `semaphore_wait`).
+Soit **1,2 % du profil et 1,8 % du temps occupe**, contre 13 163 pour le seul `batched_extend_neon_u8`.
+
+Un remplacement PARFAIT de l'allocateur par une arene rendrait donc au mieux 1,8 %, sous le plancher
+de 3 % que ce projet s'est donne, pour un refactor qui traverse quatre crates et met l'octet-identite
+en jeu. Le dossier « churn » se ferme sur ce chiffre : mimalloc encaisse 167 M d'allocations par
+500k paires pour 1,8 % du busy, ce qui est le vrai enseignement du tableau des volumes.
+
 **Ce qui reste a decider est donc un arbitrage, pas une enquete** : ce que le recouvrement vaut en
 wall quand il a de quoi recouvrir. Indice deja au dossier, a confirmer sans instrumentation : les
 deux modes instrumentes du run Linux finissent a 214,52 s et 214,83 s, six batchs et quatre coeurs,
