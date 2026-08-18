@@ -86,6 +86,12 @@ jobs:
           # self-skips otherwise, and a skipped test reports `ok`, which is exactly the failure mode
           # this workflow exists to prevent.
           qemu-x86_64 -cpu max /usr/bin/lscpu 2>/dev/null | grep -o -E 'avx512bw|avx512f' | sort -u || true
+          # BWA4_TEST_FORCE_AVX512: qemu-user emulates the instructions but does not present the
+          # XCR0 bits Rust's `is_x86_feature_detected!` checks, so without this the three AVX-512
+          # tests skip and report `ok` — which is exactly the silence this job exists to break. If
+          # the emulator cannot actually execute them, the run dies with SIGILL, which is a correct
+          # and loud answer.
+          export BWA4_TEST_FORCE_AVX512=1
           qemu-x86_64 -cpu max "$bin" --nocapture --test-threads 2 2>&1 | tail -40 > /tmp/out.txt || {
             echo "TESTS FAILED under emulation"; cat /tmp/out.txt; exit 1; }
           cat /tmp/out.txt
@@ -95,6 +101,9 @@ jobs:
             echo "no avx512 test executed: emulation did not expose the feature" >&2
             exit 1
           fi
-          if grep -q 'skipped' /tmp/out.txt; then
-            echo "WARNING: something self-skipped; read the list above" >&2
+          # The tests now announce a skip on stderr, so a skip is detectable rather than a silent
+          # `ok`. Any AVX-512 skip here means the override did not take and the job proved nothing.
+          if grep -q 'skipping avx512' /tmp/out.txt; then
+            echo "an AVX-512 test skipped despite the override: emulation did not expose the kernels" >&2
+            exit 1
           fi

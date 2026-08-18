@@ -257,6 +257,30 @@ impl SwBackend for NeonBackend {
     }
 }
 
+/// Whether the AVX-512 kernel tests should EXECUTE, as opposed to reporting `ok` without running.
+///
+/// Normally this is just feature detection. The override exists because of a specific hole: those
+/// tests have never executed anywhere. Every GitHub runner draw this project has taken has been an
+/// AMD EPYC 7763 with no AVX-512, and under `qemu-x86_64 -cpu max`, which does emulate the
+/// instructions, Rust's `is_x86_feature_detected!` still answers false, because qemu-user does not
+/// present the XCR0 state bits the detection checks. So the kernels ran nowhere while three tests
+/// reported `ok`.
+///
+/// `BWA4_TEST_FORCE_AVX512=1` says "the harness knows this machine can execute AVX-512, run them".
+/// It is test-only and deliberately dangerous: set on a CPU that genuinely lacks the instructions,
+/// the tests die with SIGILL, which is a loud, correct answer rather than a silent skip.
+///
+/// # Returns
+///
+/// True when the AVX-512 tests should run.
+// x86_64 only, because the callers are: on aarch64 the AVX-512 tests do not exist and an
+// unconditional helper would be dead code the lint gate rejects.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn avx512_testable() -> bool {
+    std::arch::is_x86_feature_detected!("avx512bw")
+        || std::env::var_os("BWA4_TEST_FORCE_AVX512").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

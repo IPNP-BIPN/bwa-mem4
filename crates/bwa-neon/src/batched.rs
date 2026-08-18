@@ -3375,10 +3375,12 @@ mod avx512_verify {
 
     #[test]
     fn avx512_u8_and_i16_match_scalar() {
-        // Unlike the AVX2 gate, this one CANNOT run under Rosetta: it has no `avx512bw`. On a
-        // host without the feature the test returns early and reports `ok` without having executed
-        // the kernel, so AVX-512 coverage comes from a native AVX-512 CI runner only.
-        if !std::arch::is_x86_feature_detected!("avx512bw") {
+        // Unlike the AVX2 gate, this one CANNOT run under Rosetta: it has no `avx512bw`. It used to
+        // return silently on such a host, which meant a green `ok` that had executed nothing; now it
+        // says so, and `BWA4_TEST_FORCE_AVX512` runs it anyway where the harness knows better (an
+        // emulator whose feature detection under-reports). See `crate::avx512_testable`.
+        if !crate::avx512_testable() {
+            eprintln!("skipping avx512_u8_and_i16_match_scalar: no avx512bw on this CPU");
             return;
         }
         let mat = scoring();
