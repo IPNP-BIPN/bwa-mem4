@@ -398,7 +398,7 @@ jobs:
       # and SA resolution compiled for a 2003 CPU. That is a plausible slice of the x86 deficit and
       # it has never been measured, so here it is measured: same source, three instruction-set
       # levels, one host.
-      - name: What the instruction set is worth (baseline vs v2 vs v3)
+      - name: What the instruction set is worth (baseline vs v3)
         run: |
           cd "$GITHUB_WORKSPACE"
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
@@ -407,29 +407,39 @@ jobs:
           # symptom is not a clear error: the runner takes a shutdown signal and the job dies with
           # exit 143 at the start of the step. Changing RUSTFLAGS invalidates the cache anyway, so
           # sharing the directory costs nothing but the rebuild that was going to happen.
+          # TWO arms, not three, and `--jobs 2`. This step has now died three times at the second
+          # build with `exit 143` and "the runner has received a shutdown signal": not the clock
+          # (ten minutes into 120) and not the disk (85 GB free, printed below), which leaves the
+          # runner being reclaimed under a full rebuild of the dependency tree, hts-sys and its
+          # vendored htslib included. Fewer arms and less compile parallelism is the cheap answer,
+          # and v2 is the arm worth dropping: v3 (AVX2) is the level the fork actually builds at,
+          # so baseline against v3 is the comparison that decides anything.
+          #
+          # cargo's stderr is NOT discarded any more. It was, which is why three failures in a row
+          # said nothing about their cause.
           df -h / | tail -1
-          for lvl in "" "x86-64-v2" "x86-64-v3"; do
+          for lvl in "" "x86-64-v3"; do
             name="${lvl:-baseline}"
             if [ -z "$lvl" ]; then export RUSTFLAGS=""; else export RUSTFLAGS="-C target-cpu=$lvl"; fi
-            cargo build --release -p bwa-mem4 --target-dir target-isa 2>/dev/null | tail -1
+            cargo build --release -p bwa-mem4 --jobs 2 --target-dir target-isa 2>&1 | tail -3
             cp target-isa/release/bwa-mem4 "./bwa-mem4-$name"
-            echo "built $name"; df -h / | tail -1
+            echo "built $name"; df -h / | tail -1; free -g | head -2
           done
           unset RUSTFLAGS
           cd work
-          for name in baseline x86-64-v2 x86-64-v3; do
+          for name in baseline x86-64-v3; do
             ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null   # warm
           done
           for rep in 1 2; do
             line="rep $rep:"
-            for name in baseline x86-64-v2 x86-64-v3; do
+            for name in baseline x86-64-v3; do
               s=$( { /usr/bin/time -f '%e' -o b.txt ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null; } 2>/dev/null; cat b.txt)
               line="$line $name ${s}s |"
             done
             echo "$line"
           done
           echo "== and they must all produce the same bytes =="
-          for name in baseline x86-64-v2 x86-64-v3; do
+          for name in baseline x86-64-v3; do
             ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
           done
 
