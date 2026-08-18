@@ -4446,6 +4446,31 @@ difference de packaging joue, `bwa-mem2` livrant un binaire par jeu d'instructio
 un binaire baseline dont seules les fonctions vectorielles sont selectionnees au runtime. Le bras
 baseline / v2 / v3 mesure precisement cela.
 
+### Le PGO de la release etait un chiffre Apple generalise, et il coutait 3,3 % sur x86 (2026-08-18)
+
+`release.yml` construit chaque artefact en PGO, avec un commentaire qui annonce +4,4 % mesure sur
+« 500k paires reelles contre GRCh38 ». Cette mesure etait sur Apple Silicon. Refaite sur trois
+architectures, trois repetitions entrelacees chacune, aucune ne se croisant :
+
+| hote | plain | PGO | verdict |
+|---|---|---|---|
+| M4 (Apple Silicon) | | | **+12,4 %** |
+| Ampere Altra (ARM heberge) | 69,43 / 69,90 / 69,69 s | 69,99 / 70,32 / 69,95 s | **-0,6 %** |
+| AMD EPYC 7763 (Zen 3), recette cargo-pgo | 103,95 / 103,59 / 104,01 s | 108,66 / 107,98 / 107,80 s | **-4,1 %** |
+| AMD EPYC 7763, **recette exacte de `release.yml`** | 104,22 / 104,27 / 104,27 s | 107,36 / 108,15 / 108,24 s | **-3,3 %** |
+
+La derniere ligne est celle qui decide : meme recette, meme entrainement sur `testdata/tiny`, memes
+CFLAGS. Ce n'est pas un proxy, c'est le chemin livre. **Chaque artefact `linux-x86_64` publie
+jusqu'ici est donc ~3 % plus lent qu'un build ordinaire**, sur la plateforme ou tourne l'essentiel du
+WGS, et le -0,4 % de nh13 sur Graviton4 disait la meme chose depuis le debut sans qu'on le croie.
+
+Le build PGO est maintenant conditionne par un champ de matrice : Apple Silicon profile, les trois
+autres compilent en clair. Effet de bord agreable : ces trois artefacts redeviennent reproductibles
+depuis un arbre propre par `cargo build --release`, ce qu'un artefact PGO n'est pas.
+
+`macos-x86_64` est desactive sans mesure propre, deliberement : deux architectures non-Apple sur deux
+perdent, et livrer des octets plus lents sur une supposition non mesuree est le mauvais defaut.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
