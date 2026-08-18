@@ -4257,6 +4257,18 @@ sur chr21 en CI. Sur macOS, `-t8`, 500k paires GIAB : 14,72 GB contre 13,28 GB d
 la part batch de 4,25 a 2,81 GB, pour 1,4 % de wall sur un jeu a deux batchs, ou le recouvrement n'a
 presque rien a recouvrir.
 
+**Et c'est le seul levier qui rende cette memoire sans toucher a la sortie.** Baisser `-K` de moitie
+donnerait le meme resident, deux batchs de `-K/2` valant un de `-K`, mais deplacerait les frontieres
+de batch, donc le modele d'insert par batch, donc les octets : c'est ce que la section « la RAM par
+batch » avait deja verrouille. Le nombre de batchs en vol, lui, n'est observable nulle part dans le
+SAM.
+
+Deuxieme point de mesure, macOS `-t8` avec `-K` 10M (15 batchs) : 11,79 GB contre 11,61 GB, soit
+0,19 GB seulement. Attendu, et il faut le dire pour que personne ne cite le levier hors de son
+regime : ce qu'il rend est UN batch, donc son gain est proportionnel a `-K`. A `-K` par defaut il
+rend 1,44 GB, a `-K` 10M presque rien. Le wall de ce meme jeu n'est pas exploitable, l'hote allant de
+13,4 a 20,3 s d'une repetition a l'autre.
+
 **Ce qui reste a decider est donc un arbitrage, pas une enquete** : ce que le recouvrement vaut en
 wall quand il a de quoi recouvrir. Indice deja au dossier, a confirmer sans instrumentation : les
 deux modes instrumentes du run Linux finissent a 214,52 s et 214,83 s, six batchs et quatre coeurs,
