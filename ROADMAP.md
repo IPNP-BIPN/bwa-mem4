@@ -4283,11 +4283,30 @@ de 3 % que ce projet s'est donne, pour un refactor qui traverse quatre crates et
 en jeu. Le dossier « churn » se ferme sur ce chiffre : mimalloc encaisse 167 M d'allocations par
 500k paires pour 1,8 % du busy, ce qui est le vrai enseignement du tableau des volumes.
 
-**Ce qui reste a decider est donc un arbitrage, pas une enquete** : ce que le recouvrement vaut en
-wall quand il a de quoi recouvrir. Indice deja au dossier, a confirmer sans instrumentation : les
-deux modes instrumentes du run Linux finissent a 214,52 s et 214,83 s, six batchs et quatre coeurs,
-soit un ecart nul. Si cela tient sur le binaire livre, le defaut lui-meme est a rediscuter, et #25 se
-fermerait en rendant la moitie de notre RAM pour rien.
+### Le prix du recouvrement, mesure : 1,1 % de wall pour 41 % de la RSS
+
+A/B entrelace sur le binaire LIVRE, sans instrumentation, meme runner Linux 4 coeurs, chr21, 2M
+paires, `-K` 100M, six batchs, le fork chronometre a cote comme temoin de derive (run 32149818162) :
+
+| | wall (3 reps) | RSS de pointe |
+|---|---|---|
+| recouvrement (defaut) | 206,16 / 206,49 / 206,85 s | 4,786 / 4,797 / 4,783 GB |
+| `BWA4_NO_BATCH_OVERLAP=1` | 208,51 / 208,10 / 209,21 s | **2,818 / 2,833 / 2,816 GB** |
+| `bwa-mem3` (fork) | 156,81 / 158,08 / 157,60 s | 2,371 / 2,385 / 2,374 GB |
+
+Les trois repetitions vont dans le meme sens sans se croiser : **+1,1 % de wall pour -41 % de RSS de
+pointe**, la part batch passant de 4,60 a 2,63 GB. Contre le fork nous passons de **2,02x a 1,19x en
+memoire**, a wall inchange (0,76x dans les deux bras). Sortie identique, md5 hors `@PG`. macOS `-t8`
+sur 500k paires GIAB donnait le meme ordre : 1,5 % de wall pour 1,46 GB, soit 10 % de la RSS totale
+la ou l'index pese 10 GB, et 34 % de la part batch.
+
+**#25 est donc chiffree et fermable, et la seule question qui reste est un choix de defaut**, pas une
+mesure : 1,1 % de wall est en dessous du plancher de 3 % que ce projet applique a ses propres
+optimisations, et 2 GB de RSS sur un run WGS est souvent ce qui decide si le job passe dans la
+machine. Ce qui plaide pour garder le defaut actuel est qu'il a ete mesure gagnant sur les etages a
+faible occupation (dedup 69 %, encode 29 %), et ces 1,1 % sont reels. Ce qui plaide pour l'inverser
+est qu'un utilisateur memoire-contraint ne peut pas deviner l'existence d'une variable d'environnement,
+alors qu'un utilisateur presse lit un chiffre de wall. Le choix n'appartient pas a la mesure.
 
 ## Ce qui reste
 
