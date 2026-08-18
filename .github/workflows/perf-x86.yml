@@ -402,11 +402,18 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          # ONE target dir, rebuilt per level, not three. Three copies of this project's release
+          # tree (hts-sys and its vendored htslib included) fill a hosted runner's disk, and the
+          # symptom is not a clear error: the runner takes a shutdown signal and the job dies with
+          # exit 143 at the start of the step. Changing RUSTFLAGS invalidates the cache anyway, so
+          # sharing the directory costs nothing but the rebuild that was going to happen.
+          df -h / | tail -1
           for lvl in "" "x86-64-v2" "x86-64-v3"; do
             name="${lvl:-baseline}"
             if [ -z "$lvl" ]; then export RUSTFLAGS=""; else export RUSTFLAGS="-C target-cpu=$lvl"; fi
-            cargo build --release -p bwa-mem4 --target-dir "target-$name" 2>/dev/null | tail -1
-            cp "target-$name/release/bwa-mem4" "./bwa-mem4-$name"
+            cargo build --release -p bwa-mem4 --target-dir target-isa 2>/dev/null | tail -1
+            cp target-isa/release/bwa-mem4 "./bwa-mem4-$name"
+            echo "built $name"; df -h / | tail -1
           done
           unset RUSTFLAGS
           cd work
