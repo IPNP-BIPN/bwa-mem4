@@ -1,0 +1,152 @@
+# Where the x86_64 wall goes, stage by stage (issues #20, #32).
+#
+# The measurement this repo owes. On Apple Silicon we are at parity with fg-labs/bwa-mem3 (0.981x,
+# real GIAB, PGO); off it we are at 0.71x on Zen 3 and 0.76x on a hosted runner, reproducibly. Every
+# explanation so far has been a guess, because the ARM profile is the only one anyone has read: on
+# ARM, seeding plus chaining is ~78% and extension ~22%, and mate rescue is 47-64% of paired-end
+# compute. Nothing says those shares hold on x86, where the vector kernels are different code.
+#
+# So this job runs OUR probes on x86 and prints them next to the fork's wall clock on the same host:
+# per-stage wall (BWA4_STAGE_TIME), per-region pool occupancy (BWA4_BARRIER_TIME), the align stage's
+# internal split (BWA4_ALIGN_SPLIT, which needs its own build), chaining and SA resolution
+# (BWA4_CHAIN_TIME), the rescue kernel's cell rate (BWA4_MATESW_TIME), and a scalar-vs-AVX2 sweep of
+# that kernel. A deficit has to show up in one of those or it is not in the aligner at all.
+#
+# Manual dispatch only, like bench-x86: cloud runners are noisy, and what is readable here are
+# shares and ratios taken inside one job on one host.
+name: perf-x86
+
+on:
+  # TEMPORARY, removed before this branch merges: a workflow_dispatch workflow is only reachable by
+  # name once its file is on the default branch, so the first run of a new one has to come from a
+  # push on the branch that introduces it.
+  push:
+    branches: [perf/alloc-probe]
+  workflow_dispatch:
+    inputs:
+      read_pairs:
+        description: "Read pairs to simulate"
+        default: "2000000"
+        required: false
+
+jobs:
+  perf-x86:
+    name: where the x86 wall goes, ours against the fork
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0} # login shell so the micromamba env is active
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log the host
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          # -o without -m1: with -o, grep -m1 stops after the first MATCH, not the first matching
+          # line, which is how bench-x86 printed a bare "avx2" on hosts that had avx512bw too.
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "nproc: $(nproc)"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + bwa-mem3 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3
+            wgsim
+          init-shell: bash
+
+      # Two builds: the shipped one carries every probe that costs nothing when off, and a second
+      # one carries `align-split`, which is a Cargo feature precisely because its wrapper is a
+      # barrier the inliner does not always see through. Timing the align stage's internals with the
+      # shipped binary is not possible, and timing the WHOLE run with the align-split binary would
+      # measure the probe.
+      - name: Build bwa-mem4, shipped and align-split
+        shell: bash
+        run: |
+          cargo build --release -p bwa-mem4
+          cp target/release/bwa-mem4 ./bwa-mem4-shipped
+          cargo build --release -p bwa-mem4 --features align-split --target-dir target-split
+          cp target-split/release/bwa-mem4 ./bwa-mem4-split
+
+      - name: Fetch reference (GRCh38 chr21)
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz
+          gunzip -f chr21.fa.gz
+
+      - name: Build shared index
+        run: cd work && bwa-mem2 index chr21.fa
+
+      - name: Simulate reads
+        run: |
+          cd work
+          n="${{ github.event.inputs.read_pairs || '2000000' }}"
+          wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          echo "simulated $n pairs"
+
+      - name: The gap, on this host
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../bwa-mem4-shipped
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2>/dev/null   # warm
+          echo "threads=$T"
+          for rep in 1 2 3; do
+            m4=$(timed $M4 mem -t "$T" chr21.fa r1.fq r2.fq)
+            fk=$(timed bwa-mem3 mem -t "$T" chr21.fa r1.fq r2.fq)
+            m2=$(timed bwa-mem2 mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: bwa-mem4 ${m4}s | bwa-mem3 ${fk}s | bwa-mem2 ${m2}s"
+          done
+
+      # Everything below is one run each: these are shares, and a share does not need repeating the
+      # way a wall-clock difference does.
+      - name: Where our wall goes (stages, occupancy, kernels)
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../bwa-mem4-shipped
+          SP=../bwa-mem4-split
+          run_probe() {
+            local title="$1"; shift
+            echo
+            echo "===== $title ====="
+            "$@" mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2> probe.err || { echo "FAILED"; tail -5 probe.err; return; }
+            grep -E '^\[(stage-time|barrier|align-split|chain-time|matesw|traffic|seed)' probe.err || tail -20 probe.err
+          }
+          run_probe "per-stage wall (BWA4_STAGE_TIME)"      env BWA4_STAGE_TIME=1 $M4
+          run_probe "pool occupancy per region (BWA4_BARRIER_TIME)" env BWA4_BARRIER_TIME=1 $M4
+          run_probe "chaining and SA resolution (BWA4_CHAIN_TIME)"  env BWA4_CHAIN_TIME=1 $M4
+          run_probe "rescue kernel cells (BWA4_MATESW_TIME)"        env BWA4_MATESW_TIME=1 $M4
+          run_probe "align internals (BWA4_ALIGN_SPLIT, split build)" env BWA4_ALIGN_SPLIT=1 $SP
+
+      - name: Rescue kernel tier sweep (is AVX2 actually carrying it)
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../bwa-mem4-shipped
+          # A forced tier the host lacks falls back to scalar, and forced scalar is legitimately an
+          # order of magnitude slower on this stage, so a timeout here is reported and not fatal.
+          for tier in scalar avx2 avx512; do
+            if timeout 1800 /usr/bin/time -f '%e' -o tt.txt env BWA4_RESCUE_TIER="$tier" $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2>/dev/null; then
+              echo "tier=$tier: $(cat tt.txt)s"
+            else
+              echo "tier=$tier: timed out or unavailable"
+            fi
+          done
