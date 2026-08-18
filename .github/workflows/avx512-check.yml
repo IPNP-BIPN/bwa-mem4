@@ -56,10 +56,12 @@ jobs:
           # rather than fall back. The point is to exercise the dispatch, not to bypass it.
           RUSTFLAGS: ""
         run: |
-          cargo test -p bwa-mem4-neon --release --no-run 2>&1 | tail -3
-          # `--no-run` prints the binaries it built; find them rather than guessing the hash suffix.
-          find target/release/deps -maxdepth 1 -type f -perm -u+x ! -name '*.d' -newermt '-10 minutes' \
-            | grep -E 'bwa_mem4_neon-[0-9a-f]+$' | tee /tmp/testbins
+          # `--message-format=json` names the executables cargo built, which is the only reliable way
+          # to find them: the hash suffix is not predictable, and a `find` over target/release/deps
+          # picks up whatever else is lying there (the first attempt at this step ran `rustc`).
+          cargo test -p bwa-mem4-neon --release --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' | tee /tmp/testbins
+          test -s /tmp/testbins || { echo "cargo built no test binary" >&2; exit 1; }
 
       - name: Run them under an emulated AVX-512 CPU
         run: |
@@ -67,6 +69,7 @@ jobs:
           # renames it, the assertion below fails loudly instead of silently testing SSE again.
           bin=$(head -1 /tmp/testbins)
           echo "binary: $bin"
+          test -x "$bin" || { echo "not executable: $bin" >&2; exit 1; }
           # First, prove the emulated CPU really advertises what we need. `avx512_u8_and_i16_match_scalar`
           # self-skips otherwise, and a skipped test reports `ok`, which is exactly the failure mode
           # this workflow exists to prevent.
