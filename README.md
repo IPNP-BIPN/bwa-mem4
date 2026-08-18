@@ -52,6 +52,12 @@ occupancy, encode at 29%) runs against batch N+1's extension, which is the one s
 every core. It costs one more resident batch, and on a human genome at the default `-K` that is the
 difference between 14.7 GB and 13.3 GB of peak RSS.
 
+That second batch is taken **only when the machine can hold it**: at startup the aligner compares
+detected RAM against the index plus two batches with headroom, and drops the overlap when it does
+not fit, printing which it chose at `-v 3`. `BWA4_NO_BATCH_OVERLAP=1` forces one batch,
+`BWA4_BATCH_OVERLAP=1` forces two. Nothing about the choice is observable in the SAM, so the same
+input still yields the same bytes on every machine.
+
 `BWA4_NO_BATCH_OVERLAP=1` gives that batch back. Measured on an M4 Max, `-t8`, 500k real GIAB pairs
 against GRCh38, six interleaved repetitions: **13.27 GB instead of 14.73 GB, for about 1.5% of wall**.
 What it returns is one batch, so the saving scales with `-K`: 1.46 GB at the default, 0.19 GB at

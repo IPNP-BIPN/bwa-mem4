@@ -1630,25 +1630,68 @@ fn spawn_reader<B: Send + 'static>(
     )
 }
 
-/// Whether `BWA4_NO_BATCH_OVERLAP` asks the pipeline to hold ONE batch at a time.
+/// Whether the pipeline holds a second batch in flight, deciding it once for the process.
 ///
-/// The default (unset, so overlap on) is the shipped behaviour and the faster one on a machine with
-/// cores to spare: batch N's thin, low-occupancy tail runs against batch N+1's `align`, which is the
-/// one stage that can fill the pool. Setting it trades that back for half the resident memory, which
-/// the Linux measurement in `run_pipeline` shows is the whole of our gap against the fork.
+/// Three inputs, in priority order, because two of them are the user saying they know better:
 ///
-/// Read once and cached: it cannot change mid-process, and the batch loop consults it per batch.
+/// 1. `BWA4_NO_BATCH_OVERLAP` set: one batch. Half the batch memory, about 1.1% of wall.
+/// 2. `BWA4_BATCH_OVERLAP` set: two batches, whatever the machine looks like.
+/// 3. Otherwise the RAM policy in [`bwa_core::sysram::batch_overlap_fits`]: overlap when the host
+///    can hold the index plus two batches with headroom, one batch when it cannot.
+///
+/// The policy exists because the two ways of being wrong are not symmetric. Dropping the overlap on
+/// a machine that could have afforded it costs 1.1% of wall; keeping it on one that cannot costs a
+/// run that swaps, and the user has no way to guess that an environment variable would have saved
+/// them. Machine-dependent, and legitimately so: the number of batches in flight is not observable
+/// in the SAM, since batch order comes from joining a batch before sending its bytes.
+///
+/// Read once and cached, like every other environment gate here.
+///
+/// # Parameters
+///
+/// - `l_pac`: forward-strand reference length, for the index footprint estimate.
+/// - `k_batch`: `-K` in bases, i.e. one batch's input size.
+/// - `verbose`: `-v`; at 3 or more the decision and the two figures behind it are printed, in bwa's
+///   own progress-line style, so a surprising memory or wall figure can be explained afterwards.
 ///
 /// # Returns
 ///
-/// True when the variable is set to anything at all, including the empty string.
-fn no_batch_overlap() -> bool {
+/// True to overlap batch N's tail with batch N+1's alignment.
+fn batch_overlap_enabled(l_pac: u64, k_batch: usize, verbose: i32) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_NO_BATCH_OVERLAP").is_some())
+    *ON.get_or_init(|| {
+        if std::env::var_os("BWA4_NO_BATCH_OVERLAP").is_some() {
+            if verbose >= 3 {
+                eprintln!("[M::main_mem] batch overlap off (BWA4_NO_BATCH_OVERLAP)");
+            }
+            return false;
+        }
+        let forced = std::env::var_os("BWA4_BATCH_OVERLAP").is_some();
+        let d = bwa_core::sysram::batch_overlap_fits(l_pac, k_batch as u64);
+        let overlap = forced || d.overlap;
+        if verbose >= 3 {
+            // `?` for undetectable RAM: the figure is genuinely unknown there, and printing a zero
+            // would read as "this machine has no memory" rather than "the probe did not answer".
+            let have = d
+                .ram_gb
+                .map_or_else(|| "?".to_string(), |g| format!("{g:.1}"));
+            eprintln!(
+                "[M::main_mem] batch overlap {} (RAM {} GB, needs {:.1} GB for index + 2 batches){}",
+                if overlap { "on" } else { "off" },
+                have,
+                d.need_gb,
+                if forced { ", forced" } else { "" },
+            );
+        }
+        overlap
+    })
 }
 
 fn run_pipeline<B: Send>(
     out: Output,
+    // Whether to keep two batches in flight; see `batch_overlap_enabled`, which the callers consult
+    // because they are the ones holding the reference length.
+    overlap: bool,
     // Already produced by a reader the CALLER started, so that reading and inflating the first
     // batch overlaps the index load instead of queueing behind it. See `spawn_reader`.
     batch_rx: std::sync::mpsc::Receiver<(B, u64)>,
@@ -1805,7 +1848,7 @@ fn run_pipeline<B: Send>(
             // Output is untouched either way. Batch order is guaranteed below by joining before
             // sending, not by how many batches are in flight, and no batch's result depends on
             // another's.
-            let started = if no_batch_overlap() || crate::stage_alloc::serialize_batches() {
+            let started = if !overlap || crate::stage_alloc::serialize_batches() {
                 let buf = started.join().expect("batch worker panicked");
                 let t_send = std::time::Instant::now();
                 let sent = sam_tx.send(buf);
@@ -2270,7 +2313,9 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         per_read_sam
     };
 
-    run_pipeline(out, batch_rx, process, args.verbose.unwrap_or(3), k_batch)?;
+    let verbose = args.verbose.unwrap_or(3);
+    let overlap = batch_overlap_enabled(bns.l_pac as u64, k_batch, verbose);
+    run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)?;
     reader.join().expect("reader thread panicked")?;
     bwa_chain::chain_time::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
@@ -3054,7 +3099,8 @@ fn run_pe(
 
     // The reader is joined by `run`, which owns its handle: it started the thread before the index
     // load, so it is also the place that observes a reader error.
-    run_pipeline(out, batch_rx, process, verbose, k_batch)
+    let overlap = batch_overlap_enabled(bns.l_pac as u64, k_batch, verbose);
+    run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)
 }
 
 /// Read pairs handed to one parallel mate-rescue task, derived from the batch rather than fixed.
