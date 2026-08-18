@@ -5,11 +5,22 @@
 # been an AMD EPYC 7763 (Zen 3, no AVX-512). Seventeen consecutive draws on 2026-08-09, and two more
 # today. A kernel that has never executed is not "untimed", it is unverified.
 #
-# Emulation separates the two halves of that problem. `qemu-x86_64 -cpu max` implements avx512bw, so
-# the feature detection returns true and the kernels really run: their results are then checked
-# against the scalar reference by the same gates that guard every other backend. What emulation
-# cannot give is a TIMING, and this workflow deliberately measures none. Speed stays open until an
-# Intel runner appears; correctness does not have to wait for one.
+# The emulation idea DID NOT WORK, and this file records why so nobody spends the afternoon again.
+# QEMU's x86 TCG gained AVX and AVX2 in 7.2 and still has **no AVX-512** in 8.2.2, which is what
+# ubuntu-24.04 ships. Two consequences, both observed here: `is_x86_feature_detected!("avx512bw")`
+# answers false under `-cpu max` (correctly, since the instructions are not implemented), and
+# forcing the tests to run anyway with `BWA4_TEST_FORCE_AVX512` dies with
+# `uncaught target signal 4 (Illegal instruction)`. Both runs are in this workflow's history.
+#
+# What the attempt DID produce is worth more than the emulation would have been: it exposed that the
+# batched AVX-512 test was skipping SILENTLY and reporting `ok`, so those kernels have never
+# executed anywhere while CI stayed green about them. Every AVX-512 test now announces its skip and
+# this job fails on one.
+#
+# What is left for #44's correctness, in order of cost: an Intel runner draw (the fleet has given
+# AMD EPYC 7763 on every attempt, 22.04 and 24.04 alike), or Intel SDE, which does emulate AVX-512
+# but is a license-gated download rather than an apt package. Speed stays open regardless: no
+# emulator can price a kernel.
 name: avx512-check
 
 on:
