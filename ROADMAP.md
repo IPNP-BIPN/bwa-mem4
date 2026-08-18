@@ -4171,14 +4171,47 @@ volume, en 336k appels**. Les 452 octets par base ne sont donc ni « beaucoup de
 « quelques grosses » : ce sont deux populations distinctes, et elles appellent deux correctifs
 differents.
 
+### Et dans `align`, aucun point chaud : les quatre sous-phases se partagent le churn
+
+La ligne `align` pesait 47 % du volume sans dire laquelle de ses phases le depense. Le compteur a
+donc ete descendu dans `bwa-core` (`alloc_probe`), seul crate que le binaire ET `bwa-mem` partagent,
+et `align_reads_batched_inner` porte maintenant quatre etiquettes. Meme protocole, mode serialise :
+
+| sous-bucket | volume | part | appels | taille moyenne | o/base |
+|---|---|---|---|---|---|
+| align:seed | 7,27 GB | 10,9 % | 26,07 M | 279 o | 49,1 |
+| align:sa | 7,40 GB | 11,1 % | 22,72 M | 326 o | 50,0 |
+| align:chain | 8,41 GB | 12,6 % | 30,57 M | 275 o | 56,8 |
+| align:extend | 8,38 GB | 12,5 % | 31,35 M | 267 o | 56,6 |
+| align (le reste) | 0,03 GB | 0,0 % | 0,14 M | 236 o | 0,2 |
+
+**Il n'y a pas de tampon a corriger, il y a un style d'allocation.** Les quatre phases sont a moins
+de 16 % l'une de l'autre en volume comme en nombre d'appels, avec des tailles moyennes entre 267 et
+326 octets, soit **une centaine d'allocations par read pour le seul `align`**, et 40 de plus par read
+dans `sam_emit` a 133 octets de moyenne. C'est la signature du `Vec` par read et par seed repete
+partout, pas d'un gros tampon mal dimensionne. Un correctif ponctuel ne peut donc pas payer : ce qui
+paierait est une arene par worker reutilisee d'un read a l'autre a l'interieur d'un chunk, ce qui
+touche les quatre phases a la fois. C'est aussi ce qui explique que les deux tentatives precedentes,
+toutes deux ponctuelles, aient mesure nul.
+
+**Les etiquettes ne sont pas livrees non plus.** Elles sont derriere la feature `stage-alloc` de
+`bwa-mem`, pour la raison qui a mis `align-split` derriere la sienne : desarmee une etiquette est une
+lecture d'`AtomicBool` par chunk de reads, donc rien, mais elle vit dans une fonction
+`inline(always)` qui est le coeur chaud de l'aligneur, et un garde dont la portee couvre la moitie de
+la fonction est exactement ce qui perturbe l'allocation de registres. L'A/B de la version non gatee
+lisait +1,2 % en min de 4 et un nul en medianes : impossible a montrer gratuite, donc pas livree.
+Apres la mise sous feature, binaire par defaut contre binaire d'avant le chantier, min de 5 :
+12,46 s contre 12,43 s de wall, medianes 12,56 contre 12,54. Nul, cette fois pour de bon.
+
 **Ce que ca change pour #25.** La cible n'est plus « nos structures sont deux fois trop grosses »,
 elle se scinde en deux, avec des chiffres :
 
 1. **Le churn de `align` et de `rescue`**, 50 GB de volume transitoire par 148M bases pour ~19
-   octets par base reellement vivants. C'est lui qui fixe le plafond que la RSS macOS reporte, et
-   c'est un probleme de reutilisation de tampons par job, pas de taille de structure. Les deux
-   correctifs deja tentes (`shrink_to_fit`, `reserve_exact`) visaient le vivant, ce qui explique
-   apres coup pourquoi l'un a coute 0,95 GB et l'autre rien.
+   octets par base reellement vivants, reparti a peu pres egalement sur les quatre sous-phases de
+   `align`. C'est lui qui fixe le plafond que la RSS macOS reporte, et c'est un probleme d'arene par
+   worker, pas de taille de structure ni de tampon isole. Les deux correctifs deja tentes
+   (`shrink_to_fit`, `reserve_exact`) visaient le vivant et un site a la fois, ce qui explique apres
+   coup pourquoi l'un a coute 0,95 GB et l'autre rien.
 2. **Le 1,4x de retention** entre vivant et resident, qui survivra a toute reduction des structures
    et qui doit etre mesure sous Linux avec la meme sonde avant qu'on lui attribue un correctif.
 

@@ -49,7 +49,7 @@ align-split = ["bwa-mem/align-split"]
 #     cargo build --release -p bwa-mem4 --features stage-alloc
 #
 # Without it, `BWA4_STAGE_ALLOC` prints a line saying the binary cannot answer and changes nothing.
-stage-alloc = []
+stage-alloc = ["bwa-mem/stage-alloc"]
 # Passthrough for `bwa-io`'s multi-format FASTQ input (bzip2, xz, zstd). Off by default: +11 s of
 # build time, +3.5% of binary, and three more C libraries in the supply chain, for formats bwa-mem2
 # does not read. NOT because it introduces a C toolchain requirement: this binary already has one,

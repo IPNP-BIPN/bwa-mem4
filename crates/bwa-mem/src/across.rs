@@ -112,6 +112,8 @@
 
 use crate::{cal_max_gap, MemAlnReg, H0_SENTINEL, MAX_BAND_TRY};
 use bwa_chain::{build_chains_from_smems, mem_chain_flt, MemChain};
+#[cfg(feature = "stage-alloc")]
+use bwa_core::alloc_probe;
 use bwa_core::MemOpt;
 use bwa_extend::{ExtendJob, SwBackend};
 use bwa_index::{BntSeq, FmIndex};
@@ -770,9 +772,24 @@ fn align_reads_batched_inner<B: SwBackend>(
     let refs: Vec<&[u8]> = reads.iter().map(|c| c.as_slice()).collect();
     // One vector of round-1 SMEMs per read, parallel to `reads`. At this point each SMEM carries an
     // SA *interval* (`k`, `s`), not yet resolved reference positions.
-    let per_read_smems = align_split::measure(&align_split::SEED_NS, || {
-        mem_collect_smem_batched(fm, &refs, opt)
-    });
+    // The four `alloc_probe::enter` scopes in this function split `BWA4_STAGE_ALLOC`'s `align` row
+    // into `align:seed`, `align:sa`, `align:chain` and `align:extend`. That row is 47% of the run's
+    // whole allocation volume (issue #25), and knowing which of the four spends it is the difference
+    // between a targeted buffer-reuse fix and another guess.
+    //
+    // Behind the `stage-alloc` feature, off by default, for the reason `align-split` is: disarmed
+    // the tag is one relaxed bool load per read chunk, which is nothing, but this function is
+    // `inline(always)` and the hottest in the aligner, and a guard whose live range spans most of it
+    // is exactly the kind of thing that perturbs register allocation. An A/B of the ungated version
+    // read +1.2% on min-of-4 and a wash on medians, i.e. it could not be shown to be free, so it is
+    // not shipped.
+    let per_read_smems = {
+        #[cfg(feature = "stage-alloc")]
+        let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SEED);
+        align_split::measure(&align_split::SEED_NS, || {
+            mem_collect_smem_batched(fm, &refs, opt)
+        })
+    };
     if std::env::var_os("BWA4_DUMP_SMEMS").is_some() {
         for sm in &per_read_smems {
             eprintln!("SMEM tot={}", sm.len());
@@ -812,6 +829,8 @@ fn align_reads_batched_inner<B: SwBackend>(
     // its SMEMs contributed, which is what lets the chain builder re-split the flat result. Both are
     // left empty on the per-read fallback path, where nothing reads them.
     let (all_positions, per_read_counts): (Vec<i64>, Vec<Vec<i64>>) = if batched_sa {
+        #[cfg(feature = "stage-alloc")]
+        let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SA);
         let mut pos = Vec::new();
         let counts = per_read_smems
             .iter_mut()
@@ -825,6 +844,8 @@ fn align_reads_batched_inner<B: SwBackend>(
     // `all_rbegs[i]` is the genome coordinate (in `0..2*l_pac`) of suffix-array entry
     // `all_positions[i]`. Sliced per read by `sa_cursor` below. Empty on the fallback path.
     let all_rbegs: Vec<i64> = if batched_sa {
+        #[cfg(feature = "stage-alloc")]
+        let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SA);
         // Output buffer for `get_sa_batch`, pre-sized and zero-filled because the batch API writes by
         // index rather than pushing.
         let mut rbegs = vec![0i64; all_positions.len()];
@@ -915,6 +936,8 @@ fn align_reads_batched_inner<B: SwBackend>(
     // Build and filter each read's chains from the (now resolved) SMEM occurrences.
     // One entry per read, in `reads` order: the chains that survive `mem_chain_flt`, each holding
     // the seeds the extension phase will work through. Everything downstream indexes this by read.
+    #[cfg(feature = "stage-alloc")]
+    let _chain_tag = alloc_probe::enter(alloc_probe::B_ALIGN_CHAIN);
     let per_read_chains: Vec<Vec<MemChain>> = per_read_smems
         .into_iter()
         .enumerate()
@@ -964,6 +987,12 @@ fn align_reads_batched_inner<B: SwBackend>(
             out
         })
         .collect();
+
+    // Chaining is over; everything from the region skeleton to the final compaction is extension.
+    #[cfg(feature = "stage-alloc")]
+    drop(_chain_tag);
+    #[cfg(feature = "stage-alloc")]
+    let _extend_tag = alloc_probe::enter(alloc_probe::B_ALIGN_EXTEND);
 
     // The output under construction: per read, one region slot per seed, in slot order (chains back
     // to back, seeds within a chain in descending-score order). Filled skeleton-first by the

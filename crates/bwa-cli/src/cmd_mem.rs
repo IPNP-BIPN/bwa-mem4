@@ -1624,7 +1624,7 @@ fn spawn_reader<B: Send + 'static>(
             // Tagged so `BWA4_STAGE_ALLOC` credits decompression and record parsing to `reader`
             // rather than to whichever stage the aligner happened to be in when they ran. No-op
             // unless that probe is armed.
-            crate::stage_alloc::set_role(crate::stage_alloc::ROLE_READER);
+            crate::stage_alloc::set_role_reader();
             read_batches(tx)
         }),
     )
@@ -1676,7 +1676,7 @@ fn run_pipeline<B: Send>(
         let writer = scope.spawn(move || -> anyhow::Result<()> {
             // Same reason as the reader: the writer allocates (BGZF blocks, htslib buffers) while a
             // stage is running, and `BWA4_STAGE_ALLOC` must not charge that to the stage.
-            crate::stage_alloc::set_role(crate::stage_alloc::ROLE_WRITER);
+            crate::stage_alloc::set_role_writer();
             // Rebound to make the move explicit: the sink now lives on this thread and nowhere else.
             let mut out = out;
             // Rust: a channel receiver can be walked like any other sequence. It yields each value
