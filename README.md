@@ -314,6 +314,10 @@ killed with the reason for each, is in
 before proposing a kernel change: several of those levers were proposed twice by different people in
 the same session, and the file says what would have to be new for one to be worth a third look.
 
+Whether a GPU could help without giving up byte-identity, how much (2.45x, and an integrated GPU
+already reaches it), and what would have to be built first, is in
+[docs/gpu-plan.md](docs/gpu-plan.md). Nothing there is implemented.
+
 ## Licence
 
 MIT, in [LICENSE](LICENSE). This is a derivative work of
