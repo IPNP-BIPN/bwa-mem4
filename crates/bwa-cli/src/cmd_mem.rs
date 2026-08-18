@@ -1618,7 +1618,16 @@ fn spawn_reader<B: Send + 'static>(
 ) {
     let (readahead, _) = queue_depths();
     let (tx, rx) = std::sync::mpsc::sync_channel::<(B, u64)>(readahead);
-    (rx, std::thread::spawn(move || read_batches(tx)))
+    (
+        rx,
+        std::thread::spawn(move || {
+            // Tagged so `BWA4_STAGE_ALLOC` credits decompression and record parsing to `reader`
+            // rather than to whichever stage the aligner happened to be in when they ran. No-op
+            // unless that probe is armed.
+            crate::stage_alloc::set_role(crate::stage_alloc::ROLE_READER);
+            read_batches(tx)
+        }),
+    )
 }
 
 fn run_pipeline<B: Send>(
@@ -1665,6 +1674,9 @@ fn run_pipeline<B: Send>(
         // makes the single-writer property a compile-time fact rather than a convention: no other
         // thread can name `out` after this line, so no other thread can write to the sink.
         let writer = scope.spawn(move || -> anyhow::Result<()> {
+            // Same reason as the reader: the writer allocates (BGZF blocks, htslib buffers) while a
+            // stage is running, and `BWA4_STAGE_ALLOC` must not charge that to the stage.
+            crate::stage_alloc::set_role(crate::stage_alloc::ROLE_WRITER);
             // Rebound to make the move explicit: the sink now lives on this thread and nowhere else.
             let mut out = out;
             // Rust: a channel receiver can be walked like any other sequence. It yields each value
@@ -1750,6 +1762,7 @@ fn run_pipeline<B: Send>(
             stage_time::add(Stage::WaitRead, t_wait.elapsed());
             n_batches += 1;
             stage_time::count_batch();
+            crate::stage_alloc::count_batch();
             // Start this batch, THEN retire the previous one: reversing the two lines would be the
             // old serial pipeline with extra threads.
             // `move` so the worker OWNS its batch and id; `process` is borrowed, which is why it
@@ -1758,6 +1771,24 @@ fn run_pipeline<B: Send>(
             // between the two batches in flight, so it is borrowed and must be `Sync`.
             let process_ref = &process;
             let started = scope.spawn(move || process_ref(batch, base_id));
+            // `BWA4_STAGE_ALLOC` tags allocations with a PROCESS-WIDE stage, so two batches in
+            // flight would each overwrite the other's tag and every per-stage byte count would be a
+            // blend of two stages. Retire this batch before reading the next one while the probe is
+            // armed. Output is untouched (batch order is already guaranteed below); only the
+            // overlap is lost, so an instrumented run's wall time means nothing, which it did not
+            // anyway at four atomics per allocation.
+            let started = if crate::stage_alloc::serialize_batches() {
+                let buf = started.join().expect("batch worker panicked");
+                let t_send = std::time::Instant::now();
+                let sent = sam_tx.send(buf);
+                stage_time::add(Stage::WaitWrite, t_send.elapsed());
+                if sent.is_err() {
+                    break; // writer exited; its error surfaces on join below
+                }
+                continue;
+            } else {
+                started
+            };
             if let Some(prev) = inflight.replace(started) {
                 let buf = prev.join().expect("batch worker panicked");
                 // Blocked here == throttled by the writer (a slow sink, or BGZF/htslib backpressure).
@@ -2013,6 +2044,10 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         eprintln!("[M::main_mem] read {} ALT contigs", bns.n_alt());
     }
     let bns = bns;
+    // Everything resident from here to the end of the run is the index and nothing else, so this is
+    // the line that lets `BWA4_STAGE_ALLOC` report a per-batch peak instead of 10 GB of genome on
+    // every row. No-op unless that probe is armed.
+    crate::stage_alloc::mark_baseline();
     // One `@SQ` line per contig, in index order. That order comes from the FASTA and must be
     // preserved: downstream tools treat @SQ order as the coordinate sort order.
     //
@@ -2139,7 +2174,9 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         // for all of them. Runs on the main thread, where the stage accumulators live.
         stage_time::dump(t_run.elapsed());
         stage_time::barrier::dump();
-        stage_time::barrier::dump();
+        // Where the BYTES went, next to where the wall clock went. The line above was duplicated,
+        // which printed the occupancy table twice.
+        crate::stage_alloc::dump();
         forget_index(fm, bns);
         return Ok(());
     }
@@ -2169,6 +2206,11 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
                 .map(|rec| rec.seq().iter().map(|&base| dna::nt4(base)).collect())
                 .collect()
         });
+        // The denominator of the bytes-per-base column issue #25 is written in. One sum per batch,
+        // and only when `BWA4_STAGE_ALLOC` is armed.
+        if crate::stage_alloc::enabled() {
+            crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
+        }
         // Per-read candidate alignments BEFORE dedup and primary marking, also parallel to `batch`.
         let regs_all =
             stage_time::measure(Stage::Align, || batched_regs(&fm, &bns, &opt, &all_codes));
@@ -2207,6 +2249,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Last, because it is the widest view: the others break down one stage, this one accounts for
     // all of them. Runs on the main thread, where the stage accumulators live.
     stage_time::dump(t_run.elapsed());
+    crate::stage_alloc::dump();
     forget_index(fm, bns);
     Ok(())
 }
@@ -2801,6 +2844,11 @@ fn run_pe(
                     .collect()
             })
         });
+        // Both mates, so the bytes-per-base column counts the same bases the aligner processed.
+        // One sum per batch, and only when `BWA4_STAGE_ALLOC` is armed.
+        if crate::stage_alloc::enabled() {
+            crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
+        }
         // Pre-dedup regions, in the same interleaved order as `all_codes`.
         let regs_all = stage_time::measure(Stage::Align, || batched_regs(fm, bns, opt, &all_codes));
 

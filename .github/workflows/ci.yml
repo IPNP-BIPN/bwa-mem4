@@ -83,6 +83,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Off-by-default features are invisible to the line above, so they rot. This one swaps the
+      # global allocator (`BWA4_STAGE_ALLOC`, see crates/bwa-cli/src/stage_alloc.rs), which is
+      # exactly the kind of code that must not be discovered broken the day someone needs it.
+      - name: Clippy (stage-alloc feature)
+        run: cargo clippy -p bwa-mem4 --all-targets --features stage-alloc -- -D warnings
+
       - name: Build (release)
         run: cargo build --workspace --release
 

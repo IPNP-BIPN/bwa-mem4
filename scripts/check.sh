@@ -17,6 +17,10 @@ echo "== rustfmt =="
 cargo fmt --check
 echo "== clippy (-D warnings) =="
 cargo clippy --workspace --all-targets -- -D warnings
+# Off-by-default features are invisible to the sweep above. `stage-alloc` swaps the global
+# allocator, so a break there is worth catching locally rather than the day the probe is needed.
+echo "== clippy (stage-alloc feature) =="
+cargo clippy -p bwa-mem4 --all-targets --features stage-alloc -- -D warnings
 echo "== test =="
 cargo test --workspace
 echo "OK"

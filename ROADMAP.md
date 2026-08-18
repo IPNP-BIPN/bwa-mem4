@@ -4094,6 +4094,98 @@ Ce qui reste pour #25 est donc etroit et bien pose : nos structures par batch, p
 la plateforme, pas les files. La cible chiffree est de rendre ~2x moins de memoire par base a batch
 egal, et la mesure de reference est desormais ce job Linux plutot qu'un chiffre macOS.
 
+## Ou vont les octets (#25) : l'allocation par etage, mesuree depuis l'allocateur (2026-08-18)
+
+Les deux sections precedentes fermaient les fausses pistes (les files, mimalloc, la plateforme) et
+laissaient une seule suite utile : « instrumenter l'allocation par etage, un compteur d'octets
+alloues, pas des snapshots ». C'est fait. `BWA4_STAGE_ALLOC` enveloppe l'allocateur global
+(`crates/bwa-cli/src/stage_alloc.rs`) et compte chaque requete au moment ou elle passe, en
+l'imputant a l'etage du pipeline qui l'a demandee.
+
+**Et il ne reste PAS dans le binaire livre, contrairement aux autres sondes.** Desarme il ne coute
+qu'une lecture d'`AtomicBool` et un branchement non pris, mais par ALLOCATION et non par batch, et
+ce pipeline alloue 167 M de fois par 500k paires GIAB. A/B entrelace, min de 6 sur hote calme :
+**12,49 s contre 12,56 s de wall et 95,14 s contre 95,67 s de user, +0,5 %**. Le wrapper vit donc
+derriere la feature `stage-alloc`, off par defaut, exactement comme `align-split` avant lui ; le
+meme A/B refait apres la mise sous feature ne distingue plus les deux binaires (12,47 contre
+12,47 s). Sans la feature, `BWA4_STAGE_ALLOC` affiche une ligne qui le dit et ne change rien.
+
+Trois colonnes, et elles ne disent pas la meme chose. Le **volume** est la somme de tout ce qui a
+ete demande, jamais decremente : c'est le chiffre que la RSS de pointe macOS mesure reellement. Le
+**vivant** est alloue moins libere, exact parce que `dealloc` recoit le `Layout` d'origine, et son
+maximum courant est le vrai pic. Les **classes de taille** disent si un chiffre par base vient de
+beaucoup de petites requetes ou de quelques grosses. Un appel `mark_baseline()` juste apres le
+chargement de l'index gele le vivant a cet instant, si bien que la colonne de pic parle du batch et
+non des 10 GB de genome.
+
+Deux modes, parce qu'une seule execution ne peut pas repondre aux deux questions. L'attribution par
+etage passe par une etiquette globale au processus, la ou allouent surtout les workers rayon, donc
+elle exige **un seul batch en vol** : `BWA4_STAGE_ALLOC=1` retire chaque batch avant de lire le
+suivant. `BWA4_STAGE_ALLOC=overlap` garde les deux batchs en vol du pipeline livre, donc le pic est
+le vrai, mais le decoupage par etage devient un melange de deux batchs. Le reader et le writer sont
+etiquetes par THREAD et echappent aux deux problemes.
+
+**Protocole.** GIAB HG002, 500k paires, index genome GRCh38, M4 Max, `-t8`, `-K` par defaut (80M),
+soit 148M bases et 2 batchs. Sortie SAM `cmp`-identique a la course non instrumentee dans les deux
+modes. Le wall d'une course instrumentee ne vaut rien (34,5 s contre 13,0 s) : quatre atomiques par
+allocation, et la serialisation en plus.
+
+| | RSS de pointe | vivant de pointe | dont index | batch vivant | batch RSS |
+|---|---|---|---|---|---|
+| sans sonde | 14,72 GB | | | | 4,25 GB |
+| `overlap` (pipeline livre) | 14,47 GB | 13,31 GB | 10,47 GB | **2,84 GB** | 4,00 GB |
+| serialise (1 batch) | 13,22 GB | 12,12 GB | 10,47 GB | **1,65 GB** | 2,75 GB |
+
+**Premier resultat : un tiers de la RSS du batch n'est vivante a aucun instant.** 4,00 GB de
+resident pour 2,84 GB de vivant au pic, soit **1,41x** dans la configuration livree, et 1,67x a un
+seul batch. Ce n'est pas une erreur de mesure : c'est ce que la section macOS annoncait sans pouvoir
+le chiffrer. Consequence directe pour #25 : diviser par deux nos structures vivantes ne diviserait
+pas par deux la RSS du batch, il resterait le ~1,2 GB que l'allocateur detient sans que personne ne
+le tienne.
+
+**Deuxieme resultat : le rapport churn sur vivant est de 23.** 66,87 GB alloues au total pour 148M
+bases, soit **452 octets par base d'entree**, contre **19 octets par base** vivants au pic. Le
+tableau par etage, mode serialise :
+
+| bucket | volume | part | appels | taille moyenne | o/base | pic vivant batch |
+|---|---|---|---|---|---|---|
+| encode | 0,17 GB | 0,3 % | 1,00 M | 172 o | 1,2 | 0,09 GB |
+| align | **31,49 GB** | **47,1 %** | **110,84 M** | 284 o | 212,8 | 1,37 GB |
+| deinterleave | 0,05 GB | 0,1 % | 2 | 24 MB | 0,3 | 1,28 GB |
+| dedup_prep | 0,16 GB | 0,2 % | 0,05 M | 3392 o | 1,1 | 1,31 GB |
+| pestat | 0,02 GB | 0,0 % | 61 | 400 kB | 0,2 | 1,27 GB |
+| rescue | **19,10 GB** | **28,6 %** | 14,95 M | 1277 o | 129,0 | 1,61 GB |
+| sam_emit | 5,32 GB | 8,0 % | 39,89 M | 133 o | 36,0 | **1,65 GB** |
+| reader | 0,10 GB | 0,2 % | 53 | 1,9 MB | 0,7 | |
+| writer | 0 | 0,0 % | 4 | | 0,0 | |
+| unstaged (index, main) | 10,45 GB | 15,6 % | 1,00 M | 10 kB | 70,6 | |
+| **TOTAL** | **66,87 GB** | 100 % | **167,73 M** | 399 o | 451,8 | 1,65 GB |
+
+L'align alloue **0,75 fois par base d'entree** et libere presque tout dans l'etage meme ; le rescue
+suit avec 15 M d'appels a 1277 octets de moyenne. Le pic vivant, lui, arrive dans `sam_emit`, ou les
+regions du batch et son texte SAM coexistent.
+
+**Troisieme resultat : la forme.** 117 M des 167 M d'appels demandent moins de 128 octets et ne
+pesent que 6 % du volume, tandis que la seule classe 16 ko - 32 ko pese **7,76 GB, 11,6 % du
+volume, en 336k appels**. Les 452 octets par base ne sont donc ni « beaucoup de petites » ni
+« quelques grosses » : ce sont deux populations distinctes, et elles appellent deux correctifs
+differents.
+
+**Ce que ca change pour #25.** La cible n'est plus « nos structures sont deux fois trop grosses »,
+elle se scinde en deux, avec des chiffres :
+
+1. **Le churn de `align` et de `rescue`**, 50 GB de volume transitoire par 148M bases pour ~19
+   octets par base reellement vivants. C'est lui qui fixe le plafond que la RSS macOS reporte, et
+   c'est un probleme de reutilisation de tampons par job, pas de taille de structure. Les deux
+   correctifs deja tentes (`shrink_to_fit`, `reserve_exact`) visaient le vivant, ce qui explique
+   apres coup pourquoi l'un a coute 0,95 GB et l'autre rien.
+2. **Le 1,4x de retention** entre vivant et resident, qui survivra a toute reduction des structures
+   et qui doit etre mesure sous Linux avec la meme sonde avant qu'on lui attribue un correctif.
+
+La suite immediate est donc de relancer exactement cette sonde sur le job Linux de reference, ou les
+pages reviennent, pour savoir laquelle des deux moities de l'ecart de 1,71x contre le fork est
+vivante et laquelle est de la retention.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
