@@ -24,12 +24,21 @@
 //! not by this comment: 64 of 64 option combinations pass `scripts/opt_parity.sh` against the
 //! oracle, and 1M chr21 pairs plus 500k real GIAB pairs are `cmp`-clean against the previous binary.
 //!
-//! **On ARM this is a wash, and the first measurement here said otherwise.** A single run showed
-//! `sam_emit` at 2.787 s against 2.668 s and that was noise; five interleaved repetitions put the
-//! minima at 2.641 s and 2.637 s, i.e. -0.2%. That is the honest ARM number, and it is what should
-//! be expected: the aarch64 baseline already lets the compiler vectorise, and this stage is 7.5% of
-//! the wall there. The x86 case is the one this was written for, where the same stage is 13.1% of
-//! the wall and 5.15x slower per pair, and it is measured in CI rather than here.
+//! **It is a wash on both platforms, and both of the first numbers here were wrong.** ARM: a single
+//! run showed `sam_emit` at 2.787 s against 2.668 s and that was noise; five interleaved reps put
+//! the minima at 2.641 and 2.637 s, -0.2%. x86, which is what it was written for: 28.736 s against
+//! **28.530 s**, -0.7%, with the whole run inside its own noise.
+//!
+//! Why, and it is worth knowing before someone tries again: at the x86-64 BASELINE a 256-entry byte
+//! lookup cannot be vectorised at all, because `pshufb` is SSSE3 and the baseline is SSE2. The block
+//! loop therefore still does one table load per base and only saves the capacity check. The fork's
+//! version is fast because their whole binary is compiled at AVX2, where that loop becomes a
+//! shuffle, and OUR version becomes one too in the `x86-64-v3` artefact this project now ships. The
+//! 5.6-6.8% measured for that build includes whatever this file contributes there.
+//!
+//! So what this file is actually worth, today, is not wall clock: it is one fewer heap allocation
+//! per integer field of every SAM record, which the allocation probe counted at 40 per read, and a
+//! shape the compiler can vectorise as soon as it is allowed to.
 //!
 //! # Rust mechanics used in this file
 //!
