@@ -25,6 +25,27 @@ every binary pre-warmed, interleaved x4):
 **PGO is worth ~+6.1% SE / +8.5% PE at genome scale**, and byte-identical: 500k SE + 1M PE records
 `cmp`-clean against the non-PGO binary (only `@PG CL:` differs, which records the invocation path).
 
+> ### ⚠️ On Apple Silicon. Off it, PGO LOSES.
+>
+> Measured 2026-08-18 on hosted runners, chr21, 1M wgsim pairs, three interleaved repetitions each,
+> training on a different seed than the measurement, `llvm-profdata` from the toolchain:
+>
+> | host | plain | PGO | verdict |
+> |---|---|---|---|
+> | M4 Max | (above) | (above) | **+12.4%** |
+> | Ampere Altra (Neoverse, hosted ARM) | 69.43 / 69.90 / 69.69 s | 69.99 / 70.32 / 69.95 s | **-0.6%** |
+> | AMD EPYC 7763 (Zen 3) | 103.95 / 103.59 / 104.01 s | 108.66 / 107.98 / 107.80 s | **-4.1%** |
+>
+> Three architectures, no repetition crossing on either non-Apple host, and @nh13's independent
+> -0.4% on Graviton4 agrees with the Altra column. So `scripts/pgo.sh` is an **Apple Silicon lever**,
+> not a property of this code, and a release process must not apply it to x86_64 artefacts: it would
+> ship a 4% slower binary to the platform where most WGS actually runs. Issue #33.
+>
+> Why that is plausible rather than mysterious: what PGO buys here is branch layout and inlining on
+> the branchy driver, seeding and SAM path, and how much that is worth depends entirely on the core's
+> own branch predictor. A core that already predicts these branches well gains nothing from being
+> told about them.
+
 **Why the région number was low, and why the old explanation was backwards.** This file said PGO is
 "below the ~10-15% estimate because ~85% of runtime is hand-written branchless NEON PGO cannot
 improve; the gain comes from the branchy driver/seeding/SAM path". The second half is right; the
