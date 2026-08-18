@@ -2240,6 +2240,8 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_mem::primary::dedup_shape::dump();
         bwa_mem::pe::anchor_spread::dump();
         bwa_chain::chain_time::dump();
+        bwa_chain::smem_dup::dump();
+        bwa_chain::smem_dup::dump();
         bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
         // Last, because it is the widest view: the others break down one stage, this one accounts
         // for all of them. Runs on the main thread, where the stage accumulators live.
@@ -2318,6 +2320,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)?;
     reader.join().expect("reader thread panicked")?;
     bwa_chain::chain_time::dump();
+    bwa_chain::smem_dup::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
     // Last, because it is the widest view: the others break down one stage, this one accounts for
     // all of them. Runs on the main thread, where the stage accumulators live.

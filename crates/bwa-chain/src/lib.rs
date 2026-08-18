@@ -369,7 +369,7 @@ pub fn build_chains(
 /// Each count is in `1 ..= max_occ` (a SMEM always has `s >= 1`).
 pub fn sa_positions_for_read(
     opt: &MemOpt,
-    smems: &mut [bwa_index::Smem],
+    smems: &mut Vec<bwa_index::Smem>,
     positions: &mut Vec<i64>,
 ) -> Vec<i64> {
     // bwa sorts the whole batch's SMEMs with `compare_smem` = (rid, m, n) ascending (`sortSMEMs`,
@@ -384,6 +384,64 @@ pub fn sa_positions_for_read(
     // multi-field sort out of a single-key sort, and it is exact rather than approximate because
     // both fields are known to fit in 32 bits.
     smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
+    // `BWA4_SMEM_DUP=1`: how many of this read's SMEMs are EXACT duplicates of the one before them,
+    // now that they are sorted. fg-labs/bwa-mem3 compacts those away in `smem_dedup.cpp` before the
+    // position walk, on the grounds that they enumerate the same suffix-array rows twice; the
+    // question here is whether that is worth anything at our seed lengths, and it is a count before
+    // it is a change. Counts only, so it cannot move a byte.
+    if smem_dup::enabled() {
+        let (mut dups, mut dup_positions, mut positions_total) = (0u64, 0u64, 0u64);
+        let max_occ_probe = i64::from(opt.max_occ);
+        for (i, p) in smems.iter().enumerate() {
+            // How many suffix-array rows this SMEM will walk, by the same stride rule as the loop
+            // below. Counting it here rather than reusing that loop keeps the probe out of it.
+            let step = if p.s > max_occ_probe {
+                p.s / max_occ_probe
+            } else {
+                1
+            };
+            // Ceiling division written out: `i64::div_ceil` is unstable on the pinned toolchain.
+            let walked = (((p.s + step - 1) / step).min(max_occ_probe)).max(0) as u64;
+            positions_total += walked;
+            if i > 0 {
+                let a = &smems[i - 1];
+                if a.m == p.m && a.n == p.n && a.k == p.k && a.s == p.s {
+                    dups += 1;
+                    dup_positions += walked;
+                }
+            }
+        }
+        smem_dup::record(smems.len() as u64, dups, positions_total, dup_positions);
+    }
+    // `BWA4_SMEM_DEDUP=1`: drop SMEMs identical to their predecessor, which the sort above has just
+    // made adjacent. Each one would otherwise walk the same suffix-array rows a second time, and the
+    // probe above measures that at 11.9% of walks on simulated reads and 17.7% on real GIAB.
+    //
+    // OFF BY DEFAULT, and it stays off: MEASURED 2026-08-18, it changes the output. chr21, 1M
+    // simulated pairs, 2,000,000 records: **8 lines differ, and only in `XS:i`** (50 against 45 on
+    // the first), i.e. four records per million reads report a different suboptimal score because a
+    // redundant candidate region no longer exists to contribute one. Placement, CIGAR and MAPQ are
+    // untouched on this data, but `XS` feeds MAPQ, so the divergence is not cosmetic by
+    // construction, only by luck on this fixture.
+    //
+    // That is a fail under this project's criterion and a non-issue under the fork's:
+    // fg-labs/bwa-mem3 compacts unconditionally (`src/smem_dedup.cpp`) and lists `score2`/MAPQ
+    // convergence among its accepted differences from bwa-mem2. Kept behind the flag with the
+    // measurement rather than deleted, so the idea is not rediscovered a third time, and so that a
+    // future compat mode that accepts `XS` drift has it ready.
+    if smem_dedup::enabled() {
+        let mut write = 0usize;
+        for read in 1..smems.len() {
+            let (a, b) = (smems[write], smems[read]);
+            if a.m != b.m || a.n != b.n || a.k != b.k || a.s != b.s {
+                write += 1;
+                smems[write] = b;
+            }
+        }
+        if !smems.is_empty() {
+            smems.truncate(write + 1);
+        }
+    }
     // Cap on materialized occurrences per SMEM (default 500), widened to i64 to compare against `s`.
     let max_occ = i64::from(opt.max_occ);
     let mut counts: Vec<i64> = Vec::with_capacity(smems.len());
@@ -407,6 +465,83 @@ pub fn sa_positions_for_read(
         counts.push(count);
     }
     counts
+}
+
+/// `BWA4_SMEM_DUP=1`: are there exact duplicate SMEMs to compact away, and how many?
+///
+/// The fork's `smem_dedup.cpp` drops SMEMs identical to their predecessor on `(rid, m, n, k, l, s)`
+/// after the sort, which removes duplicate suffix-array walks for free. Whether that is a lever
+/// here or a rounding error is a count, and this is the count. Off by default; one cached bool load
+/// per read when off.
+pub mod smem_dup {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    /// SMEMs seen, summed over reads.
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    /// Of those, how many were exact duplicates of their immediate predecessor.
+    static DUPS: AtomicU64 = AtomicU64::new(0);
+    /// Suffix-array rows the walk will visit in total.
+    static POS: AtomicU64 = AtomicU64::new(0);
+    /// Of those, how many are visited a second time because of a duplicate SMEM. This is the number
+    /// that matters: duplicates are only worth removing in proportion to the walks they cause, and a
+    /// duplicate of a one-occurrence SMEM costs one lookup while a duplicate of a 500-occurrence one
+    /// costs 500.
+    static DUP_POS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe is on. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_SMEM_DUP` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_SMEM_DUP").is_some())
+    }
+
+    /// Add one read's counts.
+    ///
+    /// # Parameters
+    /// - `total`: SMEMs this read had.
+    /// - `dups`: how many were exact duplicates of the previous one.
+    /// - `positions`: suffix-array rows the read's walk will visit.
+    /// - `dup_positions`: of those, how many are due to duplicates.
+    pub fn record(total: u64, dups: u64, positions: u64, dup_positions: u64) {
+        TOTAL.fetch_add(total, Relaxed);
+        DUPS.fetch_add(dups, Relaxed);
+        POS.fetch_add(positions, Relaxed);
+        DUP_POS.fetch_add(dup_positions, Relaxed);
+    }
+
+    /// Print the count once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (t, d) = (TOTAL.load(Relaxed), DUPS.load(Relaxed));
+        let (p, dp) = (POS.load(Relaxed), DUP_POS.load(Relaxed));
+        eprintln!(
+            "[smem-dup] {d} exact duplicate SMEMs of {t} ({:.2}%), costing {dp} of {p} \
+             suffix-array walks ({:.2}%) -- the latter is the ceiling on a sort-free dedup",
+            100.0 * d as f64 / t.max(1) as f64,
+            100.0 * dp as f64 / p.max(1) as f64,
+        );
+    }
+}
+
+/// `BWA4_SMEM_DEDUP=1`: the switch for the sort-free duplicate compaction in
+/// [`sa_positions_for_read`]. Separate module so the flag is read once and cached, like every other
+/// gate in this tree.
+pub mod smem_dedup {
+    use std::sync::OnceLock;
+
+    /// Whether duplicate SMEMs are compacted away before the suffix-array walk.
+    ///
+    /// # Returns
+    /// True if `BWA4_SMEM_DEDUP` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_SMEM_DEDUP").is_some())
+    }
 }
 
 /// Build chains from **pre-computed** SMEMs (e.g. from batched lockstep seeding). Identical to
