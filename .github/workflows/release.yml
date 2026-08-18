@@ -111,8 +111,16 @@ jobs:
         include:
           - os: ubuntu-22.04
             target_id: linux-x86_64
+            # PGO measured 2026-08-18 on this exact recipe, on an AMD EPYC 7763 (Zen 3), three
+            # interleaved repetitions that do not cross: plain 104.22 / 104.27 / 104.27 s against
+            # 107.36 / 108.15 / 108.24 s with it. It COSTS 3.3% here. An independent arm using
+            # cargo-pgo and a different training set agreed at -4.1%. See #33.
+            pgo: false
           - os: ubuntu-24.04-arm
             target_id: linux-aarch64
+            # Same story on non-Apple ARM: -0.6% on hosted Ampere Altra, three reps, matching
+            # @nh13's independent -0.4% on Graviton4. See #33.
+            pgo: false
           # DELIBERATELY NOT macos-26, the newest label. For a binary we hand to other people,
           # newer is worse: the build host sets the floor. `hts-sys` compiles vendored htslib with
           # `cc`, and `cc` with no explicit target takes the host's default deployment version, so
@@ -123,9 +131,18 @@ jobs:
           - os: macos-14
             target_id: macos-arm64
             deployment_target: "11.0"
+            # The one platform where PGO pays, and it pays a lot: +12.4% on an M4, +6.1% SE / +8.5%
+            # PE at genome scale (docs/perf-levers.md). What it buys is branch layout on the branchy
+            # driver, seeding and SAM paths, and how much that is worth is a property of the core's
+            # branch predictor, not of this code.
+            pgo: true
           - os: macos-15-intel
             target_id: macos-x86_64
             deployment_target: "10.12"
+            # Intel, so the Zen 3 and Altra results apply rather than the M4 one. Not separately
+            # measured on this exact runner; off, because two of two non-Apple architectures lose
+            # and shipping a slower binary on an unmeasured guess is the wrong default.
+            pgo: false
     steps:
       - uses: actions/checkout@v7
         with:
@@ -143,6 +160,7 @@ jobs:
       # whose format matches what a `-Cprofile-generate` binary writes. Any other llvm-profdata on
       # the runner is a coin flip.
       - name: Install llvm-tools for PGO
+        if: matrix.pgo == true
         run: rustup component add llvm-tools-preview
 
       # Profile-guided build, done natively on each target's own runner (which is why the matrix
@@ -154,6 +172,21 @@ jobs:
       # training set being tiny is not a problem here: what PGO needs from it is which branches the
       # seeding and DP loops take, and those are the same shapes at any reference size.
       #
+      # THAT MEASUREMENT WAS APPLE SILICON, and generalising it was wrong. Re-measured 2026-08-18 on
+      # three architectures, three interleaved repetitions each, none of them crossing:
+      #
+      #   | host                        | plain            | PGO              | verdict |
+      #   |-----------------------------|------------------|------------------|---------|
+      #   | M4 (Apple Silicon)          | -                | -                | +12.4%  |
+      #   | Ampere Altra (hosted ARM)   | 69.43/69.90/69.69| 69.99/70.32/69.95| -0.6%   |
+      #   | AMD EPYC 7763 (Zen 3)       |104.22/104.27/104.27|107.36/108.15/108.24| -3.3% |
+      #
+      # The Zen 3 row uses THIS recipe, tiny-fixture training included, so it is not a proxy. So the
+      # step is now gated on `matrix.pgo`: Apple Silicon builds profile-guided, everything else
+      # builds plain, and the artefacts that no longer use it become reproducible from a clean tree
+      # again. What PGO buys here is branch layout on the branchy driver, seeding and SAM paths, and
+      # how much that is worth is a property of the core's branch predictor rather than of the code.
+      #
       # Two things this deliberately does NOT do. It does not train on a real genome: that would
       # mean shipping or downloading one in a release job, and the measurement says it is not worth
       # it. And it does not use `-C target-cpu`: the artifact has to run on the audience's machines,
@@ -162,7 +195,17 @@ jobs:
       # The cost is one extra compile per target. The consequence to be aware of is that a release
       # binary is no longer bit-reproducible from a clean tree by `cargo build --release` alone: it
       # is reproducible by re-running THIS recipe, which is what the release notes point at.
+      # Plain build, for the three targets where PGO measured as a LOSS. Same flags a user gets from
+      # `cargo build --release`, which also makes those artefacts reproducible from a clean tree
+      # again, which the PGO ones are not.
+      - name: Build (plain)
+        if: matrix.pgo != true
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: cargo build --release --locked
+
       - name: Build (PGO)
+        if: matrix.pgo == true
         env:
           # Pinned rather than inherited, so the floor is a decision instead of a side effect of
           # whichever runner image happens to be current. It reaches the vendored htslib C build
