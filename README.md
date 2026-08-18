@@ -308,6 +308,12 @@ Work reimplemented from the published literature (LISA/BWA-MEME, minibwa, and ot
 measurements showing which of those techniques paid off here and which measured at zero, is written
 up in [docs/perf-levers.md](docs/perf-levers.md).
 
+What the vector kernels can still reach, and the sixteen ideas an adversarial review has already
+killed with the reason for each, is in
+[docs/kernel-ceiling-and-dead-ends.md](docs/kernel-ceiling-and-dead-ends.md). Read the second half
+before proposing a kernel change: several of those levers were proposed twice by different people in
+the same session, and the file says what would have to be new for one to be worth a third look.
+
 ## Licence
 
 MIT, in [LICENSE](LICENSE). This is a derivative work of
