@@ -188,11 +188,25 @@ jobs:
             ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
           done
 
-      - name: Rescue kernel tier sweep (is AVX2 actually carrying it)
+      # Two kernels, two sweeps. The rescue kernel is the one the x86 issues have looked at; the
+      # BATCHED EXTENSION kernel is the bigger one and nobody has priced it on x86. The ARM
+      # align-split profile makes the case: of 94.94 s of align CPU on this same data, extension
+      # kernels are 53.63 s, i.e. 56%, against 17.23 s of seeding. If our AVX2 extension is weaker
+      # relative to the fork's than our NEON one is, that is where a 25% deficit can live.
+      - name: Kernel tier sweeps (extension, then rescue)
         run: |
           cd work
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
           M4=../bwa-mem4-shipped
+          echo "== batched extension tier (BWA4_EXTEND_TIER) =="
+          for tier in scalar sse41 avx2 avx512; do
+            if timeout 1800 /usr/bin/time -f '%e' -o et.txt env BWA4_EXTEND_TIER="$tier" $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2>/dev/null; then
+              echo "  extend tier=$tier: $(cat et.txt)s"
+            else
+              echo "  extend tier=$tier: timed out or unavailable"
+            fi
+          done
+          echo "== rescue tier (BWA4_RESCUE_TIER) =="
           # A forced tier the host lacks falls back to scalar, and forced scalar is legitimately an
           # order of magnitude slower on this stage, so a timeout here is reported and not fatal.
           for tier in scalar avx2 avx512; do
