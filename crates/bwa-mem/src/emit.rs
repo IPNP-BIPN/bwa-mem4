@@ -21,7 +21,15 @@
 //!
 //! **Nothing here may change a byte of output.** Every function writes exactly the bytes the code
 //! it replaced wrote: same digits, same alphabet, same order. That is checked by the parity gate,
-//! not by this comment.
+//! not by this comment: 64 of 64 option combinations pass `scripts/opt_parity.sh` against the
+//! oracle, and 1M chr21 pairs plus 500k real GIAB pairs are `cmp`-clean against the previous binary.
+//!
+//! **On ARM this is a wash, and the first measurement here said otherwise.** A single run showed
+//! `sam_emit` at 2.787 s against 2.668 s and that was noise; five interleaved repetitions put the
+//! minima at 2.641 s and 2.637 s, i.e. -0.2%. That is the honest ARM number, and it is what should
+//! be expected: the aarch64 baseline already lets the compiler vectorise, and this stage is 7.5% of
+//! the wall there. The x86 case is the one this was written for, where the same stage is 13.1% of
+//! the wall and 5.15x slower per pair, and it is measured in CI rather than here.
 //!
 //! # Rust mechanics used in this file
 //!
