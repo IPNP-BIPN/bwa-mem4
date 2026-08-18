@@ -4,6 +4,22 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## Acceptees (par conception)
 
+- **Scoring non defaut (`-A 2`) : bwa-mem2 ne s'accorde pas avec lui-meme, et nous suivons son build
+  arm64. FIGE (2026-08-18).** Sous un score de match non defaut, les builds x86_64 et arm64 de
+  bwa-mem2 2.3 produisent des alignements differents sur les memes reads. Ce n'est pas une
+  divergence de notre part : c'est l'oracle qui se contredit selon la machine qui l'execute.
+
+  Nous suivons le build **arm64**, parce que c'est lui qui respecte la loi d'echelle imposee par
+  l'algorithme : multiplier toute la matrice de score par k doit multiplier les scores par k sans
+  changer les alignements retenus, et le build x86_64 ne le fait pas. Notre parite sous `-A 2` est
+  donc enoncee contre le build arm64, explicitement, et un lecteur qui compare nos sorties a un
+  bwa-mem2 x86_64 sous `-A 2` verra des differences qui ne sont pas les notres.
+
+  Remonte en amont comme [bwa-mem2#297](https://github.com/bwa-mem2/bwa-mem2/issues/297), ouvert
+  depuis ce projet. **Sans reponse ni commentaire au 2026-08-18**, un mois apres son ouverture, d'ou
+  le figeage de cette formulation plutot qu'une attente indefinie : si upstream tranche un jour dans
+  l'autre sens, c'est cette entree qu'il faudra rouvrir, et l'oracle de reference avec elle.
+
 - **`@PG` : DECIDE (4.0.0). Nous emettons notre propre identite, definitivement.** Notre sortie
   emet `ID:bwa-mem4 PN:bwa-mem4 VN:<ver> CL:<notre argv>`, l'oracle emet `bwa-mem2`. Exclu du gate
   d'octet-identite (on compare `@SQ` + les lignes d'alignement).
