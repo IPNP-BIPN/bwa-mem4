@@ -4308,6 +4308,65 @@ faible occupation (dedup 69 %, encode 29 %), et ces 1,1 % sont reels. Ce qui pla
 est qu'un utilisateur memoire-contraint ne peut pas deviner l'existence d'une variable d'environnement,
 alors qu'un utilisateur presse lit un chiffre de wall. Le choix n'appartient pas a la mesure.
 
+## Trois questions fermees le meme jour : le gate GIAB, le PGO hors Apple, et l'indexeur parallele (2026-08-18)
+
+### Phase 11 : l'identite octet, dite en precision et rappel (#35)
+
+`scripts/giab_happy.sh` aligne les memes reads avec les deux aligneurs, appelle les variants avec le
+meme caller, et note les deux VCF contre le benchmark NIST v4.2.1. Le workflow `giab-gate` le fait
+tourner sur des reads HG002 REELS, decoupes dans le BAM 300x de GIAB par HTTPS : 1 089 635 paires
+sur une fenetre de 10 Mb du bras q de chr21, 17 806 variants de verite dans 9,75 Mb de regions de
+confiance.
+
+| bras | TP | FP | FN | precision | sensibilite | F |
+|---|---|---|---|---|---|---|
+| bwa-mem4 | 16889 | 172 | 171 | 0,9899 | 0,9900 | 0,9899 |
+| bwa-mem2 | 16889 | 172 | 171 | 0,9899 | 0,9900 | 0,9899 |
+
+Enregistrements BAM identiques, enregistrements VCF identiques, donc la meme ligne deux fois. Ce
+n'est pas une decouverte, c'est le livrable : l'identite existe desormais dans les unites que lit un
+utilisateur de variant calling. Deux pieges rencontres et documentes sur place : Ensembl nomme le
+contig `21` la ou le benchmark le nomme `chr21`, et un caller ne produit alors rien du tout sans se
+plaindre ; et des reads extraits d'un alignement existant sont les reads que CET aligneur a places
+la, ce qui est propre pour comparer deux aligneurs sur la meme entree et n'est pas une mesure de
+sensibilite.
+
+### Le PGO est un levier Apple Silicon, et rien d'autre (#33)
+
+nh13 mesurait -0,4 % sur Graviton4 la ou nous mesurons +12,4 % sur M4. Un troisieme point tranche,
+sans Graviton : ARM heberge (Ampere Altra, `CPU implementer 0x41`), notre chaine, notre procedure
+d'entrainement, `llvm-profdata` de la toolchain et non de la distribution, entrainement sur une
+graine wgsim differente de celle mesuree.
+
+| rep | plain | PGO |
+|---|---|---|
+| 1 | 69,43 s | 69,99 s |
+| 2 | 69,90 s | 70,32 s |
+| 3 | 69,69 s | 69,95 s |
+
+**PGO est 0,6 % plus lent**, trois repetitions sans croisement. Deux coeurs ARM non-Apple disent
+donc la meme chose contre +12,4 % sur M4 : le gain appartient a l'Apple Silicon. C'est coherent avec
+ce que le PGO achete ici, de la disposition de branches sur le chemin branchu (driver, seeding,
+SAM), dont la valeur depend entierement du predicteur du coeur. `scripts/pgo.sh` doit donc etre
+presente comme un levier Apple Silicon, pas comme une propriete du binaire.
+
+### L'indexeur n'est pas mono-thread, il est mono-thread PAR DEFAUT (#37)
+
+Mesure a l'echelle genome, GRCh38 (3,15 GB de FASTA), M4 Max, index octet-identique dans les trois
+cas (md5 du `.bwt.2bit.64`) :
+
+| backend | wall | RSS de pointe |
+|---|---|---|
+| defaut (libsais C, serie) | 152,45 s | 91,6 GB |
+| `--features libsais-c-omp`, 8 threads | **90,96 s** | 98,4 GB |
+| `--features capsa` (chr21 seulement) | 24x plus lent | 2,2x moins de RAM |
+
+**1,68x pour +7 % de RAM**, et le code existe deja. Ce qui empeche d'en faire le defaut n'est pas
+l'algorithme mais la dependance : `libsais-c-omp` exige un runtime OpenMP a la compilation, et un
+artefact de release qui gagnerait silencieusement une dylib serait pire qu'un index plus lent, ce que
+`crates/bwa-cli/Cargo.toml` disait deja. Le vrai reste de #37 est donc une question de packaging, pas
+de parallelisation.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
