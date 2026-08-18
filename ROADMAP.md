@@ -4399,6 +4399,53 @@ Deux causes possibles, et elles se separent par la mesure :
    Sur ARM ce choix ne coute rien, la baseline aarch64 contenant deja NEON : controle mesure ici,
    `target-cpu=native` contre baseline donne 36,35 s contre 36,48 s, un nul.
 
+### Le profil x86, lu enfin, et il ne dit pas ce que les issues supposaient
+
+Runner heberge 4 coeurs, AMD EPYC 7763 (Zen 3, pas d'AVX-512), chr21, `-K` par defaut, un batch en
+vol pour que les parts soient exactes. Deux jeux de donnees, et c'est le point le plus important de
+toute la section.
+
+| jeu | bwa-mem4 | `bwa-mem3` | `bwa-mem2` | nous / fork |
+|---|---|---|---|---|
+| wgsim, 2M paires | 216,1 / 217,5 / 216,8 s | 162,9 / 165,7 / 165,3 s | 355 / 359 / 355 s | **1,32x** |
+| HG002 reel, 5,45M paires | 128,2 / 129,6 / 129,5 s | 118,3 / 120,8 / 126,2 s | 278 / 283 / 280 s | **1,05x** |
+
+**L'ecart x86 depend du jeu de donnees, et il n'est pas de 1,3x partout.** Sur des reads simules
+nous sommes a 1,32x du fork ; sur des reads HG002 reels, decoupes dans une fenetre de 10 Mb, a
+**1,05x**. Aucun des deux chiffres n'est le chiffre WGS que #32 demande : les reads reels utilises
+ici viennent d'un alignement existant restreint a une fenetre, donc leurs mates tombent presque
+toujours a cote et le rescue ne travaille pas (10,7 % du wall contre 21,4 % sur wgsim). La lecture
+honnete est que le deficit va de 5 % a 32 % selon ce qu'on aligne, et que le protocole doit etre
+cite avec le chiffre.
+
+**Par etage, wgsim, normalise par million de paires, contre le meme profil sur M4 :**
+
+| etage | M4 (s/Mpaires) | Zen 3 (s/Mpaires) | rapport |
+|---|---|---|---|
+| align | 24,86 | 70,3 | 2,83x |
+| rescue | 9,10 | 23,4 | 2,57x |
+| `sam_emit` | 2,79 | 14,4 | **5,15x** |
+
+Un coeur M4 est plus rapide qu'un coeur Zen 3 de cette generation, donc un rapport uniforme autour
+de 2,8x ne dit rien. Ce qui parle est **l'ecart entre les etages** : `sam_emit`, qui est du
+formatage de chaines et d'entiers sans une seule instruction vectorielle, est deux fois plus penalise
+que le reste. `chain_flt` suit a 4,3x et le `rest` du profil `align-split` (marche SA et fusion de
+chaines) a 3,5x, contre 2,57x pour les noyaux d'extension eux-memes.
+
+**Les deux noyaux vectoriels, eux, tiennent :** le kernel de rescue fait 4,56 Gcell/s/thread en AVX2
+contre 10,03 en NEON, et les noyaux d'extension sont a 2,57x du M4. C'est le rapport attendu entre
+ces deux coeurs. Ce ne sont donc pas les noyaux qui expliquent que nous perdions plus que le fork.
+
+**La fenetre SA n'est pas un levier sur x86** : 219,4 / 218,7 / 217,3 / 218,3 / 217,3 s pour
+W = 16, 32, 64, 96, 128. Plate, la ou sur M4 passer de 128 a 32 coute 18 %. Zen 3 ne profite pas du
+recouvrement de defauts de cache que le M4 exploite, ce qui est coherent avec les 163 ns par lookup
+mesures ici contre 60 ns sur M4.
+
+**Ce que cela designe** : nos chemins SCALAIRES sur x86, pas nos noyaux. Et c'est exactement la ou la
+difference de packaging joue, `bwa-mem2` livrant un binaire par jeu d'instructions quand nous livrons
+un binaire baseline dont seules les fonctions vectorielles sont selectionnees au runtime. Le bras
+baseline / v2 / v3 mesure precisement cela.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
