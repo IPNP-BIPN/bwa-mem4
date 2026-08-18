@@ -4471,6 +4471,32 @@ depuis un arbre propre par `cargo build --release`, ce qu'un artefact PGO n'est 
 `macos-x86_64` est desactive sans mesure propre, deliberement : deux architectures non-Apple sur deux
 perdent, et livrer des octets plus lents sur une supposition non mesuree est le mauvais defaut.
 
+### Le jeu d'instructions vaut 5,6 a 6,8 %, et il est livre (2026-08-18)
+
+Le levier que la retro-ingenierie du fork designait, mesure. AMD EPYC 7763, chr21, 400k paires
+simulees, `-t4`, deux repetitions, meme source des deux cotes :
+
+| bras | wall |
+|---|---|
+| baseline x86-64 (ce que nous livrions) | 32,99 s / 33,42 s |
+| `-C target-cpu=x86-64-v3` (AVX2) | **31,42 s / 31,15 s** |
+
+**5,6 % au minimum, 6,8 % en median**, et **sortie identique au md5** (`6b084cb8...` des deux cotes).
+Rien dans le code ne change : c'est le compilateur qui a enfin le droit d'auto-vectoriser les
+boucles scalaires de seeding, de chainage, de resolution SA et d'emission SAM, celles que le profil
+x86 montrait a 3,5x, 4,3x et 5,15x du meme etage sur M4 pendant que les noyaux vectoriels etaient a
+2,57x. C'est exactement ce que `BASELINE_ARCH ?= avx2` fait chez fg-labs/bwa-mem3 depuis toujours.
+
+**Livraison.** L'artefact par defaut reste en baseline, pour tourner partout ; un second executable
+`bwa-mem4-x86-64-v3` voyage dans la meme archive avec une note qui dit a qui il s'adresse. Il subit
+les memes gates que le principal, plus une troisieme qui est la seule qui compte pour un binaire en
+double : **son SAM doit diffe propre contre celui du binaire baseline**, en plus de reconstruire
+l'index a l'octet.
+
+Au passage, les balayages de tiers sur le meme runner, 400k paires : extension `scalar` 238,46 s,
+`sse41` 37,39, `avx2` 33,76 ; rescue `scalar` 306,99 s, `avx2` 34,19. Les noyaux portent bien ce
+qu'on croyait qu'ils portaient.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
