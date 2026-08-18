@@ -216,3 +216,93 @@ jobs:
               echo "tier=$tier: timed out or unavailable"
             fi
           done
+
+  # PGO has never been measured off Apple Silicon, and it is the one lever that could be worth a
+  # third of the x86 deficit for free. On an M4 it is +6.1% SE and +8.5% PE at genome scale
+  # (docs/perf-levers.md); @nh13 measured -0.4% on Graviton4, which is either a build that did not
+  # apply its profile or a benefit specific to Apple Silicon, and nobody has run the third case.
+  # The comparison also matters because the fork's conda binary is NOT profile-guided: if PGO pays
+  # here, part of the gap is a build-process difference rather than a code difference.
+  #
+  # Separate job from the profile above so a cargo-pgo or llvm-profdata failure cannot take the
+  # measurement down with it.
+  pgo-x86:
+    name: what PGO is worth on x86
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust with the LLVM tools
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+          # cargo-pgo needs `llvm-profdata` from the toolchain, not the distro: it must match the
+          # LLVM rustc was built with, or the profile is unreadable.
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            wgsim
+          init-shell: bash
+
+      - name: Install cargo-pgo
+        shell: bash
+        run: cargo install cargo-pgo --locked 2>&1 | tail -2
+
+      - name: Reference, index, reads
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          bwa-mem2 index chr21.fa
+          # Training set and measurement set are drawn with DIFFERENT seeds. Training on the reads
+          # the benchmark then times would flatter PGO with a profile it can never have in practice.
+          wgsim -S 11 -N 1000000 -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          wgsim -S 77 -N 200000 -1 150 -2 150 chr21.fa t1.fq t2.fq > /dev/null
+
+      - name: Build plain and PGO
+        shell: bash
+        run: |
+          export RUSTFLAGS=""
+          cargo build --release -p bwa-mem4 --target-dir target-plain
+          cp target-plain/release/bwa-mem4 ./bwa-mem4-plain
+          cargo pgo build -- -p bwa-mem4 2>&1 | tail -3
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          # Train. The instrumented binary is several times slower, which is why the training set is
+          # a fifth of the measurement set.
+          inst=$(find target -name bwa-mem4 -type f -perm -u+x -path '*release*' | head -1)
+          echo "instrumented: $inst"
+          (cd work && "../$inst" mem -t "$T" chr21.fa t1.fq t2.fq > /dev/null 2>/dev/null)
+          cargo pgo optimize build -- -p bwa-mem4 2>&1 | tail -3
+          opt=$(find target -name bwa-mem4 -type f -perm -u+x -path '*release*' | head -1)
+          cp "$opt" ./bwa-mem4-pgo
+          ls -la bwa-mem4-plain bwa-mem4-pgo
+
+      - name: A/B, interleaved
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          for b in plain pgo; do ../bwa-mem4-$b mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null; done
+          for rep in 1 2 3; do
+            p=$(timed ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq)
+            g=$(timed ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: plain ${p}s | pgo ${g}s"
+          done
+          echo "== PGO changes instruction selection, never output =="
+          ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+          ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
