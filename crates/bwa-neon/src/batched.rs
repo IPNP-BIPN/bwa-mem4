@@ -1418,7 +1418,12 @@ macro_rules! define_sw_kernel {
             ceqz = $ceqz:path, cge = $cge:path,
             ceq = $ceq:path, orru = $orru:path,
             andu = $andu:path, bsl = $bsl:path,
-            band = $band:path, band_bias = $bbias:expr
+            band = $band:path, band_bias = $bbias:expr,
+            // Whether `$sub` is UNSIGNED-saturating, i.e. floors at 0 rather than wrapping or
+            // saturating at a negative bound. True for every u8 instantiation and false for every
+            // i16 one. It exists to delete two vector operations per column from the u8 body; see
+            // the gap-open lines in the inner loop.
+            sub_floors_at_zero = $satsub:expr
         ) => {
         /// # Safety
         /// Requires the `$feat` target feature; all vector loads/stores use fixed-size
@@ -1850,7 +1855,22 @@ macro_rules! define_sw_kernel {
                                 // `open_del_v` lane l = the score of opening a fresh deletion here,
                                 // M - (o_del + e_del), floored at 0; `e_new` lane l = E(i+1, j), the better
                                 // of extending the deletion already open in this column and that open.
-                                let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
+                                // `max(., 0)` only where the subtraction can go below zero. On the
+                                // u8 kernels `$sub` is unsigned-saturating, so it ALREADY floors at
+                                // 0 and the clamp is two vector ops per column doing nothing; on the
+                                // i16 kernels the subtraction wraps and the clamp is the recurrence.
+                                // `$satsub` is a literal, so the branch folds at compile time and
+                                // each instantiation keeps exactly the ops it needs.
+                                //
+                                // Byte-identical by the same argument the comment above already
+                                // made, and checked by the gates rather than by the argument: the
+                                // scalar-equivalence sweeps, the batch-order invariant, and the
+                                // saturation-boundary gate that walks engineered scores through 255.
+                                let open_del_v = if $satsub {
+                                    $sub(bigm_v, oe_del_v)
+                                } else {
+                                    $max($sub(bigm_v, oe_del_v), zero_v)
+                                };
                                 let e_new = $max($sub(e_v, e_del_v), open_del_v);
                                 $sts(
                                         eh_e.as_mut_ptr().add(col_base),
@@ -1867,7 +1887,11 @@ macro_rules! define_sw_kernel {
                                 // Mirror of the pair above for the insertion: `open_ins_v` lane l is the
                                 // cost-adjusted score of opening one here, `f_new` lane l is F(i, j+1),
                                 // which the next iteration will read as its carried `f_v`.
-                                let open_ins_v = $max($sub(bigm_v, oe_ins_v), zero_v);
+                                let open_ins_v = if $satsub {
+                                    $sub(bigm_v, oe_ins_v)
+                                } else {
+                                    $max($sub(bigm_v, oe_ins_v), zero_v)
+                                };
                                 let f_new = $max($sub(f_v, e_ins_v), open_ins_v);
                                 f_v = if $masked { $bsl(band, f_new, f_v) } else { f_new };
                                 }};
@@ -2029,7 +2053,8 @@ mod neon {
         andu = vandq_u16,
         bsl = vbslq_s16,
         band = band_s16,
-        band_bias = 0
+        band_bias = 0,
+        sub_floors_at_zero = false
     );
 
     // 8-bit kernel: **unsigned** u8 [0,255] with saturating add/sub, so a local extension whose score
@@ -2065,7 +2090,8 @@ mod neon {
         andu = vandq_u8,
         bsl = vbslq_u8,
         band = band_u8,
-        band_bias = 0
+        band_bias = 0,
+        sub_floors_at_zero = true
     );
 }
 
@@ -2231,7 +2257,8 @@ mod avx2 {
         andu = _mm256_and_si256,
         bsl = bsl256,
         band = band_epi16,
-        band_bias = 0
+        band_bias = 0,
+        sub_floors_at_zero = false
     );
 
     define_sw_kernel!(
@@ -2254,7 +2281,8 @@ mod avx2 {
         andu = _mm256_and_si256,
         bsl = bsl256,
         band = band_epi8,
-        band_bias = 0x80
+        band_bias = 0,
+        sub_floors_at_zero = truex80
     );
 }
 
@@ -2403,7 +2431,8 @@ mod sse41 {
         andu = _mm_and_si128,
         bsl = bsl128,
         band = band_epi16,
-        band_bias = 0
+        band_bias = 0,
+        sub_floors_at_zero = false
     );
 
     define_sw_kernel!(
@@ -2426,7 +2455,8 @@ mod sse41 {
         andu = _mm_and_si128,
         bsl = bsl128,
         band = band_epi8,
-        band_bias = 0x80
+        band_bias = 0,
+        sub_floors_at_zero = truex80
     );
 }
 
@@ -2577,7 +2607,8 @@ mod avx512 {
         andu = _mm512_and_si512,
         bsl = bsl512,
         band = band_epi16,
-        band_bias = 0
+        band_bias = 0,
+        sub_floors_at_zero = false
     );
 
     define_sw_kernel!(
@@ -2600,7 +2631,8 @@ mod avx512 {
         andu = _mm512_and_si512,
         bsl = bsl512,
         band = band_epu8,
-        band_bias = 0
+        band_bias = 0,
+        sub_floors_at_zero = true
     );
 }
 

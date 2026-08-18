@@ -76,10 +76,20 @@ jobs:
             echo "::error::the OpenMP build links a shared OpenMP runtime; static linking did not take"
             exit 1
           fi
-          diff <(ldd ./bwa-mem4-plain | awk '{print $1}' | sort) \
-               <(ldd ./bwa-mem4-omp   | awk '{print $1}' | sort) \
-            || { echo "::error::the OpenMP build carries libraries the plain one does not"; exit 1; }
+          # A SUBSET check, not an equality one. The first version of this step demanded identical
+          # lists and failed on a result that was better than passing: the OpenMP build has one
+          # library FEWER than the plain one, because openmp-sys links libgcc statically too. What
+          # matters is that it carries nothing extra.
+          extra=$(comm -13 <(ldd ./bwa-mem4-plain | awk '{print $1}' | sort -u) \
+                           <(ldd ./bwa-mem4-omp   | awk '{print $1}' | sort -u))
+          if [ -n "$extra" ]; then
+            echo "::error::the OpenMP build carries libraries the plain one does not: $extra"
+            exit 1
+          fi
           echo "no new dynamic dependency"
+          missing=$(comm -23 <(ldd ./bwa-mem4-plain | awk '{print $1}' | sort -u) \
+                             <(ldd ./bwa-mem4-omp   | awk '{print $1}' | sort -u))
+          [ -n "$missing" ] && echo "and one fewer than the plain build: $missing"
 
       - name: Both binaries rebuild the committed index byte-identically
         run: |
