@@ -24,12 +24,14 @@
 name: avx512-check
 
 on:
-  # TEMPORARY, removed before this branch merges (a workflow_dispatch workflow is only reachable by
-  # name once its file is on the default branch).
-  push:
-    branches: [perf/alloc-probe]
-    paths: [".github/workflows/avx512-check.yml"]
   workflow_dispatch:
+
+# One run of this workflow at a time per ref. Without it a second push while the first run is still
+# measuring leaves two hour-long jobs racing for the same runners, which happened four times while
+# this branch was being written and had to be cleaned up by hand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   avx512-emulated:

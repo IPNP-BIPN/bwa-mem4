@@ -25,6 +25,13 @@ on:
         default: "100000000"
         required: false
 
+# One run of this workflow at a time per ref. Without it a second push while the first run is still
+# measuring leaves two hour-long jobs racing for the same runners, which happened four times while
+# this branch was being written and had to be cleaned up by hand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   alloc-probe:
     name: per-stage allocation on Linux, vs the fork's RSS

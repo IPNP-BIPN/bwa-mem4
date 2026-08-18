@@ -17,20 +17,19 @@
 name: perf-x86
 
 on:
-  # TEMPORARY, removed before this branch merges: a workflow_dispatch workflow is only reachable by
-  # name once its file is on the default branch, so the first run of a new one has to come from a
-  # push on the branch that introduces it.
-  push:
-    branches: [perf/alloc-probe]
-    # Only when this file changes. Without the path filter every commit on the branch relaunches an
-    # hour of CI, which happened three times before the filter was added.
-    paths: [".github/workflows/perf-x86.yml"]
   workflow_dispatch:
     inputs:
       read_pairs:
         description: "Read pairs to simulate"
         default: "2000000"
         required: false
+
+# One run of this workflow at a time per ref. Without it a second push while the first run is still
+# measuring leaves two hour-long jobs racing for the same runners, which happened four times while
+# this branch was being written and had to be cleaned up by hand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   perf-x86:

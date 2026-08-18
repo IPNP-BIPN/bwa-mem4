@@ -17,19 +17,19 @@
 name: giab-gate
 
 on:
-  # TEMPORARY, removed before this branch merges (a workflow_dispatch workflow is only reachable by
-  # name once its file is on the default branch).
-  push:
-    branches: [perf/alloc-probe]
-    # Only when this file changes. Without the path filter every commit on the branch relaunches an
-    # hour of CI, which happened three times before the filter was added.
-    paths: [".github/workflows/giab-gate.yml"]
   workflow_dispatch:
     inputs:
       region:
         description: "Region to gate on (must be inside the benchmark's confident regions)"
         default: "chr21:20000000-30000000"
         required: false
+
+# One run of this workflow at a time per ref. Without it a second push while the first run is still
+# measuring leaves two hour-long jobs racing for the same runners, which happened four times while
+# this branch was being written and had to be cleaned up by hand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   giab-gate:
