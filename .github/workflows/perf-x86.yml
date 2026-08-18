@@ -409,3 +409,95 @@ jobs:
               > /dev/null 2> p.err || { echo FAILED; tail -5 p.err; continue; }
             grep -E '^\[(stage-time|barrier|chain-time|matesw)' p.err || tail -10 p.err
           done
+
+  # Does the RELEASE recipe's PGO pay on Linux x86_64?
+  #
+  # This is not the same question as the `pgo-x86` job above, and the two disagree, which is why it
+  # exists. That job used cargo-pgo and trained on 200k simulated pairs, and measured -4.1%.
+  # release.yml uses hand-rolled `-Cprofile-generate` / `-Cprofile-use` and trains on the committed
+  # `testdata/tiny` fixture with 8000 reads, and its comment claims +4.4%. Every release artefact is
+  # built the second way, so the second way is what has to be measured: if PGO is a loss on Linux
+  # x86_64, we are shipping a slower binary to the platform where most WGS runs.
+  #
+  # The recipe below is copied from release.yml deliberately, including the CFLAGS that keep the
+  # instrumentation away from the C toolchain, so this measures the shipped path and not a variant
+  # of it.
+  release-pgo-x86:
+    name: does the RELEASE recipe's PGO pay on x86
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust with the LLVM tools
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+          components: llvm-tools-preview
+
+      - name: Install bwa-mem2 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            wgsim
+          init-shell: bash
+
+      - name: Reference, index, reads
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          bwa-mem2 index chr21.fa
+          wgsim -S 11 -N 1000000 -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+
+      - name: Plain build
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+        run: |
+          cargo build --release --locked --target-dir target-plain
+          cp target-plain/release/bwa-mem4 ./bwa-mem4-plain
+
+      - name: PGO build, exactly as release.yml does it
+        shell: bash
+        env:
+          CFLAGS: -fno-profile-generate -fno-profile-use
+          CXXFLAGS: -fno-profile-generate -fno-profile-use
+        run: |
+          set -euo pipefail
+          PROFDIR="$PWD/target/pgo"
+          rm -rf "$PROFDIR"; mkdir -p "$PROFDIR/train"
+          RUSTFLAGS="-Cprofile-generate=$PROFDIR" cargo build --release --locked
+          cp testdata/tiny/tiny.fa "$PROFDIR/train/"
+          python3 scripts/make_test_reads.py testdata/tiny/tiny.fa "$PROFDIR/train/r" --n 8000
+          ./target/release/bwa-mem4 index "$PROFDIR/train/tiny.fa"
+          ./target/release/bwa-mem4 mem -t 2 "$PROFDIR/train/tiny.fa" \
+              "$PROFDIR/train/r_1.fq" "$PROFDIR/train/r_2.fq" > /dev/null
+          PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)
+          "$PROFDATA" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/*.profraw
+          RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata" cargo build --release --locked
+          cp target/release/bwa-mem4 ./bwa-mem4-pgo
+          ls -la bwa-mem4-plain bwa-mem4-pgo
+
+      - name: A/B, interleaved, on the workload a user runs
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          for b in plain pgo; do ../bwa-mem4-$b mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null; done
+          for rep in 1 2 3; do
+            p=$(timed ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq)
+            g=$(timed ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: plain ${p}s | release-recipe pgo ${g}s"
+          done
+          ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+          ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
