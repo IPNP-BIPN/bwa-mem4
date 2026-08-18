@@ -1,0 +1,112 @@
+# Can the Linux artefacts index a genome in parallel WITHOUT gaining a shared library? (#37, #41)
+#
+# The parallel suffix-array path already exists behind `--features libsais-c-omp` and is worth 1.68x
+# at genome scale (GRCh38: 152.45 s serial, 90.96 s at 8 threads, +7% peak RSS, byte-identical
+# index). It is not the default for one stated reason, in crates/bwa-cli/Cargo.toml: it needs an
+# OpenMP runtime at build time, and "a release artifact that silently gained a dylib dependency
+# would be worse than a slower index build".
+#
+# That objection is testable rather than arguable. `openmp-sys` links libgomp STATICALLY when
+# `OPENMP_STATIC=1` is set and the compiler is GCC, which is what every Linux runner has. If the
+# resulting binary shows no libgomp in `ldd`, the artefact gains nothing to carry and the objection
+# is answered by measurement.
+#
+# Three things this job checks, in the order that matters: no new dynamic dependency, then the index
+# is still byte-identical to the committed fixture, then how much the parallelism is actually worth
+# on this host.
+name: index-omp
+
+on:
+  # TEMPORARY, removed with the others before merge: a workflow_dispatch workflow is only reachable
+  # by name once its file is on the default branch.
+  push:
+    branches: [perf/alloc-probe]
+    paths: [".github/workflows/index-omp.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-openmp:
+    name: static libgomp, byte-identical index, and what it buys
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Is libgomp.a even here
+        run: |
+          set -euo pipefail
+          gcc --version | head -1
+          # The static archive, not the shared object: this whole job depends on it existing on a
+          # stock runner, so it is checked before anything is built rather than discovered in a link
+          # error twenty minutes later.
+          find /usr/lib /usr/lib/gcc -name 'libgomp.a' 2>/dev/null | head -3
+          find /usr/lib /usr/lib/gcc -name 'libgomp.a' 2>/dev/null | grep -q . \
+            || { echo "::error::no libgomp.a on this image"; exit 1; }
+
+      - name: Build both ways
+        env:
+          RUSTFLAGS: ""
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p bwa-mem4 --target-dir target-plain
+          cp target-plain/release/bwa-mem4 ./bwa-mem4-plain
+          # OPENMP_STATIC is openmp-sys's switch; with GCC it resolves to `-l static=gomp`.
+          OPENMP_STATIC=1 cargo build --release --locked -p bwa-mem4 --features libsais-c-omp \
+            --target-dir target-omp
+          cp target-omp/release/bwa-mem4 ./bwa-mem4-omp
+
+      - name: The artefact must not have gained a dynamic dependency
+        run: |
+          set -euo pipefail
+          echo "== plain =="; ldd ./bwa-mem4-plain | sort
+          echo "== omp =="; ldd ./bwa-mem4-omp | sort
+          # The actual gate: no libgomp, and no library the plain build does not also have.
+          if ldd ./bwa-mem4-omp | grep -qi 'gomp\|libomp'; then
+            echo "::error::the OpenMP build links a shared OpenMP runtime; static linking did not take"
+            exit 1
+          fi
+          diff <(ldd ./bwa-mem4-plain | awk '{print $1}' | sort) \
+               <(ldd ./bwa-mem4-omp   | awk '{print $1}' | sort) \
+            || { echo "::error::the OpenMP build carries libraries the plain one does not"; exit 1; }
+          echo "no new dynamic dependency"
+
+      - name: Both binaries rebuild the committed index byte-identically
+        run: |
+          set -euo pipefail
+          for b in plain omp; do
+            rm -rf "/tmp/idx-$b" && mkdir -p "/tmp/idx-$b"
+            cp testdata/tiny/tiny.fa "/tmp/idx-$b/"
+            "./bwa-mem4-$b" index "/tmp/idx-$b/tiny.fa"
+            for ext in pac ann amb bwt.2bit.64 0123; do
+              cmp -s "/tmp/idx-$b/tiny.fa.$ext" "testdata/tiny/tiny.fa.$ext" \
+                || { echo "::error::$b .$ext differs from the committed fixture"; exit 1; }
+            done
+            echo "$b: index identical"
+          done
+
+      - name: What the parallel suffix array is worth here
+        run: |
+          set -euo pipefail
+          # chr21 rather than a whole genome: the runner has 16 GB and building a GRCh38 suffix array
+          # peaks near 92 GB. The genome-scale figure (152.45 s -> 90.96 s, 1.68x) is in ROADMAP.md,
+          # measured on a machine that fits it; this job is about the LINK, and the timing here is a
+          # sanity check that the parallel path is actually taken.
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          for b in plain omp; do
+            rm -f chr21.fa.{pac,ann,amb,0123} chr21.fa.bwt.2bit.64
+            s=$( { /usr/bin/time -f '%e' -o t.txt "./bwa-mem4-$b" index chr21.fa >/dev/null; } 2>&1; cat t.txt)
+            echo "$b: ${s}s  md5=$(md5sum chr21.fa.bwt.2bit.64 | cut -d' ' -f1)"
+          done
+          echo "(nproc=$(nproc), so the parallel arm has that many threads at most)"
