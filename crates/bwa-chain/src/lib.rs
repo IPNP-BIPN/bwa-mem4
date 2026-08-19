@@ -342,6 +342,29 @@ pub fn build_chains(
     build_chains_from_smems(fm, bns, opt, codes, seqid, smems)
 }
 
+/// A run of suffix-array rows that is an exact repeat of an earlier run in the same batch.
+///
+/// Produced by [`sa_positions_for_read`] when two adjacent SMEMs are identical after the sort, which
+/// happens for **3.7% of SMEMs on simulated reads and 9.8% on real GIAB** and, because a duplicate
+/// of a high-occurrence SMEM repeats all of its rows, accounts for **11.9% and 17.7% of the rows the
+/// walk visits**. Those rows are the expensive part: 60 ns each on an M4 and 163 ns on Zen 3.
+///
+/// Deleting the duplicate SMEM would be simpler and is NOT byte-identical: it removes seeds, and the
+/// discard pass reproduces bwa-mem2's scan order slot by slot, so the region set shifts and `XS`
+/// moves on a handful of records per million (measured, see `BWA4_SMEM_DEDUP`). Keeping the SMEM and
+/// skipping only the redundant WALK changes nothing downstream: the position list, the per-SMEM
+/// counts and the resolved rows are all identical, byte for byte, because the duplicate's answers
+/// are copied from the run they duplicate rather than recomputed.
+#[derive(Clone, Copy, Debug)]
+pub struct RepeatedRun {
+    /// Index into the flat position list where the duplicate run starts.
+    pub dst: usize,
+    /// Index where the run it duplicates starts. Always an earlier, non-duplicate run.
+    pub src: usize,
+    /// How many rows the run covers.
+    pub len: usize,
+}
+
 /// Sort a read's SMEMs into bwa's intra-read order and enumerate every sampled occurrence position
 /// the chain merge will consume, in exactly that order, plus each SMEM's sampled count.
 ///
@@ -371,6 +394,7 @@ pub fn sa_positions_for_read(
     opt: &MemOpt,
     smems: &mut Vec<bwa_index::Smem>,
     positions: &mut Vec<i64>,
+    repeats: &mut Vec<RepeatedRun>,
 ) -> Vec<i64> {
     // bwa sorts the whole batch's SMEMs with `compare_smem` = (rid, m, n) ascending (`sortSMEMs`,
     // via `FMI_search.cpp:987`). Within one read `rid` is constant, so packing `(m, n)` into a single
@@ -445,6 +469,9 @@ pub fn sa_positions_for_read(
     // Cap on materialized occurrences per SMEM (default 500), widened to i64 to compare against `s`.
     let max_occ = i64::from(opt.max_occ);
     let mut counts: Vec<i64> = Vec::with_capacity(smems.len());
+    // The last SMEM whose rows were actually enumerated for walking, and where its run starts. A
+    // duplicate does not replace it, so a run of identical SMEMs all point at the first.
+    let mut previous: Option<(bwa_index::Smem, usize)> = None;
     for p in smems.iter() {
         // Same stride sampling as `bwa_seed::seeds_from_smem` / `bwamem.cpp:897`: take at most
         // `max_occ` (default 500) of the SMEM's `s` occurrences, spread evenly across the interval
@@ -457,10 +484,32 @@ pub fn sa_positions_for_read(
         // the absolute row is `p.k + k`. `count` is how many rows this SMEM has emitted so far.
         let mut k = 0i64;
         let mut count = 0i64;
+        // Where this SMEM's rows begin in the flat list, so a later duplicate can point at them.
+        let run_start = positions.len();
         while k < p.s && count < max_occ {
             positions.push(p.k + k);
             k += step;
             count += 1;
+        }
+        // An SMEM identical to its predecessor enumerates the identical rows, in the identical
+        // order, because the enumeration reads nothing but `(k, s)` and `max_occ`. Record the
+        // repeat so the caller can copy the answers instead of walking the index again. The
+        // positions themselves are still pushed: the list, the counts and everything downstream stay
+        // exactly as they were, which is what makes this byte-identical where deleting the SMEM is
+        // not. `prev_start` chains to the FIRST copy, so three identical SMEMs give two repeats both
+        // pointing at the original rather than a chain that has to be resolved in order.
+        if let Some((prev, prev_start)) = previous {
+            if prev == *p && count as usize == positions.len() - run_start {
+                repeats.push(RepeatedRun {
+                    dst: run_start,
+                    src: prev_start,
+                    len: count as usize,
+                });
+            } else {
+                previous = Some((*p, run_start));
+            }
+        } else {
+            previous = Some((*p, run_start));
         }
         counts.push(count);
     }
@@ -564,7 +613,11 @@ pub fn build_chains_from_smems(
 ) -> Vec<MemChain> {
     // Suffix-array ROWS to resolve, flat and in SMEM order. Not reference coordinates yet.
     let mut positions: Vec<i64> = Vec::new();
-    let counts = sa_positions_for_read(opt, &mut smems, &mut positions);
+    // The per-read path resolves its own rows and is not the hot one (the batched seeder in
+    // `bwa-mem4-mem` is), so it walks every row and discards the repeat list rather than carrying
+    // the copy machinery for one read's worth of rows.
+    let mut repeats: Vec<RepeatedRun> = Vec::new();
+    let counts = sa_positions_for_read(opt, &mut smems, &mut positions, &mut repeats);
     // Output buffer for the resolved 2L-space REFERENCE positions, one per row, same index.
     let mut rbegs = vec![0i64; positions.len()];
     // `Some(start instant)` only under `BWA4_CHAIN_TIME=1`; `None` (and zero cost) otherwise.
@@ -1451,6 +1504,11 @@ pub mod chain_time {
     pub static GET_SA_NS: AtomicU64 = AtomicU64::new(0);
     /// Number of suffix-array rows resolved, the denominator for the "ns per lookup" figure.
     pub static GET_SA_N: AtomicU64 = AtomicU64::new(0);
+    /// Of those, how many were NOT walked because they repeated a run an identical SMEM had already
+    /// resolved (see [`RepeatedRun`]). Reported so the per-lookup figure can be read against the
+    /// rows actually walked rather than the rows asked for; without it, skipping work makes the
+    /// per-lookup number look better for the wrong reason.
+    pub static GET_SA_SKIPPED: AtomicU64 = AtomicU64::new(0);
     /// Nanoseconds spent in `build_chains_from_resolved` overall (the SA walk included), so
     /// `GET_SA_NS / TOTAL_NS` is the fraction attributable to the index rather than the merge.
     pub static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
@@ -1478,14 +1536,21 @@ pub mod chain_time {
             TOTAL_NS.load(Ordering::Relaxed) as f64 / 1e9,
             GET_SA_N.load(Ordering::Relaxed),
         );
+        // Rows asked for, rows actually walked, and the per-row cost of the SECOND, because that is
+        // the one the FM index pays. Reporting only the first made a run that skipped work look like
+        // a run with faster lookups.
+        let skipped = GET_SA_SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let walked = n.saturating_sub(skipped);
         eprintln!(
             "[chain-time] build_chains_from_smems={:.3}s of which get_sa_batch={:.3}s ({:.0}%), \
-             {} SA lookups ({:.0} ns each)",
+             {} SA lookups of which {} skipped as exact repeats ({:.1}%), {:.0} ns per row walked",
             tot,
             sa,
             100.0 * sa / tot.max(1e-9),
             n,
-            1e9 * sa / (n.max(1) as f64),
+            skipped,
+            100.0 * skipped as f64 / (n.max(1) as f64),
+            1e9 * sa / (walked.max(1) as f64),
         );
     }
 }
