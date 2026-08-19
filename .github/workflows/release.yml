@@ -124,11 +124,17 @@ jobs:
             # dispatch only hand-written kernels, which leaves every scalar loop built for a 2003
             # CPU. The default artefact stays baseline so it runs everywhere.
             variant_cpu: "x86-64-v3"
+            # Parallel suffix-array construction, statically linked. Measured: 152.45 s -> 90.96 s
+            # for a GRCh38 index at 8 threads, byte-identical, and `ldd` shows no libgomp and in
+            # fact one library FEWER than the plain build, because openmp-sys links libgcc
+            # statically too. That was the only objection on file (#37).
+            omp: true
           - os: ubuntu-24.04-arm
             target_id: linux-aarch64
             # Same story on non-Apple ARM: -0.6% on hosted Ampere Altra, three reps, matching
             # @nh13's independent -0.4% on Graviton4. See #33.
             pgo: false
+            omp: true
           # DELIBERATELY NOT macos-26, the newest label. For a binary we hand to other people,
           # newer is worse: the build host sets the floor. `hts-sys` compiles vendored htslib with
           # `cc`, and `cc` with no explicit target takes the host's default deployment version, so
@@ -213,7 +219,12 @@ jobs:
         if: matrix.pgo != true
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
-        run: cargo build --release --locked
+          # Static OpenMP where the matrix asks for it; empty everywhere else, which leaves the
+          # serial suffix array. macOS is deliberately not in that set: libomp is a brew package
+          # rather than something the toolchain ships, so the artefact could not be built without
+          # one and could not be linked statically against it.
+          OPENMP_STATIC: ${{ matrix.omp && '1' || '' }}
+        run: cargo build --release --locked ${{ matrix.omp && '--features libsais-c-omp' || '' }}
 
       - name: Build (PGO)
         if: matrix.pgo == true
@@ -272,6 +283,16 @@ jobs:
                 | awk '/LC_BUILD_VERSION/{f=1} /LC_VERSION_MIN_MACOSX/{f=1} f&&/minos|version/{print $2; exit}')
           echo "minimum macOS: $GOT (expected $WANT)"
           [ "$GOT" = "$WANT" ] || { echo "::error::built binary demands macOS $GOT, expected $WANT"; exit 1; }
+
+      - name: The parallel-index build gained no shared library
+        if: matrix.omp
+        run: |
+          set -euo pipefail
+          ldd target/release/bwa-mem4 | sort
+          if ldd target/release/bwa-mem4 | grep -qi 'gomp\|libomp'; then
+            echo "::error::the artefact links a shared OpenMP runtime"; exit 1
+          fi
+          echo "no shared OpenMP runtime in the artefact"
 
       - name: The binary reports the tagged version
         run: |
