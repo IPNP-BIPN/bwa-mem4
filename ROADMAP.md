@@ -4520,6 +4520,33 @@ prise ce jour donnait `encode` a 29,8 % et une somme a 197 %. Les accumulateurs 
 processus, donc deux batchs en vol creditent les memes compteurs. Toutes les parts citees ici sont
 prises avec `BWA4_NO_BATCH_OVERLAP=1`, et le workflow le fait desormais pour chaque sonde.
 
+### L'indexeur parallele est livre, et l'objection tombe par la mesure (2026-08-19)
+
+`libsais-c-omp` existe depuis longtemps et vaut **1,68x a l'echelle du genome** (GRCh38 : 152,45 s en
+serie, 90,96 s a 8 threads, index octet-identique, +7 % de RSS de pointe). Ce qui l'empechait
+d'entrer dans les artefacts etait une phrase du `Cargo.toml` : un artefact qui gagnerait
+silencieusement une dependance dylib serait pire qu'un index plus lent.
+
+Cette phrase est testable. Avec `OPENMP_STATIC=1` et GCC, que tout runner Linux a :
+
+```
+== plain ==  ld-linux, libc, libgcc_s.so.1, libm, vdso
+== omp   ==  ld-linux, libc,                libm, vdso
+```
+
+**Aucune bibliotheque gagnee, et une de MOINS** : `openmp-sys` lie aussi `libgcc` statiquement. Les
+deux binaires reconstruisent l'index commite a l'octet, et chr21 passe de **5,20 s a 3,84 s** sur les
+quatre threads du runner, meme md5.
+
+Les deux cibles Linux construisent donc desormais avec, et le job de release **assert sur `ldd`**
+qu'aucun runtime OpenMP partage n'entre dans l'artefact. macOS reste en serie volontairement :
+`libomp` y est un paquet brew et non quelque chose que la toolchain fournit, donc il n'y aurait rien
+contre quoi lier statiquement.
+
+Ce que cela dit au-dela de l'index : **l'objection etait raisonnable et fausse**, et elle a bloque un
+1,68x pendant des mois parce que personne n'avait ecrit les cinq lignes de CI qui la verifient. Le
+`ldd` d'un binaire est une mesure, pas une opinion.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
