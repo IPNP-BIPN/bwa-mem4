@@ -14,6 +14,15 @@
 # Three things this job checks, in the order that matters: no new dynamic dependency, then the index
 # is still byte-identical to the committed fixture, then how much the parallelism is actually worth
 # on this host.
+#
+# The first run already answered the first one, and better than the objection feared:
+#
+#   == plain ==  ld-linux, libc, libgcc_s.so.1, libm, vdso
+#   == omp   ==  ld-linux, libc,                libm, vdso
+#
+# No libgomp, and one library FEWER than the plain build, because openmp-sys links libgcc statically
+# as well. The check is a subset test for that reason: what matters is that the artefact gains
+# nothing to carry, not that the two lists match.
 name: index-omp
 
 on:
