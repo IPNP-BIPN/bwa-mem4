@@ -4547,6 +4547,61 @@ Ce que cela dit au-dela de l'index : **l'objection etait raisonnable et fausse**
 1,68x pendant des mois parce que personne n'avait ecrit les cinq lignes de CI qui la verifient. Le
 `ldd` d'un binaire est une mesure, pas une opinion.
 
+## Le travail litteralement duplique, deux fois dans la meme journee (2026-08-19)
+
+Le meme raisonnement a paye deux fois, et il vaut d'etre nomme parce qu'il est reutilisable : **un
+calcul est une fonction pure de ses entrees, donc deux entrees identiques sont un calcul et une
+copie, et la sortie ne peut pas s'en apercevoir.** Contrairement a une heuristique, cela ne demande
+aucune concession sur l'octet-identite : ce n'est pas une approximation, c'est la meme reponse
+obtenue une fois au lieu de deux.
+
+### 1. Les marches du tableau de suffixes
+
+Deux SMEM identiques apres le tri enumerent les memes rangees. Les supprimer n'est PAS
+octet-identique (cela retire des seeds, et la passe de rejet compte les slots : `XS` bouge sur 4
+enregistrements par million, mesure). Garder le SMEM et ne sauter que la MARCHE l'est.
+
+| | chr21 wgsim | GIAB reel, genome |
+|---|---|---|
+| rangees supprimees | 11,9 % | **17,6 %** |
+| temps de `get_sa_batch` | -3,9 % | **-10,6 %** |
+| effet sur le run | < 1 % | < 1 % |
+
+Les rangees sautees etaient les moins cheres : elles venaient d'etre marchees, donc en cache. Le cout
+par rangee reellement marchee monte de 61 a 66 ns, ce qui est le meme fait vu de l'autre cote.
+
+### 2. Les jobs de programmation dynamique
+
+Un job d'extension est une fonction de `(query, target, h0)`. Mesure AVANT d'ecrire quoi que ce soit,
+avec `BWA4_JOB_DUP` : **16,2 % des jobs et 11,8 % des cellules sur chr21, 23,8 % et 18,3 % sur GIAB
+reel**. Ce ne sont pas des reads dupliques (24 sequences repetees sur 1M, 485 sur 500k) : ce sont des
+seeds differents ouvrant la meme fenetre, souvent dans le meme read.
+
+Le piege etait le cout de detection : un hachage octet par octet sur ~230 octets aurait mange un
+tiers du DP du job. Le fingerprint lit des mots de 64 bits aux extremites, et les candidats sont
+**verifies par comparaison d'octets**, donc une collision coute un `memcmp` et jamais une fausse
+reponse.
+
+| mesure | avant | apres | |
+|---|---|---|---|
+| etage `align`, chr21 | 24,797 s | 23,770 s | **-4,1 %** |
+| run complet, chr21 | 36,19 s | 35,23 s | **-2,65 %** |
+| run complet, 500k paires GIAB | 12,49 s | 12,13 s | **-2,9 %** |
+
+Cinq repetitions par mesure, aucun bras ne chevauchant l'autre. Octet-identite verifiee trois fois :
+chr21 1M paires, 500k paires GIAB reelles, et 64/64 sur la matrice d'options.
+
+**La portee du dedup est deja maximale** : le taux est identique a 1, 4 et 12 threads (15,97 %), donc
+les doublons sont locaux et un chunk plus large n'en trouverait pas d'autres.
+
+### Ce que la meme recherche a elimine
+
+- **Reads identiques** : 24 sur 1M et 485 sur 500k. Rien a prendre.
+- **Jobs de rescue dupliques** : 0 sur 2,2 M, la sonde le mesurait deja.
+- **Repartition u8/i16** : 98,1 % des cellules sont deja dans le kernel a 16 voies ; le levier plafonne a 0,4 %.
+- **Tri par longueur avant decoupage** : 1,07x de divergence seulement, dont 4,0 % recuperables, moins le cout de trier 35 M de jobs.
+- **Les deux reglages de kernel** (`BWA4_EXTEND_SBT`, `BWA4_EXTEND_BANDFAST`) sont deja dans leur meilleure position, de 3 % et 6 %.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
