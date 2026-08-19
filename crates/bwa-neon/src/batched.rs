@@ -1483,6 +1483,122 @@ fn inline_sbt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_EXTEND_SBT").is_none_or(|v| v != "0"))
 }
 
+/// Whether the extension kernels clamp each lane's band by the ungapped-score bound
+/// (`BWA4_TIGHT_BAND=1`; fg-labs/bwa-mem3's `tight_band`, `bwamem.cpp:4119`). OFF by default until
+/// the byte-identity battery has ruled on it: the ceiling probe says it removes 91-97% of banded
+/// cells, and the roadmap names the three ways it could move a byte (ties at exactly `S`, z-drop
+/// firing earlier under lower row maxima, and the retry ladder's `max_off` test).
+///
+/// # Returns
+/// True if `BWA4_TIGHT_BAND` is set to anything at all.
+fn tight_band_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_TIGHT_BAND").is_some())
+}
+
+/// The ungapped-score band bound for one job, or `i32::MAX` when no bound applies.
+///
+/// The lemma (fork's `bwamem.cpp:4119`): an alignment at offset `B` from the seed diagonal carries
+/// at least `B` gap operations, so its score is at most `min_len * a - B * (o_min + e_min)`. The
+/// diagonal walk's own best prefix score `S` is attainable at offset 0, so any alignment that beats
+/// the in-band optimum needs `B < (min_len * a - S) / (o_min + e_min)`. Everything at or past that
+/// offset scores at most `S`, and the `+ 1` below turns "at most" into "strictly below": with it,
+/// every alignment TIED at the top is inside the band, so the tie-break winner is the same cell the
+/// full-width scan would have picked. That closes the one corner the fork's `ceil` leaves open, for
+/// the price of one extra column.
+///
+/// `O(min_len)` per job, against the `O(len^2)` DP it informs. An ambiguous base returns no bound,
+/// exactly like the fork's FALLBACK status: the walk's scoring does not model N.
+///
+/// **The `gscore` window, and why `end_bonus` widens the bound.** The lemma above protects the
+/// LOCAL maximum. `gscore` is different: it is the best score among query-exhausting cells, it is
+/// reported even when it is far below `score`, and a query-exhausting cell can sit outside the
+/// tight band with a `gscore` the full-width run would have reported and this band will not. The
+/// first run of the equivalence gates caught exactly that: every failure had `score`/`qle`/`tle`
+/// identical and only `gscore`/`gtle` moved. What saves the SAM is that the caller only USES
+/// `gscore` when it beats `score - pen_clip`, and bwa passes `pen_clip` to this kernel as
+/// `end_bonus` (that is what the parameter means: the bonus for reaching the end is the forgone
+/// clip penalty). A usable query-exhausting cell therefore satisfies
+/// `min_len * a - B * oe_min >= score - end_bonus > S - end_bonus`, i.e.
+/// `B < bound + end_bonus / oe_min`. Folding `end_bonus` into the numerator keeps every USABLE
+/// `gscore` cell in-band; an out-of-band `gscore` is then provably below the clip threshold in both
+/// band widths, so the clip decision and the emitted bytes agree even where the raw field does not.
+/// The FIELD can still differ, which is why the equivalence gates run with this switch off and the
+/// arbiter for it is SAM identity.
+///
+/// # Parameters
+/// - `query`, `target`: the job's sequences, nt4 codes.
+/// - `h0`: the seed score the extension starts from.
+/// - `a`: match bonus (positive). `mm`: mismatch score (negative, as `mat[1]` stores it).
+/// - `oe_min`: `(min(o_del, o_ins), min(e_del, e_ins))`, the cheapest gap open and extend.
+/// - `end_bonus`: the clip penalty the caller forgoes by extending to the end; widens the bound so
+///   every usable `gscore` cell stays in-band.
+///
+/// # Returns
+/// An upper bound on the useful band half-width, `>= 1`, or `i32::MAX` for "leave the band alone".
+fn tight_band_bound(
+    query: &[u8],
+    target: &[u8],
+    h0: i32,
+    a: i32,
+    mm: i32,
+    oe_min: (i32, i32),
+    end_bonus: i32,
+) -> i32 {
+    let min_len = query.len().min(target.len());
+    if min_len == 0 || h0 <= 0 || oe_min.0 < 0 || oe_min.1 <= 0 {
+        return i32::MAX;
+    }
+    // Best prefix score along the diagonal, STOPPING where the walk dies. In the extension DP
+    // `m == 0` means unreachable, not "restart for free": once the running score hits zero the
+    // ungapped alignment has ended, and anything beyond that column is only reachable through gaps.
+    // The first version of this walk floored at zero and kept going, which OVERSTATES `S` whenever
+    // the diagonal dips and recovers, which narrows the band below what the lemma licenses, which
+    // is how it moved `XS` on 1.1% of chr21 records (a secondary region's score fell by 9 on the
+    // first diff). The bound must be derived from a score the band-limited DP genuinely attains,
+    // and this walk's prefix maximum before death is exactly that.
+    let mut h = h0;
+    let mut s_best = h0;
+    for col in 0..min_len {
+        let (qc, tc) = (query[col], target[col]);
+        if qc >= 4 || tc >= 4 {
+            return i32::MAX;
+        }
+        h += if qc == tc { a } else { mm };
+        if h <= 0 {
+            break;
+        }
+        if h > s_best {
+            s_best = h;
+        }
+    }
+    // The cost of sitting at offset `B` is ONE gap run of `B` columns at the cheapest rates,
+    // `o_min + B * e_min`, NOT `B * (o_min + e_min)`. The fork's comment writes the latter, and
+    // porting it verbatim cut real alignments: the first diverging record was a 3-base deletion
+    // (cost 6 + 3 = 9 at bwa's defaults) whose band the per-column-open arithmetic had denied.
+    // This project's own #50 rev-bound already used the correct one-run form.
+    //
+    // Beat `S` from offset `B`:  min_len*a - (o_min + B*e_min) > S - end_bonus
+    //   =>  B < (min_len*a - S - o_min + end_bonus) / e_min
+    let (o_min, e_min) = oe_min;
+    // The ceiling on ANY alignment in this DP is `h0 + min_len * a` (all matches from the seed
+    // score), and `s_best` includes `h0`, so the numerator must carry it on both sides or the bound
+    // is `h0` columns too narrow. That asymmetry was this function's third bug: it only cancels
+    // when the diagonal walk survives to the end, which is why the md5 was close but not equal.
+    let numer =
+        i64::from(h0) + (min_len as i64) * i64::from(a) - i64::from(s_best) - i64::from(o_min)
+            + i64::from(end_bonus.max(0));
+    if numer <= 0 {
+        // No gapped alignment can pay even one open and still be useful: one column of band
+        // suffices, plus the strict-tie margin.
+        return 2;
+    }
+    let denom = i64::from(e_min);
+    // ceil(numer / denom), plus the strict-tie margin.
+    ((((numer + denom - 1) / denom).min(i64::from(i32::MAX - 1))) as i32).saturating_add(1)
+}
+
 /// Per-lane band clamp, mirroring the `w` adjustments in `ksw_extend2` (`ksw.cpp:456-461`).
 ///
 /// A band wider than the longest gap that could ever pay for itself is wasted work, and bwa shrinks
@@ -1713,6 +1829,23 @@ macro_rules! define_sw_kernel {
                     tlen[l] = job.target.len();
                     h0[l] = job.h0;
                     w[l] = clamp_band(w0, qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del);
+                    // `BWA4_TIGHT_BAND`: clamp this lane's band by the ungapped-score bound. The
+                    // row loop below derives `beg[l]`/`end[l]` from `w[l]` and `gbeg`/`gend` as
+                    // their union, so a tighter lane narrows the walked columns wherever the whole
+                    // chunk is tight, which the ceiling probe says is nearly everywhere. The walk
+                    // is O(min_len) against the O(len^2) it removes.
+                    if tight_band_enabled() {
+                        let bound = tight_band_bound(
+                            job.query,
+                            job.target,
+                            job.h0,
+                            i32::from(mat[0]),
+                            i32::from(mat[1]),
+                            (o_del.min(o_ins), e_del.min(e_ins)),
+                            end_bonus,
+                        );
+                        w[l] = w[l].min(bound);
+                    }
                 }
                 // Longest query and target in this chunk, in bases: `max_q` sizes the shared row,
                 // `max_t` is the number of lockstep row iterations every lane pays for.
@@ -2158,7 +2291,7 @@ macro_rules! define_sw_kernel {
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::{clamp_band, default_result};
+    use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
 
     /// `(j >= beg) & (j < end)` for the NEON u8 kernel. NEON has native UNSIGNED byte compares, so
     /// the portable form is already one instruction each and `band_bias` is 0: the signed rewrite of
@@ -2249,7 +2382,7 @@ mod neon {
 /// (verified via the force-run property test compiled to x86 and executed under Rosetta).
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{clamp_band, default_result};
+    use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -2452,7 +2585,7 @@ mod avx2 {
 /// integer compare, and its blend takes its arguments in the opposite order from NEON's `vbslq`.
 #[cfg(target_arch = "x86_64")]
 mod sse41 {
-    use super::{clamp_band, default_result};
+    use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -2614,7 +2747,7 @@ mod sse41 {
 /// keeps the shared body untouched. `bsl` is a single `ternarylogic` (0xCA = `mask ? a : b`).
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
-    use super::{clamp_band, default_result};
+    use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -3345,8 +3478,10 @@ pub mod tight_ceil {
                     break;
                 }
                 h += if qc == tc { a } else { -b };
-                if h < 0 {
-                    h = 0;
+                // Death, not restart: the extension DP has no free local restart, so the ungapped
+                // walk ends here and its prefix maximum is the score the lemma may use.
+                if h <= 0 {
+                    break;
                 }
                 if h > s_best {
                     s_best = h;
@@ -3356,11 +3491,12 @@ pub mod tight_ceil {
                 tight_total += cells_at(w);
                 continue;
             }
-            // The lemma's bound. `ceil` via integer arithmetic; a bound of zero means even the
-            // ungapped walk cannot be beaten by any gapped alignment, which the HIT path would
-            // normally have caught, so it is floored at 1 rather than trusted blindly.
-            let numer = (min_len as i64) * i64::from(a) - i64::from(s_best);
-            let denom = i64::from(o_min + e_min);
+            // The lemma's bound, in the correct one-gap-run form (`o + B*e`, not `B*(o+e)`; see
+            // `tight_band_bound` for the record that caught the difference).
+            let numer = i64::from(job.h0) + (min_len as i64) * i64::from(a)
+                - i64::from(s_best)
+                - i64::from(o_min);
+            let denom = i64::from(e_min);
             let bound = if numer <= 0 {
                 1
             } else {
