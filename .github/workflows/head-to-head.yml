@@ -43,7 +43,10 @@ jobs:
   head-to-head:
     name: bwa-mem4 baseline and v3, against the fork and bwa-mem2
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    # 180, not 120: five binaries, three repetitions, two datasets plus warm-ups is 34 alignments at
+    # 100-210 s each on this runner, and the 120-minute ceiling killed the first five-arm run inside
+    # its final identity step.
+    timeout-minutes: 180
     defaults:
       run:
         shell: bash -el {0}
