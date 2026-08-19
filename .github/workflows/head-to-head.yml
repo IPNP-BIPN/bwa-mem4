@@ -16,6 +16,11 @@
 # puts us within 4% of the fork, level on one repetition and ahead on another. Two datasets, because
 # the gap is data-dependent and one number has already proved misleading: simulated reads, where we
 # were 1.32x behind, and real HG002 reads, where we were level.
+#
+# The third arm, v3+tight (BWA4_TIGHT_BAND), is the ungapped-score band clamp: on an M4 it beats the
+# source-built fork 7/7 on both datasets (chr21 33.18-33.60 vs 35.28-35.86; real GIAB 12.02-12.28 vs
+# 12.19-12.40), md5-identical on both plus the 64-arm option matrix. This job is its x86 verdict,
+# and the identity step fails the run if it moves a byte here.
 name: head-to-head
 
 on:
@@ -120,12 +125,14 @@ jobs:
             # that have nothing to do with the aligner.
             for b in ../mem4-baseline ../mem4-v3; do $b mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null; done
             bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
+            env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             for rep in 1 2 3; do
               b0=$(timed ../mem4-baseline mem -t "$T" chr21.fa "$r1" "$r2")
               b3=$(timed ../mem4-v3       mem -t "$T" chr21.fa "$r1" "$r2")
+              tb=$(timed env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2")
               fk=$(timed bwa-mem3         mem -t "$T" chr21.fa "$r1" "$r2")
               m2=$(timed bwa-mem2         mem -t "$T" chr21.fa "$r1" "$r2")
-              echo "rep $rep: baseline ${b0}s | v3 ${b3}s | fork ${fk}s | mem2 ${m2}s"
+              echo "rep $rep: baseline ${b0}s | v3 ${b3}s | v3+tight ${tb}s | fork ${fk}s | mem2 ${m2}s"
             done
           done
 
@@ -158,6 +165,8 @@ jobs:
           for set in sim real; do
             a=$(../mem4-baseline mem -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@PG' | md5sum)
             b=$(../mem4-v3       mem -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@PG' | md5sum)
+            c=$(env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@PG' | md5sum)
             [ "$a" = "$b" ] || { echo "::error::$set: v3 output differs from baseline"; exit 1; }
-            echo "$set: identical ($a)"
+            [ "$a" = "$c" ] || { echo "::error::$set: TIGHT BAND output differs from baseline"; exit 1; }
+            echo "$set: identical across all three ($a)"
           done
