@@ -960,6 +960,19 @@ fn dispatch_bins(
     if job_dup::enabled() {
         job_dup::record(jobs);
     }
+    if tight_ceil::enabled() {
+        tight_ceil::record(
+            jobs,
+            max_sc,
+            -i32::from(mat[1]),
+            o_del,
+            e_del,
+            o_ins,
+            e_ins,
+            w0,
+            end_bonus,
+        );
+    }
     // Identical jobs are one job's work and a copy; see `dedup_jobs`. Done here rather than deeper
     // so every bin below sees the deduplicated batch, and undone at the end by indexing through
     // `dup_map`, which leaves the returned vector in caller order exactly as before.
@@ -3247,6 +3260,142 @@ mod neon_verify {
 /// chunking would pay: `EXEC` is what the kernel executes in caller order, `EXEC_SORTED` what it
 /// would execute after a `(tlen, qlen)` sort. Sorting is legal because each job's result depends
 /// only on that job.
+/// `BWA4_TIGHT_CEIL=1`: what fg-labs/bwa-mem3's `tight_band` would remove from OUR extension work.
+///
+/// Their lemma (`bwamem.cpp:4119`): when the ungapped fast path fails on mismatches, the diagonal
+/// walk's score `S` still bounds the useful band, because an alignment at offset `B` from the
+/// diagonal pays at least `B` gaps: for it to beat `S`,
+/// `B < (min_len * a - S) / (o_min + e_min)`. They start the DP at that band and skip the retry
+/// ladder, and it is the reason their BSW stage costs 205 s CPU where ours costs 275 on the same
+/// wgsim reads (the per-stage diff in ROADMAP.md).
+///
+/// Before porting a lemma whose byte-identity rests on tie and z-drop subtleties, this probe prices
+/// it: walk each DP job's diagonal (O(min_len), against the O(len^2) DP it informs), compute the
+/// bound, and compare the cells the kernel walks at the current band against the cells it would
+/// walk at `min(current, tight)`. Counts only; it cannot move a byte.
+pub mod tight_ceil {
+    use super::{clamp_band, ExtendJob};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    /// Jobs seen, jobs the bound tightens, and the two cell totals.
+    static JOBS: AtomicU64 = AtomicU64::new(0);
+    static TIGHTENED: AtomicU64 = AtomicU64::new(0);
+    static CELLS_NOW: AtomicU64 = AtomicU64::new(0);
+    static CELLS_TIGHT: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe is on. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_TIGHT_CEIL` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_TIGHT_CEIL").is_some())
+    }
+
+    /// Price one batch. `a`/`b` are the match bonus and mismatch penalty magnitude, the `o`/`e`
+    /// pairs the gap penalties, `w0` the caller's band, the rest as the kernel takes them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        jobs: &[ExtendJob],
+        a: i32,
+        b: i32,
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        w0: i32,
+        end_bonus: i32,
+    ) {
+        let o_min = o_del.min(o_ins);
+        let e_min = e_del.min(e_ins);
+        let (mut n, mut tightened, mut now, mut tight_total) = (0u64, 0u64, 0u64, 0u64);
+        for job in jobs {
+            n += 1;
+            let min_len = job.query.len().min(job.target.len());
+            let max_len = job.query.len().max(job.target.len());
+            // The band the kernel actually uses for this job, before the retry ladder.
+            let w = clamp_band(
+                w0,
+                job.query.len(),
+                a,
+                end_bonus,
+                o_ins,
+                e_ins,
+                o_del,
+                e_del,
+            );
+            // Cells at band `x`: each of the min_len rows walks at most `2x + 1` columns, capped by
+            // the other sequence's length. An estimate of the same shape for both arms, so the
+            // RATIO is meaningful even where the absolute count is approximate.
+            let cells_at = |x: i32| min_len as u64 * ((2 * x as u64 + 1).min(max_len as u64));
+            now += cells_at(w);
+
+            // The diagonal walk, completed regardless of mismatch count (unlike `ungapped_hit`,
+            // which bails at the HIT threshold): running local score along the diagonal, floored at
+            // zero exactly as the DP's own diagonal would be, best prefix kept as `S`. An ambiguous
+            // base is the fork's FALLBACK case: no bound.
+            let mut h = job.h0;
+            let mut s_best = job.h0;
+            let mut ambiguous = false;
+            for col in 0..min_len {
+                let (qc, tc) = (job.query[col], job.target[col]);
+                if qc >= 4 || tc >= 4 {
+                    ambiguous = true;
+                    break;
+                }
+                h += if qc == tc { a } else { -b };
+                if h < 0 {
+                    h = 0;
+                }
+                if h > s_best {
+                    s_best = h;
+                }
+            }
+            if ambiguous {
+                tight_total += cells_at(w);
+                continue;
+            }
+            // The lemma's bound. `ceil` via integer arithmetic; a bound of zero means even the
+            // ungapped walk cannot be beaten by any gapped alignment, which the HIT path would
+            // normally have caught, so it is floored at 1 rather than trusted blindly.
+            let numer = (min_len as i64) * i64::from(a) - i64::from(s_best);
+            let denom = i64::from(o_min + e_min);
+            let bound = if numer <= 0 {
+                1
+            } else {
+                ((numer + denom - 1) / denom).max(1) as i32
+            };
+            if bound < w {
+                tightened += 1;
+                tight_total += cells_at(bound);
+            } else {
+                tight_total += cells_at(w);
+            }
+        }
+        JOBS.fetch_add(n, Relaxed);
+        TIGHTENED.fetch_add(tightened, Relaxed);
+        CELLS_NOW.fetch_add(now, Relaxed);
+        CELLS_TIGHT.fetch_add(tight_total, Relaxed);
+    }
+
+    /// Print the ceiling once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (n, t) = (JOBS.load(Relaxed).max(1), TIGHTENED.load(Relaxed));
+        let (now, tight) = (CELLS_NOW.load(Relaxed).max(1), CELLS_TIGHT.load(Relaxed));
+        eprintln!(
+            "[tight-ceil] {t} of {n} DP jobs ({:.1}%) get a tighter band from the ungapped bound; \
+             banded cells {now} -> {tight} ({:.1}% removed) -- the CEILING on porting the fork's \
+             tight_band, before any byte-identity question is answered",
+            100.0 * t as f64 / n as f64,
+            100.0 * (now.saturating_sub(tight)) as f64 / now as f64,
+        );
+    }
+}
+
 /// `BWA4_JOB_DUP=1`: how many extension jobs are exact duplicates of another job in the same call.
 ///
 /// A DP job is a pure function of `(query, target, h0)`, which is what made the same trick work for

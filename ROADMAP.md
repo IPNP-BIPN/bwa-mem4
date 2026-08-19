@@ -4632,6 +4632,47 @@ Deux chantiers, donc, et rien d'autre :
 
 Et deux endroits ou nous les battons nettement des deux cotes : le seeding et les lookups SA.
 
+### Le levier qui peut battre le fork : la bande resserree par le score non-gappe (2026-08-19)
+
+Le diff par etage designait BSW (leurs kernels d'extension : 205 s CPU contre nos 275 sur les memes
+reads wgsim). La cause est dans `bwamem.cpp:4119` du fork, et c'est un lemme, pas une heuristique :
+
+> Quand la voie rapide non-gappee echoue sur les mismatches, la marche diagonale a quand meme produit
+> un score `S`. Tout alignement a offset `B` de la diagonale paie au moins `B` gaps, donc pour battre
+> `S` il faut `B < (min_len * a - S) / (o_min + e_min)`. La bande utile est bornee par ce plafond.
+
+`BWA4_TIGHT_CEIL=1` (sonde, comptage seul) mesure ce que ce resserrement retirerait de NOS jobs :
+
+| jeu | jobs resserres | cellules bandees | plafond |
+|---|---|---|---|
+| chr21 wgsim, 1M paires | 28,17 M / 28,17 M (100,0 %) | 337,3 G -> 11,6 G | **96,6 % retirees** |
+| GIAB reel, 500k paires | 12,29 M / 12,32 M (99,7 %) | 121,4 G -> 10,6 G | **91,3 % retirees** |
+
+La bande par defaut (w=100, 201 colonnes) ne mord presque pas sur des reads de 150 pb : le kernel
+marche des rectangles quasi complets pendant que le score diagonal borne la bande utile a quelques
+colonnes. L'arithmetique du plafond : capturer meme les deux tiers des 275 s CPU ramene notre wall
+wgsim de ~200 s sous les 152 s du fork. **C'est le seul levier de cette taille encore ouvert, et il
+suffit.**
+
+**Les trois risques d'octet-identite, a trancher avant de livrer :**
+
+1. **Les egalites a exactement `S`.** Le lemme donne `score(B >= borne) <= S`, inegalite LARGE : un
+   alignement hors-bande peut faire jeu egal, et les departages de ksw (quelle cellule garde
+   `qle`/`tle`) different alors entre les deux largeurs. Le `ceil` du fork laisse ce coin ouvert ;
+   un `+1` sur la borne le fermerait au prix de quelques colonnes.
+2. **`max_off` et le z-drop.** Les maxima de ligne incluent aujourd'hui des cellules hors bande
+   resserree ; avec la bande etroite ils baissent, donc le z-drop peut se declencher plus tot et
+   `max_off` change. Le fork contourne en SAUTANT l'echelle de retries sur le statut TIGHT ; notre
+   `run_side` keye son test d'acceptation sur `max_off < 3/4 w`, donc la meme adaptation est requise,
+   pas une simple borne.
+3. **L'union des voies.** Notre kernel inter-sequences marche `gbeg..gend` en UNION des bandes des 16
+   voies : une voie large force tout le monde. Le gain exige de regrouper les jobs par borne avant le
+   decoupage en voies, ce que la gate d'invariance a l'ordre du batch couvre deja.
+
+Le fork valide le sien empiriquement sur 322 M d'enregistrements. Notre barre est la meme plus
+l'oracle : matrice d'options 64/64, chr21 1M, GIAB 500k, `oracle_diff.sh`, et la gate GIAB de
+variants. Implementation derriere `BWA4_TIGHT_BAND`, off tant que tout n'est pas vert.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en

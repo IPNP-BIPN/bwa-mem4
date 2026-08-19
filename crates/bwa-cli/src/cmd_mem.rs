@@ -2235,6 +2235,8 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_neon::batched::extend_shape::dump();
         bwa_neon::batched::bin_split::dump();
         bwa_neon::batched::job_dup::dump();
+        bwa_neon::batched::tight_ceil::dump();
+        bwa_neon::batched::tight_ceil::dump();
         bwa_neon::batched::job_dup::dump();
         bwa_neon::batched::bin_split::dump();
         bwa_mem::across::align_split::dump();
