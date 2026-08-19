@@ -7,7 +7,13 @@
 # this job measures it.
 #
 # Four binaries, one host, interleaved: our baseline build, our v3 build, the fork, and bwa-mem2 as
-# the drift canary that says whether the machine moved under the measurement. Two datasets, because
+# the drift canary that says whether the machine moved under the measurement.
+#
+# First result, 2026-08-19, at the commit before the extension-job dedup landed. Simulated reads:
+# baseline 208.81 / 209.68 / 209.71 s, v3 200.70 / 200.76 / 202.12, fork 151.45 / 152.78 / 152.66.
+# Real reads: baseline 118.60 / 121.39 / 119.20, v3 107.74 / 108.54 / 108.60, fork 103.82 / 109.85 /
+# 108.60. So the v3 binary is worth 4% on simulated and 9.1% on real reads, and on real reads it
+# puts us within 4% of the fork, level on one repetition and ahead on another. Two datasets, because
 # the gap is data-dependent and one number has already proved misleading: simulated reads, where we
 # were 1.32x behind, and real HG002 reads, where we were level.
 name: head-to-head
