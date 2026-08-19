@@ -1,0 +1,136 @@
+# Where we stand against fg-labs/bwa-mem3 on x86, with the binary we now ship.
+#
+# Every head-to-head this project has recorded on x86 used a plain baseline build, because that is
+# what we shipped. Since then two things changed what a user gets: the x86 tarballs carry an
+# `x86-64-v3` binary (5.6-6.8% on its own), and the release artefacts no longer carry PGO, which was
+# costing 3.3% on this platform. Projecting the ratio from those two numbers would be arithmetic;
+# this job measures it.
+#
+# Four binaries, one host, interleaved: our baseline build, our v3 build, the fork, and bwa-mem2 as
+# the drift canary that says whether the machine moved under the measurement. Two datasets, because
+# the gap is data-dependent and one number has already proved misleading: simulated reads, where we
+# were 1.32x behind, and real HG002 reads, where we were level.
+name: head-to-head
+
+on:
+  # TEMPORARY, removed with the others before merge.
+  push:
+    branches: [perf/alloc-probe]
+    paths: [".github/workflows/head-to-head.yml"]
+  workflow_dispatch:
+    inputs:
+      read_pairs:
+        description: "Simulated pairs (the real-read arm is sliced from GIAB and sized by the window)"
+        default: "2000000"
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  head-to-head:
+    name: bwa-mem4 baseline and v3, against the fork and bwa-mem2
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log the host
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "nproc: $(nproc)"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + bwa-mem3 + wgsim + samtools (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3
+            wgsim
+            samtools
+          init-shell: bash
+
+      - name: Build both of ours
+        shell: bash
+        run: |
+          set -euo pipefail
+          # One target dir, rebuilt per level: three of them do not fit a hosted runner, and
+          # changing RUSTFLAGS invalidates the cache anyway. --jobs 2 because a full rebuild of the
+          # dependency tree has had this runner reclaimed under it twice.
+          RUSTFLAGS="" cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-isa
+          cp target-isa/release/bwa-mem4 ./mem4-baseline
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked -p bwa-mem4 --jobs 2 \
+            --target-dir target-isa
+          cp target-isa/release/bwa-mem4 ./mem4-v3
+          ls -la mem4-baseline mem4-v3
+
+      - name: Reference, index, and both read sets
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          # The benchmark's contig must be named as the GIAB BAM names it, or the slice below has
+          # nothing to fetch; bwa-mem2's indexer is what all four binaries read.
+          sed -i '1s/.*/>chr21/' chr21.fa
+          bwa-mem2 index chr21.fa
+          n="${{ github.event.inputs.read_pairs || '2000000' }}"
+          wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa sim1.fq sim2.fq > /dev/null
+          echo "simulated: $n pairs"
+          bam="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG002.GRCh38.300x.bam"
+          samtools view -@ 4 -b -s 0.5 "$bam" chr21:20000000-30000000 > slice.bam
+          samtools collate -@ 4 -u -O slice.bam \
+            | samtools fastq -@ 4 -1 real1.fq -2 real2.fq -0 /dev/null -s /dev/null -n
+          echo "real: $(( $(wc -l < real1.fq) / 4 )) pairs"
+
+      - name: Head to head
+        run: |
+          set -euo pipefail
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          for set in sim real; do
+            r1="${set}1.fq"; r2="${set}2.fq"
+            echo; echo "===== $set reads ====="
+            # Warm every binary: on a cold page cache the first of four looks slower for reasons
+            # that have nothing to do with the aligner.
+            for b in ../mem4-baseline ../mem4-v3; do $b mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null; done
+            bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
+            for rep in 1 2 3; do
+              b0=$(timed ../mem4-baseline mem -t "$T" chr21.fa "$r1" "$r2")
+              b3=$(timed ../mem4-v3       mem -t "$T" chr21.fa "$r1" "$r2")
+              fk=$(timed bwa-mem3         mem -t "$T" chr21.fa "$r1" "$r2")
+              m2=$(timed bwa-mem2         mem -t "$T" chr21.fa "$r1" "$r2")
+              echo "rep $rep: baseline ${b0}s | v3 ${b3}s | fork ${fk}s | mem2 ${m2}s"
+            done
+          done
+
+      - name: And the two of ours still agree
+        run: |
+          set -euo pipefail
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          for set in sim real; do
+            a=$(../mem4-baseline mem -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@PG' | md5sum)
+            b=$(../mem4-v3       mem -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@PG' | md5sum)
+            [ "$a" = "$b" ] || { echo "::error::$set: v3 output differs from baseline"; exit 1; }
+            echo "$set: identical ($a)"
+          done
