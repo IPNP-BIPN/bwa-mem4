@@ -4602,6 +4602,36 @@ les doublons sont locaux et un chunk plus large n'en trouverait pas d'autres.
 - **Tri par longueur avant decoupage** : 1,07x de divergence seulement, dont 4,0 % recuperables, moins le cout de trier 35 M de jobs.
 - **Les deux reglages de kernel** (`BWA4_EXTEND_SBT`, `BWA4_EXTEND_BANDFAST`) sont deja dans leur meilleure position, de 3 % et 6 %.
 
+### L'ecart wgsim x86, enfin attribue etage par etage (2026-08-19)
+
+Le binaire conda du fork imprime le profil bwa-mem2 complet sur stderr a chaque run, et chaque
+benchmark de ce depot le jetait. Une fois lu, sur le meme EPYC et les memes reads (CPU total,
+moyennes par thread x 4) :
+
+**wgsim, nous 199,7 s wall contre ~152 s :**
+
+| etage | fork | nous | verdict |
+|---|---|---|---|
+| SMEM (seeding) | 127,6 s CPU | ~103 s | nous +24 % |
+| SAL / MEM_SA | 55,7 s | 25,7 s | **nous 2,2x devant** |
+| BSW (kernels d'extension) | **204,9 s** | ~275 s | eux +34 %, ~17 s de wall |
+| WORKER_SAM (pairing+rescue+SAM) | **210,2 s** | ~282 s | eux +34 %, ~18 s de wall |
+
+**Donnees reelles, nous 111,4 s contre 103,6-108,1 s :** leur SMEM monte a 192 s CPU (les erreurs
+reelles multiplient les rounds) et nous gagnons TOUT le cote align ; eux ne gagnent que WORKER_SAM
+(92 contre 115 s CPU). D'ou le 1,045x.
+
+Deux chantiers, donc, et rien d'autre :
+
+1. **BSW.** Leur `bandedSWA` fait du band narrowing (`tight_band` dans leurs propres diagnostics) :
+   ils calculent MOINS de cellules, pas des cellules plus rapides. Notre kernel marche toutes les
+   colonnes de `gbeg..gend` sous masque. La question ouverte est de savoir si leur resserrement est
+   octet-identique par preuve ou par chance, et si notre bande peut se resserrer pareil.
+2. **WORKER_SAM.** 282 contre 210 s CPU alors que notre kernel de rescue est PLUS RAPIDE au
+   micro-bench (11,27 contre ? Gcell/s). Leur avantage est dans la colle : pairing, tri, emission.
+
+Et deux endroits ou nous les battons nettement des deux cotes : le seeding et les lookups SA.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
