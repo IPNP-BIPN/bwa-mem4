@@ -4725,6 +4725,26 @@ ARM. L'apply est l'insertion+retri de #38, et le plafond du regroupement des ded
 ~20 % d'un poste de 14 s (2,18 M dedups pour ~1,8 M calls a hit), soit <1 % du run, contre un risque
 reel sur l'ordre de merge : le verdict de #38 tient, reconfirme avec les chiffres du jour.
 
+### L'enquete est close : l'anomalie scalaire etait la plateforme (2026-08-20)
+
+L'hypothese des allocations est morte comme celle des branches, et par le meme temoin : normalise
+par le `bwa-mem2` du meme tirage, le scratch thread-local n'a pas bouge `ksw_global2` (92,7 s CPU
+equivalents contre 89,6). Le hoisting reste, il retire 11,7 M d'allocations par run pour un cout nul.
+
+Ce qui a ferme le dossier est la sonde rescue sur EPYC : collect 18,1 / kernel 92,7 / apply 67,5 s
+CPU. Rapportes a l'ARM, les kernels vectoriels sont a 2,1x (l'ecart de coeur normal) mais `apply` ET
+`ksw_global2`, deux colles scalaires sans lien, sont tous deux a ~5-6x. Deux fonctions differentes,
+meme facteur : c'est la plateforme, pas le code. Les runners heberges exposent des vCPU qui sont des
+freres SMT (4 vCPU = 2 coeurs) ; le code vectoriel, borne par le debit des ports, encaisse le
+partage, les chaines scalaires dependantes le paient double. Le M4 n'a pas de SMT. Le fork paie la
+meme taxe sur sa propre colle (WORKER_SAM 210-223 s CPU), donc la comparaison entrelacee reste juste,
+et l'ecart wgsim residuel (1,19-1,21x) est de l'ingenierie reelle, leurs builds par tier sur toute
+leur colle, pas un mystere de notre cote.
+
+Consequence pratique : les optimisations de colle scalaire ne se mesurent PAS sur ces runners, leurs
+gains y sont ecrases par la taxe SMT. Le chiffre de tete wgsim x86 exige la machine dediee de #32,
+comme le disait deja la conclusion du PGO.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
