@@ -132,3 +132,16 @@ vector is the identity, LLVM knows it, and it had already been folding both of t
 Worth knowing generally, and the reason this entry exists: an op count read off the source is not an
 op count. Before deleting arithmetic that the type system makes trivial, check whether the compiler
 has already deleted it.
+
+### The mismatch-only shortcut for the CIGAR's global DP (2026-08-20)
+
+At equal query and reference lengths, a global alignment's indels must cancel, so any gapped path
+opens two runs and costs at least `2*(o_min+e_min)`; when that strictly exceeds the exact
+substitution loss `sum(a - mat[cell])` of the diagonal, all-M is the unique optimum and the DP is
+skippable, provably and tie-free. Implemented, byte-identical, and it fired **6 times in 1.46M
+calls**. The reason is `infer_bw`: the band the caller hands this DP is already derived from the
+KNOWN region score, and it is already `0` for every one- and two-mismatch record, which the existing
+`w_ == 0` fast path absorbs. Everything that still reaches the DP has three or more mismatches,
+where the shortcut's premise fails. Reverted, since it costs a diagonal scan per call to catch
+nothing; the general lesson is that a bound derived from the known score was already in the C, and
+checking what `infer_bw` leaves behind should precede any scheme that re-derives it.
