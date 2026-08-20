@@ -22,6 +22,7 @@
 # 12.19-12.40), md5-identical on both plus the 64-arm option matrix. This job is its x86 verdict,
 # and the identity step fails the run if it moves a byte here.
 name: head-to-head
+# rev: 2026-08-20 cmov (relaunch marker; the push trigger is path-filtered to this file)
 
 on:
   # TEMPORARY, removed with the others before merge.

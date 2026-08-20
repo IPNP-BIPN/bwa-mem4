@@ -655,10 +655,18 @@ pub fn ksw_global2(
             // (`ksw.cpp:613-616`). Tie order is part of the output CIGAR, so it is not free choice.
             // `d` accumulates this cell's traceback byte: bits 0-1 (set here) say how H(i,j) was
             // reached, 0 = from M, 1 = from E, 2 = from F. `h` becomes H(i,j) = max(M, E, F).
+            // Every select in this body goes through `select_unpredictable`, and that hint is the
+            // whole x86 story: the conditions flip on mismatch positions, i.e. randomly, and LLVM's
+            // x86 backend was compiling these `if`s into BRANCHES (64 branches, 12 cmov in the v3
+            // asm of this function). At ~50% misprediction and ~17 cycles each on Zen 3 that is
+            // ~21 cycles per cell, the measured 30.6 us per call against 5.4 us for the same call
+            // on an M4, whose predictor absorbs it. The hint forces conditional moves; the VALUES
+            // are untouched, so this cannot move a byte, and the tie-break comments still hold.
+            use std::hint::select_unpredictable;
             let mut d: u8 = u8::from(mm < e);
-            let mut h = if mm >= e { mm } else { e };
-            d = if h >= f { d } else { 2 };
-            h = if h >= f { h } else { f };
+            let mut h = select_unpredictable(mm >= e, mm, e);
+            d = select_unpredictable(h >= f, d, 2);
+            h = select_unpredictable(h >= f, h, f);
             h1 = h;
             // Outgoing E/F, again opening from M (`mm`), never from `h`: same "no 100M3I3D20M" rule
             // as the local kernel, spelled out in the C's comment at `ksw.cpp:604-607`. Bit 2 records
@@ -669,15 +677,15 @@ pub fn ksw_global2(
             // `e` becomes the "keep the deletion already open" candidate. The larger is E(i+1, j).
             let t = mm - oe_del;
             e -= e_del;
-            d |= if e > t { 1 << 2 } else { 0 };
-            e = if e > t { e } else { t };
+            d |= select_unpredictable(e > t, 1 << 2, 0);
+            e = select_unpredictable(e > t, e, t);
             eh_e[j] = e;
             // Same for the insertion side: `t` opens a fresh one from M(i,j), `f` extends the one
             // already open. The larger is F(i, j+1), which flows rightward in this register only.
             let t = mm - oe_ins;
             f -= e_ins;
-            d |= if f > t { 2 << 4 } else { 0 };
-            f = if f > t { f } else { t };
+            d |= select_unpredictable(f > t, 2 << 4, 0);
+            f = select_unpredictable(f > t, f, t);
             // Stored band-relative: column j of row i lives at offset j - beg.
             z[z_row_offset + (j - beg)] = d;
         }
