@@ -295,6 +295,9 @@ mod tests {
     /// divergence from `ksw_extend2`.
     #[test]
     fn neon_backend_matches_scalar() {
+        // Field-level gate: pin the full band; the tight clamp is arbitrated at the SAM level.
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         // The shared gate (qlen/tlen <= 80). Exercises the NEON int16 kernel on aarch64.
         assert_backend_matches_scalar(&NeonBackend);
         assert_backend_batch_matches_scalar(&NeonBackend);
@@ -305,6 +308,9 @@ mod tests {
     /// must pass these unchanged: they are written against `SwBackend`, not against NEON.
     #[test]
     fn neon_backend_passes_gpu_readiness_barriers() {
+        // Field-level gate: pin the full band; the tight clamp is arbitrated at the SAM level.
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         assert_backend_tie_rule_matches_scalar(&NeonBackend);
         assert_backend_batch_order_invariant(&NeonBackend);
         // The u8 saturation boundary and the i16 replay it triggers. Engineered scores around 255,
@@ -318,6 +324,9 @@ mod tests {
     /// `extend_batch`. Confirms the int16 kernel stays exact well above the shared gate's 80 bp.
     #[test]
     fn neon_batch_matches_scalar_read_sized() {
+        // Field-level gate: pin the full band; the tight clamp is arbitrated at the SAM level.
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         use bwa_extend::{ksw_extend2, ExtendJob};
         // bwa's default scoring: `a` = +1 per match, `b` = 4 (applied as -4) per mismatch.
         let (a, b) = (1i8, 4i8);
@@ -460,6 +469,9 @@ mod tests {
     /// any divergence from the real DP on the exact cases it fires.
     #[test]
     fn neon_ungapped_hit_matches_scalar() {
+        // Field-level gate: pin the full band; the tight clamp is arbitrated at the SAM level.
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         use bwa_extend::{ksw_extend2, ExtendJob};
         // bwa's default scoring, and the same `bwa_fill_scmat` 5x5 matrix as the test above:
         // `mat[t * 5 + q]`, `a` on the diagonal, `-b` off it, -1 on the N row and column. `k` is

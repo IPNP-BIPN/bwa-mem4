@@ -1484,18 +1484,38 @@ fn inline_sbt_enabled() -> bool {
 }
 
 /// Whether the extension kernels clamp each lane's band by the ungapped-score bound
-/// (`BWA4_TIGHT_BAND=1`; fg-labs/bwa-mem3's `tight_band`, `bwamem.cpp:4119`). OFF by default until
-/// the byte-identity battery has ruled on it: the ceiling probe says it removes 91-97% of banded
-/// cells, and the roadmap names the three ways it could move a byte (ties at exactly `S`, z-drop
-/// firing earlier under lower row maxima, and the retry ladder's `max_off` test).
+/// (fg-labs/bwa-mem3's `tight_band`, `bwamem.cpp:4119`, with the lemma corrected; see
+/// [`tight_band_bound`]).
+///
+/// ON by default since 2026-08-20, because the byte-identity battery ruled: md5-identical on chr21
+/// 1M pairs and 500k real GIAB pairs on ARM, on both the simulated and real sets on x86 (checked in
+/// CI by the head-to-head's identity step, which fails the run otherwise), and 64 of 64 option
+/// combinations against the bwa-mem2 oracle with the clamp active. What it bought, interleaved and
+/// never overlapping: align -9.3% on chr21; whole runs beating the source-built fork 7/7 on both
+/// ARM datasets and 3/3 on x86 real reads, twice. `BWA4_NO_TIGHT_BAND` restores the full band for
+/// A/B and for suspicion.
 ///
 /// # Returns
-/// True if `BWA4_TIGHT_BAND` is set to anything at all.
+/// True unless `BWA4_NO_TIGHT_BAND` is set to anything at all.
 fn tight_band_enabled() -> bool {
     use std::sync::OnceLock;
+    // The FIELD-level equivalence gates compare this kernel's raw result tuple against the
+    // full-band scalar reference, and the clamp legitimately changes `gscore`/`gtle` inside the
+    // window the caller never reads (see `tight_band_bound`). Those gates therefore pin the full
+    // band through this switch; the clamp itself is arbitrated at the SAM level, where chr21, real
+    // GIAB, the 64-arm option matrix and the CI identity step all rule. Checked before the cache,
+    // sticky once set, and compiled to a constant-false branch outside `cfg(test)`.
+    if cfg!(test) && FULL_BAND_FOR_FIELD_GATES.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_TIGHT_BAND").is_some())
+    *ON.get_or_init(|| std::env::var_os("BWA4_NO_TIGHT_BAND").is_none())
 }
+
+/// Set by the field-level equivalence gates to pin the full band; see [`tight_band_enabled`].
+/// Sticky by design: gates run concurrently under the test harness, so an unset would race.
+pub(crate) static FULL_BAND_FOR_FIELD_GATES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The ungapped-score band bound for one job, or `i32::MAX` when no bound applies.
 ///
@@ -2952,6 +2972,8 @@ mod avx2_verify {
 
     #[test]
     fn avx2_u8_and_i16_match_scalar() {
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         let mat = scoring();
         let mut state = 0xA7C2_0000_0000_0001u64;
         // Deterministic LCG (the classic Numerical Recipes 64-bit multiplier/increment), returning
@@ -3250,6 +3272,8 @@ mod neon_verify {
 
     #[test]
     fn neon_u8_and_i16_match_scalar() {
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         let mat = scoring();
         let mut state = 0x1234_5678_9abc_def1u64;
         // Deterministic LCG (the classic Numerical Recipes 64-bit multiplier/increment), returning
@@ -4006,6 +4030,8 @@ mod avx512_verify {
 
     #[test]
     fn avx512_u8_and_i16_match_scalar() {
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         // Unlike the AVX2 gate, this one CANNOT run under Rosetta: it has no `avx512bw`. It used to
         // return silently on such a host, which meant a green `ok` that had executed nothing; now it
         // says so, and `BWA4_TEST_FORCE_AVX512` runs it anyway where the harness knows better (an
