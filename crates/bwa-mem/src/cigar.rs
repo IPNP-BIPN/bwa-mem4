@@ -374,7 +374,11 @@ pub(crate) fn gen_cigar2(
     // per-base `base(p)` did, and does the index arithmetic once for the range instead of once per
     // base. This runs per emitted record, so it is on the same footing as the window fetch in
     // `across.rs`.
-    let mut rseq: Vec<u8> = fm.bases(rb, re);
+    let mut rseq: Vec<u8> = crate::emit_split::measure(
+        &crate::emit_split::BASES_NS,
+        &crate::emit_split::BASES_CALLS,
+        || fm.bases(rb, re),
+    );
     // Reverse both sides for reverse-strand hits (bwa.cpp:274). This is NOT a complement, only an
     // order reversal, and it exists purely so that ties in gap placement resolve to the leftmost
     // position *in forward-genome coordinates*. Dropping it still yields valid alignments, just
@@ -443,8 +447,14 @@ pub(crate) fn gen_cigar2(
         // difference the band must absorb plus 3 bases of slack (bwa's constant, not derived).
         let min_w = (rlen - l_query).abs() + 3;
         w = w.max(min_w);
-        ksw_global2(
-            &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
+        crate::emit_split::measure(
+            &crate::emit_split::GLOBAL_NS,
+            &crate::emit_split::GLOBAL_CALLS,
+            || {
+                ksw_global2(
+                    &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
+                )
+            },
         )
     };
 

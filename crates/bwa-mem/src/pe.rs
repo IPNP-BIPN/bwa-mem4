@@ -2562,8 +2562,16 @@ pub fn mem_sam_pe<W: Write>(
                     (vec![None; a0.len()], vec![None; a1.len()])
                 } else {
                     (
-                        mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]),
-                        mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]),
+                        crate::emit_split::measure(
+                            &crate::emit_split::ALT_NS,
+                            &crate::emit_split::ALT_CALLS,
+                            || mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]),
+                        ),
+                        crate::emit_split::measure(
+                            &crate::emit_split::ALT_NS,
+                            &crate::emit_split::ALT_CALLS,
+                            || mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]),
+                        ),
                     )
                 };
 

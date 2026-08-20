@@ -156,8 +156,9 @@ jobs:
             bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> fk.err || { tail -5 fk.err; exit 1; }
             sed -n '/Runtime profile/,/Important parameter/p' fk.err | grep -vE '^\s*$' | head -30
             echo; echo "===== $set: ours (v3 build, one batch in flight so shares are exact) ====="
-            env BWA4_NO_BATCH_OVERLAP=1 BWA4_STAGE_TIME=1 BWA4_CHAIN_TIME=1               ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> m4.err
-            grep -E '^\[(stage-time|chain-time)\]' m4.err
+            env BWA4_NO_BATCH_OVERLAP=1 BWA4_STAGE_TIME=1 BWA4_CHAIN_TIME=1 BWA4_EMIT_SPLIT=1 \
+              ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> m4.err
+            grep -E '^\[(stage-time|chain-time|emit-split)\]' m4.err
           done
 
       - name: And the two of ours still agree

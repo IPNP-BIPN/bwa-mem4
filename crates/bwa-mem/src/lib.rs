@@ -111,6 +111,70 @@ use bwa_core::MemOpt;
 use bwa_extend::ksw_extend2;
 use bwa_index::{BntSeq, FmIndex};
 
+/// `BWA4_EMIT_SPLIT=1`: where the `sam_emit` stage's time goes, inside one read pair.
+///
+/// The stage is 15.9% of the x86 wgsim wall at 15.8 us per pair, against 2.7 us per pair for the
+/// SAME data on an M4: 5.9x core-for-core where the vector kernels sit at 2.6x. Something in this
+/// path behaves badly on x86, and the stage-level probe cannot say what. Three suspects, each a
+/// scalar compute pocket: the per-record global alignment that builds CIGAR/MD (`ksw_global2`), the
+/// per-ALT-hit global alignments behind `XA:Z` (`mem_gen_alt`, multiplied by chr21's repeats), and
+/// the reference-window fetch (`fm.bases`). Relaxed atomics, one `Instant` pair per call site, off
+/// unless the variable is set.
+pub mod emit_split {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    /// Nanoseconds in `mem_gen_alt` (XA generation, its global DPs included), and calls.
+    pub static ALT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ALT_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Nanoseconds in `ksw_global2` from the CIGAR path, and calls.
+    pub static GLOBAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GLOBAL_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Nanoseconds fetching reference windows in `mem_reg2aln` (`fm.bases`), and calls.
+    pub static BASES_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BASES_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe records. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_EMIT_SPLIT` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_EMIT_SPLIT").is_some())
+    }
+
+    /// Time `f` into `(ns, calls)` when enabled; a plain call otherwise.
+    #[inline]
+    pub fn measure<T>(ns: &AtomicU64, calls: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let t0 = std::time::Instant::now();
+        let out = f();
+        ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        calls.fetch_add(1, Relaxed);
+        out
+    }
+
+    /// Print the split once at end of run. No-op unless [`enabled`]. CPU seconds summed over
+    /// threads, like the other kernel probes, so the shares are comparable across `-t`.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let row = |name: &str, ns: &AtomicU64, calls: &AtomicU64| {
+            eprintln!(
+                "[emit-split] {name}: {:.3}s CPU over {} calls",
+                ns.load(Relaxed) as f64 / 1e9,
+                calls.load(Relaxed),
+            );
+        };
+        row("mem_gen_alt (XA)", &ALT_NS, &ALT_CALLS);
+        row("ksw_global2 (CIGAR)", &GLOBAL_NS, &GLOBAL_CALLS);
+        row("fm.bases (ref fetch)", &BASES_NS, &BASES_CALLS);
+    }
+}
+
 pub mod across;
 pub mod alt;
 pub mod cigar;
