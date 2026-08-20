@@ -1181,6 +1181,7 @@ pub fn batch_mate_rescue(
         // `calls`: every rescue this round will perform, tagged with the pair index and direction it
         // must be applied back to. Order is (pair ascending, then dir), which is also the order the
         // apply loop below walks, so inserts land in the same sequence as the per-pair path.
+        let t_collect = crate::rescue_split::start();
         let mut calls: Vec<(usize, usize, RescueCall)> = Vec::new(); // (pair, dir, call)
         for (pi, p) in pairs.iter().enumerate() {
             for dir in 0..2 {
@@ -1238,6 +1239,8 @@ pub fn batch_mate_rescue(
             }
             rescue_rounds::record_windows(&mut win);
         }
+        crate::rescue_split::stop(&crate::rescue_split::COLLECT_NS, t_collect);
+        let t_kernel = crate::rescue_split::start();
         // `alns`: one result per job, index-aligned with `jobs`.
         let alns = batched_ksw_align2(
             &jobs,
@@ -1250,6 +1253,8 @@ pub fn batch_mate_rescue(
             opt.min_seed_len * opt.a,
             opt.a,
         );
+        crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
+        let t_apply = crate::rescue_split::start();
         for (idx, (pi, dir, call)) in calls.iter().enumerate() {
             let (start, count) = spans[idx];
             // `target`: the region vector this call's hits are inserted into, i.e. the MATE's array
@@ -1262,6 +1267,7 @@ pub fn batch_mate_rescue(
             };
             matesw_apply(fm, bns, opt, call, &alns[start..start + count], target);
         }
+        crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
     }
 }
 

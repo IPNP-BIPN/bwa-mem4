@@ -175,6 +175,59 @@ pub mod emit_split {
     }
 }
 
+/// `BWA4_RESCUE_SPLIT=1`: the rescue stage's wall, split into its three phases per round.
+///
+/// The kernel accounts for 90.3 of the stage's ~153 s CPU on x86 wgsim, leaving ~63 s of glue that
+/// no probe attributed. `collect` is anchor selection plus the reference-window fetches, `kernel`
+/// the batched DP, `apply` the acceptance test plus the region insert and the re-sort that #38
+/// measured at 13.3% of busy on real data. Per-round timing, so the cost is a handful of `Instant`
+/// pairs per chunk rather than anything per job.
+pub mod rescue_split {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static COLLECT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe records. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_RESCUE_SPLIT` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_SPLIT").is_some())
+    }
+
+    /// A start instant when enabled, `None` otherwise.
+    #[inline]
+    pub fn start() -> Option<std::time::Instant> {
+        enabled().then(std::time::Instant::now)
+    }
+
+    /// Bank the elapsed time since `t0` into `slot`.
+    #[inline]
+    pub fn stop(slot: &AtomicU64, t0: Option<std::time::Instant>) {
+        if let Some(t) = t0 {
+            slot.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+
+    /// Print the split once at end of run. No-op unless [`enabled`]. CPU seconds summed over
+    /// threads, comparable with the other probes.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        eprintln!(
+            "[rescue-split] collect {:.3}s, kernel {:.3}s, apply {:.3}s CPU",
+            COLLECT_NS.load(Relaxed) as f64 / 1e9,
+            KERNEL_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_NS.load(Relaxed) as f64 / 1e9,
+        );
+    }
+}
+
 pub mod across;
 pub mod alt;
 pub mod cigar;

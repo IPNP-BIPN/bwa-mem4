@@ -587,164 +587,193 @@ pub fn ksw_global2(
     // say how H(i,j) was reached (0 = diagonal/M, 1 = from E, 2 = from F); bits 2-3 say whether the
     // outgoing E continued an existing deletion; bits 4-5 the same for F. Storing the continuation
     // bits is what lets the traceback stay inside a gap instead of re-deciding at every cell.
-    let mut z = vec![0u8; n_col * tlen];
-    let mut qp = vec![0i8; qlen * m];
-    // Flat cursor into `qp`: index of the next entry to write. Walks all `m * qlen` entries in
-    // order and ends at `qlen * m`.
-    let mut write_pos = 0;
-    for target_code in 0..m {
-        // The `mat` row for this target base: `mat_row[q]` scores it against query code `q`.
-        let mat_row = &mat[target_code * m..target_code * m + m];
-        for &query_base in query {
-            qp[write_pos] = mat_row[query_base as usize];
-            write_pos += 1;
+    // Per-call scratch, REUSED across calls through a thread-local. The four buffers here total
+    // ~5.5 KB and this function runs millions of times per batch from rayon workers; fresh vectors
+    // meant four allocations and ~5.5 KB of first-touch page traffic per call, which is the
+    // remaining suspect for this function costing 5.7x more per call on Zen 3 than on an M4 after
+    // the branch hypothesis died against the bwa-mem2 canary. Byte-safety of the reuse: `qp` is
+    // fully rewritten below; `eh_h`/`eh_e` are refilled to MINUS_INF wholesale; `z` is zero-filled,
+    // and in any case the traceback only reads cells the forward pass wrote this call, because the
+    // recorded directions keep the walk inside the band by construction.
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<i8>, Vec<i32>, Vec<i32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+    }
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let (z_buf, qp_buf, eh_h_buf, eh_e_buf) = &mut *scratch;
+        z_buf.clear();
+        z_buf.resize(n_col * tlen, 0u8);
+        qp_buf.clear();
+        qp_buf.resize(qlen * m, 0i8);
+        // Fixed-length reslices, and they are not cosmetic: `resize` leaves the vector length opaque to
+        // LLVM, which reinstated a bounds check on every `eh_h[j]`/`eh_e[j]`/`z[..]` access in the
+        // inner loop and cost 2.1 us per call on ARM (7.66 -> 10.75 s CPU over 1.46M calls) before
+        // these lines existed. A slice of statically-related length restores the elision the local
+        // `vec![...]` used to provide.
+        let z: &mut [u8] = &mut z_buf[..n_col * tlen];
+        let qp: &mut [i8] = &mut qp_buf[..qlen * m];
+        // Flat cursor into `qp`: index of the next entry to write. Walks all `m * qlen` entries in
+        // order and ends at `qlen * m`.
+        let mut write_pos = 0;
+        for target_code in 0..m {
+            // The `mat` row for this target base: `mat_row[q]` scores it against query code `q`.
+            let mat_row = &mat[target_code * m..target_code * m + m];
+            for &query_base in query {
+                qp[write_pos] = mat_row[query_base as usize];
+                write_pos += 1;
+            }
         }
-    }
 
-    // Row -1. Unlike the local kernel there is no 0 sentinel: unreachable is MINUS_INF, and the
-    // origin starts at score 0 because a global alignment is pinned there. Columns 1..=w are reached
-    // by a leading insertion of length j; columns beyond the band stay MINUS_INF
-    // (`ksw.cpp:584-587`).
-    let mut eh_h = vec![MINUS_INF; qlen + 1];
-    let mut eh_e = vec![MINUS_INF; qlen + 1];
-    eh_h[0] = 0;
-    for j in 1..=qlen.min(w) {
-        eh_h[j] = -(o_ins + e_ins * j as i32);
-    }
-
-    // ===========================================================================================
-    // Forward pass: fill the score arrays and record, per cell, how each of H/E/F was reached
-    // ===========================================================================================
-    for i in 0..tlen {
-        // F(i, beg): no insertion can be open at the row's left edge, and "impossible" is MINUS_INF
-        // here rather than 0, since a global alignment has no local floor.
-        let mut f = MINUS_INF;
-        // Half-open column window `[beg, end)` for this row: the band around diagonal `i`, clipped
-        // to the query. Unlike the local kernel this is fixed by `w` alone, with no adaptive shrink,
-        // which is what lets the traceback recompute it from `i` and `w`.
-        let beg = i.saturating_sub(w);
-        let end = (i + w + 1).min(qlen);
-        // H(i, beg-1), the cell to the left of the row. When the window still touches column 0 that
-        // cell is reached from the pinned origin by a leading deletion of length i+1; once the band
-        // has left column 0 no path reaches it at all.
-        let mut h1 = if beg == 0 {
-            -(o_del + e_del * (i as i32 + 1))
-        } else {
-            MINUS_INF
-        };
-        // This row's target base code, and the query-profile row it selects: `q[j] = s(target[i],
-        // query[j])`, one contiguous load per cell.
-        let tc = target[i] as usize;
-        let q = &qp[tc * qlen..tc * qlen + qlen];
-        // Where row `i`'s slice of the traceback matrix starts. Each row occupies exactly `n_col`
-        // bytes and is indexed band-relative, so column `j` lives at `z_row_offset + (j - beg)`.
-        let z_row_offset = i * n_col;
-        for j in beg..end {
-            // `mm` is M(i,j). Note it is added to unconditionally: there is no `!= 0` guard as in
-            // the local kernel, because MINUS_INF + a small score is still hugely negative and
-            // "unreachable" needs no special case here.
-            // On entry `mm` is H(i-1, j-1) (the diagonal predecessor, still in the array from the
-            // previous row) and `e` is E(i, j); after the `+= q[j]` below, `mm` is M(i,j). The
-            // store of `h1` into `eh_h[j]` publishes H(i, j-1), which is what row i+1 will read as
-            // *its* diagonal predecessor, so both reads must happen before it.
-            let mut mm = eh_h[j];
-            let mut e = eh_e[j];
-            eh_h[j] = h1;
-            mm += i32::from(q[j]);
-            // Direction bits 0-1. `>=` throughout means ties prefer M over E over F, in that order
-            // (`ksw.cpp:613-616`). Tie order is part of the output CIGAR, so it is not free choice.
-            // `d` accumulates this cell's traceback byte: bits 0-1 (set here) say how H(i,j) was
-            // reached, 0 = from M, 1 = from E, 2 = from F. `h` becomes H(i,j) = max(M, E, F).
-            // Every select in this body goes through `select_unpredictable`, and that hint is the
-            // whole x86 story: the conditions flip on mismatch positions, i.e. randomly, and LLVM's
-            // x86 backend was compiling these `if`s into BRANCHES (64 branches, 12 cmov in the v3
-            // asm of this function). At ~50% misprediction and ~17 cycles each on Zen 3 that is
-            // ~21 cycles per cell, the measured 30.6 us per call against 5.4 us for the same call
-            // on an M4, whose predictor absorbs it. The hint forces conditional moves; the VALUES
-            // are untouched, so this cannot move a byte, and the tie-break comments still hold.
-            use std::hint::select_unpredictable;
-            let mut d: u8 = u8::from(mm < e);
-            let mut h = select_unpredictable(mm >= e, mm, e);
-            d = select_unpredictable(h >= f, d, 2);
-            h = select_unpredictable(h >= f, h, f);
-            h1 = h;
-            // Outgoing E/F, again opening from M (`mm`), never from `h`: same "no 100M3I3D20M" rule
-            // as the local kernel, spelled out in the C's comment at `ksw.cpp:604-607`. Bit 2 records
-            // "the deletion was continued rather than opened", bit 4 the same for the insertion; the
-            // C uses two bits per field (`1<<2`, `2<<4`) purely so the traceback can shift by
-            // `which<<1` uniformly (`ksw.cpp:625` notes one bit would do).
-            // `t` is the "open a fresh deletion here" candidate, M(i,j) minus the first gap base;
-            // `e` becomes the "keep the deletion already open" candidate. The larger is E(i+1, j).
-            let t = mm - oe_del;
-            e -= e_del;
-            d |= select_unpredictable(e > t, 1 << 2, 0);
-            e = select_unpredictable(e > t, e, t);
-            eh_e[j] = e;
-            // Same for the insertion side: `t` opens a fresh one from M(i,j), `f` extends the one
-            // already open. The larger is F(i, j+1), which flows rightward in this register only.
-            let t = mm - oe_ins;
-            f -= e_ins;
-            d |= select_unpredictable(f > t, 2 << 4, 0);
-            f = select_unpredictable(f > t, f, t);
-            // Stored band-relative: column j of row i lives at offset j - beg.
-            z[z_row_offset + (j - beg)] = d;
+        // Row -1. Unlike the local kernel there is no 0 sentinel: unreachable is MINUS_INF, and the
+        // origin starts at score 0 because a global alignment is pinned there. Columns 1..=w are reached
+        // by a leading insertion of length j; columns beyond the band stay MINUS_INF
+        // (`ksw.cpp:584-587`).
+        eh_h_buf.clear();
+        eh_h_buf.resize(qlen + 1, MINUS_INF);
+        eh_e_buf.clear();
+        eh_e_buf.resize(qlen + 1, MINUS_INF);
+        let eh_h: &mut [i32] = &mut eh_h_buf[..qlen + 1];
+        let eh_e: &mut [i32] = &mut eh_e_buf[..qlen + 1];
+        eh_h[0] = 0;
+        for j in 1..=qlen.min(w) {
+            eh_h[j] = -(o_ins + e_ins * j as i32);
         }
-        eh_h[end] = h1;
-        eh_e[end] = MINUS_INF;
-    }
-    // H(tlen-1, qlen-1) as flushed by the last row's epilogue: the score of aligning all of `query`
-    // against all of `target`. May be negative.
-    let score = eh_h[qlen];
 
-    // ===========================================================================================
-    // Traceback: walk the recorded direction bits back to the origin, emitting one CIGAR op per step
-    // ===========================================================================================
-    // Traceback from the bottom-right cell of the band (`ksw.cpp:650-664`). `k` is the last query
-    // column row `tlen-1` actually evaluated, i.e. `min(i + w + 1, qlen) - 1`.
-    // The CIGAR under construction, built back to front (reversed at the very end).
-    let mut cigar: Vec<u32> = Vec::new();
-    // The traceback cursor: `i` is the current target row and `k` the current query column, both
-    // 0-based and both walking down to -1. At the top of each iteration they name the cell whose
-    // direction bits are about to be read; the step then decrements whichever sequence the emitted
-    // operation consumes.
-    let mut i = tlen as i64 - 1;
-    let mut k = (tlen as i64 - 1 + w as i64 + 1).min(qlen as i64) - 1;
-    // `which` is the state machine: 0 = currently on the M/diagonal surface, 1 = inside a deletion,
-    // 2 = inside an insertion. It is carried between steps and used to *select which pair of bits*
-    // to read, hence the `>> (which << 1)`: state 0 reads bits 0-1 (how H was reached), state 1
-    // reads bits 2-3 (does the deletion continue), state 2 reads bits 4-5. That is the whole reason
-    // the forward pass stored the continuation bits.
-    let mut which = 0u8;
-    while i >= 0 && k >= 0 {
-        // Recompute the row's `beg` to undo the band-relative storage. Must match the forward pass.
-        let beg = (i as usize).saturating_sub(w);
-        // The traceback byte the forward pass stored for cell (i, k): `f<<4 | e<<2 | h`.
-        let d = z[i as usize * n_col + (k as usize - beg)];
-        which = (d >> (which << 1)) & 3;
-        if which == 0 {
-            push_cigar(&mut cigar, 0, 1);
-            i -= 1;
-            k -= 1;
-        } else if which == 1 {
-            push_cigar(&mut cigar, 2, 1);
-            i -= 1;
-        } else {
-            push_cigar(&mut cigar, 1, 1);
-            k -= 1;
+        // ===========================================================================================
+        // Forward pass: fill the score arrays and record, per cell, how each of H/E/F was reached
+        // ===========================================================================================
+        for i in 0..tlen {
+            // F(i, beg): no insertion can be open at the row's left edge, and "impossible" is MINUS_INF
+            // here rather than 0, since a global alignment has no local floor.
+            let mut f = MINUS_INF;
+            // Half-open column window `[beg, end)` for this row: the band around diagonal `i`, clipped
+            // to the query. Unlike the local kernel this is fixed by `w` alone, with no adaptive shrink,
+            // which is what lets the traceback recompute it from `i` and `w`.
+            let beg = i.saturating_sub(w);
+            let end = (i + w + 1).min(qlen);
+            // H(i, beg-1), the cell to the left of the row. When the window still touches column 0 that
+            // cell is reached from the pinned origin by a leading deletion of length i+1; once the band
+            // has left column 0 no path reaches it at all.
+            let mut h1 = if beg == 0 {
+                -(o_del + e_del * (i as i32 + 1))
+            } else {
+                MINUS_INF
+            };
+            // This row's target base code, and the query-profile row it selects: `q[j] = s(target[i],
+            // query[j])`, one contiguous load per cell.
+            let tc = target[i] as usize;
+            let q = &qp[tc * qlen..tc * qlen + qlen];
+            // Where row `i`'s slice of the traceback matrix starts. Each row occupies exactly `n_col`
+            // bytes and is indexed band-relative, so column `j` lives at `z_row_offset + (j - beg)`.
+            let z_row_offset = i * n_col;
+            for j in beg..end {
+                // `mm` is M(i,j). Note it is added to unconditionally: there is no `!= 0` guard as in
+                // the local kernel, because MINUS_INF + a small score is still hugely negative and
+                // "unreachable" needs no special case here.
+                // On entry `mm` is H(i-1, j-1) (the diagonal predecessor, still in the array from the
+                // previous row) and `e` is E(i, j); after the `+= q[j]` below, `mm` is M(i,j). The
+                // store of `h1` into `eh_h[j]` publishes H(i, j-1), which is what row i+1 will read as
+                // *its* diagonal predecessor, so both reads must happen before it.
+                let mut mm = eh_h[j];
+                let mut e = eh_e[j];
+                eh_h[j] = h1;
+                mm += i32::from(q[j]);
+                // Direction bits 0-1. `>=` throughout means ties prefer M over E over F, in that order
+                // (`ksw.cpp:613-616`). Tie order is part of the output CIGAR, so it is not free choice.
+                // `d` accumulates this cell's traceback byte: bits 0-1 (set here) say how H(i,j) was
+                // reached, 0 = from M, 1 = from E, 2 = from F. `h` becomes H(i,j) = max(M, E, F).
+                // Every select in this body goes through `select_unpredictable`, and that hint is the
+                // whole x86 story: the conditions flip on mismatch positions, i.e. randomly, and LLVM's
+                // x86 backend was compiling these `if`s into BRANCHES (64 branches, 12 cmov in the v3
+                // asm of this function). At ~50% misprediction and ~17 cycles each on Zen 3 that is
+                // ~21 cycles per cell, the measured 30.6 us per call against 5.4 us for the same call
+                // on an M4, whose predictor absorbs it. The hint forces conditional moves; the VALUES
+                // are untouched, so this cannot move a byte, and the tie-break comments still hold.
+                use std::hint::select_unpredictable;
+                let mut d: u8 = u8::from(mm < e);
+                let mut h = select_unpredictable(mm >= e, mm, e);
+                d = select_unpredictable(h >= f, d, 2);
+                h = select_unpredictable(h >= f, h, f);
+                h1 = h;
+                // Outgoing E/F, again opening from M (`mm`), never from `h`: same "no 100M3I3D20M" rule
+                // as the local kernel, spelled out in the C's comment at `ksw.cpp:604-607`. Bit 2 records
+                // "the deletion was continued rather than opened", bit 4 the same for the insertion; the
+                // C uses two bits per field (`1<<2`, `2<<4`) purely so the traceback can shift by
+                // `which<<1` uniformly (`ksw.cpp:625` notes one bit would do).
+                // `t` is the "open a fresh deletion here" candidate, M(i,j) minus the first gap base;
+                // `e` becomes the "keep the deletion already open" candidate. The larger is E(i+1, j).
+                let t = mm - oe_del;
+                e -= e_del;
+                d |= select_unpredictable(e > t, 1 << 2, 0);
+                e = select_unpredictable(e > t, e, t);
+                eh_e[j] = e;
+                // Same for the insertion side: `t` opens a fresh one from M(i,j), `f` extends the one
+                // already open. The larger is F(i, j+1), which flows rightward in this register only.
+                let t = mm - oe_ins;
+                f -= e_ins;
+                d |= select_unpredictable(f > t, 2 << 4, 0);
+                f = select_unpredictable(f > t, f, t);
+                // Stored band-relative: column j of row i lives at offset j - beg.
+                z[z_row_offset + (j - beg)] = d;
+            }
+            eh_h[end] = h1;
+            eh_e[end] = MINUS_INF;
         }
-    }
-    // The loop stops as soon as *either* sequence is exhausted; whatever remains of the other must
-    // be a single leading gap, emitted here (target left over = D, query left over = I).
-    if i >= 0 {
-        push_cigar(&mut cigar, 2, (i + 1) as u32);
-    }
-    if k >= 0 {
-        push_cigar(&mut cigar, 1, (k + 1) as u32);
-    }
-    // Built back to front. Note the C reverses element-wise *without* re-merging, so an op cannot
-    // straddle the seam; matching that is why we reverse rather than build forwards.
-    cigar.reverse();
-    (score, cigar)
+        // H(tlen-1, qlen-1) as flushed by the last row's epilogue: the score of aligning all of `query`
+        // against all of `target`. May be negative.
+        let score = eh_h[qlen];
+
+        // ===========================================================================================
+        // Traceback: walk the recorded direction bits back to the origin, emitting one CIGAR op per step
+        // ===========================================================================================
+        // Traceback from the bottom-right cell of the band (`ksw.cpp:650-664`). `k` is the last query
+        // column row `tlen-1` actually evaluated, i.e. `min(i + w + 1, qlen) - 1`.
+        // The CIGAR under construction, built back to front (reversed at the very end).
+        let mut cigar: Vec<u32> = Vec::new();
+        // The traceback cursor: `i` is the current target row and `k` the current query column, both
+        // 0-based and both walking down to -1. At the top of each iteration they name the cell whose
+        // direction bits are about to be read; the step then decrements whichever sequence the emitted
+        // operation consumes.
+        let mut i = tlen as i64 - 1;
+        let mut k = (tlen as i64 - 1 + w as i64 + 1).min(qlen as i64) - 1;
+        // `which` is the state machine: 0 = currently on the M/diagonal surface, 1 = inside a deletion,
+        // 2 = inside an insertion. It is carried between steps and used to *select which pair of bits*
+        // to read, hence the `>> (which << 1)`: state 0 reads bits 0-1 (how H was reached), state 1
+        // reads bits 2-3 (does the deletion continue), state 2 reads bits 4-5. That is the whole reason
+        // the forward pass stored the continuation bits.
+        let mut which = 0u8;
+        while i >= 0 && k >= 0 {
+            // Recompute the row's `beg` to undo the band-relative storage. Must match the forward pass.
+            let beg = (i as usize).saturating_sub(w);
+            // The traceback byte the forward pass stored for cell (i, k): `f<<4 | e<<2 | h`.
+            let d = z[i as usize * n_col + (k as usize - beg)];
+            which = (d >> (which << 1)) & 3;
+            if which == 0 {
+                push_cigar(&mut cigar, 0, 1);
+                i -= 1;
+                k -= 1;
+            } else if which == 1 {
+                push_cigar(&mut cigar, 2, 1);
+                i -= 1;
+            } else {
+                push_cigar(&mut cigar, 1, 1);
+                k -= 1;
+            }
+        }
+        // The loop stops as soon as *either* sequence is exhausted; whatever remains of the other must
+        // be a single leading gap, emitted here (target left over = D, query left over = I).
+        if i >= 0 {
+            push_cigar(&mut cigar, 2, (i + 1) as u32);
+        }
+        if k >= 0 {
+            push_cigar(&mut cigar, 1, (k + 1) as u32);
+        }
+        // Built back to front. Note the C reverses element-wise *without* re-merging, so an op cannot
+        // straddle the seam; matching that is why we reverse rather than build forwards.
+        cigar.reverse();
+        (score, cigar)
+    })
 }
 
 /// Result of `ksw_align2`: a local (Smith-Waterman) alignment with start/end coordinates and the
