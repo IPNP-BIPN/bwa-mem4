@@ -26,11 +26,6 @@
 name: index-omp
 
 on:
-  # TEMPORARY, removed with the others before merge: a workflow_dispatch workflow is only reachable
-  # by name once its file is on the default branch.
-  push:
-    branches: [perf/alloc-probe]
-    paths: [".github/workflows/index-omp.yml"]
   workflow_dispatch:
 
 concurrency:

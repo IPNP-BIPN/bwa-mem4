@@ -25,10 +25,6 @@ name: head-to-head
 # rev: 2026-08-20b scratch-hoist (relaunch marker; the push trigger is path-filtered to this file)
 
 on:
-  # TEMPORARY, removed with the others before merge.
-  push:
-    branches: [perf/alloc-probe]
-    paths: [".github/workflows/head-to-head.yml"]
   workflow_dispatch:
     inputs:
       read_pairs:

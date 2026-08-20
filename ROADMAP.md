@@ -4747,22 +4747,20 @@ comme le disait deja la conclusion du PGO.
 
 ## Ce qui reste
 
-1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
-   concordance de variants sur le truth set, ce qui est le langage d'un utilisateur clinique.
-2. **`mem_sort_dedup_patch`** : **regarde (2026-07-29)**, 13,3 % du busy sur un profil `sample` en
-   donnees reelles. Ce n'est PAS l'etage dedup (0,8 % du wall) : c'est le mate rescue qui reinsere une
-   region puis retrie tout le vecteur, a chaque orientation, sur jusqu'a 50 rounds. `BWA4_DEDUP_SHAPE`
-   mesure **n moyen = 94,87** et **1,84 M d'appels avec n >= 65**, tous venant du rescue.
-   Deux correctifs octet-identiques livres (`dirty` pour sauter les re-tris a vide, **-14,2 %
-   d'appels** ; pile d'introsort en tableau fixe, ~10 M d'allocations en moins) : **~2 % de wall en
-   design apparie 4/4, donc sous le plancher de 3 %**. Le reste est incompressible sans une structure
-   incrementale reproduisant l'ordre exact des egalites de klib, la permutation etant observable dans
-   la sortie. Detail complet et tables dans `docs/perf-levers.md`.
-3. **SA-IS parallele** (Tier B de la phase 8c) : l'indexeur reste mono-thread sur le tableau de
-   suffixes, qui domine son pic RSS et son temps.
-4. ~~**Re-mesurer le fork `fg-labs/bwa-mem3`**~~ : **fait (2026-07-29)**, sur vraies donnees GIAB et
-   en PGO : **0,981x, egalite**. Voir l'encart de la phase B et `docs/perf-levers.md`.
-5. **Verifier le PGO sur Graviton** : nh13 mesure le PGO a **-0,4 %** sur Graviton4 la ou il vaut
-   **+12,4 %** ici. Les deux ne peuvent pas etre une propriete du code : soit son build n'a pas
-   applique son profil, soit le benefice est propre a l'Apple Silicon. Seule question ouverte du
-   dossier, et elle se tranche de son cote.
+1. **Le chiffre de tete WGS x86 (#32)** : exige une machine dediee. Un runner heberge ne peut ni
+   construire l'index GRCh38 (pic 92 GB) ni mesurer la colle scalaire (taxe SMT, voir l'enquete
+   ksw_global2). C'est aussi la ou l'ecart wgsim residuel contre le fork (1,19-1,21x) se mesurerait
+   honnetement.
+2. **Le kernel AVX-512 (#44)** : correctness bloquee sur du materiel Intel (la flotte ne donne que
+   de l'AMD, QEMU n'emule pas AVX-512, Intel SDE est un telechargement sous licence). Les tests ne
+   s'esquivent plus en silence et la question de rendre le tier opt-in tant qu'il n'a jamais tourne
+   reste posee au mainteneur.
+3. **L'ecart wgsim x86 residuel** : attribue (leurs builds par tier sur toute la colle, plus la taxe
+   SMT partagee), plus aucun mystere. Le fermer voudrait dire des artefacts multi-tiers au-dela du
+   binaire v3 deja livre, une decision de packaging plus que d'algorithme.
+4. **La veine du travail duplique est epuisee**, et le fichier des impasses porte tout ce qui a ete
+   essaye et refuse, avec les chiffres. Ne pas re-fouiller sans une donnee nouvelle.
+
+Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a bwa-mem2 :
+ARM wgsim 7/7 pour nous (-6 %), ARM reel 7/7, x86 reel 9/9 sur trois tirages, x86 wgsim 1,19-1,21x
+pour eux. Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux.
