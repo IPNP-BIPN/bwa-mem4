@@ -4673,6 +4673,34 @@ Le fork valide le sien empiriquement sur 322 M d'enregistrements. Notre barre es
 l'oracle : matrice d'options 64/64, chr21 1M, GIAB 500k, `oracle_diff.sh`, et la gate GIAB de
 variants. Implementation derriere `BWA4_TIGHT_BAND`, off tant que tout n'est pas vert.
 
+### La bande resserree est le defaut, et le match contre le fork bascule (2026-08-20)
+
+Le port du `tight_band` du fork, avec son lemme corrige trois fois (le restart interdit dans la DP
+d'extension, la forme a un run de gaps que leur propre commentaire ecrit faux, le `h0` manquant du
+cote majorant) et une marge derivee pour la fenetre `gscore`, est active PAR DEFAUT.
+`BWA4_NO_TIGHT_BAND` restaure la pleine bande.
+
+**La batterie qui l'a autorise** : md5 identiques sur chr21 1M paires et GIAB 500k reelles (ARM),
+sur wgsim et reels (x86, verifie en CI par une etape qui echoue le run sinon), matrice d'options
+64/64 contre l'oracle, gate locale complete verte. Les gates de champs epinglent la pleine bande via
+un interrupteur de test : le resserrement change legitimement `gscore`/`gtle` dans la fenetre que
+l'appelant ne lit jamais, et son arbitre est le SAM.
+
+**Le tableau des courses, entrelacees, aucun bras ne chevauchant l'autre :**
+
+| terrain | nous (tight) | fork | verdict |
+|---|---|---|---|
+| ARM chr21 wgsim, 7 reps | 33,18-33,60 s | 35,28-35,86 s | **nous, 7/7 (-6,0 %)** |
+| ARM GIAB reel, 7 reps | 12,02-12,28 s | 12,19-12,40 s | **nous, 7/7 (-1,4 %)** |
+| x86 reel, tirage 1 | 106,7-108,0 s | 107,2-108,8 s | **nous, 3/3** |
+| x86 reel, tirage 2 | 110,4-111,5 s | 123,0-124,5 s | **nous, 3/3 (-11 %)** |
+| x86 wgsim | ~189,4 s | ~156,2 s | eux, 1,21x (etait 1,31x) |
+
+Sur les donnees que les utilisateurs alignent reellement, nous battons le fork sur les deux
+architectures. Le seul terrain restant est wgsim x86, et son ecart residuel est attribue : ~la
+moitie dans BSW encore, l'autre dans WORKER_SAM (leur colle pairing+rescue+emission compile en AVX2
+contre notre v3, alors que notre kernel de rescue est plus rapide au micro-bench).
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
