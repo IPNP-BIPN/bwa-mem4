@@ -595,13 +595,31 @@ pub fn ksw_global2(
     // fully rewritten below; `eh_h`/`eh_e` are refilled to MINUS_INF wholesale; `z` is zero-filled,
     // and in any case the traceback only reads cells the forward pass wrote this call, because the
     // recorded directions keep the walk inside the band by construction.
+    /// The reused buffers: traceback matrix, query profile, and the two DP rows.
+    struct GlobalScratch {
+        z: Vec<u8>,
+        qp: Vec<i8>,
+        eh_h: Vec<i32>,
+        eh_e: Vec<i32>,
+    }
     thread_local! {
-        static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<i8>, Vec<i32>, Vec<i32>)> =
-            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+        static SCRATCH: std::cell::RefCell<GlobalScratch> = const {
+            std::cell::RefCell::new(GlobalScratch {
+                z: Vec::new(),
+                qp: Vec::new(),
+                eh_h: Vec::new(),
+                eh_e: Vec::new(),
+            })
+        };
     }
     SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        let (z_buf, qp_buf, eh_h_buf, eh_e_buf) = &mut *scratch;
+        let GlobalScratch {
+            z: z_buf,
+            qp: qp_buf,
+            eh_h: eh_h_buf,
+            eh_e: eh_e_buf,
+        } = &mut *scratch;
         z_buf.clear();
         z_buf.resize(n_col * tlen, 0u8);
         qp_buf.clear();
