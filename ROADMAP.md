@@ -4701,6 +4701,30 @@ architectures. Le seul terrain restant est wgsim x86, et son ecart residuel est 
 moitie dans BSW encore, l'autre dans WORKER_SAM (leur colle pairing+rescue+emission compile en AVX2
 contre notre v3, alors que notre kernel de rescue est plus rapide au micro-bench).
 
+### L'enquete ksw_global2, hypothese par hypothese (2026-08-20)
+
+`emit_split` a reduit l'anomalie `sam_emit` x86 a une fonction : `ksw_global2`, 30,6 us/appel sur
+Zen 3 contre 5,4 sur M4 (5,7x coeur pour coeur, kernels a 2,6x), 89,6 s CPU du run wgsim.
+
+**Hypothese 1, branches imprevisibles : morte, et par le temoin.** L'asm v3 local montrait 64
+branches et 12 cmov ; `hint::select_unpredictable` sur les cinq selections du corps force les cmov
+(11 cmov / 7 branches previsibles dans la boucle apres). Course refaite : normalise par le temoin
+`bwa-mem2` du meme tirage, le cout par appel n'a PAS bouge (~31 us equivalents). L'avant/apres
+d'assembleur local etait pollue par le cache de build ; le temoin embarque dans la course ne l'est
+pas. Le changement reste (semantiquement identique, inoffensif), l'hypothese est enterree.
+
+**Hypothese 2, quatre allocations et 5,5 Ko de first-touch par appel : en cours.** Scratch
+thread-local reutilise, avec deux pieges payes et documentes : `resize` opacifie la longueur et LLVM
+remet des bounds checks dans la boucle (+2,1 us/appel sur ARM, corrige par des reslices a longueur
+explicite) ; la reutilisation de `z` n'est saine que parce que le traceback ne lit que les cellules
+ecrites par la passe avant, ce que les directions enregistrees garantissent. md5 identique, ARM au
+niveau (7,85 contre 7,66-7,92 s CPU). Le verdict x86 est dans la course en vol.
+
+**Le cote rescue, sonde `rescue_split`** : collect 1,9 s / kernel 22,0 s / **apply 14,2 s CPU** sur
+ARM. L'apply est l'insertion+retri de #38, et le plafond du regroupement des dedups par call est
+~20 % d'un poste de 14 s (2,18 M dedups pour ~1,8 M calls a hit), soit <1 % du run, contre un risque
+reel sur l'ordre de merge : le verdict de #38 tient, reconfirme avec les chiffres du jour.
+
 ## Ce qui reste
 
 1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
