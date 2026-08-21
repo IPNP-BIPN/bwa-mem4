@@ -1,0 +1,217 @@
+# Where a batch's bytes go, measured on Linux (issue #25).
+#
+# The macOS numbers in ROADMAP.md cannot answer one question. There, pages returned with
+# `madvise(MADV_FREE)` stay counted until the system wants them, so peak RSS is the ceiling of
+# everything ever allocated; the allocation probe put a number on the gap (4.00 GB resident for
+# 2.84 GB live at the peak) but could not say how much of it survives on a kernel that takes its
+# pages back. This workflow re-runs exactly that probe where they do come back, next to the fork we
+# are 1.7x heavier than, so the 1.7x can be split into "our structures are bigger" and "the
+# allocator is holding pages".
+#
+# Deliberately NOT a gating check and NOT on push, like bench-x86: a memory figure from a shared
+# cloud runner is directional, and the interesting quantities here are RATIOS measured inside one
+# job on one host, which is what makes them readable at all.
+name: alloc-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      read_pairs:
+        description: "Read pairs to simulate (the ROADMAP Linux protocol used 2000000)"
+        default: "2000000"
+        required: false
+      k_batch:
+        description: "-K in bases, pinned so we and the fork see the same batch (empty = each tool's default)"
+        default: "100000000"
+        required: false
+
+# One run of this workflow at a time per ref. Without it a second push while the first run is still
+# measuring leaves two hour-long jobs racing for the same runners, which happened four times while
+# this branch was being written and had to be cleaned up by hand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alloc-probe:
+    name: per-stage allocation on Linux, vs the fork's RSS
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0} # login shell so the micromamba env is active
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log the host
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo "nproc: $(nproc)"
+          free -g || true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `bwa-mem3` is the fork the RAM comparison is against; `bwa-mem2` builds the index both read.
+      - name: Install bwa-mem2 + bwa-mem3 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3
+            wgsim
+          init-shell: bash
+
+      # Two binaries, because the probe's own wrapper costs a measured +0.5% and, armed, several
+      # times that: the RSS reference must come from the binary we ship, and only the second one can
+      # print a table. Separate target dirs so the second build cannot invalidate the first.
+      - name: Build bwa-mem4, shipped and instrumented
+        shell: bash
+        run: |
+          cargo build --release -p bwa-mem4
+          cp target/release/bwa-mem4 ./bwa-mem4-shipped
+          cargo build --release -p bwa-mem4 --features stage-alloc --target-dir target-probe
+          cp target-probe/release/bwa-mem4 ./bwa-mem4-probe
+          ls -la bwa-mem4-shipped bwa-mem4-probe
+
+      - name: Fetch reference (GRCh38 chr21)
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz
+          gunzip -f chr21.fa.gz
+          ls -la chr21.fa
+
+      - name: Build shared index
+        run: |
+          cd work
+          # bwa-mem2's own indexer, so the index is unambiguously readable by all three binaries.
+          bwa-mem2 index chr21.fa
+
+      - name: Simulate reads
+        run: |
+          cd work
+          n="${{ github.event.inputs.read_pairs || '2000000' }}"
+          # Same seed as the ROADMAP Linux protocol, so this is the same read set as that section.
+          wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          echo "simulated $n pairs"
+
+      # The measurement the section above turned into a question. If resident is live on Linux and
+      # one batch in flight lands on the fork's RSS, then our 2x is the batch overlap, and the only
+      # thing left to know is what that overlap is worth in wall clock. Both arms are the SHIPPED
+      # binary, interleaved on one host, with the fork timed alongside as a drift canary.
+      - name: Batch overlap A/B (what the second resident batch buys)
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          K="${{ github.event.inputs.k_batch || '100000000' }}"
+          KARG=""; [ -n "$K" ] && KARG="-K $K"
+          M4=../bwa-mem4-shipped
+          timed() { /usr/bin/time -f '%e %M' -o tt.txt "$@" > /dev/null 2>/dev/null; cat tt.txt; }
+          echo "threads=$T  batch=${KARG:-per-tool default}"
+          $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq > /dev/null 2>/dev/null   # warm
+          for rep in 1 2 3; do
+            on=$(timed $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+            off=$(timed env BWA4_NO_BATCH_OVERLAP=1 $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+            fk=$(timed bwa-mem3 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+            echo "rep $rep: overlap ${on} | no-overlap ${off} | fork ${fk}   (wall_s maxrss_kb)"
+          done
+          echo "== the switch must not move a byte =="
+          $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum > c.md5
+          BWA4_NO_BATCH_OVERLAP=1 $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum > d.md5
+          if cmp -s c.md5 d.md5; then echo "identical apart from @PG ($(cut -d' ' -f1 c.md5))"; else echo "OVERLAP SWITCH CHANGED THE OUTPUT" >&2; exit 1; fi
+
+      - name: Resident vs live, ours against the fork
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          K="${{ github.event.inputs.k_batch || '100000000' }}"
+          KARG=""; [ -n "$K" ] && KARG="-K $K"
+          M4=../bwa-mem4-shipped
+          P4=../bwa-mem4-probe
+          FORK=bwa-mem3
+          # No apostrophe in the default text: inside "${var:-word}" a single quote still opens a quoted
+          # section, and the one in "each tool's default" swallowed the next twenty lines, which bash
+          # reported as a syntax error twenty lines later.
+          echo "threads=$T  batch=${KARG:-per-tool default}"
+
+          # Runs one aligner under /usr/bin/time and prints "wall_s maxrss_kb". Stderr is kept, so a
+          # probe run's table survives; a hang fails the step in minutes instead of eating the budget.
+          run_one() {
+            local label="$1" errfile="$2"; shift 2
+            if ! timeout 1800 /usr/bin/time -f '%e %M' -o t.txt "$@" > /dev/null 2> "$errfile"; then
+              echo "FAILED/timeout: $label" >&2; tail -30 "$errfile" >&2; exit 1
+            fi
+            cat t.txt
+          }
+
+          echo "== warm-up (untimed: first touch of the index pages is not part of any measurement) =="
+          run_one warmup warm.err $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq
+
+          echo
+          echo "== 1. RSS reference: what a user actually pays, both binaries, 2 reps interleaved =="
+          for rep in 1 2; do
+            ours=$(run_one "mem4 rep$rep" o.err $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+            fork=$(run_one "fork rep$rep" f.err $FORK mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+            echo "rep $rep: bwa-mem4 ${ours} | bwa-mem3 ${fork}   (wall_s maxrss_kb)"
+          done
+
+          echo
+          echo "== 2. The shipped pipeline's live peak (probe, overlap mode) =="
+          # Overlap keeps the two-batches-in-flight pipeline, so the peak and TOTAL rows are the real
+          # ones; the per-stage split is a blend of two batches and must not be quoted.
+          ov=$(run_one "probe overlap" ov.err env BWA4_STAGE_ALLOC=overlap $P4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+          echo "$ov" > ov.rss
+          echo "probe(overlap): ${ov}   (wall_s maxrss_kb; instrumented wall is meaningless)"
+          grep '^\[stage-alloc\]' ov.err || { echo "NO PROBE OUTPUT" >&2; exit 1; }
+
+          echo
+          echo "== 3. Per-stage split (probe, serialised: one batch in flight) =="
+          se=$(run_one "probe serial" se.err env BWA4_STAGE_ALLOC=1 $P4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq)
+          echo "$se" > se.rss
+          echo "probe(serial): ${se}   (wall_s maxrss_kb)"
+          grep '^\[stage-alloc\]' se.err
+
+          echo
+          echo "== 4. The one ratio this job exists for =="
+          # Peak live above the index baseline, from the probe's own header line, against peak RSS
+          # above the same baseline. On macOS this was 1.41x in overlap mode, and everything above 1
+          # is memory the process asked for, stopped using, and did not give back. The baseline is
+          # LIVE index bytes while the RSS is resident, so the subtraction mixes two accountings by
+          # the index's own overhead; on a chr21 index that term is small, and it is stated here
+          # rather than hidden.
+          #
+          # The probe's header reads: "... peak live X GB (in Y), of which Z GB is the index ..."
+          for arm in ov se; do
+            rss_kb=$(awk '{print $2}' "$arm.rss")
+            awk -v rss_kb="$rss_kb" -v arm="$arm" '
+              /peak live/ {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == "live") live = $(i + 1)
+                  if ($i == "which") base = $(i + 1)
+                }
+              }
+              END {
+                if (live == "" || base == "") { print arm ": no probe header found"; exit }
+                rss = rss_kb / 1048576
+                printf "%s: peak RSS %.3f GB, index baseline %.3f GB -> batch RSS %.3f GB, batch live %.3f GB, resident/live %.2fx\n", \
+                       arm, rss, base, rss - base, live - base, (rss - base) / (live - base)
+              }
+            ' "$arm.err"
+          done
+
+          echo
+          echo "== 5. Output identity (the probe must not change a byte) =="
+          $M4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum > a.md5
+          BWA4_STAGE_ALLOC=1 $P4 mem -t "$T" $KARG chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum > b.md5
+          if cmp -s a.md5 b.md5; then echo "identical apart from @PG ($(cut -d' ' -f1 a.md5))"; else echo "PROBE CHANGED THE OUTPUT" >&2; exit 1; fi

@@ -1181,6 +1181,7 @@ pub fn batch_mate_rescue(
         // `calls`: every rescue this round will perform, tagged with the pair index and direction it
         // must be applied back to. Order is (pair ascending, then dir), which is also the order the
         // apply loop below walks, so inserts land in the same sequence as the per-pair path.
+        let t_collect = crate::rescue_split::start();
         let mut calls: Vec<(usize, usize, RescueCall)> = Vec::new(); // (pair, dir, call)
         for (pi, p) in pairs.iter().enumerate() {
             for dir in 0..2 {
@@ -1238,6 +1239,8 @@ pub fn batch_mate_rescue(
             }
             rescue_rounds::record_windows(&mut win);
         }
+        crate::rescue_split::stop(&crate::rescue_split::COLLECT_NS, t_collect);
+        let t_kernel = crate::rescue_split::start();
         // `alns`: one result per job, index-aligned with `jobs`.
         let alns = batched_ksw_align2(
             &jobs,
@@ -1250,6 +1253,8 @@ pub fn batch_mate_rescue(
             opt.min_seed_len * opt.a,
             opt.a,
         );
+        crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
+        let t_apply = crate::rescue_split::start();
         for (idx, (pi, dir, call)) in calls.iter().enumerate() {
             let (start, count) = spans[idx];
             // `target`: the region vector this call's hits are inserted into, i.e. the MATE's array
@@ -1262,6 +1267,7 @@ pub fn batch_mate_rescue(
             };
             matesw_apply(fm, bns, opt, call, &alns[start..start + count], target);
         }
+        crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
     }
 }
 
@@ -1865,7 +1871,7 @@ pub(crate) fn add_cigar(cigar: &[u32], hard_clip: bool, out: &mut Vec<u8>) {
         if (op == 3 || op == 4) && hard_clip {
             op = 4; // hard-clip on supplementary
         }
-        out.extend_from_slice((c >> 4).to_string().as_bytes());
+        crate::emit::push_int(out, i64::from(c >> 4));
         out.push(OPS[op]);
     }
 }
@@ -1961,7 +1967,7 @@ fn mem_aln2sam(
     // and translated into the real SAM 0x100 secondary bit.
     // `flag`: the value actually printed in column 2, i.e. `p.flag` with the internal bit translated.
     let flag = (p.flag & 0xffff) | if p.flag & 0x10000 != 0 { 0x100 } else { 0 };
-    out.extend_from_slice(flag.to_string().as_bytes());
+    crate::emit::push_int(out, i64::from(flag));
     out.push(b'\t');
 
     // ---- step 3: RNAME, POS, MAPQ, CIGAR ----
@@ -1970,9 +1976,9 @@ fn mem_aln2sam(
     if p.rid >= 0 {
         out.extend_from_slice(bns.contigs[p.rid as usize].name.as_bytes());
         out.push(b'\t');
-        out.extend_from_slice((p.pos + 1).to_string().as_bytes());
+        crate::emit::push_int(out, p.pos + 1);
         out.push(b'\t');
-        out.extend_from_slice(p.mapq.to_string().as_bytes());
+        crate::emit::push_int(out, i64::from(p.mapq));
         out.push(b'\t');
         add_cigar(&p.cigar, which != 0 && !softclip && !p.is_alt, out);
     } else {
@@ -1989,7 +1995,7 @@ fn mem_aln2sam(
                 out.extend_from_slice(bns.contigs[mate.rid as usize].name.as_bytes());
             }
             out.push(b'\t');
-            out.extend_from_slice((mate.pos + 1).to_string().as_bytes());
+            crate::emit::push_int(out, mate.pos + 1);
             out.push(b'\t');
             // TLEN. `p0`/`p1` are each record's *outermost* base: the leftmost for a forward
             // alignment, the rightmost (`pos + rlen - 1`) for a reverse one. TLEN is their signed
@@ -2018,7 +2024,7 @@ fn mem_aln2sam(
                         std::cmp::Ordering::Less => -1,
                         std::cmp::Ordering::Equal => 0,
                     };
-                    out.extend_from_slice((-(p0 - p1 + sign)).to_string().as_bytes());
+                    crate::emit::push_int(out, -(p0 - p1 + sign));
                 }
             } else {
                 out.push(b'0');
@@ -2071,24 +2077,21 @@ fn mem_aln2sam(
         // reverse complement of the read and reverses QUAL with it. `FWD_BASE`/`REV_BASE` are bwa's `F`/`R`,
         // "ACGTN" and "TGCAN"; indexing `REV_BASE` in reverse order performs the complement,
         // since `REV_BASE[c]` is the complement base of `FWD_BASE[c]`. `c.min(4)` guards nt4 codes above 4 (bwa indexes unguarded).
+        // Written a block at a time rather than a base at a time: see `crate::emit`, and the x86
+        // profile that motivated it (`sam_emit` is 5.15x slower per pair there than on an M4, the
+        // worst-scaling stage we have). Same bytes, same alphabets, same order.
         if !p.is_rev {
-            const FWD_BASE: [u8; 5] = *b"ACGTN";
-            for &c in &seq[qb..qe] {
-                out.push(FWD_BASE[c.min(4) as usize]);
-            }
+            crate::emit::push_seq_fwd(out, &seq[qb..qe]);
             out.push(b'\t');
             match qual {
                 Some(qv) if !qv.is_empty() => out.extend_from_slice(&qv[qb..qe]),
                 _ => out.push(b'*'),
             }
         } else {
-            const REV_BASE: [u8; 5] = *b"TGCAN";
-            for &c in seq[qb..qe].iter().rev() {
-                out.push(REV_BASE[c.min(4) as usize]);
-            }
+            crate::emit::push_seq_rev(out, &seq[qb..qe]);
             out.push(b'\t');
             match qual {
-                Some(qv) if !qv.is_empty() => out.extend(qv[qb..qe].iter().rev()),
+                Some(qv) if !qv.is_empty() => crate::emit::push_qual_rev(out, &qv[qb..qe]),
                 _ => out.push(b'*'),
             }
         }
@@ -2101,7 +2104,7 @@ fn mem_aln2sam(
     // NM/MD are gated on a non-empty CIGAR, so a read placed at its mate's coordinate gets neither.
     if !p.cigar.is_empty() {
         out.extend_from_slice(b"\tNM:i:");
-        out.extend_from_slice(p.nm.to_string().as_bytes());
+        crate::emit::push_int(out, i64::from(p.nm));
         out.extend_from_slice(b"\tMD:Z:");
         out.extend_from_slice(p.md.as_bytes());
     }
@@ -2119,11 +2122,11 @@ fn mem_aln2sam(
     // `mem_aln_t`) still carries `AS:i:0 XS:i:0`. `sub` is set to -1 for secondaries to suppress XS.
     if p.score >= 0 {
         out.extend_from_slice(b"\tAS:i:");
-        out.extend_from_slice(p.score.to_string().as_bytes());
+        crate::emit::push_int(out, i64::from(p.score));
     }
     if p.sub >= 0 {
         out.extend_from_slice(b"\tXS:i:");
-        out.extend_from_slice(p.sub.to_string().as_bytes());
+        crate::emit::push_int(out, i64::from(p.sub));
     }
     // `-R`: bwa emits RG:Z here, between XS and SA:Z.
     bwa_core::rg::append_rg_tag(out);
@@ -2150,15 +2153,15 @@ fn mem_aln2sam(
                 }
                 out.extend_from_slice(bns.contigs[r.rid as usize].name.as_bytes());
                 out.push(b',');
-                out.extend_from_slice((r.pos + 1).to_string().as_bytes());
+                crate::emit::push_int(out, r.pos + 1);
                 out.push(b',');
                 out.push(if r.is_rev { b'-' } else { b'+' });
                 out.push(b',');
                 add_cigar(&r.cigar, false, out);
                 out.push(b',');
-                out.extend_from_slice(r.mapq.to_string().as_bytes());
+                crate::emit::push_int(out, i64::from(r.mapq));
                 out.push(b',');
-                out.extend_from_slice(r.nm.to_string().as_bytes());
+                crate::emit::push_int(out, i64::from(r.nm));
                 out.push(b';');
             }
         }
@@ -2565,8 +2568,16 @@ pub fn mem_sam_pe<W: Write>(
                     (vec![None; a0.len()], vec![None; a1.len()])
                 } else {
                     (
-                        mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]),
-                        mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]),
+                        crate::emit_split::measure(
+                            &crate::emit_split::ALT_NS,
+                            &crate::emit_split::ALT_CALLS,
+                            || mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]),
+                        ),
+                        crate::emit_split::measure(
+                            &crate::emit_split::ALT_NS,
+                            &crate::emit_split::ALT_CALLS,
+                            || mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]),
+                        ),
                     )
                 };
 

@@ -5110,7 +5110,7 @@ mod avx512_verify {
     /// lacks AVX-512BW (including under Rosetta), so it is only a real check on AVX-512 hardware.
     #[test]
     fn avx512_matesw_u8_matches_scalar() {
-        if !std::arch::is_x86_feature_detected!("avx512bw") {
+        if !crate::avx512_testable() {
             eprintln!("skipping avx512_matesw_u8_matches_scalar: no avx512bw on this CPU");
             return;
         }
@@ -5142,7 +5142,7 @@ mod avx512_verify {
     /// overflows u8. Skipped without AVX-512BW.
     #[test]
     fn avx512_matesw_i16_matches_scalar() {
-        if !std::arch::is_x86_feature_detected!("avx512bw") {
+        if !crate::avx512_testable() {
             eprintln!("skipping avx512_matesw_i16_matches_scalar: no avx512bw on this CPU");
             return;
         }

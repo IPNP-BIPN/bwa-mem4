@@ -319,3 +319,90 @@ jobs:
             bm=$(awk -v a="$bm" -v x="$m" 'BEGIN{print (a=="")?x:(x<a?x:a)}')
           done
           echo "best: fork ${bf}s | mem4 ${bm}s | mem4-vs-fork $(awk -v a="$bf" -v b="$bm" 'BEGIN{printf "%.3f", a/b}')x (>1 = we win)"
+
+  # #33: PGO is worth +6.1% SE and +8.5% PE on an M4 at genome scale, and @nh13 measured -0.4% on
+  # Graviton4. Two numbers cannot both be a property of the code, so either his build did not apply
+  # its profile or the benefit is specific to Apple Silicon. This job is the third data point that
+  # decides between those, on hosted ARM (Ampere Altra, Neoverse N1): a NON-Apple ARM core with the
+  # same toolchain and the same training procedure as ours. If PGO pays here, the Graviton figure is
+  # a build problem; if it does not, the M4 gain is Apple's branch predictor and layout, and #33
+  # closes without needing a Graviton at all.
+  pgo-arm:
+    name: what PGO is worth on non-Apple ARM (#33)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log CPU
+        shell: bash
+        run: |
+          echo "arch: $(uname -m), nproc: $(nproc)"
+          grep -m1 -E 'CPU implementer|CPU part' /proc/cpuinfo || true
+
+      - name: Install Rust with the LLVM tools
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+          # `llvm-profdata` must be the toolchain's, matching the LLVM rustc was built with.
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            wgsim
+          init-shell: bash
+
+      - name: Install cargo-pgo
+        shell: bash
+        run: cargo install cargo-pgo --locked 2>&1 | tail -2
+
+      - name: Reference, index, reads
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          bwa-mem2 index chr21.fa
+          # Different seeds for training and measurement, so PGO is not handed the exact reads it is
+          # then timed on.
+          wgsim -S 11 -N 1000000 -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          wgsim -S 77 -N 200000 -1 150 -2 150 chr21.fa t1.fq t2.fq > /dev/null
+
+      - name: Build plain and PGO
+        shell: bash
+        run: |
+          export RUSTFLAGS=""
+          cargo build --release -p bwa-mem4 --target-dir target-plain
+          cp target-plain/release/bwa-mem4 ./bwa-mem4-plain
+          cargo pgo build -- -p bwa-mem4 2>&1 | tail -3
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          inst=$(find target -name bwa-mem4 -type f -perm -u+x -path '*release*' | head -1)
+          (cd work && "../$inst" mem -t "$T" chr21.fa t1.fq t2.fq > /dev/null 2>/dev/null)
+          cargo pgo optimize build -- -p bwa-mem4 2>&1 | tail -3
+          cp "$(find target -name bwa-mem4 -type f -perm -u+x -path '*release*' | head -1)" ./bwa-mem4-pgo
+
+      - name: A/B, interleaved
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          for b in plain pgo; do ../bwa-mem4-$b mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null; done
+          for rep in 1 2 3; do
+            p=$(timed ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq)
+            g=$(timed ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: plain ${p}s | pgo ${g}s"
+          done
+          ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+          ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum

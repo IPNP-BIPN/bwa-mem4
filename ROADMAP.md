@@ -4094,24 +4094,673 @@ Ce qui reste pour #25 est donc etroit et bien pose : nos structures par batch, p
 la plateforme, pas les files. La cible chiffree est de rendre ~2x moins de memoire par base a batch
 egal, et la mesure de reference est desormais ce job Linux plutot qu'un chiffre macOS.
 
+## Ou vont les octets (#25) : l'allocation par etage, mesuree depuis l'allocateur (2026-08-18)
+
+Les deux sections precedentes fermaient les fausses pistes (les files, mimalloc, la plateforme) et
+laissaient une seule suite utile : « instrumenter l'allocation par etage, un compteur d'octets
+alloues, pas des snapshots ». C'est fait. `BWA4_STAGE_ALLOC` enveloppe l'allocateur global
+(`crates/bwa-cli/src/stage_alloc.rs`) et compte chaque requete au moment ou elle passe, en
+l'imputant a l'etage du pipeline qui l'a demandee.
+
+**Et il ne reste PAS dans le binaire livre, contrairement aux autres sondes.** Desarme il ne coute
+qu'une lecture d'`AtomicBool` et un branchement non pris, mais par ALLOCATION et non par batch, et
+ce pipeline alloue 167 M de fois par 500k paires GIAB. A/B entrelace, min de 6 sur hote calme :
+**12,49 s contre 12,56 s de wall et 95,14 s contre 95,67 s de user, +0,5 %**. Le wrapper vit donc
+derriere la feature `stage-alloc`, off par defaut, exactement comme `align-split` avant lui ; le
+meme A/B refait apres la mise sous feature ne distingue plus les deux binaires (12,47 contre
+12,47 s). Sans la feature, `BWA4_STAGE_ALLOC` affiche une ligne qui le dit et ne change rien.
+
+Trois colonnes, et elles ne disent pas la meme chose. Le **volume** est la somme de tout ce qui a
+ete demande, jamais decremente : c'est le chiffre que la RSS de pointe macOS mesure reellement. Le
+**vivant** est alloue moins libere, exact parce que `dealloc` recoit le `Layout` d'origine, et son
+maximum courant est le vrai pic. Les **classes de taille** disent si un chiffre par base vient de
+beaucoup de petites requetes ou de quelques grosses. Un appel `mark_baseline()` juste apres le
+chargement de l'index gele le vivant a cet instant, si bien que la colonne de pic parle du batch et
+non des 10 GB de genome.
+
+Deux modes, parce qu'une seule execution ne peut pas repondre aux deux questions. L'attribution par
+etage passe par une etiquette globale au processus, la ou allouent surtout les workers rayon, donc
+elle exige **un seul batch en vol** : `BWA4_STAGE_ALLOC=1` retire chaque batch avant de lire le
+suivant. `BWA4_STAGE_ALLOC=overlap` garde les deux batchs en vol du pipeline livre, donc le pic est
+le vrai, mais le decoupage par etage devient un melange de deux batchs. Le reader et le writer sont
+etiquetes par THREAD et echappent aux deux problemes.
+
+**Protocole.** GIAB HG002, 500k paires, index genome GRCh38, M4 Max, `-t8`, `-K` par defaut (80M),
+soit 148M bases et 2 batchs. Sortie SAM `cmp`-identique a la course non instrumentee dans les deux
+modes. Le wall d'une course instrumentee ne vaut rien (34,5 s contre 13,0 s) : quatre atomiques par
+allocation, et la serialisation en plus.
+
+| | RSS de pointe | vivant de pointe | dont index | batch vivant | batch RSS |
+|---|---|---|---|---|---|
+| sans sonde | 14,72 GB | | | | 4,25 GB |
+| `overlap` (pipeline livre) | 14,47 GB | 13,31 GB | 10,47 GB | **2,84 GB** | 4,00 GB |
+| serialise (1 batch) | 13,22 GB | 12,12 GB | 10,47 GB | **1,65 GB** | 2,75 GB |
+
+**Premier resultat : un tiers de la RSS du batch n'est vivante a aucun instant.** 4,00 GB de
+resident pour 2,84 GB de vivant au pic, soit **1,41x** dans la configuration livree, et 1,67x a un
+seul batch. Ce n'est pas une erreur de mesure : c'est ce que la section macOS annoncait sans pouvoir
+le chiffrer. Consequence directe pour #25 : diviser par deux nos structures vivantes ne diviserait
+pas par deux la RSS du batch, il resterait le ~1,2 GB que l'allocateur detient sans que personne ne
+le tienne.
+
+**Deuxieme resultat : le rapport churn sur vivant est de 23.** 66,87 GB alloues au total pour 148M
+bases, soit **452 octets par base d'entree**, contre **19 octets par base** vivants au pic. Le
+tableau par etage, mode serialise :
+
+| bucket | volume | part | appels | taille moyenne | o/base | pic vivant batch |
+|---|---|---|---|---|---|---|
+| encode | 0,17 GB | 0,3 % | 1,00 M | 172 o | 1,2 | 0,09 GB |
+| align | **31,49 GB** | **47,1 %** | **110,84 M** | 284 o | 212,8 | 1,37 GB |
+| deinterleave | 0,05 GB | 0,1 % | 2 | 24 MB | 0,3 | 1,28 GB |
+| dedup_prep | 0,16 GB | 0,2 % | 0,05 M | 3392 o | 1,1 | 1,31 GB |
+| pestat | 0,02 GB | 0,0 % | 61 | 400 kB | 0,2 | 1,27 GB |
+| rescue | **19,10 GB** | **28,6 %** | 14,95 M | 1277 o | 129,0 | 1,61 GB |
+| sam_emit | 5,32 GB | 8,0 % | 39,89 M | 133 o | 36,0 | **1,65 GB** |
+| reader | 0,10 GB | 0,2 % | 53 | 1,9 MB | 0,7 | |
+| writer | 0 | 0,0 % | 4 | | 0,0 | |
+| unstaged (index, main) | 10,45 GB | 15,6 % | 1,00 M | 10 kB | 70,6 | |
+| **TOTAL** | **66,87 GB** | 100 % | **167,73 M** | 399 o | 451,8 | 1,65 GB |
+
+L'align alloue **0,75 fois par base d'entree** et libere presque tout dans l'etage meme ; le rescue
+suit avec 15 M d'appels a 1277 octets de moyenne. Le pic vivant, lui, arrive dans `sam_emit`, ou les
+regions du batch et son texte SAM coexistent.
+
+**Troisieme resultat : la forme.** 117 M des 167 M d'appels demandent moins de 128 octets et ne
+pesent que 6 % du volume, tandis que la seule classe 16 ko - 32 ko pese **7,76 GB, 11,6 % du
+volume, en 336k appels**. Les 452 octets par base ne sont donc ni « beaucoup de petites » ni
+« quelques grosses » : ce sont deux populations distinctes, et elles appellent deux correctifs
+differents.
+
+### Et dans `align`, aucun point chaud : les quatre sous-phases se partagent le churn
+
+La ligne `align` pesait 47 % du volume sans dire laquelle de ses phases le depense. Le compteur a
+donc ete descendu dans `bwa-core` (`alloc_probe`), seul crate que le binaire ET `bwa-mem` partagent,
+et `align_reads_batched_inner` porte maintenant quatre etiquettes. Meme protocole, mode serialise :
+
+| sous-bucket | volume | part | appels | taille moyenne | o/base |
+|---|---|---|---|---|---|
+| align:seed | 7,27 GB | 10,9 % | 26,07 M | 279 o | 49,1 |
+| align:sa | 7,40 GB | 11,1 % | 22,72 M | 326 o | 50,0 |
+| align:chain | 8,41 GB | 12,6 % | 30,57 M | 275 o | 56,8 |
+| align:extend | 8,38 GB | 12,5 % | 31,35 M | 267 o | 56,6 |
+| align (le reste) | 0,03 GB | 0,0 % | 0,14 M | 236 o | 0,2 |
+
+**Il n'y a pas de tampon a corriger, il y a un style d'allocation.** Les quatre phases sont a moins
+de 16 % l'une de l'autre en volume comme en nombre d'appels, avec des tailles moyennes entre 267 et
+326 octets, soit **une centaine d'allocations par read pour le seul `align`**, et 40 de plus par read
+dans `sam_emit` a 133 octets de moyenne. C'est la signature du `Vec` par read et par seed repete
+partout, pas d'un gros tampon mal dimensionne. Un correctif ponctuel ne peut donc pas payer : ce qui
+paierait est une arene par worker reutilisee d'un read a l'autre a l'interieur d'un chunk, ce qui
+touche les quatre phases a la fois. C'est aussi ce qui explique que les deux tentatives precedentes,
+toutes deux ponctuelles, aient mesure nul.
+
+**Les etiquettes ne sont pas livrees non plus.** Elles sont derriere la feature `stage-alloc` de
+`bwa-mem`, pour la raison qui a mis `align-split` derriere la sienne : desarmee une etiquette est une
+lecture d'`AtomicBool` par chunk de reads, donc rien, mais elle vit dans une fonction
+`inline(always)` qui est le coeur chaud de l'aligneur, et un garde dont la portee couvre la moitie de
+la fonction est exactement ce qui perturbe l'allocation de registres. L'A/B de la version non gatee
+lisait +1,2 % en min de 4 et un nul en medianes : impossible a montrer gratuite, donc pas livree.
+Apres la mise sous feature, binaire par defaut contre binaire d'avant le chantier, min de 5 :
+12,46 s contre 12,43 s de wall, medianes 12,56 contre 12,54. Nul, cette fois pour de bon.
+
+**Ce que ca change pour #25.** La cible n'est plus « nos structures sont deux fois trop grosses »,
+elle se scinde en deux, avec des chiffres :
+
+1. **Le churn de `align` et de `rescue`**, 50 GB de volume transitoire par 148M bases pour ~19
+   octets par base reellement vivants, reparti a peu pres egalement sur les quatre sous-phases de
+   `align`. C'est lui qui fixe le plafond que la RSS macOS reporte, et c'est un probleme d'arene par
+   worker, pas de taille de structure ni de tampon isole. Les deux correctifs deja tentes
+   (`shrink_to_fit`, `reserve_exact`) visaient le vivant et un site a la fois, ce qui explique apres
+   coup pourquoi l'un a coute 0,95 GB et l'autre rien.
+2. **Le 1,4x de retention** entre vivant et resident, qui survivra a toute reduction des structures
+   et qui doit etre mesure sous Linux avec la meme sonde avant qu'on lui attribue un correctif.
+
+La suite immediate est donc de relancer exactement cette sonde sur le job Linux de reference, ou les
+pages reviennent, pour savoir laquelle des deux moities de l'ecart de 1,71x contre le fork est
+vivante et laquelle est de la retention.
+
+## #25 tranche : le resident EST le vivant sous Linux, et le 2x est le double batch en vol (2026-08-18)
+
+La sonde par etage, rejouee la ou les pages reviennent. Protocole ROADMAP Linux : chr21, `wgsim -S 11`,
+2M paires, index `bwa-mem2`, runner heberge 4 coeurs, `-K` epingle a 100M pour que le fork et nous
+voyions le meme batch. Workflow `alloc-probe.yml`, run 32143186293.
+
+**Premiere ligne, celle qui ferme la piste macOS.**
+
+| | RSS de pointe | vivant de pointe | dont index | batch RSS | batch vivant | resident/vivant |
+|---|---|---|---|---|---|---|
+| pipeline livre (`overlap`) | 4,553 GB | 4,461 GB | 0,181 GB | 4,372 GB | 4,280 GB | **1,02x** |
+| un batch en vol (serialise) | 2,680 GB | 2,587 GB | 0,188 GB | 2,492 GB | 2,399 GB | **1,04x** |
+
+**Sous Linux le resident est le vivant.** Le 1,41x macOS etait de la comptabilite, entierement. Il
+n'y a rien a recuperer du cote de l'allocateur, et le 1,4x de retention annonce comme « la moitie du
+dossier » deux sections plus haut n'existe pas sur la plateforme ou les utilisateurs tournent.
+
+**Deuxieme ligne, celle qui ferme #25.** Meme job, memes reads, memes index :
+
+| | wall | RSS de pointe |
+|---|---|---|
+| bwa-mem4 | 201,71 / 202,09 s | 4,78 / 4,78 GB |
+| `bwa-mem3` (fork) | 150,74 / 151,55 s | 2,36 / 2,39 GB |
+| bwa-mem4, **un batch en vol** | | **2,49 GB** |
+
+Contre le fork : **2,02x en RSS avec le recouvrement, 1,05x sans**. Notre batch n'est donc pas deux
+fois plus gros que le sien, et nos structures ne sont pas en cause : nous en tenons deux a la fois.
+`run_pipeline` lance le batch N+1 avant de retirer le N pour que la queue peu occupee du N (dedup a
+69 %, encode a 29 %) tourne contre l'`align` du N+1, qui est la seule etape capable de remplir le
+pool. Le commentaire du site disait deja « le cout est un batch resident de plus » ; ce qui manquait
+etait son prix, et le prix est exactement l'ecart de l'issue.
+
+**`BWA4_NO_BATCH_OVERLAP=1`** rend cette moitie. Sortie inchangee : l'ordre de sortie vient du join
+avant l'envoi, pas du nombre de batchs en vol. Verifie `cmp`-propre sur 500k paires GIAB en local et
+sur chr21 en CI. Sur macOS, `-t8`, 500k paires GIAB : 14,72 GB contre 13,28 GB de RSS de pointe, soit
+la part batch de 4,25 a 2,81 GB, pour 1,4 % de wall sur un jeu a deux batchs, ou le recouvrement n'a
+presque rien a recouvrir.
+
+**Et c'est le seul levier qui rende cette memoire sans toucher a la sortie.** Baisser `-K` de moitie
+donnerait le meme resident, deux batchs de `-K/2` valant un de `-K`, mais deplacerait les frontieres
+de batch, donc le modele d'insert par batch, donc les octets : c'est ce que la section « la RAM par
+batch » avait deja verrouille. Le nombre de batchs en vol, lui, n'est observable nulle part dans le
+SAM.
+
+Deuxieme point de mesure, macOS `-t8` avec `-K` 10M (15 batchs) : 11,79 GB contre 11,61 GB, soit
+0,19 GB seulement. Attendu, et il faut le dire pour que personne ne cite le levier hors de son
+regime : ce qu'il rend est UN batch, donc son gain est proportionnel a `-K`. A `-K` par defaut il
+rend 1,44 GB, a `-K` 10M presque rien. Le wall de ce meme jeu n'est pas exploitable, l'hote allant de
+13,4 a 20,3 s d'une repetition a l'autre.
+
+### Et le churn ne coute pas de wall non plus : l'arene par worker est morte des deux cotes
+
+La section precedente concluait que les 452 octets alloues par base appelaient une arene par worker.
+Le resultat Linux lui retire sa raison memoire : ce volume transitoire ne fait pas de resident, la
+RSS du batch etant son vivant a 1,02x pres. Restait sa raison wall, et un profil `sample` la retire
+aussi. macOS, `-t8`, 500k paires GIAB, 6 s de profil en regime : **651 echantillons self dans
+l'allocateur sur 55 299**, dont 18 876 en attente (`psynch_cvwait`, `ulock_wait`, `semaphore_wait`).
+Soit **1,2 % du profil et 1,8 % du temps occupe**, contre 13 163 pour le seul `batched_extend_neon_u8`.
+
+Un remplacement PARFAIT de l'allocateur par une arene rendrait donc au mieux 1,8 %, sous le plancher
+de 3 % que ce projet s'est donne, pour un refactor qui traverse quatre crates et met l'octet-identite
+en jeu. Le dossier « churn » se ferme sur ce chiffre : mimalloc encaisse 167 M d'allocations par
+500k paires pour 1,8 % du busy, ce qui est le vrai enseignement du tableau des volumes.
+
+### Le prix du recouvrement, mesure : 1,1 % de wall pour 41 % de la RSS
+
+A/B entrelace sur le binaire LIVRE, sans instrumentation, meme runner Linux 4 coeurs, chr21, 2M
+paires, `-K` 100M, six batchs, le fork chronometre a cote comme temoin de derive (run 32149818162) :
+
+| | wall (3 reps) | RSS de pointe |
+|---|---|---|
+| recouvrement (defaut) | 206,16 / 206,49 / 206,85 s | 4,786 / 4,797 / 4,783 GB |
+| `BWA4_NO_BATCH_OVERLAP=1` | 208,51 / 208,10 / 209,21 s | **2,818 / 2,833 / 2,816 GB** |
+| `bwa-mem3` (fork) | 156,81 / 158,08 / 157,60 s | 2,371 / 2,385 / 2,374 GB |
+
+Les trois repetitions vont dans le meme sens sans se croiser : **+1,1 % de wall pour -41 % de RSS de
+pointe**, la part batch passant de 4,60 a 2,63 GB. Contre le fork nous passons de **2,02x a 1,19x en
+memoire**, a wall inchange (0,76x dans les deux bras). Sortie identique, md5 hors `@PG`. macOS `-t8`
+sur 500k paires GIAB donnait le meme ordre : 1,5 % de wall pour 1,46 GB, soit 10 % de la RSS totale
+la ou l'index pese 10 GB, et 34 % de la part batch.
+
+**#25 est donc chiffree et fermable, et la seule question qui reste est un choix de defaut**, pas une
+mesure : 1,1 % de wall est en dessous du plancher de 3 % que ce projet applique a ses propres
+optimisations, et 2 GB de RSS sur un run WGS est souvent ce qui decide si le job passe dans la
+machine. Ce qui plaide pour garder le defaut actuel est qu'il a ete mesure gagnant sur les etages a
+faible occupation (dedup 69 %, encode 29 %), et ces 1,1 % sont reels. Ce qui plaide pour l'inverser
+est qu'un utilisateur memoire-contraint ne peut pas deviner l'existence d'une variable d'environnement,
+alors qu'un utilisateur presse lit un chiffre de wall. Le choix n'appartient pas a la mesure.
+
+## Trois questions fermees le meme jour : le gate GIAB, le PGO hors Apple, et l'indexeur parallele (2026-08-18)
+
+### Phase 11 : l'identite octet, dite en precision et rappel (#35)
+
+`scripts/giab_happy.sh` aligne les memes reads avec les deux aligneurs, appelle les variants avec le
+meme caller, et note les deux VCF contre le benchmark NIST v4.2.1. Le workflow `giab-gate` le fait
+tourner sur des reads HG002 REELS, decoupes dans le BAM 300x de GIAB par HTTPS : 1 089 635 paires
+sur une fenetre de 10 Mb du bras q de chr21, 17 806 variants de verite dans 9,75 Mb de regions de
+confiance.
+
+| bras | TP | FP | FN | precision | sensibilite | F |
+|---|---|---|---|---|---|---|
+| bwa-mem4 | 16889 | 172 | 171 | 0,9899 | 0,9900 | 0,9899 |
+| bwa-mem2 | 16889 | 172 | 171 | 0,9899 | 0,9900 | 0,9899 |
+
+Enregistrements BAM identiques, enregistrements VCF identiques, donc la meme ligne deux fois. Ce
+n'est pas une decouverte, c'est le livrable : l'identite existe desormais dans les unites que lit un
+utilisateur de variant calling. Deux pieges rencontres et documentes sur place : Ensembl nomme le
+contig `21` la ou le benchmark le nomme `chr21`, et un caller ne produit alors rien du tout sans se
+plaindre ; et des reads extraits d'un alignement existant sont les reads que CET aligneur a places
+la, ce qui est propre pour comparer deux aligneurs sur la meme entree et n'est pas une mesure de
+sensibilite.
+
+### Le PGO est un levier Apple Silicon, et rien d'autre (#33)
+
+nh13 mesurait -0,4 % sur Graviton4 la ou nous mesurons +12,4 % sur M4. Un troisieme point tranche,
+sans Graviton : ARM heberge (Ampere Altra, `CPU implementer 0x41`), notre chaine, notre procedure
+d'entrainement, `llvm-profdata` de la toolchain et non de la distribution, entrainement sur une
+graine wgsim differente de celle mesuree.
+
+| rep | plain | PGO |
+|---|---|---|
+| 1 | 69,43 s | 69,99 s |
+| 2 | 69,90 s | 70,32 s |
+| 3 | 69,69 s | 69,95 s |
+
+**PGO est 0,6 % plus lent**, trois repetitions sans croisement. Deux coeurs ARM non-Apple disent
+donc la meme chose contre +12,4 % sur M4 : le gain appartient a l'Apple Silicon. C'est coherent avec
+ce que le PGO achete ici, de la disposition de branches sur le chemin branchu (driver, seeding,
+SAM), dont la valeur depend entierement du predicteur du coeur. `scripts/pgo.sh` doit donc etre
+presente comme un levier Apple Silicon, pas comme une propriete du binaire.
+
+### L'indexeur n'est pas mono-thread, il est mono-thread PAR DEFAUT (#37)
+
+Mesure a l'echelle genome, GRCh38 (3,15 GB de FASTA), M4 Max, index octet-identique dans les trois
+cas (md5 du `.bwt.2bit.64`) :
+
+| backend | wall | RSS de pointe |
+|---|---|---|
+| defaut (libsais C, serie) | 152,45 s | 91,6 GB |
+| `--features libsais-c-omp`, 8 threads | **90,96 s** | 98,4 GB |
+| `--features capsa` (chr21 seulement) | 24x plus lent | 2,2x moins de RAM |
+
+**1,68x pour +7 % de RAM**, et le code existe deja. Ce qui empeche d'en faire le defaut n'est pas
+l'algorithme mais la dependance : `libsais-c-omp` exige un runtime OpenMP a la compilation, et un
+artefact de release qui gagnerait silencieusement une dylib serait pire qu'un index plus lent, ce que
+`crates/bwa-cli/Cargo.toml` disait deja. Le vrai reste de #37 est donc une question de packaging, pas
+de parallelisation.
+
+## Le dossier x86 : ou nous perdons, mesure sur le meme hote (2026-08-18)
+
+Toutes les mesures de ce projet contre `bwa-mem2` etaient arm64. Voici les deux architectures cote a
+cote, chr21 wgsim, `-t4`, chaque ratio pris **a l'interieur d'un seul hote** pour qu'aucune
+comparaison de machines n'y entre :
+
+| hote | bwa-mem4 | `bwa-mem3` (fork) | `bwa-mem2` | nous / mem2 | fork / mem2 | nous / fork |
+|---|---|---|---|---|---|---|
+| M4 Max (1M paires) | 36,55 / 36,54 s | parite (0,981x, GIAB) | 129,84 / 116,86 s | **3,20x** | ~3,2x | **1,00x** |
+| EPYC 7763, Zen 3 (2M paires) | 205,4 / 208,0 s | 150,9 / 151,1 s | 321,7 / 324,6 s | **1,57x** | **2,13x** | **0,74x** |
+
+**Les deux aligneurs perdent en passant sur x86, et c'est attendu** : `bwa-mem2` y est chez lui,
+avec ses noyaux AVX2/AVX-512 ecrits pour Intel, tandis que sur arm64 il tourne a travers une couche
+d'emulation SSE. Un ratio contre `bwa-mem2` mesure donc en partie le handicap de `bwa-mem2`, ce qui
+est une raison de plus de citer le fork comme reference.
+
+**Mais nous perdons deux fois plus.** Le fork passe de ~3,2x a 2,13x contre `bwa-mem2` ; nous
+passons de 3,20x a 1,57x. La difference entre ces deux chutes EST l'ecart de 1,36x que nous avons
+contre lui sur x86, et c'est le seul chiffre de ce tableau qui decrit du code a nous.
+
+Deux causes possibles, et elles se separent par la mesure :
+
+1. **Nos noyaux AVX2 sont plus faibles, relativement, que nos noyaux NEON.** Le kernel d'extension
+   pese 56 % du CPU d'`align` sur ARM (profil `align-split` sur ces memes donnees), donc un deficit
+   de kernel s'y verrait.
+2. **Notre code SCALAIRE x86 est compile en baseline.** `bwa-mem2` livre un binaire par jeu
+   d'instructions (`bwa-mem2.avx2`, `bwa-mem2.avx512bw`) et choisit a l'exec ; nous livrons un
+   binaire baseline et ne selectionnons au runtime que les noyaux vectoriels. Toutes nos boucles
+   scalaires de seeding, de chainage et de resolution SA sont donc compilees pour un CPU de 2003.
+   Sur ARM ce choix ne coute rien, la baseline aarch64 contenant deja NEON : controle mesure ici,
+   `target-cpu=native` contre baseline donne 36,35 s contre 36,48 s, un nul.
+
+### Le profil x86, lu enfin, et il ne dit pas ce que les issues supposaient
+
+Runner heberge 4 coeurs, AMD EPYC 7763 (Zen 3, pas d'AVX-512), chr21, `-K` par defaut, un batch en
+vol pour que les parts soient exactes. Deux jeux de donnees, et c'est le point le plus important de
+toute la section.
+
+| jeu | bwa-mem4 | `bwa-mem3` | `bwa-mem2` | nous / fork |
+|---|---|---|---|---|
+| wgsim, 2M paires | 216,1 / 217,5 / 216,8 s | 162,9 / 165,7 / 165,3 s | 355 / 359 / 355 s | **1,32x** |
+| HG002 reel, 5,45M paires | 128,2 / 129,6 / 129,5 s | 118,3 / 120,8 / 126,2 s | 278 / 283 / 280 s | **1,05x** |
+
+**L'ecart x86 depend du jeu de donnees, et il n'est pas de 1,3x partout.** Sur des reads simules
+nous sommes a 1,32x du fork ; sur des reads HG002 reels, decoupes dans une fenetre de 10 Mb, a
+**1,05x**. Aucun des deux chiffres n'est le chiffre WGS que #32 demande : les reads reels utilises
+ici viennent d'un alignement existant restreint a une fenetre, donc leurs mates tombent presque
+toujours a cote et le rescue ne travaille pas (10,7 % du wall contre 21,4 % sur wgsim). La lecture
+honnete est que le deficit va de 5 % a 32 % selon ce qu'on aligne, et que le protocole doit etre
+cite avec le chiffre.
+
+**Par etage, wgsim, normalise par million de paires, contre le meme profil sur M4 :**
+
+| etage | M4 (s/Mpaires) | Zen 3 (s/Mpaires) | rapport |
+|---|---|---|---|
+| align | 24,86 | 70,3 | 2,83x |
+| rescue | 9,10 | 23,4 | 2,57x |
+| `sam_emit` | 2,79 | 14,4 | **5,15x** |
+
+Un coeur M4 est plus rapide qu'un coeur Zen 3 de cette generation, donc un rapport uniforme autour
+de 2,8x ne dit rien. Ce qui parle est **l'ecart entre les etages** : `sam_emit`, qui est du
+formatage de chaines et d'entiers sans une seule instruction vectorielle, est deux fois plus penalise
+que le reste. `chain_flt` suit a 4,3x et le `rest` du profil `align-split` (marche SA et fusion de
+chaines) a 3,5x, contre 2,57x pour les noyaux d'extension eux-memes.
+
+**Les deux noyaux vectoriels, eux, tiennent :** le kernel de rescue fait 4,56 Gcell/s/thread en AVX2
+contre 10,03 en NEON, et les noyaux d'extension sont a 2,57x du M4. C'est le rapport attendu entre
+ces deux coeurs. Ce ne sont donc pas les noyaux qui expliquent que nous perdions plus que le fork.
+
+**La fenetre SA n'est pas un levier sur x86** : 219,4 / 218,7 / 217,3 / 218,3 / 217,3 s pour
+W = 16, 32, 64, 96, 128. Plate, la ou sur M4 passer de 128 a 32 coute 18 %. Zen 3 ne profite pas du
+recouvrement de defauts de cache que le M4 exploite, ce qui est coherent avec les 163 ns par lookup
+mesures ici contre 60 ns sur M4.
+
+**Ce que cela designe** : nos chemins SCALAIRES sur x86, pas nos noyaux. Et c'est exactement la ou la
+difference de packaging joue, `bwa-mem2` livrant un binaire par jeu d'instructions quand nous livrons
+un binaire baseline dont seules les fonctions vectorielles sont selectionnees au runtime. Le bras
+baseline / v2 / v3 mesure precisement cela.
+
+### Le PGO de la release etait un chiffre Apple generalise, et il coutait 3,3 % sur x86 (2026-08-18)
+
+`release.yml` construit chaque artefact en PGO, avec un commentaire qui annonce +4,4 % mesure sur
+« 500k paires reelles contre GRCh38 ». Cette mesure etait sur Apple Silicon. Refaite sur trois
+architectures, trois repetitions entrelacees chacune, aucune ne se croisant :
+
+| hote | plain | PGO | verdict |
+|---|---|---|---|
+| M4 (Apple Silicon) | | | **+12,4 %** |
+| Ampere Altra (ARM heberge) | 69,43 / 69,90 / 69,69 s | 69,99 / 70,32 / 69,95 s | **-0,6 %** |
+| AMD EPYC 7763 (Zen 3), recette cargo-pgo | 103,95 / 103,59 / 104,01 s | 108,66 / 107,98 / 107,80 s | **-4,1 %** |
+| AMD EPYC 7763, **recette exacte de `release.yml`** | 104,22 / 104,27 / 104,27 s | 107,36 / 108,15 / 108,24 s | **-3,3 %** |
+
+La derniere ligne est celle qui decide : meme recette, meme entrainement sur `testdata/tiny`, memes
+CFLAGS. Ce n'est pas un proxy, c'est le chemin livre. **Chaque artefact `linux-x86_64` publie
+jusqu'ici est donc ~3 % plus lent qu'un build ordinaire**, sur la plateforme ou tourne l'essentiel du
+WGS, et le -0,4 % de nh13 sur Graviton4 disait la meme chose depuis le debut sans qu'on le croie.
+
+Le build PGO est maintenant conditionne par un champ de matrice : Apple Silicon profile, les trois
+autres compilent en clair. Effet de bord agreable : ces trois artefacts redeviennent reproductibles
+depuis un arbre propre par `cargo build --release`, ce qu'un artefact PGO n'est pas.
+
+`macos-x86_64` est desactive sans mesure propre, deliberement : deux architectures non-Apple sur deux
+perdent, et livrer des octets plus lents sur une supposition non mesuree est le mauvais defaut.
+
+### Le jeu d'instructions vaut 5,6 a 6,8 %, et il est livre (2026-08-18)
+
+Le levier que la retro-ingenierie du fork designait, mesure. AMD EPYC 7763, chr21, 400k paires
+simulees, `-t4`, deux repetitions, meme source des deux cotes :
+
+| bras | wall |
+|---|---|
+| baseline x86-64 (ce que nous livrions) | 32,99 s / 33,42 s |
+| `-C target-cpu=x86-64-v3` (AVX2) | **31,42 s / 31,15 s** |
+
+**5,6 % au minimum, 6,8 % en median**, et **sortie identique au md5** (`6b084cb8...` des deux cotes).
+Rien dans le code ne change : c'est le compilateur qui a enfin le droit d'auto-vectoriser les
+boucles scalaires de seeding, de chainage, de resolution SA et d'emission SAM, celles que le profil
+x86 montrait a 3,5x, 4,3x et 5,15x du meme etage sur M4 pendant que les noyaux vectoriels etaient a
+2,57x. C'est exactement ce que `BASELINE_ARCH ?= avx2` fait chez fg-labs/bwa-mem3 depuis toujours.
+
+**Livraison.** L'artefact par defaut reste en baseline, pour tourner partout ; un second executable
+`bwa-mem4-x86-64-v3` voyage dans la meme archive avec une note qui dit a qui il s'adresse. Il subit
+les memes gates que le principal, plus une troisieme qui est la seule qui compte pour un binaire en
+double : **son SAM doit diffe propre contre celui du binaire baseline**, en plus de reconstruire
+l'index a l'octet.
+
+Au passage, les balayages de tiers sur le meme runner, 400k paires : extension `scalar` 238,46 s,
+`sse41` 37,39, `avx2` 33,76 ; rescue `scalar` 306,99 s, `avx2` 34,19. Les noyaux portent bien ce
+qu'on croyait qu'ils portaient.
+
+### Deux corrections sur mes propres chiffres du jour (2026-08-18)
+
+Consignees parce qu'un chiffre flatteur non corrige est pire que pas de chiffre.
+
+**L'emetteur SAM ne gagne rien, sur aucune des deux plateformes.** Le commit qui l'a introduit
+annoncait -4,3 % sur `sam_emit` a partir d'UNE mesure. Cinq repetitions entrelacees donnent 2,641
+contre 2,637 s aux minima sur ARM, et le profil x86 refait donne **28,736 contre 28,530 s**, -0,7 %,
+le run entier restant dans son propre bruit.
+
+La raison merite d'etre sue avant que quelqu'un ne recommence : **a la baseline x86-64, une table de
+256 entrees ne se vectorise pas du tout**, `pshufb` etant SSSE3. La boucle par blocs fait donc
+toujours un chargement de table par base et n'economise que la verification de capacite. La version
+du fork est rapide parce que TOUT leur binaire est compile en AVX2, et la notre le devient dans
+l'artefact `x86-64-v3` que nous livrons maintenant, dont les 5,6-6,8 % mesures incluent ce que ce
+fichier y apporte. Ce qu'il vaut aujourd'hui n'est donc pas du wall : c'est une allocation de moins
+par champ entier de chaque enregistrement, 40 par read au compteur de la sonde, et une forme que le
+compilateur vectorisera des qu'on l'y autorisera.
+
+**Le profil par etage etait illisible avec le recouvrement.** La premiere table `BWA4_STAGE_TIME`
+prise ce jour donnait `encode` a 29,8 % et une somme a 197 %. Les accumulateurs sont globaux au
+processus, donc deux batchs en vol creditent les memes compteurs. Toutes les parts citees ici sont
+prises avec `BWA4_NO_BATCH_OVERLAP=1`, et le workflow le fait desormais pour chaque sonde.
+
+### L'indexeur parallele est livre, et l'objection tombe par la mesure (2026-08-19)
+
+`libsais-c-omp` existe depuis longtemps et vaut **1,68x a l'echelle du genome** (GRCh38 : 152,45 s en
+serie, 90,96 s a 8 threads, index octet-identique, +7 % de RSS de pointe). Ce qui l'empechait
+d'entrer dans les artefacts etait une phrase du `Cargo.toml` : un artefact qui gagnerait
+silencieusement une dependance dylib serait pire qu'un index plus lent.
+
+Cette phrase est testable. Avec `OPENMP_STATIC=1` et GCC, que tout runner Linux a :
+
+```
+== plain ==  ld-linux, libc, libgcc_s.so.1, libm, vdso
+== omp   ==  ld-linux, libc,                libm, vdso
+```
+
+**Aucune bibliotheque gagnee, et une de MOINS** : `openmp-sys` lie aussi `libgcc` statiquement. Les
+deux binaires reconstruisent l'index commite a l'octet, et chr21 passe de **5,20 s a 3,84 s** sur les
+quatre threads du runner, meme md5.
+
+Les deux cibles Linux construisent donc desormais avec, et le job de release **assert sur `ldd`**
+qu'aucun runtime OpenMP partage n'entre dans l'artefact. macOS reste en serie volontairement :
+`libomp` y est un paquet brew et non quelque chose que la toolchain fournit, donc il n'y aurait rien
+contre quoi lier statiquement.
+
+Ce que cela dit au-dela de l'index : **l'objection etait raisonnable et fausse**, et elle a bloque un
+1,68x pendant des mois parce que personne n'avait ecrit les cinq lignes de CI qui la verifient. Le
+`ldd` d'un binaire est une mesure, pas une opinion.
+
+## Le travail litteralement duplique, deux fois dans la meme journee (2026-08-19)
+
+Le meme raisonnement a paye deux fois, et il vaut d'etre nomme parce qu'il est reutilisable : **un
+calcul est une fonction pure de ses entrees, donc deux entrees identiques sont un calcul et une
+copie, et la sortie ne peut pas s'en apercevoir.** Contrairement a une heuristique, cela ne demande
+aucune concession sur l'octet-identite : ce n'est pas une approximation, c'est la meme reponse
+obtenue une fois au lieu de deux.
+
+### 1. Les marches du tableau de suffixes
+
+Deux SMEM identiques apres le tri enumerent les memes rangees. Les supprimer n'est PAS
+octet-identique (cela retire des seeds, et la passe de rejet compte les slots : `XS` bouge sur 4
+enregistrements par million, mesure). Garder le SMEM et ne sauter que la MARCHE l'est.
+
+| | chr21 wgsim | GIAB reel, genome |
+|---|---|---|
+| rangees supprimees | 11,9 % | **17,6 %** |
+| temps de `get_sa_batch` | -3,9 % | **-10,6 %** |
+| effet sur le run | < 1 % | < 1 % |
+
+Les rangees sautees etaient les moins cheres : elles venaient d'etre marchees, donc en cache. Le cout
+par rangee reellement marchee monte de 61 a 66 ns, ce qui est le meme fait vu de l'autre cote.
+
+### 2. Les jobs de programmation dynamique
+
+Un job d'extension est une fonction de `(query, target, h0)`. Mesure AVANT d'ecrire quoi que ce soit,
+avec `BWA4_JOB_DUP` : **16,2 % des jobs et 11,8 % des cellules sur chr21, 23,8 % et 18,3 % sur GIAB
+reel**. Ce ne sont pas des reads dupliques (24 sequences repetees sur 1M, 485 sur 500k) : ce sont des
+seeds differents ouvrant la meme fenetre, souvent dans le meme read.
+
+Le piege etait le cout de detection : un hachage octet par octet sur ~230 octets aurait mange un
+tiers du DP du job. Le fingerprint lit des mots de 64 bits aux extremites, et les candidats sont
+**verifies par comparaison d'octets**, donc une collision coute un `memcmp` et jamais une fausse
+reponse.
+
+| mesure | avant | apres | |
+|---|---|---|---|
+| etage `align`, chr21 | 24,797 s | 23,770 s | **-4,1 %** |
+| run complet, chr21 | 36,19 s | 35,23 s | **-2,65 %** |
+| run complet, 500k paires GIAB | 12,49 s | 12,13 s | **-2,9 %** |
+
+Cinq repetitions par mesure, aucun bras ne chevauchant l'autre. Octet-identite verifiee trois fois :
+chr21 1M paires, 500k paires GIAB reelles, et 64/64 sur la matrice d'options.
+
+**La portee du dedup est deja maximale** : le taux est identique a 1, 4 et 12 threads (15,97 %), donc
+les doublons sont locaux et un chunk plus large n'en trouverait pas d'autres.
+
+### Ce que la meme recherche a elimine
+
+- **Reads identiques** : 24 sur 1M et 485 sur 500k. Rien a prendre.
+- **Jobs de rescue dupliques** : 0 sur 2,2 M, la sonde le mesurait deja.
+- **Repartition u8/i16** : 98,1 % des cellules sont deja dans le kernel a 16 voies ; le levier plafonne a 0,4 %.
+- **Tri par longueur avant decoupage** : 1,07x de divergence seulement, dont 4,0 % recuperables, moins le cout de trier 35 M de jobs.
+- **Les deux reglages de kernel** (`BWA4_EXTEND_SBT`, `BWA4_EXTEND_BANDFAST`) sont deja dans leur meilleure position, de 3 % et 6 %.
+
+### L'ecart wgsim x86, enfin attribue etage par etage (2026-08-19)
+
+Le binaire conda du fork imprime le profil bwa-mem2 complet sur stderr a chaque run, et chaque
+benchmark de ce depot le jetait. Une fois lu, sur le meme EPYC et les memes reads (CPU total,
+moyennes par thread x 4) :
+
+**wgsim, nous 199,7 s wall contre ~152 s :**
+
+| etage | fork | nous | verdict |
+|---|---|---|---|
+| SMEM (seeding) | 127,6 s CPU | ~103 s | nous +24 % |
+| SAL / MEM_SA | 55,7 s | 25,7 s | **nous 2,2x devant** |
+| BSW (kernels d'extension) | **204,9 s** | ~275 s | eux +34 %, ~17 s de wall |
+| WORKER_SAM (pairing+rescue+SAM) | **210,2 s** | ~282 s | eux +34 %, ~18 s de wall |
+
+**Donnees reelles, nous 111,4 s contre 103,6-108,1 s :** leur SMEM monte a 192 s CPU (les erreurs
+reelles multiplient les rounds) et nous gagnons TOUT le cote align ; eux ne gagnent que WORKER_SAM
+(92 contre 115 s CPU). D'ou le 1,045x.
+
+Deux chantiers, donc, et rien d'autre :
+
+1. **BSW.** Leur `bandedSWA` fait du band narrowing (`tight_band` dans leurs propres diagnostics) :
+   ils calculent MOINS de cellules, pas des cellules plus rapides. Notre kernel marche toutes les
+   colonnes de `gbeg..gend` sous masque. La question ouverte est de savoir si leur resserrement est
+   octet-identique par preuve ou par chance, et si notre bande peut se resserrer pareil.
+2. **WORKER_SAM.** 282 contre 210 s CPU alors que notre kernel de rescue est PLUS RAPIDE au
+   micro-bench (11,27 contre ? Gcell/s). Leur avantage est dans la colle : pairing, tri, emission.
+
+Et deux endroits ou nous les battons nettement des deux cotes : le seeding et les lookups SA.
+
+### Le levier qui peut battre le fork : la bande resserree par le score non-gappe (2026-08-19)
+
+Le diff par etage designait BSW (leurs kernels d'extension : 205 s CPU contre nos 275 sur les memes
+reads wgsim). La cause est dans `bwamem.cpp:4119` du fork, et c'est un lemme, pas une heuristique :
+
+> Quand la voie rapide non-gappee echoue sur les mismatches, la marche diagonale a quand meme produit
+> un score `S`. Tout alignement a offset `B` de la diagonale paie au moins `B` gaps, donc pour battre
+> `S` il faut `B < (min_len * a - S) / (o_min + e_min)`. La bande utile est bornee par ce plafond.
+
+`BWA4_TIGHT_CEIL=1` (sonde, comptage seul) mesure ce que ce resserrement retirerait de NOS jobs :
+
+| jeu | jobs resserres | cellules bandees | plafond |
+|---|---|---|---|
+| chr21 wgsim, 1M paires | 28,17 M / 28,17 M (100,0 %) | 337,3 G -> 11,6 G | **96,6 % retirees** |
+| GIAB reel, 500k paires | 12,29 M / 12,32 M (99,7 %) | 121,4 G -> 10,6 G | **91,3 % retirees** |
+
+La bande par defaut (w=100, 201 colonnes) ne mord presque pas sur des reads de 150 pb : le kernel
+marche des rectangles quasi complets pendant que le score diagonal borne la bande utile a quelques
+colonnes. L'arithmetique du plafond : capturer meme les deux tiers des 275 s CPU ramene notre wall
+wgsim de ~200 s sous les 152 s du fork. **C'est le seul levier de cette taille encore ouvert, et il
+suffit.**
+
+**Les trois risques d'octet-identite, a trancher avant de livrer :**
+
+1. **Les egalites a exactement `S`.** Le lemme donne `score(B >= borne) <= S`, inegalite LARGE : un
+   alignement hors-bande peut faire jeu egal, et les departages de ksw (quelle cellule garde
+   `qle`/`tle`) different alors entre les deux largeurs. Le `ceil` du fork laisse ce coin ouvert ;
+   un `+1` sur la borne le fermerait au prix de quelques colonnes.
+2. **`max_off` et le z-drop.** Les maxima de ligne incluent aujourd'hui des cellules hors bande
+   resserree ; avec la bande etroite ils baissent, donc le z-drop peut se declencher plus tot et
+   `max_off` change. Le fork contourne en SAUTANT l'echelle de retries sur le statut TIGHT ; notre
+   `run_side` keye son test d'acceptation sur `max_off < 3/4 w`, donc la meme adaptation est requise,
+   pas une simple borne.
+3. **L'union des voies.** Notre kernel inter-sequences marche `gbeg..gend` en UNION des bandes des 16
+   voies : une voie large force tout le monde. Le gain exige de regrouper les jobs par borne avant le
+   decoupage en voies, ce que la gate d'invariance a l'ordre du batch couvre deja.
+
+Le fork valide le sien empiriquement sur 322 M d'enregistrements. Notre barre est la meme plus
+l'oracle : matrice d'options 64/64, chr21 1M, GIAB 500k, `oracle_diff.sh`, et la gate GIAB de
+variants. Implementation derriere `BWA4_TIGHT_BAND`, off tant que tout n'est pas vert.
+
+### La bande resserree est le defaut, et le match contre le fork bascule (2026-08-20)
+
+Le port du `tight_band` du fork, avec son lemme corrige trois fois (le restart interdit dans la DP
+d'extension, la forme a un run de gaps que leur propre commentaire ecrit faux, le `h0` manquant du
+cote majorant) et une marge derivee pour la fenetre `gscore`, est active PAR DEFAUT.
+`BWA4_NO_TIGHT_BAND` restaure la pleine bande.
+
+**La batterie qui l'a autorise** : md5 identiques sur chr21 1M paires et GIAB 500k reelles (ARM),
+sur wgsim et reels (x86, verifie en CI par une etape qui echoue le run sinon), matrice d'options
+64/64 contre l'oracle, gate locale complete verte. Les gates de champs epinglent la pleine bande via
+un interrupteur de test : le resserrement change legitimement `gscore`/`gtle` dans la fenetre que
+l'appelant ne lit jamais, et son arbitre est le SAM.
+
+**Le tableau des courses, entrelacees, aucun bras ne chevauchant l'autre :**
+
+| terrain | nous (tight) | fork | verdict |
+|---|---|---|---|
+| ARM chr21 wgsim, 7 reps | 33,18-33,60 s | 35,28-35,86 s | **nous, 7/7 (-6,0 %)** |
+| ARM GIAB reel, 7 reps | 12,02-12,28 s | 12,19-12,40 s | **nous, 7/7 (-1,4 %)** |
+| x86 reel, tirage 1 | 106,7-108,0 s | 107,2-108,8 s | **nous, 3/3** |
+| x86 reel, tirage 2 | 110,4-111,5 s | 123,0-124,5 s | **nous, 3/3 (-11 %)** |
+| x86 wgsim | ~189,4 s | ~156,2 s | eux, 1,21x (etait 1,31x) |
+
+Sur les donnees que les utilisateurs alignent reellement, nous battons le fork sur les deux
+architectures. Le seul terrain restant est wgsim x86, et son ecart residuel est attribue : ~la
+moitie dans BSW encore, l'autre dans WORKER_SAM (leur colle pairing+rescue+emission compile en AVX2
+contre notre v3, alors que notre kernel de rescue est plus rapide au micro-bench).
+
+### L'enquete ksw_global2, hypothese par hypothese (2026-08-20)
+
+`emit_split` a reduit l'anomalie `sam_emit` x86 a une fonction : `ksw_global2`, 30,6 us/appel sur
+Zen 3 contre 5,4 sur M4 (5,7x coeur pour coeur, kernels a 2,6x), 89,6 s CPU du run wgsim.
+
+**Hypothese 1, branches imprevisibles : morte, et par le temoin.** L'asm v3 local montrait 64
+branches et 12 cmov ; `hint::select_unpredictable` sur les cinq selections du corps force les cmov
+(11 cmov / 7 branches previsibles dans la boucle apres). Course refaite : normalise par le temoin
+`bwa-mem2` du meme tirage, le cout par appel n'a PAS bouge (~31 us equivalents). L'avant/apres
+d'assembleur local etait pollue par le cache de build ; le temoin embarque dans la course ne l'est
+pas. Le changement reste (semantiquement identique, inoffensif), l'hypothese est enterree.
+
+**Hypothese 2, quatre allocations et 5,5 Ko de first-touch par appel : en cours.** Scratch
+thread-local reutilise, avec deux pieges payes et documentes : `resize` opacifie la longueur et LLVM
+remet des bounds checks dans la boucle (+2,1 us/appel sur ARM, corrige par des reslices a longueur
+explicite) ; la reutilisation de `z` n'est saine que parce que le traceback ne lit que les cellules
+ecrites par la passe avant, ce que les directions enregistrees garantissent. md5 identique, ARM au
+niveau (7,85 contre 7,66-7,92 s CPU). Le verdict x86 est dans la course en vol.
+
+**Le cote rescue, sonde `rescue_split`** : collect 1,9 s / kernel 22,0 s / **apply 14,2 s CPU** sur
+ARM. L'apply est l'insertion+retri de #38, et le plafond du regroupement des dedups par call est
+~20 % d'un poste de 14 s (2,18 M dedups pour ~1,8 M calls a hit), soit <1 % du run, contre un risque
+reel sur l'ordre de merge : le verdict de #38 tient, reconfirme avec les chiffres du jour.
+
+### L'enquete est close : l'anomalie scalaire etait la plateforme (2026-08-20)
+
+L'hypothese des allocations est morte comme celle des branches, et par le meme temoin : normalise
+par le `bwa-mem2` du meme tirage, le scratch thread-local n'a pas bouge `ksw_global2` (92,7 s CPU
+equivalents contre 89,6). Le hoisting reste, il retire 11,7 M d'allocations par run pour un cout nul.
+
+Ce qui a ferme le dossier est la sonde rescue sur EPYC : collect 18,1 / kernel 92,7 / apply 67,5 s
+CPU. Rapportes a l'ARM, les kernels vectoriels sont a 2,1x (l'ecart de coeur normal) mais `apply` ET
+`ksw_global2`, deux colles scalaires sans lien, sont tous deux a ~5-6x. Deux fonctions differentes,
+meme facteur : c'est la plateforme, pas le code. Les runners heberges exposent des vCPU qui sont des
+freres SMT (4 vCPU = 2 coeurs) ; le code vectoriel, borne par le debit des ports, encaisse le
+partage, les chaines scalaires dependantes le paient double. Le M4 n'a pas de SMT. Le fork paie la
+meme taxe sur sa propre colle (WORKER_SAM 210-223 s CPU), donc la comparaison entrelacee reste juste,
+et l'ecart wgsim residuel (1,19-1,21x) est de l'ingenierie reelle, leurs builds par tier sur toute
+leur colle, pas un mystere de notre cote.
+
+Consequence pratique : les optimisations de colle scalaire ne se mesurent PAS sur ces runners, leurs
+gains y sont ecrases par la taxe SMT. Le chiffre de tete wgsim x86 exige la machine dediee de #32,
+comme le disait deja la conclusion du PGO.
+
 ## Ce qui reste
 
-1. **Gate GIAB `hap.py`/`vcfeval`** (phase 11) : montrer que la parite octet se traduit en
-   concordance de variants sur le truth set, ce qui est le langage d'un utilisateur clinique.
-2. **`mem_sort_dedup_patch`** : **regarde (2026-07-29)**, 13,3 % du busy sur un profil `sample` en
-   donnees reelles. Ce n'est PAS l'etage dedup (0,8 % du wall) : c'est le mate rescue qui reinsere une
-   region puis retrie tout le vecteur, a chaque orientation, sur jusqu'a 50 rounds. `BWA4_DEDUP_SHAPE`
-   mesure **n moyen = 94,87** et **1,84 M d'appels avec n >= 65**, tous venant du rescue.
-   Deux correctifs octet-identiques livres (`dirty` pour sauter les re-tris a vide, **-14,2 %
-   d'appels** ; pile d'introsort en tableau fixe, ~10 M d'allocations en moins) : **~2 % de wall en
-   design apparie 4/4, donc sous le plancher de 3 %**. Le reste est incompressible sans une structure
-   incrementale reproduisant l'ordre exact des egalites de klib, la permutation etant observable dans
-   la sortie. Detail complet et tables dans `docs/perf-levers.md`.
-3. **SA-IS parallele** (Tier B de la phase 8c) : l'indexeur reste mono-thread sur le tableau de
-   suffixes, qui domine son pic RSS et son temps.
-4. ~~**Re-mesurer le fork `fg-labs/bwa-mem3`**~~ : **fait (2026-07-29)**, sur vraies donnees GIAB et
-   en PGO : **0,981x, egalite**. Voir l'encart de la phase B et `docs/perf-levers.md`.
-5. **Verifier le PGO sur Graviton** : nh13 mesure le PGO a **-0,4 %** sur Graviton4 la ou il vaut
-   **+12,4 %** ici. Les deux ne peuvent pas etre une propriete du code : soit son build n'a pas
-   applique son profil, soit le benefice est propre a l'Apple Silicon. Seule question ouverte du
-   dossier, et elle se tranche de son cote.
+1. **Le chiffre de tete WGS x86 (#32)** : exige une machine dediee. Un runner heberge ne peut ni
+   construire l'index GRCh38 (pic 92 GB) ni mesurer la colle scalaire (taxe SMT, voir l'enquete
+   ksw_global2). C'est aussi la ou l'ecart wgsim residuel contre le fork (1,19-1,21x) se mesurerait
+   honnetement.
+2. **Le kernel AVX-512 (#44)** : correctness bloquee sur du materiel Intel (la flotte ne donne que
+   de l'AMD, QEMU n'emule pas AVX-512, Intel SDE est un telechargement sous licence). Les tests ne
+   s'esquivent plus en silence et la question de rendre le tier opt-in tant qu'il n'a jamais tourne
+   reste posee au mainteneur.
+3. **L'ecart wgsim x86 residuel** : attribue (leurs builds par tier sur toute la colle, plus la taxe
+   SMT partagee), plus aucun mystere. Le fermer voudrait dire des artefacts multi-tiers au-dela du
+   binaire v3 deja livre, une decision de packaging plus que d'algorithme.
+4. **La veine du travail duplique est epuisee**, et le fichier des impasses porte tout ce qui a ete
+   essaye et refuse, avec les chiffres. Ne pas re-fouiller sans une donnee nouvelle.
+
+Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a bwa-mem2 :
+ARM wgsim 7/7 pour nous (-6 %), ARM reel 7/7, x86 reel 9/9 sur trois tirages, x86 wgsim 1,19-1,21x
+pour eux. Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux.

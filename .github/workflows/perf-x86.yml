@@ -1,0 +1,572 @@
+# Where the x86_64 wall goes, stage by stage (issues #20, #32).
+#
+# The measurement this repo owes. On Apple Silicon we are at parity with fg-labs/bwa-mem3 (0.981x,
+# real GIAB, PGO); off it we are at 0.71x on Zen 3 and 0.76x on a hosted runner, reproducibly. Every
+# explanation so far has been a guess, because the ARM profile is the only one anyone has read: on
+# ARM, seeding plus chaining is ~78% and extension ~22%, and mate rescue is 47-64% of paired-end
+# compute. Nothing says those shares hold on x86, where the vector kernels are different code.
+#
+# So this job runs OUR probes on x86 and prints them next to the fork's wall clock on the same host:
+# per-stage wall (BWA4_STAGE_TIME), per-region pool occupancy (BWA4_BARRIER_TIME), the align stage's
+# internal split (BWA4_ALIGN_SPLIT, which needs its own build), chaining and SA resolution
+# (BWA4_CHAIN_TIME), the rescue kernel's cell rate (BWA4_MATESW_TIME), and a scalar-vs-AVX2 sweep of
+# that kernel. A deficit has to show up in one of those or it is not in the aligner at all.
+#
+# Manual dispatch only, like bench-x86: cloud runners are noisy, and what is readable here are
+# shares and ratios taken inside one job on one host.
+name: perf-x86
+
+on:
+  workflow_dispatch:
+    inputs:
+      read_pairs:
+        description: "Read pairs to simulate"
+        default: "2000000"
+        required: false
+
+# One run of this workflow at a time per ref. Without it a second push while the first run is still
+# measuring leaves two hour-long jobs racing for the same runners, which happened four times while
+# this branch was being written and had to be cleaned up by hand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  perf-x86:
+    name: where the x86 wall goes, ours against the fork
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0} # login shell so the micromamba env is active
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log the host
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          # -o without -m1: with -o, grep -m1 stops after the first MATCH, not the first matching
+          # line, which is how bench-x86 printed a bare "avx2" on hosts that had avx512bw too.
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "nproc: $(nproc)"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + bwa-mem3 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3
+            wgsim
+          init-shell: bash
+
+      # Two builds: the shipped one carries every probe that costs nothing when off, and a second
+      # one carries `align-split`, which is a Cargo feature precisely because its wrapper is a
+      # barrier the inliner does not always see through. Timing the align stage's internals with the
+      # shipped binary is not possible, and timing the WHOLE run with the align-split binary would
+      # measure the probe.
+      - name: Build bwa-mem4, shipped and align-split
+        shell: bash
+        run: |
+          cargo build --release -p bwa-mem4
+          cp target/release/bwa-mem4 ./bwa-mem4-shipped
+          cargo build --release -p bwa-mem4 --features align-split --target-dir target-split
+          cp target-split/release/bwa-mem4 ./bwa-mem4-split
+
+      - name: Fetch reference (GRCh38 chr21)
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz
+          gunzip -f chr21.fa.gz
+
+      - name: Build shared index
+        run: cd work && bwa-mem2 index chr21.fa
+
+      - name: Simulate reads
+        run: |
+          cd work
+          n="${{ github.event.inputs.read_pairs || '2000000' }}"
+          wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          echo "simulated $n pairs"
+
+      - name: The gap, on this host
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../bwa-mem4-shipped
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2>/dev/null   # warm
+          echo "threads=$T"
+          for rep in 1 2 3; do
+            m4=$(timed $M4 mem -t "$T" chr21.fa r1.fq r2.fq)
+            fk=$(timed bwa-mem3 mem -t "$T" chr21.fa r1.fq r2.fq)
+            m2=$(timed bwa-mem2 mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: bwa-mem4 ${m4}s | bwa-mem3 ${fk}s | bwa-mem2 ${m2}s"
+          done
+
+      # Everything below is one run each: these are shares, and a share does not need repeating the
+      # way a wall-clock difference does.
+      - name: Where our wall goes (stages, occupancy, kernels)
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../bwa-mem4-shipped
+          SP=../bwa-mem4-split
+          run_probe() {
+            local title="$1"; shift
+            echo
+            echo "===== $title ====="
+            "$@" mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null 2> probe.err || { echo "FAILED"; tail -5 probe.err; return; }
+            grep -E '^\[(stage-time|barrier|align-split|chain-time|matesw|traffic|seed)' probe.err || tail -20 probe.err
+          }
+          # Every probe below runs with ONE batch in flight. `BWA4_STAGE_TIME`'s accumulators are
+          # process-wide, so with the overlap on, two batches credit the same stage counters and the
+          # table sums past 100% (measured on ARM: encode reads 29.8% and the total 197%). The stage
+          # SHARES are the whole point here, so they are taken where they are exact. It costs 1.1%
+          # of wall, which no share in this step is sensitive to.
+          NOOV="BWA4_NO_BATCH_OVERLAP=1"
+          run_probe "per-stage wall (BWA4_STAGE_TIME)"      env $NOOV BWA4_STAGE_TIME=1 $M4
+          run_probe "pool occupancy per region (BWA4_BARRIER_TIME)" env $NOOV BWA4_BARRIER_TIME=1 $M4
+          run_probe "chaining and SA resolution (BWA4_CHAIN_TIME)"  env $NOOV BWA4_CHAIN_TIME=1 $M4
+          run_probe "rescue kernel cells (BWA4_MATESW_TIME)"        env $NOOV BWA4_MATESW_TIME=1 $M4
+          run_probe "align internals (BWA4_ALIGN_SPLIT, split build)" env $NOOV BWA4_ALIGN_SPLIT=1 $SP
+
+          # A fifth of the reads for every sweep below. Sweeps compare arms against each other, so
+          # they need a workload big enough to be steady and no bigger; the forced-scalar arms are an
+          # order of magnitude slower than the vector ones, and at full size they alone put this job
+          # past its 120-minute ceiling. The head-to-head above keeps the full set.
+          head -n 800000 <(zcat -f r1.fq) > s1.fq; head -n 800000 <(zcat -f r2.fq) > s2.fq
+          echo "sweeps run on $(( $(wc -l < s1.fq) / 4 )) pairs"
+
+          echo
+          echo "===== SA prefetch window sweep (BWA4_SA_WINDOW) ====="
+          # The window is the count of LF-walks kept in flight, i.e. how many DRAM misses are
+          # outstanding at once, and it was swept to 128 on an M4. Zen 3 and M4 do not have the same
+          # number of outstanding-miss slots, so the knee need not be in the same place. 128 is the
+          # compile-time ceiling, so this can only narrow: a wider optimum would show up as a curve
+          # still falling at 128, and would need a rebuild to confirm.
+          for w in 16 32 64 96 128; do
+            s=$( { /usr/bin/time -f '%e' -o w.txt env BWA4_NO_BATCH_OVERLAP=1 BWA4_SA_WINDOW=$w $M4 mem -t "$T" chr21.fa s1.fq s2.fq >/dev/null; } 2>/dev/null; cat w.txt)
+            echo "  W=$w: ${s}s"
+          done
+
+  # wgsim hides mate rescue, and this repo has already been burned by that: bwa-mem2's own
+  # paired-end-specific work is 0.49 us/read on wgsim and 15.37 us/read on real GIAB, 31x more
+  # (docs/perf-levers.md). @nh13's x86 table is real WGS and real WES, where we are 1.27x and 1.50x
+  # slower; every x86 number this repo has produced so far is simulated. So this job repeats the
+  # head-to-head on REAL HG002 reads, sliced out of GIAB's own BAM the way the giab-gate workflow
+  # does, and takes the stage profile there too.
+  real-reads-x86:
+    name: the gap on REAL reads, and where it goes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + bwa-mem3 + samtools (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3
+            samtools
+          init-shell: bash
+
+      - name: Build bwa-mem4
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+        run: cargo build --release -p bwa-mem4
+
+      - name: Reference and index
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          sed -i '1s/.*/>chr21/' chr21.fa
+          bwa-mem2 index chr21.fa
+
+      - name: Real HG002 reads
+        run: |
+          cd work
+          bam="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG002.GRCh38.300x.bam"
+          # Same slice as the gate, at a fifth of the subsampling, so the benchmark has a few million
+          # pairs rather than one: a 30-second run measures start-up, not alignment.
+          samtools view -@ 4 -b -s 0.5 "$bam" chr21:20000000-30000000 > slice.bam
+          samtools collate -@ 4 -u -O slice.bam \
+            | samtools fastq -@ 4 -1 g1.fq.gz -2 g2.fq.gz -0 /dev/null -s /dev/null -n
+          echo "pairs: $(( $(zcat g1.fq.gz | wc -l) / 4 ))"
+
+      - name: Head-to-head on real reads
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../target/release/bwa-mem4
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          $M4 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz >/dev/null 2>/dev/null   # warm
+          for rep in 1 2 3; do
+            m4=$(timed $M4 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
+            fk=$(timed bwa-mem3 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
+            m2=$(timed bwa-mem2 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
+            echo "rep $rep: bwa-mem4 ${m4}s | bwa-mem3 ${fk}s | bwa-mem2 ${m2}s"
+          done
+
+      - name: Where our wall goes on real reads
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../target/release/bwa-mem4
+          # One batch in flight, so the stage shares are exact rather than two batches' counters
+          # added together.
+          for probe in BWA4_STAGE_TIME BWA4_BARRIER_TIME BWA4_CHAIN_TIME BWA4_MATESW_TIME; do
+            echo; echo "===== $probe ====="
+            env BWA4_NO_BATCH_OVERLAP=1 "$probe=1" $M4 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz \
+              > /dev/null 2> p.err || { echo FAILED; tail -5 p.err; continue; }
+            grep -E '^\[(stage-time|barrier|chain-time|matesw)' p.err || tail -10 p.err
+          done
+
+  # Does the RELEASE recipe's PGO pay on Linux x86_64?
+  #
+  # This is not the same question as the `pgo-x86` job above, and the two disagree, which is why it
+  # exists. That job used cargo-pgo and trained on 200k simulated pairs, and measured -4.1%.
+  # release.yml uses hand-rolled `-Cprofile-generate` / `-Cprofile-use` and trains on the committed
+  # `testdata/tiny` fixture with 8000 reads, and its comment claims +4.4%. Every release artefact is
+  # built the second way, so the second way is what has to be measured: if PGO is a loss on Linux
+  # x86_64, we are shipping a slower binary to the platform where most WGS runs.
+  #
+  # The recipe below is copied from release.yml deliberately, including the CFLAGS that keep the
+  # instrumentation away from the C toolchain, so this measures the shipped path and not a variant
+  # of it.
+  release-pgo-x86:
+    name: does the RELEASE recipe's PGO pay on x86
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust with the LLVM tools
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+          components: llvm-tools-preview
+
+      - name: Install bwa-mem2 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            wgsim
+          init-shell: bash
+
+      - name: Reference, index, reads
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          bwa-mem2 index chr21.fa
+          wgsim -S 11 -N 1000000 -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+
+      - name: Plain build
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+        run: |
+          cargo build --release --locked --target-dir target-plain
+          cp target-plain/release/bwa-mem4 ./bwa-mem4-plain
+
+      - name: PGO build, exactly as release.yml does it
+        shell: bash
+        env:
+          CFLAGS: -fno-profile-generate -fno-profile-use
+          CXXFLAGS: -fno-profile-generate -fno-profile-use
+        run: |
+          set -euo pipefail
+          PROFDIR="$PWD/target/pgo"
+          rm -rf "$PROFDIR"; mkdir -p "$PROFDIR/train"
+          RUSTFLAGS="-Cprofile-generate=$PROFDIR" cargo build --release --locked
+          cp testdata/tiny/tiny.fa "$PROFDIR/train/"
+          python3 scripts/make_test_reads.py testdata/tiny/tiny.fa "$PROFDIR/train/r" --n 8000
+          ./target/release/bwa-mem4 index "$PROFDIR/train/tiny.fa"
+          ./target/release/bwa-mem4 mem -t 2 "$PROFDIR/train/tiny.fa" \
+              "$PROFDIR/train/r_1.fq" "$PROFDIR/train/r_2.fq" > /dev/null
+          PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)
+          "$PROFDATA" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/*.profraw
+          RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata" cargo build --release --locked
+          cp target/release/bwa-mem4 ./bwa-mem4-pgo
+          ls -la bwa-mem4-plain bwa-mem4-pgo
+
+      - name: A/B, interleaved, on the workload a user runs
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          for b in plain pgo; do ../bwa-mem4-$b mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null; done
+          for rep in 1 2 3; do
+            p=$(timed ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq)
+            g=$(timed ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: plain ${p}s | release-recipe pgo ${g}s"
+          done
+          ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+          ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+
+  # The instruction-set arm and the kernel tier sweeps, in their OWN job.
+  #
+  # They used to be the last two steps of the profile job and were killed twice by the 120-minute
+  # ceiling after queueing behind an hour of profiling; a build matrix and a forced-scalar arm do not
+  # belong at the end of a long job. Same data, same runner class, independent budget.
+  isa-and-tiers-x86:
+    name: what the instruction set and each kernel tier are worth
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            wgsim
+          init-shell: bash
+
+      - name: Reference, index, reads
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          bwa-mem2 index chr21.fa
+          # A fifth of the profile job's read set: every measurement in this job is a RATIO between
+          # arms on one host, and the forced-scalar arms are an order of magnitude slower.
+          wgsim -S 11 -N 400000 -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          echo "pairs: 400000"
+
+      # bwa-mem2, and the fork with it, SHIP one binary per instruction set (`bwa-mem2.avx2`,
+      # `bwa-mem2.avx512bw`) and pick at exec time. We ship one baseline binary and select only the
+      # rescue and extension kernels at runtime, which leaves every scalar loop in seeding, chaining
+      # and SA resolution compiled for a 2003 CPU. That is a plausible slice of the x86 deficit and
+      # it has never been measured, so here it is measured: same source, three instruction-set
+      # levels, one host.
+      - name: What the instruction set is worth (baseline vs v3)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          # ONE target dir, rebuilt per level, not three. Three copies of this project's release
+          # tree (hts-sys and its vendored htslib included) fill a hosted runner's disk, and the
+          # symptom is not a clear error: the runner takes a shutdown signal and the job dies with
+          # exit 143 at the start of the step. Changing RUSTFLAGS invalidates the cache anyway, so
+          # sharing the directory costs nothing but the rebuild that was going to happen.
+          # TWO arms, not three, and `--jobs 2`. This step has now died three times at the second
+          # build with `exit 143` and "the runner has received a shutdown signal": not the clock
+          # (ten minutes into 120) and not the disk (85 GB free, printed below), which leaves the
+          # runner being reclaimed under a full rebuild of the dependency tree, hts-sys and its
+          # vendored htslib included. Fewer arms and less compile parallelism is the cheap answer,
+          # and v2 is the arm worth dropping: v3 (AVX2) is the level the fork actually builds at,
+          # so baseline against v3 is the comparison that decides anything.
+          #
+          # cargo's stderr is NOT discarded any more. It was, which is why three failures in a row
+          # said nothing about their cause.
+          df -h / | tail -1
+          for lvl in "" "x86-64-v3"; do
+            name="${lvl:-baseline}"
+            if [ -z "$lvl" ]; then export RUSTFLAGS=""; else export RUSTFLAGS="-C target-cpu=$lvl"; fi
+            cargo build --release -p bwa-mem4 --jobs 2 --target-dir target-isa 2>&1 | tail -3
+            cp target-isa/release/bwa-mem4 "./bwa-mem4-$name"
+            echo "built $name"; df -h / | tail -1; free -g | head -2
+          done
+          unset RUSTFLAGS
+          cd work
+          for name in baseline x86-64-v3; do
+            ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null   # warm
+          done
+          for rep in 1 2; do
+            line="rep $rep:"
+            for name in baseline x86-64-v3; do
+              s=$( { /usr/bin/time -f '%e' -o b.txt ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null; } 2>/dev/null; cat b.txt)
+              line="$line $name ${s}s |"
+            done
+            echo "$line"
+          done
+          echo "== and they must all produce the same bytes =="
+          for name in baseline x86-64-v3; do
+            ../bwa-mem4-$name mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+          done
+
+      # Two kernels, two sweeps. The rescue kernel is the one the x86 issues have looked at; the
+      # BATCHED EXTENSION kernel is the bigger one and nobody has priced it on x86. The ARM
+      # align-split profile makes the case: of 94.94 s of align CPU on this same data, extension
+      # kernels are 53.63 s, i.e. 56%, against 17.23 s of seeding. If our AVX2 extension is weaker
+      # relative to the fork's than our NEON one is, that is where a 25% deficit can live.
+      - name: Build bwa-mem4
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+        run: cargo build --release -p bwa-mem4
+
+      - name: Kernel tier sweeps (extension, then rescue)
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          M4=../target/release/bwa-mem4
+          # This job's read set is already the small one, so the sweeps use it directly.
+          cp r1.fq s1.fq; cp r2.fq s2.fq
+          echo "sweeps run on $(( $(wc -l < s1.fq) / 4 )) pairs"
+          echo "== batched extension tier (BWA4_EXTEND_TIER) =="
+          for tier in scalar sse41 avx2 avx512; do
+            if timeout 900 /usr/bin/time -f '%e' -o et.txt env BWA4_EXTEND_TIER="$tier" $M4 mem -t "$T" chr21.fa s1.fq s2.fq > /dev/null 2>/dev/null; then
+              echo "  extend tier=$tier: $(cat et.txt)s"
+            else
+              echo "  extend tier=$tier: timed out or unavailable"
+            fi
+          done
+          echo "== rescue tier (BWA4_RESCUE_TIER) =="
+          # A forced tier the host lacks falls back to scalar, and forced scalar is legitimately an
+          # order of magnitude slower on this stage, so a timeout here is reported and not fatal.
+          for tier in scalar avx2 avx512; do
+            if timeout 900 /usr/bin/time -f '%e' -o tt.txt env BWA4_RESCUE_TIER="$tier" $M4 mem -t "$T" chr21.fa s1.fq s2.fq > /dev/null 2>/dev/null; then
+              echo "tier=$tier: $(cat tt.txt)s"
+            else
+              echo "tier=$tier: timed out or unavailable"
+            fi
+          done
+
+  # PGO has never been measured off Apple Silicon, and it is the one lever that could be worth a
+  # third of the x86 deficit for free. On an M4 it is +6.1% SE and +8.5% PE at genome scale
+  # (docs/perf-levers.md); @nh13 measured -0.4% on Graviton4, which is either a build that did not
+  # apply its profile or a benefit specific to Apple Silicon, and nobody has run the third case.
+  # The comparison also matters because the fork's conda binary is NOT profile-guided: if PGO pays
+  # here, part of the gap is a build-process difference rather than a code difference.
+  #
+  # Separate job from the profile above so a cargo-pgo or llvm-profdata failure cannot take the
+  # measurement down with it.
+  pgo-x86:
+    name: what PGO is worth on x86
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust with the LLVM tools
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+          # cargo-pgo needs `llvm-profdata` from the toolchain, not the distro: it must match the
+          # LLVM rustc was built with, or the profile is unreadable.
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bwa-mem2 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            wgsim
+          init-shell: bash
+
+      - name: Install cargo-pgo
+        shell: bash
+        run: cargo install cargo-pgo --locked 2>&1 | tail -2
+
+      - name: Reference, index, reads
+        run: |
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          bwa-mem2 index chr21.fa
+          # Training set and measurement set are drawn with DIFFERENT seeds. Training on the reads
+          # the benchmark then times would flatter PGO with a profile it can never have in practice.
+          wgsim -S 11 -N 1000000 -1 150 -2 150 chr21.fa r1.fq r2.fq > /dev/null
+          wgsim -S 77 -N 200000 -1 150 -2 150 chr21.fa t1.fq t2.fq > /dev/null
+
+      - name: Build plain and PGO
+        shell: bash
+        run: |
+          export RUSTFLAGS=""
+          cargo build --release -p bwa-mem4 --target-dir target-plain
+          cp target-plain/release/bwa-mem4 ./bwa-mem4-plain
+          cargo pgo build -- -p bwa-mem4 2>&1 | tail -3
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          # Train. The instrumented binary is several times slower, which is why the training set is
+          # a fifth of the measurement set.
+          inst=$(find target -name bwa-mem4 -type f -perm -u+x -path '*release*' | head -1)
+          echo "instrumented: $inst"
+          (cd work && "../$inst" mem -t "$T" chr21.fa t1.fq t2.fq > /dev/null 2>/dev/null)
+          cargo pgo optimize build -- -p bwa-mem4 2>&1 | tail -3
+          opt=$(find target -name bwa-mem4 -type f -perm -u+x -path '*release*' | head -1)
+          cp "$opt" ./bwa-mem4-pgo
+          ls -la bwa-mem4-plain bwa-mem4-pgo
+
+      - name: A/B, interleaved
+        run: |
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          for b in plain pgo; do ../bwa-mem4-$b mem -t "$T" chr21.fa r1.fq r2.fq >/dev/null 2>/dev/null; done
+          for rep in 1 2 3; do
+            p=$(timed ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq)
+            g=$(timed ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq)
+            echo "rep $rep: plain ${p}s | pgo ${g}s"
+          done
+          echo "== PGO changes instruction selection, never output =="
+          ../bwa-mem4-plain mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+          ../bwa-mem4-pgo   mem -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@PG' | md5sum
+

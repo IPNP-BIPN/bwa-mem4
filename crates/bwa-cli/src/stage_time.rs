@@ -101,7 +101,22 @@ const NAMES: [&str; N_STAGES] = [
 
 /// Number of stages, i.e. the accumulator array's length. Kept next to [`NAMES`] so a new stage
 /// that forgets to add its name fails to compile rather than printing a wrong label.
-const N_STAGES: usize = 9;
+///
+/// Public because [`crate::stage_alloc`] tiles the same stages with three buckets of its own and
+/// must agree with this count exactly.
+pub const N_STAGES: usize = 9;
+
+/// The stage labels, in discriminant order.
+///
+/// Exists so [`crate::stage_alloc`] prints the same name for the same stage rather than keeping a
+/// second copy that could drift.
+///
+/// # Returns
+///
+/// The [`NAMES`] table, indexed by [`Stage`]'s discriminant.
+pub fn names() -> &'static [&'static str; N_STAGES] {
+    &NAMES
+}
 
 /// Nanoseconds accumulated per stage, across every thread.
 ///
@@ -163,6 +178,10 @@ pub fn add(stage: Stage, elapsed: Duration) {
 ///
 /// `f`'s return value, unchanged.
 pub fn measure<T>(stage: Stage, f: impl FnOnce() -> T) -> T {
+    // One instrumentation point, two probes: `BWA4_STAGE_ALLOC` credits this stage with every byte
+    // allocated until the guard drops, so the wall-clock table and the allocation table can never
+    // disagree about where a stage begins. Inert (one bool load) unless that probe is armed.
+    let _tag = crate::stage_alloc::enter(stage);
     if !enabled() {
         return f();
     }

@@ -374,7 +374,11 @@ pub(crate) fn gen_cigar2(
     // per-base `base(p)` did, and does the index arithmetic once for the range instead of once per
     // base. This runs per emitted record, so it is on the same footing as the window fetch in
     // `across.rs`.
-    let mut rseq: Vec<u8> = fm.bases(rb, re);
+    let mut rseq: Vec<u8> = crate::emit_split::measure(
+        &crate::emit_split::BASES_NS,
+        &crate::emit_split::BASES_CALLS,
+        || fm.bases(rb, re),
+    );
     // Reverse both sides for reverse-strand hits (bwa.cpp:274). This is NOT a complement, only an
     // order reversal, and it exists purely so that ties in gap placement resolve to the leftmost
     // position *in forward-genome coordinates*. Dropping it still yields valid alignments, just
@@ -443,8 +447,14 @@ pub(crate) fn gen_cigar2(
         // difference the band must absorb plus 3 bases of slack (bwa's constant, not derived).
         let min_w = (rlen - l_query).abs() + 3;
         w = w.max(min_w);
-        ksw_global2(
-            &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
+        crate::emit_split::measure(
+            &crate::emit_split::GLOBAL_NS,
+            &crate::emit_split::GLOBAL_CALLS,
+            || {
+                ksw_global2(
+                    &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
+                )
+            },
         )
     };
 
@@ -505,7 +515,7 @@ pub(crate) fn gen_cigar2(
             // base and always scores as a mismatch in NM.
             for i in 0..len {
                 if query[query_pos + i] != rseq[ref_pos + i] {
-                    md.push_str(&match_run.to_string());
+                    crate::emit::push_int_str(&mut md, i64::from(match_run));
                     md.push(base_char(rseq[ref_pos + i]));
                     n_mm += 1;
                     match_run = 0;
@@ -521,7 +531,7 @@ pub(crate) fn gen_cigar2(
             // the CIGAR, so recording it in MD or NM would describe an alignment that will not be
             // emitted. `ref_pos` still advances in either case, keeping the reference cursor honest.
             if op_idx > 0 && op_idx < n_cigar - 1 {
-                md.push_str(&match_run.to_string());
+                crate::emit::push_int_str(&mut md, i64::from(match_run));
                 md.push('^');
                 for i in 0..len {
                     md.push(base_char(rseq[ref_pos + i]));
@@ -539,7 +549,7 @@ pub(crate) fn gen_cigar2(
     }
     // MD always ends with a run length, even when that run is empty ("0"), matching the final
     // `kputw(u, &str)` at bwa.cpp:336.
-    md.push_str(&match_run.to_string());
+    crate::emit::push_int_str(&mut md, i64::from(match_run));
     Some((score, cigar, n_mm + n_gap, md))
 }
 
@@ -825,7 +835,7 @@ pub fn cigar_string(cigar: &[u32]) -> String {
     // The SAM CIGAR field being built, complete for the ops emitted so far.
     let mut s = String::new();
     for &packed_op in cigar {
-        s.push_str(&(packed_op >> 4).to_string());
+        crate::emit::push_int_str(&mut s, i64::from(packed_op >> 4));
         s.push(OPS[(packed_op & CIGAR_OP_MASK) as usize]);
     }
     s
@@ -876,7 +886,7 @@ pub fn cigar_string_which(cigar: &[u32], which: usize, is_alt: bool, softclip: b
         if !softclip && !is_alt && (op == SOFT_CLIP || op == HARD_CLIP) {
             op = if which != 0 { HARD_CLIP } else { SOFT_CLIP };
         }
-        s.push_str(&(packed_op >> 4).to_string());
+        crate::emit::push_int_str(&mut s, i64::from(packed_op >> 4));
         s.push(OPS[op]);
     }
     s

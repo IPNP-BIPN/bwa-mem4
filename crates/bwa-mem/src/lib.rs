@@ -111,9 +111,127 @@ use bwa_core::MemOpt;
 use bwa_extend::ksw_extend2;
 use bwa_index::{BntSeq, FmIndex};
 
+/// `BWA4_EMIT_SPLIT=1`: where the `sam_emit` stage's time goes, inside one read pair.
+///
+/// The stage is 15.9% of the x86 wgsim wall at 15.8 us per pair, against 2.7 us per pair for the
+/// SAME data on an M4: 5.9x core-for-core where the vector kernels sit at 2.6x. Something in this
+/// path behaves badly on x86, and the stage-level probe cannot say what. Three suspects, each a
+/// scalar compute pocket: the per-record global alignment that builds CIGAR/MD (`ksw_global2`), the
+/// per-ALT-hit global alignments behind `XA:Z` (`mem_gen_alt`, multiplied by chr21's repeats), and
+/// the reference-window fetch (`fm.bases`). Relaxed atomics, one `Instant` pair per call site, off
+/// unless the variable is set.
+pub mod emit_split {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    /// Nanoseconds in `mem_gen_alt` (XA generation, its global DPs included), and calls.
+    pub static ALT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ALT_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Nanoseconds in `ksw_global2` from the CIGAR path, and calls.
+    pub static GLOBAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GLOBAL_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Nanoseconds fetching reference windows in `mem_reg2aln` (`fm.bases`), and calls.
+    pub static BASES_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BASES_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe records. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_EMIT_SPLIT` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_EMIT_SPLIT").is_some())
+    }
+
+    /// Time `f` into `(ns, calls)` when enabled; a plain call otherwise.
+    #[inline]
+    pub fn measure<T>(ns: &AtomicU64, calls: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let t0 = std::time::Instant::now();
+        let out = f();
+        ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        calls.fetch_add(1, Relaxed);
+        out
+    }
+
+    /// Print the split once at end of run. No-op unless [`enabled`]. CPU seconds summed over
+    /// threads, like the other kernel probes, so the shares are comparable across `-t`.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let row = |name: &str, ns: &AtomicU64, calls: &AtomicU64| {
+            eprintln!(
+                "[emit-split] {name}: {:.3}s CPU over {} calls",
+                ns.load(Relaxed) as f64 / 1e9,
+                calls.load(Relaxed),
+            );
+        };
+        row("mem_gen_alt (XA)", &ALT_NS, &ALT_CALLS);
+        row("ksw_global2 (CIGAR)", &GLOBAL_NS, &GLOBAL_CALLS);
+        row("fm.bases (ref fetch)", &BASES_NS, &BASES_CALLS);
+    }
+}
+
+/// `BWA4_RESCUE_SPLIT=1`: the rescue stage's wall, split into its three phases per round.
+///
+/// The kernel accounts for 90.3 of the stage's ~153 s CPU on x86 wgsim, leaving ~63 s of glue that
+/// no probe attributed. `collect` is anchor selection plus the reference-window fetches, `kernel`
+/// the batched DP, `apply` the acceptance test plus the region insert and the re-sort that #38
+/// measured at 13.3% of busy on real data. Per-round timing, so the cost is a handful of `Instant`
+/// pairs per chunk rather than anything per job.
+pub mod rescue_split {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static COLLECT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe records. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_RESCUE_SPLIT` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_SPLIT").is_some())
+    }
+
+    /// A start instant when enabled, `None` otherwise.
+    #[inline]
+    pub fn start() -> Option<std::time::Instant> {
+        enabled().then(std::time::Instant::now)
+    }
+
+    /// Bank the elapsed time since `t0` into `slot`.
+    #[inline]
+    pub fn stop(slot: &AtomicU64, t0: Option<std::time::Instant>) {
+        if let Some(t) = t0 {
+            slot.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+
+    /// Print the split once at end of run. No-op unless [`enabled`]. CPU seconds summed over
+    /// threads, comparable with the other probes.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        eprintln!(
+            "[rescue-split] collect {:.3}s, kernel {:.3}s, apply {:.3}s CPU",
+            COLLECT_NS.load(Relaxed) as f64 / 1e9,
+            KERNEL_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_NS.load(Relaxed) as f64 / 1e9,
+        );
+    }
+}
+
 pub mod across;
 pub mod alt;
 pub mod cigar;
+pub mod emit;
 pub mod pe;
 pub mod primary;
 pub use across::align_reads_batched;

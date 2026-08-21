@@ -26,9 +26,27 @@ use clap::{Parser, Subcommand};
 // Behind a feature because a global allocator is a whole-program decision and
 // this crate is also a library now; see Cargo.toml. On by default, so this
 // binary is unchanged.
-#[cfg(feature = "mimalloc")]
+#[cfg(all(feature = "mimalloc", not(feature = "stage-alloc")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// With `--features stage-alloc`, the same allocator wrapped in `stage_alloc::Counting`, which
+// forwards every request and counts the bytes against the pipeline stage that asked for them. Off
+// by default because that wrapper costs a measured +0.5% even disarmed, one branch per allocation
+// times 167M allocations per 500k pairs; see the feature's entry in Cargo.toml and `stage_alloc`
+// for why issue #25 needs a counter inside the allocator rather than another peak-RSS snapshot.
+#[cfg(all(feature = "mimalloc", feature = "stage-alloc"))]
+#[global_allocator]
+static GLOBAL: bwa_mem4::stage_alloc::Counting<mimalloc::MiMalloc> =
+    bwa_mem4::stage_alloc::Counting::new(mimalloc::MiMalloc);
+
+// Without the `mimalloc` feature the binary declares no allocator at all and gets the system one.
+// The probe still wraps it, so a build made to compare allocators can measure both with the same
+// instrument.
+#[cfg(all(not(feature = "mimalloc"), feature = "stage-alloc"))]
+#[global_allocator]
+static GLOBAL: bwa_mem4::stage_alloc::Counting<std::alloc::System> =
+    bwa_mem4::stage_alloc::Counting::new(std::alloc::System);
 
 // The command implementations live in the library target so an embedder can
 // call them without spawning this binary. Declared there, used here, so there
@@ -87,6 +105,10 @@ fn main() -> anyhow::Result<()> {
     // argv, not a reconstruction from the parsed args: the CL field is meant to record what the
     // user actually typed, defaults and all, so the SAM file documents its own provenance.
     let argv: Vec<String> = std::env::args().collect();
+    // Arms the allocation probe if `BWA4_STAGE_ALLOC` is set. First thing after argv, because it
+    // reads the environment (which allocates) and the allocator must never do that itself; every
+    // allocation before this line goes uncounted, which is clap's parsing and nothing else.
+    bwa_mem4::stage_alloc::init();
     match Cli::parse().cmd {
         Cmd::Index(args) => cmd_index::run(args),
         Cmd::Mem(args) => cmd_mem::run(args, &argv),

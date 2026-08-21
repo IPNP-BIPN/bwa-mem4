@@ -131,9 +131,98 @@ pub fn learned_index_fits(index_gb: f64) -> bool {
     }
 }
 
+/// Resident bytes one in-flight batch costs, per base of `-K`.
+///
+/// Measured, not guessed. The allocation probe (`BWA4_STAGE_ALLOC`) on Linux, where resident memory
+/// IS live memory to within 1.02x, puts one batch of 100M bases at 2.40 GB of live bytes, and the
+/// A/B of the batch overlap on the same job moves peak RSS by 1.97 GB, i.e. 20 to 24 bytes per base
+/// either way. The upper end is taken, because overestimating a batch makes this policy drop the
+/// overlap sooner, which is the harmless direction: the cost of being wrong is 1.1% of wall, while
+/// the cost of the opposite error is a run that swaps.
+const BATCH_BYTES_PER_BASE: f64 = 24.0;
+
+/// Resident bytes the loaded index costs, per base of the FORWARD strand (`l_pac`).
+///
+/// Also measured, from the same probe's index baseline: 0.181 GB for chr21 (3.9 bytes per base) and
+/// 10.47 GB for GRCh38 (3.4). Rounded UP for the same reason as above.
+const INDEX_BYTES_PER_PAC_BASE: f64 = 4.0;
+
+/// What the aligner should do about holding a second batch in flight.
+///
+/// Returned as a struct rather than a bare `bool` so the caller can print the arithmetic it used.
+/// A policy the user cannot see is a policy they cannot argue with, and this one changes peak RSS
+/// by 40% on a memory-tight host.
+pub struct OverlapDecision {
+    /// Whether to overlap batch N's tail with batch N+1's alignment.
+    pub overlap: bool,
+    /// Detected physical RAM in decimal GB, or `None` when detection failed.
+    pub ram_gb: Option<f64>,
+    /// Estimated peak footprint of the overlapped pipeline in decimal GB: index plus two batches,
+    /// with the headroom factor already applied.
+    pub need_gb: f64,
+}
+
+/// Whether the machine can afford the pipeline's second resident batch.
+///
+/// The overlap runs batch N's low-occupancy tail against batch N+1's extension and is worth about
+/// 1.1% of wall (measured on Linux, chr21, 4 cores). It costs one more resident batch, which on a
+/// human genome at the default `-K` is around 2 GB, and that is the difference between fitting in a
+/// machine and swapping. So it is taken only when the RAM is there.
+///
+/// Nothing here can change a SAM byte: the number of batches in flight is not observable in the
+/// output (batch order comes from joining a batch before sending it), which is what makes this a
+/// legitimate machine-dependent policy rather than a source of irreproducible results.
+///
+/// # Parameters
+///
+/// - `l_pac`: forward-strand length of the reference in bases, i.e. `BntSeq::l_pac`, used to
+///   estimate the loaded index's footprint.
+/// - `k_batch`: `-K` in bases, i.e. one batch's input size.
+///
+/// # Returns
+///
+/// The decision and the two figures behind it. When RAM cannot be detected the overlap is KEPT:
+/// unlike [`learned_index_fits`], whose fallback avoids a large speculative allocation, the
+/// conservative answer here would silently cost every user on an undetectable platform 1.1% of wall
+/// for a memory problem they may not have.
+pub fn batch_overlap_fits(l_pac: u64, k_batch: u64) -> OverlapDecision {
+    let index_bytes = l_pac as f64 * INDEX_BYTES_PER_PAC_BASE;
+    let two_batches = 2.0 * k_batch as f64 * BATCH_BYTES_PER_BASE;
+    let need_gb = RAM_HEADROOM_FACTOR * (index_bytes + two_batches) / BYTES_PER_GB;
+    let ram_gb = total_ram_bytes().map(|b| b as f64 / BYTES_PER_GB);
+    OverlapDecision {
+        // No RAM figure means no reason to give up the overlap; see the doc comment.
+        overlap: ram_gb.is_none_or(|have| have >= need_gb),
+        ram_gb,
+        need_gb,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The policy must flip where it is designed to flip, and both sides are checked with figures
+    /// from the two measured configurations rather than round numbers.
+    #[test]
+    fn overlap_is_dropped_only_when_the_machine_is_actually_tight() {
+        // GRCh38 (l_pac 3.1e9) at the default -K for 8 threads (80M bases): the index alone is
+        // ~12.4 GB by this estimate, two batches ~3.8 GB, so a 16 GB host cannot hold it and a
+        // 128 GB one can, comfortably.
+        let d = batch_overlap_fits(3_100_000_000, 80_000_000);
+        assert!(d.need_gb > 16.0 && d.need_gb < 32.0, "need {}", d.need_gb);
+
+        // chr21 (l_pac 46.7e6) at -K 100M, the CI measurement: 6 GB of need, so any real machine
+        // keeps the overlap.
+        let d = batch_overlap_fits(46_700_000, 100_000_000);
+        assert!(d.need_gb > 5.0 && d.need_gb < 8.0, "need {}", d.need_gb);
+
+        // The decision is monotone in both inputs, which is the property that makes it explainable:
+        // a bigger reference or a bigger batch can only ever make the overlap less affordable.
+        let small = batch_overlap_fits(46_700_000, 10_000_000).need_gb;
+        let big = batch_overlap_fits(46_700_000, 320_000_000).need_gb;
+        assert!(big > small);
+    }
 
     #[test]
     fn ram_detection_plausible() {

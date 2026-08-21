@@ -38,6 +38,18 @@ rammap-core = "1.1.2"
 # Per-stage timing counters in bwa-mem4-mem. Off by default: the wrapper is a barrier the inliner
 # does not always see through, and it costs measurable CPU even with BWA4_ALIGN_SPLIT unset.
 align-split = ["bwa-mem/align-split"]
+# The allocation probe's global-allocator wrapper (`BWA4_STAGE_ALLOC`, see src/stage_alloc.rs). Off
+# by default for the same reason as `align-split`, and measured: the wrapper's disabled path is one
+# relaxed bool load and an untaken branch, but it sits on EVERY allocation, and this pipeline makes
+# 167M of them per 500k GIAB pairs. Interleaved A/B, min of 6 on a quiet host: 12.49 s -> 12.56 s
+# real and 95.14 s -> 95.67 s user, i.e. +0.5%, which is not a tax a shipped aligner should pay for
+# a diagnostic. Everything else in the probe (the stage tags, the per-batch counters) is per stage
+# or per batch and stays compiled in, so only this feature moves the allocator itself:
+#
+#     cargo build --release -p bwa-mem4 --features stage-alloc
+#
+# Without it, `BWA4_STAGE_ALLOC` prints a line saying the binary cannot answer and changes nothing.
+stage-alloc = ["bwa-mem/stage-alloc"]
 # Passthrough for `bwa-io`'s multi-format FASTQ input (bzip2, xz, zstd). Off by default: +11 s of
 # build time, +3.5% of binary, and three more C libraries in the supply chain, for formats bwa-mem2
 # does not read. NOT because it introduces a C toolchain requirement: this binary already has one,

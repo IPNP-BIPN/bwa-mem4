@@ -45,6 +45,27 @@ longer, so rayon's even split leaves their chunk straggling while everything els
 applies to the pool only: `-t` still sets the default `-K`, so the output is unchanged, verified
 byte-identical to the oracle with and without it. `BWA4_NO_PCORE_CAP=1` disables it.
 
+### Trading a batch of memory for a little wall clock
+
+The pipeline keeps TWO batches in flight: batch N's thin, low-occupancy tail (dedup at 69% pool
+occupancy, encode at 29%) runs against batch N+1's extension, which is the one stage that can fill
+every core. It costs one more resident batch, and on a human genome at the default `-K` that is the
+difference between 14.7 GB and 13.3 GB of peak RSS.
+
+That second batch is taken **only when the machine can hold it**: at startup the aligner compares
+detected RAM against the index plus two batches with headroom, and drops the overlap when it does
+not fit, printing which it chose at `-v 3`. `BWA4_NO_BATCH_OVERLAP=1` forces one batch,
+`BWA4_BATCH_OVERLAP=1` forces two. Nothing about the choice is observable in the SAM, so the same
+input still yields the same bytes on every machine.
+
+`BWA4_NO_BATCH_OVERLAP=1` gives that batch back. Measured on an M4 Max, `-t8`, 500k real GIAB pairs
+against GRCh38, six interleaved repetitions: **13.27 GB instead of 14.73 GB, for about 1.5% of wall**.
+What it returns is one batch, so the saving scales with `-K`: 1.46 GB at the default, 0.19 GB at
+`-K` 10M. Output is unaffected, and not by luck: batch order comes from joining a batch before
+sending its bytes, never from how many are in flight, and no batch's result depends on another's.
+Lowering `-K` is NOT the same lever, since it moves batch boundaries and with them the per-batch
+insert-size model, which does change the SAM.
+
 ## Why byte-identity is the hard part
 
 Reproducing an aligner's *results* is not especially difficult. Reproducing its *bytes* means
@@ -286,6 +307,23 @@ the place to go for that lineage.
 Work reimplemented from the published literature (LISA/BWA-MEME, minibwa, and others), and the
 measurements showing which of those techniques paid off here and which measured at zero, is written
 up in [docs/perf-levers.md](docs/perf-levers.md).
+
+What the vector kernels can still reach, and the sixteen ideas an adversarial review has already
+killed with the reason for each, is in
+[docs/kernel-ceiling-and-dead-ends.md](docs/kernel-ceiling-and-dead-ends.md). Read the second half
+before proposing a kernel change: several of those levers were proposed twice by different people in
+the same session, and the file says what would have to be new for one to be worth a third look.
+
+Whether a GPU could help without giving up byte-identity, how much (2.45x, and an integrated GPU
+already reaches it), and what would have to be built first, is in
+[docs/gpu-plan.md](docs/gpu-plan.md). Nothing there is implemented.
+
+A read of fg-labs/bwa-mem3's source, asking why it is faster than us on x86_64 while we are at
+parity on Apple Silicon, is in [docs/fork-teardown.md](docs/fork-teardown.md). The short answer is
+its build: their whole non-kernel codebase is compiled at AVX2 and ours at the x86-64 baseline.
+
+What is left to try, and what the 2026 literature does and does not offer under byte-identity, is in
+[docs/whats-left-2026.md](docs/whats-left-2026.md).
 
 ## Licence
 

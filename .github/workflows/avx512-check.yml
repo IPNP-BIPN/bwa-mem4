@@ -1,0 +1,122 @@
+# The AVX-512 kernels of #44, executed at last (#44).
+#
+# Those kernels have byte-identity tests and the tests have never RUN: they self-skip when
+# `is_x86_feature_detected!("avx512bw")` is false, and every GitHub draw this project has taken has
+# been an AMD EPYC 7763 (Zen 3, no AVX-512). Seventeen consecutive draws on 2026-08-09, and two more
+# today. A kernel that has never executed is not "untimed", it is unverified.
+#
+# The emulation idea DID NOT WORK, and this file records why so nobody spends the afternoon again.
+# QEMU's x86 TCG gained AVX and AVX2 in 7.2 and still has **no AVX-512** in 8.2.2, which is what
+# ubuntu-24.04 ships. Two consequences, both observed here: `is_x86_feature_detected!("avx512bw")`
+# answers false under `-cpu max` (correctly, since the instructions are not implemented), and
+# forcing the tests to run anyway with `BWA4_TEST_FORCE_AVX512` dies with
+# `uncaught target signal 4 (Illegal instruction)`. Both runs are in this workflow's history.
+#
+# What the attempt DID produce is worth more than the emulation would have been: it exposed that the
+# batched AVX-512 test was skipping SILENTLY and reporting `ok`, so those kernels have never
+# executed anywhere while CI stayed green about them. Every AVX-512 test now announces its skip and
+# this job fails on one.
+#
+# What is left for #44's correctness, in order of cost: an Intel runner draw (the fleet has given
+# AMD EPYC 7763 on every attempt, 22.04 and 24.04 alike), or Intel SDE, which does emulate AVX-512
+# but is a license-gated download rather than an apt package. Speed stays open regardless: no
+# emulator can price a kernel.
+name: avx512-check
+
+on:
+  workflow_dispatch:
+
+# One run of this workflow at a time per ref. Without it a second push while the first run is still
+# measuring leaves two hour-long jobs racing for the same runners, which happened four times while
+# this branch was being written and had to be cleaned up by hand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  avx512-emulated:
+    name: AVX-512 kernels under qemu, byte-identity only
+    # 24.04, not 22.04, and it is not cosmetic: 22.04 ships qemu 6.2, which ADVERTISES avx512 in
+    # CPUID under `-cpu max` and then faults on the first such instruction. The first attempt died
+    # with "uncaught target signal 4 (Illegal instruction)" for exactly that reason. AVX-512
+    # emulation arrived in qemu 7.2; 24.04 ships 8.2.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: What the host has (and does not)
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          if grep -q avx512bw /proc/cpuinfo; then
+            echo "NOTE: this draw HAS avx512bw, so the native tests below are the real thing"
+          else
+            echo "NOTE: no avx512bw on this draw, which is why the emulated run exists"
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install qemu-user
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user
+          # Printed because the whole job depends on it: below 7.2 there is no AVX-512 emulation and
+          # the run can only fail with SIGILL.
+          qemu-x86_64 --version | head -1
+
+      - name: Build the test binaries
+        env:
+          # No `-C target-cpu`: the kernels are selected at RUNTIME by feature detection, and a
+          # target-cpu that promises AVX-512 to the whole binary would let the compiler emit those
+          # instructions in code that is NOT feature-gated, which would then fault on a real host
+          # rather than fall back. The point is to exercise the dispatch, not to bypass it.
+          RUSTFLAGS: ""
+        run: |
+          # `--message-format=json` names the executables cargo built, which is the only reliable way
+          # to find them: the hash suffix is not predictable, and a `find` over target/release/deps
+          # picks up whatever else is lying there (the first attempt at this step ran `rustc`).
+          #
+          # `.target.test == true` is load-bearing and cost a run: without it the first executable
+          # cargo reports is the `bench_batch` EXAMPLE, which runs happily under qemu, prints a
+          # throughput table, and proves nothing about any kernel's correctness.
+          cargo test -p bwa-mem4-neon --release --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.test == true) | .executable' | tee /tmp/testbins
+          test -s /tmp/testbins || { echo "cargo built no test binary" >&2; exit 1; }
+
+      - name: Run them under an emulated AVX-512 CPU
+        run: |
+          # `-cpu max` gives qemu's widest model, which includes avx512f/bw/vl. If a future qemu
+          # renames it, the assertion below fails loudly instead of silently testing SSE again.
+          bin=$(head -1 /tmp/testbins)
+          echo "binary: $bin"
+          test -x "$bin" || { echo "not executable: $bin" >&2; exit 1; }
+          # First, prove the emulated CPU really advertises what we need. `avx512_u8_and_i16_match_scalar`
+          # self-skips otherwise, and a skipped test reports `ok`, which is exactly the failure mode
+          # this workflow exists to prevent.
+          qemu-x86_64 -cpu max /usr/bin/lscpu 2>/dev/null | grep -o -E 'avx512bw|avx512f' | sort -u || true
+          # BWA4_TEST_FORCE_AVX512: qemu-user emulates the instructions but does not present the
+          # XCR0 bits Rust's `is_x86_feature_detected!` checks, so without this the three AVX-512
+          # tests skip and report `ok` — which is exactly the silence this job exists to break. If
+          # the emulator cannot actually execute them, the run dies with SIGILL, which is a correct
+          # and loud answer.
+          export BWA4_TEST_FORCE_AVX512=1
+          qemu-x86_64 -cpu max "$bin" --nocapture --test-threads 2 2>&1 | tail -40 > /tmp/out.txt || {
+            echo "TESTS FAILED under emulation"; cat /tmp/out.txt; exit 1; }
+          cat /tmp/out.txt
+          # A run where the AVX-512 test self-skipped is a run that proved nothing. The kernels print
+          # nothing on success, so the check is on the test names having executed at all.
+          if ! grep -qE 'avx512.*(ok|FAILED)' /tmp/out.txt; then
+            echo "no avx512 test executed: emulation did not expose the feature" >&2
+            exit 1
+          fi
+          # The tests now announce a skip on stderr, so a skip is detectable rather than a silent
+          # `ok`. Any AVX-512 skip here means the override did not take and the job proved nothing.
+          if grep -q 'skipping avx512' /tmp/out.txt; then
+            echo "an AVX-512 test skipped despite the override: emulation did not expose the kernels" >&2
+            exit 1
+          fi

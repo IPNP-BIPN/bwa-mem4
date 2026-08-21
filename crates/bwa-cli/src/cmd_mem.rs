@@ -1618,11 +1618,80 @@ fn spawn_reader<B: Send + 'static>(
 ) {
     let (readahead, _) = queue_depths();
     let (tx, rx) = std::sync::mpsc::sync_channel::<(B, u64)>(readahead);
-    (rx, std::thread::spawn(move || read_batches(tx)))
+    (
+        rx,
+        std::thread::spawn(move || {
+            // Tagged so `BWA4_STAGE_ALLOC` credits decompression and record parsing to `reader`
+            // rather than to whichever stage the aligner happened to be in when they ran. No-op
+            // unless that probe is armed.
+            crate::stage_alloc::set_role_reader();
+            read_batches(tx)
+        }),
+    )
+}
+
+/// Whether the pipeline holds a second batch in flight, deciding it once for the process.
+///
+/// Three inputs, in priority order, because two of them are the user saying they know better:
+///
+/// 1. `BWA4_NO_BATCH_OVERLAP` set: one batch. Half the batch memory, about 1.1% of wall.
+/// 2. `BWA4_BATCH_OVERLAP` set: two batches, whatever the machine looks like.
+/// 3. Otherwise the RAM policy in [`bwa_core::sysram::batch_overlap_fits`]: overlap when the host
+///    can hold the index plus two batches with headroom, one batch when it cannot.
+///
+/// The policy exists because the two ways of being wrong are not symmetric. Dropping the overlap on
+/// a machine that could have afforded it costs 1.1% of wall; keeping it on one that cannot costs a
+/// run that swaps, and the user has no way to guess that an environment variable would have saved
+/// them. Machine-dependent, and legitimately so: the number of batches in flight is not observable
+/// in the SAM, since batch order comes from joining a batch before sending its bytes.
+///
+/// Read once and cached, like every other environment gate here.
+///
+/// # Parameters
+///
+/// - `l_pac`: forward-strand reference length, for the index footprint estimate.
+/// - `k_batch`: `-K` in bases, i.e. one batch's input size.
+/// - `verbose`: `-v`; at 3 or more the decision and the two figures behind it are printed, in bwa's
+///   own progress-line style, so a surprising memory or wall figure can be explained afterwards.
+///
+/// # Returns
+///
+/// True to overlap batch N's tail with batch N+1's alignment.
+fn batch_overlap_enabled(l_pac: u64, k_batch: usize, verbose: i32) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("BWA4_NO_BATCH_OVERLAP").is_some() {
+            if verbose >= 3 {
+                eprintln!("[M::main_mem] batch overlap off (BWA4_NO_BATCH_OVERLAP)");
+            }
+            return false;
+        }
+        let forced = std::env::var_os("BWA4_BATCH_OVERLAP").is_some();
+        let d = bwa_core::sysram::batch_overlap_fits(l_pac, k_batch as u64);
+        let overlap = forced || d.overlap;
+        if verbose >= 3 {
+            // `?` for undetectable RAM: the figure is genuinely unknown there, and printing a zero
+            // would read as "this machine has no memory" rather than "the probe did not answer".
+            let have = d
+                .ram_gb
+                .map_or_else(|| "?".to_string(), |g| format!("{g:.1}"));
+            eprintln!(
+                "[M::main_mem] batch overlap {} (RAM {} GB, needs {:.1} GB for index + 2 batches){}",
+                if overlap { "on" } else { "off" },
+                have,
+                d.need_gb,
+                if forced { ", forced" } else { "" },
+            );
+        }
+        overlap
+    })
 }
 
 fn run_pipeline<B: Send>(
     out: Output,
+    // Whether to keep two batches in flight; see `batch_overlap_enabled`, which the callers consult
+    // because they are the ones holding the reference length.
+    overlap: bool,
     // Already produced by a reader the CALLER started, so that reading and inflating the first
     // batch overlaps the index load instead of queueing behind it. See `spawn_reader`.
     batch_rx: std::sync::mpsc::Receiver<(B, u64)>,
@@ -1665,6 +1734,9 @@ fn run_pipeline<B: Send>(
         // makes the single-writer property a compile-time fact rather than a convention: no other
         // thread can name `out` after this line, so no other thread can write to the sink.
         let writer = scope.spawn(move || -> anyhow::Result<()> {
+            // Same reason as the reader: the writer allocates (BGZF blocks, htslib buffers) while a
+            // stage is running, and `BWA4_STAGE_ALLOC` must not charge that to the stage.
+            crate::stage_alloc::set_role_writer();
             // Rebound to make the move explicit: the sink now lives on this thread and nowhere else.
             let mut out = out;
             // Rust: a channel receiver can be walked like any other sequence. It yields each value
@@ -1739,6 +1811,14 @@ fn run_pipeline<B: Send>(
         // The cost is one more resident batch: records and regions for two batches instead of one,
         // on top of the reader's queue. That is the same currency `queue_depths` spends, and it is
         // spent here because this is where it buys wall clock rather than latency tolerance.
+        //
+        // And that cost turned out to BE issue #25. Measured on Linux with the allocation probe
+        // (chr21, 2M pairs, `-K` 100M, 4 threads): resident memory is live memory there, 1.02x, so
+        // the 2.02x we carry against fg-labs/bwa-mem3 (4.78 GB against 2.36 GB) is not allocator
+        // retention and not a fatter batch. It is THIS line: with one batch in flight the same run
+        // takes 2.49 GB, which is 1.05x the fork rather than 2.02x. `BWA4_NO_BATCH_OVERLAP=1` is
+        // how that half of the memory is handed back, for a caller who would rather have it than
+        // the overlap.
         let mut inflight: Option<std::thread::ScopedJoinHandle<'_, Vec<Vec<u8>>>> = None;
         loop {
             // Blocked here == starved by the reader. Charged to `wait_read`, which is the one
@@ -1750,6 +1830,7 @@ fn run_pipeline<B: Send>(
             stage_time::add(Stage::WaitRead, t_wait.elapsed());
             n_batches += 1;
             stage_time::count_batch();
+            crate::stage_alloc::count_batch();
             // Start this batch, THEN retire the previous one: reversing the two lines would be the
             // old serial pipeline with extra threads.
             // `move` so the worker OWNS its batch and id; `process` is borrowed, which is why it
@@ -1758,6 +1839,27 @@ fn run_pipeline<B: Send>(
             // between the two batches in flight, so it is borrowed and must be `Sync`.
             let process_ref = &process;
             let started = scope.spawn(move || process_ref(batch, base_id));
+            // Two reasons to retire this batch before reading the next one, and they meet here.
+            // `BWA4_NO_BATCH_OVERLAP` is the user-facing one: it halves resident memory (see the
+            // block above). `BWA4_STAGE_ALLOC` is the probe's: it tags allocations with a
+            // PROCESS-WIDE stage, so two batches in flight would each overwrite the other's tag and
+            // every per-stage byte count would be a blend of two stages.
+            //
+            // Output is untouched either way. Batch order is guaranteed below by joining before
+            // sending, not by how many batches are in flight, and no batch's result depends on
+            // another's.
+            let started = if !overlap || crate::stage_alloc::serialize_batches() {
+                let buf = started.join().expect("batch worker panicked");
+                let t_send = std::time::Instant::now();
+                let sent = sam_tx.send(buf);
+                stage_time::add(Stage::WaitWrite, t_send.elapsed());
+                if sent.is_err() {
+                    break; // writer exited; its error surfaces on join below
+                }
+                continue;
+            } else {
+                started
+            };
             if let Some(prev) = inflight.replace(started) {
                 let buf = prev.join().expect("batch worker panicked");
                 // Blocked here == throttled by the writer (a slow sink, or BGZF/htslib backpressure).
@@ -2013,6 +2115,10 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         eprintln!("[M::main_mem] read {} ALT contigs", bns.n_alt());
     }
     let bns = bns;
+    // Everything resident from here to the end of the run is the index and nothing else, so this is
+    // the line that lets `BWA4_STAGE_ALLOC` report a per-batch peak instead of 10 GB of genome on
+    // every row. No-op unless that probe is armed.
+    crate::stage_alloc::mark_baseline();
     // One `@SQ` line per contig, in index order. That order comes from the FASTA and must be
     // preserved: downstream tools treat @SQ order as the coordinate sort order.
     //
@@ -2127,6 +2233,16 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         reader.join().expect("reader thread panicked")?;
         bwa_neon::matesw::cells::dump();
         bwa_neon::batched::extend_shape::dump();
+        bwa_neon::batched::bin_split::dump();
+        bwa_neon::batched::job_dup::dump();
+        bwa_neon::batched::tight_ceil::dump();
+        bwa_mem::emit_split::dump();
+        bwa_mem::rescue_split::dump();
+        bwa_mem::rescue_split::dump();
+        bwa_mem::emit_split::dump();
+        bwa_neon::batched::tight_ceil::dump();
+        bwa_neon::batched::job_dup::dump();
+        bwa_neon::batched::bin_split::dump();
         bwa_mem::across::align_split::dump();
         bwa_mem::seed_stats_dump();
         bwa_mem::pe::rescue_rounds::dump();
@@ -2134,12 +2250,16 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_mem::primary::dedup_shape::dump();
         bwa_mem::pe::anchor_spread::dump();
         bwa_chain::chain_time::dump();
+        bwa_chain::smem_dup::dump();
+        bwa_chain::smem_dup::dump();
         bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
         // Last, because it is the widest view: the others break down one stage, this one accounts
         // for all of them. Runs on the main thread, where the stage accumulators live.
         stage_time::dump(t_run.elapsed());
         stage_time::barrier::dump();
-        stage_time::barrier::dump();
+        // Where the BYTES went, next to where the wall clock went. The line above was duplicated,
+        // which printed the occupancy table twice.
+        crate::stage_alloc::dump();
         forget_index(fm, bns);
         return Ok(());
     }
@@ -2169,6 +2289,11 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
                 .map(|rec| rec.seq().iter().map(|&base| dna::nt4(base)).collect())
                 .collect()
         });
+        // The denominator of the bytes-per-base column issue #25 is written in. One sum per batch,
+        // and only when `BWA4_STAGE_ALLOC` is armed.
+        if crate::stage_alloc::enabled() {
+            crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
+        }
         // Per-read candidate alignments BEFORE dedup and primary marking, also parallel to `batch`.
         let regs_all =
             stage_time::measure(Stage::Align, || batched_regs(&fm, &bns, &opt, &all_codes));
@@ -2200,13 +2325,17 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         per_read_sam
     };
 
-    run_pipeline(out, batch_rx, process, args.verbose.unwrap_or(3), k_batch)?;
+    let verbose = args.verbose.unwrap_or(3);
+    let overlap = batch_overlap_enabled(bns.l_pac as u64, k_batch, verbose);
+    run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)?;
     reader.join().expect("reader thread panicked")?;
     bwa_chain::chain_time::dump();
+    bwa_chain::smem_dup::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
     // Last, because it is the widest view: the others break down one stage, this one accounts for
     // all of them. Runs on the main thread, where the stage accumulators live.
     stage_time::dump(t_run.elapsed());
+    crate::stage_alloc::dump();
     forget_index(fm, bns);
     Ok(())
 }
@@ -2801,6 +2930,11 @@ fn run_pe(
                     .collect()
             })
         });
+        // Both mates, so the bytes-per-base column counts the same bases the aligner processed.
+        // One sum per batch, and only when `BWA4_STAGE_ALLOC` is armed.
+        if crate::stage_alloc::enabled() {
+            crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
+        }
         // Pre-dedup regions, in the same interleaved order as `all_codes`.
         let regs_all = stage_time::measure(Stage::Align, || batched_regs(fm, bns, opt, &all_codes));
 
@@ -2978,7 +3112,8 @@ fn run_pe(
 
     // The reader is joined by `run`, which owns its handle: it started the thread before the index
     // load, so it is also the place that observes a reader error.
-    run_pipeline(out, batch_rx, process, verbose, k_batch)
+    let overlap = batch_overlap_enabled(bns.l_pac as u64, k_batch, verbose);
+    run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)
 }
 
 /// Read pairs handed to one parallel mate-rescue task, derived from the batch rather than fixed.

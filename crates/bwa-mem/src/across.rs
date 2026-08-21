@@ -112,6 +112,8 @@
 
 use crate::{cal_max_gap, MemAlnReg, H0_SENTINEL, MAX_BAND_TRY};
 use bwa_chain::{build_chains_from_smems, mem_chain_flt, MemChain};
+#[cfg(feature = "stage-alloc")]
+use bwa_core::alloc_probe;
 use bwa_core::MemOpt;
 use bwa_extend::{ExtendJob, SwBackend};
 use bwa_index::{BntSeq, FmIndex};
@@ -770,9 +772,24 @@ fn align_reads_batched_inner<B: SwBackend>(
     let refs: Vec<&[u8]> = reads.iter().map(|c| c.as_slice()).collect();
     // One vector of round-1 SMEMs per read, parallel to `reads`. At this point each SMEM carries an
     // SA *interval* (`k`, `s`), not yet resolved reference positions.
-    let per_read_smems = align_split::measure(&align_split::SEED_NS, || {
-        mem_collect_smem_batched(fm, &refs, opt)
-    });
+    // The four `alloc_probe::enter` scopes in this function split `BWA4_STAGE_ALLOC`'s `align` row
+    // into `align:seed`, `align:sa`, `align:chain` and `align:extend`. That row is 47% of the run's
+    // whole allocation volume (issue #25), and knowing which of the four spends it is the difference
+    // between a targeted buffer-reuse fix and another guess.
+    //
+    // Behind the `stage-alloc` feature, off by default, for the reason `align-split` is: disarmed
+    // the tag is one relaxed bool load per read chunk, which is nothing, but this function is
+    // `inline(always)` and the hottest in the aligner, and a guard whose live range spans most of it
+    // is exactly the kind of thing that perturbs register allocation. An A/B of the ungated version
+    // read +1.2% on min-of-4 and a wash on medians, i.e. it could not be shown to be free, so it is
+    // not shipped.
+    let per_read_smems = {
+        #[cfg(feature = "stage-alloc")]
+        let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SEED);
+        align_split::measure(&align_split::SEED_NS, || {
+            mem_collect_smem_batched(fm, &refs, opt)
+        })
+    };
     if std::env::var_os("BWA4_DUMP_SMEMS").is_some() {
         for sm in &per_read_smems {
             eprintln!("SMEM tot={}", sm.len());
@@ -811,12 +828,20 @@ fn align_reads_batched_inner<B: SwBackend>(
     // ready for one lockstep `get_sa_batch`. `per_read_counts`: per read, how many positions each of
     // its SMEMs contributed, which is what lets the chain builder re-split the flat result. Both are
     // left empty on the per-read fallback path, where nothing reads them.
+    // Filled by the position walk below when the batched path runs; empty otherwise.
+    let mut sa_repeats: Vec<bwa_chain::RepeatedRun> = Vec::new();
     let (all_positions, per_read_counts): (Vec<i64>, Vec<Vec<i64>>) = if batched_sa {
+        #[cfg(feature = "stage-alloc")]
+        let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SA);
         let mut pos = Vec::new();
+        // Runs of rows that repeat an earlier run exactly, because two adjacent SMEMs are identical
+        // after the sort. Collected here and consumed by the resolution below; see `RepeatedRun`.
+        let mut repeats = Vec::new();
         let counts = per_read_smems
             .iter_mut()
-            .map(|smems| bwa_chain::sa_positions_for_read(opt, smems, &mut pos))
+            .map(|smems| bwa_chain::sa_positions_for_read(opt, smems, &mut pos, &mut repeats))
             .collect();
+        sa_repeats = repeats;
         (pos, counts)
     } else {
         (Vec::new(), Vec::new())
@@ -825,6 +850,8 @@ fn align_reads_batched_inner<B: SwBackend>(
     // `all_rbegs[i]` is the genome coordinate (in `0..2*l_pac`) of suffix-array entry
     // `all_positions[i]`. Sliced per read by `sa_cursor` below. Empty on the fallback path.
     let all_rbegs: Vec<i64> = if batched_sa {
+        #[cfg(feature = "stage-alloc")]
+        let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SA);
         // Output buffer for `get_sa_batch`, pre-sized and zero-filled because the batch API writes by
         // index rather than pushing.
         let mut rbegs = vec![0i64; all_positions.len()];
@@ -894,14 +921,75 @@ fn align_reads_batched_inner<B: SwBackend>(
             for (i, k) in keyed.iter().enumerate() {
                 rbegs[(k & ((1 << IDX_BITS) - 1)) as usize] = sorted_rbegs[i];
             }
-        } else {
+        } else if sa_repeats.is_empty() || !repeat_skip_enabled() {
             fm.get_sa_batch(&all_positions, &mut rbegs);
+        } else {
+            // Resolve each row ONCE. A duplicate SMEM enumerates rows an earlier SMEM already
+            // enumerated, and a row's answer depends on nothing but the row, so the second walk can
+            // be a copy. Measured at 11.9% of rows on simulated reads and 17.7% on real GIAB, and
+            // each row costs 60 ns on an M4 and 163 ns on Zen 3.
+            //
+            // Byte-identical by construction rather than by argument: `all_positions`, the per-SMEM
+            // counts and the resulting `rbegs` are all exactly what the unskipped path produces.
+            // Only the number of FM-index walks changes, and `BWA4_NO_SA_REPEAT_SKIP` restores the
+            // old path for an A/B.
+            //
+            // The rows that actually need walking, and where each answer belongs. The repeats are
+            // already sorted by `dst` and do not overlap, so this walks the two lists together
+            // instead of materialising a per-row flag: at 86M rows a byte each would be 86 MB of
+            // allocation per million pairs, which the allocation probe would rightly report as
+            // churn introduced to avoid churn.
+            let mut to_walk: Vec<i64> = Vec::with_capacity(all_positions.len());
+            let mut dst_of: Vec<u32> = Vec::with_capacity(all_positions.len());
+            let mut next_repeat = 0usize;
+            let mut i = 0usize;
+            while i < all_positions.len() {
+                if next_repeat < sa_repeats.len() && sa_repeats[next_repeat].dst == i {
+                    // Inside a repeat: skip the whole run in one step.
+                    i += sa_repeats[next_repeat].len;
+                    next_repeat += 1;
+                    continue;
+                }
+                to_walk.push(all_positions[i]);
+                dst_of.push(i as u32);
+                i += 1;
+            }
+            let mut walked = vec![0i64; to_walk.len()];
+            fm.get_sa_batch(&to_walk, &mut walked);
+            for (k, &i) in dst_of.iter().enumerate() {
+                rbegs[i as usize] = walked[k];
+            }
+            // Then the repeats, in order. Every `src` run is non-repeated, so it is already filled.
+            for r in &sa_repeats {
+                let (src, dst, len) = (r.src, r.dst, r.len);
+                let (head, tail) = rbegs.split_at_mut(dst.max(src + len));
+                if src + len <= dst {
+                    tail[..len].copy_from_slice(&head[src..src + len]);
+                } else {
+                    // Overlapping runs cannot happen (a repeat starts after the run it copies ends),
+                    // but a wrong answer here would be silent, so it is a copy loop rather than an
+                    // assumption.
+                    for j in 0..len {
+                        rbegs[dst + j] = rbegs[src + j];
+                    }
+                }
+            }
         }
         if let Some(sa_timer) = sa_timer {
             use std::sync::atomic::Ordering::Relaxed;
             bwa_chain::chain_time::GET_SA_NS
                 .fetch_add(sa_timer.elapsed().as_nanos() as u64, Relaxed);
+            // Rows the walk was ASKED for, and rows it actually walked. They differ by the
+            // repeated runs skipped above, and reporting only the first made the per-lookup figure
+            // read low for the wrong reason.
             bwa_chain::chain_time::GET_SA_N.fetch_add(all_positions.len() as u64, Relaxed);
+            // Only what was ACTUALLY skipped. Summing the repeat list unconditionally reported
+            // rows as skipped in the `BWA4_NO_SA_REPEAT_SKIP` arm, which walks all of them, and
+            // that made the A/B's two halves look like they had done the same work.
+            if repeat_skip_enabled() {
+                let skipped: usize = sa_repeats.iter().map(|r| r.len).sum();
+                bwa_chain::chain_time::GET_SA_SKIPPED.fetch_add(skipped as u64, Relaxed);
+            }
         }
         rbegs
     } else {
@@ -915,6 +1003,8 @@ fn align_reads_batched_inner<B: SwBackend>(
     // Build and filter each read's chains from the (now resolved) SMEM occurrences.
     // One entry per read, in `reads` order: the chains that survive `mem_chain_flt`, each holding
     // the seeds the extension phase will work through. Everything downstream indexes this by read.
+    #[cfg(feature = "stage-alloc")]
+    let _chain_tag = alloc_probe::enter(alloc_probe::B_ALIGN_CHAIN);
     let per_read_chains: Vec<Vec<MemChain>> = per_read_smems
         .into_iter()
         .enumerate()
@@ -964,6 +1054,12 @@ fn align_reads_batched_inner<B: SwBackend>(
             out
         })
         .collect();
+
+    // Chaining is over; everything from the region skeleton to the final compaction is extension.
+    #[cfg(feature = "stage-alloc")]
+    drop(_chain_tag);
+    #[cfg(feature = "stage-alloc")]
+    let _extend_tag = alloc_probe::enter(alloc_probe::B_ALIGN_EXTEND);
 
     // The output under construction: per read, one region slot per seed, in slot order (chains back
     // to back, seeds within a chain in descending-score order). Filled skeleton-first by the
@@ -1344,6 +1440,21 @@ fn align_reads_batched_inner<B: SwBackend>(
     }
 
     regs
+}
+
+/// Whether the suffix-array walk skips rows a duplicate SMEM already resolved.
+///
+/// On by default because it is byte-identical by construction: the skipped rows get the answers of
+/// the identical rows they repeat, so `rbegs` is the same array either way and nothing downstream
+/// can tell. `BWA4_NO_SA_REPEAT_SKIP` restores the walk-everything path, which is how the two are
+/// A/B'd.
+///
+/// # Returns
+///
+/// True unless `BWA4_NO_SA_REPEAT_SKIP` is set to anything at all.
+fn repeat_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_NO_SA_REPEAT_SKIP").is_none())
 }
 
 /// Whether bwa-mem2's post-extension discard pass runs (`BWA4_NO_DISCARD` opts out).

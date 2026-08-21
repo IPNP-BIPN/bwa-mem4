@@ -1,5 +1,8 @@
 # Rust build output
 /target
+# Alternate target dirs used when a measurement needs two builds of the same source (a probe
+# feature, an instruction-set arm). The workflows create these by name, so they are ignored by name.
+/target-*
 
 # Reference clones (study material, gitignored; recreated by scripts/setup_reference.sh)
 /reference/

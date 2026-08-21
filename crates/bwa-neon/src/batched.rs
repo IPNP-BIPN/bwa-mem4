@@ -800,6 +800,115 @@ fn simd_dispatch(
     out
 }
 
+/// Compute each DISTINCT extension job once and copy the answer to its repeats.
+///
+/// A DP job is a pure function of `(query, target, h0)`: same bytes in, same `ExtendResult` out,
+/// with no shared state and no dependence on batch composition (which is what
+/// `assert_backend_batch_order_invariant` exists to hold). So two identical jobs in one batch are
+/// one job's worth of work and a copy, and the SAM cannot tell.
+///
+/// They are not rare. Measured with `BWA4_JOB_DUP` on this pipeline: **16.2% of jobs and 11.8% of
+/// cells on simulated chr21 reads, 23.8% and 18.3% on real GIAB against the whole genome**, because
+/// reads landing on the same repeat present the same window. None of them share a slice address, so
+/// the equality has to be on content.
+///
+/// The cost of finding them has to stay far below what they cost to compute. A byte-wise hash over
+/// ~230 bytes per job would eat a third of the job's own DP; instead this fingerprints the lengths,
+/// `h0` and up to 32 bytes from each end of each sequence, reading them as 64-bit words, and then
+/// **verifies candidates by comparing the bytes**. The fingerprint may collide; the verification is
+/// what makes the result exact.
+///
+/// # Parameters
+/// - `jobs`: the batch, in caller order.
+///
+/// # Returns
+/// `(unique, map)`: the distinct jobs in first-appearance order, and for each input job the index
+/// of its representative in `unique`. `map[i] == i'` means `out[i]` must be `results[i']`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
+    use std::collections::hash_map::Entry;
+    use std::collections::HashMap;
+
+    /// Fold up to `LIMIT` bytes from each end of `s` into `h`, eight at a time. Reading words
+    /// rather than bytes is what keeps this at a few percent of a job's DP instead of a third of it.
+    fn fold(h: &mut u64, s: &[u8]) {
+        const LIMIT: usize = 32;
+        let mut mix = |chunk: &[u8]| {
+            for w in chunk.chunks(8) {
+                let mut v = 0u64;
+                for (i, &b) in w.iter().enumerate() {
+                    v |= u64::from(b) << (8 * i);
+                }
+                *h ^= v;
+                *h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+        };
+        if s.len() <= 2 * LIMIT {
+            mix(s);
+        } else {
+            mix(&s[..LIMIT]);
+            mix(&s[s.len() - LIMIT..]);
+        }
+    }
+
+    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(jobs.len());
+    let mut unique: Vec<ExtendJob<'a>> = Vec::with_capacity(jobs.len());
+    let mut map: Vec<u32> = Vec::with_capacity(jobs.len());
+
+    for job in jobs {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        h ^= (job.query.len() as u64) << 32 | job.target.len() as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+        h ^= job.h0 as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+        fold(&mut h, job.query);
+        fold(&mut h, job.target);
+
+        let slot = match buckets.entry(h) {
+            Entry::Occupied(e) => {
+                // Same fingerprint: could be the same job or a collision, so compare the bytes.
+                // Only jobs that reach here pay for a comparison, and they are the minority.
+                let mut found = None;
+                for &cand in e.get() {
+                    let u = &unique[cand as usize];
+                    if u.h0 == job.h0 && u.query == job.query && u.target == job.target {
+                        found = Some(cand);
+                        break;
+                    }
+                }
+                match found {
+                    Some(cand) => cand,
+                    None => {
+                        let idx = unique.len() as u32;
+                        unique.push(*job);
+                        e.into_mut().push(idx);
+                        idx
+                    }
+                }
+            }
+            Entry::Vacant(e) => {
+                let idx = unique.len() as u32;
+                unique.push(*job);
+                e.insert(vec![idx]);
+                idx
+            }
+        };
+        map.push(slot);
+    }
+    (unique, map)
+}
+
+/// Whether identical jobs are computed once and copied. On by default: it is byte-identical by
+/// construction and removes 12-18% of the DP cells. `BWA4_NO_JOB_DEDUP` restores the
+/// compute-everything path, which is how the two are A/B'd.
+///
+/// # Returns
+/// True unless `BWA4_NO_JOB_DEDUP` is set to anything at all.
+fn job_dedup_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_NO_JOB_DEDUP").is_none())
+}
+
 /// Length/score binning + kernel dispatch for the jobs that are not ungapped HITs. Bins each into
 /// int8 (16 lanes) / int16 (8 lanes) / scalar, runs each bin, scatters back. This is bwa-mem2's
 /// `MAX_SEQ_LEN8`/`MAX_SEQ_LEN16` binning; the 8-bit path packs twice the lanes for short pairs.
@@ -848,6 +957,30 @@ fn dispatch_bins(
     // need a ~250-base perfect match, which is far past where these bins already send work to i16.
     let sbt_headroom = (-i32::from(mat[1])).max(-i32::from(mat[m - 1])).max(0) + max_sc;
 
+    if job_dup::enabled() {
+        job_dup::record(jobs);
+    }
+    if tight_ceil::enabled() {
+        tight_ceil::record(
+            jobs,
+            max_sc,
+            -i32::from(mat[1]),
+            o_del,
+            e_del,
+            o_ins,
+            e_ins,
+            w0,
+            end_bonus,
+        );
+    }
+    // Identical jobs are one job's work and a copy; see `dedup_jobs`. Done here rather than deeper
+    // so every bin below sees the deduplicated batch, and undone at the end by indexing through
+    // `dup_map`, which leaves the returned vector in caller order exactly as before.
+    let dedup = (jobs.len() > 1 && job_dedup_enabled()).then(|| dedup_jobs(jobs));
+    let (jobs, dup_map): (&[ExtendJob], Option<&[u32]>) = match &dedup {
+        Some((unique, map)) => (unique.as_slice(), Some(map.as_slice())),
+        None => (jobs, None),
+    };
     // Job indices per bin, in ascending order, partitioning `0..jobs.len()` exactly once.
     let (mut u8_idx, mut i16_idx, mut sc_idx) = (Vec::new(), Vec::new(), Vec::new());
     for (k, job) in jobs.iter().enumerate() {
@@ -855,6 +988,18 @@ fn dispatch_bins(
         // lengths (column and row indices are stored in lanes too).
         let minval = cell_bound(job, max_sc);
         let (qlen, tlen) = (job.query.len(), job.target.len());
+        if bin_split::enabled() {
+            // Which of the three gates would send this job away from the 16-lane kernel, and how
+            // many cells it carries. The lane type is a scheduling decision, not a scoring one, so
+            // if a large share of the work is in i16 for a LENGTH reason rather than a score
+            // reason, that is a lever worth having a number for. See `bin_split`.
+            bin_split::record(
+                (qlen * tlen) as u64,
+                qlen >= U8_LEN,
+                tlen >= U8_LEN,
+                minval + sbt_headroom >= U8_LEN as i32,
+            );
+        }
         if qlen < U8_LEN && tlen < U8_LEN && minval + sbt_headroom < U8_LEN as i32 {
             u8_idx.push(k);
         } else if qlen < MAX_SEQ_LEN16
@@ -900,17 +1045,24 @@ fn dispatch_bins(
     // Homogeneous fast path: whole batch in one bin -> run the kernel on `jobs` with no gather/scatter.
     // `n` is the batch size, so `x_idx.len() == n` means bin `x` took every job.
     let n = jobs.len();
+    // The three single-bin fast paths. Each has to go through `expand`, because with the dedup
+    // above `jobs` is the DISTINCT batch and the caller is owed one result per ORIGINAL job. Missing
+    // that on these paths is what the paired-end overlap test caught: they are the common case, so
+    // the bug was not subtle, only invisible until something indexed past the end.
     if u8_idx.len() == n {
         // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
-        return unsafe { run_u8!(jobs) };
+        return expand(unsafe { run_u8!(jobs) }, dup_map);
     }
     if i16_idx.len() == n {
         // SAFETY: neon available; MAX_SEQ_LEN16 bounds keep all values inside i16.
-        return unsafe { run_i16!(jobs) };
+        return expand(unsafe { run_i16!(jobs) }, dup_map);
     }
     if sc_idx.len() == n {
-        return batched_extend_scalar(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        return expand(
+            batched_extend_scalar(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            ),
+            dup_map,
         );
     }
 
@@ -942,7 +1094,28 @@ fn dispatch_bins(
             bin, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         )
     });
-    out
+    // Expand back to one result per ORIGINAL job. `out` currently holds one per distinct job; every
+    // repeat takes its representative's answer, which is the same answer it would have computed.
+    expand(out, dup_map)
+}
+
+/// Turn one result per DISTINCT job into one result per original job.
+///
+/// The inverse of [`dedup_jobs`]'s map, and the only thing that has to be remembered on every exit
+/// path of `dispatch_bins`. `None` means no deduplication happened and the vector is already right.
+///
+/// # Parameters
+/// - `results`: one entry per distinct job, in the order `dedup_jobs` returned them.
+/// - `dup_map`: for each original job, the index of its representative.
+///
+/// # Returns
+/// One result per original job, in caller order.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn expand(results: Vec<ExtendResult>, dup_map: Option<&[u32]>) -> Vec<ExtendResult> {
+    match dup_map {
+        Some(map) => map.iter().map(|&u| results[u as usize]).collect(),
+        None => results,
+    }
 }
 
 /// Portable scalar reference (step 2b-i): lane-batched control flow, scalar per-cell arithmetic.
@@ -1310,6 +1483,142 @@ fn inline_sbt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_EXTEND_SBT").is_none_or(|v| v != "0"))
 }
 
+/// Whether the extension kernels clamp each lane's band by the ungapped-score bound
+/// (fg-labs/bwa-mem3's `tight_band`, `bwamem.cpp:4119`, with the lemma corrected; see
+/// [`tight_band_bound`]).
+///
+/// ON by default since 2026-08-20, because the byte-identity battery ruled: md5-identical on chr21
+/// 1M pairs and 500k real GIAB pairs on ARM, on both the simulated and real sets on x86 (checked in
+/// CI by the head-to-head's identity step, which fails the run otherwise), and 64 of 64 option
+/// combinations against the bwa-mem2 oracle with the clamp active. What it bought, interleaved and
+/// never overlapping: align -9.3% on chr21; whole runs beating the source-built fork 7/7 on both
+/// ARM datasets and 3/3 on x86 real reads, twice. `BWA4_NO_TIGHT_BAND` restores the full band for
+/// A/B and for suspicion.
+///
+/// # Returns
+/// True unless `BWA4_NO_TIGHT_BAND` is set to anything at all.
+fn tight_band_enabled() -> bool {
+    use std::sync::OnceLock;
+    // The FIELD-level equivalence gates compare this kernel's raw result tuple against the
+    // full-band scalar reference, and the clamp legitimately changes `gscore`/`gtle` inside the
+    // window the caller never reads (see `tight_band_bound`). Those gates therefore pin the full
+    // band through this switch; the clamp itself is arbitrated at the SAM level, where chr21, real
+    // GIAB, the 64-arm option matrix and the CI identity step all rule. Checked before the cache,
+    // sticky once set, and compiled to a constant-false branch outside `cfg(test)`.
+    if cfg!(test) && FULL_BAND_FOR_FIELD_GATES.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_NO_TIGHT_BAND").is_none())
+}
+
+/// Set by the field-level equivalence gates to pin the full band; see [`tight_band_enabled`].
+/// Sticky by design: gates run concurrently under the test harness, so an unset would race.
+pub(crate) static FULL_BAND_FOR_FIELD_GATES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The ungapped-score band bound for one job, or `i32::MAX` when no bound applies.
+///
+/// The lemma (fork's `bwamem.cpp:4119`): an alignment at offset `B` from the seed diagonal carries
+/// at least `B` gap operations, so its score is at most `min_len * a - B * (o_min + e_min)`. The
+/// diagonal walk's own best prefix score `S` is attainable at offset 0, so any alignment that beats
+/// the in-band optimum needs `B < (min_len * a - S) / (o_min + e_min)`. Everything at or past that
+/// offset scores at most `S`, and the `+ 1` below turns "at most" into "strictly below": with it,
+/// every alignment TIED at the top is inside the band, so the tie-break winner is the same cell the
+/// full-width scan would have picked. That closes the one corner the fork's `ceil` leaves open, for
+/// the price of one extra column.
+///
+/// `O(min_len)` per job, against the `O(len^2)` DP it informs. An ambiguous base returns no bound,
+/// exactly like the fork's FALLBACK status: the walk's scoring does not model N.
+///
+/// **The `gscore` window, and why `end_bonus` widens the bound.** The lemma above protects the
+/// LOCAL maximum. `gscore` is different: it is the best score among query-exhausting cells, it is
+/// reported even when it is far below `score`, and a query-exhausting cell can sit outside the
+/// tight band with a `gscore` the full-width run would have reported and this band will not. The
+/// first run of the equivalence gates caught exactly that: every failure had `score`/`qle`/`tle`
+/// identical and only `gscore`/`gtle` moved. What saves the SAM is that the caller only USES
+/// `gscore` when it beats `score - pen_clip`, and bwa passes `pen_clip` to this kernel as
+/// `end_bonus` (that is what the parameter means: the bonus for reaching the end is the forgone
+/// clip penalty). A usable query-exhausting cell therefore satisfies
+/// `min_len * a - B * oe_min >= score - end_bonus > S - end_bonus`, i.e.
+/// `B < bound + end_bonus / oe_min`. Folding `end_bonus` into the numerator keeps every USABLE
+/// `gscore` cell in-band; an out-of-band `gscore` is then provably below the clip threshold in both
+/// band widths, so the clip decision and the emitted bytes agree even where the raw field does not.
+/// The FIELD can still differ, which is why the equivalence gates run with this switch off and the
+/// arbiter for it is SAM identity.
+///
+/// # Parameters
+/// - `query`, `target`: the job's sequences, nt4 codes.
+/// - `h0`: the seed score the extension starts from.
+/// - `a`: match bonus (positive). `mm`: mismatch score (negative, as `mat[1]` stores it).
+/// - `oe_min`: `(min(o_del, o_ins), min(e_del, e_ins))`, the cheapest gap open and extend.
+/// - `end_bonus`: the clip penalty the caller forgoes by extending to the end; widens the bound so
+///   every usable `gscore` cell stays in-band.
+///
+/// # Returns
+/// An upper bound on the useful band half-width, `>= 1`, or `i32::MAX` for "leave the band alone".
+fn tight_band_bound(
+    query: &[u8],
+    target: &[u8],
+    h0: i32,
+    a: i32,
+    mm: i32,
+    oe_min: (i32, i32),
+    end_bonus: i32,
+) -> i32 {
+    let min_len = query.len().min(target.len());
+    if min_len == 0 || h0 <= 0 || oe_min.0 < 0 || oe_min.1 <= 0 {
+        return i32::MAX;
+    }
+    // Best prefix score along the diagonal, STOPPING where the walk dies. In the extension DP
+    // `m == 0` means unreachable, not "restart for free": once the running score hits zero the
+    // ungapped alignment has ended, and anything beyond that column is only reachable through gaps.
+    // The first version of this walk floored at zero and kept going, which OVERSTATES `S` whenever
+    // the diagonal dips and recovers, which narrows the band below what the lemma licenses, which
+    // is how it moved `XS` on 1.1% of chr21 records (a secondary region's score fell by 9 on the
+    // first diff). The bound must be derived from a score the band-limited DP genuinely attains,
+    // and this walk's prefix maximum before death is exactly that.
+    let mut h = h0;
+    let mut s_best = h0;
+    for col in 0..min_len {
+        let (qc, tc) = (query[col], target[col]);
+        if qc >= 4 || tc >= 4 {
+            return i32::MAX;
+        }
+        h += if qc == tc { a } else { mm };
+        if h <= 0 {
+            break;
+        }
+        if h > s_best {
+            s_best = h;
+        }
+    }
+    // The cost of sitting at offset `B` is ONE gap run of `B` columns at the cheapest rates,
+    // `o_min + B * e_min`, NOT `B * (o_min + e_min)`. The fork's comment writes the latter, and
+    // porting it verbatim cut real alignments: the first diverging record was a 3-base deletion
+    // (cost 6 + 3 = 9 at bwa's defaults) whose band the per-column-open arithmetic had denied.
+    // This project's own #50 rev-bound already used the correct one-run form.
+    //
+    // Beat `S` from offset `B`:  min_len*a - (o_min + B*e_min) > S - end_bonus
+    //   =>  B < (min_len*a - S - o_min + end_bonus) / e_min
+    let (o_min, e_min) = oe_min;
+    // The ceiling on ANY alignment in this DP is `h0 + min_len * a` (all matches from the seed
+    // score), and `s_best` includes `h0`, so the numerator must carry it on both sides or the bound
+    // is `h0` columns too narrow. That asymmetry was this function's third bug: it only cancels
+    // when the diagonal walk survives to the end, which is why the md5 was close but not equal.
+    let numer =
+        i64::from(h0) + (min_len as i64) * i64::from(a) - i64::from(s_best) - i64::from(o_min)
+            + i64::from(end_bonus.max(0));
+    if numer <= 0 {
+        // No gapped alignment can pay even one open and still be useful: one column of band
+        // suffices, plus the strict-tie margin.
+        return 2;
+    }
+    let denom = i64::from(e_min);
+    // ceil(numer / denom), plus the strict-tie margin.
+    ((((numer + denom - 1) / denom).min(i64::from(i32::MAX - 1))) as i32).saturating_add(1)
+}
+
 /// Per-lane band clamp, mirroring the `w` adjustments in `ksw_extend2` (`ksw.cpp:456-461`).
 ///
 /// A band wider than the longest gap that could ever pay for itself is wasted work, and bwa shrinks
@@ -1540,6 +1849,23 @@ macro_rules! define_sw_kernel {
                     tlen[l] = job.target.len();
                     h0[l] = job.h0;
                     w[l] = clamp_band(w0, qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del);
+                    // `BWA4_TIGHT_BAND`: clamp this lane's band by the ungapped-score bound. The
+                    // row loop below derives `beg[l]`/`end[l]` from `w[l]` and `gbeg`/`gend` as
+                    // their union, so a tighter lane narrows the walked columns wherever the whole
+                    // chunk is tight, which the ceiling probe says is nearly everywhere. The walk
+                    // is O(min_len) against the O(len^2) it removes.
+                    if tight_band_enabled() {
+                        let bound = tight_band_bound(
+                            job.query,
+                            job.target,
+                            job.h0,
+                            i32::from(mat[0]),
+                            i32::from(mat[1]),
+                            (o_del.min(o_ins), e_del.min(e_ins)),
+                            end_bonus,
+                        );
+                        w[l] = w[l].min(bound);
+                    }
                 }
                 // Longest query and target in this chunk, in bases: `max_q` sizes the shared row,
                 // `max_t` is the number of lockstep row iterations every lane pays for.
@@ -1985,7 +2311,7 @@ macro_rules! define_sw_kernel {
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::{clamp_band, default_result};
+    use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
 
     /// `(j >= beg) & (j < end)` for the NEON u8 kernel. NEON has native UNSIGNED byte compares, so
     /// the portable form is already one instruction each and `band_bias` is 0: the signed rewrite of
@@ -2076,7 +2402,7 @@ mod neon {
 /// (verified via the force-run property test compiled to x86 and executed under Rosetta).
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{clamp_band, default_result};
+    use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -2279,7 +2605,7 @@ mod avx2 {
 /// integer compare, and its blend takes its arguments in the opposite order from NEON's `vbslq`.
 #[cfg(target_arch = "x86_64")]
 mod sse41 {
-    use super::{clamp_band, default_result};
+    use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -2441,7 +2767,7 @@ mod sse41 {
 /// keeps the shared body untouched. `bsl` is a single `ternarylogic` (0xCA = `mask ? a : b`).
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
-    use super::{clamp_band, default_result};
+    use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -2646,6 +2972,8 @@ mod avx2_verify {
 
     #[test]
     fn avx2_u8_and_i16_match_scalar() {
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         let mat = scoring();
         let mut state = 0xA7C2_0000_0000_0001u64;
         // Deterministic LCG (the classic Numerical Recipes 64-bit multiplier/increment), returning
@@ -2944,6 +3272,8 @@ mod neon_verify {
 
     #[test]
     fn neon_u8_and_i16_match_scalar() {
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
         let mat = scoring();
         let mut state = 0x1234_5678_9abc_def1u64;
         // Deterministic LCG (the classic Numerical Recipes 64-bit multiplier/increment), returning
@@ -3087,6 +3417,331 @@ mod neon_verify {
 /// chunking would pay: `EXEC` is what the kernel executes in caller order, `EXEC_SORTED` what it
 /// would execute after a `(tlen, qlen)` sort. Sorting is legal because each job's result depends
 /// only on that job.
+/// `BWA4_TIGHT_CEIL=1`: what fg-labs/bwa-mem3's `tight_band` would remove from OUR extension work.
+///
+/// Their lemma (`bwamem.cpp:4119`): when the ungapped fast path fails on mismatches, the diagonal
+/// walk's score `S` still bounds the useful band, because an alignment at offset `B` from the
+/// diagonal pays at least `B` gaps: for it to beat `S`,
+/// `B < (min_len * a - S) / (o_min + e_min)`. They start the DP at that band and skip the retry
+/// ladder, and it is the reason their BSW stage costs 205 s CPU where ours costs 275 on the same
+/// wgsim reads (the per-stage diff in ROADMAP.md).
+///
+/// Before porting a lemma whose byte-identity rests on tie and z-drop subtleties, this probe prices
+/// it: walk each DP job's diagonal (O(min_len), against the O(len^2) DP it informs), compute the
+/// bound, and compare the cells the kernel walks at the current band against the cells it would
+/// walk at `min(current, tight)`. Counts only; it cannot move a byte.
+pub mod tight_ceil {
+    use super::{clamp_band, ExtendJob};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    /// Jobs seen, jobs the bound tightens, and the two cell totals.
+    static JOBS: AtomicU64 = AtomicU64::new(0);
+    static TIGHTENED: AtomicU64 = AtomicU64::new(0);
+    static CELLS_NOW: AtomicU64 = AtomicU64::new(0);
+    static CELLS_TIGHT: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe is on. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_TIGHT_CEIL` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_TIGHT_CEIL").is_some())
+    }
+
+    /// Price one batch. `a`/`b` are the match bonus and mismatch penalty magnitude, the `o`/`e`
+    /// pairs the gap penalties, `w0` the caller's band, the rest as the kernel takes them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        jobs: &[ExtendJob],
+        a: i32,
+        b: i32,
+        o_del: i32,
+        e_del: i32,
+        o_ins: i32,
+        e_ins: i32,
+        w0: i32,
+        end_bonus: i32,
+    ) {
+        let o_min = o_del.min(o_ins);
+        let e_min = e_del.min(e_ins);
+        let (mut n, mut tightened, mut now, mut tight_total) = (0u64, 0u64, 0u64, 0u64);
+        for job in jobs {
+            n += 1;
+            let min_len = job.query.len().min(job.target.len());
+            let max_len = job.query.len().max(job.target.len());
+            // The band the kernel actually uses for this job, before the retry ladder.
+            let w = clamp_band(
+                w0,
+                job.query.len(),
+                a,
+                end_bonus,
+                o_ins,
+                e_ins,
+                o_del,
+                e_del,
+            );
+            // Cells at band `x`: each of the min_len rows walks at most `2x + 1` columns, capped by
+            // the other sequence's length. An estimate of the same shape for both arms, so the
+            // RATIO is meaningful even where the absolute count is approximate.
+            let cells_at = |x: i32| min_len as u64 * ((2 * x as u64 + 1).min(max_len as u64));
+            now += cells_at(w);
+
+            // The diagonal walk, completed regardless of mismatch count (unlike `ungapped_hit`,
+            // which bails at the HIT threshold): running local score along the diagonal, floored at
+            // zero exactly as the DP's own diagonal would be, best prefix kept as `S`. An ambiguous
+            // base is the fork's FALLBACK case: no bound.
+            let mut h = job.h0;
+            let mut s_best = job.h0;
+            let mut ambiguous = false;
+            for col in 0..min_len {
+                let (qc, tc) = (job.query[col], job.target[col]);
+                if qc >= 4 || tc >= 4 {
+                    ambiguous = true;
+                    break;
+                }
+                h += if qc == tc { a } else { -b };
+                // Death, not restart: the extension DP has no free local restart, so the ungapped
+                // walk ends here and its prefix maximum is the score the lemma may use.
+                if h <= 0 {
+                    break;
+                }
+                if h > s_best {
+                    s_best = h;
+                }
+            }
+            if ambiguous {
+                tight_total += cells_at(w);
+                continue;
+            }
+            // The lemma's bound, in the correct one-gap-run form (`o + B*e`, not `B*(o+e)`; see
+            // `tight_band_bound` for the record that caught the difference).
+            let numer = i64::from(job.h0) + (min_len as i64) * i64::from(a)
+                - i64::from(s_best)
+                - i64::from(o_min);
+            let denom = i64::from(e_min);
+            let bound = if numer <= 0 {
+                1
+            } else {
+                ((numer + denom - 1) / denom).max(1) as i32
+            };
+            if bound < w {
+                tightened += 1;
+                tight_total += cells_at(bound);
+            } else {
+                tight_total += cells_at(w);
+            }
+        }
+        JOBS.fetch_add(n, Relaxed);
+        TIGHTENED.fetch_add(tightened, Relaxed);
+        CELLS_NOW.fetch_add(now, Relaxed);
+        CELLS_TIGHT.fetch_add(tight_total, Relaxed);
+    }
+
+    /// Print the ceiling once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (n, t) = (JOBS.load(Relaxed).max(1), TIGHTENED.load(Relaxed));
+        let (now, tight) = (CELLS_NOW.load(Relaxed).max(1), CELLS_TIGHT.load(Relaxed));
+        eprintln!(
+            "[tight-ceil] {t} of {n} DP jobs ({:.1}%) get a tighter band from the ungapped bound; \
+             banded cells {now} -> {tight} ({:.1}% removed) -- the CEILING on porting the fork's \
+             tight_band, before any byte-identity question is answered",
+            100.0 * t as f64 / n as f64,
+            100.0 * (now.saturating_sub(tight)) as f64 / now as f64,
+        );
+    }
+}
+
+/// `BWA4_JOB_DUP=1`: how many extension jobs are exact duplicates of another job in the same call.
+///
+/// A DP job is a pure function of `(query, target, h0)`, which is what made the same trick work for
+/// the suffix-array walk: identical inputs can be computed once and copied, byte-identically, with
+/// nothing downstream able to tell. The question is whether the aligner actually produces identical
+/// jobs, and how much of the cell count they carry. The seed loop extends every seed of every
+/// surviving chain, and seeds on the same diagonal from different chains can present the same
+/// window, so the rate is not obviously zero.
+///
+/// Counts only. A hash decides equality here, so this measures an UPPER bound on the opportunity;
+/// an implementation would have to compare the bytes.
+pub mod job_dup {
+    use super::ExtendJob;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    /// Jobs seen, and the cells they carry.
+    static JOBS: AtomicU64 = AtomicU64::new(0);
+    static CELLS: AtomicU64 = AtomicU64::new(0);
+    /// Jobs whose `(query, target, h0)` had already been seen in the same call, and their cells.
+    static DUP_JOBS: AtomicU64 = AtomicU64::new(0);
+    static DUP_CELLS: AtomicU64 = AtomicU64::new(0);
+    /// The same, but keyed on the SLICE IDENTITY (pointer and length) rather than on the bytes.
+    /// This is the version an implementation could afford: hashing 230 bytes of content per job
+    /// costs a noticeable fraction of the job's own DP, while comparing two fat pointers is free.
+    /// It can only find fewer duplicates than the content key, so the gap between the two columns
+    /// is the part of the opportunity that a cheap implementation would leave on the table.
+    static PTR_DUP_JOBS: AtomicU64 = AtomicU64::new(0);
+    static PTR_DUP_CELLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe is on. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_JOB_DUP` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_JOB_DUP").is_some())
+    }
+
+    /// Hash one job's content. FNV-1a over the two sequences and `h0`: cheap, and good enough for a
+    /// counting probe that is explicitly measuring an upper bound.
+    fn hash(job: &ExtendJob) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in job.query.iter().chain(job.target.iter()) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        h ^= job.h0 as u64;
+        h.wrapping_mul(0x1000_0000_01b3)
+    }
+
+    /// Count duplicates within one kernel call.
+    ///
+    /// # Parameters
+    /// - `jobs`: the batch as the kernel received it.
+    pub fn record(jobs: &[ExtendJob]) {
+        let mut seen: HashMap<u64, ()> = HashMap::with_capacity(jobs.len());
+        let mut seen_ptr: HashMap<(usize, usize, usize, usize, i32), ()> =
+            HashMap::with_capacity(jobs.len());
+        let (mut n, mut c, mut dn, mut dc, mut pn, mut pc) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        for job in jobs {
+            let cells = (job.query.len() * job.target.len()) as u64;
+            n += 1;
+            c += cells;
+            if seen.insert(hash(job), ()).is_some() {
+                dn += 1;
+                dc += cells;
+            }
+            let key = (
+                job.query.as_ptr() as usize,
+                job.query.len(),
+                job.target.as_ptr() as usize,
+                job.target.len(),
+                job.h0,
+            );
+            if seen_ptr.insert(key, ()).is_some() {
+                pn += 1;
+                pc += cells;
+            }
+        }
+        JOBS.fetch_add(n, Relaxed);
+        CELLS.fetch_add(c, Relaxed);
+        DUP_JOBS.fetch_add(dn, Relaxed);
+        DUP_CELLS.fetch_add(dc, Relaxed);
+        PTR_DUP_JOBS.fetch_add(pn, Relaxed);
+        PTR_DUP_CELLS.fetch_add(pc, Relaxed);
+    }
+
+    /// Print the rate once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (n, c) = (JOBS.load(Relaxed).max(1), CELLS.load(Relaxed).max(1));
+        let (dn, dc) = (DUP_JOBS.load(Relaxed), DUP_CELLS.load(Relaxed));
+        let (pn, pc) = (PTR_DUP_JOBS.load(Relaxed), PTR_DUP_CELLS.load(Relaxed));
+        eprintln!(
+            "[job-dup] by CONTENT: {dn} of {n} jobs ({:.2}%), {dc} of {c} cells ({:.2}%). \
+             by SLICE IDENTITY: {pn} jobs ({:.2}%), {pc} cells ({:.2}%). The second is what a \
+             free implementation can reach; the first is the ceiling",
+            100.0 * dn as f64 / n as f64,
+            100.0 * dc as f64 / c as f64,
+            100.0 * pn as f64 / n as f64,
+            100.0 * pc as f64 / c as f64,
+        );
+    }
+}
+
+/// `BWA4_BIN_SPLIT=1`: how much extension work runs in the 8-lane kernel, and WHY.
+///
+/// The u8 kernel has twice the lanes of the i16 one, and both are exact, so which one a job takes is
+/// pure scheduling. Three gates can push a job to i16: a query at or past 256, a target at or past
+/// 256, or a score ceiling that would not fit. They have very different implications. A score gate
+/// is physics. A LENGTH gate is a choice about where the kernel keeps its column and row indices,
+/// and if most of the work is leaving the wide kernel for that reason, it is worth knowing before
+/// anyone tries to make the wide kernel faster.
+pub mod bin_split {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    /// Jobs seen, and cells they carry.
+    static JOBS: AtomicU64 = AtomicU64::new(0);
+    /// Cells in jobs the u8 kernel takes.
+    static CELLS_U8: AtomicU64 = AtomicU64::new(0);
+    /// Cells in jobs pushed out by each gate. A job can trip several; each is counted.
+    static CELLS_QLEN: AtomicU64 = AtomicU64::new(0);
+    static CELLS_TLEN: AtomicU64 = AtomicU64::new(0);
+    static CELLS_SCORE: AtomicU64 = AtomicU64::new(0);
+    /// Cells in jobs that leave the wide kernel for any reason.
+    static CELLS_WIDE_LOST: AtomicU64 = AtomicU64::new(0);
+    /// Cells overall.
+    static CELLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe is on. Read once and cached.
+    ///
+    /// # Returns
+    /// True if `BWA4_BIN_SPLIT` is set to anything at all.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_BIN_SPLIT").is_some())
+    }
+
+    /// Record one job.
+    ///
+    /// # Parameters
+    /// - `cells`: `qlen * tlen`, the nominal work.
+    /// - `qlen_gate`, `tlen_gate`, `score_gate`: which gates this job trips.
+    pub fn record(cells: u64, qlen_gate: bool, tlen_gate: bool, score_gate: bool) {
+        JOBS.fetch_add(1, Relaxed);
+        CELLS.fetch_add(cells, Relaxed);
+        if qlen_gate {
+            CELLS_QLEN.fetch_add(cells, Relaxed);
+        }
+        if tlen_gate {
+            CELLS_TLEN.fetch_add(cells, Relaxed);
+        }
+        if score_gate {
+            CELLS_SCORE.fetch_add(cells, Relaxed);
+        }
+        if qlen_gate || tlen_gate || score_gate {
+            CELLS_WIDE_LOST.fetch_add(cells, Relaxed);
+        } else {
+            CELLS_U8.fetch_add(cells, Relaxed);
+        }
+    }
+
+    /// Print the split once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let (j, c) = (JOBS.load(Relaxed), CELLS.load(Relaxed).max(1));
+        let pct = |v: u64| 100.0 * v as f64 / c as f64;
+        eprintln!(
+            "[bin-split] {j} extension jobs, {c} cells: {:.1}% in the 16-lane u8 kernel, \
+             {:.1}% pushed to 8-lane i16 (qlen gate {:.1}%, tlen gate {:.1}%, score gate {:.1}%)",
+            pct(CELLS_U8.load(Relaxed)),
+            pct(CELLS_WIDE_LOST.load(Relaxed)),
+            pct(CELLS_QLEN.load(Relaxed)),
+            pct(CELLS_TLEN.load(Relaxed)),
+            pct(CELLS_SCORE.load(Relaxed)),
+        );
+    }
+}
+
 pub mod extend_shape {
     use super::ExtendJob;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -3375,10 +4030,14 @@ mod avx512_verify {
 
     #[test]
     fn avx512_u8_and_i16_match_scalar() {
-        // Unlike the AVX2 gate, this one CANNOT run under Rosetta: it has no `avx512bw`. On a
-        // host without the feature the test returns early and reports `ok` without having executed
-        // the kernel, so AVX-512 coverage comes from a native AVX-512 CI runner only.
-        if !std::arch::is_x86_feature_detected!("avx512bw") {
+        crate::batched::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Unlike the AVX2 gate, this one CANNOT run under Rosetta: it has no `avx512bw`. It used to
+        // return silently on such a host, which meant a green `ok` that had executed nothing; now it
+        // says so, and `BWA4_TEST_FORCE_AVX512` runs it anyway where the harness knows better (an
+        // emulator whose feature detection under-reports). See `crate::avx512_testable`.
+        if !crate::avx512_testable() {
+            eprintln!("skipping avx512_u8_and_i16_match_scalar: no avx512bw on this CPU");
             return;
         }
         let mat = scoring();

@@ -111,8 +111,30 @@ jobs:
         include:
           - os: ubuntu-22.04
             target_id: linux-x86_64
+            # PGO measured 2026-08-18 on this exact recipe, on an AMD EPYC 7763 (Zen 3), three
+            # interleaved repetitions that do not cross: plain 104.22 / 104.27 / 104.27 s against
+            # 107.36 / 108.15 / 108.24 s with it. It COSTS 3.3% here. An independent arm using
+            # cargo-pgo and a different training set agreed at -4.1%. See #33.
+            pgo: false
+            # And a SECOND binary in the same tarball, compiled for AVX2. Measured on the same Zen 3
+            # runner, byte-identical output (md5 6b084cb8...): baseline 32.99 / 33.42 s against
+            # 31.42 / 31.15 s, i.e. 5.6% to 6.8% for free on any host from 2013 on. This is the
+            # lever docs/fork-teardown.md identified: fg-labs/bwa-mem3 compiles its whole non-kernel
+            # codebase at AVX2 (`BASELINE_ARCH ?= avx2`) while we ship one baseline binary and
+            # dispatch only hand-written kernels, which leaves every scalar loop built for a 2003
+            # CPU. The default artefact stays baseline so it runs everywhere.
+            variant_cpu: "x86-64-v3"
+            # Parallel suffix-array construction, statically linked. Measured: 152.45 s -> 90.96 s
+            # for a GRCh38 index at 8 threads, byte-identical, and `ldd` shows no libgomp and in
+            # fact one library FEWER than the plain build, because openmp-sys links libgcc
+            # statically too. That was the only objection on file (#37).
+            omp: true
           - os: ubuntu-24.04-arm
             target_id: linux-aarch64
+            # Same story on non-Apple ARM: -0.6% on hosted Ampere Altra, three reps, matching
+            # @nh13's independent -0.4% on Graviton4. See #33.
+            pgo: false
+            omp: true
           # DELIBERATELY NOT macos-26, the newest label. For a binary we hand to other people,
           # newer is worse: the build host sets the floor. `hts-sys` compiles vendored htslib with
           # `cc`, and `cc` with no explicit target takes the host's default deployment version, so
@@ -123,9 +145,21 @@ jobs:
           - os: macos-14
             target_id: macos-arm64
             deployment_target: "11.0"
+            # The one platform where PGO pays, and it pays a lot: +12.4% on an M4, +6.1% SE / +8.5%
+            # PE at genome scale (docs/perf-levers.md). What it buys is branch layout on the branchy
+            # driver, seeding and SAM paths, and how much that is worth is a property of the core's
+            # branch predictor, not of this code.
+            pgo: true
           - os: macos-15-intel
             target_id: macos-x86_64
             deployment_target: "10.12"
+            # Intel, so the Zen 3 and Altra results apply rather than the M4 one. Not separately
+            # measured on this exact runner; off, because two of two non-Apple architectures lose
+            # and shipping a slower binary on an unmeasured guess is the wrong default.
+            pgo: false
+            # Same AVX2 variant as the Linux x86_64 artefact: every Intel Mac that can run this is
+            # from 2013 or later and has AVX2.
+            variant_cpu: "x86-64-v3"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -143,6 +177,7 @@ jobs:
       # whose format matches what a `-Cprofile-generate` binary writes. Any other llvm-profdata on
       # the runner is a coin flip.
       - name: Install llvm-tools for PGO
+        if: matrix.pgo == true
         run: rustup component add llvm-tools-preview
 
       # Profile-guided build, done natively on each target's own runner (which is why the matrix
@@ -154,6 +189,21 @@ jobs:
       # training set being tiny is not a problem here: what PGO needs from it is which branches the
       # seeding and DP loops take, and those are the same shapes at any reference size.
       #
+      # THAT MEASUREMENT WAS APPLE SILICON, and generalising it was wrong. Re-measured 2026-08-18 on
+      # three architectures, three interleaved repetitions each, none of them crossing:
+      #
+      #   | host                        | plain            | PGO              | verdict |
+      #   |-----------------------------|------------------|------------------|---------|
+      #   | M4 (Apple Silicon)          | -                | -                | +12.4%  |
+      #   | Ampere Altra (hosted ARM)   | 69.43/69.90/69.69| 69.99/70.32/69.95| -0.6%   |
+      #   | AMD EPYC 7763 (Zen 3)       |104.22/104.27/104.27|107.36/108.15/108.24| -3.3% |
+      #
+      # The Zen 3 row uses THIS recipe, tiny-fixture training included, so it is not a proxy. So the
+      # step is now gated on `matrix.pgo`: Apple Silicon builds profile-guided, everything else
+      # builds plain, and the artefacts that no longer use it become reproducible from a clean tree
+      # again. What PGO buys here is branch layout on the branchy driver, seeding and SAM paths, and
+      # how much that is worth is a property of the core's branch predictor rather than of the code.
+      #
       # Two things this deliberately does NOT do. It does not train on a real genome: that would
       # mean shipping or downloading one in a release job, and the measurement says it is not worth
       # it. And it does not use `-C target-cpu`: the artifact has to run on the audience's machines,
@@ -162,7 +212,22 @@ jobs:
       # The cost is one extra compile per target. The consequence to be aware of is that a release
       # binary is no longer bit-reproducible from a clean tree by `cargo build --release` alone: it
       # is reproducible by re-running THIS recipe, which is what the release notes point at.
+      # Plain build, for the three targets where PGO measured as a LOSS. Same flags a user gets from
+      # `cargo build --release`, which also makes those artefacts reproducible from a clean tree
+      # again, which the PGO ones are not.
+      - name: Build (plain)
+        if: matrix.pgo != true
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+          # Static OpenMP where the matrix asks for it; empty everywhere else, which leaves the
+          # serial suffix array. macOS is deliberately not in that set: libomp is a brew package
+          # rather than something the toolchain ships, so the artefact could not be built without
+          # one and could not be linked statically against it.
+          OPENMP_STATIC: ${{ matrix.omp && '1' || '' }}
+        run: cargo build --release --locked ${{ matrix.omp && '--features libsais-c-omp' || '' }}
+
       - name: Build (PGO)
+        if: matrix.pgo == true
         env:
           # Pinned rather than inherited, so the floor is a decision instead of a side effect of
           # whichever runner image happens to be current. It reaches the vendored htslib C build
@@ -219,6 +284,16 @@ jobs:
           echo "minimum macOS: $GOT (expected $WANT)"
           [ "$GOT" = "$WANT" ] || { echo "::error::built binary demands macOS $GOT, expected $WANT"; exit 1; }
 
+      - name: The parallel-index build gained no shared library
+        if: matrix.omp
+        run: |
+          set -euo pipefail
+          ldd target/release/bwa-mem4 | sort
+          if ldd target/release/bwa-mem4 | grep -qi 'gomp\|libomp'; then
+            echo "::error::the artefact links a shared OpenMP runtime"; exit 1
+          fi
+          echo "no shared OpenMP runtime in the artefact"
+
       - name: The binary reports the tagged version
         run: |
           set -euo pipefail
@@ -261,6 +336,39 @@ jobs:
           [ "$RECORDS" -eq 1000 ]
           grep -q '^@SQ' /tmp/relcheck/out.sam
 
+      # The AVX2 variant, for the x86_64 targets only. Built AFTER the gates above have passed on the
+      # baseline binary, and put through the same two gates itself: an artefact that ships a second
+      # executable has to prove that one rebuilds the committed index and aligns, or the second
+      # executable is untested bytes with a helpful name.
+      - name: Build the AVX2 variant
+        if: matrix.variant_cpu != ''
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+          RUSTFLAGS: -C target-cpu=${{ matrix.variant_cpu }}
+        run: cargo build --release --locked --target-dir target-variant
+
+      - name: The variant rebuilds the committed index byte-identically, and aligns
+        if: matrix.variant_cpu != ''
+        run: |
+          set -euo pipefail
+          # A different instruction set must not move a byte: same gate as the baseline binary, on a
+          # clean directory so a leftover cannot make it pass.
+          rm -rf /tmp/relcheck-variant && mkdir -p /tmp/relcheck-variant
+          cp testdata/tiny/tiny.fa /tmp/relcheck-variant/tiny.fa
+          ./target-variant/release/bwa-mem4 index /tmp/relcheck-variant/tiny.fa
+          for ext in pac ann amb bwt.2bit.64 0123; do
+            cmp -s "/tmp/relcheck-variant/tiny.fa.$ext" "testdata/tiny/tiny.fa.$ext" \
+              || { echo "::error::variant .$ext differs on ${{ matrix.target_id }}"; exit 1; }
+          done
+          ./target-variant/release/bwa-mem4 mem -t2 -K 10000000 testdata/tiny/tiny.fa \
+            /tmp/relcheck/r_1.fq /tmp/relcheck/r_2.fq > /tmp/relcheck-variant/out.sam
+          [ "$(grep -vc '^@' /tmp/relcheck-variant/out.sam)" -eq 1000 ]
+          # And the two binaries must agree with each other, which is the property that makes
+          # shipping both safe: same records, only the @PG CL path differs.
+          diff <(grep -v '^@PG' /tmp/relcheck/out.sam) <(grep -v '^@PG' /tmp/relcheck-variant/out.sam) \
+            || { echo "::error::variant output differs from baseline on ${{ matrix.target_id }}"; exit 1; }
+          echo "variant: index identical, 1000 records, output identical to the baseline binary"
+
       - name: Package
         id: pkg
         run: |
@@ -268,6 +376,30 @@ jobs:
           NAME="bwa-mem4-${{ needs.check-version.outputs.tag }}-${{ matrix.target_id }}"
           mkdir -p "dist/$NAME"
           cp target/release/bwa-mem4 "dist/$NAME/"
+          # The AVX2 variant, where there is one. Named after the instruction set it needs rather
+          # than after a marketing tier, and accompanied by a note, because a second executable in a
+          # tarball with no explanation is a support ticket.
+          if [ -x target-variant/release/bwa-mem4 ]; then
+            cp target-variant/release/bwa-mem4 "dist/$NAME/bwa-mem4-${{ matrix.variant_cpu }}"
+            {
+              printf '%s\n' '# `bwa-mem4-x86-64-v3`'
+              printf '%s\n' ''
+              printf '%s\n' 'The second binary in this archive is the same source compiled for **x86-64-v3** (AVX2, i.e. Intel'
+              printf '%s\n' 'Haswell 2013 and AMD Excavator 2015 onwards). It produces **identical output**: the release job'
+              printf '%s\n' 'rebuilds the committed index with it and diffs a full alignment against the baseline binary'\''s,'
+              printf '%s\n' 'byte for byte, before either is packaged.'
+              printf '%s\n' ''
+              printf '%s\n' 'It is **5.6% to 6.8% faster**, measured on an AMD EPYC 7763 over interleaved repetitions'
+              printf '%s\n' '(32.99 / 33.42 s against 31.42 / 31.15 s on 400k simulated pairs against chr21).'
+              printf '%s\n' ''
+              printf '%s\n' 'Use it if your CPU has AVX2, which every x86 server bought in the last decade does:'
+              printf '%s\n' ''
+              printf '%s\n' '    grep -q avx2 /proc/cpuinfo && ./bwa-mem4-x86-64-v3 mem ...'
+              printf '%s\n' ''
+              printf '%s\n' '`bwa-mem4` itself stays compiled at the x86-64 baseline so that it runs anywhere, including hosts'
+              printf '%s\n' 'where the variant would die with an illegal instruction. Nothing chooses between them for you.'
+            } > "dist/$NAME/AVX2-VARIANT.md"
+          fi
           # LICENSE travels with the binary: this is a derivative work of bwa-mem2 and the MIT terms
           # require the notice to accompany every distributed copy, source or not.
           cp LICENSE README.md "dist/$NAME/"

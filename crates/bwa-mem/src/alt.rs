@@ -273,11 +273,11 @@ pub fn mem_gen_alt(
             xa_bytes.extend_from_slice(bns.contigs[aln.rid as usize].name.as_bytes());
             xa_bytes.push(b',');
             xa_bytes.push(if aln.is_rev { b'-' } else { b'+' });
-            xa_bytes.extend_from_slice((aln.pos + 1).to_string().as_bytes());
+            crate::emit::push_int(&mut xa_bytes, aln.pos + 1);
             xa_bytes.push(b',');
             crate::pe::add_cigar(&aln.cigar, false, &mut xa_bytes);
             xa_bytes.push(b',');
-            xa_bytes.extend_from_slice(aln.nm.to_string().as_bytes());
+            crate::emit::push_int(&mut xa_bytes, i64::from(aln.nm));
             xa_bytes.push(b';');
         }
         out[primary_idx] = Some(String::from_utf8(xa_bytes).expect("ASCII XA"));

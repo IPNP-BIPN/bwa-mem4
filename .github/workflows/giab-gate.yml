@@ -1,0 +1,152 @@
+# Phase 11 (#35): byte-identity, expressed as variant concordance against the GIAB truth set.
+#
+# `oracle_diff.sh` proves our SAM bytes equal bwa-mem2's. That is the strongest claim an aligner can
+# make and the wrong language for whoever has to sign off on a clinical pipeline: they ask for
+# precision and recall against a truth set. This job answers in that language, on REAL HG002 reads
+# and the real NIST v4.2.1 benchmark, by running `scripts/giab_happy.sh`: align with both aligners,
+# call with the same caller, score both VCFs, print both rows.
+#
+# The expected result is two identical rows, and that is the point rather than a disappointment. The
+# artefact is the deliverable: an automated statement, with numbers, that the identity survives to
+# called variants.
+#
+# Sized to a hosted runner: a 10 Mb window of chr21's q-arm at the depth the source BAM has there,
+# rather than a 30x whole genome, which is hours of download before any alignment starts. The window
+# is real data with real coverage inside a real confident region, which is what makes the numbers
+# mean something; it is simply a small piece of the genome, and the summary says so.
+name: giab-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "Region to gate on (must be inside the benchmark's confident regions)"
+        default: "chr21:20000000-30000000"
+        required: false
+
+# One run of this workflow at a time per ref. Without it a second push while the first run is still
+# measuring leaves two hour-long jobs racing for the same runners, which happened four times while
+# this branch was being written and had to be cleaned up by hand.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  giab-gate:
+    name: variant concordance, ours against bwa-mem2, on GIAB HG002
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the pipeline (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: gate
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            samtools
+            bcftools
+            rtg-tools
+          init-shell: bash
+
+      - name: Build bwa-mem4
+        shell: bash
+        env:
+          # As everywhere else in CI: `-C target-cpu=native` from .cargo/config.toml is a SIGILL
+          # hazard on cloud VMs, and the SIMD kernels are dispatched at runtime anyway.
+          RUSTFLAGS: ""
+        run: cargo build --release -p bwa-mem4
+
+      - name: Reference (chr21, named as the benchmark names it)
+        run: |
+          mkdir -p work/gate && cd work/gate
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          # Ensembl calls it `21`, the GIAB benchmark calls it `chr21`. Same assembly, same
+          # coordinates, different naming convention, and a caller will silently produce nothing if
+          # the two disagree. Renaming the single header is the whole fix.
+          sed -i '1s/.*/>chr21/' chr21.fa
+          samtools faidx chr21.fa
+          bwa-mem2 index chr21.fa
+          head -c 60 chr21.fa; echo
+
+      - name: Truth set (NIST v4.2.1), restricted to the window
+        run: |
+          cd work/gate
+          base="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/AshkenazimTrio/HG002_NA24385_son/NISTv4.2.1/GRCh38"
+          vcf="HG002_GRCh38_1_22_v4.2.1_benchmark.vcf.gz"
+          bed="HG002_GRCh38_1_22_v4.2.1_benchmark_noinconsistent.bed"
+          curl -fsSL --retry 3 "$base/$vcf" -o truth.vcf.gz
+          curl -fsSL --retry 3 "$base/$vcf.tbi" -o truth.vcf.gz.tbi
+          curl -fsSL --retry 3 "$base/$bed" -o truth.bed
+          region="${{ github.event.inputs.region || 'chr21:20000000-30000000' }}"
+          echo "region=$region"
+          bcftools view -Oz -r "$region" truth.vcf.gz -o truth.region.vcf.gz
+          bcftools index -t truth.region.vcf.gz
+          # The BED is plain text and small enough to filter with awk, which avoids depending on
+          # bedtools for one intersection.
+          chrom="${region%%:*}"; span="${region#*:}"; from="${span%%-*}"; to="${span##*-}"
+          awk -v c="$chrom" -v f="$from" -v t="$to" 'BEGIN{OFS="\t"} $1==c && $3>f && $2<t {
+            if ($2 < f) $2 = f; if ($3 > t) $3 = t; print $1, $2, $3
+          }' truth.bed > truth.region.bed
+          echo "truth variants: $(bcftools view -H truth.region.vcf.gz | wc -l)"
+          echo "confident bases: $(awk '{s += $3 - $2} END {print s}' truth.region.bed)"
+
+      - name: Real HG002 reads for the window
+        run: |
+          cd work/gate
+          region="${{ github.event.inputs.region || 'chr21:20000000-30000000' }}"
+          # Sliced straight out of GIAB's own 300x novoalign BAM over HTTPS: samtools reads the
+          # remote index and fetches only the blocks the region needs. Subsampled to a sane depth,
+          # because 300x of a 10 Mb window is 30 GB of reads and adds nothing to a concordance
+          # comparison that only cares whether the two arms agree.
+          #
+          # The caveat that must travel with these numbers: reads taken from an existing alignment
+          # are the reads THAT aligner placed here. Anything it failed to map, or mapped elsewhere,
+          # is absent. That is fine for comparing two aligners on identical input, which is all this
+          # gate does, and it is not a statement about either one's sensitivity on raw data.
+          bam="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG002.GRCh38.300x.bam"
+          samtools view -@ 4 -b -s 0.1 "$bam" "$region" > slice.bam
+          echo "sliced records: $(samtools view -c slice.bam)"
+          # Name-collate before converting, or the two mates of a pair do not come out adjacent and
+          # the FASTQ pairing is silently wrong.
+          samtools collate -@ 4 -u -O slice.bam \
+            | samtools fastq -@ 4 -1 r1.fq.gz -2 r2.fq.gz -0 /dev/null -s /dev/null -n
+          echo "reads: $(( $(zcat r1.fq.gz | wc -l) / 4 )) pairs"
+
+      - name: Run the gate
+        run: |
+          region="${{ github.event.inputs.region || 'chr21:20000000-30000000' }}"
+          REF=work/gate/chr21.fa \
+          R1=work/gate/r1.fq.gz R2=work/gate/r2.fq.gz \
+          TRUTH_VCF=work/gate/truth.region.vcf.gz \
+          TRUTH_BED=work/gate/truth.region.bed \
+          REGION="$region" \
+          OUT=work/gate/out \
+          THREADS="$(nproc)" \
+          bash scripts/giab_happy.sh
+
+      - name: Keep the evaluation output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: giab-gate-results
+          path: |
+            work/gate/out/eval-*/**
+            work/gate/out/*.log
+          if-no-files-found: warn
