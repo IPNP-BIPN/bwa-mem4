@@ -195,6 +195,14 @@ question asked of a dependency bump is never "is this crate's patch release safe
 still emit the same bytes", which is one gate run for all of them at once. Review them as you would
 any other PR, and re-pin `Cargo.lock` deliberately, since it is the pin of record (`DEPENDENCIES.md`).
 
+`.github/workflows/dependabot-auto-merge.yml` then queues GitHub's auto-merge for the subset that
+cannot change what the binary emits: GitHub Actions on patch and minor, Cargo on patch only. Nothing
+is merged by that workflow itself. It asks GitHub to merge once `dev`'s protection is satisfied, so
+a red `option-parity` or `build-test` leaves the PR open. Everything else, Cargo minor and major,
+Actions major, and every security PR, waits for a human. The reasoning is that an action bump cannot
+alter a SAM record while a crate bump can, and `option-parity`'s 64 cases are a real gate but not
+`oracle_diff.sh` on a 30x WGS.
+
 `rammap-core` is exempt from major and minor bumps. Its version is stamped into the SAM `@PG` and
 its gate compares against the matching `rammap` binary, so lifting it means re-pinning that oracle
 too, in its own PR.
