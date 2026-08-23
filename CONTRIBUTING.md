@@ -186,6 +186,19 @@ Every PR must keep `scripts/check.sh` green (fmt, clippy with `-D warnings`, all
 regress `oracle_diff.sh`. New behavior is test-first (TDD); accelerated backends additionally pass
 `assert_backend_matches_scalar`.
 
+## Dependency updates
+
+Dependabot is configured in `.github/dependabot.yml` and opens the update PRs itself, one for the
+GitHub Actions used by the workflows (weekly) and one for the Cargo workspace (monthly). Both are
+grouped into a single PR per run on purpose: a pull request here runs the full parity gate, and the
+question asked of a dependency bump is never "is this crate's patch release safe" but "does the tree
+still emit the same bytes", which is one gate run for all of them at once. Review them as you would
+any other PR, and re-pin `Cargo.lock` deliberately, since it is the pin of record (`DEPENDENCIES.md`).
+
+`rammap-core` is exempt from major and minor bumps. Its version is stamped into the SAM `@PG` and
+its gate compares against the matching `rammap` binary, so lifting it means re-pinning that oracle
+too, in its own PR.
+
 ## Workflow
 
 You have **read + fork** access. Fork `IPNP-BIPN/bwa-mem4`, push a branch to your fork, and open a
