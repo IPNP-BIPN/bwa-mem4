@@ -1,0 +1,72 @@
+# Turns on GitHub's auto-merge for the Dependabot pull requests that cannot change what the binary
+# emits, and leaves every other one for a human.
+#
+# WHAT AUTO-MERGE ACTUALLY DOES: nothing is merged here. The job asks GitHub to queue the PR, and
+# GitHub merges it only once `dev`'s branch protection is satisfied, which on this repository means
+# `option-parity` plus the two Linux `build-test` jobs, with the branch up to date. A red gate
+# leaves the PR sitting open. So the gate, not this file, is what decides.
+#
+# THE POLICY, and why it is split by ecosystem:
+#   - github-actions, patch AND minor. An action bump changes what runs the build, never what the
+#     build produces: no output of this project can differ because upload-artifact moved. A MAJOR is
+#     excluded because that is where actions delete inputs and change defaults (the @v4 -> @v7 drift
+#     this repository already carries is exactly that kind of read).
+#   - cargo, patch ONLY. A crate bump CAN change the bytes we emit, and the acceptance criterion of
+#     this project is byte-identity with bwa-mem2. `option-parity` covers 64 cases, which is a real
+#     gate but not `oracle_diff.sh` on a 30x WGS, so the further a version moves the less the gate
+#     proves. Patch is the range where an upstream break is a bug on their side rather than a
+#     documented change on ours. Minor and major stay manual, deliberately.
+#
+# Security updates are NOT grouped by Dependabot, and `.github/dependabot.yml` groups everything it
+# schedules, so a security PR arrives ungrouped and still goes through this same rule. That is
+# intended: a RUSTSEC bump should be read by someone, not queued.
+#
+# SECURITY NOTE: this workflow never checks out the pull request. It runs on `pull_request` (not
+# `pull_request_target`) and touches only the PR metadata, so the elevated token below is never
+# exposed to code coming from the branch being merged.
+name: Dependabot auto-merge
+
+on: pull_request
+
+# Dependabot-triggered runs get a read-only token unless the workflow asks otherwise. `contents` is
+# what queues the merge, `pull-requests` is what marks it auto-merge.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Read the Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # On a grouped PR `update-type` is the HIGHEST bump in the group, so one minor crate in a
+      # group of patches keeps the whole group manual. That is the conservative direction, and it is
+      # the one we want.
+      - name: Queue the merge when the policy allows it
+        if: >-
+          (contains(fromJSON('["github_actions","github-actions"]'), steps.metadata.outputs.package-ecosystem)
+            && contains(fromJSON('["version-update:semver-patch","version-update:semver-minor"]'), steps.metadata.outputs.update-type))
+          || (steps.metadata.outputs.package-ecosystem == 'cargo'
+            && steps.metadata.outputs.update-type == 'version-update:semver-patch')
+        run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Say why it was left alone
+        if: >-
+          !((contains(fromJSON('["github_actions","github-actions"]'), steps.metadata.outputs.package-ecosystem)
+            && contains(fromJSON('["version-update:semver-patch","version-update:semver-minor"]'), steps.metadata.outputs.update-type))
+          || (steps.metadata.outputs.package-ecosystem == 'cargo'
+            && steps.metadata.outputs.update-type == 'version-update:semver-patch'))
+        run: |
+          echo "Left for manual review:"
+          echo "  ecosystem   ${{ steps.metadata.outputs.package-ecosystem }}"
+          echo "  update-type ${{ steps.metadata.outputs.update-type }}"
+          echo "  group       ${{ steps.metadata.outputs.dependency-group }}"
