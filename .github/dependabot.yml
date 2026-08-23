@@ -1,0 +1,71 @@
+# Dependabot: version updates for the two dependency graphs this repository actually has, the
+# GitHub Actions used by the twelve workflows and the Cargo crates of the workspace.
+#
+# The configuration is shaped by one fact about this project: a pull request runs the full 58-case
+# parity gate on Linux x86_64 and Linux arm64, because the acceptance criterion is byte-identity
+# with bwa-mem2 rather than a green test suite. So every update PR is expensive, and an ungrouped
+# Dependabot would open one per crate. Both ecosystems are therefore GROUPED into a single PR per
+# run, and the Cargo one runs monthly rather than weekly. A grouped PR is also the honest unit of
+# review here: the question is never "is `serde` 1.0.n+1 safe", it is "does the tree still produce
+# the same bytes", and that is one gate run for all of them at once.
+#
+# Security updates are NOT configured here. They are a separate repository setting
+# (Settings > Code security > Dependabot security updates); when enabled they ignore the schedule
+# and the grouping below and open their own PR immediately, which is the behaviour we want for a
+# RUSTSEC advisory.
+version: 2
+
+updates:
+  # --- GitHub Actions -------------------------------------------------------------------------
+  # This one earns its keep today: the workflows currently pin actions/upload-artifact at BOTH @v4
+  # and @v7 in different files, which is the kind of drift nobody notices until the older major is
+  # deprecated mid-release. Weekly, because an action bump does not touch the binary and the cost
+  # of reviewing it is a diff of one line per workflow.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: ci(deps)
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # --- Cargo ----------------------------------------------------------------------------------
+  # `directory: "/"` is the workspace root, and that is the whole graph: `members = ["crates/*"]`
+  # with every external version declared once under [workspace.dependencies], so there is nothing
+  # per-crate for Dependabot to find separately.
+  #
+  # Monthly and grouped, for the parity-gate cost described above. `versioning-strategy: increase`
+  # lets Dependabot lift the declared requirement rather than only the lockfile, which matters here
+  # because Cargo.lock is the pin of record (see DEPENDENCIES.md) and a lockfile-only bump would
+  # leave the manifest saying something the tree no longer does.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 2
+    versioning-strategy: increase
+    commit-message:
+      prefix: build(deps)
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    ignore:
+      # `rammap-core` is not an ordinary dependency: `mem -x pacbio|pbref|ont2d` delegates the whole
+      # map to it, the crate version is stamped into the SAM `@PG`, and its gate
+      # (`scripts/longread_parity.sh`) demands records identical to those of the matching `rammap`
+      # BINARY. Bumping it is a deliberate act that includes re-pinning the oracle binary, not
+      # something to review as one line inside a grouped PR. Patch releases still come through.
+      - dependency-name: rammap-core
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
