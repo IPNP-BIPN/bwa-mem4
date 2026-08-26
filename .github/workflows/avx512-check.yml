@@ -143,17 +143,37 @@ jobs:
           set -o pipefail
           bin=$(head -1 /tmp/testbins)
           sde="./$SDE_DIR/sde64"
-          # The point of #44 part A is that the scoring block became `vpxord` + `vpshufb`. A dynamic
-          # instruction mix says whether those ZMM forms executed, which no source review can. One
-          # test is enough for the question and keeps the emulated run short.
+          # The point of #44 part A is that the scoring block became `vpxor` + `vpshufb`. A dynamic
+          # instruction mix says whether those really issued, which no source review can. One test is
+          # enough for the question and keeps the emulated run short.
           "$sde" -spr -mix -omix /tmp/mix.txt -- \
             "$bin" avx512_matesw_u8_matches_scalar --nocapture --test-threads 1 > /dev/null 2>&1
-          echo "--- ZMM ops in the dynamic mix (top 25) ---"
-          grep -i -E '^\*?[a-z0-9_]*(zmm|VPSHUFB|VPXORD|VPMAXUB|VPADDUSB|VPSUBUSB)' /tmp/mix.txt \
-            | sort -k2 -n -r | head -25 || true
-          zmm=$(grep -ci 'zmm' /tmp/mix.txt || true)
-          if [ "$zmm" -eq 0 ]; then
-            echo "no ZMM instruction in the mix: the u8 test did not reach the AVX-512 kernel" >&2
+          # SDE's mix names opcodes WITHOUT an operand-width tag (`VPSHUFB`, not `VPSHUFB_ZMM`), so
+          # the 512-bit-ness comes from the `*isa-ext-AVX512EVEX` counter, not from the mnemonic.
+          # Counting a mnemonic that AVX2 also has would prove nothing.
+          n() { grep -E "^$1[[:space:]]" /tmp/mix.txt | awk '{print $2}' | sort -n | tail -1; }
+          evex=$(n '\*isa-ext-AVX512EVEX'); evex=${evex:-0}
+          shuf=$(n VPSHUFB); shuf=${shuf:-0}
+          xord=$(n VPXORD); xorq=$(n VPXORQ)
+          echo "--- what the kernel executed, dynamic counts ---"
+          printf 'AVX512EVEX %s\nVPSHUFB %s\nVPXORD %s\nVPXORQ %s\nVPMAXUB %s\nVMOVDQU8 %s\nVPCMPUB %s\n' \
+            "$evex" "$shuf" "${xord:-0}" "${xorq:-0}" "$(n VPMAXUB)" "$(n VMOVDQU8)" "$(n VPCMPUB)" | column -t
+          grep -o 'fwd_local_sw_avx512_u8[^ ]*' /tmp/mix.txt | head -1
+          if [ "$evex" -lt 1000000 ]; then
+            echo "only $evex EVEX-encoded instructions: the u8 test did not reach the AVX-512 kernel" >&2
+            exit 1
+          fi
+          if [ "$shuf" -eq 0 ]; then
+            echo "no VPSHUFB: the XOR score table of #44 part A did not execute" >&2
+            exit 1
+          fi
+          # LLVM picks either encoding for the same xor, so the check is on the pair, not on one.
+          if [ $(( ${xord:-0} + ${xorq:-0} )) -eq 0 ]; then
+            echo "no VPXORD/VPXORQ: the score table was indexed by something other than the XOR" >&2
+            exit 1
+          fi
+          if ! grep -q 'dynamic-counts-for-function: .*fwd_local_sw_avx512_u8' /tmp/mix.txt; then
+            echo "the kernel does not appear in the per-function mix: it was never entered" >&2
             exit 1
           fi
 
