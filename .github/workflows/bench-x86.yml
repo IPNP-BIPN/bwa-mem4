@@ -55,6 +55,30 @@ on:
         description: "Runner image for the kernel job (ubuntu-22.04 | ubuntu-24.04 | ubuntu-latest)"
         default: "ubuntu-22.04"
         required: false
+      # The end-to-end job was pinned to `ubuntu-22.04`, whose pool is uniformly AMD EPYC 7763, so
+      # every end-to-end number this project has ever published on x86 is a Zen 3 number. The
+      # `ubuntu-24.04` pool now draws Intel parts that expose avx512bw (a Xeon Platinum 8573C,
+      # Emerald Rapids, on 2026-08-26), which is what makes an Intel end-to-end reachable at all.
+      e2e_runner:
+        description: "Runner image for the end-to-end job (ubuntu-22.04 | ubuntu-24.04)"
+        default: "ubuntu-22.04"
+        required: false
+      # Same fail-fast idea as `require_avx512`, for the hour-long job: an AMD draw dies in about a
+      # minute instead of spending an hour producing a number that is not the one being hunted.
+      require_avx512_e2e:
+        description: "Fail the end-to-end job unless the runner has avx512bw (re-draw until Intel)"
+        type: boolean
+        default: false
+        required: false
+      # A SECOND binary of the same source, compiled for a narrower CPU (`x86-64-v4` = AVX-512F/BW/
+      # VL/DQ, `x86-64-v3` = AVX2), timed beside the baseline one in the same interleaved loop. This
+      # is the measurement behind the residual wgsim gap against the fork: their advantage is
+      # per-tier builds of the whole SCALAR GLUE, not of the kernels, which we already dispatch at
+      # run time. Empty = do not build a variant.
+      variant_cpu:
+        description: "Also build and time a -C target-cpu variant (e.g. x86-64-v4), empty = none"
+        default: ""
+        required: false
   schedule:
     # Mondays 05:00 UTC, offset from the parity/CI schedules.
     - cron: "0 5 * * 1"
@@ -149,7 +173,7 @@ jobs:
     # the string 'true' because a workflow_dispatch input arrives as a string even when typed boolean,
     # and it must stay true for the weekly schedule, where `inputs` is empty.
     if: github.event.inputs.kernel_ab_only != 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ${{ github.event.inputs.e2e_runner || 'ubuntu-22.04' }}
     timeout-minutes: 120
     defaults:
       run:
@@ -169,6 +193,17 @@ jobs:
           # present on the same flags line. It has been lying in every run of this workflow.
           echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           echo "nproc: $(nproc)"
+
+      # Before the hour, not after it. Without this an AMD draw spends 45 minutes producing another
+      # Zen 3 number while the run was dispatched to get an Intel one.
+      - name: This draw must have avx512bw
+        if: github.event.inputs.require_avx512_e2e == 'true'
+        shell: bash
+        run: |
+          grep -q avx512bw /proc/cpuinfo || {
+            echo "::error::this draw has no avx512bw; re-dispatch until an Intel runner comes up"
+            exit 1
+          }
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -196,6 +231,20 @@ jobs:
       - name: Build bwa-mem4 (release)
         shell: bash
         run: cargo build --release -p bwa-mem4
+
+      # The same source, compiled for the narrower CPU. Separate target dir so it cannot overwrite
+      # the baseline binary, and `--locked` for the same dependency set. This is what a per-tier
+      # release artifact would be, so timing it here is what decides whether shipping one is worth
+      # the packaging.
+      - name: Build the ${{ github.event.inputs.variant_cpu }} variant
+        if: github.event.inputs.variant_cpu != ''
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-cpu=${{ github.event.inputs.variant_cpu }}
+          CARGO_TARGET_DIR: target-variant
+        run: |
+          cargo build --release --locked -p bwa-mem4
+          ls -la target-variant/release/bwa-mem4
 
       - name: Fetch reference (GRCh38 chr21)
         run: |
@@ -257,13 +306,38 @@ jobs:
           m4md5=$(grep -v '^@' m4.sam | md5sum | cut -d' ' -f1)
           if [ "$m2md5" = "$m4md5" ]; then echo "records byte-identical ($m2md5)"; else echo "records DIFFER: mem2=$m2md5 mem4=$m4md5"; fi
 
+          # The tier variant, when one was asked for: same source, compiled for a narrower CPU, timed
+          # in the SAME interleaved loop so a machine that drifts drifts under both.
+          VAR=../target-variant/release/bwa-mem4
+          have_var=0
+          if [ -x "$VAR" ]; then
+            have_var=1
+            run_one "warmup variant" $VAR mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
+            $VAR mem -t "$T" chr21.fa r1.fq r2.fq > mv.sam 2>/dev/null
+            vmd5=$(grep -v '^@' mv.sam | md5sum | cut -d' ' -f1)
+            # A faster binary that changed the output is not a faster binary. `-C target-cpu` is not
+            # supposed to move a single byte, and this is where that claim is checked on the tier
+            # actually being considered for release.
+            if [ "$vmd5" = "$m4md5" ]; then
+              echo "variant records byte-identical to the baseline build ($vmd5)"
+            else
+              echo "::error::variant SAM differs from the baseline build: $vmd5 vs $m4md5"; exit 1
+            fi
+          fi
+
           echo "== timed reps (interleaved, best-of 2) =="
-          best_m2=""; best_fk=""; best_m4=""
+          best_m2=""; best_fk=""; best_m4=""; best_var=""
           for rep in 1 2; do
             r2=$(run_one "mem2 rep$rep" $M2 mem -t "$T" chr21.fa r1.fq r2.fq); w2=${r2%% *}
             rf=$(run_one "fork rep$rep" $FORK mem -t "$T" chr21.fa r1.fq r2.fq); wf=${rf%% *}
             r4=$(run_one "mem4 rep$rep" $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w4=${r4%% *}
-            echo "rep $rep: bwa-mem2 ${r2} | bwa-mem3 ${rf} | bwa-mem4 ${r4}  (wall_s maxrss_kb)"
+            line="rep $rep: bwa-mem2 ${r2} | bwa-mem3 ${rf} | bwa-mem4 ${r4}"
+            if [ "$have_var" = 1 ]; then
+              rv=$(run_one "variant rep$rep" $VAR mem -t "$T" chr21.fa r1.fq r2.fq); wv=${rv%% *}
+              line="$line | variant ${rv}"
+              best_var=$(awk -v a="$best_var" -v b="$wv" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
+            fi
+            echo "$line  (wall_s maxrss_kb)"
             best_m2=$(awk -v a="$best_m2" -v b="$w2" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
             best_fk=$(awk -v a="$best_fk" -v b="$wf" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
             best_m4=$(awk -v a="$best_m4" -v b="$w4" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
@@ -294,6 +368,11 @@ jobs:
           awk -v m2="$best_m2" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs bwa-mem2: %.2fx\n", m2/m4}'
           # The number #20/#27 care about: us vs the fork on x86. >1 means bwa-mem4 wins.
           awk -v fk="$best_fk" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs fork (bwa-mem3): %.2fx  (>1 = we win)\n", fk/m4}'
+          if [ "$have_var" = 1 ]; then
+            echo "variant (${{ github.event.inputs.variant_cpu }}) best wall: ${best_var}s"
+            awk -v b="$best_m4" -v v="$best_var" 'BEGIN{printf "variant vs baseline build: %.3fx  (>1 = the tier build is faster)\n", b/v}'
+            awk -v fk="$best_fk" -v v="$best_var" 'BEGIN{printf "variant vs fork (bwa-mem3): %.2fx  (>1 = we win)\n", fk/v}'
+          fi
 
       # The measurement the x86 issues actually owe: not "how do we compare to bwa-mem2", but "did
       # our own changes make the WHOLE PROCESS faster on x86". The kernel probes answer it per
