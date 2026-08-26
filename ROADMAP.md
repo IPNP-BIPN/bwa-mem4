@@ -4745,16 +4745,67 @@ Consequence pratique : les optimisations de colle scalaire ne se mesurent PAS su
 gains y sont ecrases par la taxe SMT. Le chiffre de tete wgsim x86 exige la machine dediee de #32,
 comme le disait deja la conclusion du PGO.
 
+### Les kernels AVX-512 ont enfin tourne, et c'est Intel SDE qui les a fait tourner (2026-08-26)
+
+Depuis leur ecriture, les trois tests d'octet-identite AVX-512 n'avaient **jamais** ete executes :
+23 dispatches, trois images de runner, zero `avx512bw` (EPYC 7763 en Zen 3, et un EPYC 9V74 en Zen 4
+dont l'hyperviseur masque le drapeau). QEMU 8.2 n'a toujours pas d'AVX-512 en TCG. Le dossier notait
+"Intel SDE est un telechargement sous licence", ce qui etait exact et n'etait pas un obstacle : c'est
+une archive publique sous Intel Simplified Software License, sans enregistrement, donc epinglable par
+URL et SHA-256 dans un workflow comme n'importe quelle dependance.
+
+Premier run reel (`avx512-check`, job `avx512-sde`, SDE 9.48.0, `-spr`, run 33009772433) :
+
+```
+running 3 tests
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 128.44s
+```
+
+Aucun `skipping avx512`, et **sans** `BWA4_TEST_FORCE_AVX512` : SDE presente CPUID et XCR0 assez
+fidelement pour que la detection de Rust choisisse elle-meme les kernels, la ou qemu-user emulait les
+instructions sans exposer les bits d'etat, laissant les tests s'esquiver en repondant `ok`.
+
+Le mix dynamique dit ce qu'aucune relecture de source ne peut dire :
+
+| compteur | executions |
+|---|---|
+| `*isa-ext-AVX512EVEX` | 66 972 292 |
+| `fwd_local_sw_avx512_u8` | 78,2 M instructions, 99,4 % du programme |
+| VPSHUFB | 3 043 264 |
+| VPXORD + VPXORQ | 3 052 957 |
+| VPMAXUB | 15 216 320 |
+| VMOVDQU8 | 6 112 080 |
+| VPCMPUB | 3 043 365 |
+
+Un `vpshufb` par xor, a l'unite pres : c'est exactement la table de scores XOR de la partie A de #44
+(LLVM a choisi les deux encodages pour le meme xor). Les 6,1 M de `vmovdqu8` sont le blend masque de
+la partie B "gratuite", que LLVM emet en `vmovdqu8 zmm{k}` plutot qu'en `vpblendmb`.
+
+**Ce que ca ferme :** la correctness de #44, et avec elle le risque permanent qu'un utilisateur Intel
+selectionne automatiquement, par la calibration de tier, du code qu'aucun test n'avait jamais
+execute. La question du tier opt-in posee au mainteneur tombe d'elle-meme.
+
+**Ce que ca ne ferme pas :** la vitesse, et pas d'un peu. SDE est un interpreteur a deux ordres de
+grandeur du materiel, sans aucune des pressions de port dont l'issue parle ; le +11 % a +40 % exige
+toujours un coeur Ice Lake ou Sapphire/Emerald Rapids, c'est-a-dire la machine dediee de #32.
+
+Piege paye au passage, note pour le prochain : le mix de SDE nomme les opcodes **sans etiquette de
+largeur** (`VPSHUFB`, pas `VPSHUFB_ZMM`), donc un gate qui cherche `zmm` echoue sur un run qui vient
+de prouver le contraire. La 512-bit-ness se lit dans `*isa-ext-AVX512EVEX`, pas dans le mnemonique,
+qu'AVX2 porte aussi.
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige une machine dediee. Un runner heberge ne peut ni
    construire l'index GRCh38 (pic 92 GB) ni mesurer la colle scalaire (taxe SMT, voir l'enquete
    ksw_global2). C'est aussi la ou l'ecart wgsim residuel contre le fork (1,19-1,21x) se mesurerait
    honnetement.
-2. **Le kernel AVX-512 (#44)** : correctness bloquee sur du materiel Intel (la flotte ne donne que
-   de l'AMD, QEMU n'emule pas AVX-512, Intel SDE est un telechargement sous licence). Les tests ne
-   s'esquivent plus en silence et la question de rendre le tier opt-in tant qu'il n'a jamais tourne
-   reste posee au mainteneur.
+2. **Le kernel AVX-512 (#44)** : correctness **faite**, sous Intel SDE (`avx512-check`) : les trois
+   tests d'octet-identite passent et le mix prouve que la table XOR de la partie A a bien issu. Ne
+   reste que la vitesse, qui exige un coeur Intel reel, aucun emulateur ne chiffrant un kernel. La
+   partie B payante (les swaps `vpcmpub` + blend sur les maxes feuilles de E et F) n'est **pas**
+   ecrite, volontairement : elle est Intel-only, gagnante seulement la ou p0 sature, et personne ici
+   ne peut la mesurer.
 3. **L'ecart wgsim x86 residuel** : attribue (leurs builds par tier sur toute la colle, plus la taxe
    SMT partagee), plus aucun mystere. Le fermer voudrait dire des artefacts multi-tiers au-dela du
    binaire v3 deja livre, une decision de packaging plus que d'algorithme.
