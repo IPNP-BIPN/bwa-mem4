@@ -16,6 +16,12 @@ on:
       - main
       - dev
   pull_request:
+  # Weekly, and deliberately aimed at the pool that sometimes has AVX-512. A dispatch-only capability
+  # is a capability nobody uses: this way, roughly one scheduled run in six lands on a host with
+  # `avx512bw` and covers the 512-bit dispatch for free, and the ones that do not are an ordinary
+  # parity run that costs what it always cost. Sunday, away from CI's Monday slot.
+  schedule:
+    - cron: "0 7 * * 0"  # Sundays 07:00 UTC
   workflow_dispatch:
     inputs:
       # The 58-case gate has only ever run on `ubuntu-22.04`, whose pool is uniformly AMD EPYC 7763,
@@ -58,7 +64,7 @@ jobs:
     # x86_64 Linux only: upstream ships a prebuilt binary for that target and no other, and
     # building bwa-mem2 from source in CI would add several minutes for no extra coverage of OUR
     # code. Note this also means the comparison runs against our AVX2 path, not NEON.
-    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
+    runs-on: ${{ github.event.inputs.runner || (github.event_name == 'schedule' && 'ubuntu-24.04') || 'ubuntu-22.04' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -67,11 +73,21 @@ jobs:
         run: |
           echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
           echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          force=no
           if [ "${{ github.event.inputs.require_avx512 }}" = "true" ]; then
+            # Demanded: an AMD draw is a failed draw, and the caller re-dispatches.
             grep -q avx512bw /proc/cpuinfo || {
               echo "::error::this draw has no avx512bw; re-dispatch until one comes up"
               exit 1
             }
+            force=yes
+          elif [ "${{ github.event_name }}" = "schedule" ] && grep -q avx512bw /proc/cpuinfo; then
+            # Opportunistic: the weekly run takes the 512-bit path when the draw happens to allow
+            # it, and is an ordinary parity run when it does not. Free coverage, no re-draws.
+            force=yes
+            echo "scheduled run drew an avx512bw host: taking the 512-bit path"
+          fi
+          if [ "$force" = yes ]; then
             # Not just "the CPU has it": force the dispatch so the gate cannot quietly compare the
             # AVX2 path again. A forced tier the host lacks falls to scalar, never silently to AVX2,
             # so this either runs the 512-bit kernels or fails visibly.
