@@ -4781,6 +4781,26 @@ Un `vpshufb` par xor, a l'unite pres : c'est exactement la table de scores XOR d
 (LLVM a choisi les deux encodages pour le meme xor). Les 6,1 M de `vmovdqu8` sont le blend masque de
 la partie B "gratuite", que LLVM emet en `vmovdqu8 zmm{k}` plutot qu'en `vpblendmb`.
 
+**Le garde-fou, pas seulement la preuve.** Le job ne tourne plus seulement sur dispatch : toute pull
+request qui touche `crates/bwa-neon/**` le declenche, plus un passage hebdomadaire. Et il tourne sur
+deux modeles, parce qu'un modele n'est pas le jeu d'instructions : la selection au runtime ne teste
+que `avx512bw`, or Skylake-X a `avx512bw` sans VBMI ni VNNI. Le bras `-skx` est donc le plancher
+reel, SDE refusant toute instruction absente du modele choisi, et il passe : les kernels tiennent
+dans `avx512f` + `avx512bw`, ce que leurs `target_feature` promettent. Le bras `-spr` reste la cible
+de #44 et porte le mix.
+
+**Et le bras `-spr` a rapporte autre chose que ce qu'on lui demandait.** Son tirage `ubuntu-24.04`
+etait un **AMD EPYC 9V74 qui expose `avx512bw`, `avx512f` et `avx512vl`** dans `/proc/cpuinfo`. Les
+memes trois tests y ont pris **3,13 s** contre 128,56 s sur le bras `-skx` (un EPYC 7763), et cet
+ecart est exactement SDE laissant passer les instructions au materiel au lieu de les interpreter.
+
+Cela **corrige la conclusion du 2026-08-15** inscrite dans #44 : "l'hyperviseur masque le drapeau,
+donc aucun runner heberge ne peut le faire" n'est plus vrai sur `ubuntu-24.04`. Le pool y est
+melange (7763 sans, 9V74 avec), donc c'est bien un tirage, cette fois-ci au sens propre. La
+consequence pratique est que la moitie VITESSE de #44 redevient atteignable sans materiel emprunte,
+par re-tirage de `bench-x86` avec `require_avx512=true`, meme si un Zen 4 n'est pas le Golden Cove
+sur lequel le raisonnement de ports de l'issue est bati.
+
 **Ce que ca ferme :** la correctness de #44, et avec elle le risque permanent qu'un utilisateur Intel
 selectionne automatiquement, par la calibration de tier, du code qu'aucun test n'avait jamais
 execute. La question du tier opt-in posee au mainteneur tombe d'elle-meme.
