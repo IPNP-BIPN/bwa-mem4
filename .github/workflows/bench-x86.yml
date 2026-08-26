@@ -76,7 +76,7 @@ on:
       # per-tier builds of the whole SCALAR GLUE, not of the kernels, which we already dispatch at
       # run time. Empty = do not build a variant.
       variant_cpu:
-        description: "Also build and time a -C target-cpu variant (e.g. x86-64-v4), empty = none"
+        description: "Space-separated -C target-cpu variants to build and time (e.g. \"x86-64-v3 x86-64-v4\"), empty = none"
         default: ""
         required: false
   schedule:
@@ -236,15 +236,20 @@ jobs:
       # the baseline binary, and `--locked` for the same dependency set. This is what a per-tier
       # release artifact would be, so timing it here is what decides whether shipping one is worth
       # the packaging.
-      - name: Build the ${{ github.event.inputs.variant_cpu }} variant
+      # One build per named tier. `x86-64-v3` is what the release already ships beside the baseline
+      # binary, so it is the CONTROL: the question is never "is v4 faster than the x86-64 baseline"
+      # (of course it is, the baseline has no AVX2), it is "is v4 faster than the tier binary users
+      # already get". A run that omits v3 cannot answer it.
+      - name: Build the tier variants (${{ github.event.inputs.variant_cpu }})
         if: github.event.inputs.variant_cpu != ''
         shell: bash
-        env:
-          RUSTFLAGS: -C target-cpu=${{ github.event.inputs.variant_cpu }}
-          CARGO_TARGET_DIR: target-variant
         run: |
-          cargo build --release --locked -p bwa-mem4
-          ls -la target-variant/release/bwa-mem4
+          for cpu in ${{ github.event.inputs.variant_cpu }}; do
+            echo "== building $cpu =="
+            RUSTFLAGS="-C target-cpu=$cpu" CARGO_TARGET_DIR="target-$cpu" \
+              cargo build --release --locked -p bwa-mem4
+            ls -la "target-$cpu/release/bwa-mem4"
+          done
 
       - name: Fetch reference (GRCh38 chr21)
         run: |
@@ -306,37 +311,44 @@ jobs:
           m4md5=$(grep -v '^@' m4.sam | md5sum | cut -d' ' -f1)
           if [ "$m2md5" = "$m4md5" ]; then echo "records byte-identical ($m2md5)"; else echo "records DIFFER: mem2=$m2md5 mem4=$m4md5"; fi
 
-          # The tier variant, when one was asked for: same source, compiled for a narrower CPU, timed
-          # in the SAME interleaved loop so a machine that drifts drifts under both.
-          VAR=../target-variant/release/bwa-mem4
-          have_var=0
-          if [ -x "$VAR" ]; then
-            have_var=1
-            run_one "warmup variant" $VAR mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
-            $VAR mem -t "$T" chr21.fa r1.fq r2.fq > mv.sam 2>/dev/null
-            vmd5=$(grep -v '^@' mv.sam | md5sum | cut -d' ' -f1)
+          # The tier variants, when any were asked for: same source, narrower CPU, timed in the SAME
+          # interleaved loop so a machine that drifts drifts under all of them.
+          VARIANTS=""
+          for cpu in ${{ github.event.inputs.variant_cpu }}; do
+            bin="../target-$cpu/release/bwa-mem4"
+            [ -x "$bin" ] || { echo "::error::no binary for $cpu"; exit 1; }
+            run_one "warmup $cpu" "$bin" mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
+            "$bin" mem -t "$T" chr21.fa r1.fq r2.fq > "mv-$cpu.sam" 2>/dev/null
+            vmd5=$(grep -v '^@' "mv-$cpu.sam" | md5sum | cut -d' ' -f1)
             # A faster binary that changed the output is not a faster binary. `-C target-cpu` is not
-            # supposed to move a single byte, and this is where that claim is checked on the tier
+            # supposed to move a single byte, and this is where that claim is checked on the tiers
             # actually being considered for release.
             if [ "$vmd5" = "$m4md5" ]; then
-              echo "variant records byte-identical to the baseline build ($vmd5)"
+              echo "variant $cpu records byte-identical to the baseline build ($vmd5)"
             else
-              echo "::error::variant SAM differs from the baseline build: $vmd5 vs $m4md5"; exit 1
+              echo "::error::variant $cpu SAM differs from the baseline build: $vmd5 vs $m4md5"; exit 1
             fi
-          fi
+            VARIANTS="$VARIANTS $cpu"
+          done
 
           echo "== timed reps (interleaved, best-of 2) =="
-          best_m2=""; best_fk=""; best_m4=""; best_var=""
+          best_m2=""; best_fk=""; best_m4=""
+          # Per-tier bests live in files rather than in dynamically named shell variables: `eval` on
+          # a name built from an input is exactly the kind of cleverness that breaks silently in a
+          # YAML block and takes an hour of runner time with it.
+          rm -f best-*.txt
           for rep in 1 2; do
             r2=$(run_one "mem2 rep$rep" $M2 mem -t "$T" chr21.fa r1.fq r2.fq); w2=${r2%% *}
             rf=$(run_one "fork rep$rep" $FORK mem -t "$T" chr21.fa r1.fq r2.fq); wf=${rf%% *}
             r4=$(run_one "mem4 rep$rep" $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w4=${r4%% *}
             line="rep $rep: bwa-mem2 ${r2} | bwa-mem3 ${rf} | bwa-mem4 ${r4}"
-            if [ "$have_var" = 1 ]; then
-              rv=$(run_one "variant rep$rep" $VAR mem -t "$T" chr21.fa r1.fq r2.fq); wv=${rv%% *}
-              line="$line | variant ${rv}"
-              best_var=$(awk -v a="$best_var" -v b="$wv" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
-            fi
+            for cpu in $VARIANTS; do
+              rv=$(run_one "$cpu rep$rep" "../target-$cpu/release/bwa-mem4" mem -t "$T" chr21.fa r1.fq r2.fq)
+              wv=${rv%% *}
+              line="$line | $cpu ${rv}"
+              prev=$(cat "best-$cpu.txt" 2>/dev/null || true)
+              awk -v a="$prev" -v b="$wv" 'BEGIN{print (a=="")?b:(b<a?b:a)}' > "best-$cpu.txt"
+            done
             echo "$line  (wall_s maxrss_kb)"
             best_m2=$(awk -v a="$best_m2" -v b="$w2" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
             best_fk=$(awk -v a="$best_fk" -v b="$wf" 'BEGIN{print (a=="")?b:(b<a?b:a)}')
@@ -368,10 +380,17 @@ jobs:
           awk -v m2="$best_m2" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs bwa-mem2: %.2fx\n", m2/m4}'
           # The number #20/#27 care about: us vs the fork on x86. >1 means bwa-mem4 wins.
           awk -v fk="$best_fk" -v m4="$best_m4" 'BEGIN{printf "bwa-mem4 vs fork (bwa-mem3): %.2fx  (>1 = we win)\n", fk/m4}'
-          if [ "$have_var" = 1 ]; then
-            echo "variant (${{ github.event.inputs.variant_cpu }}) best wall: ${best_var}s"
-            awk -v b="$best_m4" -v v="$best_var" 'BEGIN{printf "variant vs baseline build: %.3fx  (>1 = the tier build is faster)\n", b/v}'
-            awk -v fk="$best_fk" -v v="$best_var" 'BEGIN{printf "variant vs fork (bwa-mem3): %.2fx  (>1 = we win)\n", fk/v}'
+          for cpu in $VARIANTS; do
+            bv=$(cat "best-$cpu.txt")
+            echo "variant $cpu best wall: ${bv}s"
+            awk -v b="$best_m4" -v v="$bv" -v c="$cpu" 'BEGIN{printf "variant %s vs baseline build: %.3fx  (>1 = the tier build is faster)\n", c, b/v}'
+            awk -v fk="$best_fk" -v v="$bv" -v c="$cpu" 'BEGIN{printf "variant %s vs fork (bwa-mem3): %.2fx  (>1 = we win)\n", c, fk/v}'
+          done
+          # The comparison the packaging decision actually turns on: a NEW tier against the tier the
+          # release already ships, not against the baseline binary nobody fast uses.
+          bv3=$(cat best-x86-64-v3.txt 2>/dev/null || true); bv4=$(cat best-x86-64-v4.txt 2>/dev/null || true)
+          if [ -n "$bv3" ] && [ -n "$bv4" ]; then
+            awk -v a="$bv3" -v b="$bv4" 'BEGIN{printf "x86-64-v4 vs x86-64-v3: %.3fx  (>1 = v4 is faster, and only then is it worth shipping)\n", a/b}'
           fi
 
       # The measurement the x86 issues actually owe: not "how do we compare to bwa-mem2", but "did
