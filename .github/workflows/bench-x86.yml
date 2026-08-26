@@ -35,7 +35,7 @@ on:
       # issues therefore owes a NUMBER. This input is how it is paid: the kernel job builds and probes
       # the current ref AND this base ref on the same runner, back to back, and prints both.
       base_ref:
-        description: "Commit/tag to compare the kernel probes against (empty = skip the comparison)"
+        description: "Commit/tag to compare against (empty or 'none' = skip the comparison)"
         default: "7428cd0"
         required: false
       # A GitHub ubuntu-22.04 draw is either Intel (has avx512bw) or AMD (does not), and which one is
@@ -155,7 +155,7 @@ jobs:
       # when the changes are compile-time choices with no in-binary switch left. Read it as a
       # two-binary comparison, which is what it is, not as an interleaved A/B.
       - name: Kernel probes, base ref
-        if: github.event.inputs.base_ref != ''
+        if: github.event.inputs.base_ref != '' && github.event.inputs.base_ref != 'none'
         run: |
           base="${{ github.event.inputs.base_ref || '7428cd0' }}"
           git worktree add ../base "$base"
@@ -400,8 +400,12 @@ jobs:
       # Both binaries run on the same runner, on the same index and the same reads, INTERLEAVED, and
       # bwa-mem2 is timed alongside as a drift canary: if the machine slows down mid-run, its number
       # moves too and the comparison is discarded rather than believed.
+      # `!= ''` alone was not enough: `gh workflow run -f base_ref=` sends an empty value that the
+      # API replaces with the declared default, so a dispatch asking for no comparison still built an
+      # old tree and ran nine more alignments, which on a 120-minute job is most of the budget. A
+      # literal 'none' is the way to say no and be heard.
       - name: Whole-process A/B vs base_ref
-        if: github.event.inputs.base_ref != ''
+        if: github.event.inputs.base_ref != '' && github.event.inputs.base_ref != 'none'
         run: |
           base="${{ github.event.inputs.base_ref || '7428cd0' }}"
           git worktree add ../base "$base"
