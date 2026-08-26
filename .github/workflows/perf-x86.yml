@@ -57,12 +57,14 @@ jobs:
 
       - name: Log the host
         shell: bash
+        env:
+          REQUIRE_AVX512: ${{ github.event.inputs.require_avx512 }}
         run: |
           echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
           # -o without -m1: with -o, grep -m1 stops after the first MATCH, not the first matching
           # line, which is how bench-x86 printed a bare "avx2" on hosts that had avx512bw too.
           echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
-          if [ "${{ github.event.inputs.require_avx512 }}" = "true" ]; then
+          if [ "$REQUIRE_AVX512" = "true" ]; then
             grep -q avx512bw /proc/cpuinfo || {
               echo "::error::this draw has no avx512bw; re-dispatch until an AVX-512 host comes up"
               exit 1
