@@ -133,6 +133,47 @@ Worth knowing generally, and the reason this entry exists: an op count read off 
 op count. Before deleting arithmetic that the type system makes trivial, check whether the compiler
 has already deleted it.
 
+### Part B of #44: the port arbitrage on the AVX-512 leaf maxes (2026-08-26)
+
+The issue's part B is a port-pressure argument, and a good one on paper. On Golden Cove every
+512-bit saturating-integer and max op is single-ported: uops.info measures `VPMAXUB` ZMM at 1 uop,
+**p0 only, throughput 1.00**, because at 512 bits port 1's vector ALU folds into p0. `VPCMPUB` is
+p5-only and `VPBLENDMB` is p05 at 2/cycle, so replacing a leaf `max_epu8` with compare-then-blend
+pays one extra instruction to move work off the port that binds. The port LP said 10 cycles per row
+of 64 cells becomes 8.5, i.e. **+18%**, on top of part A.
+
+It was implemented properly: the kernel generic over `LEAF_CMP_BLEND`, the swap applied to the
+twelve LEAF maxes only (the E and F updates, never `max(diag, e)` or `max(mfe, f)`, which sit on the
+cross-row latency chain), and the spelling chosen per process by a timed calibration in the shape of
+`extend_tier`'s, because the same rewrite is a known loss on Zen 5. Both spellings were verified
+byte-identical against the scalar reference under Intel SDE, on `-skx` and `-spr` (commit 4c5675e).
+
+**Measured: nothing, on both vendors.** Same runner, same process, best of 5, 8192 jobs of 614.4 M
+DP cells:
+
+| host | `vpmaxub` | `vpcmpub` + blend | ratio |
+|---|---|---|---|
+| Intel Xeon Platinum 8573C (Emerald Rapids, Golden Cove) | 59.39 ms, 10.345 Gcell/s | 59.84 ms, 10.267 Gcell/s | **0.99x** |
+| AMD EPYC 9V74 (Zen 4) | 53.24 ms, 11.541 Gcell/s | 52.18 ms, 11.775 Gcell/s | 1.02x |
+
+The Intel number is the one that matters, because Emerald Rapids IS the part the port analysis was
+written against, and there the rewrite is a wash at best. Both are inside the calibration's 3%
+margin, so on every machine measured it picked `vpmaxub` and part B was doing nothing but costing a
+few milliseconds of calibration and a second instantiation of a 400-line kernel. The code was
+reverted; part A, the XOR score table, stays and is worth **+11.4%** on the same Intel host (62.99
+-> 56.55 ms, 9.753 -> 10.865 Gcell/s, run 33013582129).
+
+Why the LP was wrong is worth stating, since the same reasoning will be tempting again. A port LP
+prices instructions against ports and assumes the ports are the binding constraint. This body also
+carries loads, stores and a loop-carried `h0 -> e_mid -> mfe1 -> h1` dependence, and the free half of
+part B (reusing the `col` mask for `imax`) had already taken the cheapest p0 work away. What is left
+is not p0-bound, so moving two more ops off p0 buys nothing and the extra `vpcmpub` uop cancels what
+little it does buy.
+
+**The rule:** a port-pressure LP is a hypothesis about the binding constraint, not a measurement of
+it. Before implementing one, get the kernel onto the machine class it describes and check that the
+port it names is actually the ceiling.
+
 ### The mismatch-only shortcut for the CIGAR's global DP (2026-08-20)
 
 At equal query and reference lengths, a global alignment's indels must cancel, so any gapped path

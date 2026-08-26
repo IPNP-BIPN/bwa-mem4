@@ -4048,139 +4048,6 @@ unsafe fn fwd_local_sw_sse41_i16(
     }
     out
 }
-/// Whether this process runs the AVX-512 u8 rescue kernel with its leaf maxes spelled as
-/// `vpcmpub` + `vpblendmb` instead of `vpmaxub` (ISSUE #44 part B), decided once by timing both.
-///
-/// The lever is real but **not portable**, which is why it is measured rather than assumed. On
-/// Golden Cove every 512-bit saturating-integer and max op is single-ported (p0, TP 1.00), so the
-/// kernel's cost is the count of p0-only ops and moving two of them per row onto p5/p05 is worth
-/// about a sixth of the body. On Zen 5 the same rewrite is a loss: `vpmaxub` runs on all four FP
-/// pipes at TP 0.25 while `vpcmpub` costs latency 6. A CPUID model match would have to be updated
-/// for every part ever shipped; a stopwatch does not.
-///
-/// This mirrors `batched::extend_tier`'s calibration in shape and in caution: best of three on a
-/// fixed synthetic batch, and the new spelling has to be more than 3% faster to be taken, so noise
-/// on a normal host cannot flip a kernel that is already correct and fast. Both spellings are
-/// byte-identical to the scalar reference (`avx512_verify::avx512_matesw_u8_matches_scalar` runs
-/// both), so this decides speed and nothing else.
-///
-/// `BWA4_AVX512_CMPBLEND=1|0` skips the timing and names the spelling, for A/B runs.
-///
-/// # Returns
-///
-/// True to use the compare-and-blend spelling.
-#[cfg(target_arch = "x86_64")]
-fn avx512_leaf_cmp_blend() -> bool {
-    use std::sync::OnceLock;
-    static CHOICE: OnceLock<bool> = OnceLock::new();
-    *CHOICE.get_or_init(|| {
-        match std::env::var("BWA4_AVX512_CMPBLEND").as_deref() {
-            Ok("1") => return true,
-            Ok("0") => return false,
-            _ => {}
-        }
-        if !std::arch::is_x86_feature_detected!("avx512bw") {
-            return false;
-        }
-        // Mate-rescue shape, not a generic one: 150 bp query against a 500 bp insert window, with
-        // the query planted in the target so the batch actually walks the full body instead of
-        // dying to the score floor in the first rows.
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        let mut next = move || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (state >> 33) as usize
-        };
-        let (qlen, tlen) = (150usize, 500usize);
-        let mut qbufs: Vec<Vec<u8>> = Vec::with_capacity(64);
-        let mut tbufs: Vec<Vec<u8>> = Vec::with_capacity(64);
-        for _ in 0..64 {
-            let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
-            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
-            let at = next() % (tlen - qlen);
-            t[at..at + qlen].copy_from_slice(&q);
-            qbufs.push(q);
-            tbufs.push(t);
-        }
-        // bwa's default DNA scores, so the calibration measures the scheme the run will use.
-        let mut mat = vec![0i8; 25];
-        let mut k = 0;
-        for i in 0..4 {
-            for j in 0..4 {
-                mat[k] = if i == j { 1 } else { -4 };
-                k += 1;
-            }
-            mat[k] = -1;
-            k += 1;
-        }
-        for _ in 0..5 {
-            mat[k] = -1;
-            k += 1;
-        }
-        let jobs: Vec<FwdJob> = qbufs
-            .iter()
-            .zip(tbufs.iter())
-            .map(|(q, t)| FwdJob {
-                query: q.as_slice(),
-                target: t.as_slice(),
-                minsc: 19,
-                endsc: i32::MAX,
-            })
-            .collect();
-        // Best of three, for the same reason the extension tier takes the best rather than the
-        // mean: the fastest observation is the one least polluted by whatever else the box is doing.
-        let time = |f: &dyn Fn()| {
-            let mut best = std::time::Duration::MAX;
-            for _ in 0..3 {
-                let t0 = std::time::Instant::now();
-                f();
-                best = best.min(t0.elapsed());
-            }
-            best
-        };
-        // SAFETY of both closures: avx512bw was just detected, and these are stock-DNA-scored jobs
-        // whose ceiling is far below `U8_SCORE_LIMIT`, which is the u8 kernel's precondition.
-        let plain = time(&|| {
-            let out =
-                unsafe { fwd_local_sw_avx512_u8_impl::<false>(&jobs, 5, &mat, 6, 1, 6, 1, 1) };
-            std::hint::black_box(&out);
-        });
-        let blended = time(&|| {
-            let out = unsafe { fwd_local_sw_avx512_u8_impl::<true>(&jobs, 5, &mat, 6, 1, 6, 1, 1) };
-            std::hint::black_box(&out);
-        });
-        blended.as_secs_f64() < plain.as_secs_f64() * 0.97
-    })
-}
-
-/// The AVX-512 u8 rescue kernel, in whichever spelling this host timed as faster.
-///
-/// # Parameters / Returns
-/// As [`fwd_local_sw_avx512_u8_impl`], which does the work; this only picks `LEAF_CMP_BLEND`.
-///
-/// # Safety
-/// Caller must have confirmed AVX-512BW is available, as for the implementation.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn fwd_local_sw_avx512_u8(
-    jobs: &[FwdJob],
-    m: usize,
-    mat: &[i8],
-    o_del: i32,
-    e_del: i32,
-    o_ins: i32,
-    e_ins: i32,
-    max_sc: i32,
-) -> Vec<(i32, i32, i32, i32, i32)> {
-    if avx512_leaf_cmp_blend() {
-        fwd_local_sw_avx512_u8_impl::<true>(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
-    } else {
-        fwd_local_sw_avx512_u8_impl::<false>(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
-    }
-}
-
 /// AVX512 `u8x64` forward local-SW: [`fwd_local_sw_avx2_u8`] widened to `__m512i`, 64 rescue jobs per
 /// group instead of 32. Mate-rescue jobs are cross-lane independent and near-uniform in size (query =
 /// read length, target = the insert-size window), so doubling the lane count keeps utilisation high;
@@ -4212,7 +4079,7 @@ unsafe fn fwd_local_sw_avx512_u8(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fwd_local_sw_avx512_u8_impl<const LEAF_CMP_BLEND: bool>(
+unsafe fn fwd_local_sw_avx512_u8(
     jobs: &[FwdJob],
     // Matrix dimension (5). No longer read: dead cells are detected by the PAD byte's high
     // bit, as in every other u8 kernel here. Kept for signature parity.
@@ -4273,31 +4140,6 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const LEAF_CMP_BLEND: bool>(
     ) -> __m512i {
         let s = _mm512_shuffle_epi8(tbl, _mm512_xor_si512(t_v, q_v));
         _mm512_subs_epu8(_mm512_adds_epu8(d, s), bias_v)
-    }
-    /// One unsigned byte max, in either of its two spellings (ISSUE #44 part B, the paid half).
-    ///
-    /// `vpmaxub` ZMM is one uop on **p0 only** at throughput 1.00 on Golden Cove, because at 512
-    /// bits port 1's vector ALU folds into p0; `vpcmpub` is p5-only and `vpblendmb` is p05 at
-    /// 2/cycle. So paying one extra instruction to move a max off the port that binds is a win
-    /// wherever p0 is the constraint, and a loss where it is not: on Zen 5 all four FP pipes take
-    /// `vpmaxub` at TP 0.25 while `vpcmpub` costs latency 6. Hence `LEAF_CMP_BLEND` is decided by
-    /// timing, in [`avx512_leaf_cmp_blend`], never by a CPUID model match.
-    ///
-    /// Only ever applied to the E and F updates, which are LEAVES: their results feed the next
-    /// column, not this cell's `h`. `max(diag, e)` and `max(mfe, f)` sit on the cross-row
-    /// `h0 -> e_mid -> mfe1 -> h1` chain, where 3 + 3 cycles of compare-then-blend latency would
-    /// replace `vpmaxub`'s 1 and lose whatever the ports gained.
-    ///
-    /// Byte-identical to `max_epu8` by definition: the strict `>` mask selects `a` exactly where
-    /// `a > b`, and `b` (which is then `>= a`) everywhere else.
-    #[target_feature(enable = "avx512f,avx512bw")]
-    #[inline]
-    unsafe fn leaf_max<const CMP_BLEND: bool>(a: __m512i, b: __m512i) -> __m512i {
-        if CMP_BLEND {
-            _mm512_mask_blend_epi8(_mm512_cmpgt_epu8_mask(a, b), b, a)
-        } else {
-            _mm512_max_epu8(a, b)
-        }
     }
     let one_v = _mm512_set1_epi8(1);
     let zpad_v = _mm512_set1_epi8(ZPAD as i8);
@@ -4438,11 +4280,11 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const LEAF_CMP_BLEND: bool>(
                     col0 = _mm512_mask_blend_epi8(gt, col0, j_v);
                     imax0 = _mm512_mask_blend_epi8(gt, imax0, h0);
                     // E(i+1, j), handed to row i+1 in a register rather than stored and reloaded.
-                    let e_mid = leaf_max::<LEAF_CMP_BLEND>(
+                    let e_mid = _mm512_max_epu8(
                         _mm512_subs_epu8(e_v, e_del_v),
                         _mm512_subs_epu8(h0, oe_del_v),
                     );
-                    f0 = leaf_max::<LEAF_CMP_BLEND>(
+                    f0 = _mm512_max_epu8(
                         _mm512_subs_epu8(f0, e_ins_v),
                         _mm512_subs_epu8(mfe0, oe_ins_v),
                     );
@@ -4460,12 +4302,12 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const LEAF_CMP_BLEND: bool>(
                     imax1 = _mm512_mask_blend_epi8(gt, imax1, h1);
                     _mm512_storeu_si512(
                         e.as_mut_ptr().add(j * LANES64) as *mut __m512i,
-                        leaf_max::<LEAF_CMP_BLEND>(
+                        _mm512_max_epu8(
                             _mm512_subs_epu8(e_mid, e_del_v),
                             _mm512_subs_epu8(h1, oe_del_v),
                         ),
                     );
-                    f1 = leaf_max::<LEAF_CMP_BLEND>(
+                    f1 = _mm512_max_epu8(
                         _mm512_subs_epu8(f1, e_ins_v),
                         _mm512_subs_epu8(mfe1, oe_ins_v),
                     );
@@ -4493,11 +4335,11 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const LEAF_CMP_BLEND: bool>(
                     let gt = _mm512_cmpgt_epu8_mask(h0, imax0);
                     col0 = _mm512_mask_blend_epi8(gt, col0, j_v);
                     imax0 = _mm512_mask_blend_epi8(gt, imax0, h0);
-                    let e_mid = leaf_max::<LEAF_CMP_BLEND>(
+                    let e_mid = _mm512_max_epu8(
                         _mm512_subs_epu8(e_v, e_del_v),
                         _mm512_subs_epu8(h0, oe_del_v),
                     );
-                    f0 = leaf_max::<LEAF_CMP_BLEND>(
+                    f0 = _mm512_max_epu8(
                         _mm512_subs_epu8(f0, e_ins_v),
                         _mm512_subs_epu8(mfe0, oe_ins_v),
                     );
@@ -4517,12 +4359,12 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const LEAF_CMP_BLEND: bool>(
                     imax1 = _mm512_mask_blend_epi8(gt, imax1, h1);
                     _mm512_storeu_si512(
                         e.as_mut_ptr().add(j * LANES64) as *mut __m512i,
-                        leaf_max::<LEAF_CMP_BLEND>(
+                        _mm512_max_epu8(
                             _mm512_subs_epu8(e_mid, e_del_v),
                             _mm512_subs_epu8(h1, oe_del_v),
                         ),
                     );
-                    f1 = leaf_max::<LEAF_CMP_BLEND>(
+                    f1 = _mm512_max_epu8(
                         _mm512_subs_epu8(f1, e_ins_v),
                         _mm512_subs_epu8(mfe1, oe_ins_v),
                     );
@@ -4555,12 +4397,12 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const LEAF_CMP_BLEND: bool>(
                     imax_col_v = _mm512_mask_blend_epi8(is_new_row_max, imax_col_v, j_v);
                     imax_v = _mm512_mask_blend_epi8(is_new_row_max, imax_v, h_v);
                     _mm512_storeu_si512(h_cur.as_mut_ptr().add(j * LANES64) as *mut __m512i, h_v);
-                    let e_new = leaf_max::<LEAF_CMP_BLEND>(
+                    let e_new = _mm512_max_epu8(
                         _mm512_subs_epu8(e_v, e_del_v),
                         _mm512_subs_epu8(h_v, oe_del_v),
                     );
                     _mm512_storeu_si512(e.as_mut_ptr().add(j * LANES64) as *mut __m512i, e_new);
-                    f_v = leaf_max::<LEAF_CMP_BLEND>(
+                    f_v = _mm512_max_epu8(
                         _mm512_subs_epu8(f_v, e_ins_v),
                         _mm512_subs_epu8(mfe, oe_ins_v),
                     );
@@ -4593,12 +4435,12 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const LEAF_CMP_BLEND: bool>(
                     imax_v = _mm512_mask_blend_epi8(is_new_row_max, imax_v, h_v);
                     _mm512_storeu_si512(h_cur.as_mut_ptr().add(j * LANES64) as *mut __m512i, h_v);
 
-                    let e_new = leaf_max::<LEAF_CMP_BLEND>(
+                    let e_new = _mm512_max_epu8(
                         _mm512_subs_epu8(e_v, e_del_v),
                         _mm512_subs_epu8(h_v, oe_del_v),
                     );
                     _mm512_storeu_si512(e.as_mut_ptr().add(j * LANES64) as *mut __m512i, e_new);
-                    f_v = leaf_max::<LEAF_CMP_BLEND>(
+                    f_v = _mm512_max_epu8(
                         _mm512_subs_epu8(f_v, e_ins_v),
                         _mm512_subs_epu8(mfe, oe_ins_v),
                     );
@@ -5288,24 +5130,11 @@ mod avx512_verify {
             })
             .collect();
         let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
-        // BOTH spellings of #44 part B, not whichever this host's calibration prefers: the one that
-        // is not selected here is the one that would otherwise ship untested, and it is selected on
-        // somebody else's machine.
         // SAFETY: avx512bw just confirmed; u8 preconditions hold for these stock-DNA-scored jobs.
-        let plain = unsafe {
-            fwd_local_sw_avx512_u8_impl::<false>(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
-        };
-        let blended = unsafe {
-            fwd_local_sw_avx512_u8_impl::<true>(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
-        };
+        let got =
+            unsafe { fwd_local_sw_avx512_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
         for i in 0..jobs.len() {
-            assert_eq!(plain[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
-            assert_eq!(
-                blended[i],
-                want[i],
-                "cmp+blend, job {i} (qlen {})",
-                jobs[i].query.len()
-            );
+            assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
         }
     }
 
@@ -5471,31 +5300,12 @@ mod bench {
         eprintln!("  avx2 vs scalar: {:.2}x", scalar / avx2);
         if std::arch::is_x86_feature_detected!("avx512bw") {
             let avx512 = bench("avx512_u8", &|| unsafe {
-                fwd_local_sw_avx512_u8_impl::<false>(
-                    &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc,
-                )
+                fwd_local_sw_avx512_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
             });
             eprintln!(
                 "  avx512 vs scalar: {:.2}x   avx512 vs avx2: {:.2}x",
                 scalar / avx512,
                 avx2 / avx512
-            );
-            // ISSUE #44 part B, the paid half. Timed here rather than trusted: it is a win only
-            // where p0 binds, which is an Intel-at-512-bits property, and the run-time calibration
-            // decides on exactly this comparison.
-            let blended = bench("avx512_cmpblend", &|| unsafe {
-                fwd_local_sw_avx512_u8_impl::<true>(
-                    &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc,
-                )
-            });
-            eprintln!(
-                "  part B cmp+blend vs max: {:.2}x   (calibration picked {})",
-                avx512 / blended,
-                if avx512_leaf_cmp_blend() {
-                    "cmp+blend"
-                } else {
-                    "max"
-                }
             );
         } else {
             eprintln!("  avx512_u8  skipped (no avx512bw on this runner)");
