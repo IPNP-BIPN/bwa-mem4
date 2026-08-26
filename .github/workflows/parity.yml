@@ -17,6 +17,22 @@ on:
       - dev
   pull_request:
   workflow_dispatch:
+    inputs:
+      # The 58-case gate has only ever run on `ubuntu-22.04`, whose pool is uniformly AMD EPYC 7763,
+      # so it has only ever exercised the AVX2 dispatch. The AVX-512 kernels are byte-identity
+      # tested in isolation (Intel SDE, `avx512-check.yml`), which is not the same claim as "the
+      # whole pipeline is byte-identical to bwa-mem2 when the AVX-512 kernels are the ones running".
+      # The `ubuntu-24.04` pool now draws parts that expose `avx512bw`, so that claim is reachable:
+      # dispatch with `runner: ubuntu-24.04` and `require_avx512: true` until a draw sticks.
+      runner:
+        description: "Runner image (ubuntu-22.04 | ubuntu-24.04)"
+        default: "ubuntu-22.04"
+        required: false
+      require_avx512:
+        description: "Fail fast unless the runner has avx512bw, so the gate runs on the AVX-512 path"
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: read
@@ -42,10 +58,27 @@ jobs:
     # x86_64 Linux only: upstream ships a prebuilt binary for that target and no other, and
     # building bwa-mem2 from source in CI would add several minutes for no extra coverage of OUR
     # code. Note this also means the comparison runs against our AVX2 path, not NEON.
-    runs-on: ubuntu-22.04
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+
+      - name: What this draw is, and whether it can run the AVX-512 path
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          if [ "${{ github.event.inputs.require_avx512 }}" = "true" ]; then
+            grep -q avx512bw /proc/cpuinfo || {
+              echo "::error::this draw has no avx512bw; re-dispatch until one comes up"
+              exit 1
+            }
+            # Not just "the CPU has it": force the dispatch so the gate cannot quietly compare the
+            # AVX2 path again. A forced tier the host lacks falls to scalar, never silently to AVX2,
+            # so this either runs the 512-bit kernels or fails visibly.
+            echo "BWA4_RESCUE_TIER=avx512" >> "$GITHUB_ENV"
+            echo "BWA4_EXTEND_TIER=avx512" >> "$GITHUB_ENV"
+            echo "forcing BWA4_RESCUE_TIER=avx512 and BWA4_EXTEND_TIER=avx512 for the whole gate"
+          fi
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@master
