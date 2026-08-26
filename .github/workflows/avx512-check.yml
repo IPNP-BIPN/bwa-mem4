@@ -131,7 +131,7 @@ jobs:
             | jq -r 'select(.executable != null and .target.test == true) | .executable' | tee /tmp/testbins
           test -s /tmp/testbins || { echo "cargo built no test binary" >&2; exit 1; }
 
-      - name: Run the AVX-512 byte-identity tests on an emulated Sapphire Rapids
+      - name: "Run the AVX-512 byte-identity tests on an emulated ${{ matrix.chip }}"
         run: |
           set -o pipefail
           bin=$(head -1 /tmp/testbins)
