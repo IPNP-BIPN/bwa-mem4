@@ -4862,6 +4862,32 @@ contrainte. Avant d'implementer, amener le kernel sur la classe de machine decri
 le port nomme est bien le plafond.
 
 
+### La parite complete tourne enfin sur le chemin AVX-512, 64 cas sur 64 (2026-08-27)
+
+SDE prouve que chaque kernel AVX-512 egale la reference scalaire. Ce n'est pas la meme affirmation
+que "toute la chaine est octet-identique a bwa-mem2 pendant que ce sont les kernels 512 bits qui
+tournent". Cette seconde affirmation n'avait jamais ete testee : le gate des 58 cas ne tournait que
+sur `ubuntu-22.04`, pool uniformement AMD EPYC 7763, donc il n'a jamais compare que le chemin AVX2.
+
+`parity.yml` prend maintenant `runner` et `require_avx512` en entrees de dispatch, et quand on
+l'exige il **force** `BWA4_RESCUE_TIER=avx512` et `BWA4_EXTEND_TIER=avx512` : posseder la feature
+n'est pas s'en servir, la calibration reste libre de preferer un tier plus etroit, et un gate qui
+re-testerait AVX2 en silence serait pire que pas de gate. Un tier force absent de l'hote retombe sur
+scalaire, jamais silencieusement sur AVX2, donc soit les kernels 512 bits tournent, soit ca echoue
+visiblement.
+
+Resultat du tirage (run 33019473899, AMD EPYC 9V74, `simd: avx2 avx512bw avx512f avx512vl`) :
+
+```
+RESULT: 64 passed, 0 failed
+```
+
+Soit les 64 cas d'options, avec les deux dispatchs forces en AVX-512. C'est la premiere preuve
+d'octet-identite de bout en bout sur ce chemin, et elle complete SDE plutot qu'elle ne le remplace :
+SDE couvre les kernels a chaque PR sans dependre d'un tirage, le gate de parite couvre la chaine
+entiere quand un tirage le permet.
+
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
