@@ -1050,8 +1050,10 @@ RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --workspace --target x86_64-apple
 CPU name; rustc otherwise aborts with "64-bit code requested on a subtarget that doesn't support
 it"). With it, `avx2_matesw_u8_matches_scalar`, `avx2_matesw_i16_matches_scalar` and
 `avx2_u8_and_i16_match_scalar` run for real and pass, so the AVX2 paired kernel is **verified, not
-merely compiled**. AVX-512 is not covered: Rosetta has no `avx512bw`, so those tests take their
-feature-detect early return. Added to `scripts/check.sh`.
+merely compiled**. AVX-512 is not covered locally: Rosetta has no `avx512bw`, so those tests take
+their feature-detect early return, and that early return is now LOUD (it prints a skip line, and CI
+fails on one). The AVX-512 tests are covered in CI instead, under Intel SDE, by
+`.github/workflows/avx512-check.yml`. Added to `scripts/check.sh`.
 
 ## Round 3: three structural ideas, all priced before building, all under the floor
 
@@ -1127,9 +1129,19 @@ present and compiles, and it **returns early on this host**, because Rosetta exe
 `avx512bw`. So:
 
 - AVX2 extension and rescue kernels: **verified** locally (Rosetta) and in CI.
-- AVX-512 extension and rescue kernels: **compile-checked only** until a native AVX-512BW runner runs
-  the tests. The expected win (up to 2x on the extension kernel, ~9% end to end) is a projection from
-  the lane count, **not a measurement**, and must not be quoted as one.
+- AVX-512 extension and rescue kernels: **verified, and now measured** (updated 2026-08-26). They
+  were compile-checked only for a long time, which is why the paragraph above is written the way it
+  is; two things changed. Intel SDE runs `avx512_matesw_u8_matches_scalar`,
+  `avx512_matesw_i16_matches_scalar` and `avx512_u8_and_i16_match_scalar` on every pull request that
+  touches `crates/bwa-neon/**`, on an emulated `-skx` (the ISA floor) and `-spr`; and the
+  `ubuntu-24.04` runner pool now draws parts that expose `avx512bw`, including an Intel Xeon
+  Platinum 8573C (Emerald Rapids), so the kernels also execute on real silicon.
+
+  The measured numbers, same runner, same process, best of 5, 8192 jobs of 614.4 M DP cells on that
+  8573C: rescue kernel **avx512 1.20x avx2** (56.55 ms against 67.60 ms), extension kernel avx512
+  2.399 Gcell/s against avx2 1.812 (1.32x). The old "up to 2x on the extension kernel, ~9% end to
+  end" was a lane-count projection; the kernel half of it is roughly right, and the end-to-end share
+  is what `bench-x86`'s end-to-end job now measures on the same class of host.
 
 ### Row maxima published with one vector store: null on this host, kept
 
