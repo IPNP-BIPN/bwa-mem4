@@ -101,7 +101,11 @@ jobs:
         shell: bash
         run: |
           if [ -r /proc/cpuinfo ]; then
-            grep -o -m1 -E 'avx2|avx512bw|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+            # NOT `-m1`: with `-o`, GNU grep's `-m1` stops after the first MATCH, not the first
+            # matching line, and every flag lives on the same `flags` line. It printed a bare
+            # "avx2" on hosts that also had avx512bw and avx512f, which is exactly the fact this
+            # line exists to report.
+            grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           else
             sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null | tr 'A-Z ' 'a-z\n' | grep -E 'avx2|avx512' | sort -u | tr '\n' ' '; echo
           fi
