@@ -27,6 +27,11 @@
 #     The +11% to +40% still needs an Ice Lake or Sapphire/Emerald Rapids core, per #32's machine.
 name: avx512-check
 
+# Dispatch is not enough. A check that only runs when someone remembers it is a check that rots,
+# and these kernels are the ones nobody can run by accident: no hosted runner has the silicon, so a
+# regression in them would reach a user's Sapphire Rapids before it reached any log. So the SDE job
+# also runs on any pull request that touches the crate holding them, and weekly on the schedule, half
+# an hour after CI's own Monday slot so the two do not queue against each other.
 on:
   workflow_dispatch:
     inputs:
@@ -34,6 +39,12 @@ on:
         description: "Also run the QEMU job (expected to fail: no AVX-512 in TCG, kept as a record)"
         type: boolean
         default: false
+  pull_request:
+    paths:
+      - "crates/bwa-neon/**"
+      - ".github/workflows/avx512-check.yml"
+  schedule:
+    - cron: "30 6 * * 1"  # Mondays 06:30 UTC
 
 # One run of this workflow at a time per ref. Without it a second push while the first run is still
 # measuring leaves two hour-long jobs racing for the same runners, which happened four times while
@@ -44,9 +55,23 @@ concurrency:
 
 jobs:
   avx512-sde:
-    name: AVX-512 kernels under Intel SDE, byte-identity only
+    name: "AVX-512 kernels under Intel SDE (${{ matrix.chip }}), byte-identity only"
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The FLOOR, and it is the arm that can fail on its own. Runtime dispatch selects these
+          # kernels on `avx512bw` alone, which Skylake-X has, and Skylake-X has neither VBMI nor
+          # VNNI. SDE aborts on any instruction the selected chip lacks, so this arm is the guard
+          # against LLVM (or a future edit) reaching for `vpermb` or a newer form inside a block
+          # gated only on BW: on real Skylake-X that would be a SIGILL in a user's alignment.
+          - chip: skx
+          # The TARGET of #44: Golden Cove server, where the port pressure the issue is about lives.
+          # The instruction mix is taken here, not on the floor arm, because this is the model the
+          # cycle counting in the issue was done against.
+          - chip: spr
     env:
       # Pinned, both the URL and the hash. An emulator that silently changed under us would turn a
       # green tick back into the thing this workflow exists to prevent: a claim with nothing behind
@@ -112,17 +137,17 @@ jobs:
           bin=$(head -1 /tmp/testbins)
           echo "binary: $bin"
           sde="./$SDE_DIR/sde64"
-          # `-spr` is the target of the whole issue (Golden Cove server), and SDE faults on any
-          # instruction the selected chip does not have, so the run also proves the kernels stay
-          # inside the SPR ISA rather than only inside avx512bw.
+          # `-${{ matrix.chip }}`: SDE faults on any instruction the selected chip does not have,
+          # so the run proves the kernels stay inside that model's ISA and not merely inside
+          # `avx512bw`, which is all the runtime dispatch checks before selecting them.
           #
           # First pass deliberately does NOT set BWA4_TEST_FORCE_AVX512: what SDE presents to
           # `is_x86_feature_detected!` is itself part of what is being checked, and under QEMU that
           # is exactly what failed (instructions emulated, XCR0 bits absent, tests skipped, `ok`).
-          "$sde" -spr -- "$bin" avx512 --nocapture --test-threads 1 2>&1 | tee /tmp/out.txt
+          "$sde" -${{ matrix.chip }} -- "$bin" avx512 --nocapture --test-threads 1 2>&1 | tee /tmp/out.txt
           if grep -q 'skipping avx512' /tmp/out.txt; then
             echo "SDE did not expose avx512bw to feature detection; re-running with the override"
-            BWA4_TEST_FORCE_AVX512=1 "$sde" -spr -- "$bin" avx512 --nocapture --test-threads 1 2>&1 | tee /tmp/out.txt
+            BWA4_TEST_FORCE_AVX512=1 "$sde" -${{ matrix.chip }} -- "$bin" avx512 --nocapture --test-threads 1 2>&1 | tee /tmp/out.txt
           fi
           # Three gates, because each of them has silently passed at some point in this file's life:
           # a skip must not be reported as `ok`, the filter must actually have matched tests, and
@@ -139,6 +164,7 @@ jobs:
           fi
 
       - name: Prove the XOR score table really issued, not a fallback
+        if: matrix.chip == 'spr'
         run: |
           set -o pipefail
           bin=$(head -1 /tmp/testbins)
@@ -178,7 +204,7 @@ jobs:
           fi
 
       - name: Keep the mix
-        if: always()
+        if: always() && matrix.chip == 'spr'
         uses: actions/upload-artifact@v4
         with:
           name: sde-instruction-mix
