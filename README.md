@@ -32,9 +32,20 @@ extension and mate-rescue Smith-Waterman kernels are vectorised on x86_64 (AVX2,
 the CPU has it, selected at runtime), so the SIMD paths are covered on both architectures; but a
 head-to-head against bwa-mem2 on a full x86_64 WGS run has not yet been recorded, and the paired-end
 ratio in particular (mate rescue is roughly half of PE time) should not be assumed portable until it
-is. The `bench-x86` workflow records two directional x86 signals on GitHub-hosted runners: a
-same-runner scalar/AVX2/AVX-512 rescue-kernel A/B, and a single-chromosome bwa-mem4-vs-bwa-mem2 run;
-both are cloud-noisy and small-scale, not the headline ratio. Byte-identity to bwa-mem2 holds on every
+is. The `bench-x86` workflow records directional x86 signals on GitHub-hosted runners: a same-runner
+scalar/AVX2/AVX-512 rescue-kernel A/B, and a single-chromosome bwa-mem4-vs-bwa-mem2 run; both are
+cloud-noisy and small-scale, not the headline ratio.
+
+The first of those taken on Intel (Xeon Platinum 8573C, Emerald Rapids, chr21, 1M simulated pairs,
+`-t8`, interleaved): bwa-mem2 128.80 s against bwa-mem4 93.17 s, i.e. **1.38x**, with the archive's
+`x86-64-v3` binary at 88.28 s. On the same host the AVX-512 rescue kernel is worth about 4.8% end to
+end over AVX2 (92.51 s against 97.14 s), and the 512-bit kernels are 1.20x the AVX2 ones on the
+kernel A/B. Directional, single chromosome, simulated reads: not the headline ratio.
+
+The AVX-512 kernels are verified rather than merely compiled: Intel SDE runs their byte-identity
+tests on every pull request that touches the kernel crate, on an emulated Skylake-X (the ISA floor)
+and Sapphire Rapids, and the full 58-case parity gate has been run on a host that has `avx512bw`
+with the 512-bit dispatch forced (64 cases, 0 failures). Byte-identity to bwa-mem2 holds on every
 architecture regardless.
 
 On Apple Silicon the worker pool is capped at the Performance-core count, because the Efficiency
