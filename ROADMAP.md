@@ -4814,18 +4814,67 @@ largeur** (`VPSHUFB`, pas `VPSHUFB_ZMM`), donc un gate qui cherche `zmm` echoue 
 de prouver le contraire. La 512-bit-ness se lit dans `*isa-ext-AVX512EVEX`, pas dans le mnemonique,
 qu'AVX2 porte aussi.
 
+### #44 est fini : la partie A vaut +11,4 % mesures, la partie B ne vaut rien (2026-08-26)
+
+Les tirages `ubuntu-24.04` donnent maintenant de l'Intel. Le tirage 7 de la boucle de re-dispatch a
+sorti un **INTEL(R) XEON(R) PLATINUM 8573C**, c'est-a-dire un Emerald Rapids, coeur Golden Cove
+serveur : exactement la piece contre laquelle tout le raisonnement de ports de #44 a ete ecrit. La
+mesure ne se discute donc plus par procuration.
+
+**Partie A, la table de scores XOR : +11,4 %.** Meme runner, l'un apres l'autre, best of 5, 8192
+jobs, 614,4 M cellules (run 33013582129) :
+
+| ref | avx512_u8 | vs avx2 |
+|---|---|---|
+| base 89e019f, avant la partie A | 62,99 ms, 9,753 Gcell/s | 1,08x |
+| HEAD, partie A + le swap gratuit | 56,55 ms, 10,865 Gcell/s | 1,20x |
+
+La projection de l'issue etait +11 % a +15 % : atterrissage en bas de fourchette, comme le jumeau
+AVX2 (#43) qui avait fait +17 % contre +31 % projetes. Le bras AVX2 sert de temoin et n'a pas bouge
+(68,16 -> 67,60 ms, 0,8 %, du bruit), ce qui est attendu puisque sa table etait deja en place.
+
+**Partie B, l'arbitrage de ports : rien, et sur les deux vendeurs.** Elle a ete ecrite pour de vrai
+(kernel generique sur `LEAF_CMP_BLEND`, les douze maxes FEUILLES seulement, jamais ceux de la chaine
+`h0 -> e_mid -> mfe1 -> h1`, choix du spelling par calibration chronometree a la maniere de
+`extend_tier`, les deux spellings verifies octet-identiques sous SDE en `-skx` et `-spr`), puis
+mesuree :
+
+| hote | `vpmaxub` | `vpcmpub` + blend | rapport |
+|---|---|---|---|
+| Intel Xeon Platinum 8573C (Emerald Rapids) | 59,39 ms, 10,345 Gcell/s | 59,84 ms, 10,267 Gcell/s | **0,99x** |
+| AMD EPYC 9V74 (Zen 4) | 53,24 ms, 11,541 Gcell/s | 52,18 ms, 11,775 Gcell/s | 1,02x |
+
+Les deux sont dans la marge de 3 % de la calibration, donc elle a choisi `vpmaxub` sur toutes les
+machines ou elle a tourne, et il ne restait qu'un cout : quelques millisecondes de chronometrage par
+processus et une seconde instanciation d'un kernel de 400 lignes. Le code est revenu en arriere
+(commit e1f9fe7), l'impasse est ecrite avec ses chiffres dans
+`docs/kernel-ceiling-and-dead-ends.md`.
+
+**Pourquoi la LP se trompait**, parce que la meme tentation reviendra : une LP de ports facture des
+instructions contre des ports en supposant que les ports sont la contrainte qui lie. Ce corps porte
+aussi des charges, des stores et la dependance inter-lignes ; et la moitie GRATUITE de la partie B
+(reutiliser le masque de `col` pour `imax`, conservee) avait deja retire le travail p0 bon marche.
+Deplacer deux operations de plus hors d'un port qui n'est plus le plafond n'achete rien, et l'uop
+supplementaire annule le peu que ca achete.
+
+**La regle :** une LP de ports est une hypothese sur la contrainte qui lie, pas une mesure de cette
+contrainte. Avant d'implementer, amener le kernel sur la classe de machine decrite et verifier que
+le port nomme est bien le plafond.
+
+
 ## Ce qui reste
 
-1. **Le chiffre de tete WGS x86 (#32)** : exige une machine dediee. Un runner heberge ne peut ni
-   construire l'index GRCh38 (pic 92 GB) ni mesurer la colle scalaire (taxe SMT, voir l'enquete
-   ksw_global2). C'est aussi la ou l'ecart wgsim residuel contre le fork (1,19-1,21x) se mesurerait
-   honnetement.
-2. **Le kernel AVX-512 (#44)** : correctness **faite**, sous Intel SDE (`avx512-check`) : les trois
-   tests d'octet-identite passent et le mix prouve que la table XOR de la partie A a bien issu. Ne
-   reste que la vitesse, qui exige un coeur Intel reel, aucun emulateur ne chiffrant un kernel. La
-   partie B payante (les swaps `vpcmpub` + blend sur les maxes feuilles de E et F) n'est **pas**
-   ecrite, volontairement : elle est Intel-only, gagnante seulement la ou p0 sature, et personne ici
-   ne peut la mesurer.
+1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
+   tirages Intel existent maintenant n'y change rien. Un runner heberge ne peut ni construire
+   l'index GRCh38 (pic 92 GB contre 16 GB de RAM) ni mesurer la colle scalaire (taxe SMT, voir
+   l'enquete ksw_global2), et il est detruit avant la fin d'un run 30x. Ce qui a change est plus
+   modeste et utile : le **micro-benchmark** x86 se mesure desormais sur du Golden Cove reel, ce
+   qui a suffi a trancher #44. C'est aussi la ou l'ecart wgsim residuel contre le fork (1,19-1,21x)
+   se mesurerait honnetement.
+2. **Le kernel AVX-512 (#44) : fini.** Correctness prouvee (SDE, `-skx` et `-spr`), partie A
+   mesuree a **+11,4 %** sur un Emerald Rapids, partie B implementee, mesuree a 0,99x sur cette
+   meme piece et **refusee**, code revenu en arriere et impasse documentee. Il ne reste rien
+   d'actionnable dans cette issue.
 3. **L'ecart wgsim x86 residuel** : attribue (leurs builds par tier sur toute la colle, plus la taxe
    SMT partagee), plus aucun mystere. Le fermer voudrait dire des artefacts multi-tiers au-dela du
    binaire v3 deja livre, une decision de packaging plus que d'algorithme.
