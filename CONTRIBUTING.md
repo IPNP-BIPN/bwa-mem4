@@ -42,6 +42,15 @@ started on the NEON backend, but it applies to any contributor. The project docs
   What it cannot do is **price** anything: SDE is an interpreter about two orders of magnitude off
   the hardware, with none of the port pressure the kernel tuning is about. Speed claims on AVX-512
   need a real Intel draw (`bench-x86` with `require_avx512=true`), never this workflow.
+
+  On x86_64 Linux you can run the same thing locally with `scripts/avx512_sde.sh` (it pins the same
+  SDE build by SHA-256 and runs the same two chip arms). There is no macOS or aarch64 build of SDE,
+  so on those hosts the workflow is the only route.
+
+  Note also that the **58-case parity gate** can now run on that path: dispatch `parity.yml` with
+  `runner: ubuntu-24.04` and `require_avx512: true`, which forces `BWA4_RESCUE_TIER=avx512` and
+  `BWA4_EXTEND_TIER=avx512` so the gate cannot quietly re-test AVX2. It also runs weekly on that
+  pool and takes the 512-bit path whenever the draw allows. First green run: 64 cases, 0 failures.
 - A **release** is one act: push an annotated `vX.Y.Z` tag on `dev`. Everything else is automatic.
   `.github/workflows/release.yml` then, in this order: refuses to start unless the tag matches the
   workspace version, builds the four supported targets, proves each binary rebuilds the committed
