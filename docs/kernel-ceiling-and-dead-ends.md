@@ -133,6 +133,40 @@ Worth knowing generally, and the reason this entry exists: an op count read off 
 op count. Before deleting arithmetic that the type system makes trivial, check whether the compiler
 has already deleted it.
 
+### An `x86-64-v4` release binary, the AVX-512 tier build (2026-08-27)
+
+The x86 tarballs ship two binaries: the baseline one, which runs anywhere, and an `x86-64-v3` one
+(AVX2) worth 5.6-6.8% on Zen 3. The residual gap against fg-labs/bwa-mem3 on simulated reads is
+attributed to their per-tier builds of the whole SCALAR GLUE, not of the kernels, which we already
+dispatch at run time. The obvious next move is therefore an `x86-64-v4` binary: AVX-512F/BW/VL/DQ
+for the compiler, everywhere, not just in the hand-written kernels.
+
+**Measured on the part it was for, and it loses to the tier we already ship.** Intel Xeon Platinum
+8573C (Emerald Rapids), GRCh38 chr21, 1 M simulated pairs, `-t8`, interleaved, best of 2, all
+binaries md5-identical to each other and to bwa-mem2 (`0feca445b3a990adaae368d4a38ed90b`):
+
+| binary | best wall | vs the baseline build |
+|---|---|---|
+| bwa-mem4 baseline | 93.17 s | 1.000x |
+| bwa-mem4 `x86-64-v3` | 88.28 s | 1.055x |
+| bwa-mem4 `x86-64-v4` | 89.71 s | 1.039x |
+
+`x86-64-v4` against `x86-64-v3` is **0.984x**: slower, by more than the two reps' own spread
+(88.28/88.98 against 89.71/89.88, no overlap). So a third binary in the tarball would cost every
+user a decision and a download to give the AVX-512 owners among them a small loss.
+
+Why, when the AVX-512 KERNELS are worth having on the same host? Because they are already selected
+at run time: the same run's tier sweep shows `BWA4_RESCUE_TIER=avx512` at 92.51 s against `avx2` at
+97.14 s, so the 512-bit rescue kernel is worth about 4.8% end to end **and the baseline binary
+already gets it**. What `-C target-cpu=x86-64-v4` adds on top is auto-vectorised glue, and there it
+is a wash at best: 512-bit code in cold or branchy paths costs frequency and port pressure it does
+not repay. The AVX2 tier build, by contrast, wins because it lets the compiler use AVX2 in the glue
+without any of that.
+
+**The rule:** a wider tier for the compiler is not the same lever as a wider kernel for the hot
+loop. The kernels are dispatched, so the tier build only ever buys the glue, and the glue does not
+want 512 bits.
+
 ### Part B of #44: the port arbitrage on the AVX-512 leaf maxes (2026-08-26)
 
 The issue's part B is a port-pressure argument, and a good one on paper. On Golden Cove every

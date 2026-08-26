@@ -4888,6 +4888,44 @@ SDE couvre les kernels a chaque PR sans dependre d'un tirage, le gate de parite 
 entiere quand un tirage le permet.
 
 
+### Le premier end-to-end x86 sur de l'Intel, et ce qu'il dit (2026-08-27)
+
+Toutes les mesures end-to-end x86 de ce projet etaient des mesures AMD EPYC 7763, parce que
+`ubuntu-22.04` est uniformement Zen 3. Le job end-to-end de `bench-x86` accepte desormais un
+`e2e_runner` et un `require_avx512_e2e`, et le tirage est tombe sur un **INTEL(R) XEON(R) PLATINUM
+8573C** (Emerald Rapids). GRCh38 chr21, 1 M paires simulees, `-t8`, entrelace, best of 2, toutes les
+sorties md5-identiques entre elles et a bwa-mem2 (`0feca445b3a990adaae368d4a38ed90b`) :
+
+| binaire | meilleur mur |
+|---|---|
+| bwa-mem2 | 128,80 s |
+| fork fg-labs/bwa-mem3 | 73,23 s |
+| bwa-mem4 baseline | 93,17 s |
+| bwa-mem4 `x86-64-v3` | 88,28 s |
+| bwa-mem4 `x86-64-v4` | 89,71 s |
+
+Trois lectures, dans l'ordre d'importance.
+
+**1. Contre bwa-mem2 : 1,38x** sur ce terrain. C'est un chr21 simule sur runner heberge, donc
+directionnel, mais c'est le premier chiffre Intel du projet.
+
+**2. Contre le fork, sur wgsim, l'ecart est reel et un peu plus large qu'en Zen 3 : 0,79x**
+(baseline) et **0,83x** (v3), la ou l'AMD donnait 1,19-1,21x en leur faveur. Rien de nouveau dans
+l'attribution (leurs builds par tier sur toute la colle, plus la taxe SMT partagee), mais il faut
+cesser de dire "environ 1,2x" : sur Intel, sur des reads simules, c'est 1,21x contre notre v3 et
+1,27x contre notre baseline. Sur des reads reels, l'ARM et le x86 nous donnaient gagnants ; ce run-ci
+ne mesure pas le terrain reel, et c'est exactement la distinction que #32 existe pour trancher.
+
+**3. Le tier `x86-64-v4` ne vaut pas la peine d'etre livre : 0,984x contre notre `x86-64-v3`**,
+c'est-a-dire plus lent, sans recouvrement entre les deux repetitions. La raison est structurelle et
+merite d'etre retenue : les kernels AVX-512 sont deja selectionnes au RUNTIME, et le meme run le
+montre (sweep de tiers : `avx512` 92,51 s contre `avx2` 97,14 s, soit ~4,8 % de bout en bout, que le
+binaire baseline encaisse deja). Ce qu'un `-C target-cpu=x86-64-v4` ajoute par-dessus, c'est de la
+colle auto-vectorisee en 512 bits, et la c'est au mieux neutre. Le v3 gagne parce qu'il donne AVX2 a
+la colle sans ce cout. Impasse ecrite avec ses chiffres dans
+`docs/kernel-ceiling-and-dead-ends.md`.
+
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
@@ -4908,5 +4946,7 @@ entiere quand un tirage le permet.
    essaye et refuse, avec les chiffres. Ne pas re-fouiller sans une donnee nouvelle.
 
 Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a bwa-mem2 :
-ARM wgsim 7/7 pour nous (-6 %), ARM reel 7/7, x86 reel 9/9 sur trois tirages, x86 wgsim 1,19-1,21x
-pour eux. Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux.
+ARM wgsim 7/7 pour nous (-6 %), ARM reel 7/7, x86 reel 9/9 sur trois tirages (Zen 3), x86 wgsim pour
+eux : 1,19-1,21x sur Zen 3 et 1,21x contre notre `x86-64-v3` sur Emerald Rapids (2026-08-27, chr21,
+1 M paires). Sur les donnees reelles, sur les deux architectures, bwa-mem4 reste le plus rapide des
+deux ; sur des reads simules, le fork l'est. Le terrain reel x86 a grande echelle est #32.
