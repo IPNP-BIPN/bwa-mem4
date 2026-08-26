@@ -40,7 +40,7 @@ The first of those taken on Intel (Xeon Platinum 8573C, Emerald Rapids, chr21, 1
 `-t8`, interleaved): bwa-mem2 128.80 s against bwa-mem4 93.17 s, i.e. **1.38x**, with the archive's
 `x86-64-v3` binary at 88.28 s. On the same host the AVX-512 rescue kernel is worth about 4.8% end to
 end over AVX2 (92.51 s against 97.14 s), and the 512-bit kernels are 1.20x the AVX2 ones on the
-kernel A/B. Directional, single chromosome, simulated reads: not the headline ratio.
+kernel A/B. Directional, and narrow: one runner draw, one chromosome, simulated reads. Not the headline ratio.
 
 The AVX-512 kernels are verified rather than merely compiled: Intel SDE runs their byte-identity
 tests on every pull request that touches the kernel crate, on an emulated Skylake-X (the ISA floor)
