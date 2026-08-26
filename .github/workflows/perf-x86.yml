@@ -23,6 +23,19 @@ on:
         description: "Read pairs to simulate"
         default: "2000000"
         required: false
+      # This workflow attributes the x86 wall clock stage by stage, and every attribution it has
+      # ever produced is an AMD EPYC 7763 one, because `ubuntu-22.04` is uniformly Zen 3. On a host
+      # that exposes avx512bw the vector stages run 64 lanes instead of 32, so the SHAPE of the
+      # profile changes, not just its scale. `ubuntu-24.04` draws such parts about one time in six.
+      runner:
+        description: "Runner image (ubuntu-22.04 | ubuntu-24.04)"
+        default: "ubuntu-22.04"
+        required: false
+      require_avx512:
+        description: "Fail fast unless the runner has avx512bw (re-draw until an AVX-512 host)"
+        type: boolean
+        default: false
+        required: false
 
 # One run of this workflow at a time per ref. Without it a second push while the first run is still
 # measuring leaves two hour-long jobs racing for the same runners, which happened four times while
@@ -34,7 +47,7 @@ concurrency:
 jobs:
   perf-x86:
     name: where the x86 wall goes, ours against the fork
-    runs-on: ubuntu-22.04
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 120
     defaults:
       run:
@@ -49,6 +62,12 @@ jobs:
           # -o without -m1: with -o, grep -m1 stops after the first MATCH, not the first matching
           # line, which is how bench-x86 printed a bare "avx2" on hosts that had avx512bw too.
           echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          if [ "${{ github.event.inputs.require_avx512 }}" = "true" ]; then
+            grep -q avx512bw /proc/cpuinfo || {
+              echo "::error::this draw has no avx512bw; re-dispatch until an AVX-512 host comes up"
+              exit 1
+            }
+          fi
           echo "nproc: $(nproc)"
 
       - name: Install Rust
