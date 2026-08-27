@@ -5010,9 +5010,10 @@ jeu (`ed67c31d...` en simule, `dfd8b409...` en reel) :
 | reel (GIAB) | 96,56 s | 86,91 s | 86,48 s | 99,41 s | 209,88 s |
 
 **Sur reads reels : 1,15x pour nous contre le fork, 3/3, et 2,43x contre bwa-mem2.** C'est la marge
-la plus large jamais mesuree contre le fork sur x86 (Zen 3 donnait 1 a 3 %), et elle est coherente
-avec ce que la journee a etabli par ailleurs : sur un hote 512 bits, le rescue et l'extension
-tournent en 64 voies chez nous, et le rescue est justement la ou le terrain reel depense son temps.
+la plus large jamais mesuree contre le fork sur x86 (Zen 3 donnait 1 a 3 %). L'explication qui vient
+a l'esprit, "c'est parce que nos kernels tournent en 64 voies sur cet hote", a ete ecrite ici puis
+**mesuree et refutee le lendemain** : voir la section suivante, les kernels 512 bits ne valent que
+0,7 % sur ce terrain.
 
 **Sur reads simules : 0,83x, soit 1,21x pour eux**, ce qui est la TROISIEME mesure independante du
 meme chiffre aujourd'hui (Emerald Rapids 0,83x, Zen 4 en end-to-end 0,83x, Zen 4 en head-to-head
@@ -5023,6 +5024,36 @@ et il perd.
 La lecture d'ensemble ne change pas de forme, elle gagne en precision : **sur les donnees que les
 utilisateurs alignent, bwa-mem4 est devant, et l'ecart grandit avec la largeur du vecteur ; sur des
 reads simules, le fork est devant, de 1,21x, partout.**
+
+
+### Notre avance sur reads reels ne vient PAS des kernels 512 bits (2026-08-27)
+
+L'hypothese ecrite la veille etait la bonne a tester et elle est fausse. `head-to-head.yml` a gagne
+un bras `avx2_arm` qui chronometre **le meme binaire** avec `BWA4_RESCUE_TIER=avx2` et
+`BWA4_EXTEND_TIER=avx2`, dans la meme boucle entrelacee, sur le meme hote et les memes reads : pas
+une recompilation, seule la dispatch change, donc l'ecart est les kernels et rien d'autre.
+
+Tirage : AMD EPYC 9V74 (`avx512bw`), trois repetitions par jeu.
+
+| jeu | nous, 512 bits | nous, tiers forces en avx2 | ce que valent les kernels | contre le fork, avec 512 | sans |
+|---|---|---|---|---|---|
+| reel (GIAB) | 87,62 s | 88,23 s | **0,7 %** | 1,120x | 1,113x |
+| simule (wgsim) | 147,56 s | 155,83 s | **5,6 %** | 0,835x | 0,791x |
+
+**Sur reads reels, l'avance survit entierement a la retrogradation** : 1,120x avec les kernels 512
+bits, 1,113x sans. Elle ne vient donc pas de la largeur du vecteur, mais de tout le reste, la bande
+resserree en tete. Ecrire "notre marge s'elargit quand le vecteur s'elargit" etait une inference,
+pas une mesure, et la mesure dit non.
+
+**Sur reads simules, les kernels valent huit fois plus (5,6 %)**, coherent avec le sweep de tiers du
+end-to-end (4,8 %) : c'est la que le rescue travaille. Et meme la, ils ne renversent rien, 0,835x
+contre 0,791x : le fork garde son avance wgsim avec ou sans nos 512 bits, ce qui elimine la largeur
+de vecteur comme explication de cet ecart aussi, et renvoie a leur colle.
+
+Deux conclusions pratiques. La premiere : **le tier AVX-512 est un gain modeste et localise**, pas un
+argument de vente ; il vaut 5 % la ou le rescue domine et rien ailleurs. La seconde, plus utile pour
+la suite : **ce qui nous fait gagner sur donnees reelles est scalaire et algorithmique**, donc c'est
+la, et pas dans un kernel plus large, que se trouve la marge restante.
 
 
 ## Ce qui reste
@@ -5059,7 +5090,8 @@ Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a 
 | x86 Zen 4 (avx512) reel, 3 reps | 86,48-87,84 s | 99,41-104,41 s | **nous, 3/3 (1,15x)** |
 | x86 wgsim, trois tirages, deux vendeurs | | | eux, **1,21x**, replique |
 
-Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux, et sa marge
-s'elargit quand le vecteur s'elargit. Sur des reads simules, le fork garde 1,21x, partout, et cette
+Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux. Sa marge ne
+vient PAS de la largeur du vecteur (mesure du 2026-08-27 : les kernels 512 bits valent 0,7 % sur
+reads reels), mais du reste de la chaine. Sur des reads simules, le fork garde 1,21x, partout, et cette
 constance est ce qui rend le chiffre credible plutot qu'inquietant. Le terrain qui manque reste le
 WGS reel a grande echelle sur machine dediee : #32.
