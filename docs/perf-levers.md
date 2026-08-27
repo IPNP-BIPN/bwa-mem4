@@ -1063,26 +1063,33 @@ Both are real and neither answers the question a user asks, which is what the ti
 
 Measured by forcing the same binary down a tier in the middle of an interleaved head-to-head
 (`head-to-head.yml`'s `avx2_arm`: only `BWA4_RESCUE_TIER` and `BWA4_EXTEND_TIER` change, no rebuild),
-on an AMD EPYC 9V74 with `avx512bw`, three repetitions per read set:
+three repetitions per read set. **Run twice, and the second draw refuted the first's conclusion**:
 
-| read set | with the 512-bit kernels | forced to AVX2 | the tier is worth |
-|---|---|---|---|
-| real (GIAB slice) | 87.62 s | 88.23 s | **0.7%** |
-| simulated (wgsim) | 147.56 s | 155.83 s | **5.6%** |
+| host | real reads: 512-bit / AVX2 | worth | simulated: 512-bit / AVX2 | worth |
+|---|---|---|---|---|
+| AMD EPYC 9V74 (Zen 4) | 87.62 s / 88.23 s | **0.7%** | 147.56 s / 155.83 s | **5.6%** |
+| Intel Xeon 6973P-C (Granite Rapids) | 78.16 s / 83.47 s | **6.8%** | 136.47 s / 150.32 s | **10.1%** |
 
-The end-to-end tier sweep on a different host agrees on the simulated figure (92.51 s against
-97.14 s, 4.8%).
+The end-to-end tier sweep on an Emerald Rapids agrees on the simulated order of magnitude (92.51 s
+against 97.14 s, 4.8%).
 
-**The lesson is the ratio between those two rows, not either number.** The kernels are worth eight
-times more on simulated reads than on real ones, because mate rescue is where they live and wgsim's
-uniform, mismatch-free-ish reads send far more work through it. Any claim of the form "the vector
-width is why we are fast" therefore has to name the read set, and on real data it is false: our lead
-over fg-labs/bwa-mem3 moves from 1.120x to 1.113x when the kernels are downgraded, i.e. it comes from
-the rest of the pipeline.
+**Two axes move this number, and only one of them was visible on the first host.** The read set
+matters, as the first draw showed: the tier is worth several times more on wgsim than on real reads,
+because mate rescue is where the kernels live and wgsim's uniform reads send far more work through
+it. But the HOST matters at least as much. Zen 4 executes a 512-bit operation as two 256-bit halves,
+so surrendering the tier there costs almost nothing on real reads (0.7%); Granite Rapids has the
+full-width datapath these kernels were written for, and the same surrender costs 6.8%.
 
-Two consequences for lever-hunting. Kernel width is a spent lever on real data, so a wider kernel is
-not where the next percent lives. And the scalar and algorithmic parts of `align`, which the
-stage profile puts at 61% of the run with the kernels enabled, are where it does.
+That is why the sentence "our real-read lead is not the AVX-512 kernels", published here for a day
+on the strength of the AMD row alone, is **wrong**. On the Intel part our lead over fg-labs/bwa-mem3
+moves from 1.135x to 1.063x when the kernels are downgraded: the kernels carry 6.3 of its 13.5
+points, about half. The general form of the mistake is the one this file keeps recording: a single
+draw measured a property of the silicon and it was written down as a property of the code.
+
+Two consequences for lever-hunting. Kernel width is NOT a spent lever on native-512 parts, and the
+extension kernel is the one to widen there. On double-pumped parts it is spent, and the scalar and
+algorithmic parts of `align`, which the stage profile puts at 61% of the run, are where the next
+percent lives.
 
 ## Round 3: three structural ideas, all priced before building, all under the floor
 

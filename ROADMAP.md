@@ -5015,8 +5015,9 @@ jeu (`ed67c31d...` en simule, `dfd8b409...` en reel) :
 **Sur reads reels : 1,15x pour nous contre le fork, 3/3, et 2,43x contre bwa-mem2.** C'est la marge
 la plus large jamais mesuree contre le fork sur x86 (Zen 3 donnait 1 a 3 %). L'explication qui vient
 a l'esprit, "c'est parce que nos kernels tournent en 64 voies sur cet hote", a ete ecrite ici puis
-**mesuree et refutee le lendemain** : voir la section suivante, les kernels 512 bits ne valent que
-0,7 % sur ce terrain.
+**mesuree** : elle est fausse sur cette piece-ci (les kernels 512 bits n'y valent que 0,7 %) et
+largement vraie sur une piece a 512 bits natifs (6,8 % sur un Granite Rapids). Voir les deux
+sections suivantes, dans l'ordre : l'hypothese, puis sa refutation par replication.
 
 **Sur reads simules : 0,83x, soit 1,21x pour eux**, ce qui est la TROISIEME mesure independante du
 meme chiffre aujourd'hui (Emerald Rapids 0,83x, Zen 4 en end-to-end 0,83x, Zen 4 en head-to-head
@@ -5025,11 +5026,13 @@ artefact de plateforme, et il ne bougera pas par du packaging : le tier `x86-64-
 et il perd.
 
 La lecture d'ensemble ne change pas de forme, elle gagne en precision : **sur les donnees que les
-utilisateurs alignent, bwa-mem4 est devant, et l'ecart grandit avec la largeur du vecteur ; sur des
-reads simules, le fork est devant, de 1,21x, partout.**
+utilisateurs alignent, bwa-mem4 est devant ; sur des reads simules, le fork est devant, de 1,21x,
+partout.** (La version d'origine de cette phrase ajoutait "et l'ecart grandit avec la largeur du
+vecteur". C'etait une inference, deux fois mesuree depuis, et elle ne tient pas telle quelle : la
+largeur paie sur les pieces a 512 bits natifs et presque pas sur les pieces a double pompage.)
 
 
-### Notre avance sur reads reels ne vient PAS des kernels 512 bits (2026-08-27)
+### Notre avance sur reads reels ne vient PAS des kernels 512 bits (2026-08-27, REFUTE le jour meme, section suivante)
 
 L'hypothese ecrite la veille etait la bonne a tester et elle est fausse. `head-to-head.yml` a gagne
 un bras `avx2_arm` qui chronometre **le meme binaire** avec `BWA4_RESCUE_TIER=avx2` et
@@ -5057,6 +5060,45 @@ Deux conclusions pratiques. La premiere : **le tier AVX-512 est un gain modeste 
 argument de vente ; il vaut 5 % la ou le rescue domine et rien ailleurs. La seconde, plus utile pour
 la suite : **ce qui nous fait gagner sur donnees reelles est scalaire et algorithmique**, donc c'est
 la, et pas dans un kernel plus large, que se trouve la marge restante.
+
+*(Ces deux conclusions sont fausses. Elles reposent sur un seul tirage, et le tirage de replication,
+lance dans la foulee, a mesure l'inverse. La section suivante est la correction.)*
+
+
+### La replication refute la section precedente : ce que valent les kernels depend de la MACHINE (2026-08-27)
+
+La regle de la maison a fini par s'appliquer a moi : une mesure sur un seul hote est une propriete de
+la piece de silicium tant qu'un deuxieme tirage n'a pas dit le contraire. Le seuil de la porte H11
+avait ete fixe **avant** que le second run ne tombe (le tier doit valoir moins de 2 % sur reads reels,
+plus de 3 % sur simules, et au moins deux fois plus sur simules que sur reels). La porte a echoue,
+et c'est le resultat.
+
+Le second tirage n'est pas tombe sur un Zen 4 mais sur un **Intel Xeon 6973P-C** (Granite Rapids),
+c'est-a-dire une piece avec un vrai chemin de donnees 512 bits. Meme protocole exactement : meme
+binaire, meme boucle entrelacee, trois repetitions, seule la dispatch change.
+
+| hote | reel : 512 bits / avx2 | ce que vaut le tier | simule : 512 bits / avx2 | ce que vaut le tier |
+|---|---|---|---|---|
+| AMD EPYC 9V74 (Zen 4) | 87,62 s / 88,23 s | **0,7 %** | 147,56 s / 155,83 s | **5,6 %** |
+| Intel Xeon 6973P-C (Granite Rapids) | 78,16 s / 83,47 s | **6,8 %** | 136,47 s / 150,32 s | **10,1 %** |
+
+**Un facteur dix sur la meme question.** L'explication tient a la microarchitecture et pas au code :
+Zen 4 execute une operation 512 bits en deux moities de 256 bits, donc y renoncer ne coute presque
+rien ; Granite Rapids a la largeur complete pour laquelle ces kernels ont ete ecrits.
+
+Consequence sur la phrase publiee la veille : sur la piece Intel, notre avance sur le fork passe de
+**1,135x a 1,063x** quand on retrograde les tiers. Les kernels y portent 6,3 des 13,5 points, soit
+a peu pres la moitie de l'avance. La phrase "notre avance sur reads reels ne vient pas des kernels"
+est donc vraie sur Zen 4 et fausse sur Intel, et elle avait ete ecrite sans qualificatif.
+
+Au passage, cette piece donne aussi le meilleur rapport contre bwa-mem2 mesure jusqu'ici dans ce
+protocole : **1,99x sur reads reels** (155,91 s contre 78,16 s) et **1,42x sur wgsim** (193,59 s
+contre 136,47 s), sortie identique des trois binaires.
+
+Ce qu'il faut retenir pour la chasse aux leviers, corrige : **la largeur de kernel n'est pas un
+levier epuise sur les pieces a 512 bits natifs**, elle l'est sur les pieces a double pompage. Et
+les deux affirmations doivent desormais nommer la machine, comme le ratio contre bwa-mem2 le fait
+deja depuis la replication du 2026-08-27 au matin.
 
 
 ## Ce qui reste
@@ -5091,10 +5133,13 @@ Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a 
 | ARM reel, 7 reps | 12,02-12,28 s | 12,19-12,40 s | **nous, 7/7 (-1,4 %)** |
 | x86 Zen 3 reel, 3 tirages | 100,83-101,07 s | 102,00-104,16 s | **nous, 9/9** |
 | x86 Zen 4 (avx512) reel, 3 reps | 86,48-87,84 s | 99,41-104,41 s | **nous, 3/3 (1,15x)** |
+| x86 Granite Rapids reel, 3 reps | 78,16-81,19 s | 88,72-90,88 s | **nous, 3/3 (1,14x)** |
 | x86 wgsim, trois tirages, deux vendeurs | | | eux, **1,21x**, replique |
 
-Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux. Sa marge ne
-vient PAS de la largeur du vecteur (mesure du 2026-08-27 : les kernels 512 bits valent 0,7 % sur
-reads reels), mais du reste de la chaine. Sur des reads simules, le fork garde 1,21x, partout, et cette
-constance est ce qui rend le chiffre credible plutot qu'inquietant. Le terrain qui manque reste le
+Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux. D'ou vient
+cette marge depend de la machine, et les deux tirages du 2026-08-27 le disent sans ambiguite : sur
+Zen 4 les kernels 512 bits n'en portent que 0,7 % et le reste de la chaine fait le travail ; sur un
+Granite Rapids ils en portent 6,8 %, soit a peu pres la moitie de l'avance. Sur des reads simules, le
+fork garde 1,21x, partout, et cette constance est ce qui rend le chiffre credible plutot
+qu'inquietant. Le terrain qui manque reste le
 WGS reel a grande echelle sur machine dediee : #32.

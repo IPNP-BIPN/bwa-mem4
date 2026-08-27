@@ -58,11 +58,23 @@ bwa-mem2**, with identical records from all three. On simulated reads the fork i
 measured three times on two vendors. Both belong in the same paragraph: which one describes your
 workload depends on your reads, not on the aligner.
 
-That real-read lead is **not** the AVX-512 kernels. Timing the same binary with the kernels forced
-down to AVX2, in the same interleaved loop on the same host, moves it from 1.120x to 1.113x: the
-512-bit kernels are worth 0.7% there. They are worth 5.6% on simulated reads, where mate rescue does
-the work, and they do not close that gap either (0.835x against 0.791x). So the vector width is a
-modest, localised gain, and what puts bwa-mem4 ahead on real data is the rest of the pipeline.
+What the AVX-512 kernels contribute to that lead was measured directly, by timing the same binary
+with the kernels forced down to AVX2 in the same interleaved loop, and the answer **depends on the
+host, by an order of magnitude**:
+
+| host | real reads, 512-bit | forced AVX2 | tier is worth | vs the fork, with / without |
+|---|---|---|---|---|
+| AMD EPYC 9V74 (Zen 4) | 87.62 s | 88.23 s | 0.7% | 1.120x / 1.113x |
+| Intel Xeon 6973P-C (Granite Rapids) | 78.16 s | 83.47 s | 6.8% | 1.135x / 1.063x |
+
+On the AMD part the 512-bit kernels are nearly free to give up, on the Intel one they carry about
+half the lead over the fork (6.3 of its 13.5 points). Zen 4 executes a 512-bit operation as two
+256-bit halves, so what our kernels buy there is mostly encoding density, while Granite Rapids has
+the full-width datapath the kernels were written for; that is the explanation, and the two rows are
+the measurement. On simulated reads the tier pays on both (5.6% and 10.1%) and closes none of the
+fork's lead there. The first of these rows was published on its own for a day, as if "the lead is
+not the kernels" were a property of the code. It is not; it is a property of the silicon, and one
+draw could not tell the difference.
 
 The AVX-512 kernels are verified rather than merely compiled: Intel SDE runs their byte-identity
 tests on every pull request that touches the kernel crate, on an emulated Skylake-X (the ISA floor)
