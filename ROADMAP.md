@@ -4926,6 +4926,44 @@ la colle sans ce cout. Impasse ecrite avec ses chiffres dans
 `docs/kernel-ceiling-and-dead-ends.md`.
 
 
+### Un profil x86 pris sur un hote AVX-512, et les reads reels reconfirmes (2026-08-27)
+
+`perf-x86` accepte desormais un `runner` et un `require_avx512`, et son job d'attribution est tombe
+sur un **AMD EPYC 9V74** exposant `avx512bw` : c'est le premier profil par etage de ce projet ou les
+kernels 512 bits sont ceux qui tournent. 1 M paires simulees, chr21, un batch en vol (les parts sont
+exactes dans ce mode) :
+
+| etage | mur | part |
+|---|---|---|
+| align | 45,444 s | 61,0 % |
+| rescue | 17,006 s | 22,8 % |
+| sam_emit | 10,941 s | 14,7 % |
+| tout le reste | ~0,7 s | 0,9 % |
+
+Occupation du pool : align 97,3 %, rescue 98,1 %, sam_emit 99,6 %, donc rien ne se perd en barriere.
+Le kernel de rescue tourne a **7,38 Gcell/s/thread** (plafond mesure sur M4 Max : ~16), la taxe de
+divergence de voies est 1,08x et le tri par longueur ne sauverait rien (0,0 %), ce qui reconfirme le
+verdict de #38 sur un troisieme type de machine.
+
+**Ne pas comparer cette table telle quelle a celle de Zen 3** (align 73,1 %, rescue 12,3 %, sam_emit
+10,7 %) : ce run-la avait deux fois plus de paires et cinq fois plus de batches, donc les parts ne
+sont pas prises sur le meme decoupage. Ce qui se lit ici, c'est la forme sur un hote 512 bits, pas un
+delta.
+
+**Les reads reels, eux, sont directement comparables et retombent au meme endroit.** Meme workflow,
+job `the gap on REAL reads`, tranche GIAB, trois repetitions :
+
+```
+rep 1: bwa-mem4 101.07s | bwa-mem3 102.00s | bwa-mem2 228.36s
+rep 2: bwa-mem4 101.01s | bwa-mem3 102.21s | bwa-mem2 224.85s
+rep 3: bwa-mem4 100.83s | bwa-mem3 104.16s | bwa-mem2 231.05s
+```
+
+**3/3 pour nous contre le fork** (1 a 3 %), et **2,2x contre bwa-mem2**. C'est la position que le
+ROADMAP tenait deja et elle ne bouge pas : sur des reads simules le fork passe devant, sur les
+donnees que les utilisateurs alignent, non.
+
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
