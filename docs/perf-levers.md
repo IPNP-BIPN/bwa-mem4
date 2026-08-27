@@ -1050,8 +1050,46 @@ RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --workspace --target x86_64-apple
 CPU name; rustc otherwise aborts with "64-bit code requested on a subtarget that doesn't support
 it"). With it, `avx2_matesw_u8_matches_scalar`, `avx2_matesw_i16_matches_scalar` and
 `avx2_u8_and_i16_match_scalar` run for real and pass, so the AVX2 paired kernel is **verified, not
-merely compiled**. AVX-512 is not covered: Rosetta has no `avx512bw`, so those tests take their
-feature-detect early return. Added to `scripts/check.sh`.
+merely compiled**. AVX-512 is not covered locally: Rosetta has no `avx512bw`, so those tests take
+their feature-detect early return, and that early return is now LOUD (it prints a skip line, and CI
+fails on one). The AVX-512 tests are covered in CI instead, under Intel SDE, by
+`.github/workflows/avx512-check.yml`. Added to `scripts/check.sh`.
+
+## What the AVX-512 tier is actually worth, measured by turning it off (2026-08-27)
+
+The AVX-512 kernels were argued for by lane count and, once they finally executed, timed at the
+kernel level: 1.20x the AVX2 rescue kernel and 1.32x the AVX2 extension kernel on an Emerald Rapids.
+Both are real and neither answers the question a user asks, which is what the tier is worth to a RUN.
+
+Measured by forcing the same binary down a tier in the middle of an interleaved head-to-head
+(`head-to-head.yml`'s `avx2_arm`: only `BWA4_RESCUE_TIER` and `BWA4_EXTEND_TIER` change, no rebuild),
+three repetitions per read set. **Run twice, and the second draw refuted the first's conclusion**:
+
+| host | real reads: 512-bit / AVX2 | worth | simulated: 512-bit / AVX2 | worth |
+|---|---|---|---|---|
+| AMD EPYC 9V74 (Zen 4) | 87.62 s / 88.23 s | **0.7%** | 147.56 s / 155.83 s | **5.6%** |
+| Intel Xeon 6973P-C (Granite Rapids) | 78.16 s / 83.47 s | **6.8%** | 136.47 s / 150.32 s | **10.1%** |
+
+The end-to-end tier sweep on an Emerald Rapids agrees on the simulated order of magnitude (92.51 s
+against 97.14 s, 4.8%).
+
+**Two axes move this number, and only one of them was visible on the first host.** The read set
+matters, as the first draw showed: the tier is worth several times more on wgsim than on real reads,
+because mate rescue is where the kernels live and wgsim's uniform reads send far more work through
+it. But the HOST matters at least as much. Zen 4 executes a 512-bit operation as two 256-bit halves,
+so surrendering the tier there costs almost nothing on real reads (0.7%); Granite Rapids has the
+full-width datapath these kernels were written for, and the same surrender costs 6.8%.
+
+That is why the sentence "our real-read lead is not the AVX-512 kernels", published here for a day
+on the strength of the AMD row alone, is **wrong**. On the Intel part our lead over fg-labs/bwa-mem3
+moves from 1.135x to 1.063x when the kernels are downgraded: the kernels carry 6.3 of its 13.5
+points, about half. The general form of the mistake is the one this file keeps recording: a single
+draw measured a property of the silicon and it was written down as a property of the code.
+
+Two consequences for lever-hunting. Kernel width is NOT a spent lever on native-512 parts, and the
+extension kernel is the one to widen there. On double-pumped parts it is spent, and the scalar and
+algorithmic parts of `align`, which the stage profile puts at 61% of the run, are where the next
+percent lives.
 
 ## Round 3: three structural ideas, all priced before building, all under the floor
 
@@ -1127,9 +1165,19 @@ present and compiles, and it **returns early on this host**, because Rosetta exe
 `avx512bw`. So:
 
 - AVX2 extension and rescue kernels: **verified** locally (Rosetta) and in CI.
-- AVX-512 extension and rescue kernels: **compile-checked only** until a native AVX-512BW runner runs
-  the tests. The expected win (up to 2x on the extension kernel, ~9% end to end) is a projection from
-  the lane count, **not a measurement**, and must not be quoted as one.
+- AVX-512 extension and rescue kernels: **verified, and now measured** (updated 2026-08-26). They
+  were compile-checked only for a long time, which is why the paragraph above is written the way it
+  is; two things changed. Intel SDE runs `avx512_matesw_u8_matches_scalar`,
+  `avx512_matesw_i16_matches_scalar` and `avx512_u8_and_i16_match_scalar` on every pull request that
+  touches `crates/bwa-neon/**`, on an emulated `-skx` (the ISA floor) and `-spr`; and the
+  `ubuntu-24.04` runner pool now draws parts that expose `avx512bw`, including an Intel Xeon
+  Platinum 8573C (Emerald Rapids), so the kernels also execute on real silicon.
+
+  The measured numbers, same runner, same process, best of 5, 8192 jobs of 614.4 M DP cells on that
+  8573C: rescue kernel **avx512 1.20x avx2** (56.55 ms against 67.60 ms), extension kernel avx512
+  2.399 Gcell/s against avx2 1.812 (1.32x). The old "up to 2x on the extension kernel, ~9% end to
+  end" was a lane-count projection; the kernel half of it is roughly right, and the end-to-end share
+  is what `bench-x86`'s end-to-end job now measures on the same class of host.
 
 ### Row maxima published with one vector store: null on this host, kept
 

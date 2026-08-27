@@ -9,6 +9,11 @@
 #     bash scripts/opt_parity.sh ./target/release/bwa-mem4
 #
 # and remember `cargo test` does not relink target/release/bwa-mem4: `cargo build --release` first.
+#
+# It also does NOT cover the AVX-512 kernels, on any machine. Their byte-identity tests self-skip
+# wherever `avx512bw` is absent, which is every arm64 host and most x86 ones, and a skip reports
+# `ok`. On x86_64 Linux, `scripts/avx512_sde.sh` runs them for real under Intel SDE; everywhere else
+# the `avx512-check` workflow does it on every pull request that touches `crates/bwa-neon/**`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

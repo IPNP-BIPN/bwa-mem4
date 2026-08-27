@@ -380,25 +380,33 @@ jobs:
           # than after a marketing tier, and accompanied by a note, because a second executable in a
           # tarball with no explanation is a support ticket.
           if [ -x target-variant/release/bwa-mem4 ]; then
-            cp target-variant/release/bwa-mem4 "dist/$NAME/bwa-mem4-${{ matrix.variant_cpu }}"
+            VC="${{ matrix.variant_cpu }}"
+            cp target-variant/release/bwa-mem4 "dist/$NAME/bwa-mem4-$VC"
+            # The note is written FROM `$VC`, not around a hardcoded "x86-64-v3". It used to say v3
+            # in its prose and its example command while naming the file after the matrix value, so
+            # a matrix change would have shipped a note describing a binary that was not there.
+            case "$VC" in
+              x86-64-v3) NEEDS='AVX2, i.e. Intel Haswell 2013 and AMD Excavator 2015 onwards'
+                         PROBE='avx2'
+                         SPEED='It is **5.6% to 6.8% faster**, measured on an AMD EPYC 7763 over interleaved repetitions (32.99 / 33.42 s against 31.42 / 31.15 s on 400k simulated pairs against chr21).' ;;
+              x86-64-v4) NEEDS='AVX-512F/BW/VL/DQ, i.e. Intel Skylake-SP 2017 onwards and AMD Zen 4 2022 onwards'
+                         PROBE='avx512bw'
+                         SPEED='Its speed against the v3 binary is measured per release; see the release notes.' ;;
+              *)         NEEDS="the $VC instruction set"
+                         PROBE='flags'
+                         SPEED='' ;;
+            esac
             {
-              printf '%s\n' '# `bwa-mem4-x86-64-v3`'
-              printf '%s\n' ''
-              printf '%s\n' 'The second binary in this archive is the same source compiled for **x86-64-v3** (AVX2, i.e. Intel'
-              printf '%s\n' 'Haswell 2013 and AMD Excavator 2015 onwards). It produces **identical output**: the release job'
-              printf '%s\n' 'rebuilds the committed index with it and diffs a full alignment against the baseline binary'\''s,'
-              printf '%s\n' 'byte for byte, before either is packaged.'
-              printf '%s\n' ''
-              printf '%s\n' 'It is **5.6% to 6.8% faster**, measured on an AMD EPYC 7763 over interleaved repetitions'
-              printf '%s\n' '(32.99 / 33.42 s against 31.42 / 31.15 s on 400k simulated pairs against chr21).'
-              printf '%s\n' ''
-              printf '%s\n' 'Use it if your CPU has AVX2, which every x86 server bought in the last decade does:'
-              printf '%s\n' ''
-              printf '%s\n' '    grep -q avx2 /proc/cpuinfo && ./bwa-mem4-x86-64-v3 mem ...'
-              printf '%s\n' ''
-              printf '%s\n' '`bwa-mem4` itself stays compiled at the x86-64 baseline so that it runs anywhere, including hosts'
-              printf '%s\n' 'where the variant would die with an illegal instruction. Nothing chooses between them for you.'
-            } > "dist/$NAME/AVX2-VARIANT.md"
+              printf '# `bwa-mem4-%s`\n\n' "$VC"
+              printf 'The second binary in this archive is the same source compiled for **%s** (%s).\n' "$VC" "$NEEDS"
+              printf 'It produces **identical output**: the release job rebuilds the committed index with it and diffs\n'
+              printf 'a full alignment against the baseline binary'\''s, byte for byte, before either is packaged.\n\n'
+              [ -n "$SPEED" ] && printf '%s\n\n' "$SPEED"
+              printf 'Use it if your CPU has the instruction set:\n\n'
+              printf '    grep -q %s /proc/cpuinfo && ./bwa-mem4-%s mem ...\n\n' "$PROBE" "$VC"
+              printf '`bwa-mem4` itself stays compiled at the x86-64 baseline so that it runs anywhere, including hosts\n'
+              printf 'where the variant would die with an illegal instruction. Nothing chooses between them for you.\n'
+            } > "dist/$NAME/VARIANT-$VC.md"
           fi
           # LICENSE travels with the binary: this is a derivative work of bwa-mem2 and the MIT terms
           # require the notice to accompany every distributed copy, source or not.

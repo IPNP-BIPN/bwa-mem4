@@ -31,6 +31,30 @@ on:
         description: "Simulated pairs (the real-read arm is sliced from GIAB and sized by the window)"
         default: "2000000"
         required: false
+      # Every head-to-head recorded here is an AMD EPYC 7763 number, because `ubuntu-22.04` is
+      # uniformly Zen 3. The residual gap against the fork is an x86 question and a CPU is not a
+      # vendor: `ubuntu-24.04` now draws parts that expose avx512bw, including Intel Emerald Rapids,
+      # where our 512-bit kernels are the ones that run and the fork's tier builds meet ours on
+      # different ground.
+      runner:
+        description: "Runner image (ubuntu-22.04 | ubuntu-24.04)"
+        default: "ubuntu-22.04"
+        required: false
+      require_avx512:
+        description: "Fail fast unless the runner has avx512bw (re-draw until an AVX-512 host)"
+        type: boolean
+        default: false
+        required: false
+      # On an AVX-512 host we beat the fork on real reads by 15% (2026-08-27, EPYC 9V74). That
+      # number does not say WHY. This arm answers it by timing the same binary with the 512-bit
+      # kernels turned off, in the same interleaved loop, on the same host: if the lead survives
+      # `avx2`, it is not the kernels; if it collapses, it is. Comparing across two runs would not
+      # settle it, because the hosts differ more than the arms do.
+      avx2_arm:
+        description: "Also time our v3 binary with the kernels forced to avx2 (attributes the AVX-512 share)"
+        type: boolean
+        default: false
+        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,7 +63,7 @@ concurrency:
 jobs:
   head-to-head:
     name: bwa-mem4 baseline and v3, against the fork and bwa-mem2
-    runs-on: ubuntu-22.04
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     # 180, not 120: five binaries, three repetitions, two datasets plus warm-ups is 34 alignments at
     # 100-210 s each on this runner, and the 120-minute ceiling killed the first five-arm run inside
     # its final identity step.
@@ -52,10 +76,20 @@ jobs:
 
       - name: Log the host
         shell: bash
+        env:
+          REQUIRE_AVX512: ${{ github.event.inputs.require_avx512 }}
         run: |
           echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
-          echo -n "simd: "; grep -o -E 'avx2|avx512bw' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          # No `-m1`: with `-o` it counts matches, not lines, so it printed one flag out of the
+          # several on the same `flags` line and hid an AVX-512 host for a whole run elsewhere.
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           echo "nproc: $(nproc)"
+          if [ "$REQUIRE_AVX512" = "true" ]; then
+            grep -q avx512bw /proc/cpuinfo || {
+              echo "::error::this draw has no avx512bw; re-dispatch until an AVX-512 host comes up"
+              exit 1
+            }
+          fi
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -113,6 +147,8 @@ jobs:
           echo "real: $(( $(wc -l < real1.fq) / 4 )) pairs"
 
       - name: Head to head
+        env:
+          AVX2_ARM: ${{ github.event.inputs.avx2_arm }}
         run: |
           set -euo pipefail
           cd work
@@ -126,13 +162,26 @@ jobs:
             for b in ../mem4-baseline ../mem4-v3; do $b mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null; done
             bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
+            if [ "$AVX2_ARM" = "true" ]; then
+              env BWA4_TIGHT_BAND=1 BWA4_RESCUE_TIER=avx2 BWA4_EXTEND_TIER=avx2 \
+                ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
+            fi
             for rep in 1 2 3; do
               b0=$(timed ../mem4-baseline mem -t "$T" chr21.fa "$r1" "$r2")
               b3=$(timed ../mem4-v3       mem -t "$T" chr21.fa "$r1" "$r2")
               tb=$(timed env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2")
               fk=$(timed bwa-mem3         mem -t "$T" chr21.fa "$r1" "$r2")
               m2=$(timed bwa-mem2         mem -t "$T" chr21.fa "$r1" "$r2")
-              echo "rep $rep: baseline ${b0}s | v3 ${b3}s | v3+tight ${tb}s | fork ${fk}s | mem2 ${m2}s"
+              line="rep $rep: baseline ${b0}s | v3 ${b3}s | v3+tight ${tb}s | fork ${fk}s | mem2 ${m2}s"
+              if [ "$AVX2_ARM" = "true" ]; then
+                # Forced tiers, not a rebuild: the binary is identical, only the dispatch changes,
+                # so the difference is the kernels and nothing else. A forced tier the host lacks
+                # falls to scalar rather than silently to a wider one, which would be invisible here.
+                a2=$(timed env BWA4_TIGHT_BAND=1 BWA4_RESCUE_TIER=avx2 BWA4_EXTEND_TIER=avx2 \
+                     ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2")
+                line="$line | v3+tight+avx2 ${a2}s"
+              fi
+              echo "$line"
             done
           done
 

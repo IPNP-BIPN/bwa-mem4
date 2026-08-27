@@ -24,6 +24,33 @@ started on the NEON backend, but it applies to any contributor. The project docs
   bill. Neither SIMD path loses coverage, because `ubuntu-24.04-arm` compiles and runs the NEON
   kernels and `ubuntu-22.04` the AVX2 ones. What macOS adds is the operating system itself, checked
   before code reaches a long-lived branch and again on every release.
+- **The AVX-512 kernels are checked by an emulator, and you should know why.** No GitHub-hosted
+  runner reliably has AVX-512: the `ubuntu-22.04` pool is uniformly AMD EPYC 7763 (Zen 3, no
+  AVX-512), and although `ubuntu-24.04` now sometimes draws a part that exposes `avx512bw`, it is
+  roughly one draw in six. For months that meant three byte-identity tests self-skipped everywhere
+  and CI stayed green about kernels that had never executed anywhere at all.
+
+  `.github/workflows/avx512-check.yml` fixes that with **Intel SDE**, pinned by URL and SHA-256. It
+  runs on every pull request touching `crates/bwa-neon/**`, weekly, and on dispatch. Two arms, and
+  the pair is the point: `-skx` is the ISA floor, because the runtime dispatch selects those kernels
+  on `avx512bw` alone and Skylake-X has it without VBMI or VNNI, so an instruction from a newer set
+  slipping into a BW-gated block fails there instead of in a user's alignment; `-spr` is the target
+  the kernels were tuned against. A third step reads SDE's dynamic instruction mix and fails if the
+  kernel never issued an EVEX-encoded instruction, so "the test passed" cannot mean "the fallback
+  passed".
+
+  What it cannot do is **price** anything: SDE is an interpreter about two orders of magnitude off
+  the hardware, with none of the port pressure the kernel tuning is about. Speed claims on AVX-512
+  need a real Intel draw (`bench-x86` with `require_avx512=true`), never this workflow.
+
+  On x86_64 Linux you can run the same thing locally with `scripts/avx512_sde.sh` (it pins the same
+  SDE build by SHA-256 and runs the same two chip arms). There is no macOS or aarch64 build of SDE,
+  so on those hosts the workflow is the only route.
+
+  Note also that the **58-case parity gate** can now run on that path: dispatch `parity.yml` with
+  `runner: ubuntu-24.04` and `require_avx512: true`, which forces `BWA4_RESCUE_TIER=avx512` and
+  `BWA4_EXTEND_TIER=avx512` so the gate cannot quietly re-test AVX2. It also runs weekly on that
+  pool and takes the 512-bit path whenever the draw allows. First green run: 64 cases, 0 failures.
 - A **release** is one act: push an annotated `vX.Y.Z` tag on `dev`. Everything else is automatic.
   `.github/workflows/release.yml` then, in this order: refuses to start unless the tag matches the
   workspace version, builds the four supported targets, proves each binary rebuilds the committed

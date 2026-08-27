@@ -32,9 +32,55 @@ extension and mate-rescue Smith-Waterman kernels are vectorised on x86_64 (AVX2,
 the CPU has it, selected at runtime), so the SIMD paths are covered on both architectures; but a
 head-to-head against bwa-mem2 on a full x86_64 WGS run has not yet been recorded, and the paired-end
 ratio in particular (mate rescue is roughly half of PE time) should not be assumed portable until it
-is. The `bench-x86` workflow records two directional x86 signals on GitHub-hosted runners: a
-same-runner scalar/AVX2/AVX-512 rescue-kernel A/B, and a single-chromosome bwa-mem4-vs-bwa-mem2 run;
-both are cloud-noisy and small-scale, not the headline ratio. Byte-identity to bwa-mem2 holds on every
+is. The `bench-x86` workflow records directional x86 signals on GitHub-hosted runners: a same-runner
+scalar/AVX2/AVX-512 rescue-kernel A/B, and a single-chromosome bwa-mem4-vs-bwa-mem2 run; both are
+cloud-noisy and small-scale, not the headline ratio.
+
+Two such draws, both with AVX-512, chr21, 1M simulated pairs, `-t8`, interleaved, every binary
+producing identical records:
+
+| host | bwa-mem2 | bwa-mem4 | with the archive's `x86-64-v3` | ratio |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C (Emerald Rapids) | 128.80 s | 93.17 s | 88.28 s | 1.38x |
+| AMD EPYC 9V74 (Zen 4) | 129.31 s | 76.10 s | 73.12 s | 1.70x |
+
+The ratio is a property of the host as much as of the code (bwa-mem2 takes the same time on both;
+we do not), which is why both rows are here rather than an average that would describe neither. What
+does hold across both: the AVX-512 rescue kernel is worth about 4-5% end to end over AVX2 (92.51 s
+against 97.14 on the Intel part, 76.29 against 79.35 on the AMD one), and the 512-bit kernels are
+1.20x the AVX2 ones on the kernel A/B. Directional and narrow: one chromosome of simulated reads on
+cloud runners, not the headline ratio.
+
+On real reads the picture on x86 is the other way round from simulated ones: on an AMD EPYC 9V74
+with `avx512bw`, a GIAB slice, three interleaved repetitions, the archive's `x86-64-v3` binary takes
+86.91 s against fg-labs/bwa-mem3's 99.41 s and bwa-mem2's 209.88 s, i.e. **1.15x the fork and 2.43x
+bwa-mem2**, with identical records from all three. On simulated reads the fork is ahead by 1.21x,
+measured five times on three microarchitectures (Emerald Rapids, Zen 4, Granite Rapids) and spread
+over one percent. Both belong in the same paragraph: which one describes your
+workload depends on your reads, not on the aligner.
+
+What the AVX-512 kernels contribute to that lead was measured directly, by timing the same binary
+with the kernels forced down to AVX2 in the same interleaved loop, and the answer **depends on the
+host, by an order of magnitude**:
+
+| host | real reads, 512-bit | forced AVX2 | tier is worth | vs the fork, with / without |
+|---|---|---|---|---|
+| AMD EPYC 9V74 (Zen 4) | 87.62 s | 88.23 s | 0.7% | 1.120x / 1.113x |
+| Intel Xeon 6973P-C (Granite Rapids) | 78.16 s | 83.47 s | 6.8% | 1.135x / 1.063x |
+
+On the AMD part the 512-bit kernels are nearly free to give up, on the Intel one they carry about
+half the lead over the fork (6.3 of its 13.5 points). Zen 4 executes a 512-bit operation as two
+256-bit halves, so what our kernels buy there is mostly encoding density, while Granite Rapids has
+the full-width datapath the kernels were written for; that is the explanation, and the two rows are
+the measurement. On simulated reads the tier pays on both (5.6% and 10.1%) and closes none of the
+fork's lead there. The first of these rows was published on its own for a day, as if "the lead is
+not the kernels" were a property of the code. It is not; it is a property of the silicon, and one
+draw could not tell the difference.
+
+The AVX-512 kernels are verified rather than merely compiled: Intel SDE runs their byte-identity
+tests on every pull request that touches the kernel crate, on an emulated Skylake-X (the ISA floor)
+and Sapphire Rapids, and the full 58-case parity gate has been run on a host that has `avx512bw`
+with the 512-bit dispatch forced (64 cases, 0 failures). Byte-identity to bwa-mem2 holds on every
 architecture regardless.
 
 On Apple Silicon the worker pool is capped at the Performance-core count, because the Efficiency

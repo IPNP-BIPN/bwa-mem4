@@ -4745,22 +4745,404 @@ Consequence pratique : les optimisations de colle scalaire ne se mesurent PAS su
 gains y sont ecrases par la taxe SMT. Le chiffre de tete wgsim x86 exige la machine dediee de #32,
 comme le disait deja la conclusion du PGO.
 
+### Les kernels AVX-512 ont enfin tourne, et c'est Intel SDE qui les a fait tourner (2026-08-26)
+
+Depuis leur ecriture, les trois tests d'octet-identite AVX-512 n'avaient **jamais** ete executes :
+23 dispatches, trois images de runner, zero `avx512bw` (EPYC 7763 en Zen 3, et un EPYC 9V74 en Zen 4
+dont l'hyperviseur masque le drapeau). QEMU 8.2 n'a toujours pas d'AVX-512 en TCG. Le dossier notait
+"Intel SDE est un telechargement sous licence", ce qui etait exact et n'etait pas un obstacle : c'est
+une archive publique sous Intel Simplified Software License, sans enregistrement, donc epinglable par
+URL et SHA-256 dans un workflow comme n'importe quelle dependance.
+
+Premier run reel (`avx512-check`, job `avx512-sde`, SDE 9.48.0, `-spr`, run 33009772433) :
+
+```
+running 3 tests
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 128.44s
+```
+
+Aucun `skipping avx512`, et **sans** `BWA4_TEST_FORCE_AVX512` : SDE presente CPUID et XCR0 assez
+fidelement pour que la detection de Rust choisisse elle-meme les kernels, la ou qemu-user emulait les
+instructions sans exposer les bits d'etat, laissant les tests s'esquiver en repondant `ok`.
+
+Le mix dynamique dit ce qu'aucune relecture de source ne peut dire :
+
+| compteur | executions |
+|---|---|
+| `*isa-ext-AVX512EVEX` | 66 972 292 |
+| `fwd_local_sw_avx512_u8` | 78,2 M instructions, 99,4 % du programme |
+| VPSHUFB | 3 043 264 |
+| VPXORD + VPXORQ | 3 052 957 |
+| VPMAXUB | 15 216 320 |
+| VMOVDQU8 | 6 112 080 |
+| VPCMPUB | 3 043 365 |
+
+Un `vpshufb` par xor, a l'unite pres : c'est exactement la table de scores XOR de la partie A de #44
+(LLVM a choisi les deux encodages pour le meme xor). Les 6,1 M de `vmovdqu8` sont le blend masque de
+la partie B "gratuite", que LLVM emet en `vmovdqu8 zmm{k}` plutot qu'en `vpblendmb`.
+
+**Le garde-fou, pas seulement la preuve.** Le job ne tourne plus seulement sur dispatch : toute pull
+request qui touche `crates/bwa-neon/**` le declenche, plus un passage hebdomadaire. Et il tourne sur
+deux modeles, parce qu'un modele n'est pas le jeu d'instructions : la selection au runtime ne teste
+que `avx512bw`, or Skylake-X a `avx512bw` sans VBMI ni VNNI. Le bras `-skx` est donc le plancher
+reel, SDE refusant toute instruction absente du modele choisi, et il passe : les kernels tiennent
+dans `avx512f` + `avx512bw`, ce que leurs `target_feature` promettent. Le bras `-spr` reste la cible
+de #44 et porte le mix.
+
+**Et le bras `-spr` a rapporte autre chose que ce qu'on lui demandait.** Son tirage `ubuntu-24.04`
+etait un **AMD EPYC 9V74 qui expose `avx512bw`, `avx512f` et `avx512vl`** dans `/proc/cpuinfo`. Les
+memes trois tests y ont pris **3,13 s** contre 128,56 s sur le bras `-skx` (un EPYC 7763), et cet
+ecart est exactement SDE laissant passer les instructions au materiel au lieu de les interpreter.
+
+Cela **corrige la conclusion du 2026-08-15** inscrite dans #44 : "l'hyperviseur masque le drapeau,
+donc aucun runner heberge ne peut le faire" n'est plus vrai sur `ubuntu-24.04`. Le pool y est
+melange (7763 sans, 9V74 avec), donc c'est bien un tirage, cette fois-ci au sens propre. La
+consequence pratique est que la moitie VITESSE de #44 redevient atteignable sans materiel emprunte,
+par re-tirage de `bench-x86` avec `require_avx512=true`, meme si un Zen 4 n'est pas le Golden Cove
+sur lequel le raisonnement de ports de l'issue est bati.
+
+**Ce que ca ferme :** la correctness de #44, et avec elle le risque permanent qu'un utilisateur Intel
+selectionne automatiquement, par la calibration de tier, du code qu'aucun test n'avait jamais
+execute. La question du tier opt-in posee au mainteneur tombe d'elle-meme.
+
+**Ce que ca ne ferme pas :** la vitesse, et pas d'un peu. SDE est un interpreteur a deux ordres de
+grandeur du materiel, sans aucune des pressions de port dont l'issue parle ; le +11 % a +40 % exige
+toujours un coeur Ice Lake ou Sapphire/Emerald Rapids, c'est-a-dire la machine dediee de #32.
+
+Piege paye au passage, note pour le prochain : le mix de SDE nomme les opcodes **sans etiquette de
+largeur** (`VPSHUFB`, pas `VPSHUFB_ZMM`), donc un gate qui cherche `zmm` echoue sur un run qui vient
+de prouver le contraire. La 512-bit-ness se lit dans `*isa-ext-AVX512EVEX`, pas dans le mnemonique,
+qu'AVX2 porte aussi.
+
+### #44 est fini : la partie A vaut +11,4 % mesures, la partie B ne vaut rien (2026-08-26)
+
+Les tirages `ubuntu-24.04` donnent maintenant de l'Intel. Le tirage 7 de la boucle de re-dispatch a
+sorti un **INTEL(R) XEON(R) PLATINUM 8573C**, c'est-a-dire un Emerald Rapids, coeur Golden Cove
+serveur : exactement la piece contre laquelle tout le raisonnement de ports de #44 a ete ecrit. La
+mesure ne se discute donc plus par procuration.
+
+**Partie A, la table de scores XOR : +11,4 %.** Meme runner, l'un apres l'autre, best of 5, 8192
+jobs, 614,4 M cellules (run 33013582129) :
+
+| ref | avx512_u8 | vs avx2 |
+|---|---|---|
+| base 89e019f, avant la partie A | 62,99 ms, 9,753 Gcell/s | 1,08x |
+| HEAD, partie A + le swap gratuit | 56,55 ms, 10,865 Gcell/s | 1,20x |
+
+La projection de l'issue etait +11 % a +15 % : atterrissage en bas de fourchette, comme le jumeau
+AVX2 (#43) qui avait fait +17 % contre +31 % projetes. Le bras AVX2 sert de temoin et n'a pas bouge
+(68,16 -> 67,60 ms, 0,8 %, du bruit), ce qui est attendu puisque sa table etait deja en place.
+
+**Partie B, l'arbitrage de ports : rien, et sur les deux vendeurs.** Elle a ete ecrite pour de vrai
+(kernel generique sur `LEAF_CMP_BLEND`, les douze maxes FEUILLES seulement, jamais ceux de la chaine
+`h0 -> e_mid -> mfe1 -> h1`, choix du spelling par calibration chronometree a la maniere de
+`extend_tier`, les deux spellings verifies octet-identiques sous SDE en `-skx` et `-spr`), puis
+mesuree :
+
+| hote | `vpmaxub` | `vpcmpub` + blend | rapport |
+|---|---|---|---|
+| Intel Xeon Platinum 8573C (Emerald Rapids) | 59,39 ms, 10,345 Gcell/s | 59,84 ms, 10,267 Gcell/s | **0,99x** |
+| AMD EPYC 9V74 (Zen 4) | 53,24 ms, 11,541 Gcell/s | 52,18 ms, 11,775 Gcell/s | 1,02x |
+
+Les deux sont dans la marge de 3 % de la calibration, donc elle a choisi `vpmaxub` sur toutes les
+machines ou elle a tourne, et il ne restait qu'un cout : quelques millisecondes de chronometrage par
+processus et une seconde instanciation d'un kernel de 400 lignes. Le code est revenu en arriere
+(commit e1f9fe7), l'impasse est ecrite avec ses chiffres dans
+`docs/kernel-ceiling-and-dead-ends.md`.
+
+**Pourquoi la LP se trompait**, parce que la meme tentation reviendra : une LP de ports facture des
+instructions contre des ports en supposant que les ports sont la contrainte qui lie. Ce corps porte
+aussi des charges, des stores et la dependance inter-lignes ; et la moitie GRATUITE de la partie B
+(reutiliser le masque de `col` pour `imax`, conservee) avait deja retire le travail p0 bon marche.
+Deplacer deux operations de plus hors d'un port qui n'est plus le plafond n'achete rien, et l'uop
+supplementaire annule le peu que ca achete.
+
+**La regle :** une LP de ports est une hypothese sur la contrainte qui lie, pas une mesure de cette
+contrainte. Avant d'implementer, amener le kernel sur la classe de machine decrite et verifier que
+le port nomme est bien le plafond.
+
+
+### La parite complete tourne enfin sur le chemin AVX-512, 64 cas sur 64 (2026-08-27)
+
+SDE prouve que chaque kernel AVX-512 egale la reference scalaire. Ce n'est pas la meme affirmation
+que "toute la chaine est octet-identique a bwa-mem2 pendant que ce sont les kernels 512 bits qui
+tournent". Cette seconde affirmation n'avait jamais ete testee : le gate des 58 cas ne tournait que
+sur `ubuntu-22.04`, pool uniformement AMD EPYC 7763, donc il n'a jamais compare que le chemin AVX2.
+
+`parity.yml` prend maintenant `runner` et `require_avx512` en entrees de dispatch, et quand on
+l'exige il **force** `BWA4_RESCUE_TIER=avx512` et `BWA4_EXTEND_TIER=avx512` : posseder la feature
+n'est pas s'en servir, la calibration reste libre de preferer un tier plus etroit, et un gate qui
+re-testerait AVX2 en silence serait pire que pas de gate. Un tier force absent de l'hote retombe sur
+scalaire, jamais silencieusement sur AVX2, donc soit les kernels 512 bits tournent, soit ca echoue
+visiblement.
+
+Resultat du tirage (run 33019473899, AMD EPYC 9V74, `simd: avx2 avx512bw avx512f avx512vl`) :
+
+```
+RESULT: 64 passed, 0 failed
+```
+
+Soit les 64 cas d'options, avec les deux dispatchs forces en AVX-512. C'est la premiere preuve
+d'octet-identite de bout en bout sur ce chemin, et elle complete SDE plutot qu'elle ne le remplace :
+SDE couvre les kernels a chaque PR sans dependre d'un tirage, le gate de parite couvre la chaine
+entiere quand un tirage le permet.
+
+
+### Le premier end-to-end x86 sur de l'Intel, et ce qu'il dit (2026-08-27)
+
+Toutes les mesures end-to-end x86 de ce projet etaient des mesures AMD EPYC 7763, parce que
+`ubuntu-22.04` est uniformement Zen 3. Le job end-to-end de `bench-x86` accepte desormais un
+`e2e_runner` et un `require_avx512_e2e`, et le tirage est tombe sur un **INTEL(R) XEON(R) PLATINUM
+8573C** (Emerald Rapids). GRCh38 chr21, 1 M paires simulees, `-t8`, entrelace, best of 2, toutes les
+sorties md5-identiques entre elles et a bwa-mem2 (`0feca445b3a990adaae368d4a38ed90b`) :
+
+| binaire | meilleur mur |
+|---|---|
+| bwa-mem2 | 128,80 s |
+| fork fg-labs/bwa-mem3 | 73,23 s |
+| bwa-mem4 baseline | 93,17 s |
+| bwa-mem4 `x86-64-v3` | 88,28 s |
+| bwa-mem4 `x86-64-v4` | 89,71 s |
+
+Trois lectures, dans l'ordre d'importance.
+
+**1. Contre bwa-mem2 : 1,38x** sur ce terrain. C'est un chr21 simule sur runner heberge, donc
+directionnel, mais c'est le premier chiffre Intel du projet.
+
+**2. Contre le fork, sur wgsim : 0,79x** (baseline) et **0,83x** (v3). Le binaire que les
+utilisateurs ont dans l'archive est le v3, donc le chiffre a citer est **1,21x en leur faveur**,
+c'est-a-dire le meme que les 1,19-1,21x de Zen 3 : l'ecart ne s'elargit pas sur Intel, il se
+reproduit. (La replication du 2026-08-27 sur un Zen 4 le redonne a 0,83x lui aussi, voir plus bas.)
+Rien de nouveau dans l'attribution, mais il faut citer les deux chiffres et dire lequel correspond au
+binaire livre : 1,21x contre le v3, 1,27x contre la baseline. Sur des reads reels l'ARM et le x86
+nous donnaient gagnants ; ce run-ci ne mesure pas le terrain reel, et c'est exactement la distinction
+que #32 existe pour trancher.
+
+**3. Le tier `x86-64-v4` ne vaut pas la peine d'etre livre : 0,984x contre notre `x86-64-v3`**,
+c'est-a-dire plus lent, sans recouvrement entre les deux repetitions. La raison est structurelle et
+merite d'etre retenue : les kernels AVX-512 sont deja selectionnes au RUNTIME, et le meme run le
+montre (sweep de tiers : `avx512` 92,51 s contre `avx2` 97,14 s, soit ~4,8 % de bout en bout, que le
+binaire baseline encaisse deja). Ce qu'un `-C target-cpu=x86-64-v4` ajoute par-dessus, c'est de la
+colle auto-vectorisee en 512 bits, et la c'est au mieux neutre. Le v3 gagne parce qu'il donne AVX2 a
+la colle sans ce cout. Impasse ecrite avec ses chiffres dans
+`docs/kernel-ceiling-and-dead-ends.md`.
+
+
+### Un profil x86 pris sur un hote AVX-512, et les reads reels reconfirmes (2026-08-27)
+
+`perf-x86` accepte desormais un `runner` et un `require_avx512`, et son job d'attribution est tombe
+sur un **AMD EPYC 9V74** exposant `avx512bw` : c'est le premier profil par etage de ce projet ou les
+kernels 512 bits sont ceux qui tournent. 1 M paires simulees, chr21, un batch en vol (les parts sont
+exactes dans ce mode) :
+
+| etage | mur | part |
+|---|---|---|
+| align | 45,444 s | 61,0 % |
+| rescue | 17,006 s | 22,8 % |
+| sam_emit | 10,941 s | 14,7 % |
+| tout le reste | ~0,7 s | 0,9 % |
+
+Occupation du pool : align 97,3 %, rescue 98,1 %, sam_emit 99,6 %, donc rien ne se perd en barriere.
+Le balayage de la fenetre de prefetch SA du meme run est **plat** sur cette machine (W=16 15,01 s,
+32 14,89, 64 14,90, 96 14,83, 128 14,91, soit 0,6 % d'ecart total) : le 128 regle sur M4 n'est ni
+mauvais ni ameliorable ici, et c'est la troisieme classe de machine ou ce reglage ne bouge rien.
+Le kernel de rescue tourne a **7,38 Gcell/s/thread** (plafond mesure sur M4 Max : ~16), la taxe de
+divergence de voies est 1,08x et le tri par longueur ne sauverait rien (0,0 %), ce qui reconfirme le
+verdict de #38 sur un troisieme type de machine.
+
+**Ne pas comparer cette table telle quelle a celle de Zen 3** (align 73,1 %, rescue 12,3 %, sam_emit
+10,7 %) : ce run-la avait deux fois plus de paires et cinq fois plus de batches, donc les parts ne
+sont pas prises sur le meme decoupage. Ce qui se lit ici, c'est la forme sur un hote 512 bits, pas un
+delta.
+
+**Les reads reels, eux, sont directement comparables et retombent au meme endroit.** Meme workflow,
+job `the gap on REAL reads`, tranche GIAB, trois repetitions :
+
+```
+rep 1: bwa-mem4 101.07s | bwa-mem3 102.00s | bwa-mem2 228.36s
+rep 2: bwa-mem4 101.01s | bwa-mem3 102.21s | bwa-mem2 224.85s
+rep 3: bwa-mem4 100.83s | bwa-mem3 104.16s | bwa-mem2 231.05s
+```
+
+**3/3 pour nous contre le fork** (1 a 3 %), et **2,2x contre bwa-mem2**. C'est la position que le
+ROADMAP tenait deja et elle ne bouge pas : sur des reads simules le fork passe devant, sur les
+donnees que les utilisateurs alignent, non.
+
+
+### La replication du end-to-end dit ce qui appartient au code et ce qui appartient a la machine (2026-08-27)
+
+Le second tirage n'est pas tombe sur la meme piece que le premier, et c'est ce qui le rend utile.
+Meme protocole, chr21, 1 M paires simulees, `-t8`, entrelace, toutes les sorties md5-identiques
+(`0feca445b3a990adaae368d4a38ed90b`) :
+
+| hote | bwa-mem2 | fork | nous | notre `x86-64-v3` | notre `x86-64-v4` |
+|---|---|---|---|---|---|
+| Intel Xeon Platinum 8573C (Emerald Rapids) | 128,80 s | 73,23 s | 93,17 s | 88,28 s | 89,71 s |
+| AMD EPYC 9V74 (Zen 4) | 129,31 s | 60,84 s | 76,10 s | 73,12 s | 74,83 s |
+
+Trois lectures, et la premiere est un avertissement sur la premiere version de ce paragraphe.
+
+**Le rapport contre bwa-mem2 n'est PAS une propriete de notre code : 1,38x sur l'Intel, 1,70x sur le
+Zen 4.** bwa-mem2 met le meme temps sur les deux (128,80 contre 129,31), c'est nous qui allons plus
+vite sur le Zen 4 (76,10 contre 93,17). Publier "1,38x" tout seul aurait sous-vendu la moitie des
+machines et decrit aucune des deux. Les deux lignes restent, avec leur CPU.
+
+**Le deficit contre le fork sur reads simules, lui, replique exactement : 0,83x sur les deux hotes**,
+soit 1,21x en leur faveur contre notre binaire v3, a deux chiffres significatifs pres, sur deux
+microarchitectures differentes. C'est donc bien une propriete de nos deux codes et pas un accident de
+tirage, et c'est la forme que doit prendre toute affirmation de ce genre ici.
+
+**Le refus de `x86-64-v4` replique aussi** : 0,984x sur l'Intel, 0,977x sur le Zen 4, contre notre
+`x86-64-v3` dans les deux cas. Deux tirages, deux vendeurs, meme reponse.
+
+Le gate de replication a ete corrige en consequence plutot que satisfait de force : il exige la
+replication de ce qui est annonce comme une propriete du code (le rapport au fork, le verdict v4) et
+n'exige la replication du rapport a bwa-mem2 que sur une meme piece.
+
+
+### Le head-to-head contre le fork, sur un hote AVX-512 : +15 % sur reads reels (2026-08-27)
+
+`head-to-head.yml` accepte maintenant un `runner` et un `require_avx512`, et le tirage est un **AMD
+EPYC 9V74** exposant `avx512bw`, donc ce sont nos kernels 512 bits qui tournent. Cinq binaires, un
+hote, entrelaces, trois repetitions par jeu, sorties identiques entre les trois binaires dans chaque
+jeu (`ed67c31d...` en simule, `dfd8b409...` en reel) :
+
+| jeu | notre baseline | notre v3 | v3+tight | fork | bwa-mem2 |
+|---|---|---|---|---|---|
+| simule (wgsim) | 153,52 s | 147,05 s | 146,24 s | 120,78 s | 260,74 s |
+| reel (GIAB) | 96,56 s | 86,91 s | 86,48 s | 99,41 s | 209,88 s |
+
+**Sur reads reels : 1,15x pour nous contre le fork, 3/3, et 2,43x contre bwa-mem2.** C'est la marge
+la plus large jamais mesuree contre le fork sur x86 (Zen 3 donnait 1 a 3 %). L'explication qui vient
+a l'esprit, "c'est parce que nos kernels tournent en 64 voies sur cet hote", a ete ecrite ici puis
+**mesuree** : elle est fausse sur cette piece-ci (les kernels 512 bits n'y valent que 0,7 %) et
+largement vraie sur une piece a 512 bits natifs (6,8 % sur un Granite Rapids). Voir les deux
+sections suivantes, dans l'ordre : l'hypothese, puis sa refutation par replication.
+
+**Sur reads simules : 0,83x, soit 1,21x pour eux**, ce qui est la TROISIEME mesure independante du
+meme chiffre aujourd'hui (Emerald Rapids 0,83x, Zen 4 en end-to-end 0,83x, Zen 4 en head-to-head
+0,826x), sur deux vendeurs. L'ecart wgsim est donc une constante de nos deux codes et non un
+artefact de plateforme, et il ne bougera pas par du packaging : le tier `x86-64-v4` a ete construit
+et il perd.
+
+La lecture d'ensemble ne change pas de forme, elle gagne en precision : **sur les donnees que les
+utilisateurs alignent, bwa-mem4 est devant ; sur des reads simules, le fork est devant, de 1,21x,
+partout.** (La version d'origine de cette phrase ajoutait "et l'ecart grandit avec la largeur du
+vecteur". C'etait une inference, deux fois mesuree depuis, et elle ne tient pas telle quelle : la
+largeur paie sur les pieces a 512 bits natifs et presque pas sur les pieces a double pompage.)
+
+
+### Notre avance sur reads reels ne vient PAS des kernels 512 bits (2026-08-27, REFUTE le jour meme, section suivante)
+
+L'hypothese ecrite la veille etait la bonne a tester et elle est fausse. `head-to-head.yml` a gagne
+un bras `avx2_arm` qui chronometre **le meme binaire** avec `BWA4_RESCUE_TIER=avx2` et
+`BWA4_EXTEND_TIER=avx2`, dans la meme boucle entrelacee, sur le meme hote et les memes reads : pas
+une recompilation, seule la dispatch change, donc l'ecart est les kernels et rien d'autre.
+
+Tirage : AMD EPYC 9V74 (`avx512bw`), trois repetitions par jeu.
+
+| jeu | nous, 512 bits | nous, tiers forces en avx2 | ce que valent les kernels | contre le fork, avec 512 | sans |
+|---|---|---|---|---|---|
+| reel (GIAB) | 87,62 s | 88,23 s | **0,7 %** | 1,120x | 1,113x |
+| simule (wgsim) | 147,56 s | 155,83 s | **5,6 %** | 0,835x | 0,791x |
+
+**Sur reads reels, l'avance survit entierement a la retrogradation** : 1,120x avec les kernels 512
+bits, 1,113x sans. Elle ne vient donc pas de la largeur du vecteur, mais de tout le reste, la bande
+resserree en tete. Ecrire "notre marge s'elargit quand le vecteur s'elargit" etait une inference,
+pas une mesure, et la mesure dit non.
+
+**Sur reads simules, les kernels valent huit fois plus (5,6 %)**, coherent avec le sweep de tiers du
+end-to-end (4,8 %) : c'est la que le rescue travaille. Et meme la, ils ne renversent rien, 0,835x
+contre 0,791x : le fork garde son avance wgsim avec ou sans nos 512 bits, ce qui elimine la largeur
+de vecteur comme explication de cet ecart aussi, et renvoie a leur colle.
+
+Deux conclusions pratiques. La premiere : **le tier AVX-512 est un gain modeste et localise**, pas un
+argument de vente ; il vaut 5 % la ou le rescue domine et rien ailleurs. La seconde, plus utile pour
+la suite : **ce qui nous fait gagner sur donnees reelles est scalaire et algorithmique**, donc c'est
+la, et pas dans un kernel plus large, que se trouve la marge restante.
+
+*(Ces deux conclusions sont fausses. Elles reposent sur un seul tirage, et le tirage de replication,
+lance dans la foulee, a mesure l'inverse. La section suivante est la correction.)*
+
+
+### La replication refute la section precedente : ce que valent les kernels depend de la MACHINE (2026-08-27)
+
+La regle de la maison a fini par s'appliquer a moi : une mesure sur un seul hote est une propriete de
+la piece de silicium tant qu'un deuxieme tirage n'a pas dit le contraire. Le seuil de la porte H11
+avait ete fixe **avant** que le second run ne tombe (le tier doit valoir moins de 2 % sur reads reels,
+plus de 3 % sur simules, et au moins deux fois plus sur simules que sur reels). La porte a echoue,
+et c'est le resultat.
+
+Le second tirage n'est pas tombe sur un Zen 4 mais sur un **Intel Xeon 6973P-C** (Granite Rapids),
+c'est-a-dire une piece avec un vrai chemin de donnees 512 bits. Meme protocole exactement : meme
+binaire, meme boucle entrelacee, trois repetitions, seule la dispatch change.
+
+| hote | reel : 512 bits / avx2 | ce que vaut le tier | simule : 512 bits / avx2 | ce que vaut le tier |
+|---|---|---|---|---|
+| AMD EPYC 9V74 (Zen 4) | 87,62 s / 88,23 s | **0,7 %** | 147,56 s / 155,83 s | **5,6 %** |
+| Intel Xeon 6973P-C (Granite Rapids) | 78,16 s / 83,47 s | **6,8 %** | 136,47 s / 150,32 s | **10,1 %** |
+
+**Un facteur dix sur la meme question.** L'explication tient a la microarchitecture et pas au code :
+Zen 4 execute une operation 512 bits en deux moities de 256 bits, donc y renoncer ne coute presque
+rien ; Granite Rapids a la largeur complete pour laquelle ces kernels ont ete ecrits.
+
+Consequence sur la phrase publiee la veille : sur la piece Intel, notre avance sur le fork passe de
+**1,135x a 1,063x** quand on retrograde les tiers. Les kernels y portent 6,3 des 13,5 points, soit
+a peu pres la moitie de l'avance. La phrase "notre avance sur reads reels ne vient pas des kernels"
+est donc vraie sur Zen 4 et fausse sur Intel, et elle avait ete ecrite sans qualificatif.
+
+Au passage, cette piece donne aussi le meilleur rapport contre bwa-mem2 mesure jusqu'ici dans ce
+protocole : **1,99x sur reads reels** (155,91 s contre 78,16 s) et **1,42x sur wgsim** (193,59 s
+contre 136,47 s), sortie identique des trois binaires.
+
+Ce qu'il faut retenir pour la chasse aux leviers, corrige : **la largeur de kernel n'est pas un
+levier epuise sur les pieces a 512 bits natifs**, elle l'est sur les pieces a double pompage. Et
+les deux affirmations doivent desormais nommer la machine, comme le ratio contre bwa-mem2 le fait
+deja depuis la replication du 2026-08-27 au matin.
+
+
 ## Ce qui reste
 
-1. **Le chiffre de tete WGS x86 (#32)** : exige une machine dediee. Un runner heberge ne peut ni
-   construire l'index GRCh38 (pic 92 GB) ni mesurer la colle scalaire (taxe SMT, voir l'enquete
-   ksw_global2). C'est aussi la ou l'ecart wgsim residuel contre le fork (1,19-1,21x) se mesurerait
-   honnetement.
-2. **Le kernel AVX-512 (#44)** : correctness bloquee sur du materiel Intel (la flotte ne donne que
-   de l'AMD, QEMU n'emule pas AVX-512, Intel SDE est un telechargement sous licence). Les tests ne
-   s'esquivent plus en silence et la question de rendre le tier opt-in tant qu'il n'a jamais tourne
-   reste posee au mainteneur.
-3. **L'ecart wgsim x86 residuel** : attribue (leurs builds par tier sur toute la colle, plus la taxe
-   SMT partagee), plus aucun mystere. Le fermer voudrait dire des artefacts multi-tiers au-dela du
-   binaire v3 deja livre, une decision de packaging plus que d'algorithme.
+1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
+   tirages Intel existent maintenant n'y change rien. Un runner heberge ne peut ni construire
+   l'index GRCh38 (pic 92 GB contre 16 GB de RAM) ni mesurer la colle scalaire (taxe SMT, voir
+   l'enquete ksw_global2), et il est detruit avant la fin d'un run 30x. Ce qui a change est plus
+   modeste et utile : le **micro-benchmark** x86 se mesure desormais sur du Golden Cove reel, ce
+   qui a suffi a trancher #44. C'est aussi la ou l'ecart wgsim residuel contre le fork (1,19-1,21x)
+   se mesurerait honnetement.
+2. **Le kernel AVX-512 (#44) : fini.** Correctness prouvee (SDE, `-skx` et `-spr`), partie A
+   mesuree a **+11,4 %** sur un Emerald Rapids, partie B implementee, mesuree a 0,99x sur cette
+   meme piece et **refusee**, code revenu en arriere et impasse documentee. Il ne reste rien
+   d'actionnable dans cette issue.
+3. **L'ecart wgsim x86 residuel : 1,21x contre notre `x86-64-v3`, cinq mesures sur trois
+   microarchitectures** (Emerald Rapids, Zen 4 et Granite Rapids, 2026-08-27), donc c'est une
+   propriete des deux codes et non un accident de tirage. Les cinq valeurs, recalculees depuis les
+   logs et non recopiees : 1,211 / 1,197 / 1,211 / 1,206 / 1,202. **Un pour cent d'etalement sur
+   trois pieces et deux protocoles** ; peu de chiffres de ce projet sont aussi stables, et c'est
+   precisement ce qui rend cet ecart interessant plutot qu'inquietant. L'explication "des artefacts multi-tiers au-dela du v3" est
+   **morte** : le tier suivant a ete construit et chronometre, et `x86-64-v4` perd contre le v3
+   (0,984x puis 0,977x). Ce qui reste comme piste est donc leur travail dans la colle elle-meme, pas
+   un choix de packaging de notre cote, et cela ne se mesure pas sur un runner heberge (taxe SMT,
+   voir l'enquete ksw_global2). Sur reads reels, la position est inverse et tient : 3/3 pour nous le
+   2026-08-27, 100,83-101,07 s contre 102,00-104,16 s.
 4. **La veine du travail duplique est epuisee**, et le fichier des impasses porte tout ce qui a ete
    essaye et refuse, avec les chiffres. Ne pas re-fouiller sans une donnee nouvelle.
 
 Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a bwa-mem2 :
-ARM wgsim 7/7 pour nous (-6 %), ARM reel 7/7, x86 reel 9/9 sur trois tirages, x86 wgsim 1,19-1,21x
-pour eux. Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux.
+
+| terrain | nous | eux | verdict |
+|---|---|---|---|
+| ARM wgsim, 7 reps | 33,18-33,60 s | 35,28-35,86 s | **nous, 7/7 (-6,0 %)** |
+| ARM reel, 7 reps | 12,02-12,28 s | 12,19-12,40 s | **nous, 7/7 (-1,4 %)** |
+| x86 Zen 3 reel, 3 tirages | 100,83-101,07 s | 102,00-104,16 s | **nous, 9/9** |
+| x86 Zen 4 (avx512) reel, 3 reps | 86,48-87,84 s | 99,41-104,41 s | **nous, 3/3 (1,15x)** |
+| x86 Granite Rapids reel, 3 reps | 78,16-81,19 s | 88,72-90,88 s | **nous, 3/3 (1,14x)** |
+| x86 wgsim, cinq tirages, trois pieces | | | eux, **1,206x** median, replique |
+
+Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux. D'ou vient
+cette marge depend de la machine, et les deux tirages du 2026-08-27 le disent sans ambiguite : sur
+Zen 4 les kernels 512 bits n'en portent que 0,7 % et le reste de la chaine fait le travail ; sur un
+Granite Rapids ils en portent 6,8 %, soit a peu pres la moitie de l'avance. Sur des reads simules, le
+fork garde 1,21x, partout, et cette constance est ce qui rend le chiffre credible plutot
+qu'inquietant. Le terrain qui manque reste le
+WGS reel a grande echelle sur machine dediee : #32.
