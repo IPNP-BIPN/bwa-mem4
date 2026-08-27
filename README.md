@@ -20,6 +20,7 @@ code tells you not to use them.
 | ALT contigs | byte-identical on the real GRCh38 analysis set, 261 ALT contigs |
 | Speed | SE **2.62x**, PE **1.85x** vs bwa-mem2 at `-t8` |
 | Output | SAM, BGZF-compressed SAM, BAM, CRAM |
+| Option surface | all three subcommands, and **every one of the 35 options `bwa-mem2 mem` accepts**; 64 of 64 per-option SAM parity cases pass |
 
 Measured on a real 32.9x human WGS (GIAB HG002, 2x150), not simulated reads and not a sampled
 subset. Both aligners read the same on-disk index. Reproduce with `scripts/giab30x_pe.sh`.

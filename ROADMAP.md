@@ -1535,7 +1535,7 @@ ont donne le meme AMD EPYC 7763, ce qui se lisait alors comme de la malchance. C
 | `ubuntu-24.04` | AMD EPYC 9V74 (Zen 4) | non |
 | `macos-15-intel` | Intel Core i7-8700B | non |
 | `macos-26-intel` | Intel Core i7-8700B | non |
-| `macos-13` | label retire, job jamais planifie | — |
+| `macos-13` | label retire, job jamais planifie | sans objet |
 
 Deux lectures a en tirer. Les runners Intel de macOS sont des Mac mini 2018 en Coffee Lake, une
 generation grand public qui n'a jamais porte AVX-512 : cette piste est fermee par construction, pas
@@ -1908,7 +1908,7 @@ Formes d'extension reelles (requetes 40-110 bases, cibles legerement plus longue
 | 65 536 | 3,49 | 22,1 | 6,3x |
 
 Meme courbe d'occupancy que le noyau de rescue, meme genou : le lot **est** le nombre de threads.
-L'empaquetage coute 0,3 ms sur 8, soit 4 % — la memoire unifiee tient toujours sa promesse.
+L'empaquetage coute 0,3 ms sur 8, soit 4 % : la memoire unifiee tient toujours sa promesse.
 
 **A la taille de lot que la production soumet deja, sans aucune file d'agregation, le GPU fait 2,5x
 un coeur.** En agregeant les quatre threads d'un chunk a `-t4` (4 x 10 800 = 43 000), il fait 6,4x.
@@ -5147,3 +5147,29 @@ Granite Rapids ils en portent 6,8 %, soit a peu pres la moitie de l'avance. Sur 
 fork garde 1,21x, partout, et cette constance est ce qui rend le chiffre credible plutot
 qu'inquietant. Le terrain qui manque reste le
 WGS reel a grande echelle sur machine dediee : #32.
+
+## Le port est fini (2026-08-27)
+
+Ce que "fini" veut dire ici, verifie contre le `bwa-mem2` installe sur la machine et non affirme :
+
+- **Surface complete.** Les trois sous-commandes (`index`, `mem`, `version`) existent, et sur les
+  35 options que `bwa-mem2 mem` accepte, **aucune ne manque**. bwa-mem4 en expose 42, les sept
+  supplementaires venant de bwa d'origine.
+- **Comportement identique.** La suite de parite par option passe **64 cas sur 64**, zero echec, en
+  comparant les octets SAM des deux aligneurs option par option. `tiny_index_is_byte_identical`
+  passe dans le meme `cargo test`.
+- **Rien d'inacheve dans le code.** Zero `todo!()`, zero `unimplemented!()` dans les dix crates. Il
+  restait un `TODO` qui n'etait pas une citation de bwa, sur `SwBackend::extend`, et il decrivait
+  mal ce qu'il commentait : la vectorisation est inter-sequence, donc l'entree mono-job est scalaire
+  par construction et sert de reference a laquelle le noyau est compare, job par job. C'est ce qui
+  rend l'identite octet a octet demontrable plutot que seulement testee.
+- **Le gate local passe sur la toolchain du jour.** Il ne passait plus depuis que Homebrew est
+  passe a Rust 1.98, dont clippy ajoute `chunks_exact_to_as_chunks`, et **aucune execution de CI ne
+  pouvait le dire** puisque toutes epinglent 1.96.1. Corrige, et un job hebdomadaire lint desormais
+  sur la stable du moment, jamais sur une pull request, pour que le prochain lint ajoute en amont
+  soit signale par une machine et non par le premier contributeur dont le compilateur a bouge.
+
+Ce qui reste ouvert est une **mesure, pas du code** : #32, le chiffre de tete WGS 30x contre
+bwa-mem2 sur une machine x86_64 dediee. Un runner heberge ne peut ni construire l'index GRCh38
+(pic 92 GB contre 16 GB de RAM) ni mesurer la colle scalaire sans la taxe SMT, et il est detruit
+avant la fin d'un run 30x. La condition de fermeture est chiffree dans l'issue.
