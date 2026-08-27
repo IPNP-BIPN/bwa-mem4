@@ -173,14 +173,17 @@ const BLOCK: usize = 16;
 pub fn push_seq_fwd(out: &mut Vec<u8>, codes: &[u8]) {
     out.reserve(codes.len());
     let mut block = [0u8; BLOCK];
-    let mut chunks = codes.chunks_exact(BLOCK);
-    for chunk in &mut chunks {
+    // `as_chunks` rather than `chunks_exact`: the chunk size is a constant, so this hands the
+    // compiler `&[u8; BLOCK]` instead of a `&[u8]` it has to re-prove the length of, and it is what
+    // clippy's `chunks_exact_to_as_chunks` asks for from 1.98 on. Same blocks, same remainder.
+    let (chunks, remainder) = codes.as_chunks::<BLOCK>();
+    for chunk in chunks {
         for (dst, &c) in block.iter_mut().zip(chunk) {
             *dst = FWD_TABLE[c as usize];
         }
         out.extend_from_slice(&block);
     }
-    for &c in chunks.remainder() {
+    for &c in remainder {
         out.push(FWD_TABLE[c as usize]);
     }
 }
