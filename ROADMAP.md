@@ -5114,9 +5114,12 @@ deja depuis la replication du 2026-08-27 au matin.
    mesuree a **+11,4 %** sur un Emerald Rapids, partie B implementee, mesuree a 0,99x sur cette
    meme piece et **refusee**, code revenu en arriere et impasse documentee. Il ne reste rien
    d'actionnable dans cette issue.
-3. **L'ecart wgsim x86 residuel : 1,21x contre notre `x86-64-v3`, replique sur deux
-   microarchitectures** (Emerald Rapids et Zen 4, 2026-08-27), donc c'est une propriete des deux
-   codes et non un accident de tirage. L'explication "des artefacts multi-tiers au-dela du v3" est
+3. **L'ecart wgsim x86 residuel : 1,21x contre notre `x86-64-v3`, cinq mesures sur trois
+   microarchitectures** (Emerald Rapids, Zen 4 et Granite Rapids, 2026-08-27), donc c'est une
+   propriete des deux codes et non un accident de tirage. Les cinq valeurs, recalculees depuis les
+   logs et non recopiees : 1,211 / 1,197 / 1,211 / 1,206 / 1,202. **Un pour cent d'etalement sur
+   trois pieces et deux protocoles** ; peu de chiffres de ce projet sont aussi stables, et c'est
+   precisement ce qui rend cet ecart interessant plutot qu'inquietant. L'explication "des artefacts multi-tiers au-dela du v3" est
    **morte** : le tier suivant a ete construit et chronometre, et `x86-64-v4` perd contre le v3
    (0,984x puis 0,977x). Ce qui reste comme piste est donc leur travail dans la colle elle-meme, pas
    un choix de packaging de notre cote, et cela ne se mesure pas sur un runner heberge (taxe SMT,
@@ -5134,7 +5137,7 @@ Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a 
 | x86 Zen 3 reel, 3 tirages | 100,83-101,07 s | 102,00-104,16 s | **nous, 9/9** |
 | x86 Zen 4 (avx512) reel, 3 reps | 86,48-87,84 s | 99,41-104,41 s | **nous, 3/3 (1,15x)** |
 | x86 Granite Rapids reel, 3 reps | 78,16-81,19 s | 88,72-90,88 s | **nous, 3/3 (1,14x)** |
-| x86 wgsim, trois tirages, deux vendeurs | | | eux, **1,21x**, replique |
+| x86 wgsim, cinq tirages, trois pieces | | | eux, **1,206x** median, replique |
 
 Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux. D'ou vient
 cette marge depend de la machine, et les deux tirages du 2026-08-27 le disent sans ambiguite : sur

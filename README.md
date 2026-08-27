@@ -55,7 +55,8 @@ On real reads the picture on x86 is the other way round from simulated ones: on 
 with `avx512bw`, a GIAB slice, three interleaved repetitions, the archive's `x86-64-v3` binary takes
 86.91 s against fg-labs/bwa-mem3's 99.41 s and bwa-mem2's 209.88 s, i.e. **1.15x the fork and 2.43x
 bwa-mem2**, with identical records from all three. On simulated reads the fork is ahead by 1.21x,
-measured three times on two vendors. Both belong in the same paragraph: which one describes your
+measured five times on three microarchitectures (Emerald Rapids, Zen 4, Granite Rapids) and spread
+over one percent. Both belong in the same paragraph: which one describes your
 workload depends on your reads, not on the aligner.
 
 What the AVX-512 kernels contribute to that lead was measured directly, by timing the same binary
