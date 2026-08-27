@@ -200,6 +200,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Log the host
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "nproc: $(nproc)"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -296,6 +303,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Log the host
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "nproc: $(nproc)"
+
       - name: Install Rust with the LLVM tools
         uses: dtolnay/rust-toolchain@master
         with:
@@ -380,6 +394,13 @@ jobs:
         shell: bash -el {0}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Log the host
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "nproc: $(nproc)"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -519,6 +540,13 @@ jobs:
         shell: bash -el {0}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Log the host
+        shell: bash
+        run: |
+          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "nproc: $(nproc)"
 
       - name: Install Rust with the LLVM tools
         uses: dtolnay/rust-toolchain@master
