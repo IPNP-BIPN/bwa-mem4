@@ -4943,6 +4943,9 @@ exactes dans ce mode) :
 | tout le reste | ~0,7 s | 0,9 % |
 
 Occupation du pool : align 97,3 %, rescue 98,1 %, sam_emit 99,6 %, donc rien ne se perd en barriere.
+Le balayage de la fenetre de prefetch SA du meme run est **plat** sur cette machine (W=16 15,01 s,
+32 14,89, 64 14,90, 96 14,83, 128 14,91, soit 0,6 % d'ecart total) : le 128 regle sur M4 n'est ni
+mauvais ni ameliorable ici, et c'est la troisieme classe de machine ou ce reglage ne bouge rien.
 Le kernel de rescue tourne a **7,38 Gcell/s/thread** (plafond mesure sur M4 Max : ~16), la taxe de
 divergence de voies est 1,08x et le tri par longueur ne sauverait rien (0,0 %), ce qui reconfirme le
 verdict de #38 sur un troisieme type de machine.
