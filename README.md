@@ -36,11 +36,20 @@ is. The `bench-x86` workflow records directional x86 signals on GitHub-hosted ru
 scalar/AVX2/AVX-512 rescue-kernel A/B, and a single-chromosome bwa-mem4-vs-bwa-mem2 run; both are
 cloud-noisy and small-scale, not the headline ratio.
 
-The first of those taken on Intel (Xeon Platinum 8573C, Emerald Rapids, chr21, 1M simulated pairs,
-`-t8`, interleaved): bwa-mem2 128.80 s against bwa-mem4 93.17 s, i.e. **1.38x**, with the archive's
-`x86-64-v3` binary at 88.28 s. On the same host the AVX-512 rescue kernel is worth about 4.8% end to
-end over AVX2 (92.51 s against 97.14 s), and the 512-bit kernels are 1.20x the AVX2 ones on the
-kernel A/B. Directional, and narrow: one runner draw, one chromosome, simulated reads. Not the headline ratio.
+Two such draws, both with AVX-512, chr21, 1M simulated pairs, `-t8`, interleaved, every binary
+producing identical records:
+
+| host | bwa-mem2 | bwa-mem4 | with the archive's `x86-64-v3` | ratio |
+|---|---|---|---|---|
+| Intel Xeon Platinum 8573C (Emerald Rapids) | 128.80 s | 93.17 s | 88.28 s | 1.38x |
+| AMD EPYC 9V74 (Zen 4) | 129.31 s | 76.10 s | 73.12 s | 1.70x |
+
+The ratio is a property of the host as much as of the code (bwa-mem2 takes the same time on both;
+we do not), which is why both rows are here rather than an average that would describe neither. What
+does hold across both: the AVX-512 rescue kernel is worth about 4-5% end to end over AVX2 (92.51 s
+against 97.14 on the Intel part, 76.29 against 79.35 on the AMD one), and the 512-bit kernels are
+1.20x the AVX2 ones on the kernel A/B. Directional and narrow: one chromosome of simulated reads on
+cloud runners, not the headline ratio.
 
 The AVX-512 kernels are verified rather than merely compiled: Intel SDE runs their byte-identity
 tests on every pull request that touches the kernel crate, on an emulated Skylake-X (the ISA floor)
