@@ -205,7 +205,11 @@ impl SwBackend for NeonBackend {
         zdrop: i32,
         h0: i32,
     ) -> ExtendResult {
-        // TODO(phase9a): NEON lane-parallel DP. Delegates to scalar until byte-identity is verified.
+        // Scalar BY DESIGN, and this is not the unfinished half of anything. The vectorisation here
+        // is INTER-sequence: one alignment per lane, many jobs at once. A single extension has
+        // nothing to put in the other lanes, so `extend` is the scalar reference implementation and
+        // `extend_batch` below is the kernel. That split is also what makes byte-identity provable
+        // rather than merely tested, since the two are compared against each other job for job.
         ksw_extend2(
             query, target, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, h0,
         )
@@ -259,12 +263,18 @@ impl SwBackend for NeonBackend {
 
 /// Whether the AVX-512 kernel tests should EXECUTE, as opposed to reporting `ok` without running.
 ///
-/// Normally this is just feature detection. The override exists because of a specific hole: those
-/// tests have never executed anywhere. Every GitHub runner draw this project has taken has been an
-/// AMD EPYC 7763 with no AVX-512, and under `qemu-x86_64 -cpu max`, which does emulate the
-/// instructions, Rust's `is_x86_feature_detected!` still answers false, because qemu-user does not
-/// present the XCR0 state bits the detection checks. So the kernels ran nowhere while three tests
-/// reported `ok`.
+/// Normally this is just feature detection. The override exists because of a hole that was real for
+/// months: these tests executed NOWHERE while reporting `ok`. Every GitHub runner draw was an AMD
+/// EPYC 7763 with no AVX-512, and under `qemu-x86_64 -cpu max`, which does emulate the instructions,
+/// Rust's `is_x86_feature_detected!` still answers false, because qemu-user does not present the
+/// XCR0 state bits the detection checks.
+///
+/// That hole is closed, and this flag is no longer how it is closed. Intel SDE runs these tests on
+/// every pull request that touches this crate (`.github/workflows/avx512-check.yml`, emulated
+/// Skylake-X and Sapphire Rapids), and SDE presents CPUID and XCR0 faithfully, so detection selects
+/// the kernels on its own and the override is not set there. Hosted `ubuntu-24.04` also draws real
+/// `avx512bw` parts now, perhaps one time in six. The flag stays for the case it was written for: a
+/// machine whose emulator or hypervisor executes the instructions without advertising them.
 ///
 /// `BWA4_TEST_FORCE_AVX512=1` says "the harness knows this machine can execute AVX-512, run them".
 /// It is test-only and deliberately dangerous: set on a CPU that genuinely lacks the instructions,
