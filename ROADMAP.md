@@ -4964,6 +4964,37 @@ ROADMAP tenait deja et elle ne bouge pas : sur des reads simules le fork passe d
 donnees que les utilisateurs alignent, non.
 
 
+### La replication du end-to-end dit ce qui appartient au code et ce qui appartient a la machine (2026-08-27)
+
+Le second tirage n'est pas tombe sur la meme piece que le premier, et c'est ce qui le rend utile.
+Meme protocole, chr21, 1 M paires simulees, `-t8`, entrelace, toutes les sorties md5-identiques
+(`0feca445b3a990adaae368d4a38ed90b`) :
+
+| hote | bwa-mem2 | fork | nous | notre `x86-64-v3` | notre `x86-64-v4` |
+|---|---|---|---|---|---|
+| Intel Xeon Platinum 8573C (Emerald Rapids) | 128,80 s | 73,23 s | 93,17 s | 88,28 s | 89,71 s |
+| AMD EPYC 9V74 (Zen 4) | 129,31 s | 60,84 s | 76,10 s | 73,12 s | 74,83 s |
+
+Trois lectures, et la premiere est un avertissement sur la premiere version de ce paragraphe.
+
+**Le rapport contre bwa-mem2 n'est PAS une propriete de notre code : 1,38x sur l'Intel, 1,70x sur le
+Zen 4.** bwa-mem2 met le meme temps sur les deux (128,80 contre 129,31), c'est nous qui allons plus
+vite sur le Zen 4 (76,10 contre 93,17). Publier "1,38x" tout seul aurait sous-vendu la moitie des
+machines et decrit aucune des deux. Les deux lignes restent, avec leur CPU.
+
+**Le deficit contre le fork sur reads simules, lui, replique exactement : 0,83x sur les deux hotes**,
+soit 1,21x en leur faveur contre notre binaire v3, a deux chiffres significatifs pres, sur deux
+microarchitectures differentes. C'est donc bien une propriete de nos deux codes et pas un accident de
+tirage, et c'est la forme que doit prendre toute affirmation de ce genre ici.
+
+**Le refus de `x86-64-v4` replique aussi** : 0,984x sur l'Intel, 0,977x sur le Zen 4, contre notre
+`x86-64-v3` dans les deux cas. Deux tirages, deux vendeurs, meme reponse.
+
+Le gate de replication a ete corrige en consequence plutot que satisfait de force : il exige la
+replication de ce qui est annonce comme une propriete du code (le rapport au fork, le verdict v4) et
+n'exige la replication du rapport a bwa-mem2 que sur une meme piece.
+
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
