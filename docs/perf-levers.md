@@ -1055,6 +1055,35 @@ their feature-detect early return, and that early return is now LOUD (it prints 
 fails on one). The AVX-512 tests are covered in CI instead, under Intel SDE, by
 `.github/workflows/avx512-check.yml`. Added to `scripts/check.sh`.
 
+## What the AVX-512 tier is actually worth, measured by turning it off (2026-08-27)
+
+The AVX-512 kernels were argued for by lane count and, once they finally executed, timed at the
+kernel level: 1.20x the AVX2 rescue kernel and 1.32x the AVX2 extension kernel on an Emerald Rapids.
+Both are real and neither answers the question a user asks, which is what the tier is worth to a RUN.
+
+Measured by forcing the same binary down a tier in the middle of an interleaved head-to-head
+(`head-to-head.yml`'s `avx2_arm`: only `BWA4_RESCUE_TIER` and `BWA4_EXTEND_TIER` change, no rebuild),
+on an AMD EPYC 9V74 with `avx512bw`, three repetitions per read set:
+
+| read set | with the 512-bit kernels | forced to AVX2 | the tier is worth |
+|---|---|---|---|
+| real (GIAB slice) | 87.62 s | 88.23 s | **0.7%** |
+| simulated (wgsim) | 147.56 s | 155.83 s | **5.6%** |
+
+The end-to-end tier sweep on a different host agrees on the simulated figure (92.51 s against
+97.14 s, 4.8%).
+
+**The lesson is the ratio between those two rows, not either number.** The kernels are worth eight
+times more on simulated reads than on real ones, because mate rescue is where they live and wgsim's
+uniform, mismatch-free-ish reads send far more work through it. Any claim of the form "the vector
+width is why we are fast" therefore has to name the read set, and on real data it is false: our lead
+over fg-labs/bwa-mem3 moves from 1.120x to 1.113x when the kernels are downgraded, i.e. it comes from
+the rest of the pipeline.
+
+Two consequences for lever-hunting. Kernel width is a spent lever on real data, so a wider kernel is
+not where the next percent lives. And the scalar and algorithmic parts of `align`, which the
+stage profile puts at 61% of the run with the kernels enabled, are where it does.
+
 ## Round 3: three structural ideas, all priced before building, all under the floor
 
 Following the literature review, three ideas that had never been measured here. Each was priced with
