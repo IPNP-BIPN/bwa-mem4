@@ -5008,9 +5008,14 @@ n'exige la replication du rapport a bwa-mem2 que sur une meme piece.
    mesuree a **+11,4 %** sur un Emerald Rapids, partie B implementee, mesuree a 0,99x sur cette
    meme piece et **refusee**, code revenu en arriere et impasse documentee. Il ne reste rien
    d'actionnable dans cette issue.
-3. **L'ecart wgsim x86 residuel** : attribue (leurs builds par tier sur toute la colle, plus la taxe
-   SMT partagee), plus aucun mystere. Le fermer voudrait dire des artefacts multi-tiers au-dela du
-   binaire v3 deja livre, une decision de packaging plus que d'algorithme.
+3. **L'ecart wgsim x86 residuel : 1,21x contre notre `x86-64-v3`, replique sur deux
+   microarchitectures** (Emerald Rapids et Zen 4, 2026-08-27), donc c'est une propriete des deux
+   codes et non un accident de tirage. L'explication "des artefacts multi-tiers au-dela du v3" est
+   **morte** : le tier suivant a ete construit et chronometre, et `x86-64-v4` perd contre le v3
+   (0,984x puis 0,977x). Ce qui reste comme piste est donc leur travail dans la colle elle-meme, pas
+   un choix de packaging de notre cote, et cela ne se mesure pas sur un runner heberge (taxe SMT,
+   voir l'enquete ksw_global2). Sur reads reels, la position est inverse et tient : 3/3 pour nous le
+   2026-08-27, 100,83-101,07 s contre 102,00-104,16 s.
 4. **La veine du travail duplique est epuisee**, et le fichier des impasses porte tout ce qui a ete
    essaye et refuse, avec les chiffres. Ne pas re-fouiller sans une donnee nouvelle.
 
