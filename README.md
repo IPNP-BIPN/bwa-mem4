@@ -51,12 +51,18 @@ against 97.14 on the Intel part, 76.29 against 79.35 on the AMD one), and the 51
 1.20x the AVX2 ones on the kernel A/B. Directional and narrow: one chromosome of simulated reads on
 cloud runners, not the headline ratio.
 
-On real reads the picture on x86 is the other way round from simulated ones, and the widest vector
-widens it: on an AMD EPYC 9V74 with `avx512bw`, a GIAB slice, three interleaved repetitions, the
-archive's `x86-64-v3` binary takes 86.91 s against fg-labs/bwa-mem3's 99.41 s and bwa-mem2's
-209.88 s, i.e. **1.15x the fork and 2.43x bwa-mem2**, with identical records from all three. On
-simulated reads the fork is ahead by 1.21x, measured three times on two vendors. Both belong in the
-same paragraph: which one describes your workload depends on your reads, not on the aligner.
+On real reads the picture on x86 is the other way round from simulated ones: on an AMD EPYC 9V74
+with `avx512bw`, a GIAB slice, three interleaved repetitions, the archive's `x86-64-v3` binary takes
+86.91 s against fg-labs/bwa-mem3's 99.41 s and bwa-mem2's 209.88 s, i.e. **1.15x the fork and 2.43x
+bwa-mem2**, with identical records from all three. On simulated reads the fork is ahead by 1.21x,
+measured three times on two vendors. Both belong in the same paragraph: which one describes your
+workload depends on your reads, not on the aligner.
+
+That real-read lead is **not** the AVX-512 kernels. Timing the same binary with the kernels forced
+down to AVX2, in the same interleaved loop on the same host, moves it from 1.120x to 1.113x: the
+512-bit kernels are worth 0.7% there. They are worth 5.6% on simulated reads, where mate rescue does
+the work, and they do not close that gap either (0.835x against 0.791x). So the vector width is a
+modest, localised gain, and what puts bwa-mem4 ahead on real data is the rest of the pipeline.
 
 The AVX-512 kernels are verified rather than merely compiled: Intel SDE runs their byte-identity
 tests on every pull request that touches the kernel crate, on an emulated Skylake-X (the ISA floor)
