@@ -1,6 +1,18 @@
-# Documentaire. On developpe avec le cargo/rustc Homebrew (1.96.1), premier sur le PATH, qui
-# n'interprete PAS ce fichier (ce n'est pas un toolchain rustup) et qui EST deja 1.96.1. Un CI
-# base rustup l'honore apres `rustup toolchain install 1.96.1`. Voir le plan (skew Homebrew vs rustup).
+# Documentaire, et il faut savoir lire ce que ce fichier ne fait PAS.
+#
+# On developpe avec le cargo/rustc de Homebrew, premier sur le PATH, qui n'est pas un toolchain
+# rustup et n'interprete donc pas ce fichier. Un CI base rustup l'honore apres
+# `rustup toolchain install 1.96.1`, et c'est le cas de .github/workflows/ci.yml.
+#
+# La version precedente de ce commentaire affirmait que le Homebrew "EST deja 1.96.1". C'etait vrai
+# a l'ecriture et ca a cesse de l'etre sans bruit : Homebrew est passe a 1.98, dont clippy ajoute
+# `chunks_exact_to_as_chunks`, et `./scripts/check.sh` s'est mis a echouer sur un arbre propre alors
+# que la CI restait verte, parce qu'elle epingle 1.96.1. Le pin ne peut pas voir devant lui.
+#
+# D'ou la regle : ce fichier dit quel compilateur la CI utilise, PAS quel compilateur vous avez.
+# `rustc --version` dit la seconde chose. Le job `lint-current-stable` de ci.yml lint sur la stable
+# du moment, chaque semaine, precisement pour que le prochain lint ajoute en amont soit signale par
+# une machine et non par le premier contributeur dont le Homebrew a bouge.
 [toolchain]
 channel = "1.96.1"
 components = ["clippy", "rustfmt"]

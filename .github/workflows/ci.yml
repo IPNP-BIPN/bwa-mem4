@@ -115,3 +115,49 @@ jobs:
       # runs the AVX2 rescue-kernel byte-identity gates, and the AVX-512 ones where the runner has it.
       - name: Test (release)
         run: cargo test --workspace --release
+
+  # WHY THIS EXISTS. Everything above pins 1.96.1, which is correct for a release gate: it is the
+  # MSRV, and a matrix that floats would make a red tick mean "someone upstream shipped a lint"
+  # rather than "this change is broken". The cost of that pin is a blind spot, and it was not
+  # hypothetical: Homebrew moved to Rust 1.98, whose clippy added `chunks_exact_to_as_chunks`, and
+  # `./scripts/check.sh` (the first command CLAUDE.md tells a contributor to run) began failing on
+  # a clean tree the day that toolchain landed on the maintainer's machine (2026-08-22), and no CI
+  # run could ever have said so, because none of them uses that compiler. The duration is not the
+  # point; the blindness is. The pin cannot see forward, so something has to look.
+  #
+  # It runs on the SCHEDULE and on demand, never on a pull request. A new Rust release must not be
+  # able to turn somebody else's unrelated PR red; a failure here is a message to the maintainers,
+  # not a blocked merge. That is also why it is not in the required-checks list on `dev`.
+  lint-current-stable:
+    name: "clippy on current stable (advisory, not required)"
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both architectures, because the `cfg(target_arch)` arms are different code: a lint that
+        # fires only inside the NEON blocks would be invisible on x86 and vice versa.
+        os: [ubuntu-22.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install current stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Which stable is this
+        run: |
+          rustc --version
+          cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Same three commands `scripts/check.sh` runs, in the same order, because reproducing that
+      # script's verdict is the entire point. If this job is red, that script is red on a
+      # contributor's machine.
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p bwa-mem4 --all-targets --features stage-alloc -- -D warnings
+      - run: cargo test --workspace
