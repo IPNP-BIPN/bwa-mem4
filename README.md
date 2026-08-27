@@ -51,6 +51,13 @@ against 97.14 on the Intel part, 76.29 against 79.35 on the AMD one), and the 51
 1.20x the AVX2 ones on the kernel A/B. Directional and narrow: one chromosome of simulated reads on
 cloud runners, not the headline ratio.
 
+On real reads the picture on x86 is the other way round from simulated ones, and the widest vector
+widens it: on an AMD EPYC 9V74 with `avx512bw`, a GIAB slice, three interleaved repetitions, the
+archive's `x86-64-v3` binary takes 86.91 s against fg-labs/bwa-mem3's 99.41 s and bwa-mem2's
+209.88 s, i.e. **1.15x the fork and 2.43x bwa-mem2**, with identical records from all three. On
+simulated reads the fork is ahead by 1.21x, measured three times on two vendors. Both belong in the
+same paragraph: which one describes your workload depends on your reads, not on the aligner.
+
 The AVX-512 kernels are verified rather than merely compiled: Intel SDE runs their byte-identity
 tests on every pull request that touches the kernel crate, on an emulated Skylake-X (the ISA floor)
 and Sapphire Rapids, and the full 58-case parity gate has been run on a host that has `avx512bw`
