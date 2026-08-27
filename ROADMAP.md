@@ -4909,12 +4909,14 @@ Trois lectures, dans l'ordre d'importance.
 **1. Contre bwa-mem2 : 1,38x** sur ce terrain. C'est un chr21 simule sur runner heberge, donc
 directionnel, mais c'est le premier chiffre Intel du projet.
 
-**2. Contre le fork, sur wgsim, l'ecart est reel et un peu plus large qu'en Zen 3 : 0,79x**
-(baseline) et **0,83x** (v3), la ou l'AMD donnait 1,19-1,21x en leur faveur. Rien de nouveau dans
-l'attribution (leurs builds par tier sur toute la colle, plus la taxe SMT partagee), mais il faut
-cesser de dire "environ 1,2x" : sur Intel, sur des reads simules, c'est 1,21x contre notre v3 et
-1,27x contre notre baseline. Sur des reads reels, l'ARM et le x86 nous donnaient gagnants ; ce run-ci
-ne mesure pas le terrain reel, et c'est exactement la distinction que #32 existe pour trancher.
+**2. Contre le fork, sur wgsim : 0,79x** (baseline) et **0,83x** (v3). Le binaire que les
+utilisateurs ont dans l'archive est le v3, donc le chiffre a citer est **1,21x en leur faveur**,
+c'est-a-dire le meme que les 1,19-1,21x de Zen 3 : l'ecart ne s'elargit pas sur Intel, il se
+reproduit. (La replication du 2026-08-27 sur un Zen 4 le redonne a 0,83x lui aussi, voir plus bas.)
+Rien de nouveau dans l'attribution, mais il faut citer les deux chiffres et dire lequel correspond au
+binaire livre : 1,21x contre le v3, 1,27x contre la baseline. Sur des reads reels l'ARM et le x86
+nous donnaient gagnants ; ce run-ci ne mesure pas le terrain reel, et c'est exactement la distinction
+que #32 existe pour trancher.
 
 **3. Le tier `x86-64-v4` ne vaut pas la peine d'etre livre : 0,984x contre notre `x86-64-v3`**,
 c'est-a-dire plus lent, sans recouvrement entre les deux repetitions. La raison est structurelle et
