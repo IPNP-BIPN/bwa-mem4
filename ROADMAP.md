@@ -4997,6 +4997,34 @@ replication de ce qui est annonce comme une propriete du code (le rapport au for
 n'exige la replication du rapport a bwa-mem2 que sur une meme piece.
 
 
+### Le head-to-head contre le fork, sur un hote AVX-512 : +15 % sur reads reels (2026-08-27)
+
+`head-to-head.yml` accepte maintenant un `runner` et un `require_avx512`, et le tirage est un **AMD
+EPYC 9V74** exposant `avx512bw`, donc ce sont nos kernels 512 bits qui tournent. Cinq binaires, un
+hote, entrelaces, trois repetitions par jeu, sorties identiques entre les trois binaires dans chaque
+jeu (`ed67c31d...` en simule, `dfd8b409...` en reel) :
+
+| jeu | notre baseline | notre v3 | v3+tight | fork | bwa-mem2 |
+|---|---|---|---|---|---|
+| simule (wgsim) | 153,52 s | 147,05 s | 146,24 s | 120,78 s | 260,74 s |
+| reel (GIAB) | 96,56 s | 86,91 s | 86,48 s | 99,41 s | 209,88 s |
+
+**Sur reads reels : 1,15x pour nous contre le fork, 3/3, et 2,43x contre bwa-mem2.** C'est la marge
+la plus large jamais mesuree contre le fork sur x86 (Zen 3 donnait 1 a 3 %), et elle est coherente
+avec ce que la journee a etabli par ailleurs : sur un hote 512 bits, le rescue et l'extension
+tournent en 64 voies chez nous, et le rescue est justement la ou le terrain reel depense son temps.
+
+**Sur reads simules : 0,83x, soit 1,21x pour eux**, ce qui est la TROISIEME mesure independante du
+meme chiffre aujourd'hui (Emerald Rapids 0,83x, Zen 4 en end-to-end 0,83x, Zen 4 en head-to-head
+0,826x), sur deux vendeurs. L'ecart wgsim est donc une constante de nos deux codes et non un
+artefact de plateforme, et il ne bougera pas par du packaging : le tier `x86-64-v4` a ete construit
+et il perd.
+
+La lecture d'ensemble ne change pas de forme, elle gagne en precision : **sur les donnees que les
+utilisateurs alignent, bwa-mem4 est devant, et l'ecart grandit avec la largeur du vecteur ; sur des
+reads simules, le fork est devant, de 1,21x, partout.**
+
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
@@ -5022,7 +5050,16 @@ n'exige la replication du rapport a bwa-mem2 que sur une meme piece.
    essaye et refuse, avec les chiffres. Ne pas re-fouiller sans une donnee nouvelle.
 
 Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a bwa-mem2 :
-ARM wgsim 7/7 pour nous (-6 %), ARM reel 7/7, x86 reel 9/9 sur trois tirages (Zen 3), x86 wgsim pour
-eux : 1,19-1,21x sur Zen 3 et 1,21x contre notre `x86-64-v3` sur Emerald Rapids (2026-08-27, chr21,
-1 M paires). Sur les donnees reelles, sur les deux architectures, bwa-mem4 reste le plus rapide des
-deux ; sur des reads simules, le fork l'est. Le terrain reel x86 a grande echelle est #32.
+
+| terrain | nous | eux | verdict |
+|---|---|---|---|
+| ARM wgsim, 7 reps | 33,18-33,60 s | 35,28-35,86 s | **nous, 7/7 (-6,0 %)** |
+| ARM reel, 7 reps | 12,02-12,28 s | 12,19-12,40 s | **nous, 7/7 (-1,4 %)** |
+| x86 Zen 3 reel, 3 tirages | 100,83-101,07 s | 102,00-104,16 s | **nous, 9/9** |
+| x86 Zen 4 (avx512) reel, 3 reps | 86,48-87,84 s | 99,41-104,41 s | **nous, 3/3 (1,15x)** |
+| x86 wgsim, trois tirages, deux vendeurs | | | eux, **1,21x**, replique |
+
+Sur les donnees que les utilisateurs alignent, bwa-mem4 est le plus rapide des deux, et sa marge
+s'elargit quand le vecteur s'elargit. Sur des reads simules, le fork garde 1,21x, partout, et cette
+constance est ce qui rend le chiffre credible plutot qu'inquietant. Le terrain qui manque reste le
+WGS reel a grande echelle sur machine dediee : #32.
