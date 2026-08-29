@@ -1427,13 +1427,29 @@ fn extract_group<R: Copy + Into<i32>>(
         // outside the exclusion window around `te`. The tracker is shared with the scalar
         // `ksw_local_fwd` precisely so the merge rule and the window cannot drift between them.
         let mut b = SuboptimalTracker::new();
-        if limit[l] >= 0 {
+        // `best_score` is the maximum of every row's maximum, so when it is below `minsc` no row can
+        // clear `minsc` either, the candidate list is necessarily empty, and `finish` returns
+        // `(-1, -1)` on its `self.b.is_empty()` arm. The whole walk is then provably pointless.
+        //
+        // It is not a rare case, it is the common one: `BWA4_SUBOPT_SHAPE` on 1M chr21 wgsim pairs
+        // counts 4,388,797 jobs pushing 1,694,171,812 rows, and 2,212,629 of those jobs, 50.4%,
+        // keep ZERO candidates. Half the rows pushed in a run are pushed only to be discarded one
+        // at a time, at about 2.9 ns each.
+        //
+        // Provable rather than measured: the test is on the same `minsc` the pushes use, and the
+        // skipped work has no effect other than filling `b`.
+        if limit[l] >= 0 && best_score >= minsc[l] {
             for i in 0..=limit[l] {
                 // Best H anywhere in target row `i` for this lane. Rows past `limit[l]` were never
                 // processed by this lane, so they are not offered as candidates.
                 b.push_row(i, rowmax[i as usize * lanes + l].into(), minsc[l]);
             }
         }
+        b.record_shape(if limit[l] >= 0 {
+            limit[l] as u64 + 1
+        } else {
+            0
+        });
         let (score2, te2) = b.finish(best_score, best_te, max_sc);
         out[group_idx * lanes + l] = (best_score, best_te, best_qe, score2, te2);
     }

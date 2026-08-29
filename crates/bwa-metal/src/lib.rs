@@ -351,7 +351,10 @@ mod backend {
                 .map(|(k, j)| {
                     let r = res[k];
                     let mut b = SuboptimalTracker::new();
-                    if r.limit >= 0 {
+                    // Same provable skip as the CPU backends: `r.score` is the maximum over rows, so
+                    // below `minsc` no row can be a candidate and `finish` returns `(-1, -1)`.
+                    // Half the jobs of a real run take this branch.
+                    if r.limit >= 0 && r.score >= j.minsc {
                         for i in 0..=r.limit {
                             // Column-major, matching the kernel: row `i` of job `k` is at
                             // `i * n_jobs + k`.

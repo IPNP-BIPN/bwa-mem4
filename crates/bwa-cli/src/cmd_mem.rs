@@ -2238,6 +2238,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_neon::batched::tight_ceil::dump();
         bwa_mem::emit_split::dump();
         bwa_mem::rescue_split::dump();
+        bwa_mem::subopt_shape::dump();
         bwa_mem::rescue_split::dump();
         bwa_mem::emit_split::dump();
         bwa_neon::batched::tight_ceil::dump();
