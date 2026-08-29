@@ -5110,7 +5110,11 @@ deja depuis la replication du 2026-08-27 au matin.
    l'enquete ksw_global2), et il est detruit avant la fin d'un run 30x. Ce qui a change est plus
    modeste et utile : le **micro-benchmark** x86 se mesure desormais sur du Golden Cove reel, ce
    qui a suffi a trancher #44. C'est aussi la ou l'ecart wgsim residuel contre le fork (1,19-1,21x)
-   se mesurerait honnetement.
+   se mesurerait honnetement. Ce qui manquait en plus de la machine, l'instrument, existe
+   desormais : `scripts/giab32_headline.sh` execute le protocole exact de l'issue (ordre alterne,
+   repetitions, PGO des deux cotes, identite md5 verifiee a chaque passe, nombre de threads porte
+   dans la ligne publiee) et **refuse de tourner** sur une machine qui ne remplit pas les conditions,
+   chaque derogation etant nommee dans le journal du run.
 2. **Le kernel AVX-512 (#44) : fini.** Correctness prouvee (SDE, `-skx` et `-spr`), partie A
    mesuree a **+11,4 %** sur un Emerald Rapids, partie B implementee, mesuree a 0,99x sur cette
    meme piece et **refusee**, code revenu en arriere et impasse documentee. Il ne reste rien
