@@ -926,7 +926,9 @@ pub fn cigar_string_which(cigar: &[u32], which: usize, is_alt: bool, softclip: b
 /// least one insertion AND one deletion, and therefore pays at least `o_ins + e_ins + o_del + e_del`
 /// below the all-match ceiling. The diagonal pays `X * (a + b)` for its `X` mismatches. While
 ///
-///     X * (a + b) < o_ins + e_ins + o_del + e_del
+/// ```text
+/// X * (a + b) < o_ins + e_ins + o_del + e_del
+/// ```
 ///
 /// the diagonal is the UNIQUE optimum, so its CIGAR (`<L>M`) is the one the DP's traceback would
 /// return. At bwa's defaults (a=1, b=4, o=6, e=1) that is `X <= 2`.
