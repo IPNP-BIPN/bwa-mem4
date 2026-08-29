@@ -24,7 +24,9 @@ const fn base_table(alpha: &[u8; 5]) -> [u8; 256] {
 }
 static FWD: [u8; 256] = base_table(b"ACGTN");
 
-/// The formulation that shipped before 1.98's lint.
+/// The formulation that shipped before 1.98's lint. The lint is allowed here on purpose: the whole
+/// point of this file is to time the form clippy rejects against the form it asks for.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn push_chunks_exact(out: &mut Vec<u8>, codes: &[u8]) {
     out.reserve(codes.len());
     let mut block = [0u8; BLOCK];

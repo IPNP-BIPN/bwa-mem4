@@ -144,5 +144,8 @@ fn main() {
     println!("u128 key:  {:.3}s", best[1]);
     println!("u64 pair:  {:.3}s", best[2]);
     println!("u128 is {:.3}x the cost of the tuple", best[1] / best[0]);
-    println!("u64 pair is {:.3}x the cost of the tuple", best[2] / best[0]);
+    println!(
+        "u64 pair is {:.3}x the cost of the tuple",
+        best[2] / best[0]
+    );
 }
