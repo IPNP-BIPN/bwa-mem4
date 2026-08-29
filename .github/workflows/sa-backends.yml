@@ -1,0 +1,86 @@
+name: suffix-array backends
+
+# WHY THIS EXISTS. The milestone "SA-IS parallele" asks for one thing this repository could not
+# answer from a laptop: the same comparison on x86_64. Every suffix-array timing here was taken on
+# Apple Silicon, where the serial path benefits from a prefetch tuning that does not apply on x86,
+# so a decision about the DEFAULT backend taken on arm64 numbers alone would be a decision about the
+# wrong machine.
+#
+# It runs the `libsais_parity` example, which builds the same synthetic 2L-space text with every
+# backend compiled in, asserts all of them produce the SAME suffix array (a suffix array is unique,
+# so anything else is a bug), and prints the timings. Dispatch-only: it answers a question that is
+# asked at decision time, not on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      bases:
+        description: "Text length in bases (100000000 is the number the arm64 table uses)"
+        default: "100000000"
+        required: false
+      threads:
+        description: "BWA4_SA_THREADS for the parallel arms (empty = nproc, which is what the aligner itself would pick)"
+        default: ""
+        required: false
+      runner:
+        description: "Runner image (ubuntu-22.04 | ubuntu-24.04)"
+        default: "ubuntu-22.04"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same reason as everywhere else in this repository: `-C target-cpu=native` from .cargo/config.toml
+  # can name a CPU whose features the hypervisor masks off.
+  RUSTFLAGS: ""
+
+jobs:
+  compare:
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: What machine is this
+        run: |
+          awk -F': ' '/^model name/{print "cpu: "$2; exit}' /proc/cpuinfo
+          echo "cores: $(nproc)"
+          awk '/^MemTotal:/{printf "ram: %d GiB\n", $2/1048576}' /proc/meminfo
+
+      # libomp is what the C backend's threaded arm needs. On Linux with gcc it is a package, not the
+      # ordeal it is on macOS.
+      - name: Install OpenMP
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libomp-dev
+
+      - name: Build the comparison with every backend compiled in
+        run: |
+          cargo build --release -p bwa-mem4-index --no-default-features \
+            --features libsais-omp,libsais-c-omp --example libsais_parity
+
+      - name: Compare
+        env:
+          BASES: ${{ github.event.inputs.bases || '100000000' }}
+          THREADS_IN: ${{ github.event.inputs.threads }}
+        run: |
+          set -o pipefail
+          # Default to the core count, NOT to a fixed 8. The first run of this workflow asked for 8
+          # threads on a four-core runner, which measured oversubscription rather than parallelism:
+          # the Rust translation came out at 0.67x, i.e. slower than its own serial arm. That is a
+          # real property worth knowing, but it is not the number the milestone is asking for, and
+          # `sa_threads()` in the indexer would never have picked 8 there either (it caps at rayon's
+          # pool, which is the core count).
+          export BWA4_SA_THREADS="${THREADS_IN:-$(nproc)}"
+          echo "threads: $BWA4_SA_THREADS (cores: $(nproc))"
+          # Three repetitions: the parallel gain being measured is small enough on one of the
+          # backends that a single run cannot tell it from noise.
+          for i in 1 2 3; do
+            echo "--- repetition $i ---"
+            ./target/release/examples/libsais_parity "$BASES"
+          done

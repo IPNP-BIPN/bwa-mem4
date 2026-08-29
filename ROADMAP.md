@@ -26,7 +26,7 @@ rapprochees.
 | 9b | `phase9b-gpu` | backend Metal du SW | **abandonnee**, backend retire (voir plus bas) |
 | 9c-9e | | recurrence bandedSWA, prefetch de seeding, vague perf | fait |
 | 10 | | ALT contigs, BAM/CRAM, CI, packaging, release 4.0.0 | fait |
-| 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | a faire, jalon v4.3.4 |
+| 11 | | gate GIAB `hap.py`/`vcfeval` (concordance variants) | **fait** (2026-08-18), workflow `giab-gate` sur reads HG002 reels, les deux bras a 0,9899 de precision et 0,9900 de sensibilite |
 
 ## Releases
 
@@ -46,8 +46,8 @@ rapprochees.
 | Jalon | Contenu | Etat |
 |---|---|---|
 | v4.3.3 | parite perf x86_64 (issues #20, #25, #27, #32, #33) | **4 issues sur 5 fermees ; seule #32 reste, bloquee sur du materiel dedie** |
-| v4.3.4 | phase 11, gate GIAB `hap.py`/`vcfeval` ; suivi upstream `bwa-mem2#297` | ouvert |
-| v4.3.5 | SA-IS parallele (l'indexeur reste mono-thread sur le tableau de suffixes), structure de dedup incrementale | ouvert |
+| v4.3.4 | phase 11, gate GIAB `hap.py`/`vcfeval` ; suivi upstream `bwa-mem2#297` | **les 3 issues sont fermees et le livrable est enregistre** (tableau precision/rappel plus bas) |
+| v4.3.5 | SA-IS parallele (l'indexeur reste mono-thread sur le tableau de suffixes), structure de dedup incrementale | **les 3 issues sont fermees ; le reste nomme par la description est traite** (voir plus bas : la premisse 0.2.3 est fausse, l'octet-identite est prouvee avec le backend parallele, et la mesure garde le defaut `libsais-c`) |
 
 Les trois jalons ont recule d'un cran : 4.3.2 portait le nom du jalon perf x86_64 et a ete publiee
 avant lui, pour la cible bibliotheque. **Les milestones GitHub Projects portent encore les anciens
@@ -5101,6 +5101,41 @@ levier epuise sur les pieces a 512 bits natifs**, elle l'est sur les pieces a do
 les deux affirmations doivent desormais nommer la machine, comme le ratio contre bwa-mem2 le fait
 deja depuis la replication du 2026-08-27 au matin.
 
+
+## Le jalon SA-IS parallele : une premisse fausse, et un gain qui change de signe selon la machine (2026-08-29)
+
+La description du jalon disait que la parallelisation amont etait « faite et mergee dans
+libsais-rs 0.2.3 ». **crates.io ne publie pas de 0.2.3** (0.1.0, 0.1.1, 0.2.0, 0.2.2). Rien
+n'attendait une release : la capacite est dans la 0.2.2, deja epinglee dans `Cargo.lock`.
+
+Le point d'entree evident est un piege. `libsais64_upstream_c_omp` prend un nombre de threads en
+argument, mais il vit derriere la feature `upstream-c` de la crate, qui tire `cc` et **recompile le
+C d'amont**, c'est-a-dire exactement ce que le backend pur Rust existe pour eviter. La voie pure
+Rust passe par un contexte : `create_ctx_main(threads)` alloue l'etat par thread, `libsais64_main_ctx`
+repartit sur `ctx.threads`. D'ou `--features libsais-omp`.
+
+L'octet-identite, que le jalon designait comme la partie que l'amont ne peut pas prouver a notre
+place : les cinq fichiers d'index de la fixture restent identiques a la sortie de `bwa-mem2 index`
+avec le backend parallele, a 1 thread comme a 8, et l'exemple compare les deux tableaux de suffixes
+element par element avant d'imprimer le moindre chronometre.
+
+La mesure, tous backends dans un seul processus, un texte de 100 M bases, threads = coeurs, trois
+repetitions :
+
+| machine | SA-IS interne | libsais-rs serie | libsais-rs threads | libsais C serie | libsais C threads |
+|---|---|---|---|---|---|
+| Apple M4, 8 threads | 6,151 s | 2,552 s | 2,206 s (**1,17x**) | 1,470 s | 0,756 s (1,95x) |
+| Intel Xeon 8573C, 4 threads | 14,6 s | 5,472 s | 7,895 s (**0,69x**) | 4,881 s | 3,175 s (1,54x) |
+
+**Le defaut ne bouge pas** : le C en SERIE bat la traduction Rust en PARALLELE sur les deux machines
+(1,470 contre 2,206 ; 4,881 contre 7,895). Aucun threading de la traduction n'atteint le point de
+depart du C.
+
+**Et le threading de la traduction est negatif sur x86_64.** 0,69x, trois fois sur trois. Ce n'est
+pas de la sursouscription : le premier tirage demandait 8 threads sur un runner a 4 coeurs et
+rendait 0,67x, ce qui invitait exactement cette explication, mais a threads = coeurs le chiffre est
+0,69x. La feature reste, parce qu'elle est desactivee par defaut et que le gain arm64 est reel, et
+elle est documentee a sa definition comme un levier aarch64 et non portable.
 
 ## Ce qui reste
 
