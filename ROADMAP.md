@@ -5158,6 +5158,55 @@ noyau sans y toucher plafonne le bras a 2x, quoi qu'il arrive au GPU.
 
 Aucun de ces deux constats ne demande d'ecrire une ligne de MSL.
 
+### Ce qui borne vraiment le noyau GPU, mesure avec les deux noyaux (2026-08-29)
+
+Le fichier disait que le trafic memoire des rails etait « exactement la ressource qui lie ». C'est
+vrai pour le noyau 32 bits et faux pour le u8, et la difference decide de ce qu'il faut faire
+ensuite.
+
+`BWA4_METAL_FORCE32` envoie tous les travaux sur le noyau 32 bits. Les deux noyaux ont **le meme flot
+de controle et le meme nombre d'acces memoire par cellule** (3 lectures, 2 ecritures) ; ils ne
+different que par la largeur de l'element, 5 octets par cellule contre 20. Les comparer a occupancy
+egale isole donc la bande passante du debit d'instructions. Sur 524 288 travaux :
+
+| noyau | debit | octets/cellule | bande passante atteinte | ops memoire/s |
+|---|---|---|---|---|
+| u8 | 50,31 Gcell/s | 5 | 252 Go/s (**46 %**) | **252 G** |
+| 32 bits | 26,47 Gcell/s | 20 | **529 Go/s (97 %)** | 132 G |
+
+Si le debit d'emission d'instructions etait la seule limite, les deux rendraient le meme Gcell/s,
+puisqu'ils emettent le meme nombre d'acces par cellule. Ils ne le font pas : le 32 bits est **rattrape
+par la bande passante** (529 sur 546 Go/s, la machine est saturee), et le u8, deux fois plus rapide,
+n'est qu'a 46 % de cette bande passante. Le u8 est donc assis sur l'**autre** plafond, celui du
+**debit d'emission d'acces memoire, ~252 G ops/s**.
+
+Verifie par l'occupancy : le u8 monte de 14,04 (8 192 travaux) a 47,9 (524 288) puis **50,31**
+(1 048 576) et ne monte plus. Ce n'est ni la latence ni le nombre de threads.
+
+### Ce que cela dit de la suite, et cela reouvre le `uchar4` pour une autre raison que la premiere
+
+Pour depasser 50 Gcell/s il faut emettre **moins d'acces par cellule**, pas deplacer moins d'octets.
+Un `uchar4` ne reduit pas les octets, il fait servir **un acces pour quatre travaux**, donc il divise
+les ops par 4. La borne suivante est alors la bande passante :
+
+| paquetage | ops/4 vise | borne bande passante | resultat attendu |
+|---|---|---|---|
+| `uchar2` | 101 Gcell/s | 109 | **~101** |
+| `uchar4` | 201 Gcell/s | 109 | **~109** |
+
+Donc **~2,2x pour le `uchar4`, et non 4x**, parce que la bande passante le rattrape a 109 Gcell/s.
+Au-dela il faudrait aussi reduire les octets, c'est-a-dire bloquer plusieurs LIGNES par thread pour
+garder H et E en registres entre elles, ce que le CPU fait deja sous `BWA4_RESCUE_ROWQUAD`. Le
+ROADMAP avait ecarte ROWQUAD sur GPU au motif que « le parallelisme vient du nombre de threads » :
+c'est vrai et hors sujet, son interet ici est le trafic, pas le parallelisme.
+
+**Et cela explique pourquoi la premiere tentative `uchar4` n'a rien montre.** Elle a ete mesuree a la
+taille de lot de production, 8 192 travaux, ou le noyau rend 14 Gcell/s parce qu'il est sous-alimente.
+Dans ce regime le noyau n'est ni borne par les ops ni par la bande passante, et diviser les ops par
+quatre ne pouvait rien changer. Le levier etait bon, le regime de mesure ne l'etait pas. C'est la
+troisieme fois cette semaine qu'un resultat nul se revele etre un defaut de protocole plutot qu'un
+verdict.
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les

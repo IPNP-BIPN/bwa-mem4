@@ -205,8 +205,15 @@ mod backend {
             // most `min(qlen, tlen)` bases and only loses score from there, so `min(len) * max_sc`
             // bounds every H/E/F cell. Under `U8_SCORE_LIMIT` the u8 rails are exact; at or above it
             // they would saturate, so those jobs take the 32-bit kernel.
+            //
+            // `BWA4_METAL_FORCE32=1` sends every job down the 32-bit kernel instead. It exists for
+            // one experiment and is not a tuning knob: the two kernels differ only in rail element
+            // width, 5 bytes per cell against 20, so comparing them at the SAME occupancy is what
+            // decides whether this kernel is bound by memory traffic or by anything else. Forcing it
+            // cannot change a result, only saturate later, and the byte-identity gates run both.
+            let force32 = std::env::var_os("BWA4_METAL_FORCE32").is_some();
             let fits_u8 = |j: &RescueJob| {
-                (j.query.len().min(j.target.len()) as i32) * max_sc < U8_SCORE_LIMIT
+                !force32 && (j.query.len().min(j.target.len()) as i32) * max_sc < U8_SCORE_LIMIT
             };
 
             // One flat sequence buffer, written straight into shared memory: the CPU fills the
