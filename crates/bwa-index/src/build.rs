@@ -191,6 +191,11 @@ fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
     // `create_ctx_main` is `#[doc(hidden)] pub`: reachable, and not part of the crate's promised
     // surface. If a future version removes it, this arm fails to COMPILE rather than silently
     // dropping back to one thread, which is the failure mode worth having.
+    //
+    // AND IT IS NOT A PORTABLE WIN. On a 100 M-base text with threads = cores, three repetitions:
+    // 1.17x on an Apple M4, and 0.69x on an Intel Xeon 8573C, where the threaded arm is 45% slower
+    // than its own serial path. See the feature's comment in Cargo.toml for the table. This arm is
+    // opt-in for that reason.
     #[cfg(feature = "libsais-omp")]
     let ret = {
         let threads = sa_threads();

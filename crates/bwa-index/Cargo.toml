@@ -73,6 +73,19 @@ libsais-c-omp = ["libsais-c", "libsais/openmp"]
 # is what this feature is for: `libsais-c-omp` above is faster, but it needs a C compiler and an
 # OpenMP runtime, which is precisely what the pure-Rust backend exists to avoid. Before this, the
 # escape hatch for a C-free build was also the single-threaded one.
+#
+# ENABLE IT ON aarch64 ONLY. Measured on a 100 M-base text, threads = cores, three repetitions, all
+# backends in one process:
+#
+#   | machine                     | rust serial | rust threaded | verdict |
+#   |-----------------------------|-------------|---------------|---------|
+#   | Apple M4, 8 threads         | 2.563 s     | 2.193 s       | 1.17x   |
+#   | Intel Xeon 8573C, 4 threads | 5.472 s     | 7.895 s       | 0.69x   |
+#
+# On x86_64 the threaded arm is 45% SLOWER than its own serial path, three times out of three, and
+# that is with threads equal to cores rather than oversubscribed. The translation's parallel
+# sections lose to their coordination there. The feature stays because the arm64 gain is real and
+# because it is off by default; it is not a portable win and must not be enabled blindly.
 libsais-omp = ["libsais"]
 # Experimental CaPS-SA backend (spike). Not in `default`. In-memory build ~ libsais-class speed, plus a
 # bounded-RAM external-memory build that libsais/SA-IS cannot do. Byte-identical (a SA is unique).

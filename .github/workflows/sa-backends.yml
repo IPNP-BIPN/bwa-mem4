@@ -11,12 +11,6 @@ name: suffix-array backends
 # so anything else is a bug), and prints the timings. Dispatch-only: it answers a question that is
 # asked at decision time, not on every push.
 on:
-  # TEMPORARY, and removed before this branch merges. `workflow_dispatch` only works once the file
-  # is on the default branch, so the x86_64 number the milestone asks for cannot be obtained from a
-  # feature branch any other way. A push trigger does run from the branch it is pushed to.
-  push:
-    branches:
-      - feat/libsais-rs-parallel
   workflow_dispatch:
     inputs:
       bases:

@@ -220,3 +220,35 @@ KNOWN region score, and it is already `0` for every one- and two-mismatch record
 where the shortcut's premise fails. Reverted, since it costs a diagonal scan per call to catch
 nothing; the general lesson is that a bound derived from the known score was already in the C, and
 checking what `infer_bw` leaves behind should precede any scheme that re-derives it.
+
+## The pure-Rust libsais threading is an arm64 lever and an x86_64 regression (2026-08-29)
+
+`--features libsais-omp` makes the pure-Rust suffix-array backend build on several threads with no C
+toolchain, which is the one thing the C backend cannot offer. The obvious expectation is a small win
+everywhere, since a suffix array is unique and the only thing changing is how many threads compute
+it. That expectation is wrong on half the machines tested.
+
+Measured with every backend in one process, on one synthetic 2L-space text of 100 M bases, threads
+equal to cores, three repetitions:
+
+| machine | SA-IS in-tree | libsais-rs serial | libsais-rs threaded | libsais C serial | libsais C threaded |
+|---|---|---|---|---|---|
+| Apple M4, 8 threads | 6.151 s | 2.552 s | 2.206 s (**1.17x**) | 1.470 s | 0.756 s (1.95x) |
+| Intel Xeon 8573C, 4 threads | 14.6 s | 5.472 s | 7.895 s (**0.69x**) | 4.881 s | 3.175 s (1.54x) |
+
+Two separate findings, and the second is the one worth recording.
+
+**The default does not move.** The C's SERIAL time beats the Rust translation's THREADED time on
+both machines (1.470 against 2.206, and 4.881 against 7.895). No amount of threading in the
+translation reaches the C's starting point, so `libsais-c` stays the default and the question the
+milestone asked is answered by measurement rather than preference.
+
+**The translation's threading is negative on x86_64.** 0.69x, three times out of three, and not
+because of oversubscription: the first run did ask for eight threads on a four-core runner and
+returned 0.67x, which invited exactly that explanation, but re-running with threads equal to cores
+returned 0.69x. The translation's parallel sections lose to their own coordination on that part.
+The feature is kept because it is off by default and because the arm64 gain is real, but it is
+documented at its definition as an aarch64 lever, not a portable one.
+
+The general shape is the one this file keeps recording: a change that is obviously beneficial in
+principle, measured on two machines, is beneficial on one of them.
