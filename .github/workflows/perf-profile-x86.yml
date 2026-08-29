@@ -1,0 +1,146 @@
+name: perf profile (x86)
+
+# WHY THIS EXISTS. On simulated reads fg-labs/bwa-mem3 is ahead of us by 1.206x on x86, replicated
+# five times over three microarchitectures, while on the SAME code and the same read set we are 6%
+# ahead of them on arm64. A gap that changes sign with the platform is not algorithmic, and every
+# explanation offered so far has been inferred from stage timers rather than read off a profile.
+#
+# Nothing in this repository produces a symbol-level profile on x86. `perf-x86.yml` reports our own
+# stage shares; the fork reports its own stage shares in its own units; the two cannot be subtracted.
+# So this job records BOTH binaries under `perf` on ONE host with ONE read set and prints the top
+# symbols of each, which turns "their scalar glue is faster" into a ranked list of functions.
+#
+# Dispatch-only. It answers a question asked at investigation time.
+on:
+  # TEMPORARY, removed before merge: `workflow_dispatch` cannot reach a workflow that is not yet on
+  # the default branch, and this profile is the whole point of the branch.
+  push:
+    branches:
+      - perf/rescue-apply-dedup
+  workflow_dispatch:
+    inputs:
+      read_pairs:
+        description: "Simulated pairs (1000000 keeps the profile under ten minutes)"
+        default: "1000000"
+        required: false
+      read_set:
+        description: "sim | real"
+        default: "sim"
+        required: false
+      runner:
+        description: "Runner image"
+        default: "ubuntu-22.04"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+
+jobs:
+  profile:
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: What machine is this
+        run: |
+          awk -F': ' '/^model name/{print "cpu: "$2; exit}' /proc/cpuinfo
+          echo "cores: $(nproc)"
+          grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+
+      - name: Install perf
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # `linux-tools-$(uname -r)` does not exist for the Azure kernels these runners run, so the
+          # generic build is used. It prints a version-mismatch warning and samples correctly.
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic || true
+          PERF=$(ls /usr/lib/linux-tools*/perf 2>/dev/null | head -1)
+          [ -n "$PERF" ] || { echo "::error::no perf binary found"; exit 1; }
+          echo "PERF=$PERF" >> "$GITHUB_ENV"
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+          sudo sysctl -w kernel.kptr_restrict=0
+          "$PERF" --version || true
+
+      - name: Install bwa-mem2 + bwa-mem3 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bench
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3
+            wgsim
+            samtools
+          init-shell: bash
+
+      - name: Build ours at the tier we ship
+        run: |
+          set -euo pipefail
+          # `-C force-frame-pointers=yes` so `perf` can walk the stack without DWARF unwinding, and
+          # debug symbols so the report carries names rather than addresses. Neither changes which
+          # code runs; both change what the profile can say about it.
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C debuginfo=1" \
+            cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf
+          cp target-perf/release/bwa-mem4 ./mem4-v3
+
+      - name: Reference, index and reads
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          sed -i '1s/.*/>chr21/' chr21.fa
+          bwa-mem2 index chr21.fa
+          n="${{ github.event.inputs.read_pairs || '1000000' }}"
+          wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa sim1.fq sim2.fq > /dev/null
+          echo "simulated: $n pairs"
+
+      - name: Record both binaries
+        shell: bash -el {0}
+        env:
+          SET: ${{ github.event.inputs.read_set || 'sim' }}
+        run: |
+          set -euo pipefail
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          r1="${SET}1.fq"; r2="${SET}2.fq"
+          # Warm the page cache for both, so the first one recorded is not paying for the index read.
+          ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
+          bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
+
+          for arm in ours fork; do
+            case "$arm" in
+              ours) cmd=(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
+              fork) cmd=(bwa-mem3   mem -t "$T" chr21.fa "$r1" "$r2") ;;
+            esac
+            echo "::group::perf record: $arm"
+            "$PERF" record -F 499 -g --call-graph fp -o "$arm.data" -- "${cmd[@]}" > /dev/null 2>/dev/null || true
+            echo "::endgroup::"
+            echo
+            echo "===== $arm: top symbols by self time ====="
+            "$PERF" report -i "$arm.data" --stdio --no-children --percent-limit 0.4 2>/dev/null \
+              | grep -E '^\s+[0-9]+\.[0-9]+%' | head -30 || echo "(perf report produced nothing)"
+          done
+
+      - name: Keep the recordings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-data
+          path: work/*.data
+          if-no-files-found: warn

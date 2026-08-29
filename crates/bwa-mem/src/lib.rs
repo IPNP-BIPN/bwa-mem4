@@ -189,6 +189,15 @@ pub mod rescue_split {
     pub static COLLECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static KERNEL_NS: AtomicU64 = AtomicU64::new(0);
     pub static APPLY_NS: AtomicU64 = AtomicU64::new(0);
+    /// The part of `apply` spent re-running `mem_sort_dedup_patch` after an insertion, and the
+    /// number of those re-runs. Split out because `apply` is 0.3 s CPU on real reads and 49 s on
+    /// wgsim, and a 164x swing between read sets is a question about ONE line, not about a stage.
+    pub static APPLY_DEDUP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_DEDUP_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_DEDUP_ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static T_SORT1: AtomicU64 = AtomicU64::new(0);
+    pub static T_SCAN: AtomicU64 = AtomicU64::new(0);
+    pub static T_SORT3: AtomicU64 = AtomicU64::new(0);
 
     /// Whether the probe records. Read once and cached.
     ///
@@ -220,10 +229,19 @@ pub mod rescue_split {
             return;
         }
         eprintln!(
-            "[rescue-split] collect {:.3}s, kernel {:.3}s, apply {:.3}s CPU",
+            "[rescue-split] collect {:.3}s, kernel {:.3}s, apply {:.3}s CPU (of which sort/dedup {:.3}s over {} calls, {} regions)",
             COLLECT_NS.load(Relaxed) as f64 / 1e9,
             KERNEL_NS.load(Relaxed) as f64 / 1e9,
             APPLY_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_DEDUP_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_DEDUP_CALLS.load(Relaxed),
+            APPLY_DEDUP_ROWS.load(Relaxed),
+        );
+        eprintln!(
+            "[dedup-internals] sort_re {:.3}s, scan {:.3}s, sort_score {:.3}s CPU (all callers)",
+            T_SORT1.load(Relaxed) as f64 / 1e9,
+            T_SCAN.load(Relaxed) as f64 / 1e9,
+            T_SORT3.load(Relaxed) as f64 / 1e9,
         );
     }
 }

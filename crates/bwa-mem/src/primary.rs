@@ -449,8 +449,9 @@ mod sort_scratch {
 
     /// Pass 1a's permutation: `re` and the index of the region it came from.
     type PermRe = Vec<(i64, u32)>;
-    /// Pass 3's permutation: the three-field sort key `(score, rb, qb)` and the same index.
-    type PermScore = Vec<((i32, i64, i32), u32)>;
+    /// Pass 3's permutation: the three-field sort key `(score, rb, qb)` packed into one u128 (see
+    /// `score_key`), and the index of the region it came from.
+    type PermScore = Vec<(u128, u32)>;
 
     thread_local! {
         pub static PERM_RE: RefCell<PermRe> = const { RefCell::new(Vec::new()) };
@@ -512,11 +513,14 @@ pub fn mem_sort_dedup_patch(
     // `_by_key` rather than `_by`: same algorithm, same permutation (proved and tested in
     // `bwa-chain`), but the 96-byte `MemAlnReg`s move once at the end instead of twice per swap.
     // This sort and the one in pass 3 are together the most-executed sort in the run.
+    let _t1 = crate::rescue_split::start();
     sort_scratch::PERM_RE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
             ks_introsort_by_key(&mut a, perm, spare, |r| r.re, |x, y| x < y);
         });
     });
+    crate::rescue_split::stop(&crate::rescue_split::T_SORT1, _t1);
+    let _t2 = crate::rescue_split::start();
     // `n_comp` counts how many original regions were folded into this one; it starts at 1 (itself)
     // and the merge branch accumulates. Only `mem_patch_reg` merging changes it.
     for r in &mut a {
@@ -626,17 +630,33 @@ pub fn mem_sort_dedup_patch(
     // and keeps the relative order, which is exactly `retain`'s contract.
     a.retain(|r| r.qe > r.qb);
 
+    crate::rescue_split::stop(&crate::rescue_split::T_SCAN, _t2);
+    let _t3 = crate::rescue_split::start();
     // ---- Pass 3: re-sort by score and drop exact coordinate duplicates ------------------------
     // Sort by score desc, then rb, then qb (`alnreg_slt`), again with bwa's unstable introsort.
+    // The key is packed into ONE u128 rather than compared as a `(i32, i64, i32)` tuple, and the
+    // three fields happen to fit exactly: 32 bits of score, 64 of `rb`, 32 of `qb`.
+    //
+    // This is an implementation change and nothing else. `ks_introsort_by` is permutation-observable
+    // (which region survives a tie is decided by where the unstable sort leaves it), so the
+    // algorithm may not be swapped; but the permutation depends only on the BOOLEAN each comparison
+    // returns, and this packing returns the same boolean as the tuple comparator for every input.
+    // The mapping is the standard order-preserving one: flip the sign bit of each signed field to
+    // get an unsigned key that compares the same way, and complement the score field because it
+    // sorts descending while the other two sort ascending.
+    //
+    // Why bother: this sort is 7.4s of CPU on a 1M-pair wgsim run, the single largest scalar cost in
+    // the profile after the two SIMD kernels, and its inner loop is comparisons.
+    #[inline(always)]
+    fn score_key(r: &MemAlnReg) -> u128 {
+        let score = !((r.score as u32) ^ 0x8000_0000) as u128;
+        let rb = ((r.rb as u64) ^ 0x8000_0000_0000_0000) as u128;
+        let qb = ((r.qb as u32) ^ 0x8000_0000) as u128;
+        (score << 96) | (rb << 32) | qb
+    }
     sort_scratch::PERM_SCORE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
-            ks_introsort_by_key(
-                &mut a,
-                perm,
-                spare,
-                |r| (r.score, r.rb, r.qb),
-                |x, y| x.0 > y.0 || (x.0 == y.0 && (x.1 < y.1 || (x.1 == y.1 && x.2 < y.2))),
-            );
+            ks_introsort_by_key(&mut a, perm, spare, score_key, |x, y| x < y);
         });
     });
     // Exact-duplicate removal (`bwamem.cpp:343`). After the score sort, identical regions are
@@ -652,6 +672,7 @@ pub fn mem_sort_dedup_patch(
     // keeping `a[0]`. That is safe to express as a plain `retain` because the marking loop above
     // also starts at 1 and therefore can never kill `a[0]`.
     a.retain(|r| r.qe > r.qb);
+    crate::rescue_split::stop(&crate::rescue_split::T_SORT3, _t3);
     a
 }
 
