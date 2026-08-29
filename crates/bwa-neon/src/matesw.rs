@@ -251,11 +251,32 @@ pub mod cells {
     /// cell per lane per cycle. Disassembling the shipped binary confirms it: the quad fast-column
     /// loop is 71 instructions for 64 cells, 63 of them vector, i.e. 1.11 instructions per cell.
     ///
-    /// So the arithmetic is essentially done, and the remaining 36% is NOT in the DP body. It is in
-    /// the per-row and per-group work around it: the 1.09x lane-divergence tax, the row epilogue's
-    /// scalar sixteen-lane loop, the padded tail columns (1.42 instructions per cell against 1.11),
-    /// and the group pack/extract. Anyone chasing the next percent should start there and should not
-    /// try to shorten the cell recurrence.
+    /// So the arithmetic is essentially done. What the 36% actually is, corrected on 2026-08-29
+    /// after two of the four suspects above were measured and cleared:
+    ///
+    /// | | |
+    /// |---|---|
+    /// | measured gap to the ceiling | 1.62x |
+    /// | lane divergence and padding, from this probe's own accounting | 1.08x |
+    /// | leaves | 1.50x |
+    /// | the DP loop's four memory accesses, which the ceiling does not pay | 1.31x |
+    /// | genuinely unexplained | **1.15x** |
+    ///
+    /// **The ceiling was never reachable, and that is the first thing to know before chasing it.**
+    /// It is measured registers-only; the shipped loop is 17 instructions of which 2 loads and 2
+    /// stores, so a register-only twin would be 13, and 17/13 is 1.31x on its own. Every lane of an
+    /// inter-sequence kernel needs its own H and E state across a 150-column query, and that state
+    /// cannot live in registers. The memory is the layout, not slack in it.
+    ///
+    /// Two of the four suspects this note used to name have since been measured and are NOT where
+    /// the time is. The row epilogue's scalar sixteen-lane loop was guarded with a vector test, and
+    /// that was **1.1% slower** (see `docs/kernel-ceiling-and-dead-ends.md`): the horizontal
+    /// reduction costs more than the well-predicted loop it skips. The `score2` walk inside
+    /// `extract_group` had half its work removed by a provable skip, and this probe did not move.
+    ///
+    /// So what remains for the next person is 1.15x, not 1.55x, and the two places left to look are
+    /// the group pack/extract and the padded tail columns. Do not try to shorten the cell
+    /// recurrence, and do not expect the register-only figure to be an achievable target.
     pub fn dump() {
         if !enabled() {
             return;
