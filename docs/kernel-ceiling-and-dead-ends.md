@@ -393,3 +393,42 @@ There is no slack left in this kernel for issue #48 to remove. Anyone returning 
 from the recurrence, not from the instruction count, and should note that three of the four levers
 in that issue were rewrites the compiler had already performed. A count of operations read off the
 source is not a count of operations.
+
+## The rescue kernel's row epilogue is cheaper than a vector guard over it (2026-08-29)
+
+`matesw`'s own note lists what the remaining 36% of that kernel is: "the 1.09x lane-divergence tax,
+the row epilogue's scalar sixteen-lane loop, the padded tail columns and the group pack/extract".
+Measured today, the arithmetic is worse than that reads:
+
+    shipped kernel            9.91 Gcell/s/thread
+    register-only ceiling    16.04
+    divergence + padding      1.08x   (BWA4_MATESW_TIME's own accounting)
+
+1.62x of gap, of which the tax explains 1.08x, so **1.50x sits outside the DP body**. That is half
+the kernel, and the row epilogue was the obvious suspect: `finish_row!` walks sixteen lanes scalar-
+wise once per ROW, which is 9,600 lane-steps for a 600-row job and about 1.3 billion for a 1M-pair
+run, while a lane's maximum improves a few dozen times in those 600 rows.
+
+So the loop was guarded: a `gmax_guard` vector holding 255 for lanes that are frozen or past their
+target, and `vmaxvq_u8(vcgtq_u8(imax, guard))` to ask "can any lane improve?" in three instructions
+before entering it. The two stores into the scalar mirror arrays moved inside the guard as well,
+since only the slow path reads them. Byte-identical, provably: the loop is skipped exactly when no
+lane satisfies the condition of the only branch that does anything.
+
+Interleaved, three repetitions, alternating arms:
+
+| | base | guarded |
+|---|---|---|
+| rep 1 | 9.91 | 9.81 |
+| rep 2 | 9.92 | 9.81 |
+| rep 3 | 9.90 | 9.79 |
+
+**1.1% slower, reproducibly.** `vmaxvq_u8` is a horizontal reduction: it collapses a vector into a
+general register, which on these cores costs several cycles of cross-domain latency and puts a
+scalar dependency on the row's critical path. The sixteen-iteration loop it was meant to avoid is
+predictable, mostly early-exits, and LLVM was already doing better with it than the guard does
+without it. Reverted.
+
+Two things to carry forward. The row epilogue is NOT where the 1.50x is, so the note in `matesw.rs`
+should not send the next person there first. And a horizontal reduction is not a cheap way to ask a
+question about a vector: it costs more than sixteen well-predicted scalar iterations.
