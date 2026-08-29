@@ -5102,6 +5102,164 @@ les deux affirmations doivent desormais nommer la machine, comme le ratio contre
 deja depuis la replication du 2026-08-27 au matin.
 
 
+## Le GPU rouvert : le noyau tournait a 3,6 % de la machine, et la cause n'est pas le noyau (2026-08-29)
+
+Le dossier avait ete ferme le 2026-08-09 sur deux motifs, et les deux etaient contestables.
+
+**Le plafond, remesure aujourd'hui : 385,7 Gcell/s** (`scripts/msl_probe.sh`, `uchar4`, registres
+seuls, la vraie recurrence de rescue, 1 048 576 threads). Le ROADMAP notait ~330 ; c'est mieux que
+ca. Le noyau livre tournait a **12 Gcell/s**, soit **3,1 % de ce que la sonde du projet avait prouve
+que la machine faisait sur exactement cette recurrence**. Un materiel juge a 3 % de sa capacite n'a
+pas ete juge.
+
+**Et l'Amdahl de la note d'abandon ne tient pas.** Elle ecrit « le seeding pese 41 % du busy et
+l'extension 23 % ». Le tableau de `docs/gpu-plan.md` lui-meme dit 59,2 % de DP et 6,7 % de seeding
+sur 1 M paires GIAB reelles, et les deux profils symboliques pris cette semaine disent 44,6 % / 10,8 %
+sur aarch64 et 33,7 % / 13,4 % sur x86. Trois mesures sur quatre placent le DP entre 34 et 59 %. Le
+seeding a ete rendu ~2,5x moins cher par LISA depuis la fermeture, donc la part offloadable a MONTE
+pendant que le dossier etait clos.
+
+### Ce que le decoupage montre, et il corrige le diagnostic precedent
+
+Le ROADMAP attribuait l'echec de la tentative `uchar4` au fait que la sonde chronometrait
+`forward_batch` en entier, empaquetage compris. **C'est faux, et le decoupage le dit** : sur 8192
+travaux, `pack` fait 0,0005 s sur 0,0643 s, soit **0,8 %**. L'hote n'a jamais masque le levier. Si le
+`uchar4` avait rendu 4x sur le noyau, l'appel entier serait passe de 64 a 26 ms, ce qu'aucune sonde
+ne pouvait rater. La conclusion honnete est donc que **ce noyau `uchar4`-la n'accelerait pas le GPU**,
+et non que la mesure l'avait cache.
+
+### La vraie premiere cause : l'occupancy, et elle se corrige sans toucher au noyau
+
+| travaux par lancement | debit GPU seul |
+|---|---|
+| 8 192 (la taille de production) | 14,04 Gcell/s |
+| 32 768 | 46,28 |
+| 131 072 | 42,70 |
+| 524 288 | **51,54** |
+
+**3,7x en donnant simplement plus de travail au meme noyau.** La sonde de plafond lance 1 048 576
+threads ; le pipeline en lancait 8 192, soit 256 simdgroups pour 40 coeurs. Le `BWA4_GPU_CHUNK` de
+16384 *reads* avait ete regle sur le mur, pas sur l'occupancy.
+
+Rapporte au bon plafond, l'ecart restant se lit enfin. La sonde fait 4 cellules par thread ; le noyau
+livre en fait 1. Le plafond a iso-forme est donc ~96 Gcell/s, et 51,54 en est **54 %**. Le noyau
+n'est pas mauvais : il est sous-alimente, et il laisse le facteur 4 du `uchar4` sur la table.
+
+### La deuxieme cause, invisible jusqu'ici : `score2` sur l'hote
+
+| travaux | pack | GPU | `score2` (hote) |
+|---|---|---|---|
+| 8 192 | 0,0005 s | 0,0546 s | 0,0099 s |
+| 524 288 | 0,0274 s | 0,9530 s | **0,9701 s** |
+
+A l'echelle, la passe `score2` cote CPU coute **autant que le noyau GPU**. C'est un Amdahl interne au
+bras GPU que personne n'avait vu, parce que la sonde d'origine additionnait les trois. Accelerer le
+noyau sans y toucher plafonne le bras a 2x, quoi qu'il arrive au GPU.
+
+Aucun de ces deux constats ne demande d'ecrire une ligne de MSL.
+
+### Ce qui borne vraiment le noyau GPU, mesure avec les deux noyaux (2026-08-29)
+
+Le fichier disait que le trafic memoire des rails etait « exactement la ressource qui lie ». C'est
+vrai pour le noyau 32 bits et faux pour le u8, et la difference decide de ce qu'il faut faire
+ensuite.
+
+`BWA4_METAL_FORCE32` envoie tous les travaux sur le noyau 32 bits. Les deux noyaux ont **le meme flot
+de controle et le meme nombre d'acces memoire par cellule** (3 lectures, 2 ecritures) ; ils ne
+different que par la largeur de l'element, 5 octets par cellule contre 20. Les comparer a occupancy
+egale isole donc la bande passante du debit d'instructions. Sur 524 288 travaux :
+
+| noyau | debit | octets/cellule | bande passante atteinte | ops memoire/s |
+|---|---|---|---|---|
+| u8 | 50,31 Gcell/s | 5 | 252 Go/s (**46 %**) | **252 G** |
+| 32 bits | 26,47 Gcell/s | 20 | **529 Go/s (97 %)** | 132 G |
+
+Si le debit d'emission d'instructions etait la seule limite, les deux rendraient le meme Gcell/s,
+puisqu'ils emettent le meme nombre d'acces par cellule. Ils ne le font pas : le 32 bits est **rattrape
+par la bande passante** (529 sur 546 Go/s, la machine est saturee), et le u8, deux fois plus rapide,
+n'est qu'a 46 % de cette bande passante. Le u8 est donc assis sur l'**autre** plafond, celui du
+**debit d'emission d'acces memoire, ~252 G ops/s**.
+
+Verifie par l'occupancy : le u8 monte de 14,04 (8 192 travaux) a 47,9 (524 288) puis **50,31**
+(1 048 576) et ne monte plus. Ce n'est ni la latence ni le nombre de threads.
+
+### Ce que cela dit de la suite, et cela reouvre le `uchar4` pour une autre raison que la premiere
+
+Pour depasser 50 Gcell/s il faut emettre **moins d'acces par cellule**, pas deplacer moins d'octets.
+Un `uchar4` ne reduit pas les octets, il fait servir **un acces pour quatre travaux**, donc il divise
+les ops par 4. La borne suivante est alors la bande passante :
+
+| paquetage | ops/4 vise | borne bande passante | resultat attendu |
+|---|---|---|---|
+| `uchar2` | 101 Gcell/s | 109 | **~101** |
+| `uchar4` | 201 Gcell/s | 109 | **~109** |
+
+Donc **~2,2x pour le `uchar4`, et non 4x**, parce que la bande passante le rattrape a 109 Gcell/s.
+Au-dela il faudrait aussi reduire les octets, c'est-a-dire bloquer plusieurs LIGNES par thread pour
+garder H et E en registres entre elles, ce que le CPU fait deja sous `BWA4_RESCUE_ROWQUAD`. Le
+ROADMAP avait ecarte ROWQUAD sur GPU au motif que « le parallelisme vient du nombre de threads » :
+c'est vrai et hors sujet, son interet ici est le trafic, pas le parallelisme.
+
+**Et cela explique pourquoi la premiere tentative `uchar4` n'a rien montre.** Elle a ete mesuree a la
+taille de lot de production, 8 192 travaux, ou le noyau rend 14 Gcell/s parce qu'il est sous-alimente.
+Dans ce regime le noyau n'est ni borne par les ops ni par la bande passante, et diviser les ops par
+quatre ne pouvait rien changer. Le levier etait bon, le regime de mesure ne l'etait pas. C'est la
+troisieme fois cette semaine qu'un resultat nul se revele etre un defaut de protocole plutot qu'un
+verdict.
+
+### Trois leviers GPU chiffres avant d'etre construits, et les trois sont morts (2026-08-29)
+
+Suite de la section precedente. Elle concluait que le noyau u8 etait borne par le debit d'emission
+d'acces memoire, ~252 G ops/s, et que le `uchar4` valait donc ~2,2x en divisant les acces par quatre.
+`scripts/msl/mem_ops.m` teste cela en quarante lignes plutot qu'en une journee de noyau : deux
+kernels, meme recurrence et meme motif d'acces que `rescue_fwd_u8` (trois lectures et deux ecritures
+par cellule sur des rails column-major), l'un a un travail par thread en `uchar`, l'autre a quatre
+travaux par thread en `uchar4`, dispatches pour calculer le MEME nombre de cellules.
+
+| bras | debit |
+|---|---|
+| `mem1` (uchar, 1 travail/thread) | 150,23 Gcell/s |
+| `mem4` (uchar4, 4 travaux/thread) | 145,98 |
+| **rapport** | **0,97x** |
+
+**Le `uchar4` ne rend rien**, et la sonde dit aussi pourquoi ma deduction etait fausse : elle soutient
+150 Gcell/s, soit 750 G acces/s, trois fois le plafond de 252 G ops/s que j'avais deduit. Ce plafond
+n'existe pas. Les deux noyaux de l'aligneur rendaient 50 et 26 Gcell/s pour une autre raison, et il
+manquait quelque chose a mon raisonnement, pas au materiel.
+
+### Ce qui manquait : un gather par cellule
+
+Le noyau lit une base de query par CELLULE, a `seqs[j.q_off + c]`. Les threads voisins sont des
+travaux voisins, dont les queries sont loin les unes des autres dans ce tampon : les 32 voies d'un
+simdgroup emettent donc 32 lectures dispersees, un **gather**, une fois par cellule, dans un noyau
+dont tous les autres acces sont coalesces. Un troisieme bras l'ajoute a `mem1` et rien d'autre :
+
+| bras | debit | contre `mem1` |
+|---|---|---|
+| `mem1g` (uchar + gather de query par cellule) | 75,61 Gcell/s | **0,50x** |
+
+Le gather coute la moitie du noyau, dans la sonde.
+
+### Et la correction ne transfere pas, ce qui est le resultat le plus utile des trois
+
+Query ecrite une seconde fois en column-major, `qcm[c * n_jobs + k]`, pour que les voies voisines
+lisent des octets voisins. Octet-identique par construction, les huit portes Metal passent. Mesure :
+
+| | avant | apres |
+|---|---|---|
+| noyau seul | 50,31 Gcell/s | 54,49 (**1,08x**) |
+| empaquetage hote | 0,027 s | **0,380 s** |
+
+**1,08x sur le noyau et 0,35 s perdues sur l'hote, donc une perte nette**, et surtout pas le 2x que
+la sonde annoncait. L'explication tient a ce que la sonde ne reproduisait pas : dans le vrai noyau,
+les 1024 queries d'un threadgroup font 153 KB et restent en cache d'une ligne a l'autre, alors que la
+sonde relit un tampon de 39 MB. La sonde a donc surestime le gather en le mesurant hors de son cache.
+
+Revenu en arriere. Ce qui reste acquis : trois leviers ont ete chiffres pour le prix d'une sonde
+chacun au lieu d'une journee de noyau chacun, et le fichier porte les trois chiffres plutot que trois
+intuitions. Ce qui reste ouvert cote GPU est donc **la raison des 50 Gcell/s, qui n'est ni la bande
+passante, ni l'emission d'acces, ni le gather de query**.
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les

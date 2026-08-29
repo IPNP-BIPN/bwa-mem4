@@ -246,6 +246,10 @@ pub mod rescue_split {
     }
 }
 
+/// Re-exported so the CLI can dump the tracker shape probe without depending on `bwa-extend`
+/// directly; the counters live where the tracker does.
+pub use bwa_extend::sw::subopt_shape;
+
 pub mod across;
 pub mod alt;
 pub mod cigar;
