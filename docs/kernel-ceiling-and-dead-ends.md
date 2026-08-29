@@ -320,3 +320,36 @@ skip that question because it accepts the divergence; we cannot. Recorded rather
 What would unblock it: a proof that on a qualifying job no improving row can be off-diagonal, or an
 acceptance test that does not consult `max_off` when the ungapped optimum is proven. Both are
 research, not implementation.
+
+## Issue #48 lever A is already done, by LLVM, and the disassembly says so (2026-08-29)
+
+#48's first lever looked like the safest few percent in the codebase: the E and F recurrences open a
+gap with `max($sub(bigm_v, oe_v), zero_v)`, and for every u8 instantiation `$sub` is a SATURATING
+UNSIGNED subtract whose result is already in `[0, 255]`. The issue called it "2 of ~33 vector ALU ops
+in the inner loop", "provable, not empirical", and estimated +1.1%.
+
+It was implemented: a `clamp0` slot in the kernel macro, bound to the real `max` for the four i16
+instantiations where `$sub` wraps and the clamp is load-bearing, and to a two-argument identity for
+the four u8 ones. Byte-identity held (NEON and AVX2 kernel tests green, full SAM md5 unchanged).
+
+Then it was measured, and it is worth nothing:
+
+| batch=64 kernel | before | after |
+|---|---|---|
+| aarch64 NEON | 68.46 / 68.69 / 67.48 ms | 68.46 / 68.13 / 68.46 ms |
+| x86-64-v3 AVX2 | 147.57 / 148.51 / 147.67 ms | 148.16 / 146.82 / 148.41 ms |
+
+A timer that says "no difference" is weak evidence, so the binaries were disassembled instead:
+
+    before: vpmaxub=100  vpsubusb=312
+    after:  vpmaxub=100  vpsubusb=312
+
+Identical, and the two executables are the same size to the byte. LLVM already knows that
+`max(saturating_sub_u8(a, b), 0)` is `saturating_sub_u8(a, b)` and had removed the op before the
+source change asked it to. The change was reverted: it adds a macro slot and a helper for machine
+code that does not move.
+
+The general lesson is the one this file keeps learning from the other direction. An op count read off
+the SOURCE is not an op count. #43 and #48 both reasoned about "ops per cell" from the Rust, and the
+compiler had already collected the easy half. Count instructions in the binary before believing a
+source-level tally, especially for anything a peephole optimiser could see.
