@@ -815,8 +815,15 @@ fn matesw_apply(
             n += 1;
         }
         if n > 0 && dirty {
+            let t_dd = crate::rescue_split::start();
+            if t_dd.is_some() {
+                use std::sync::atomic::Ordering::Relaxed;
+                crate::rescue_split::APPLY_DEDUP_CALLS.fetch_add(1, Relaxed);
+                crate::rescue_split::APPLY_DEDUP_ROWS.fetch_add(ma.len() as u64, Relaxed);
+            }
             let taken = std::mem::take(ma);
             *ma = mem_sort_dedup_patch(fm, opt, &[], taken);
+            crate::rescue_split::stop(&crate::rescue_split::APPLY_DEDUP_NS, t_dd);
             dirty = false;
         }
     }

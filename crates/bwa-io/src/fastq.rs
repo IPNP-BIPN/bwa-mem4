@@ -251,6 +251,25 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
         return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
     }
 
+    // PLAIN TEXT, AND IT GETS THE SAME READ-AHEAD THREAD THE COMPRESSED PATHS GET.
+    //
+    // `parse_fastx_file` opens the file itself and parses off its own buffer, so reading block N+1
+    // and parsing block N are the same thread's work, one after the other. Every compressed path
+    // above already avoids that: `rapidgzip` decodes on its own threads, and `spawn_inflate` exists
+    // precisely so "inflating block N+1 overlaps parsing block N".
+    //
+    // The asymmetry is measurable and it runs against us. On a four-core runner with the same 5.45M
+    // real pairs, the fork leads by 2.3% when the input is plain FASTQ (3.5 GB) and trails by 3.1%
+    // when it is gzipped (900 MB). Same reads, same binaries; the input format flips the verdict,
+    // and the difference is that our compressed path overlaps its I/O and our plain path does not.
+    //
+    // Byte-identical by construction: the parser sees the same bytes in the same order, only
+    // delivered by a different thread.
+    if !is_gzip && looks_like_text {
+        let blocks = spawn_plain(path)?;
+        return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
+    }
+
     if is_gzip || looks_like_text || cfg!(not(feature = "multi-format")) {
         return parse_fastx_file(path).map_err(|e| Error::Fastq(e.to_string()));
     }
@@ -312,12 +331,10 @@ fn gzip_threads() -> usize {
 /// Decompressed bytes handed over per channel message. 4 MiB is about 12 000 reads at 150 bp, so
 /// the channel is touched ~90 times for a 1 M-pair mate file, and three of them in flight cost
 /// 12 MiB, which is noise next to a batch of records.
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
 const INFLATE_BLOCK: usize = 4 << 20;
 
 /// Blocks the inflater may run ahead. One in flight plus one being parsed is the double buffering
 /// that makes the overlap work; the third absorbs a slow parse without stalling the inflater.
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
 const INFLATE_DEPTH: usize = 3;
 
 /// The decompressed side of a gzipped FASTQ, as a plain [`std::io::Read`] fed by an inflater thread.
@@ -345,7 +362,6 @@ const INFLATE_DEPTH: usize = 3;
 /// Not a parallel decoder. One stream is still inflated by one thread, at the 898 MB/s this
 /// machine measures for `zlib-rs` (`gzcat` on Apple's zlib does 1137 MB/s on the same file). What
 /// is bought here is the overlap, not the throughput.
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
 struct InflatedBlocks {
     /// Blocks from the inflater thread, or the first I/O error it hit.
     rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
@@ -358,7 +374,6 @@ struct InflatedBlocks {
     done: bool,
 }
 
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
 impl std::io::Read for InflatedBlocks {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         loop {
@@ -388,6 +403,57 @@ impl std::io::Read for InflatedBlocks {
             }
         }
     }
+}
+
+/// The plain-text twin of [`spawn_inflate`]: read the file on a thread of its own and hand the
+/// parser the bytes, so that reading block N+1 overlaps parsing block N.
+///
+/// Same block size, same queue depth and the same `InflatedBlocks` consumer as the gzip path, for
+/// the same reason: the point is the overlap, not the decompression. See the call site for the
+/// measurement that motivates it.
+fn spawn_plain(path: &std::path::Path) -> Result<InflatedBlocks> {
+    use std::io::Read;
+    let file =
+        std::fs::File::open(path).map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(INFLATE_DEPTH);
+    std::thread::spawn(move || {
+        let mut src = std::io::BufReader::with_capacity(1 << 20, file);
+        loop {
+            let mut block = vec![0u8; INFLATE_BLOCK];
+            // Fill each block completely unless the file ends, so the parser is handed whole blocks
+            // rather than whatever length a single `read` happened to return.
+            let mut filled = 0;
+            let mut failed = None;
+            while filled < INFLATE_BLOCK {
+                match src.read(&mut block[filled..]) {
+                    Ok(0) => break,
+                    Ok(k) => filled += k,
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            let last = filled < INFLATE_BLOCK;
+            block.truncate(filled);
+            if filled > 0 && tx.send(Ok(block)).is_err() {
+                return; // consumer went away
+            }
+            if let Some(e) = failed {
+                let _ = tx.send(Err(e));
+                return;
+            }
+            if last {
+                return;
+            }
+        }
+    });
+    Ok(InflatedBlocks {
+        rx,
+        cur: Vec::new(),
+        pos: 0,
+        done: false,
+    })
 }
 
 /// Open `path`, inflate it on a fresh thread, and return the decompressed stream.
