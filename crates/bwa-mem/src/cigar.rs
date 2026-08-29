@@ -499,7 +499,10 @@ pub(crate) fn gen_cigar2(
     };
     // The MD:Z body under construction, complete except for its final run length (appended after
     // the loop). Grows as alternating decimal run lengths and reference letters.
-    let mut md = String::new();
+    // Sized from the reference span: MD alternates run lengths and mismatched bases, so it cannot
+    // exceed a few bytes per aligned base and is usually far shorter. Growing from empty cost two
+    // or three reallocations per record.
+    let mut md = String::with_capacity((rlen as usize / 4).max(16));
     // Three cursors, named `x`, `y` and `u` in the C: the query position, the reference position,
     // and the length of the match run currently being accumulated (the integers that alternate with
     // the letters in an MD string).
@@ -858,7 +861,12 @@ pub fn cigar_string(cigar: &[u32]) -> String {
     // characters would mislabel every CIGAR in the output.
     const OPS: [char; 5] = ['M', 'I', 'D', 'S', 'H'];
     // The SAM CIGAR field being built, complete for the ops emitted so far.
-    let mut s = String::new();
+    //
+    // Sized up front rather than grown. A CIGAR op is a run length and one letter, so eight bytes
+    // covers every op a read of any plausible length can produce, and growing from empty instead
+    // reallocated two or three times per RECORD. The allocation probe counts 47.0M allocations in
+    // the `sam_emit` bucket per million pairs; this is one of the sources.
+    let mut s = String::with_capacity(cigar.len() * 8);
     for &packed_op in cigar {
         crate::emit::push_int_str(&mut s, i64::from(packed_op >> 4));
         s.push(OPS[(packed_op & CIGAR_OP_MASK) as usize]);
@@ -900,8 +908,9 @@ pub fn cigar_string_which(cigar: &[u32], which: usize, is_alt: bool, softclip: b
     // rather than used raw. Same values as `CIGAR_OP_SOFT_CLIP` (3) and `CIGAR_OP_HARD_CLIP` (4).
     const SOFT_CLIP: usize = CIGAR_OP_SOFT_CLIP as usize;
     const HARD_CLIP: usize = CIGAR_OP_HARD_CLIP as usize;
-    // The SAM CIGAR field being built, with clip ops already rewritten for this `which`.
-    let mut s = String::new();
+    // The SAM CIGAR field being built, with clip ops already rewritten for this `which`. Sized up
+    // front for the same reason as in [`cigar_string`].
+    let mut s = String::with_capacity(cigar.len() * 8);
     for &packed_op in cigar {
         // This operation's code, possibly rewritten below from S to H or back.
         let mut op = (packed_op & CIGAR_OP_MASK) as usize;
