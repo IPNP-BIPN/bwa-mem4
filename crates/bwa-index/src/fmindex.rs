@@ -241,7 +241,56 @@ fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
         }
     }
 
-    // Tail (and the whole range on a non-NEON build).
+    // The same sixteen-bases-per-iteration unpack on x86. It was missing, and the cost of missing
+    // it is measurable: a side-by-side `perf` profile against fg-labs/bwa-mem3 on an EPYC 7763 put
+    // this function at 3.50% of our run against 1.39% for their `bns_get_seq_into`, because on x86
+    // every base went through the scalar tail below while aarch64 took the vector path above.
+    //
+    // SSSE3 rather than AVX2, and chosen at runtime: `pshufb` is the only instruction here that is
+    // not in SSE2, every x86-64 part since 2006 has it, and the release artefact is built at the
+    // x86-64 baseline, so a compile-time gate would leave the shipped binary on the scalar loop.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("ssse3") {
+            use std::arch::x86_64::*;
+            // SAFETY: ssse3 detected. Each iteration reads the 4 packed bytes at `pos >> 2` with
+            // `pos + 16 <= end <= 2 * l_pac`, so the byte index is inside the payload, and writes
+            // 16 bytes into capacity the caller reserved (`bases_into` reserves `len + 16`).
+            unsafe {
+                // Byte k of the loaded word into lanes 4k..4k+3, the same spread the NEON arm uses.
+                let spread = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+                let three = _mm_set1_epi8(3);
+                // x86 has no per-byte variable shift before AVX-512, so the four shifts are done
+                // whole-vector and then selected by lane. A 16-bit shift is safe here even though
+                // the data is bytes: the bits that leak in from the neighbouring byte land in bit
+                // positions 8-s and above, and the `& 3` that follows discards every one of them.
+                // Within a packed byte the most significant pair is base 0, hence 6, 4, 2, 0.
+                let m0 = _mm_setr_epi8(-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0);
+                let m1 = _mm_setr_epi8(0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0);
+                let m2 = _mm_setr_epi8(0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0);
+                let m3 = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
+                while pos + 16 <= end {
+                    let word =
+                        (pac.as_ptr().add((pos >> 2) as usize) as *const u32).read_unaligned();
+                    let v = _mm_shuffle_epi8(_mm_set1_epi32(word as i32), spread);
+                    let s6 = _mm_and_si128(_mm_srli_epi16(v, 6), m0);
+                    let s4 = _mm_and_si128(_mm_srli_epi16(v, 4), m1);
+                    let s2 = _mm_and_si128(_mm_srli_epi16(v, 2), m2);
+                    let s0 = _mm_and_si128(v, m3);
+                    let out_v = _mm_and_si128(
+                        _mm_or_si128(_mm_or_si128(s6, s4), _mm_or_si128(s2, s0)),
+                        three,
+                    );
+                    let n = out.len();
+                    _mm_storeu_si128(out.as_mut_ptr().add(n) as *mut __m128i, out_v);
+                    out.set_len(n + 16);
+                    pos += 16;
+                }
+            }
+        }
+    }
+
+    // Tail, and the whole range on a build with neither vector path.
     while pos < end {
         out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
         pos += 1;
