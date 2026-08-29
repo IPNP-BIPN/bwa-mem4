@@ -274,9 +274,25 @@ pub mod cells {
     /// reduction costs more than the well-predicted loop it skips. The `score2` walk inside
     /// `extract_group` had half its work removed by a provable skip, and this probe did not move.
     ///
-    /// So what remains for the next person is 1.15x, not 1.55x, and the two places left to look are
-    /// the group pack/extract and the padded tail columns. Do not try to shorten the cell
-    /// recurrence, and do not expect the register-only figure to be an achievable target.
+    /// And then the two places left were measured too, so the accounting closes:
+    ///
+    /// | | |
+    /// |---|---|
+    /// | lane divergence and padding | 1.080x |
+    /// | the four memory accesses the ceiling omits (17 instructions against 13) | 1.308x |
+    /// | padded tail columns (10 of 160, at 1.28x each) | 1.018x |
+    /// | group pack and extract (1.40% of the x86 profile against the kernel's 9.55%) | 1.147x |
+    /// | **product** | **1.648x** |
+    /// | measured gap | **1.617x** |
+    ///
+    /// **There is no unexplained slack in this kernel.** Every part of the 1.62x is a named,
+    /// measured cost, and not one of them is removable without changing the layout: the memory is
+    /// what an inter-sequence kernel needs to keep per-lane state across a 150-column query, the
+    /// divergence is what batching unequal lengths costs, the tail columns are the padding the
+    /// vector width requires, and the pack/extract is the price of the SoA transpose.
+    ///
+    /// So: do not try to shorten the cell recurrence, do not treat the register-only figure as a
+    /// target, and do not come back here for a factor. The next factor is not on this CPU.
     pub fn dump() {
         if !enabled() {
             return;
