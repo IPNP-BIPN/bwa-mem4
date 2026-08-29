@@ -12,11 +12,6 @@ name: perf profile (x86)
 #
 # Dispatch-only. It answers a question asked at investigation time.
 on:
-  # TEMPORARY, removed before merge: `workflow_dispatch` cannot reach a workflow that is not yet on
-  # the default branch, and this profile is the whole point of the branch.
-  push:
-    branches:
-      - perf/rescue-apply-dedup
   workflow_dispatch:
     inputs:
       read_pairs:
