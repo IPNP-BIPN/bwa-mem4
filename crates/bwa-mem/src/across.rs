@@ -1799,8 +1799,8 @@ mod tests {
 /// This measures the prize before anything is built: how many extension jobs qualify, and what
 /// share of the DP cells they carry. It changes nothing.
 pub mod ungapped_fp {
-    use bwa_extend::ExtendJob;
     use bwa_core::MemOpt;
+    use bwa_extend::ExtendJob;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::OnceLock;
 
