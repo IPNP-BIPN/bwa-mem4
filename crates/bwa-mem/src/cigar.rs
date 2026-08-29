@@ -409,6 +409,7 @@ pub(crate) fn gen_cigar2(
     // units. `cigar`: the packed M/I/D operations describing that alignment, left to right along
     // the reference. Both come from one branch or the other and are final from here on; step 4 only
     // reads them.
+    global_fp::survey(l_query, rlen, &query, &rseq, opt, w_);
     let (score, cigar) = if l_query == rlen && w_ == 0 {
         // Ungapped fast path (bwa.cpp:280): equal lengths and a proven-zero band mean the CIGAR is
         // a single M run and the score is just the sum of matrix cells down the diagonal. The
@@ -914,4 +915,136 @@ pub fn cigar_string_which(cigar: &[u32], which: usize, is_alt: bool, softclip: b
         s.push(OPS[op]);
     }
     s
+}
+
+/// `BWA4_GLOBAL_FP` probe: how many `ksw_global2` calls are a full-length diagonal that could be
+/// proven optimal without running the DP.
+///
+/// `gen_cigar2` already has an ungapped fast path, but it is gated on `w_ == 0`, which is a
+/// statement about the CALLER's band rather than about the sequences. The lemma is stronger than
+/// that gate. Here both sequences have the same length, so any gapped global alignment must carry at
+/// least one insertion AND one deletion, and therefore pays at least `o_ins + e_ins + o_del + e_del`
+/// below the all-match ceiling. The diagonal pays `X * (a + b)` for its `X` mismatches. While
+///
+///     X * (a + b) < o_ins + e_ins + o_del + e_del
+///
+/// the diagonal is the UNIQUE optimum, so its CIGAR (`<L>M`) is the one the DP's traceback would
+/// return. At bwa's defaults (a=1, b=4, o=6, e=1) that is `X <= 2`.
+///
+/// Unlike the extension fast path, which is blocked because `ksw_extend2` also returns `max_off` and
+/// the caller's band-retry test reads it, `ksw_global2` returns only a score and a CIGAR. There is
+/// no control-flow decision to predict.
+///
+/// This counts the prize. It changes nothing.
+pub mod global_fp {
+    use bwa_core::MemOpt;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static ALREADY_FAST: AtomicU64 = AtomicU64::new(0);
+    pub static EQ_LEN: AtomicU64 = AtomicU64::new(0);
+    pub static PROVABLE: AtomicU64 = AtomicU64::new(0);
+    pub static CELLS: AtomicU64 = AtomicU64::new(0);
+    pub static CELLS_PROVABLE: AtomicU64 = AtomicU64::new(0);
+    pub static AMBIG: AtomicU64 = AtomicU64::new(0);
+    /// The threshold the scoring model licenses, recorded so the dump does not recompute it from
+    /// options it no longer holds.
+    pub static THRESHOLD: AtomicU64 = AtomicU64::new(0);
+    /// Mismatch counts over the diagonal, capped at 15, for equal-length calls. The threshold test
+    /// alone cannot say whether a zero result means "no call qualifies" or "the comparison is
+    /// wrong", and the first version of this probe reported exactly zero, which is not a number
+    /// wgsim can produce.
+    pub static HIST: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+    /// Whether the probe records. Read once and cached.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_GLOBAL_FP").is_some())
+    }
+
+    /// Classify one call. `w_` is the caller's band, i.e. what the existing gate tests.
+    pub fn survey(l_query: i32, rlen: i32, query: &[u8], rseq: &[u8], opt: &MemOpt, w_: i32) {
+        if !enabled() {
+            return;
+        }
+        CALLS.fetch_add(1, Relaxed);
+        // The DP's cost is rows times band width; the band the caller would use is what a skip saves.
+        CELLS.fetch_add((rlen.max(1) as u64) * (2 * w_.max(1) as u64 + 1), Relaxed);
+        if l_query == rlen && w_ == 0 {
+            ALREADY_FAST.fetch_add(1, Relaxed);
+            return;
+        }
+        if l_query != rlen {
+            return;
+        }
+        EQ_LEN.fetch_add(1, Relaxed);
+        let threshold = {
+            let num = opt.o_ins + opt.e_ins + opt.o_del + opt.e_del;
+            let den = opt.a + opt.b;
+            if den > 0 {
+                (num - 1) / den
+            } else {
+                0
+            }
+        };
+        THRESHOLD.store(threshold.max(0) as u64, Relaxed);
+        let mut mis = 0i32;
+        let mut ambig = false;
+        for i in 0..l_query as usize {
+            let (q, t) = (query[i], rseq[i]);
+            if q >= 4 || t >= 4 {
+                ambig = true;
+                break;
+            }
+            if q != t {
+                mis += 1;
+            }
+        }
+        if ambig {
+            AMBIG.fetch_add(1, Relaxed);
+            return;
+        }
+        HIST[(mis.min(15)) as usize].fetch_add(1, Relaxed);
+        if mis > threshold {
+            return;
+        }
+        PROVABLE.fetch_add(1, Relaxed);
+        CELLS_PROVABLE.fetch_add((rlen.max(1) as u64) * (2 * w_.max(1) as u64 + 1), Relaxed);
+    }
+
+    /// Print the survey once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let calls = CALLS.load(Relaxed).max(1);
+        let cells = CELLS.load(Relaxed).max(1);
+        eprintln!(
+            "[global-fp] {} ksw_global2 calls, {} already take the w_==0 fast path, {} have equal lengths",
+            CALLS.load(Relaxed),
+            ALREADY_FAST.load(Relaxed),
+            EQ_LEN.load(Relaxed),
+        );
+        eprintln!(
+            "[global-fp] provably a full-length diagonal: {} ({:.1}% of calls), carrying {:.1}% of the banded cells",
+            PROVABLE.load(Relaxed),
+            PROVABLE.load(Relaxed) as f64 * 100.0 / calls as f64,
+            CELLS_PROVABLE.load(Relaxed) as f64 * 100.0 / cells as f64,
+        );
+        let h: Vec<String> = HIST
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{i}:{}", c.load(Relaxed)))
+            .collect();
+        eprintln!(
+            "[global-fp] ambiguous {} | mismatches over the diagonal {}",
+            AMBIG.load(Relaxed),
+            h.join(" ")
+        );
+        eprintln!(
+            "[global-fp] the lemma licenses X <= {}",
+            THRESHOLD.load(Relaxed)
+        );
+    }
 }
