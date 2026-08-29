@@ -71,6 +71,69 @@ static const char *SRC =
 "    device uchar *t = p; p = c; c = t;\n"
 "  }\n"
 "}\n"
+"kernel void mem1b(device uchar *hp [[buffer(0)]],\n"
+"                  device uchar *hc [[buffer(1)]],\n"
+"                  device uchar *ev [[buffer(2)]],\n"
+"                  constant uint &cols [[buffer(3)]],\n"
+"                  constant uint &rows [[buffer(4)]],\n"
+"                  constant uint &stride [[buffer(5)]],\n"
+"                  device const uchar *seqs [[buffer(6)]],\n"
+"                  uint gid [[thread_position_in_grid]]) {\n"
+"  device uchar *p = hp, *c = hc;\n"
+"  uchar f = 0, hd = 0, imax = 0; uint imax_col = 0;\n"
+"  ulong qoff = (ulong)gid * cols;\n"
+"  for (uint i = 0; i < rows; ++i) {\n"
+"    uchar t = seqs[qoff + (i % cols)];\n"
+"    for (uint j = 0; j < cols; ++j) {\n"
+"      ulong o = (ulong)j * stride + gid;\n"
+"      uchar q = seqs[qoff + j];\n"
+"      uchar s = (t == 4 || q == 4) ? (uchar)1 : (t == q ? (uchar)5 : (uchar)0);\n"
+"      uchar e = ev[o];\n"
+"      uchar h = max(max(subsat(addsat(hd, s), (uchar)4), e), f);\n"
+"      if (h > imax) { imax = h; imax_col = j; }\n"
+"      hd = p[o];\n"
+"      c[o] = h;\n"
+"      ev[o] = max(subsat(e, (uchar)1), subsat(h, (uchar)7));\n"
+"      f     = max(subsat(f, (uchar)1), subsat(h, (uchar)7));\n"
+"    }\n"
+"    device uchar *t2 = p; p = c; c = t2;\n"
+"  }\n"
+"  if (imax_col == 0xffffffffu) hc[gid] = imax;\n"
+"}\n"
+"kernel void mem1d(device uchar *hp [[buffer(0)]],\n"
+"                  device uchar *hc [[buffer(1)]],\n"
+"                  device uchar *ev [[buffer(2)]],\n"
+"                  constant uint &cols [[buffer(3)]],\n"
+"                  constant uint &rows [[buffer(4)]],\n"
+"                  constant uint &stride [[buffer(5)]],\n"
+"                  device const uchar *seqs [[buffer(6)]],\n"
+"                  uint gid [[thread_position_in_grid]]) {\n"
+"  device uchar *p = hp, *c = hc;\n"
+"  uchar f = 0, hd = 0, imax = 0; uint imax_col = 0;\n"
+"  ulong qoff = (ulong)gid * cols;\n"
+// The one difference left between this probe and the aligner's kernel: per-thread trip counts.
+// A launch's targets run 600 to 650 bases, so neighbouring lanes of a simdgroup do not finish
+// together and the group runs at its longest lane. Spread is +/-8% around `rows`, which is what the
+// aligner's own accounting reports for its batches.
+"  uint my_rows = rows - (rows / 12) + ((gid * 2654435761u) >> 28) * (rows / 90 + 1);\n"
+"  for (uint i = 0; i < my_rows; ++i) {\n"
+"    uchar t = seqs[qoff + (i % cols)];\n"
+"    for (uint j = 0; j < cols; ++j) {\n"
+"      ulong o = (ulong)j * stride + gid;\n"
+"      uchar q = seqs[qoff + j];\n"
+"      uchar s = (t == 4 || q == 4) ? (uchar)1 : (t == q ? (uchar)5 : (uchar)0);\n"
+"      uchar e = ev[o];\n"
+"      uchar h = max(max(subsat(addsat(hd, s), (uchar)4), e), f);\n"
+"      if (h > imax) { imax = h; imax_col = j; }\n"
+"      hd = p[o];\n"
+"      c[o] = h;\n"
+"      ev[o] = max(subsat(e, (uchar)1), subsat(h, (uchar)7));\n"
+"      f     = max(subsat(f, (uchar)1), subsat(h, (uchar)7));\n"
+"    }\n"
+"    device uchar *t2 = p; p = c; c = t2;\n"
+"  }\n"
+"  if (imax_col == 0xffffffffu) hc[gid] = imax;\n"
+"}\n"
 "kernel void mem4(device uchar4 *hp [[buffer(0)]],\n"
 "                 device uchar4 *hc [[buffer(1)]],\n"
 "                 device uchar4 *ev [[buffer(2)]],\n"
@@ -119,13 +182,15 @@ int main(void) { @autoreleasepool {
   id<MTLBuffer> qb = [dev newBufferWithLength:(size_t)cols * jobs
                                       options:MTLResourceStorageModePrivate];
 
-  struct { const char *name; const char *fn; uint32_t threads; uint32_t stride; double per_iter; } arms[3] = {
+  struct { const char *name; const char *fn; uint32_t threads; uint32_t stride; double per_iter; } arms[5] = {
     { "mem1  (uchar,  1 job/thread)",        "mem1",  jobs,     jobs,     1.0 },
     { "mem4  (uchar4, 4 jobs/thread)",       "mem4",  jobs / 4, jobs / 4, 4.0 },
     { "mem1g (uchar + query gather/cell)",   "mem1g", jobs,     jobs,     1.0 },
+    { "mem1b (gather + branches/cell)",      "mem1b", jobs,     jobs,     1.0 },
+    { "mem1d (+ per-thread trip counts)",    "mem1d", jobs,     jobs,     1.0 },
   };
-  double gcell[3];
-  for (int a = 0; a < 3; ++a) {
+  double gcell[5];
+  for (int a = 0; a < 5; ++a) {
     id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:arms[a].fn]];
     id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:fn error:&err];
     if (!ps) { printf("pipeline failed: %s\n", err.localizedDescription.UTF8String); return 1; }
@@ -139,7 +204,7 @@ int main(void) { @autoreleasepool {
       [ce setBytes:&c length:4 atIndex:3];
       [ce setBytes:&r length:4 atIndex:4];
       [ce setBytes:&s length:4 atIndex:5];
-      if (a == 2) [ce setBuffer:qb offset:0 atIndex:6];
+      if (a >= 2) [ce setBuffer:qb offset:0 atIndex:6];
       [ce dispatchThreads:MTLSizeMake(arms[a].threads,1,1)
           threadsPerThreadgroup:MTLSizeMake(ps.maxTotalThreadsPerThreadgroup,1,1)];
       [ce endEncoding];
@@ -154,5 +219,9 @@ int main(void) { @autoreleasepool {
   }
   printf("\nuchar4 against scalar: %.2fx\n", gcell[1]/gcell[0]);
   printf("what the per-cell query gather costs: %.2fx\n", gcell[2]/gcell[0]);
+  printf("what the per-cell branches add on top: %.2fx\n", gcell[3]/gcell[2]);
+  printf("gather and branches together: %.2fx\n", gcell[3]/gcell[0]);
+  printf("what divergent trip counts add on top: %.2fx\n", gcell[4]/gcell[3]);
+  printf("all three against the plain kernel: %.2fx\n", gcell[4]/gcell[0]);
   return 0;
 } }
