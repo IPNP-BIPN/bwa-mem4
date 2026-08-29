@@ -353,3 +353,43 @@ The general lesson is the one this file keeps learning from the other direction.
 the SOURCE is not an op count. #43 and #48 both reasoned about "ops per cell" from the Rust, and the
 compiler had already collected the easy half. Count instructions in the binary before believing a
 source-level tally, especially for anything a peephole optimiser could see.
+
+## Issue #48 is finished, and the extension kernel's remaining gap is its recurrence (2026-08-29)
+
+The extension kernel costs 1.00 vector instruction per cell against the rescue kernel's 0.69,
+counted in the shipped binary. That 0.31 is five vector instructions per column on the line that is
+24% of the x86 profile, so it was worth finding out what they are. The answer closes the issue.
+
+**Lever A: already done by LLVM.** `max(saturating_sub_u8(a, b), 0)` is `saturating_sub_u8(a, b)`,
+and the compiler knew. Implemented, measured at nothing on either ISA, and proven by disassembly
+(`vpmaxub=100` and `vpsubusb=312` on both sides of the change, executables the same size). Reverted.
+
+**Lever D: also already done by LLVM.** The issue says `j` is broadcast twice per column, once for
+the band compare and once for the `mj` update. On NEON `band_bias` is 0 so the two are the same
+value and CSE collapses them; on AVX2 the bias is 0x80 and they are different values, which is where
+the lever was supposed to pay. The AVX2 column loop contains **one** `vpbroadcast`. The compiler had
+hoisted the other one anyway.
+
+**Levers B and C: already implemented, and on by default.** `inline_sbt_enabled` folds the
+substitution pre-pass into the column loop, and `band_bias` builds the band mask in signed space.
+The binary agrees: the DP loop has three loads and **two** stores, with no third store for a
+`sbt_buf` round trip.
+
+**So what are the five instructions?** They are the recurrence, not slack. Side by side, the NEON
+column loops:
+
+| | rescue | extension |
+|---|---|---|
+| instructions | 17 | 25 |
+| vector | 11 | 16 |
+| loads / stores | 2 / 2 | 3 / 2 |
+
+The extension kernel carries `cmeq` plus `bic` to implement "H(i-1,j-1) == 0 means unreachable",
+which the rescue recurrence does not have; it computes its substitution score inline where the
+rescue kernel's is already folded into its loads; and it maintains a band mask per column because
+its band is per lane. Every one of those is a term the extension DP has and the rescue DP does not.
+
+There is no slack left in this kernel for issue #48 to remove. Anyone returning here should start
+from the recurrence, not from the instruction count, and should note that three of the four levers
+in that issue were rewrites the compiler had already performed. A count of operations read off the
+source is not a count of operations.
