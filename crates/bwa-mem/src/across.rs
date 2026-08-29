@@ -1551,6 +1551,7 @@ fn run_side<B: SwBackend>(
                 h0: jobs[k].h0,
             })
             .collect();
+        ungapped_fp::survey(&batch, opt, round);
         // `opt.mat` is the flattened `ALPHABET_SIZE x ALPHABET_SIZE` substitution matrix.
         // `results` is parallel to `batch`, hence to `active_idxs`, not to `jobs`.
         let results = align_split::measure(&align_split::EXTEND_NS, || {
@@ -1781,5 +1782,110 @@ mod tests {
                 codes.len()
             );
         }
+    }
+}
+
+/// `BWA4_UNGAPPED_FP=1` probe: how much of the banded DP is an ungapped diagonal that could be
+/// proven optimal without running it.
+///
+/// fg-labs/bwa-mem3 carries this as `ungapped_analyze` (`bwamem.cpp:4241`) and skips the banded
+/// Smith-Waterman outright when it fires. The argument is a scoring-model proof rather than a
+/// heuristic: an ungapped walk carrying `X` mismatches scores `X * (a + b)` below the all-match
+/// diagonal, while the cheapest gapped alternative pays at least `o_min + e_min` and can at best
+/// convert every one of those mismatches back into a match. So the ungapped answer is the unique
+/// optimum while `X * (a + b) < o_min + e_min`, i.e. `X <= (o_min + e_min - 1) / (a + b)`, which at
+/// bwa's defaults (a=1, b=4, o=6, e=1) is `X <= 1`.
+///
+/// This measures the prize before anything is built: how many extension jobs qualify, and what
+/// share of the DP cells they carry. It changes nothing.
+pub mod ungapped_fp {
+    use bwa_extend::ExtendJob;
+    use bwa_core::MemOpt;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    pub static HIT_ZERO: AtomicU64 = AtomicU64::new(0);
+    pub static HIT_THRESH: AtomicU64 = AtomicU64::new(0);
+    pub static AMBIG: AtomicU64 = AtomicU64::new(0);
+    pub static CELLS: AtomicU64 = AtomicU64::new(0);
+    pub static CELLS_HIT: AtomicU64 = AtomicU64::new(0);
+    pub static ROUND0: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe records. Read once and cached, like every other probe in this crate.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_UNGAPPED_FP").is_some())
+    }
+
+    /// Count one round's batch. `round` is recorded because only round 0 is the interesting case:
+    /// a job that reached a later round is one the acceptance test rejected, and the fast path
+    /// would have kept it out of the DP in the first place.
+    pub fn survey(batch: &[ExtendJob], opt: &MemOpt, round: i32) {
+        if !enabled() {
+            return;
+        }
+        if round == 0 {
+            ROUND0.fetch_add(batch.len() as u64, Relaxed);
+        }
+        // The threshold from the scoring model, exactly as the fork derives it.
+        let o_min = opt.o_del.min(opt.o_ins);
+        let e_min = opt.e_del.min(opt.e_ins);
+        let x_threshold = if opt.a + opt.b > 0 {
+            (o_min + e_min - 1) / (opt.a + opt.b)
+        } else {
+            0
+        };
+        for j in batch {
+            let n = j.query.len().min(j.target.len());
+            JOBS.fetch_add(1, Relaxed);
+            CELLS.fetch_add((j.query.len() * j.target.len()) as u64, Relaxed);
+            let mut mis = 0i32;
+            let mut ambig = false;
+            for i in 0..n {
+                let (q, t) = (j.query[i], j.target[i]);
+                if q >= 4 || t >= 4 {
+                    ambig = true;
+                    break;
+                }
+                if q != t {
+                    mis += 1;
+                }
+            }
+            if ambig {
+                AMBIG.fetch_add(1, Relaxed);
+                continue;
+            }
+            if mis == 0 && j.h0 > 0 {
+                HIT_ZERO.fetch_add(1, Relaxed);
+            }
+            if mis <= x_threshold {
+                HIT_THRESH.fetch_add(1, Relaxed);
+                CELLS_HIT.fetch_add((j.query.len() * j.target.len()) as u64, Relaxed);
+            }
+        }
+    }
+
+    /// Print the survey once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let jobs = JOBS.load(Relaxed).max(1);
+        let cells = CELLS.load(Relaxed).max(1);
+        eprintln!(
+            "[ungapped-fp] {} extension jobs ({} in round 0), {} with an ambiguous base",
+            JOBS.load(Relaxed),
+            ROUND0.load(Relaxed),
+            AMBIG.load(Relaxed),
+        );
+        eprintln!(
+            "[ungapped-fp] provably ungapped-optimal: {} jobs ({:.1}%), of which {} are exact matches; \
+             they carry {:.1}% of the DP cells",
+            HIT_THRESH.load(Relaxed),
+            HIT_THRESH.load(Relaxed) as f64 * 100.0 / jobs as f64,
+            HIT_ZERO.load(Relaxed),
+            CELLS_HIT.load(Relaxed) as f64 * 100.0 / cells as f64,
+        );
     }
 }

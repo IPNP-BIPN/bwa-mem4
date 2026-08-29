@@ -220,3 +220,69 @@ KNOWN region score, and it is already `0` for every one- and two-mismatch record
 where the shortcut's premise fails. Reverted, since it costs a diagonal scan per call to catch
 nothing; the general lesson is that a bound derived from the known score was already in the C, and
 checking what `infer_bw` leaves behind should precede any scheme that re-derives it.
+
+## Three x86 hypotheses, measured: one structural bug, one null, one that is their divergence (2026-08-29)
+
+The side-by-side profile (`docs/x86-side-by-side-profile.md`) produced three hypotheses about the
+wgsim deficit. Measuring them is what this entry records, because two of the three are now closed.
+
+### The memory-level-parallelism knobs are already right on x86. NULL.
+
+`DEFAULT_LOCKSTEP_WIDTH` is 32 on aarch64 and 16 on x86, with a comment saying no x86 measurement
+existed to move it. `BWA4_SA_WINDOW` was swept flat from 16 to 128 on three machines, all of them
+Apple Silicon or hosted ARM. `BWA4_SEED_PREFETCH` likewise. All three trade instructions for
+memory-level parallelism, so the obvious hypothesis was that they pay more where a DRAM miss costs
+more, and the profile put `get_sa_batch` at 4.1 units against the fork's 0.9.
+
+Swept on an EPYC 7763, 1M chr21 pairs, each arm interleaved with a control at the defaults:
+
+| arm | wall | against its own control |
+|---|---|---|
+| `BWA4_LOCKSTEP_N=16` (the x86 default) | 90.46 s | +0.5% |
+| `BWA4_LOCKSTEP_N=32` (the arm64 default) | 91.99 s | -1.5% |
+| `BWA4_LOCKSTEP_N=64` | 94.98 s | -2.9% |
+| `BWA4_SA_WINDOW=32` | 92.07 s | -0.3% |
+| `BWA4_SA_WINDOW=64` | 93.69 s | -0.8% |
+| `BWA4_SA_WINDOW=256` | 93.88 s | -0.9% |
+| `BWA4_SEED_PREFETCH=0` | 92.26 s | +0.7% |
+| `BWA4_SEED_PREFETCH=16` | 92.48 s | -0.3% |
+| `BWA4_SEED_PREFETCH=32` | 92.03 s | +0.2% |
+
+Every arm is identical to the control's md5, and every one except `LOCKSTEP_N=64` is inside the
+control's own drift over the run (90.6 to 93.1 s). The defaults are right, on x86 as on arm64, and
+widening the arm64 value onto x86 would have cost 1.5%. The hypothesis was mine and it is dead.
+
+Note what this does NOT close: the profile's 4.5x on SA resolution is real, and it is not prefetch
+tuning. It is either more walks or a slower walk, and the grouping that produced "4.5x" put the
+fork's `ls_advance_*_step` in seeding rather than in SA resolution, which is a judgement call that
+could move the number.
+
+### The reference unpack had no x86 path at all. A REAL BUG, fixed.
+
+`unpack_pac_fwd` unpacked sixteen bases per iteration under `cfg(target_arch = "aarch64")` and fell
+through to a per-base scalar loop everywhere else. That is the whole of the 3.50%-against-1.39% in
+the profile. An SSSE3 path, selected at runtime, is in. Not a dead end: recorded here because the
+SHAPE of the bug is worth remembering, a vector path written on the development machine and never
+mirrored on the deployment one.
+
+### Their tighter band is their divergence, not a free lunch. CANNOT BE TAKEN.
+
+`ungapped_analyze` (`bwamem.cpp:4241`) derives the extension band from a mismatch bitmap and says of
+it: "the optimal ungapped score over all prefix lengths in [0, N], with no floor (score is allowed
+to dip and recover). It is >= the walk's max_sc, so substituting it into the band proof yields a
+strictly tighter (still safe) bound."
+
+Our `tight_band_bound` says the opposite, and says it from experience: "The first version of this
+walk floored at zero and kept going, which OVERSTATES S whenever the diagonal dips and recovers,
+which narrows the band below what the lemma licenses, which is how it moved XS on 1.1% of chr21
+records."
+
+Both cannot be right, and the lemma settles it. The band proof is "no alignment outside the band can
+beat S", so S has to be a score the band-limited DP genuinely ATTAINS. A no-floor prefix maximum is
+not attainable by a local DP that dies at zero, so a band derived from it can exclude an offset that
+would have won. The fork can afford that because it lists score2 and MAPQ convergence among its
+accepted differences; we cannot, and we already paid once to learn it.
+
+So part of the extension-kernel row in the side-by-side table is the fork computing FEWER CELLS than
+byte-identity permits, rather than computing the same cells faster. That is not a lever, it is a
+different acceptance criterion, and it should stop being read as a gap to close.

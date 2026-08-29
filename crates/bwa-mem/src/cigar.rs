@@ -368,16 +368,27 @@ pub(crate) fn gen_cigar2(
     let rlen = (re - rb) as i32;
     // Owned copy of the query codes, because the reverse-strand branch below mutates it in place.
     // Length `l_query`; indexed by the `query_pos` cursor during the NM/MD walk.
-    let mut query: Vec<u8> = query_codes.to_vec();
+    //
+    // Both this and `rseq` below come from a per-thread buffer instead of a fresh allocation. This
+    // function runs once per EMITTED RECORD, so the two allocations it used to make were two per
+    // record: the allocation probe counts 51.7M allocations in the `sam_emit` bucket on a 1M-pair
+    // wgsim run, and the fork carries a per-chunk arena (`read_arena.h`) precisely to avoid this
+    // class of traffic. The buffers are taken out of the thread-local and put back at the end; an
+    // early return would simply drop them and cost one allocation next call, so this is a
+    // performance path and never a correctness one.
+    let mut query: Vec<u8> = SCRATCH_QUERY.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    query.clear();
+    query.extend_from_slice(query_codes);
     // The reference side of the alignment: `rlen` nt4 codes for packed positions `[rb, re)`.
     // `bases` is the bulk unpack; it handles the reverse-strand half of the pac exactly as the
     // per-base `base(p)` did, and does the index arithmetic once for the range instead of once per
     // base. This runs per emitted record, so it is on the same footing as the window fetch in
     // `across.rs`.
-    let mut rseq: Vec<u8> = crate::emit_split::measure(
+    let mut rseq: Vec<u8> = SCRATCH_RSEQ.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    crate::emit_split::measure(
         &crate::emit_split::BASES_NS,
         &crate::emit_split::BASES_CALLS,
-        || fm.bases(rb, re),
+        || fm.bases_into(rb, re, &mut rseq),
     );
     // Reverse both sides for reverse-strand hits (bwa.cpp:274). This is NOT a complement, only an
     // order reversal, and it exists purely so that ties in gap placement resolve to the leftmost
@@ -550,7 +561,20 @@ pub(crate) fn gen_cigar2(
     // MD always ends with a run length, even when that run is empty ("0"), matching the final
     // `kputw(u, &str)` at bwa.cpp:336.
     crate::emit::push_int_str(&mut md, i64::from(match_run));
+    // Hand both buffers back for the next record on this thread. There is no early return between
+    // here and where they were taken, so this runs on every path that took them.
+    SCRATCH_QUERY.with(|c| *c.borrow_mut() = std::mem::take(&mut query));
+    SCRATCH_RSEQ.with(|c| *c.borrow_mut() = std::mem::take(&mut rseq));
     Some((score, cigar, n_mm + n_gap, md))
+}
+
+thread_local! {
+    /// Per-thread scratch for [`gen_cigar2`]'s owned copy of the query codes. See the comment at
+    /// its first use: this function runs once per emitted record, so a fresh `Vec` here is one
+    /// allocation per record.
+    static SCRATCH_QUERY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Per-thread scratch for the reference window the same function unpacks.
+    static SCRATCH_RSEQ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Turn an alignment region into a finalized alignment (CIGAR, NM, MD, position). Port of the CIGAR
