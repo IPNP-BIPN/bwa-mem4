@@ -220,3 +220,39 @@ KNOWN region score, and it is already `0` for every one- and two-mismatch record
 where the shortcut's premise fails. Reverted, since it costs a diagonal scan per call to catch
 nothing; the general lesson is that a bound derived from the known score was already in the C, and
 checking what `infer_bw` leaves behind should precede any scheme that re-derives it.
+
+## Saturating the CPU: it is already at 64%, and issue #48's op count was a source-level tally (2026-08-29)
+
+The same question that reopened the GPU, asked of the CPU: how far is the shipped kernel from what
+the machine does? The answer is a different shape entirely, and it is worth writing down beside the
+GPU one because the two together say where the remaining work is.
+
+**The CPU is close to its ceiling.** `matesw`'s own note records the measurement: peak NEON op
+throughput with no dependencies and no memory is 16.63 G ops/s; the kernel's own per-cell op sequence
+in registers is 16.04 Gcell/s, 93% of that; the shipped kernel on real data is 10.34 Gcell/s, **64%
+of the ceiling**. So the CPU has at most **1.55x** of headroom on this stage, against the **32x** the
+GPU had when its file was reopened, and the remaining 36% is named rather than mysterious: the 1.09x
+lane-divergence tax, the row epilogue's scalar sixteen-lane loop, the padded tail columns (1.42
+instructions per cell against 1.11) and the group pack and extract.
+
+**And the extension kernel is 1.45x the rescue kernel per cell, not the 2.1x issue #48 estimated.**
+Counted in the shipped binary rather than in the source, taking the innermost column loop of each:
+
+| kernel | inner loop | vector instructions | per cell, 16 lanes |
+|---|---|---|---|
+| `fwd_local_sw_neon_u8` (rescue) | 17 instructions, 2 loads, 2 stores | 11 | **0.69** |
+| `batched_extend_neon_u8` (extension) | 21 instructions, 3 loads, 0 stores | 16 | **1.00** |
+
+Issue #48 read 2.0 operations per cell against `matesw`'s 0.95 off the Rust and called the extension
+kernel twice as expensive. The binary says 1.45x on vector instructions and 1.24x on all
+instructions. The gap is real and it is smaller than the issue claimed, which matters because the
+issue's four levers were sized against the larger number.
+
+This is the second time this week the same correction has been needed, and the first was in the same
+issue: lever A was already applied by LLVM, proven by `vpmaxub=100` on both sides of the change. A
+count of operations read off the source is not a count of operations. Count them in the binary.
+
+**What that leaves.** The extension kernel's extra 0.31 vector instructions per cell is five vector
+instructions per column, and that is the whole of the CPU-side prize on the biggest line of the
+profile. It is worth having and it is not a factor. The factor is on the GPU, where the same
+recurrence was running at 3.1% of the machine.
