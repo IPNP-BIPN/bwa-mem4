@@ -449,8 +449,15 @@ mod sort_scratch {
 
     /// Pass 1a's permutation: `re` and the index of the region it came from.
     type PermRe = Vec<(i64, u32)>;
-    /// Pass 3's permutation: the three-field sort key `(score, rb, qb)` and the same index.
+    /// Pass 3's permutation: the sort key and the index of the region it came from.
+    ///
+    /// The key's SHAPE is per-architecture, and that is measured rather than assumed. See the sort
+    /// itself for the numbers; in one line, packing `(score, rb, qb)` into a u128 is a win on
+    /// aarch64 and a 1.27x LOSS on x86-64, which has no 128-bit ALU.
+    #[cfg(target_arch = "x86_64")]
     type PermScore = Vec<((i32, i64, i32), u32)>;
+    #[cfg(not(target_arch = "x86_64"))]
+    type PermScore = Vec<(u128, u32)>;
 
     thread_local! {
         pub static PERM_RE: RefCell<PermRe> = const { RefCell::new(Vec::new()) };
@@ -512,11 +519,14 @@ pub fn mem_sort_dedup_patch(
     // `_by_key` rather than `_by`: same algorithm, same permutation (proved and tested in
     // `bwa-chain`), but the 96-byte `MemAlnReg`s move once at the end instead of twice per swap.
     // This sort and the one in pass 3 are together the most-executed sort in the run.
+    let _t1 = crate::rescue_split::start();
     sort_scratch::PERM_RE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
             ks_introsort_by_key(&mut a, perm, spare, |r| r.re, |x, y| x < y);
         });
     });
+    crate::rescue_split::stop(&crate::rescue_split::T_SORT1, _t1);
+    let _t2 = crate::rescue_split::start();
     // `n_comp` counts how many original regions were folded into this one; it starts at 1 (itself)
     // and the merge branch accumulates. Only `mem_patch_reg` merging changes it.
     for r in &mut a {
@@ -626,10 +636,43 @@ pub fn mem_sort_dedup_patch(
     // and keeps the relative order, which is exactly `retain`'s contract.
     a.retain(|r| r.qe > r.qb);
 
+    crate::rescue_split::stop(&crate::rescue_split::T_SCAN, _t2);
+    let _t3 = crate::rescue_split::start();
     // ---- Pass 3: re-sort by score and drop exact coordinate duplicates ------------------------
     // Sort by score desc, then rb, then qb (`alnreg_slt`), again with bwa's unstable introsort.
+    // The key is per-architecture, and the split is measured, not guessed.
+    //
+    // `(score, rb, qb)` packs EXACTLY into 128 bits: 32 of score, 64 of `rb`, 32 of `qb`. On aarch64
+    // that is a win, because one 128-bit compare replaces a three-field branchy one. On x86-64 it is
+    // a LOSS, because there is no 128-bit ALU: building the key costs two multi-word shifts per
+    // element, and the comparison saving does not repay them. Measured with
+    // `examples/score_sort_bench.rs`, 92 rows per sort and 200k sorts, best of three interleaved:
+    //
+    //   | key           | aarch64 | x86-64-v3 |
+    //   |---------------|---------|-----------|
+    //   | tuple         | 1.00x   | 1.00x     |
+    //   | packed u128   | 0.97x   | **1.27x** |
+    //   | pair of u64   | 1.03x   | 1.10x     |
+    //
+    // The u128 form was introduced on the strength of an aarch64-only measurement, and x86 is the
+    // architecture this project is BEHIND on, so that was the wrong way round.
+    //
+    // Either form is byte-identical to the other and to the original. `ks_introsort_by` is
+    // permutation-observable (which region survives a tie is decided by where the unstable sort
+    // leaves it), so the algorithm may not be swapped; but the permutation depends only on the
+    // BOOLEAN each comparison returns, and an order-preserving encoding returns the same boolean for
+    // every input. The bench asserts the two permutations are equal before timing either.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline(always)]
+    fn score_key(r: &MemAlnReg) -> u128 {
+        let score = !((r.score as u32) ^ 0x8000_0000) as u128;
+        let rb = ((r.rb as u64) ^ 0x8000_0000_0000_0000) as u128;
+        let qb = ((r.qb as u32) ^ 0x8000_0000) as u128;
+        (score << 96) | (rb << 32) | qb
+    }
     sort_scratch::PERM_SCORE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
+            #[cfg(target_arch = "x86_64")]
             ks_introsort_by_key(
                 &mut a,
                 perm,
@@ -637,6 +680,8 @@ pub fn mem_sort_dedup_patch(
                 |r| (r.score, r.rb, r.qb),
                 |x, y| x.0 > y.0 || (x.0 == y.0 && (x.1 < y.1 || (x.1 == y.1 && x.2 < y.2))),
             );
+            #[cfg(not(target_arch = "x86_64"))]
+            ks_introsort_by_key(&mut a, perm, spare, score_key, |x, y| x < y);
         });
     });
     // Exact-duplicate removal (`bwamem.cpp:343`). After the score sort, identical regions are
@@ -652,6 +697,7 @@ pub fn mem_sort_dedup_patch(
     // keeping `a[0]`. That is safe to express as a plain `retain` because the marking loop above
     // also starts at 1 and therefore can never kill `a[0]`.
     a.retain(|r| r.qe > r.qb);
+    crate::rescue_split::stop(&crate::rescue_split::T_SORT3, _t3);
     a
 }
 

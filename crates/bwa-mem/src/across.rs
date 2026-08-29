@@ -539,9 +539,16 @@ struct SideJob {
     /// Query bases, 2-bit codes 0..=3 with 4 for N, oriented **outward from the seed**: for a left
     /// job the read is reversed so index 0 is the base immediately left of the seed. This is why the
     /// same DP kernel serves both sides.
-    query: Vec<u8>,
-    /// Reference bases in the same outward orientation, taken from the chain's fetched window.
-    target: Vec<u8>,
+    ///
+    /// A `(start, len)` range into the collection pass's arena, not an owned vector. Two vectors per
+    /// seed per side was four allocations per seed and 70M of the 302M allocations a 1M-pair wgsim
+    /// run makes; more to the point it was a REVERSAL per seed, when the reversed prefix a seed
+    /// needs is a suffix of the read reversed once. The arena holds each read's codes forward and
+    /// reversed, and each chain's window forward and reversed, so every job is a slice of something
+    /// built once rather than a copy built per seed.
+    query: (u32, u32),
+    /// Reference bases in the same outward orientation, as a range into the same arena.
+    target: (u32, u32),
     /// Starting DP score handed to `ksw_extend`. For left jobs it is `seed.len * opt.a` (the seed's
     /// own match score, `bwamem.cpp:2249`). For right jobs it is filled in later from the region's
     /// post-left `score`, which is why it starts at the `H0_SENTINEL` placeholder, matching the C's
@@ -1101,7 +1108,19 @@ fn align_reads_batched_inner<B: SwBackend>(
     // millions of short vectors, and returning an owned one each time made the allocator visible
     // next to the unpack itself.
     let mut rseq_buf: Vec<u8> = Vec::new();
+    // Backing store for every job's query and target. Cleared once per chunk; the ranges in
+    // `SideJob` index it. Holding it whole for the chunk is what the owned vectors were doing
+    // anyway, and this way each read's bases and each chain's window are stored ONCE instead of
+    // once per seed that slices them.
+    let mut arena: Vec<u8> = Vec::new();
     for (r, codes) in reads.iter().enumerate() {
+        // This read's bases in the arena, forward then reversed. Right-side jobs slice the forward
+        // copy from `qe`; left-side jobs slice the LAST `qbeg` bytes of the reversed copy, which is
+        // exactly `codes[qbeg-1], ..., codes[0]`.
+        let fwd_off = arena.len() as u32;
+        arena.extend_from_slice(codes);
+        let rev_off = arena.len() as u32;
+        arena.extend(codes.iter().rev().copied());
         // This read's length in bases, and its surviving chains. `l_query` is the 3' limit every
         // right-side decision below compares against.
         let l_query = codes.len() as i32;
@@ -1166,6 +1185,13 @@ fn align_reads_batched_inner<B: SwBackend>(
             // chain filter) stay: they wrap per-batch and per-read work, where the check is free.
             fm.bases_into(rmax0, rmax1, &mut rseq_buf);
             let rseq = &rseq_buf[..];
+            // Same pair for the chain's window: forward for right-side targets, reversed for
+            // left-side ones.
+            let rseq_off = arena.len() as u32;
+            arena.extend_from_slice(rseq);
+            let rrseq_off = arena.len() as u32;
+            arena.extend(rseq.iter().rev().copied());
+            let w_len = rseq.len() as u32;
 
             // Seeds in descending (score, index) order.
             //
@@ -1265,12 +1291,13 @@ fn align_reads_batched_inner<B: SwBackend>(
                     // `qbeg` bases before the seed, last-first (C: `qs[i] = query[s->qbeg-1-i]`,
                     // `bwamem.cpp:2286`). Target: the `rbeg - rmax0` window bases before the seed,
                     // likewise reversed (C: `rs[i] = rseq[tmp-1-i]`, `bwamem.cpp:2299`).
-                    let query: Vec<u8> = (0..seed.qbeg).rev().map(|i| codes[i as usize]).collect();
+                    let l_codes = codes.len() as u32;
+                    let query = (rev_off + l_codes - seed.qbeg as u32, seed.qbeg as u32);
                     // Bases of the window lying left of the seed, i.e. how much reference the left
                     // extension may consume. Non-negative because `rmax0 <= seed.rbeg` by
                     // construction of the window above.
-                    let rlen = (seed.rbeg - rmax0) as usize;
-                    let target: Vec<u8> = (0..rlen).rev().map(|i| rseq[i]).collect();
+                    let rlen = (seed.rbeg - rmax0) as u32;
+                    let target = (rrseq_off + w_len - rlen, rlen);
                     // Provisional bounds at the seed's left edge; `run_side` walks them further left
                     // by subtracting the DP's `qle` (query length consumed) / `tle` (target length
                     // consumed).
@@ -1310,8 +1337,8 @@ fn align_reads_batched_inner<B: SwBackend>(
                     // asserts `re >= 0`). Both slices then run to the end of their buffer, which is
                     // the C's `len2 = l_query - qe` and `len1 = rmax[1] - rmax[0] - re`.
                     let re = seed.rbeg + i64::from(seed.len) - rmax0;
-                    let query: Vec<u8> = codes[qe as usize..].to_vec();
-                    let target: Vec<u8> = rseq[re as usize..].to_vec();
+                    let query = (fwd_off + qe as u32, codes.len() as u32 - qe as u32);
+                    let target = (rseq_off + re as u32, w_len - re as u32);
                     reg.qe = qe;
                     // Back to an absolute reference position for the region's bound.
                     reg.re = rmax0 + re;
@@ -1350,7 +1377,15 @@ fn align_reads_batched_inner<B: SwBackend>(
     // `BandedPairWiseSW` objects differing only in that penalty (`bwamem.cpp:2452-2458`). The
     // penalty decides whether a soft clip beats running the alignment to the end of the query.
     align_split::measure(&align_split::SIDE_NS, || {
-        run_side(backend, opt, &mut left_jobs, &mut regs, opt.pen_clip5, true)
+        run_side(
+            backend,
+            opt,
+            &arena,
+            &mut left_jobs,
+            &mut regs,
+            opt.pen_clip5,
+            true,
+        )
     });
 
     // The hard serialisation point, and the reason there are two job arrays rather than one: a right
@@ -1379,6 +1414,7 @@ fn align_reads_batched_inner<B: SwBackend>(
         run_side(
             backend,
             opt,
+            &arena,
             &mut right_jobs,
             &mut regs,
             opt.pen_clip3,
@@ -1512,6 +1548,8 @@ pub(crate) fn discard_enabled() -> bool {
 fn run_side<B: SwBackend>(
     backend: &B,
     opt: &MemOpt,
+    // Backing store the jobs' `(start, len)` ranges index. See `SideJob::query`.
+    arena: &[u8],
     jobs: &mut [SideJob],
     regs: &mut [Vec<MemAlnReg>],
     pen_clip: i32,
@@ -1532,8 +1570,7 @@ fn run_side<B: SwBackend>(
         // `sortPairsLenExt` (`bwamem.cpp:2446`, and again for the right side at `bwamem.cpp:2679`),
         // which also keys on length. Unobservable in the output because each job's result depends
         // only on its own `(query, target, h0, w)`, which is the invariant this whole file rests on.
-        active_idxs
-            .sort_by_key(|&k| std::cmp::Reverse(jobs[k].query.len().max(jobs[k].target.len())));
+        active_idxs.sort_by_key(|&k| std::cmp::Reverse(jobs[k].query.1.max(jobs[k].target.1)));
 
         // ---- step 2: run the batch at this round's band width ----
         // Band width for this round: `opt.w`, then `2*opt.w` (`bwamem.cpp:2474`).
@@ -1545,12 +1582,13 @@ fn run_side<B: SwBackend>(
         let batch: Vec<ExtendJob> = active_idxs
             .iter()
             .map(|&k| ExtendJob {
-                query: &jobs[k].query,
-                target: &jobs[k].target,
+                query: &arena[jobs[k].query.0 as usize..][..jobs[k].query.1 as usize],
+                target: &arena[jobs[k].target.0 as usize..][..jobs[k].target.1 as usize],
                 // `h0`: the score the seed (plus, for right jobs, the left extension) already earned.
                 h0: jobs[k].h0,
             })
             .collect();
+        ungapped_fp::survey(&batch, opt, round);
         // `opt.mat` is the flattened `ALPHABET_SIZE x ALPHABET_SIZE` substitution matrix.
         // `results` is parallel to `batch`, hence to `active_idxs`, not to `jobs`.
         let results = align_split::measure(&align_split::EXTEND_NS, || {
@@ -1656,7 +1694,7 @@ fn run_side<B: SwBackend>(
                     // read length back out of `seq_[sp->seqid].l_seq`. We have no read handle inside
                     // `run_side`, so we add the slice length instead. Identical by the arithmetic
                     // above, and it avoids threading `reads` through purely for this one line.
-                    reg.qe += jobs[job_idx].query.len() as i32;
+                    reg.qe += jobs[job_idx].query.1 as i32;
                     reg.re += i64::from(res.gtle);
                     reg.truesc += res.gscore - h0;
                 }
@@ -1781,5 +1819,110 @@ mod tests {
                 codes.len()
             );
         }
+    }
+}
+
+/// `BWA4_UNGAPPED_FP=1` probe: how much of the banded DP is an ungapped diagonal that could be
+/// proven optimal without running it.
+///
+/// fg-labs/bwa-mem3 carries this as `ungapped_analyze` (`bwamem.cpp:4241`) and skips the banded
+/// Smith-Waterman outright when it fires. The argument is a scoring-model proof rather than a
+/// heuristic: an ungapped walk carrying `X` mismatches scores `X * (a + b)` below the all-match
+/// diagonal, while the cheapest gapped alternative pays at least `o_min + e_min` and can at best
+/// convert every one of those mismatches back into a match. So the ungapped answer is the unique
+/// optimum while `X * (a + b) < o_min + e_min`, i.e. `X <= (o_min + e_min - 1) / (a + b)`, which at
+/// bwa's defaults (a=1, b=4, o=6, e=1) is `X <= 1`.
+///
+/// This measures the prize before anything is built: how many extension jobs qualify, and what
+/// share of the DP cells they carry. It changes nothing.
+pub mod ungapped_fp {
+    use bwa_core::MemOpt;
+    use bwa_extend::ExtendJob;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    pub static HIT_ZERO: AtomicU64 = AtomicU64::new(0);
+    pub static HIT_THRESH: AtomicU64 = AtomicU64::new(0);
+    pub static AMBIG: AtomicU64 = AtomicU64::new(0);
+    pub static CELLS: AtomicU64 = AtomicU64::new(0);
+    pub static CELLS_HIT: AtomicU64 = AtomicU64::new(0);
+    pub static ROUND0: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the probe records. Read once and cached, like every other probe in this crate.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_UNGAPPED_FP").is_some())
+    }
+
+    /// Count one round's batch. `round` is recorded because only round 0 is the interesting case:
+    /// a job that reached a later round is one the acceptance test rejected, and the fast path
+    /// would have kept it out of the DP in the first place.
+    pub fn survey(batch: &[ExtendJob], opt: &MemOpt, round: i32) {
+        if !enabled() {
+            return;
+        }
+        if round == 0 {
+            ROUND0.fetch_add(batch.len() as u64, Relaxed);
+        }
+        // The threshold from the scoring model, exactly as the fork derives it.
+        let o_min = opt.o_del.min(opt.o_ins);
+        let e_min = opt.e_del.min(opt.e_ins);
+        let x_threshold = if opt.a + opt.b > 0 {
+            (o_min + e_min - 1) / (opt.a + opt.b)
+        } else {
+            0
+        };
+        for j in batch {
+            let n = j.query.len().min(j.target.len());
+            JOBS.fetch_add(1, Relaxed);
+            CELLS.fetch_add((j.query.len() * j.target.len()) as u64, Relaxed);
+            let mut mis = 0i32;
+            let mut ambig = false;
+            for i in 0..n {
+                let (q, t) = (j.query[i], j.target[i]);
+                if q >= 4 || t >= 4 {
+                    ambig = true;
+                    break;
+                }
+                if q != t {
+                    mis += 1;
+                }
+            }
+            if ambig {
+                AMBIG.fetch_add(1, Relaxed);
+                continue;
+            }
+            if mis == 0 && j.h0 > 0 {
+                HIT_ZERO.fetch_add(1, Relaxed);
+            }
+            if mis <= x_threshold {
+                HIT_THRESH.fetch_add(1, Relaxed);
+                CELLS_HIT.fetch_add((j.query.len() * j.target.len()) as u64, Relaxed);
+            }
+        }
+    }
+
+    /// Print the survey once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let jobs = JOBS.load(Relaxed).max(1);
+        let cells = CELLS.load(Relaxed).max(1);
+        eprintln!(
+            "[ungapped-fp] {} extension jobs ({} in round 0), {} with an ambiguous base",
+            JOBS.load(Relaxed),
+            ROUND0.load(Relaxed),
+            AMBIG.load(Relaxed),
+        );
+        eprintln!(
+            "[ungapped-fp] provably ungapped-optimal: {} jobs ({:.1}%), of which {} are exact matches; \
+             they carry {:.1}% of the DP cells",
+            HIT_THRESH.load(Relaxed),
+            HIT_THRESH.load(Relaxed) as f64 * 100.0 / jobs as f64,
+            HIT_ZERO.load(Relaxed),
+            CELLS_HIT.load(Relaxed) as f64 * 100.0 / cells as f64,
+        );
     }
 }

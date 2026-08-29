@@ -221,38 +221,214 @@ where the shortcut's premise fails. Reverted, since it costs a diagonal scan per
 nothing; the general lesson is that a bound derived from the known score was already in the C, and
 checking what `infer_bw` leaves behind should precede any scheme that re-derives it.
 
-## Saturating the CPU: it is already at 64%, and issue #48's op count was a source-level tally (2026-08-29)
+## Three x86 hypotheses, measured: one structural bug, one null, one that is their divergence (2026-08-29)
 
-The same question that reopened the GPU, asked of the CPU: how far is the shipped kernel from what
-the machine does? The answer is a different shape entirely, and it is worth writing down beside the
-GPU one because the two together say where the remaining work is.
+The side-by-side profile (`docs/x86-side-by-side-profile.md`) produced three hypotheses about the
+wgsim deficit. Measuring them is what this entry records, because two of the three are now closed.
 
-**The CPU is close to its ceiling.** `matesw`'s own note records the measurement: peak NEON op
-throughput with no dependencies and no memory is 16.63 G ops/s; the kernel's own per-cell op sequence
-in registers is 16.04 Gcell/s, 93% of that; the shipped kernel on real data is 10.34 Gcell/s, **64%
-of the ceiling**. So the CPU has at most **1.55x** of headroom on this stage, against the **32x** the
-GPU had when its file was reopened, and the remaining 36% is named rather than mysterious: the 1.09x
-lane-divergence tax, the row epilogue's scalar sixteen-lane loop, the padded tail columns (1.42
-instructions per cell against 1.11) and the group pack and extract.
+### The memory-level-parallelism knobs are already right on x86. NULL.
 
-**And the extension kernel is 1.45x the rescue kernel per cell, not the 2.1x issue #48 estimated.**
-Counted in the shipped binary rather than in the source, taking the innermost column loop of each:
+`DEFAULT_LOCKSTEP_WIDTH` is 32 on aarch64 and 16 on x86, with a comment saying no x86 measurement
+existed to move it. `BWA4_SA_WINDOW` was swept flat from 16 to 128 on three machines, all of them
+Apple Silicon or hosted ARM. `BWA4_SEED_PREFETCH` likewise. All three trade instructions for
+memory-level parallelism, so the obvious hypothesis was that they pay more where a DRAM miss costs
+more, and the profile put `get_sa_batch` at 4.1 units against the fork's 0.9.
 
-| kernel | inner loop | vector instructions | per cell, 16 lanes |
-|---|---|---|---|
-| `fwd_local_sw_neon_u8` (rescue) | 17 instructions, 2 loads, 2 stores | 11 | **0.69** |
-| `batched_extend_neon_u8` (extension) | 21 instructions, 3 loads, 0 stores | 16 | **1.00** |
+Swept on an EPYC 7763, 1M chr21 pairs, each arm interleaved with a control at the defaults:
 
-Issue #48 read 2.0 operations per cell against `matesw`'s 0.95 off the Rust and called the extension
-kernel twice as expensive. The binary says 1.45x on vector instructions and 1.24x on all
-instructions. The gap is real and it is smaller than the issue claimed, which matters because the
-issue's four levers were sized against the larger number.
+| arm | wall | against its own control |
+|---|---|---|
+| `BWA4_LOCKSTEP_N=16` (the x86 default) | 90.46 s | +0.5% |
+| `BWA4_LOCKSTEP_N=32` (the arm64 default) | 91.99 s | -1.5% |
+| `BWA4_LOCKSTEP_N=64` | 94.98 s | -2.9% |
+| `BWA4_SA_WINDOW=32` | 92.07 s | -0.3% |
+| `BWA4_SA_WINDOW=64` | 93.69 s | -0.8% |
+| `BWA4_SA_WINDOW=256` | 93.88 s | -0.9% |
+| `BWA4_SEED_PREFETCH=0` | 92.26 s | +0.7% |
+| `BWA4_SEED_PREFETCH=16` | 92.48 s | -0.3% |
+| `BWA4_SEED_PREFETCH=32` | 92.03 s | +0.2% |
 
-This is the second time this week the same correction has been needed, and the first was in the same
-issue: lever A was already applied by LLVM, proven by `vpmaxub=100` on both sides of the change. A
-count of operations read off the source is not a count of operations. Count them in the binary.
+Every arm is identical to the control's md5, and every one except `LOCKSTEP_N=64` is inside the
+control's own drift over the run (90.6 to 93.1 s). The defaults are right, on x86 as on arm64, and
+widening the arm64 value onto x86 would have cost 1.5%. The hypothesis was mine and it is dead.
 
-**What that leaves.** The extension kernel's extra 0.31 vector instructions per cell is five vector
-instructions per column, and that is the whole of the CPU-side prize on the biggest line of the
-profile. It is worth having and it is not a factor. The factor is on the GPU, where the same
-recurrence was running at 3.1% of the machine.
+Note what this does NOT close: the profile's 4.5x on SA resolution is real, and it is not prefetch
+tuning. It is either more walks or a slower walk, and the grouping that produced "4.5x" put the
+fork's `ls_advance_*_step` in seeding rather than in SA resolution, which is a judgement call that
+could move the number.
+
+### The reference unpack had no x86 path at all. A REAL BUG, fixed.
+
+`unpack_pac_fwd` unpacked sixteen bases per iteration under `cfg(target_arch = "aarch64")` and fell
+through to a per-base scalar loop everywhere else. That is the whole of the 3.50%-against-1.39% in
+the profile. An SSSE3 path, selected at runtime, is in. Not a dead end: recorded here because the
+SHAPE of the bug is worth remembering, a vector path written on the development machine and never
+mirrored on the deployment one.
+
+### Their tighter band is their divergence, not a free lunch. CANNOT BE TAKEN.
+
+`ungapped_analyze` (`bwamem.cpp:4241`) derives the extension band from a mismatch bitmap and says of
+it: "the optimal ungapped score over all prefix lengths in [0, N], with no floor (score is allowed
+to dip and recover). It is >= the walk's max_sc, so substituting it into the band proof yields a
+strictly tighter (still safe) bound."
+
+Our `tight_band_bound` says the opposite, and says it from experience: "The first version of this
+walk floored at zero and kept going, which OVERSTATES S whenever the diagonal dips and recovers,
+which narrows the band below what the lemma licenses, which is how it moved XS on 1.1% of chr21
+records."
+
+Both cannot be right, and the lemma settles it. The band proof is "no alignment outside the band can
+beat S", so S has to be a score the band-limited DP genuinely ATTAINS. A no-floor prefix maximum is
+not attainable by a local DP that dies at zero, so a band derived from it can exclude an offset that
+would have won. The fork can afford that because it lists score2 and MAPQ convergence among its
+accepted differences; we cannot, and we already paid once to learn it.
+
+So part of the extension-kernel row in the side-by-side table is the fork computing FEWER CELLS than
+byte-identity permits, rather than computing the same cells faster. That is not a lever, it is a
+different acceptance criterion, and it should stop being read as a gap to close.
+
+## The ungapped fast path: priced, then blocked by `max_off` (2026-08-29)
+
+Following the entry above, the one piece of `ungapped_analyze` that IS compatible with byte-identity
+is `FP_STATUS_HIT`: skip the banded DP outright when the ungapped diagonal is the unique optimum. The
+strictness is what makes it sound. An ungapped walk carrying `X` mismatches scores `X * (a + b)`
+below the all-match diagonal; the cheapest gapped alternative pays at least `o_min + e_min` and can
+at best convert every one of those mismatches back into a match. So while `X * (a + b) < o_min +
+e_min`, no gapped alignment can tie, let alone win. At bwa's defaults that is `X <= 1`.
+
+**Priced first.** `BWA4_UNGAPPED_FP` surveys every extension job. On 1M chr21 wgsim pairs:
+7,172,498 of 35,324,706 jobs qualify, **20.3%**, and they carry **7.3% of the DP cells**. The job
+count matters as much as the cells, because a skipped job also skips its two buffer allocations, its
+two reversals, its lane in the batch and its extraction. Rough value: about 3% of the run.
+
+**Then blocked, by a field that is not a score.** `ksw_extend2` returns `max_off`, the furthest the
+best cell of any row strayed from the main diagonal, and the caller's acceptance test reads it:
+a job is accepted only when `max_off < (w >> 1) + (w >> 2)`, otherwise it is REQUEUED with a doubled
+band, and the band it finally settles on is stored in `MemAlnReg.w` and reaches `gen_cigar2`.
+
+A fast path can predict the score, and cannot predict `max_off`. The uniqueness lemma bounds every
+GAPPED alignment below the ungapped optimum, which pins the final `max_i`/`max_j` to the diagonal;
+but `max_off` accumulates over every row that IMPROVED on the running maximum, and an intermediate
+improving row's best cell may sit off the diagonal while still scoring below the global optimum.
+Returning `max_off = 0` would therefore accept jobs the DP would have requeued, and the requeue is
+not a no-op: it changes the recorded band.
+
+So the fast path would have to predict a control-flow decision, not just an alignment. The fork can
+skip that question because it accepts the divergence; we cannot. Recorded rather than attempted: the
+20.3% is real and someone will find it again, and the blocker is one field, not the idea.
+
+What would unblock it: a proof that on a qualifying job no improving row can be off-diagonal, or an
+acceptance test that does not consult `max_off` when the ungapped optimum is proven. Both are
+research, not implementation.
+
+## Issue #48 lever A is already done, by LLVM, and the disassembly says so (2026-08-29)
+
+#48's first lever looked like the safest few percent in the codebase: the E and F recurrences open a
+gap with `max($sub(bigm_v, oe_v), zero_v)`, and for every u8 instantiation `$sub` is a SATURATING
+UNSIGNED subtract whose result is already in `[0, 255]`. The issue called it "2 of ~33 vector ALU ops
+in the inner loop", "provable, not empirical", and estimated +1.1%.
+
+It was implemented: a `clamp0` slot in the kernel macro, bound to the real `max` for the four i16
+instantiations where `$sub` wraps and the clamp is load-bearing, and to a two-argument identity for
+the four u8 ones. Byte-identity held (NEON and AVX2 kernel tests green, full SAM md5 unchanged).
+
+Then it was measured, and it is worth nothing:
+
+| batch=64 kernel | before | after |
+|---|---|---|
+| aarch64 NEON | 68.46 / 68.69 / 67.48 ms | 68.46 / 68.13 / 68.46 ms |
+| x86-64-v3 AVX2 | 147.57 / 148.51 / 147.67 ms | 148.16 / 146.82 / 148.41 ms |
+
+A timer that says "no difference" is weak evidence, so the binaries were disassembled instead:
+
+    before: vpmaxub=100  vpsubusb=312
+    after:  vpmaxub=100  vpsubusb=312
+
+Identical, and the two executables are the same size to the byte. LLVM already knows that
+`max(saturating_sub_u8(a, b), 0)` is `saturating_sub_u8(a, b)` and had removed the op before the
+source change asked it to. The change was reverted: it adds a macro slot and a helper for machine
+code that does not move.
+
+The general lesson is the one this file keeps learning from the other direction. An op count read off
+the SOURCE is not an op count. #43 and #48 both reasoned about "ops per cell" from the Rust, and the
+compiler had already collected the easy half. Count instructions in the binary before believing a
+source-level tally, especially for anything a peephole optimiser could see.
+
+## Issue #48 is finished, and the extension kernel's remaining gap is its recurrence (2026-08-29)
+
+The extension kernel costs 1.00 vector instruction per cell against the rescue kernel's 0.69,
+counted in the shipped binary. That 0.31 is five vector instructions per column on the line that is
+24% of the x86 profile, so it was worth finding out what they are. The answer closes the issue.
+
+**Lever A: already done by LLVM.** `max(saturating_sub_u8(a, b), 0)` is `saturating_sub_u8(a, b)`,
+and the compiler knew. Implemented, measured at nothing on either ISA, and proven by disassembly
+(`vpmaxub=100` and `vpsubusb=312` on both sides of the change, executables the same size). Reverted.
+
+**Lever D: also already done by LLVM.** The issue says `j` is broadcast twice per column, once for
+the band compare and once for the `mj` update. On NEON `band_bias` is 0 so the two are the same
+value and CSE collapses them; on AVX2 the bias is 0x80 and they are different values, which is where
+the lever was supposed to pay. The AVX2 column loop contains **one** `vpbroadcast`. The compiler had
+hoisted the other one anyway.
+
+**Levers B and C: already implemented, and on by default.** `inline_sbt_enabled` folds the
+substitution pre-pass into the column loop, and `band_bias` builds the band mask in signed space.
+The binary agrees: the DP loop has three loads and **two** stores, with no third store for a
+`sbt_buf` round trip.
+
+**So what are the five instructions?** They are the recurrence, not slack. Side by side, the NEON
+column loops:
+
+| | rescue | extension |
+|---|---|---|
+| instructions | 17 | 25 |
+| vector | 11 | 16 |
+| loads / stores | 2 / 2 | 3 / 2 |
+
+The extension kernel carries `cmeq` plus `bic` to implement "H(i-1,j-1) == 0 means unreachable",
+which the rescue recurrence does not have; it computes its substitution score inline where the
+rescue kernel's is already folded into its loads; and it maintains a band mask per column because
+its band is per lane. Every one of those is a term the extension DP has and the rescue DP does not.
+
+There is no slack left in this kernel for issue #48 to remove. Anyone returning here should start
+from the recurrence, not from the instruction count, and should note that three of the four levers
+in that issue were rewrites the compiler had already performed. A count of operations read off the
+source is not a count of operations.
+
+## The rescue kernel's row epilogue is cheaper than a vector guard over it (2026-08-29)
+
+`matesw`'s own note lists what the remaining 36% of that kernel is: "the 1.09x lane-divergence tax,
+the row epilogue's scalar sixteen-lane loop, the padded tail columns and the group pack/extract".
+Measured today, the arithmetic is worse than that reads:
+
+    shipped kernel            9.91 Gcell/s/thread
+    register-only ceiling    16.04
+    divergence + padding      1.08x   (BWA4_MATESW_TIME's own accounting)
+
+1.62x of gap, of which the tax explains 1.08x, so **1.50x sits outside the DP body**. That is half
+the kernel, and the row epilogue was the obvious suspect: `finish_row!` walks sixteen lanes scalar-
+wise once per ROW, which is 9,600 lane-steps for a 600-row job and about 1.3 billion for a 1M-pair
+run, while a lane's maximum improves a few dozen times in those 600 rows.
+
+So the loop was guarded: a `gmax_guard` vector holding 255 for lanes that are frozen or past their
+target, and `vmaxvq_u8(vcgtq_u8(imax, guard))` to ask "can any lane improve?" in three instructions
+before entering it. The two stores into the scalar mirror arrays moved inside the guard as well,
+since only the slow path reads them. Byte-identical, provably: the loop is skipped exactly when no
+lane satisfies the condition of the only branch that does anything.
+
+Interleaved, three repetitions, alternating arms:
+
+| | base | guarded |
+|---|---|---|
+| rep 1 | 9.91 | 9.81 |
+| rep 2 | 9.92 | 9.81 |
+| rep 3 | 9.90 | 9.79 |
+
+**1.1% slower, reproducibly.** `vmaxvq_u8` is a horizontal reduction: it collapses a vector into a
+general register, which on these cores costs several cycles of cross-domain latency and puts a
+scalar dependency on the row's critical path. The sixteen-iteration loop it was meant to avoid is
+predictable, mostly early-exits, and LLVM was already doing better with it than the guard does
+without it. Reverted.
+
+Two things to carry forward. The row epilogue is NOT where the 1.50x is, so the note in `matesw.rs`
+should not send the next person there first. And a horizontal reduction is not a cheap way to ask a
+question about a vector: it costs more than sixteen well-predicted scalar iterations.

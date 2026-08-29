@@ -368,16 +368,27 @@ pub(crate) fn gen_cigar2(
     let rlen = (re - rb) as i32;
     // Owned copy of the query codes, because the reverse-strand branch below mutates it in place.
     // Length `l_query`; indexed by the `query_pos` cursor during the NM/MD walk.
-    let mut query: Vec<u8> = query_codes.to_vec();
+    //
+    // Both this and `rseq` below come from a per-thread buffer instead of a fresh allocation. This
+    // function runs once per EMITTED RECORD, so the two allocations it used to make were two per
+    // record: the allocation probe counts 51.7M allocations in the `sam_emit` bucket on a 1M-pair
+    // wgsim run, and the fork carries a per-chunk arena (`read_arena.h`) precisely to avoid this
+    // class of traffic. The buffers are taken out of the thread-local and put back at the end; an
+    // early return would simply drop them and cost one allocation next call, so this is a
+    // performance path and never a correctness one.
+    let mut query: Vec<u8> = SCRATCH_QUERY.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    query.clear();
+    query.extend_from_slice(query_codes);
     // The reference side of the alignment: `rlen` nt4 codes for packed positions `[rb, re)`.
     // `bases` is the bulk unpack; it handles the reverse-strand half of the pac exactly as the
     // per-base `base(p)` did, and does the index arithmetic once for the range instead of once per
     // base. This runs per emitted record, so it is on the same footing as the window fetch in
     // `across.rs`.
-    let mut rseq: Vec<u8> = crate::emit_split::measure(
+    let mut rseq: Vec<u8> = SCRATCH_RSEQ.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    crate::emit_split::measure(
         &crate::emit_split::BASES_NS,
         &crate::emit_split::BASES_CALLS,
-        || fm.bases(rb, re),
+        || fm.bases_into(rb, re, &mut rseq),
     );
     // Reverse both sides for reverse-strand hits (bwa.cpp:274). This is NOT a complement, only an
     // order reversal, and it exists purely so that ties in gap placement resolve to the leftmost
@@ -398,6 +409,7 @@ pub(crate) fn gen_cigar2(
     // units. `cigar`: the packed M/I/D operations describing that alignment, left to right along
     // the reference. Both come from one branch or the other and are final from here on; step 4 only
     // reads them.
+    global_fp::survey(l_query, rlen, &query, &rseq, opt, w_);
     let (score, cigar) = if l_query == rlen && w_ == 0 {
         // Ungapped fast path (bwa.cpp:280): equal lengths and a proven-zero band mean the CIGAR is
         // a single M run and the score is just the sum of matrix cells down the diagonal. The
@@ -487,7 +499,10 @@ pub(crate) fn gen_cigar2(
     };
     // The MD:Z body under construction, complete except for its final run length (appended after
     // the loop). Grows as alternating decimal run lengths and reference letters.
-    let mut md = String::new();
+    // Sized from the reference span: MD alternates run lengths and mismatched bases, so it cannot
+    // exceed a few bytes per aligned base and is usually far shorter. Growing from empty cost two
+    // or three reallocations per record.
+    let mut md = String::with_capacity((rlen as usize / 4).max(16));
     // Three cursors, named `x`, `y` and `u` in the C: the query position, the reference position,
     // and the length of the match run currently being accumulated (the integers that alternate with
     // the letters in an MD string).
@@ -550,7 +565,20 @@ pub(crate) fn gen_cigar2(
     // MD always ends with a run length, even when that run is empty ("0"), matching the final
     // `kputw(u, &str)` at bwa.cpp:336.
     crate::emit::push_int_str(&mut md, i64::from(match_run));
+    // Hand both buffers back for the next record on this thread. There is no early return between
+    // here and where they were taken, so this runs on every path that took them.
+    SCRATCH_QUERY.with(|c| *c.borrow_mut() = std::mem::take(&mut query));
+    SCRATCH_RSEQ.with(|c| *c.borrow_mut() = std::mem::take(&mut rseq));
     Some((score, cigar, n_mm + n_gap, md))
+}
+
+thread_local! {
+    /// Per-thread scratch for [`gen_cigar2`]'s owned copy of the query codes. See the comment at
+    /// its first use: this function runs once per emitted record, so a fresh `Vec` here is one
+    /// allocation per record.
+    static SCRATCH_QUERY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Per-thread scratch for the reference window the same function unpacks.
+    static SCRATCH_RSEQ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Turn an alignment region into a finalized alignment (CIGAR, NM, MD, position). Port of the CIGAR
@@ -833,7 +861,12 @@ pub fn cigar_string(cigar: &[u32]) -> String {
     // characters would mislabel every CIGAR in the output.
     const OPS: [char; 5] = ['M', 'I', 'D', 'S', 'H'];
     // The SAM CIGAR field being built, complete for the ops emitted so far.
-    let mut s = String::new();
+    //
+    // Sized up front rather than grown. A CIGAR op is a run length and one letter, so eight bytes
+    // covers every op a read of any plausible length can produce, and growing from empty instead
+    // reallocated two or three times per RECORD. The allocation probe counts 47.0M allocations in
+    // the `sam_emit` bucket per million pairs; this is one of the sources.
+    let mut s = String::with_capacity(cigar.len() * 8);
     for &packed_op in cigar {
         crate::emit::push_int_str(&mut s, i64::from(packed_op >> 4));
         s.push(OPS[(packed_op & CIGAR_OP_MASK) as usize]);
@@ -875,8 +908,9 @@ pub fn cigar_string_which(cigar: &[u32], which: usize, is_alt: bool, softclip: b
     // rather than used raw. Same values as `CIGAR_OP_SOFT_CLIP` (3) and `CIGAR_OP_HARD_CLIP` (4).
     const SOFT_CLIP: usize = CIGAR_OP_SOFT_CLIP as usize;
     const HARD_CLIP: usize = CIGAR_OP_HARD_CLIP as usize;
-    // The SAM CIGAR field being built, with clip ops already rewritten for this `which`.
-    let mut s = String::new();
+    // The SAM CIGAR field being built, with clip ops already rewritten for this `which`. Sized up
+    // front for the same reason as in [`cigar_string`].
+    let mut s = String::with_capacity(cigar.len() * 8);
     for &packed_op in cigar {
         // This operation's code, possibly rewritten below from S to H or back.
         let mut op = (packed_op & CIGAR_OP_MASK) as usize;
@@ -890,4 +924,138 @@ pub fn cigar_string_which(cigar: &[u32], which: usize, is_alt: bool, softclip: b
         s.push(OPS[op]);
     }
     s
+}
+
+/// `BWA4_GLOBAL_FP` probe: how many `ksw_global2` calls are a full-length diagonal that could be
+/// proven optimal without running the DP.
+///
+/// `gen_cigar2` already has an ungapped fast path, but it is gated on `w_ == 0`, which is a
+/// statement about the CALLER's band rather than about the sequences. The lemma is stronger than
+/// that gate. Here both sequences have the same length, so any gapped global alignment must carry at
+/// least one insertion AND one deletion, and therefore pays at least `o_ins + e_ins + o_del + e_del`
+/// below the all-match ceiling. The diagonal pays `X * (a + b)` for its `X` mismatches. While
+///
+/// ```text
+/// X * (a + b) < o_ins + e_ins + o_del + e_del
+/// ```
+///
+/// the diagonal is the UNIQUE optimum, so its CIGAR (`<L>M`) is the one the DP's traceback would
+/// return. At bwa's defaults (a=1, b=4, o=6, e=1) that is `X <= 2`.
+///
+/// Unlike the extension fast path, which is blocked because `ksw_extend2` also returns `max_off` and
+/// the caller's band-retry test reads it, `ksw_global2` returns only a score and a CIGAR. There is
+/// no control-flow decision to predict.
+///
+/// This counts the prize. It changes nothing.
+pub mod global_fp {
+    use bwa_core::MemOpt;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static ALREADY_FAST: AtomicU64 = AtomicU64::new(0);
+    pub static EQ_LEN: AtomicU64 = AtomicU64::new(0);
+    pub static PROVABLE: AtomicU64 = AtomicU64::new(0);
+    pub static CELLS: AtomicU64 = AtomicU64::new(0);
+    pub static CELLS_PROVABLE: AtomicU64 = AtomicU64::new(0);
+    pub static AMBIG: AtomicU64 = AtomicU64::new(0);
+    /// The threshold the scoring model licenses, recorded so the dump does not recompute it from
+    /// options it no longer holds.
+    pub static THRESHOLD: AtomicU64 = AtomicU64::new(0);
+    /// Mismatch counts over the diagonal, capped at 15, for equal-length calls. The threshold test
+    /// alone cannot say whether a zero result means "no call qualifies" or "the comparison is
+    /// wrong", and the first version of this probe reported exactly zero, which is not a number
+    /// wgsim can produce.
+    pub static HIST: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+    /// Whether the probe records. Read once and cached.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_GLOBAL_FP").is_some())
+    }
+
+    /// Classify one call. `w_` is the caller's band, i.e. what the existing gate tests.
+    pub fn survey(l_query: i32, rlen: i32, query: &[u8], rseq: &[u8], opt: &MemOpt, w_: i32) {
+        if !enabled() {
+            return;
+        }
+        CALLS.fetch_add(1, Relaxed);
+        // The DP's cost is rows times band width; the band the caller would use is what a skip saves.
+        CELLS.fetch_add((rlen.max(1) as u64) * (2 * w_.max(1) as u64 + 1), Relaxed);
+        if l_query == rlen && w_ == 0 {
+            ALREADY_FAST.fetch_add(1, Relaxed);
+            return;
+        }
+        if l_query != rlen {
+            return;
+        }
+        EQ_LEN.fetch_add(1, Relaxed);
+        let threshold = {
+            let num = opt.o_ins + opt.e_ins + opt.o_del + opt.e_del;
+            let den = opt.a + opt.b;
+            if den > 0 {
+                (num - 1) / den
+            } else {
+                0
+            }
+        };
+        THRESHOLD.store(threshold.max(0) as u64, Relaxed);
+        let mut mis = 0i32;
+        let mut ambig = false;
+        for i in 0..l_query as usize {
+            let (q, t) = (query[i], rseq[i]);
+            if q >= 4 || t >= 4 {
+                ambig = true;
+                break;
+            }
+            if q != t {
+                mis += 1;
+            }
+        }
+        if ambig {
+            AMBIG.fetch_add(1, Relaxed);
+            return;
+        }
+        HIST[(mis.min(15)) as usize].fetch_add(1, Relaxed);
+        if mis > threshold {
+            return;
+        }
+        PROVABLE.fetch_add(1, Relaxed);
+        CELLS_PROVABLE.fetch_add((rlen.max(1) as u64) * (2 * w_.max(1) as u64 + 1), Relaxed);
+    }
+
+    /// Print the survey once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let calls = CALLS.load(Relaxed).max(1);
+        let cells = CELLS.load(Relaxed).max(1);
+        eprintln!(
+            "[global-fp] {} ksw_global2 calls, {} already take the w_==0 fast path, {} have equal lengths",
+            CALLS.load(Relaxed),
+            ALREADY_FAST.load(Relaxed),
+            EQ_LEN.load(Relaxed),
+        );
+        eprintln!(
+            "[global-fp] provably a full-length diagonal: {} ({:.1}% of calls), carrying {:.1}% of the banded cells",
+            PROVABLE.load(Relaxed),
+            PROVABLE.load(Relaxed) as f64 * 100.0 / calls as f64,
+            CELLS_PROVABLE.load(Relaxed) as f64 * 100.0 / cells as f64,
+        );
+        let h: Vec<String> = HIST
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{i}:{}", c.load(Relaxed)))
+            .collect();
+        eprintln!(
+            "[global-fp] ambiguous {} | mismatches over the diagonal {}",
+            AMBIG.load(Relaxed),
+            h.join(" ")
+        );
+        eprintln!(
+            "[global-fp] the lemma licenses X <= {}",
+            THRESHOLD.load(Relaxed)
+        );
+    }
 }

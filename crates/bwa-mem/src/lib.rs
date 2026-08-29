@@ -189,6 +189,15 @@ pub mod rescue_split {
     pub static COLLECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static KERNEL_NS: AtomicU64 = AtomicU64::new(0);
     pub static APPLY_NS: AtomicU64 = AtomicU64::new(0);
+    /// The part of `apply` spent re-running `mem_sort_dedup_patch` after an insertion, and the
+    /// number of those re-runs. Split out because `apply` is 0.3 s CPU on real reads and 49 s on
+    /// wgsim, and a 164x swing between read sets is a question about ONE line, not about a stage.
+    pub static APPLY_DEDUP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_DEDUP_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_DEDUP_ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static T_SORT1: AtomicU64 = AtomicU64::new(0);
+    pub static T_SCAN: AtomicU64 = AtomicU64::new(0);
+    pub static T_SORT3: AtomicU64 = AtomicU64::new(0);
 
     /// Whether the probe records. Read once and cached.
     ///
@@ -220,10 +229,19 @@ pub mod rescue_split {
             return;
         }
         eprintln!(
-            "[rescue-split] collect {:.3}s, kernel {:.3}s, apply {:.3}s CPU",
+            "[rescue-split] collect {:.3}s, kernel {:.3}s, apply {:.3}s CPU (of which sort/dedup {:.3}s over {} calls, {} regions)",
             COLLECT_NS.load(Relaxed) as f64 / 1e9,
             KERNEL_NS.load(Relaxed) as f64 / 1e9,
             APPLY_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_DEDUP_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_DEDUP_CALLS.load(Relaxed),
+            APPLY_DEDUP_ROWS.load(Relaxed),
+        );
+        eprintln!(
+            "[dedup-internals] sort_re {:.3}s, scan {:.3}s, sort_score {:.3}s CPU (all callers)",
+            T_SORT1.load(Relaxed) as f64 / 1e9,
+            T_SCAN.load(Relaxed) as f64 / 1e9,
+            T_SORT3.load(Relaxed) as f64 / 1e9,
         );
     }
 }
@@ -753,17 +771,25 @@ pub(crate) fn mem_chain2aln_meta(
         if seed.qbeg > 0 {
             // `qs`/`rs`: the query and reference slices for the DP, reversed here so that "forward"
             // for the kernel means "leftwards" for us.
-            let qs: Vec<u8> = (0..seed.qbeg).rev().map(|i| codes[i as usize]).collect();
+            // Per-thread buffers rather than fresh vectors: this runs once per SEED, and these
+            // two were two of the four allocations that put 71.9M in the extension bucket. They
+            // have to be buffers and not slices because the left side is reversed.
+            let mut qs_buf = SCRATCH_QS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            qs_buf.clear();
+            qs_buf.extend((0..seed.qbeg).rev().map(|i| codes[i as usize]));
             // Reference bases lying between the window start and the seed, i.e. the most this
             // left extension could consume. Nonnegative because `rmax0 <= seed.rbeg` by construction.
             let ref_bases_available = (seed.rbeg - rmax0) as usize;
-            let rs: Vec<u8> = (0..ref_bases_available).rev().map(|i| rseq[i]).collect();
+            let mut rs_buf = SCRATCH_RS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            rs_buf.clear();
+            rs_buf.extend((0..ref_bases_available).rev().map(|i| rseq[i]));
+            let (qs, rs) = (&qs_buf, &rs_buf);
             // Score already banked before this DP starts: the seed's `len` exact matches at `a` each.
             let h0 = seed.len * opt.a;
             // `prev0 = -1`: the region has not been scored yet on this side, which is the -1 the C
             // initialises `a->score` to (`bwamem.cpp:2218`).
             // The accepted left-extension answer (clipped optimum, run-to-end optimum, band width).
-            let left = extend_side(&qs, &rs, opt, opt.pen_clip5, h0, -1);
+            let left = extend_side(qs, rs, opt, opt.pen_clip5, h0, -1);
             reg.score = left.score;
             // Clip or run to the read's 5' end? Take the to-end alignment only when it exists
             // (`gscore > 0`; `ksw_extend2` returns -1 when no path reached the query end) AND it
@@ -780,6 +806,9 @@ pub(crate) fn mem_chain2aln_meta(
                 reg.truesc = left.gscore;
             }
             reg.w = reg.w.max(left.w);
+            // Hand the two buffers back for the next seed on this thread.
+            SCRATCH_QS.with(|c| *c.borrow_mut() = qs_buf);
+            SCRATCH_RS.with(|c| *c.borrow_mut() = rs_buf);
         } else {
             // The seed already starts at query base 0, so there is nothing to extend into. Score is
             // just the seed's own match score and the region begins exactly at the seed.
@@ -803,15 +832,19 @@ pub(crate) fn mem_chain2aln_meta(
             let re = seed.rbeg + i64::from(seed.len) - rmax0;
             // The read suffix and reference suffix past the seed: what this extension may consume.
             // No reversal, unlike the left side, because DP direction and growth direction agree.
-            let qs: Vec<u8> = codes[qe as usize..].to_vec();
-            let rs: Vec<u8> = rseq[re as usize..].to_vec();
+            // Slices, not copies. `extend_side` takes `&[u8]`, so the two `to_vec()`s that used to
+            // be here were a heap allocation each for data neither side mutates: two allocations
+            // per SEED, and the allocation probe counts 71.9M in the extension bucket on a 1M-pair
+            // wgsim run. The left side below still needs buffers because it reverses.
+            let qs: &[u8] = &codes[qe as usize..];
+            let rs: &[u8] = &rseq[re as usize..];
             // Score carried over from the left extension (or from the bare seed if there was none):
             // starting here is what welds the two halves into a single cumulative alignment score.
             let h0 = reg.score;
             // `prev0 = reg.score`, which is also this side's `h0`: the C's `int prev = a->score;`
             // reads the left extension's result on the very first band try.
             // The accepted right-extension answer; its `score` is CUMULATIVE (it includes `h0`).
-            let right = extend_side(&qs, &rs, opt, opt.pen_clip3, h0, reg.score);
+            let right = extend_side(qs, rs, opt, opt.pen_clip3, h0, reg.score);
             reg.score = right.score;
             // The seed's end back in absolute pac coordinates, the base `right.tle`/`right.gtle`
             // are measured from.
@@ -1168,4 +1201,12 @@ mod tests {
         assert!(!is_rev);
         assert_eq!(pos, start + 1);
     }
+}
+
+thread_local! {
+    /// Per-thread scratch for the LEFT extension's reversed query, one per seed. See its use in
+    /// `mem_chain2aln`: the right side needs no buffer because it can pass slices.
+    static SCRATCH_QS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Per-thread scratch for the left extension's reversed reference window.
+    static SCRATCH_RS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
