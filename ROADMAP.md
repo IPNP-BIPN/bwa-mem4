@@ -5102,6 +5102,62 @@ les deux affirmations doivent desormais nommer la machine, comme le ratio contre
 deja depuis la replication du 2026-08-27 au matin.
 
 
+## Le GPU rouvert : le noyau tournait a 3,6 % de la machine, et la cause n'est pas le noyau (2026-08-29)
+
+Le dossier avait ete ferme le 2026-08-09 sur deux motifs, et les deux etaient contestables.
+
+**Le plafond, remesure aujourd'hui : 385,7 Gcell/s** (`scripts/msl_probe.sh`, `uchar4`, registres
+seuls, la vraie recurrence de rescue, 1 048 576 threads). Le ROADMAP notait ~330 ; c'est mieux que
+ca. Le noyau livre tournait a **12 Gcell/s**, soit **3,1 % de ce que la sonde du projet avait prouve
+que la machine faisait sur exactement cette recurrence**. Un materiel juge a 3 % de sa capacite n'a
+pas ete juge.
+
+**Et l'Amdahl de la note d'abandon ne tient pas.** Elle ecrit « le seeding pese 41 % du busy et
+l'extension 23 % ». Le tableau de `docs/gpu-plan.md` lui-meme dit 59,2 % de DP et 6,7 % de seeding
+sur 1 M paires GIAB reelles, et les deux profils symboliques pris cette semaine disent 44,6 % / 10,8 %
+sur aarch64 et 33,7 % / 13,4 % sur x86. Trois mesures sur quatre placent le DP entre 34 et 59 %. Le
+seeding a ete rendu ~2,5x moins cher par LISA depuis la fermeture, donc la part offloadable a MONTE
+pendant que le dossier etait clos.
+
+### Ce que le decoupage montre, et il corrige le diagnostic precedent
+
+Le ROADMAP attribuait l'echec de la tentative `uchar4` au fait que la sonde chronometrait
+`forward_batch` en entier, empaquetage compris. **C'est faux, et le decoupage le dit** : sur 8192
+travaux, `pack` fait 0,0005 s sur 0,0643 s, soit **0,8 %**. L'hote n'a jamais masque le levier. Si le
+`uchar4` avait rendu 4x sur le noyau, l'appel entier serait passe de 64 a 26 ms, ce qu'aucune sonde
+ne pouvait rater. La conclusion honnete est donc que **ce noyau `uchar4`-la n'accelerait pas le GPU**,
+et non que la mesure l'avait cache.
+
+### La vraie premiere cause : l'occupancy, et elle se corrige sans toucher au noyau
+
+| travaux par lancement | debit GPU seul |
+|---|---|
+| 8 192 (la taille de production) | 14,04 Gcell/s |
+| 32 768 | 46,28 |
+| 131 072 | 42,70 |
+| 524 288 | **51,54** |
+
+**3,7x en donnant simplement plus de travail au meme noyau.** La sonde de plafond lance 1 048 576
+threads ; le pipeline en lancait 8 192, soit 256 simdgroups pour 40 coeurs. Le `BWA4_GPU_CHUNK` de
+16384 *reads* avait ete regle sur le mur, pas sur l'occupancy.
+
+Rapporte au bon plafond, l'ecart restant se lit enfin. La sonde fait 4 cellules par thread ; le noyau
+livre en fait 1. Le plafond a iso-forme est donc ~96 Gcell/s, et 51,54 en est **54 %**. Le noyau
+n'est pas mauvais : il est sous-alimente, et il laisse le facteur 4 du `uchar4` sur la table.
+
+### La deuxieme cause, invisible jusqu'ici : `score2` sur l'hote
+
+| travaux | pack | GPU | `score2` (hote) |
+|---|---|---|---|
+| 8 192 | 0,0005 s | 0,0546 s | 0,0099 s |
+| 524 288 | 0,0274 s | 0,9530 s | **0,9701 s** |
+
+A l'echelle, la passe `score2` cote CPU coute **autant que le noyau GPU**. C'est un Amdahl interne au
+bras GPU que personne n'avait vu, parce que la sonde d'origine additionnait les trois. Accelerer le
+noyau sans y toucher plafonne le bras a 2x, quoi qu'il arrive au GPU.
+
+Aucun de ces deux constats ne demande d'ecrire une ligne de MSL.
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
