@@ -286,3 +286,37 @@ accepted differences; we cannot, and we already paid once to learn it.
 So part of the extension-kernel row in the side-by-side table is the fork computing FEWER CELLS than
 byte-identity permits, rather than computing the same cells faster. That is not a lever, it is a
 different acceptance criterion, and it should stop being read as a gap to close.
+
+## The ungapped fast path: priced, then blocked by `max_off` (2026-08-29)
+
+Following the entry above, the one piece of `ungapped_analyze` that IS compatible with byte-identity
+is `FP_STATUS_HIT`: skip the banded DP outright when the ungapped diagonal is the unique optimum. The
+strictness is what makes it sound. An ungapped walk carrying `X` mismatches scores `X * (a + b)`
+below the all-match diagonal; the cheapest gapped alternative pays at least `o_min + e_min` and can
+at best convert every one of those mismatches back into a match. So while `X * (a + b) < o_min +
+e_min`, no gapped alignment can tie, let alone win. At bwa's defaults that is `X <= 1`.
+
+**Priced first.** `BWA4_UNGAPPED_FP` surveys every extension job. On 1M chr21 wgsim pairs:
+7,172,498 of 35,324,706 jobs qualify, **20.3%**, and they carry **7.3% of the DP cells**. The job
+count matters as much as the cells, because a skipped job also skips its two buffer allocations, its
+two reversals, its lane in the batch and its extraction. Rough value: about 3% of the run.
+
+**Then blocked, by a field that is not a score.** `ksw_extend2` returns `max_off`, the furthest the
+best cell of any row strayed from the main diagonal, and the caller's acceptance test reads it:
+a job is accepted only when `max_off < (w >> 1) + (w >> 2)`, otherwise it is REQUEUED with a doubled
+band, and the band it finally settles on is stored in `MemAlnReg.w` and reaches `gen_cigar2`.
+
+A fast path can predict the score, and cannot predict `max_off`. The uniqueness lemma bounds every
+GAPPED alignment below the ungapped optimum, which pins the final `max_i`/`max_j` to the diagonal;
+but `max_off` accumulates over every row that IMPROVED on the running maximum, and an intermediate
+improving row's best cell may sit off the diagonal while still scoring below the global optimum.
+Returning `max_off = 0` would therefore accept jobs the DP would have requeued, and the requeue is
+not a no-op: it changes the recorded band.
+
+So the fast path would have to predict a control-flow decision, not just an alignment. The fork can
+skip that question because it accepts the divergence; we cannot. Recorded rather than attempted: the
+20.3% is real and someone will find it again, and the blocker is one field, not the idea.
+
+What would unblock it: a proof that on a qualifying job no improving row can be off-diagonal, or an
+acceptance test that does not consult `max_off` when the ungapped optimum is proven. Both are
+research, not implementation.
