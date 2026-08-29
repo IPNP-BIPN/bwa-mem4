@@ -449,8 +449,14 @@ mod sort_scratch {
 
     /// Pass 1a's permutation: `re` and the index of the region it came from.
     type PermRe = Vec<(i64, u32)>;
-    /// Pass 3's permutation: the three-field sort key `(score, rb, qb)` packed into one u128 (see
-    /// `score_key`), and the index of the region it came from.
+    /// Pass 3's permutation: the sort key and the index of the region it came from.
+    ///
+    /// The key's SHAPE is per-architecture, and that is measured rather than assumed. See the sort
+    /// itself for the numbers; in one line, packing `(score, rb, qb)` into a u128 is a win on
+    /// aarch64 and a 1.27x LOSS on x86-64, which has no 128-bit ALU.
+    #[cfg(target_arch = "x86_64")]
+    type PermScore = Vec<((i32, i64, i32), u32)>;
+    #[cfg(not(target_arch = "x86_64"))]
     type PermScore = Vec<(u128, u32)>;
 
     thread_local! {
@@ -634,19 +640,29 @@ pub fn mem_sort_dedup_patch(
     let _t3 = crate::rescue_split::start();
     // ---- Pass 3: re-sort by score and drop exact coordinate duplicates ------------------------
     // Sort by score desc, then rb, then qb (`alnreg_slt`), again with bwa's unstable introsort.
-    // The key is packed into ONE u128 rather than compared as a `(i32, i64, i32)` tuple, and the
-    // three fields happen to fit exactly: 32 bits of score, 64 of `rb`, 32 of `qb`.
+    // The key is per-architecture, and the split is measured, not guessed.
     //
-    // This is an implementation change and nothing else. `ks_introsort_by` is permutation-observable
-    // (which region survives a tie is decided by where the unstable sort leaves it), so the
-    // algorithm may not be swapped; but the permutation depends only on the BOOLEAN each comparison
-    // returns, and this packing returns the same boolean as the tuple comparator for every input.
-    // The mapping is the standard order-preserving one: flip the sign bit of each signed field to
-    // get an unsigned key that compares the same way, and complement the score field because it
-    // sorts descending while the other two sort ascending.
+    // `(score, rb, qb)` packs EXACTLY into 128 bits: 32 of score, 64 of `rb`, 32 of `qb`. On aarch64
+    // that is a win, because one 128-bit compare replaces a three-field branchy one. On x86-64 it is
+    // a LOSS, because there is no 128-bit ALU: building the key costs two multi-word shifts per
+    // element, and the comparison saving does not repay them. Measured with
+    // `examples/score_sort_bench.rs`, 92 rows per sort and 200k sorts, best of three interleaved:
     //
-    // Why bother: this sort is 7.4s of CPU on a 1M-pair wgsim run, the single largest scalar cost in
-    // the profile after the two SIMD kernels, and its inner loop is comparisons.
+    //   | key           | aarch64 | x86-64-v3 |
+    //   |---------------|---------|-----------|
+    //   | tuple         | 1.00x   | 1.00x     |
+    //   | packed u128   | 0.97x   | **1.27x** |
+    //   | pair of u64   | 1.03x   | 1.10x     |
+    //
+    // The u128 form was introduced on the strength of an aarch64-only measurement, and x86 is the
+    // architecture this project is BEHIND on, so that was the wrong way round.
+    //
+    // Either form is byte-identical to the other and to the original. `ks_introsort_by` is
+    // permutation-observable (which region survives a tie is decided by where the unstable sort
+    // leaves it), so the algorithm may not be swapped; but the permutation depends only on the
+    // BOOLEAN each comparison returns, and an order-preserving encoding returns the same boolean for
+    // every input. The bench asserts the two permutations are equal before timing either.
+    #[cfg(not(target_arch = "x86_64"))]
     #[inline(always)]
     fn score_key(r: &MemAlnReg) -> u128 {
         let score = !((r.score as u32) ^ 0x8000_0000) as u128;
@@ -656,6 +672,15 @@ pub fn mem_sort_dedup_patch(
     }
     sort_scratch::PERM_SCORE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
+            #[cfg(target_arch = "x86_64")]
+            ks_introsort_by_key(
+                &mut a,
+                perm,
+                spare,
+                |r| (r.score, r.rb, r.qb),
+                |x, y| x.0 > y.0 || (x.0 == y.0 && (x.1 < y.1 || (x.1 == y.1 && x.2 < y.2))),
+            );
+            #[cfg(not(target_arch = "x86_64"))]
             ks_introsort_by_key(&mut a, perm, spare, score_key, |x, y| x < y);
         });
     });
