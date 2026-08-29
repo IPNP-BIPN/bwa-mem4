@@ -69,6 +69,11 @@ libsais-c = ["dep:libsais"]
 # ... and with OpenMP, which is where the 4.3x is. Needs libomp at build time: present on Linux with
 # gcc, needs `brew install libomp` on macOS. Off by default for that reason alone.
 libsais-c-omp = ["libsais-c", "libsais/openmp"]
+# The pure-Rust translation, on several threads, with NO C toolchain and no libomp. That combination
+# is what this feature is for: `libsais-c-omp` above is faster, but it needs a C compiler and an
+# OpenMP runtime, which is precisely what the pure-Rust backend exists to avoid. Before this, the
+# escape hatch for a C-free build was also the single-threaded one.
+libsais-omp = ["libsais"]
 # Experimental CaPS-SA backend (spike). Not in `default`. In-memory build ~ libsais-class speed, plus a
 # bounded-RAM external-memory build that libsais/SA-IS cannot do. Byte-identical (a SA is unique).
 capsa = ["dep:caps-sa"]
