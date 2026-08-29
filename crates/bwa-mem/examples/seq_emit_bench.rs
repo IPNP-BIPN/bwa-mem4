@@ -26,6 +26,10 @@ static FWD: [u8; 256] = base_table(b"ACGTN");
 
 /// The formulation that shipped before 1.98's lint. The lint is allowed here on purpose: the whole
 /// point of this file is to time the form clippy rejects against the form it asks for.
+// `unknown_lints` first, and it is not decoration: `chunks_exact_to_as_chunks` does not exist in
+// clippy 1.96.1, which is the toolchain CI pins, so naming it there is itself a denied lint. This is
+// the same blind spot as the one this branch fixed in the other direction, met from the other side.
+#[allow(unknown_lints)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn push_chunks_exact(out: &mut Vec<u8>, codes: &[u8]) {
     out.reserve(codes.len());
