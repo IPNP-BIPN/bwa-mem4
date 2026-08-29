@@ -24,8 +24,8 @@ on:
         default: "100000000"
         required: false
       threads:
-        description: "BWA4_SA_THREADS for the parallel arms"
-        default: "8"
+        description: "BWA4_SA_THREADS for the parallel arms (empty = nproc, which is what the aligner itself would pick)"
+        default: ""
         required: false
       runner:
         description: "Runner image (ubuntu-22.04 | ubuntu-24.04)"
@@ -73,9 +73,17 @@ jobs:
       - name: Compare
         env:
           BASES: ${{ github.event.inputs.bases || '100000000' }}
-          BWA4_SA_THREADS: ${{ github.event.inputs.threads || '8' }}
+          THREADS_IN: ${{ github.event.inputs.threads }}
         run: |
           set -o pipefail
+          # Default to the core count, NOT to a fixed 8. The first run of this workflow asked for 8
+          # threads on a four-core runner, which measured oversubscription rather than parallelism:
+          # the Rust translation came out at 0.67x, i.e. slower than its own serial arm. That is a
+          # real property worth knowing, but it is not the number the milestone is asking for, and
+          # `sa_threads()` in the indexer would never have picked 8 there either (it caps at rayon's
+          # pool, which is the core count).
+          export BWA4_SA_THREADS="${THREADS_IN:-$(nproc)}"
+          echo "threads: $BWA4_SA_THREADS (cores: $(nproc))"
           # Three repetitions: the parallel gain being measured is small enough on one of the
           # backends that a single run cannot tell it from noise.
           for i in 1 2 3; do
