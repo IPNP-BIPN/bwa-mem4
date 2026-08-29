@@ -5207,6 +5207,59 @@ quatre ne pouvait rien changer. Le levier etait bon, le regime de mesure ne l'et
 troisieme fois cette semaine qu'un resultat nul se revele etre un defaut de protocole plutot qu'un
 verdict.
 
+### Trois leviers GPU chiffres avant d'etre construits, et les trois sont morts (2026-08-29)
+
+Suite de la section precedente. Elle concluait que le noyau u8 etait borne par le debit d'emission
+d'acces memoire, ~252 G ops/s, et que le `uchar4` valait donc ~2,2x en divisant les acces par quatre.
+`scripts/msl/mem_ops.m` teste cela en quarante lignes plutot qu'en une journee de noyau : deux
+kernels, meme recurrence et meme motif d'acces que `rescue_fwd_u8` (trois lectures et deux ecritures
+par cellule sur des rails column-major), l'un a un travail par thread en `uchar`, l'autre a quatre
+travaux par thread en `uchar4`, dispatches pour calculer le MEME nombre de cellules.
+
+| bras | debit |
+|---|---|
+| `mem1` (uchar, 1 travail/thread) | 150,23 Gcell/s |
+| `mem4` (uchar4, 4 travaux/thread) | 145,98 |
+| **rapport** | **0,97x** |
+
+**Le `uchar4` ne rend rien**, et la sonde dit aussi pourquoi ma deduction etait fausse : elle soutient
+150 Gcell/s, soit 750 G acces/s, trois fois le plafond de 252 G ops/s que j'avais deduit. Ce plafond
+n'existe pas. Les deux noyaux de l'aligneur rendaient 50 et 26 Gcell/s pour une autre raison, et il
+manquait quelque chose a mon raisonnement, pas au materiel.
+
+### Ce qui manquait : un gather par cellule
+
+Le noyau lit une base de query par CELLULE, a `seqs[j.q_off + c]`. Les threads voisins sont des
+travaux voisins, dont les queries sont loin les unes des autres dans ce tampon : les 32 voies d'un
+simdgroup emettent donc 32 lectures dispersees, un **gather**, une fois par cellule, dans un noyau
+dont tous les autres acces sont coalesces. Un troisieme bras l'ajoute a `mem1` et rien d'autre :
+
+| bras | debit | contre `mem1` |
+|---|---|---|
+| `mem1g` (uchar + gather de query par cellule) | 75,61 Gcell/s | **0,50x** |
+
+Le gather coute la moitie du noyau, dans la sonde.
+
+### Et la correction ne transfere pas, ce qui est le resultat le plus utile des trois
+
+Query ecrite une seconde fois en column-major, `qcm[c * n_jobs + k]`, pour que les voies voisines
+lisent des octets voisins. Octet-identique par construction, les huit portes Metal passent. Mesure :
+
+| | avant | apres |
+|---|---|---|
+| noyau seul | 50,31 Gcell/s | 54,49 (**1,08x**) |
+| empaquetage hote | 0,027 s | **0,380 s** |
+
+**1,08x sur le noyau et 0,35 s perdues sur l'hote, donc une perte nette**, et surtout pas le 2x que
+la sonde annoncait. L'explication tient a ce que la sonde ne reproduisait pas : dans le vrai noyau,
+les 1024 queries d'un threadgroup font 153 KB et restent en cache d'une ligne a l'autre, alors que la
+sonde relit un tampon de 39 MB. La sonde a donc surestime le gather en le mesurant hors de son cache.
+
+Revenu en arriere. Ce qui reste acquis : trois leviers ont ete chiffres pour le prix d'une sonde
+chacun au lieu d'une journee de noyau chacun, et le fichier porte les trois chiffres plutot que trois
+intuitions. Ce qui reste ouvert cote GPU est donc **la raison des 50 Gcell/s, qui n'est ni la bande
+passante, ni l'emission d'acces, ni le gather de query**.
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
