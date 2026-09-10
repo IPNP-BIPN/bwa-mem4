@@ -413,6 +413,60 @@ check_longread() {
   fi
 }
 
+# INPUT SHAPES, not options. bwa reads FASTQ with klib's `kseq`, which accumulates sequence lines
+# until a line starting with `+` and then quality lines until quality is as long as sequence, so it
+# takes a WRAPPED (multi-line) FASTQ without noticing. needletail's FASTQ parser requires exactly
+# four lines per record, and until 4.4.x we answered such a file with a parse error and zero
+# records -- a file bwa aligns perfectly happily.
+#
+# The oracle's output for a wrapped file is byte-identical to its output for the same reads
+# unwrapped, so what is checked here is just that: same reads, two spellings, one answer. Gzip is
+# included because that path decompresses before the parser sees anything, and CRLF because a stray
+# carriage return is what would hide the `+` from the detector.
+check_shapes() {
+  local seq reflen i p line
+  seq=$(grep -v '^>' "$IDX" | tr -d '\n' | tr 'acgt' 'ACGT')
+  reflen=${#seq}
+  : > "$TMP/flat.fq"
+  : > "$TMP/wrap.fq"
+  : > "$TMP/crlf.fq"
+  for i in $(seq 1 300); do
+    p=$(( reflen / 320 * i ))
+    line="${seq:$p:150}"
+    printf '@s%s\n%s\n+\n%s\n' "$i" "$line" "$(printf 'I%.0s' $(seq 1 150))" >> "$TMP/flat.fq"
+    printf '@s%s\r\n%s\r\n+\r\n%s\r\n' "$i" "$line" "$(printf 'I%.0s' $(seq 1 150))" >> "$TMP/crlf.fq"
+    # The same record with sequence and quality wrapped at 60 columns.
+    {
+      printf '@s%s\n' "$i"
+      printf '%s\n' "${line:0:60}" "${line:60:60}" "${line:120:30}"
+      printf '+\n'
+      printf '%s\n' "$(printf 'I%.0s' $(seq 1 60))" "$(printf 'I%.0s' $(seq 1 60))" "$(printf 'I%.0s' $(seq 1 30))"
+    } >> "$TMP/wrap.fq"
+  done
+  gzip -c "$TMP/wrap.fq" > "$TMP/wrap.fq.gz"
+
+  # The oracle's answer for the flat spelling is the reference every shape is held to.
+  $M2 mem -t2 -K 10000000 "$IDX" "$TMP/flat.fq" 2>/dev/null | grep -v '^@PG' > "$TMP/shape_ref.sam"
+  local name file
+  for name in flat wrap crlf wrap.fq.gz; do
+    case "$name" in
+      wrap.fq.gz) file="$TMP/wrap.fq.gz" ;;
+      *)          file="$TMP/$name.fq" ;;
+    esac
+    $M3 mem -t2 -K 10000000 "$IDX" "$file" 2>/dev/null | grep -v '^@PG' > "$TMP/shape_b.sam"
+    if cmp -s "$TMP/shape_ref.sam" "$TMP/shape_b.sam"; then
+      printf '  %-28s %-3s [PASS]\n' "input shape: $name" "se"; pass=$((pass+1))
+    else
+      printf '  %-28s %-3s [FAIL] %s records against the oracle'"'"'s flat run\n' \
+        "input shape: $name" "se" "$(grep -vc '^@' "$TMP/shape_b.sam")"
+      fail=$((fail+1)); failed_opts+=("input shape: $name")
+    fi
+  done
+}
+
+echo "=== input shapes ==="
+check_shapes
+
 echo "=== long reads on the bwa path ==="
 check_longread
 

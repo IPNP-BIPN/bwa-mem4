@@ -170,6 +170,235 @@ pub struct FastqReader {
     inner: Box<dyn FastxReader>,
 }
 
+/// Bytes peeked from the head of an input to decide whether it needs [`UnwrapFastq`].
+///
+/// 64 KiB is about 200 records of 150 bp, which is ample evidence for a file that is homogeneous --
+/// and real FASTQ is: a writer that wraps wraps everything. It is also small enough to disappear
+/// into the noise. At one megabyte the peek was measurable: `wait_read` went from 20 ms to 34 ms on
+/// a two-file paired run, because the first batch cannot start until both peeks are done, and total
+/// CPU rose 0.7%. At 64 KiB both are back in the noise.
+const WRAP_PEEK: usize = 64 << 10;
+
+/// Whether `head`, the first bytes of an input, is FASTQ that puts each record on exactly four
+/// lines -- which is what needletail's FASTQ parser requires.
+///
+/// Returns `true` for anything that is NOT four-line FASTQ needing repair, including FASTA (whose
+/// wrapping needletail handles on its own) and input too short to judge. The bias is deliberate:
+/// a wrong `true` costs the loud parse error we already had, while a wrong `false` would put a
+/// normaliser in front of every byte of a 3.5 GB file for nothing.
+fn is_four_line_fastq(head: &[u8]) -> bool {
+    // Skip whatever leading blank lines a hand-edited file might carry.
+    let mut lines = head.split(|&b| b == b'\n').map(|l| {
+        // Tolerate CRLF: the parser does, and a trailing \r would otherwise hide the '+'.
+        l.strip_suffix(b"\r").unwrap_or(l)
+    });
+    let Some(first) = lines.find(|l| !l.is_empty()) else {
+        return true; // nothing to judge
+    };
+    if first[0] != b'@' {
+        return true; // FASTA, or not sequence data at all; neither is ours to repair
+    }
+    // Walk whole records: name, sequence, '+' separator, quality. The last record in the peek is
+    // usually truncated, so run out of lines rather than concluding anything from it.
+    loop {
+        let (Some(seq), Some(plus)) = (lines.next(), lines.next()) else {
+            return true; // the peek ended mid-record
+        };
+        // An empty line where sequence or separator belongs means the peek ran out on a line
+        // boundary rather than that the record is malformed, so it decides nothing either.
+        if seq.is_empty() || plus.is_empty() {
+            return true;
+        }
+        if plus.first() != Some(&b'+') {
+            // The third line of the record is not the separator, so the sequence was wrapped.
+            return false;
+        }
+        // Quality is as long as the sequence, and here that means exactly one line.
+        let Some(qual) = lines.next() else {
+            return true;
+        };
+        if qual.len() != seq.len() {
+            return false;
+        }
+        // Next record, or the end of the peek.
+        match lines.next() {
+            None => return true,
+            Some([]) => return true, // trailing newline at the end of the peek
+            Some(l) if l[0] == b'@' => continue,
+            Some(_) => return false,
+        }
+    }
+}
+
+/// A `Read` that rewrites multi-line FASTQ into the four-line form, and passes everything else
+/// through untouched.
+///
+/// WHY IT EXISTS. bwa reads FASTQ with klib's `kseq`, which accumulates sequence lines until it
+/// meets a line starting with `+` and then accumulates quality lines until quality is as long as
+/// sequence. So `bwa-mem2` aligns a wrapped FASTQ perfectly happily, and its output is
+/// byte-identical to the same reads unwrapped (measured: 2000 records, identical). needletail's
+/// FASTQ parser requires exactly four lines per record and errors on anything else, so until this
+/// existed `bwa-mem4` produced ZERO records and a parse error on a file bwa aligns.
+///
+/// It is placed in front of the parser only when [`is_four_line_fastq`] says the input needs it, so
+/// the ordinary case pays one megabyte of peek at open and nothing per byte after that.
+///
+/// KSEQ'S QUALITY RULE IS THE POINT. Quality is accumulated until it is as long as the sequence,
+/// NOT until a line starting with `@` is seen -- because `@` is a legal quality character and a
+/// quality line may well start with one. Terminating on `@` is the classic FASTQ parsing bug, and
+/// this reproduces bwa's rule rather than inventing one.
+struct UnwrapFastq<R: std::io::BufRead> {
+    /// The wrapped input, read a line at a time.
+    inner: R,
+    /// Normalised bytes not yet handed to the caller, and how far into them we are. Holds at most
+    /// one record.
+    out: Vec<u8>,
+    /// Read cursor into `out`.
+    pos: usize,
+    /// Set once `inner` reports end of input, so `read` stops asking for more.
+    done: bool,
+}
+
+impl<R: std::io::BufRead> UnwrapFastq<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            out: Vec::with_capacity(1024),
+            pos: 0,
+            done: false,
+        }
+    }
+
+    /// Read one line, stripped of its newline (and of a CR before it). `Ok(None)` at end of input.
+    fn line(&mut self, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+        buf.clear();
+        if self.inner.read_until(b'\n', buf)? == 0 {
+            return Ok(false);
+        }
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+        }
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        Ok(true)
+    }
+
+    /// Normalise the next record into `out`. `Ok(false)` at end of input.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        self.out.clear();
+        self.pos = 0;
+        let mut buf = Vec::with_capacity(256);
+        // The header, skipping blank lines before it.
+        loop {
+            if !self.line(&mut buf)? {
+                return Ok(false);
+            }
+            if !buf.is_empty() {
+                break;
+            }
+        }
+        if buf.first() != Some(&b'@') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "expected a FASTQ header starting with '@', found {:?}",
+                    String::from_utf8_lossy(&buf[..buf.len().min(32)])
+                ),
+            ));
+        }
+        self.out.extend_from_slice(&buf);
+        self.out.push(b'\n');
+        // Sequence lines, up to the '+' separator.
+        // `seq_len` is what the quality accumulation below has to match, which is kseq's rule.
+        let mut seq_len = 0usize;
+        loop {
+            if !self.line(&mut buf)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "FASTQ input ended inside a record's sequence",
+                ));
+            }
+            if buf.first() == Some(&b'+') {
+                break;
+            }
+            seq_len += buf.len();
+            self.out.extend_from_slice(&buf);
+        }
+        // The separator is emitted bare: its optional repeat of the name is not data, and bwa does
+        // not read it either.
+        self.out.extend_from_slice(b"\n+\n");
+        // Quality lines, until quality is as long as sequence. See the note above on why the test is
+        // a length and not a leading character.
+        let mut qual_len = 0usize;
+        while qual_len < seq_len {
+            if !self.line(&mut buf)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "FASTQ input ended inside a record's quality string",
+                ));
+            }
+            qual_len += buf.len();
+            self.out.extend_from_slice(&buf);
+        }
+        self.out.push(b'\n');
+        Ok(true)
+    }
+}
+
+impl<R: std::io::BufRead> std::io::Read for UnwrapFastq<R> {
+    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos == self.out.len() {
+            if self.done {
+                return Ok(0);
+            }
+            if !self.fill()? {
+                self.done = true;
+                return Ok(0);
+            }
+        }
+        let n = (self.out.len() - self.pos).min(dst.len());
+        dst[..n].copy_from_slice(&self.out[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Put [`UnwrapFastq`] in front of `r` if, and only if, its first [`WRAP_PEEK`] bytes are FASTQ that
+/// is not already in four-line form.
+///
+/// The peeked bytes are chained back in front of the stream either way, so nothing is consumed: the
+/// same trick `open_reader` already uses to keep the two magic bytes it sniffed.
+///
+/// # Parameters
+///
+/// - `r`: the input, decompressed if it was compressed. Taken by value and returned inside the
+///   result, so callers hand over ownership.
+///
+/// # Returns
+///
+/// A `Read` yielding either exactly `r`'s bytes or its records normalised to four lines each.
+fn unwrap_multiline_fastq<R: std::io::Read + Send + 'static>(
+    mut r: R,
+) -> Result<Box<dyn std::io::Read + Send>> {
+    use std::io::Read;
+    // `take` bounds the peek; a short input simply yields fewer bytes.
+    let mut head = Vec::with_capacity(WRAP_PEEK);
+    (&mut r)
+        .take(WRAP_PEEK as u64)
+        .read_to_end(&mut head)
+        .map_err(|e| Error::Fastq(e.to_string()))?;
+    // Decided before `head` is moved into the cursor, so the peek is not copied.
+    let already_four_line = is_four_line_fastq(&head);
+    let rest = std::io::Read::chain(std::io::Cursor::new(head), r);
+    if already_four_line {
+        return Ok(Box::new(rest));
+    }
+    Ok(Box::new(UnwrapFastq::new(
+        std::io::BufReader::with_capacity(1 << 16, rest),
+    )))
+}
+
 /// Open a FASTQ/FASTA file and return the parser for it, whatever its compression.
 ///
 /// Plain and gzip go straight to needletail, which sniffs the magic bytes and builds its own
@@ -223,6 +452,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     if !seekable {
         let head = std::io::Cursor::new(magic.map(Vec::from).unwrap_or_default());
         let stream = std::io::Read::chain(head, opened);
+        let stream = unwrap_multiline_fastq(stream)?;
         return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
     }
 
@@ -239,6 +469,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
         let stream = dec
             .open(path)
             .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+        let stream = unwrap_multiline_fastq(stream)?;
         return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
     }
 
@@ -247,7 +478,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // it. See [`spawn_inflate`] for the measurement that motivates it.
     #[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
     if is_gzip {
-        let blocks = spawn_inflate(path)?;
+        let blocks = unwrap_multiline_fastq(spawn_inflate(path)?)?;
         return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
     }
 
@@ -266,7 +497,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // Byte-identical by construction: the parser sees the same bytes in the same order, only
     // delivered by a different thread.
     if !is_gzip && looks_like_text {
-        let blocks = spawn_plain(path)?;
+        let blocks = unwrap_multiline_fastq(spawn_plain(path)?)?;
         return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
     }
 
@@ -1005,7 +1236,7 @@ mod multi_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_id, FastqReader, PairedFastqReader};
+    use super::{is_four_line_fastq, split_id, FastqReader, PairedFastqReader, UnwrapFastq};
     use std::io::Write;
 
     /// Build a FASTQ of `n` records named `<prefix><i>` with a 4-base sequence, and return its path.
@@ -1087,6 +1318,74 @@ mod tests {
         let mut r = PairedFastqReader::from_paths(&p1, &p2).unwrap();
         assert!(r.next_batch(usize::MAX).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The four-line test decides whether a normaliser is put in front of the parser, so both of its
+    /// answers cost something: a wrong "already fine" is the parse error we had, and a wrong "needs
+    /// repair" puts a rewriter in front of every byte of the input.
+    #[test]
+    fn four_line_detection() {
+        assert!(is_four_line_fastq(
+            b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n"
+        ));
+        assert!(
+            is_four_line_fastq(b"@r1\r\nACGT\r\n+\r\nIIII\r\n"),
+            "CRLF is still four-line"
+        );
+        assert!(
+            is_four_line_fastq(b"@r1\nACGT\n+r1\nIIII\n"),
+            "the separator may repeat the name"
+        );
+        assert!(is_four_line_fastq(b""), "nothing to judge");
+        assert!(
+            is_four_line_fastq(b">r1\nACGT\nACGT\n"),
+            "FASTA wrapping is needletail's own job"
+        );
+        assert!(
+            is_four_line_fastq(b"@r1\nACGT\n"),
+            "truncated peek decides nothing"
+        );
+
+        // Wrapped sequence: the third line is not the separator.
+        assert!(!is_four_line_fastq(
+            b"@r1\nAC\nGT\n+\nIIII\n@r2\nAC\nGT\n+\nIIII\n"
+        ));
+        // Wrapped quality: the separator is where it should be, but quality is short.
+        assert!(!is_four_line_fastq(
+            b"@r1\nACGT\n+\nII\nII\n@r2\nACGT\n+\nIIII\n"
+        ));
+    }
+
+    /// Wrapped FASTQ is rewritten into the four-line form bwa's `kseq` accepts and needletail
+    /// requires.
+    ///
+    /// The `@`-quality case is the one worth pinning. `@` is a legal quality character, so a parser
+    /// that ends the quality block at the first line starting with `@` splits one record into two
+    /// and silently corrupts everything after it. kseq's rule, reproduced here, is to accumulate
+    /// quality until it is as long as the sequence.
+    #[test]
+    fn unwrap_rewrites_wrapped_records() {
+        let read = |src: &[u8]| {
+            use std::io::Read;
+            let mut out = Vec::new();
+            UnwrapFastq::new(std::io::BufReader::new(std::io::Cursor::new(src.to_vec())))
+                .read_to_end(&mut out)
+                .unwrap();
+            out
+        };
+
+        assert_eq!(
+            read(b"@r1\nAC\nGT\n+\nII\nII\n@r2\nACGT\n+\nIIII\n"),
+            b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n"
+        );
+        // Already four-line input passes through unchanged apart from the bare separator.
+        assert_eq!(read(b"@r1\nACGT\n+r1\nIIII\n"), b"@r1\nACGT\n+\nIIII\n");
+        // CRLF, and a quality string that both starts with `@` and is wrapped.
+        assert_eq!(
+            read(b"@r1\r\nACGTAC\r\nGT\r\n+\r\n@@@@\r\n@@@@\r\n"),
+            b"@r1\nACGTACGT\n+\n@@@@@@@@\n"
+        );
+        assert_eq!(read(b""), b"");
     }
 
     /// A named pipe is not seekable, so the two magic bytes read for format sniffing can never be
