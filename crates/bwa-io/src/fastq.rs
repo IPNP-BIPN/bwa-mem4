@@ -179,55 +179,87 @@ pub struct FastqReader {
 /// CPU rose 0.7%. At 64 KiB both are back in the noise.
 const WRAP_PEEK: usize = 64 << 10;
 
-/// Whether `head`, the first bytes of an input, is FASTQ that puts each record on exactly four
-/// lines -- which is what needletail's FASTQ parser requires.
+/// Whether the input starting at `head` is FASTQ that needs [`UnwrapFastq`] in front of it.
 ///
-/// Returns `true` for anything that is NOT four-line FASTQ needing repair, including FASTA (whose
-/// wrapping needletail handles on its own) and input too short to judge. The bias is deliberate:
-/// a wrong `true` costs the loud parse error we already had, while a wrong `false` would put a
-/// normaliser in front of every byte of a 3.5 GB file for nothing.
-fn is_four_line_fastq(head: &[u8]) -> bool {
-    // Skip whatever leading blank lines a hand-edited file might carry.
-    let mut lines = head.split(|&b| b == b'\n').map(|l| {
-        // Tolerate CRLF: the parser does, and a trailing \r would otherwise hide the '+'.
-        l.strip_suffix(b"\r").unwrap_or(l)
-    });
+/// TRUE ONLY ON PROOF. The answer is `true` only when the first record parses cleanly under kseq's
+/// rules AND takes more than four lines; everything else -- FASTA, four-line FASTQ, junk, and
+/// anything malformed -- is `false` and goes to needletail untouched.
+///
+/// That asymmetry is the point, and it was learned the hard way. An earlier version answered "is
+/// this already four-line?" and so returned "needs unwrapping" for MALFORMED files too, since a
+/// quality string of the wrong length looks exactly like a wrapped one from the third line. The
+/// unwrapper then failed on them and needletail reported `Failed to read the first two bytes. Is
+/// the file empty?` for a file that was neither empty nor unreadable, in place of the precise
+/// `Sequence length is 150 but quality length is 100` it gives when it parses the bytes itself.
+/// Diagnosing broken input is needletail's job and it is good at it; this function's only job is to
+/// recognise the one shape it cannot handle.
+///
+/// # Parameters
+///
+/// - `head`: the first bytes of the input.
+/// - `complete`: true when `head` is the WHOLE input rather than a prefix of it. It decides what a
+///   record running off the end means: in a complete file that is malformed input, and in a prefix
+///   it is just the peek ending, so the two cases must not be conflated.
+///
+/// # Returns
+///
+/// Whether to insert [`UnwrapFastq`].
+fn needs_unwrapping(head: &[u8], complete: bool) -> bool {
+    // Tolerate CRLF: a trailing carriage return would otherwise hide the `+` and make every record
+    // look wrapped.
+    let mut lines = head
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let Some(first) = lines.find(|l| !l.is_empty()) else {
-        return true; // nothing to judge
+        return false; // nothing to judge
     };
     if first[0] != b'@' {
-        return true; // FASTA, or not sequence data at all; neither is ours to repair
+        return false; // FASTA, whose wrapping needletail handles, or not sequence data at all
     }
-    // Walk whole records: name, sequence, '+' separator, quality. The last record in the peek is
-    // usually truncated, so run out of lines rather than concluding anything from it.
+    // Sequence lines, up to the `+` separator. More than one of them is the wrapped shape.
+    let (mut seq_len, mut seq_lines) = (0usize, 0usize);
     loop {
-        let (Some(seq), Some(plus)) = (lines.next(), lines.next()) else {
-            return true; // the peek ended mid-record
+        let Some(line) = lines.next() else {
+            // Ran out before the separator. In a complete file that is malformed; in a prefix it
+            // only means the peek ended, and a sequence already spanning two lines is wrapped.
+            return !complete && seq_lines > 1;
         };
-        // An empty line where sequence or separator belongs means the peek ran out on a line
-        // boundary rather than that the record is malformed, so it decides nothing either.
-        if seq.is_empty() || plus.is_empty() {
-            return true;
+        if line.first() == Some(&b'+') {
+            break;
         }
-        if plus.first() != Some(&b'+') {
-            // The third line of the record is not the separator, so the sequence was wrapped.
-            return false;
+        // An empty piece is the trailing newline's split artifact as often as it is a blank line, so
+        // it is treated as the input ending here: malformed in a complete file, just the peek
+        // running out in a prefix. Reading it as a blank line inside a record instead made every
+        // wrapped file whose peek ended on a newline look unwrapped.
+        if line.is_empty() {
+            return !complete && seq_lines > 1;
         }
-        // Quality is as long as the sequence, and here that means exactly one line.
-        let Some(qual) = lines.next() else {
-            return true;
-        };
-        if qual.len() != seq.len() {
-            return false;
-        }
-        // Next record, or the end of the peek.
-        match lines.next() {
-            None => return true,
-            Some([]) => return true, // trailing newline at the end of the peek
-            Some(l) if l[0] == b'@' => continue,
-            Some(_) => return false,
-        }
+        seq_len += line.len();
+        seq_lines += 1;
     }
+    if seq_lines == 0 {
+        return false; // `@name` followed immediately by `+`
+    }
+    // Quality lines, until quality is as long as the sequence. kseq's rule, and the reason a
+    // quality line may legally start with `@`.
+    let mut qual_lines = 0usize;
+    let mut qual_len = 0usize;
+    while qual_len < seq_len {
+        let Some(line) = lines.next() else {
+            return !complete && qual_lines > 1;
+        };
+        if line.is_empty() {
+            return !complete && qual_lines > 1;
+        }
+        qual_len += line.len();
+        qual_lines += 1;
+    }
+    // Overshooting means the quality string is longer than the sequence, which is malformed rather
+    // than wrapped, and needletail says so far better than this could.
+    if qual_len != seq_len {
+        return false;
+    }
+    seq_lines > 1 || qual_lines > 1
 }
 
 /// A `Read` that rewrites multi-line FASTQ into the four-line form, and passes everything else
@@ -240,7 +272,7 @@ fn is_four_line_fastq(head: &[u8]) -> bool {
 /// FASTQ parser requires exactly four lines per record and errors on anything else, so until this
 /// existed `bwa-mem4` produced ZERO records and a parse error on a file bwa aligns.
 ///
-/// It is placed in front of the parser only when [`is_four_line_fastq`] says the input needs it, so
+/// It is placed in front of the parser only when [`needs_unwrapping`] proves the input needs it, so
 /// the ordinary case pays one megabyte of peek at open and nothing per byte after that.
 ///
 /// KSEQ'S QUALITY RULE IS THE POINT. Quality is accumulated until it is as long as the sequence,
@@ -388,10 +420,14 @@ fn unwrap_multiline_fastq<R: std::io::Read + Send + 'static>(
         .take(WRAP_PEEK as u64)
         .read_to_end(&mut head)
         .map_err(|e| Error::Fastq(e.to_string()))?;
-    // Decided before `head` is moved into the cursor, so the peek is not copied.
-    let already_four_line = is_four_line_fastq(&head);
+    // `head` shorter than the cap means `read_to_end` hit the end of the input, so this IS the whole
+    // file; that distinction is what lets a record running off the end be read as malformed input
+    // rather than as the peek ending. Decided before `head` is moved into the cursor, so the peek is
+    // not copied.
+    let complete = head.len() < WRAP_PEEK;
+    let wrapped = needs_unwrapping(&head, complete);
     let rest = std::io::Read::chain(std::io::Cursor::new(head), r);
-    if already_four_line {
+    if !wrapped {
         return Ok(Box::new(rest));
     }
     Ok(Box::new(UnwrapFastq::new(
@@ -1236,7 +1272,7 @@ mod multi_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_four_line_fastq, split_id, FastqReader, PairedFastqReader, UnwrapFastq};
+    use super::{needs_unwrapping, split_id, FastqReader, PairedFastqReader, UnwrapFastq};
     use std::io::Write;
 
     /// Build a FASTQ of `n` records named `<prefix><i>` with a 4-base sequence, and return its path.
@@ -1320,40 +1356,80 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The four-line test decides whether a normaliser is put in front of the parser, so both of its
-    /// answers cost something: a wrong "already fine" is the parse error we had, and a wrong "needs
-    /// repair" puts a rewriter in front of every byte of the input.
+    /// The detector answers "does this need unwrapping", and it must answer NO unless it can prove
+    /// YES.
+    ///
+    /// A wrong yes is the expensive direction: the unwrapper then meets input it cannot rewrite,
+    /// and needletail's precise complaint about the real problem is replaced by a claim that the
+    /// file was empty. That is exactly what an earlier version did to three malformed shapes, and
+    /// the last group below is those three.
     #[test]
-    fn four_line_detection() {
-        assert!(is_four_line_fastq(
-            b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n"
+    fn unwrap_detection() {
+        // Four-line FASTQ, FASTA and junk all pass straight through.
+        assert!(!needs_unwrapping(
+            b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n",
+            true
         ));
         assert!(
-            is_four_line_fastq(b"@r1\r\nACGT\r\n+\r\nIIII\r\n"),
-            "CRLF is still four-line"
+            !needs_unwrapping(b"@r1\r\nACGT\r\n+\r\nIIII\r\n", true),
+            "CRLF"
         );
         assert!(
-            is_four_line_fastq(b"@r1\nACGT\n+r1\nIIII\n"),
-            "the separator may repeat the name"
+            !needs_unwrapping(b"@r1\nACGT\n+r1\nIIII\n", true),
+            "separator repeats the name"
         );
-        assert!(is_four_line_fastq(b""), "nothing to judge");
+        assert!(!needs_unwrapping(b"", true), "nothing to judge");
         assert!(
-            is_four_line_fastq(b">r1\nACGT\nACGT\n"),
-            "FASTA wrapping is needletail's own job"
-        );
-        assert!(
-            is_four_line_fastq(b"@r1\nACGT\n"),
-            "truncated peek decides nothing"
+            !needs_unwrapping(b">r1\nACGT\nACGT\n", true),
+            "FASTA is needletail's own job"
         );
 
-        // Wrapped sequence: the third line is not the separator.
-        assert!(!is_four_line_fastq(
-            b"@r1\nAC\nGT\n+\nIIII\n@r2\nAC\nGT\n+\nIIII\n"
-        ));
-        // Wrapped quality: the separator is where it should be, but quality is short.
-        assert!(!is_four_line_fastq(
-            b"@r1\nACGT\n+\nII\nII\n@r2\nACGT\n+\nIIII\n"
-        ));
+        // Genuinely wrapped, on either half of the record.
+        assert!(
+            needs_unwrapping(b"@r1\nAC\nGT\n+\nIIII\n", true),
+            "wrapped sequence"
+        );
+        assert!(
+            needs_unwrapping(b"@r1\nACGT\n+\nII\nII\n", true),
+            "wrapped quality"
+        );
+        assert!(
+            needs_unwrapping(b"@r1\r\nAC\r\nGT\r\n+\r\nIIII\r\n", true),
+            "wrapped, CRLF"
+        );
+
+        // MALFORMED, and every one of these must be handed to needletail rather than rewritten.
+        assert!(
+            !needs_unwrapping(b"@a\nACGTACGT\n+\nIIII\n", true),
+            "quality shorter than sequence"
+        );
+        assert!(
+            !needs_unwrapping(b"@a\nACGT\n+\nIIIIIIII\n", true),
+            "quality longer than sequence"
+        );
+        assert!(
+            !needs_unwrapping(b"@a\nACGT\n+\n", true),
+            "truncated before quality"
+        );
+        assert!(
+            !needs_unwrapping(b"@a\nACGT\nIIII\n", true),
+            "no separator at all"
+        );
+
+        // `complete` is what separates "the file ends here" from "the peek ends here". The same
+        // bytes mean malformed input in a whole file and an unfinished record in a prefix.
+        assert!(
+            !needs_unwrapping(b"@a\nAC\nGT\n", true),
+            "whole file, no separator: malformed"
+        );
+        assert!(
+            needs_unwrapping(b"@a\nAC\nGT\n", false),
+            "prefix, sequence already wrapped"
+        );
+        assert!(
+            !needs_unwrapping(b"@a\nACGT\n", false),
+            "prefix, nothing proven yet"
+        );
     }
 
     /// Wrapped FASTQ is rewritten into the four-line form bwa's `kseq` accepts and needletail
