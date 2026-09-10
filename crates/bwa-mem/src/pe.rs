@@ -2477,7 +2477,20 @@ pub fn mem_sam_pe<W: Write>(
             let a: [&[MemAlnReg]; 2] = [&a0[..n_pri0], &a1[..n_pri1]];
             mem_pair(bns, opt, pes, &a, id)
         };
-        if let Some(pr) = pr {
+        // `.filter(score > 0)` is bwa's `(o = mem_pair(...)) > 0`, and it is not a nicety. A pair
+        // whose best score is exactly ZERO is not a proper pair to the C, which falls straight
+        // through to `no_pairing` -- where the insert window, not the pair score, decides the 0x2
+        // bit. Testing only for `Some` took the paired branch instead, and that branch never
+        // evaluates the `no_pairing` window test, so the pair lost its proper-pair bit.
+        //
+        // Zero is reachable, and reachable on ordinary data: the insert-size term is
+        // `0.721 * ln(2 * erfc(|z| / sqrt(2))) * a`, and with a standard deviation of ZERO the
+        // z-score is `0/0` for an insert exactly at the mean. That is NaN, `NaN as i64` is 0 here
+        // and `(int)NaN` is 0 in the C on this machine, so both floor the pair at 0 -- and then only
+        // the C drew the right conclusion from it. `-I 400,0` reproduces it on any read set, and so
+        // does a library with a fixed insert size, where the inferred distribution has no spread at
+        // all: 600 of 600 records differed on a simulated fixed-insert set before this.
+        if let Some(pr) = pr.filter(|p| p.score > 0) {
             // Multiple sufficiently-good primary hits on either end -> fall back. bwa's rationale
             // (its own TODO) is that a split alignment would be mangled by forcing a single paired
             // record, so it prefers the per-end emitter. The scan starts at j = 1 because a[0] is

@@ -234,6 +234,21 @@ check "-P"     pe -P
 echo "=== I/O features ==="
 check "-R rg"  se -R '@RG\tID:foo\tSM:bar'
 check "-I 300" pe -I 300
+# `-I` WITH A ZERO STANDARD DEVIATION. `-I 300` alone cannot reach it: bwa defaults the deviation to
+# a tenth of the mean, so the insert window is wide and every z-score is finite. Pin the deviation to
+# 0 and the window collapses to a single value, the z-score of an insert exactly at the mean becomes
+# `0/0`, and the pair scores exactly zero -- which bwa does NOT accept as a proper pair
+# (`(o = mem_pair(...)) > 0`), falling through to `no_pairing`, where the insert window sets the 0x2
+# bit instead. Testing only that a pair was FOUND took the other branch and lost the bit: 22 records
+# on this fixture at `-I 400,0`, and 600 of 600 on a simulated fixed-insert library, where the
+# INFERRED distribution has no spread either. Amplicon panels are the real-world shape of that.
+#
+# The mean is 394 because the case has to have TEETH: only pairs whose insert lands EXACTLY on the
+# mean hit the `0/0`, so the value has to be one this fixture actually produces. With the pre-fix
+# behaviour restored, `-I 394,0` differs on 204 records here and `-I 394,1` on none, which is the
+# whole point of keeping the second case beside it.
+check "-I 394,0" pe -I 394,0
+check "-I 394,1" pe -I 394,1
 check "-v 1"   se -v 1
 
 # Options that were implemented but NEVER exercised until 2026-07-18. That gap is not academic:
