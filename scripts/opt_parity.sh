@@ -325,6 +325,28 @@ check_primary5() {
 }
 check_primary5
 
+# `-X` ABOVE 1.0, WITH `-M` AND WITH `-q`. `-X` is `mask_level`, the overlap fraction above which an
+# alignment is marked as shadowing another. Push it past 1.0 and the test can never be satisfied, so
+# overlapping alignments all stay non-secondary and a read emits SUPPLEMENTARY records where it
+# normally emits one. That is the only way to reach two branches of `mem_reg2sam` on the paired-end
+# side, and both were wrong until 4.4.x: `-M` was ignored there (the supplementary bit was written
+# unconditionally instead of bwa's internal 0x10000, which prints as SAM's 0x100), and the
+# supplementary MAPQ cap ran even under `-q`/`-5`, which exist to suppress it. The single-end path
+# had both right, which is why one-option-at-a-time never saw it.
+#
+# ONLY THE `-M` CASE GATES ITS FIX. With the pre-fix behaviour restored, `-X 1.2 -M (pe)` fails on
+# 25833 of 25833 records here, while the `-q` and `-5` cases still pass: the MAPQ cap fires only
+# when a supplementary is MORE confident than the primary it was split from, and no input built for
+# this -- simulated reads, chimeric reads, either end of a pair -- produces one. That half of the
+# fix follows `bwamem.cpp:1555` and the single-end path, and is not covered by a fixture. The two
+# cases are kept anyway, as coverage of the `-X > 1` shape itself.
+#
+# `-X` on its own is checked here too, so a future change that breaks it is not blamed on `-M`.
+check "-X 1.2 (pe)"       pe -X 1.2
+check "-X 1.2 -M (pe)"    pe -X 1.2 -M
+check "-X 1.2 -q (pe)"    pe -X 1.2 -q
+check "-X 1.2 -5 (pe)"    pe -X 1.2 -5
+
 echo "=== input and output paths ==="
 check "-p (interleaved)" pi -p
 

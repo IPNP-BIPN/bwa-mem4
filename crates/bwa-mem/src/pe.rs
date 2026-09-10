@@ -2289,14 +2289,32 @@ fn mem_reg2sam(
         if p.secondary >= 0 {
             aln.sub = -1;
         }
-        // Everything after the first accepted record is a supplementary. bwa picks 0x10000 instead
-        // of 0x800 under `-M`; without that flag it is always 0x800.
+        // Everything after the first accepted record is a supplementary. Under `-M`
+        // (MEM_F_NO_MULTI) bwa sets its INTERNAL 0x10000 instead of 0x800 (`bwamem.cpp:1552`),
+        // which `mem_aln2sam` then prints as SAM's 0x100 secondary bit: `-M` exists so that older
+        // tools, which understand secondary but not supplementary, still see one primary per read.
+        // This branch used to write 0x800 unconditionally, its own comment describing the `-M` case
+        // it did not implement, so every supplementary this path emitted came out supplementary
+        // under `-M` too.
         if n_emitted > 0 && p.secondary < 0 {
-            aln.flag |= 0x800; // supplementary
+            aln.flag |= if opt.flag & bwa_core::opt::flags::NO_MULTI != 0 {
+                0x10000 // bwa-internal; printed as 0x100
+            } else {
+                0x800 // supplementary
+            };
         }
         // A supplementary must not claim higher confidence than the primary it came from, so its
         // MAPQ is capped at the first record's. Only lowered, never raised.
-        if n_emitted > 0 && !p.is_alt && aln.mapq > emitted[0].mapq {
+        //
+        // `-q` (MEM_F_KEEP_SUPP_MAPQ), which `-5` also sets, suppresses the cap: for a chimeric
+        // library each segment is its own real placement and capping it hides that. The C's guard
+        // is the `#if V17` arm at `bwamem.cpp:1555`, and it was missing here, so `-q` and `-5`
+        // capped anyway on this path while the single-end path honoured them.
+        if opt.flag & bwa_core::opt::flags::KEEP_SUPP_MAPQ == 0
+            && n_emitted > 0
+            && !p.is_alt
+            && aln.mapq > emitted[0].mapq
+        {
             aln.mapq = emitted[0].mapq;
         }
         emitted.push(aln);
