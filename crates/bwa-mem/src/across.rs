@@ -1045,7 +1045,14 @@ fn align_reads_batched_inner<B: SwBackend>(
             }
             // The kept chains: overlapping and dominated chains dropped, `kept`/`w` filled in. This
             // is the value the closure yields into `per_read_chains`.
-            let out = align_split::measure(&align_split::CHAINFLT_NS, || mem_chain_flt(opt, pre));
+            let mut out =
+                align_split::measure(&align_split::CHAINFLT_NS, || mem_chain_flt(opt, pre));
+            // bwa's second chain-level pass (`bwamem.cpp:1084`). See `crate::seedflt`; it is inside
+            // the chain-filter timer because it is the same stage of the C's pipeline and, on the
+            // short reads this path exists for, it returns without doing anything.
+            align_split::measure(&align_split::CHAINFLT_NS, || {
+                crate::seedflt::mem_flt_chained_seeds(fm, bns, opt, codes, &mut out);
+            });
             if dump_chains {
                 eprintln!("CHAIN nchains={}", out.len());
                 for (ci, c) in out.iter().enumerate() {

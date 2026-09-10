@@ -229,7 +229,7 @@ fn mem_infer_dir(l_pac: i64, b1: i64, b2: i64) -> (usize, i64) {
 /// RETURNS the *clamped* `(rb, re)` (the caller needs them, since every returned coordinate is
 /// relative to the clamped `rb`), the contig id `rid` (-1 if `mid` falls outside every contig), and
 /// the fetched bases. `rid < 0` cannot match a real `a.rid`, so it fails the caller's guard.
-fn bns_fetch_seq(
+pub(crate) fn bns_fetch_seq(
     fm: &FmIndex,
     bns: &BntSeq,
     rb: i64,
@@ -1918,10 +1918,29 @@ fn mem_aln2sam(
     softclip: bool,
     out: &mut Vec<u8>,
 ) {
-    // `p`: the alignment being printed, and `m` the mate's, both private copies (bwa's `ptmp`/
-    // `mtmp`) precisely because step 1 rewrites their `rid`/`pos`/`is_rev` and clears their CIGARs.
-    let mut p = list[which].clone();
-    let mut m = m.cloned();
+    // `p`: the alignment being printed, and `m` the mate's. bwa works on private copies
+    // (`ptmp`/`mtmp`) precisely because step 1 rewrites their `rid`/`pos`/`is_rev` and clears their
+    // CIGARs, and this used to clone both. A `MemAln` owns a `Vec<u32>` CIGAR, an `md` String and
+    // an `xa` String, so those two clones were up to six allocations PER RECORD, paid only to get
+    // four mutable scalars and a "CIGAR is now empty" bit. The borrow below plus the shadow
+    // variables carry exactly the same mutations without touching the heap; every read of a field
+    // step 1 can rewrite goes through a shadow, and every field it cannot (`mapq`, `nm`, `md`,
+    // `score`, `sub`, `alt_sc`, `is_alt`, `xa`) is read straight off the borrow.
+    let p = &list[which];
+    // The four mutable scalars of `ptmp`, plus `p_cigar`, which is `&p.cigar` until the mate-
+    // coordinate copy empties it. Emptying a slice reference is bwa's `p->n_cigar = 0`: the storage
+    // is untouched, only this record stops seeing it.
+    let mut p_flag = p.flag;
+    let mut p_rid = p.rid;
+    let mut p_pos = p.pos;
+    let mut p_is_rev = p.is_rev;
+    let mut p_cigar: &[u32] = &p.cigar;
+    // Same for `mtmp`. The values are meaningless when `m` is `None`; every use below is guarded by
+    // `m.is_some()` or by an `if let`, exactly as the `Option` was.
+    let (mut m_rid, mut m_pos, mut m_is_rev, mut m_cigar): (i32, i64, bool, &[u32]) = match m {
+        Some(x) => (x.rid, x.pos, x.is_rev, &x.cigar),
+        None => (0, 0, false, &[]),
+    };
 
     // ---- step 1: FLAG bits and the unmapped-read mate coordinate copy ----
     // An unmapped read is placed AT ITS MATE'S COORDINATE (with an
@@ -1929,41 +1948,33 @@ fn mem_aln2sam(
     // Both directions are done, and the order matters: `p.rid < 0` is tested before `p` is possibly
     // overwritten, so a pair with both ends unmapped copies nothing.
     if m.is_some() {
-        p.flag |= 0x1;
+        p_flag |= 0x1;
     }
     // 0x4 / 0x8 are decided BEFORE the coordinate copy below, so a read that ends up printing its
     // mate's RNAME/POS still carries the unmapped bit. That is deliberate and load-bearing.
-    if p.rid < 0 {
-        p.flag |= 0x4;
+    if p_rid < 0 {
+        p_flag |= 0x4;
     }
-    if m.as_ref().map(|x| x.rid < 0).unwrap_or(false) {
-        p.flag |= 0x8;
+    if m.is_some() && m_rid < 0 {
+        p_flag |= 0x8;
     }
-    if p.rid < 0 {
-        if let Some(mate) = m.as_ref() {
-            if mate.rid >= 0 {
-                p.rid = mate.rid;
-                p.pos = mate.pos;
-                p.is_rev = mate.is_rev;
-                p.cigar.clear();
-            }
-        }
+    if p_rid < 0 && m.is_some() && m_rid >= 0 {
+        p_rid = m_rid;
+        p_pos = m_pos;
+        p_is_rev = m_is_rev;
+        p_cigar = &[];
     }
-    if p.rid >= 0 {
-        if let Some(mate) = m.as_mut() {
-            if mate.rid < 0 {
-                mate.rid = p.rid;
-                mate.pos = p.pos;
-                mate.is_rev = p.is_rev;
-                mate.cigar.clear();
-            }
-        }
+    if p_rid >= 0 && m.is_some() && m_rid < 0 {
+        m_rid = p_rid;
+        m_pos = p_pos;
+        m_is_rev = p_is_rev;
+        m_cigar = &[];
     }
-    if p.is_rev {
-        p.flag |= 0x10;
+    if p_is_rev {
+        p_flag |= 0x10;
     }
-    if m.as_ref().map(|x| x.is_rev).unwrap_or(false) {
-        p.flag |= 0x20;
+    if m.is_some() && m_is_rev {
+        p_flag |= 0x20;
     }
 
     // ---- step 2: QNAME, FLAG ----
@@ -1973,36 +1984,36 @@ fn mem_aln2sam(
     // (MEM_F_NO_MULTI) to mark "supplementary, but report it as secondary". Here it is masked off
     // and translated into the real SAM 0x100 secondary bit.
     // `flag`: the value actually printed in column 2, i.e. `p.flag` with the internal bit translated.
-    let flag = (p.flag & 0xffff) | if p.flag & 0x10000 != 0 { 0x100 } else { 0 };
+    let flag = (p_flag & 0xffff) | if p_flag & 0x10000 != 0 { 0x100 } else { 0 };
     crate::emit::push_int(out, i64::from(flag));
     out.push(b'\t');
 
     // ---- step 3: RNAME, POS, MAPQ, CIGAR ----
     // `pos` is 0-based internally and SAM is 1-based, hence `+ 1`. The
     // unmapped branch writes the four fields at once as `*\t0\t0\t*` (bwa's `kputsn(..., 7, str)`).
-    if p.rid >= 0 {
-        out.extend_from_slice(bns.contigs[p.rid as usize].name.as_bytes());
+    if p_rid >= 0 {
+        out.extend_from_slice(bns.contigs[p_rid as usize].name.as_bytes());
         out.push(b'\t');
-        crate::emit::push_int(out, p.pos + 1);
+        crate::emit::push_int(out, p_pos + 1);
         out.push(b'\t');
         crate::emit::push_int(out, i64::from(p.mapq));
         out.push(b'\t');
-        add_cigar(&p.cigar, which != 0 && !softclip && !p.is_alt, out);
+        add_cigar(p_cigar, which != 0 && !softclip && !p.is_alt, out);
     } else {
         out.extend_from_slice(b"*\t0\t0\t*");
     }
     out.push(b'\t');
 
     // ---- step 4: RNEXT, PNEXT, TLEN ----
-    match m.as_ref() {
-        Some(mate) if mate.rid >= 0 => {
-            if p.rid == mate.rid {
+    match m {
+        Some(_) if m_rid >= 0 => {
+            if p_rid == m_rid {
                 out.push(b'=');
             } else {
-                out.extend_from_slice(bns.contigs[mate.rid as usize].name.as_bytes());
+                out.extend_from_slice(bns.contigs[m_rid as usize].name.as_bytes());
             }
             out.push(b'\t');
-            crate::emit::push_int(out, mate.pos + 1);
+            crate::emit::push_int(out, m_pos + 1);
             out.push(b'\t');
             // TLEN. `p0`/`p1` are each record's *outermost* base: the leftmost for a forward
             // alignment, the rightmost (`pos + rlen - 1`) for a reverse one. TLEN is their signed
@@ -2013,16 +2024,11 @@ fn mem_aln2sam(
             //
             // Either CIGAR being empty means one end is only borrowing the other's coordinate (see
             // the mate-copy above), so there is no real template and TLEN is 0.
-            if p.rid == mate.rid {
+            if p_rid == m_rid {
                 // `p0`/`p1`: this record's and the mate's outermost reference base, 0-based.
-                let p0 = p.pos + if p.is_rev { get_rlen(&p.cigar) - 1 } else { 0 };
-                let p1 = mate.pos
-                    + if mate.is_rev {
-                        get_rlen(&mate.cigar) - 1
-                    } else {
-                        0
-                    };
-                if mate.cigar.is_empty() || p.cigar.is_empty() {
+                let p0 = p_pos + if p_is_rev { get_rlen(p_cigar) - 1 } else { 0 };
+                let p1 = m_pos + if m_is_rev { get_rlen(m_cigar) - 1 } else { 0 };
+                if m_cigar.is_empty() || p_cigar.is_empty() {
                     out.push(b'0');
                 } else {
                     // +1, -1 or 0: widens the span by one so TLEN counts both endpoints inclusively.
@@ -2044,7 +2050,7 @@ fn mem_aln2sam(
     // ---- step 5: SEQ, QUAL ----
     // Secondary records (0x100) omit both, per SAM convention and to keep file size
     // sane; the read's bases are already on its primary record.
-    if p.flag & 0x100 != 0 {
+    if p_flag & 0x100 != 0 {
         out.extend_from_slice(b"*\t*");
     } else {
         // `qb`/`qe`: the half-open slice of `seq` (and of `qual`) this record actually prints, in
@@ -2056,27 +2062,27 @@ fn mem_aln2sam(
         // to match or the record is self-inconsistent. This condition is EXACTLY `add_cigar`'s
         // (`bwamem.cpp:1655` repeats the same four terms), and the two must be kept in step: trim
         // without hard-clipping and the record claims bases it does not carry.
-        if !p.cigar.is_empty() && which != 0 && !softclip && !p.is_alt {
+        if !p_cigar.is_empty() && which != 0 && !softclip && !p.is_alt {
             // Opcodes of the CIGAR's two outermost ops; 3 (S) or 4 (H) means that end is clipped.
-            let first = p.cigar[0] & 0xf;
-            let last = p.cigar[p.cigar.len() - 1] & 0xf;
+            let first = p_cigar[0] & 0xf;
+            let last = p_cigar[p_cigar.len() - 1] & 0xf;
             // `qb`/`qe` index `seq` in SEQUENCING orientation, but the CIGAR is in REFERENCE
             // orientation, so on a reverse-strand alignment the leading CIGAR clip corresponds to
             // the trailing end of `seq` and vice versa. That is the only difference between the two
             // branches below, and getting it backwards trims the wrong end of the read.
-            if !p.is_rev {
+            if !p_is_rev {
                 if first == 4 || first == 3 {
-                    qb += (p.cigar[0] >> 4) as usize;
+                    qb += (p_cigar[0] >> 4) as usize;
                 }
                 if last == 4 || last == 3 {
-                    qe -= (p.cigar[p.cigar.len() - 1] >> 4) as usize;
+                    qe -= (p_cigar[p_cigar.len() - 1] >> 4) as usize;
                 }
             } else {
                 if first == 4 || first == 3 {
-                    qe -= (p.cigar[0] >> 4) as usize;
+                    qe -= (p_cigar[0] >> 4) as usize;
                 }
                 if last == 4 || last == 3 {
-                    qb += (p.cigar[p.cigar.len() - 1] >> 4) as usize;
+                    qb += (p_cigar[p_cigar.len() - 1] >> 4) as usize;
                 }
             }
         }
@@ -2087,7 +2093,7 @@ fn mem_aln2sam(
         // Written a block at a time rather than a base at a time: see `crate::emit`, and the x86
         // profile that motivated it (`sam_emit` is 5.15x slower per pair there than on an M4, the
         // worst-scaling stage we have). Same bytes, same alphabets, same order.
-        if !p.is_rev {
+        if !p_is_rev {
             crate::emit::push_seq_fwd(out, &seq[qb..qe]);
             out.push(b'\t');
             match qual {
@@ -2109,7 +2115,7 @@ fn mem_aln2sam(
     // SAM does not prescribe an order, but byte-identity does, so nothing here may be reordered.
     //
     // NM/MD are gated on a non-empty CIGAR, so a read placed at its mate's coordinate gets neither.
-    if !p.cigar.is_empty() {
+    if !p_cigar.is_empty() {
         out.extend_from_slice(b"\tNM:i:");
         crate::emit::push_int(out, i64::from(p.nm));
         out.extend_from_slice(b"\tMD:Z:");
@@ -2119,10 +2125,10 @@ fn mem_aln2sam(
     // (`bwamem.cpp:1689` passes `which` straight through), so on a supplementary record the mate's
     // clips are printed as H even though the mate's own record prints them as S. That is bwa's
     // behaviour, not a transcription slip.
-    if let Some(mate) = m.as_ref() {
-        if !mate.cigar.is_empty() {
+    if let Some(mate) = m {
+        if !m_cigar.is_empty() {
             out.extend_from_slice(b"\tMC:Z:");
-            add_cigar(&mate.cigar, which != 0 && !softclip && !mate.is_alt, out);
+            add_cigar(m_cigar, which != 0 && !softclip && !mate.is_alt, out);
         }
     }
     // AS/XS are gated on `>= 0`, not on `> 0`, which is why an unmapped record (built from a zeroed
@@ -2145,7 +2151,7 @@ fn mem_aln2sam(
     // Each entry is `rname,pos,strand,CIGAR,mapq,NM;` INCLUDING the trailing semicolon on the last
     // one. The CIGAR here is rendered with `which = 0`, i.e. always soft-clipped, regardless of
     // whether the referenced hit is itself a supplementary.
-    if p.flag & 0x100 == 0 {
+    if p_flag & 0x100 == 0 {
         // True when some OTHER non-secondary record exists for this read, i.e. the SA:Z tag will
         // have at least one entry. Scanned first so the `SA:Z:` prefix is never written empty.
         let has_other = list
@@ -2176,7 +2182,7 @@ fn mem_aln2sam(
     // `pa:f` (`bwamem.cpp:1714`): emitted for a non-secondary record whenever `alt_sc` was set,
     // independently of whether an `SA:Z` was printed, and always before `XA:Z`. `alt_sc` is 0
     // unless the index has ALT contigs.
-    if p.flag & 0x100 == 0 && p.alt_sc > 0 {
+    if p_flag & 0x100 == 0 && p.alt_sc > 0 {
         out.extend_from_slice(b"\tpa:f:");
         out.extend_from_slice(crate::cigar::format_pa(p.score, p.alt_sc).as_bytes());
     }
@@ -2283,14 +2289,32 @@ fn mem_reg2sam(
         if p.secondary >= 0 {
             aln.sub = -1;
         }
-        // Everything after the first accepted record is a supplementary. bwa picks 0x10000 instead
-        // of 0x800 under `-M`; without that flag it is always 0x800.
+        // Everything after the first accepted record is a supplementary. Under `-M`
+        // (MEM_F_NO_MULTI) bwa sets its INTERNAL 0x10000 instead of 0x800 (`bwamem.cpp:1552`),
+        // which `mem_aln2sam` then prints as SAM's 0x100 secondary bit: `-M` exists so that older
+        // tools, which understand secondary but not supplementary, still see one primary per read.
+        // This branch used to write 0x800 unconditionally, its own comment describing the `-M` case
+        // it did not implement, so every supplementary this path emitted came out supplementary
+        // under `-M` too.
         if n_emitted > 0 && p.secondary < 0 {
-            aln.flag |= 0x800; // supplementary
+            aln.flag |= if opt.flag & bwa_core::opt::flags::NO_MULTI != 0 {
+                0x10000 // bwa-internal; printed as 0x100
+            } else {
+                0x800 // supplementary
+            };
         }
         // A supplementary must not claim higher confidence than the primary it came from, so its
         // MAPQ is capped at the first record's. Only lowered, never raised.
-        if n_emitted > 0 && !p.is_alt && aln.mapq > emitted[0].mapq {
+        //
+        // `-q` (MEM_F_KEEP_SUPP_MAPQ), which `-5` also sets, suppresses the cap: for a chimeric
+        // library each segment is its own real placement and capping it hides that. The C's guard
+        // is the `#if V17` arm at `bwamem.cpp:1555`, and it was missing here, so `-q` and `-5`
+        // capped anyway on this path while the single-end path honoured them.
+        if opt.flag & bwa_core::opt::flags::KEEP_SUPP_MAPQ == 0
+            && n_emitted > 0
+            && !p.is_alt
+            && aln.mapq > emitted[0].mapq
+        {
             aln.mapq = emitted[0].mapq;
         }
         emitted.push(aln);
@@ -2323,6 +2347,20 @@ fn mem_reg2sam(
     }
 }
 
+thread_local! {
+    /// One SAM output buffer per thread, reused across every pair that thread emits.
+    ///
+    /// `mem_sam_pe` used to build each end's records in its own fresh `Vec`, so a pair paid two
+    /// allocations plus the reallocations of growing from empty to a few hundred bytes, and then
+    /// issued two writes. The buffer is taken out here and put back at the end; an early return
+    /// between the two simply drops it and costs one allocation on the next pair, which makes this
+    /// a performance path and never a correctness one.
+    ///
+    /// Per-THREAD and not per-call, so it cannot be shared between the rayon workers that run pairs
+    /// concurrently. Both ends of a pair still go in before anything is written.
+    static SCRATCH_SAM: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Full paired-end SAM for one read pair. Port of `mem_sam_pe` (`bwamem_pair.cpp:353-546`),
 /// non-ALT, without `-a`/`-5`.
 ///
@@ -2345,8 +2383,9 @@ fn mem_reg2sam(
 /// renumber. `rescue_done` is a port-only flag: true when the caller already ran
 /// [`batch_mate_rescue`] over the whole batch, in which case stage 1 is skipped here.
 ///
-/// Records are written to `w` read 1 first, then read 2. Each end's records are built in a private
-/// buffer and written in one call, so a pair's lines cannot interleave with another thread's.
+/// Records are written to `w` read 1 first, then read 2. The whole pair is built in
+/// [`SCRATCH_SAM`], this thread's reusable buffer, and written in ONE call, so a pair's lines
+/// cannot interleave with another thread's.
 ///
 /// RETURNS whatever `w` reported; the only failure mode is the write itself.
 ///
@@ -2416,6 +2455,13 @@ pub fn mem_sam_pe<W: Write>(
     // `n_pri < a.len()` ALT branches stay meaningful.
     let n_pri0 = mem_mark_primary_se(opt, a0, id << 1) as usize;
     let n_pri1 = mem_mark_primary_se(opt, a1, (id << 1) | 1) as usize;
+    // `-5`: both ends, after the marking and before the `-P` test, exactly where
+    // `bwamem_pair.cpp:419-423` puts it. `n_pri0`/`n_pri1` are computed FIRST and stay valid: the
+    // reorder swaps two slots that were both non-secondary, so it cannot change how many there are.
+    if opt.flag & bwa_core::opt::flags::PRIMARY5 != 0 {
+        crate::primary::mem_reorder_primary5(opt.t, a0);
+        crate::primary::mem_reorder_primary5(opt.t, a1);
+    }
     // 0x1 (paired in sequencing) is stamped on every record either path emits.
     let extra_flag: u32 = 1;
 
@@ -2431,7 +2477,20 @@ pub fn mem_sam_pe<W: Write>(
             let a: [&[MemAlnReg]; 2] = [&a0[..n_pri0], &a1[..n_pri1]];
             mem_pair(bns, opt, pes, &a, id)
         };
-        if let Some(pr) = pr {
+        // `.filter(score > 0)` is bwa's `(o = mem_pair(...)) > 0`, and it is not a nicety. A pair
+        // whose best score is exactly ZERO is not a proper pair to the C, which falls straight
+        // through to `no_pairing` -- where the insert window, not the pair score, decides the 0x2
+        // bit. Testing only for `Some` took the paired branch instead, and that branch never
+        // evaluates the `no_pairing` window test, so the pair lost its proper-pair bit.
+        //
+        // Zero is reachable, and reachable on ordinary data: the insert-size term is
+        // `0.721 * ln(2 * erfc(|z| / sqrt(2))) * a`, and with a standard deviation of ZERO the
+        // z-score is `0/0` for an insert exactly at the mean. That is NaN, `NaN as i64` is 0 here
+        // and `(int)NaN` is 0 in the C on this machine, so both floor the pair at 0 -- and then only
+        // the C drew the right conclusion from it. `-I 400,0` reproduces it on any read set, and so
+        // does a library with a fixed insert size, where the inferred distribution has no spread at
+        // all: 600 of 600 records differed on a simulated fixed-insert set before this.
+        if let Some(pr) = pr.filter(|p| p.score > 0) {
             // Multiple sufficiently-good primary hits on either end -> fall back. bwa's rationale
             // (its own TODO) is that a split alignment would be mangled by forcing a single paired
             // record, so it prefers the per-end emitter. The scan starts at j = 1 because a[0] is
@@ -2646,14 +2705,40 @@ pub fn mem_sam_pe<W: Write>(
                 // bwa's `aa[i]`: every record emitted for this end, primary first. Its LENGTH is
                 // what makes the difference downstream, because `mem_aln2sam` uses it to decide
                 // whether an `SA:Z` is owed and how to clip.
-                let mut aa0 = vec![h0.clone()];
-                aa0.extend(alt_extra(a0, n_pri0, &xa0, seqs[0], 0x40));
-                let mut aa1 = vec![h1.clone()];
-                aa1.extend(alt_extra(a1, n_pri1, &xa1, seqs[1], 0x80));
+                let extra0 = alt_extra(a0, n_pri0, &xa0, seqs[0], 0x40);
+                let extra1 = alt_extra(a1, n_pri1, &xa1, seqs[1], 0x80);
+                // Backing storage for the TWO-record case only. On an index with no ALT contigs
+                // `alt_extra` returns `None` for every read, so `aa0`/`aa1` borrow `h0`/`h1` in
+                // place and nothing is allocated or copied. They used to be
+                // `vec![h0.clone()]`, which on the common path was one `Vec` plus a `MemAln` clone
+                // per end -- and a `MemAln` clone is its CIGAR `Vec`, its `md` String and its `xa`
+                // String, so up to eight allocations per pair to build two one-element lists that
+                // `mem_aln2sam` only ever reads.
+                let (both0, both1);
+                let aa0: &[MemAln] = match extra0 {
+                    None => std::slice::from_ref(&h0),
+                    Some(g) => {
+                        both0 = [h0.clone(), g];
+                        &both0
+                    }
+                };
+                let aa1: &[MemAln] = match extra1 {
+                    None => std::slice::from_ref(&h1),
+                    Some(g) => {
+                        both1 = [h1.clone(), g];
+                        &both1
+                    }
+                };
 
                 // The MATE handed to the other end's records is `h`, the paired primary record,
                 // never the ALT supplementary one (the C passes `&h[1]` and `&h[0]`).
-                let mut buf0 = Vec::new();
+                // ONE buffer for both ends, taken from the per-thread scratch, so a pair costs no
+                // allocation here at all after the first one on this thread. It was two `Vec`s
+                // grown from empty per pair, each reallocating its way up to a few hundred bytes.
+                // Both ends still land in the buffer before anything is written, and now in a
+                // single `write_all` rather than two, so a pair's records cannot be split.
+                let mut buf = SCRATCH_SAM.with(|c| std::mem::take(&mut *c.borrow_mut()));
+                buf.clear();
                 for which in 0..aa0.len() {
                     mem_aln2sam(
                         bns,
@@ -2661,14 +2746,13 @@ pub fn mem_sam_pe<W: Write>(
                         seqs[0],
                         quals[0],
                         comments[0],
-                        &aa0,
+                        aa0,
                         which,
                         Some(&h1),
                         softclip,
-                        &mut buf0,
+                        &mut buf,
                     );
                 }
-                let mut buf1 = Vec::new();
                 for which in 0..aa1.len() {
                     mem_aln2sam(
                         bns,
@@ -2676,16 +2760,16 @@ pub fn mem_sam_pe<W: Write>(
                         seqs[1],
                         quals[1],
                         comments[1],
-                        &aa1,
+                        aa1,
                         which,
                         Some(&h0),
                         softclip,
-                        &mut buf1,
+                        &mut buf,
                     );
                 }
-                w.write_all(&buf0)?;
-                w.write_all(&buf1)?;
-                return Ok(());
+                let wrote = w.write_all(&buf);
+                SCRATCH_SAM.with(|c| *c.borrow_mut() = buf);
+                return wrote;
             }
         }
     }
@@ -2761,7 +2845,8 @@ pub fn mem_sam_pe<W: Write>(
     // carries 0x01 already, so the OR is redundant on that bit; it matters only for 0x2. Each end
     // is handed the OTHER end's picked alignment as its mate. Both buffers are built in full before
     // either is written so a pair's four-or-more lines never interleave with another thread's.
-    let mut buf0 = Vec::new();
+    let mut buf = SCRATCH_SAM.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    buf.clear();
     mem_reg2sam(
         fm,
         bns,
@@ -2773,9 +2858,8 @@ pub fn mem_sam_pe<W: Write>(
         a0,
         0x41 | extra_flag,
         Some(&h1),
-        &mut buf0,
+        &mut buf,
     );
-    let mut buf1 = Vec::new();
     mem_reg2sam(
         fm,
         bns,
@@ -2787,11 +2871,11 @@ pub fn mem_sam_pe<W: Write>(
         a1,
         0x81 | extra_flag,
         Some(&h0),
-        &mut buf1,
+        &mut buf,
     );
-    w.write_all(&buf0)?;
-    w.write_all(&buf1)?;
-    Ok(())
+    let wrote = w.write_all(&buf);
+    SCRATCH_SAM.with(|c| *c.borrow_mut() = buf);
+    wrote
 }
 
 #[cfg(test)]

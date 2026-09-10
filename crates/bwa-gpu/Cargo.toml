@@ -1,0 +1,27 @@
+[package]
+name = "bwa-mem4-gpu"
+description = "GPU seam for bwa-mem4: job flattening, backend selection and CPU fallback. No system dependency unless a GPU feature is enabled."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "gpu"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bwa-mem4-extend = { path = "../bwa-extend", version = "4.3.1" }
+
+[features]
+# Both empty on purpose. The concrete backends live in their own crates and are wired in behind
+# these names; declaring them now is what lets `select()` compile the same on every machine and lets
+# `cargo build --features metal` on a GPU-less host exercise the fallback path (issue #53's second
+# acceptance criterion) before either backend exists.
+default = []
+metal = []
+cuda = []

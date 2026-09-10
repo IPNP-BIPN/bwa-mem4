@@ -432,3 +432,39 @@ without it. Reverted.
 Two things to carry forward. The row epilogue is NOT where the 1.50x is, so the note in `matesw.rs`
 should not send the next person there first. And a horizontal reduction is not a cheap way to ask a
 question about a vector: it costs more than sixteen well-predicted scalar iterations.
+
+## The GPU probe reproduces the kernel's shape but not its cache, and that is why it stops here (2026-08-30)
+
+`scripts/msl/mem_ops.m` now adds the real kernel's differences one at a time, on the same recurrence
+and the same access pattern, to see how much of the gap between a bare loop and the shipped kernel
+each one explains:
+
+| arm | throughput | against the previous |
+|---|---|---|
+| `mem1`, the bare recurrence | 157.06 Gcell/s | |
+| `mem1g`, plus one query gather per cell | 78.63 | **0.50x** |
+| `mem1b`, plus the four per-cell branches | 71.51 | 0.91x |
+| `mem1d`, plus per-thread trip counts | 68.88 | 0.96x |
+| the shipped kernel | **50.31** | 0.73x still unexplained |
+
+So three named differences explain 2.28x of the 3.12x, and 1.37x is left over. That reads like
+progress, and the next step would be to attack the gather, which is by far the largest of the three.
+
+**Except that step was already taken and it did not work.** The query was transposed into
+column-major order so neighbouring lanes read neighbouring bytes, which removes exactly the gather
+this probe prices at 2x. Measured on the real kernel: **1.08x**, and a net loss once the host's
+transpose was counted.
+
+That is the finding, and it is about the method rather than the kernel. The probe reproduces the
+kernel's SHAPE, and it does not reproduce its CACHE: a threadgroup's 1024 queries are 153 KB and
+stay resident across rows, while the probe re-reads a 39 MB buffer. In the one case where both the
+probe and the kernel were measured, the probe overstated the cost by a factor of two.
+
+**So no further decomposition of this kernel by probe is trustworthy**, including the two numbers
+above that were not independently checked. What remains needs hardware counters on the real kernel,
+which on this machine means Instruments, which means the Xcode licence being accepted. The device
+exposes only the `timestamp` counter set through the Metal API: enough for true GPU time, not enough
+for the ALU-against-memory question that is actually open.
+
+Recorded rather than pushed further, because the alternative is another confident decomposition
+built on an instrument that has already been caught being wrong once.

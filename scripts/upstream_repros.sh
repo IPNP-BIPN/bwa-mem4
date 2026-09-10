@@ -61,6 +61,91 @@ echo "        AVX512 build, so this case is a regression guard here, not a repro
 
 echo
 echo "======================================================================"
+echo "bwa-mem2 - reads near a contig start placed at POS 1 with a nonsense NM"
+echo "======================================================================"
+# NOT a filed issue: found here on 2026-09-10 by fuzzing REFERENCE shapes. On an 80 kb reference cut
+# from `testdata/tiny`, 150 bp reads taken at offsets 1..11 are all placed by bwa-mem2 2.3 at POS 1,
+# and the record contradicts itself: `150M`, `AS:i:150` (the score of a perfect match) and
+# `NM:i:110`. bwa 0.7.19 and this aligner place all eleven correctly with `NM:i:0`.
+#
+# The trigger is the reference and not its length alone: sweeping 20 kb to 200 kb in 20 kb steps,
+# the oracle misplaces 3, 8, 0, 11, 8, 3, 0, 11, 1, 3 of the eleven. That irregularity is the
+# signature of an out-of-bounds read rather than a threshold. Its output is deterministic across
+# runs, so it is not uninitialised memory in the simplest sense.
+#
+# The committed 200 001-base fixture does not trigger it, which is the only reason the parity suites
+# stay byte-identical: wgsim does draw about 11 reads in 150 000 within the first 15 bases, and on
+# THAT reference the oracle places them correctly.
+python3 - "$TMP" <<'PY'
+import sys
+T = sys.argv[1]
+ref = "".join(l.strip() for l in open("testdata/tiny/tiny.fa") if not l.startswith(">")).upper()
+s = ref[:80000]
+with open(f"{T}/edge.fa", "w") as f:
+    f.write(">c1\n")
+    for i in range(0, len(s), 60):
+        f.write(s[i:i + 60] + "\n")
+# One read per offset, each an exact copy of the reference from that offset, so the only correct
+# answer is POS = offset + 1 and any other placement is wrong on its face.
+with open(f"{T}/edge.fq", "w") as f:
+    for off in range(1, 12):
+        f.write(f"@off{off}\n{s[off:off + 150]}\n+\n{'I' * 150}\n")
+PY
+"$M2" index "$TMP/edge.fa" >/dev/null 2>&1
+misplaced() {
+  # Reads are named for the offset they came from, so the expected POS is in the name.
+  awk '!/^@/ {split($1, a, "off"); if ($4 != a[2] + 1) c++} END {print c + 0}' "$1"
+}
+"$M2" mem -t1 "$TMP/edge.fa" "$TMP/edge.fq" >"$TMP/edge_m2.sam" 2>/dev/null
+echo "  bwa-mem2: $(misplaced "$TMP/edge_m2.sam") of 11 reads misplaced"
+"$M3" mem -t1 "$TMP/edge.fa" "$TMP/edge.fq" >"$TMP/edge_m3.sam" 2>/dev/null
+E3=$(misplaced "$TMP/edge_m3.sam")
+echo "  bwa-mem4: $E3 of 11 reads misplaced"
+if [ "$E3" = 0 ]; then
+  echo "  -> we place every read at the offset it was cut from."
+else
+  echo "  -> WE MISPLACED READS, which is a regression: this used to be exact."
+fi
+
+echo
+echo "======================================================================"
+echo "bwa-mem2 - assert in bns_fetch_seq_v2 under a large -W"
+echo "======================================================================"
+# NOT a filed issue: found here on 2026-09-10 by `scripts/opt_fuzz.py`, which draws random option
+# combinations. `-W 100` on ordinary 150 bp reads aborts bwa-mem2 2.3 with
+#
+#   Assertion failed: (*beg <= mid && mid < *end), function bns_fetch_seq_v2, bwamem.cpp:1901
+#
+# `-W` is `min_chain_weight`, a chain-filter threshold; a value at or above the read length leaves
+# the chain window degenerate. bwa 0.7.19 runs the same options to completion, so this is bwa-mem2's
+# own regression rather than a property of the algorithm, and there is no output to be
+# byte-identical to. What this case asserts is only that WE keep producing a complete SAM, the same
+# exception the crash cases above run under.
+#
+# It needs the COMMITTED fixture, not a synthetic reference: a random sequence has no repeats, so no
+# chain window ever becomes degenerate and the oracle finishes normally. The threshold is sharp on
+# this fixture -- `-W 60` is fine, `-W 100` aborts.
+python3 scripts/make_test_reads.py testdata/tiny/tiny.fa "$TMP/w" --n 4000 >/dev/null 2>&1
+# The subshell is not decoration: the oracle dies on a SIGABRT and the shell prints its own
+# "Abort trap: 6" job message, which redirecting the command's stderr does not suppress.
+( "$M2" mem -t1 -W 100 testdata/tiny/tiny.fa "$TMP/w_1.fq" >"$TMP/w_m2.sam" 2>/dev/null ) 2>/dev/null
+M2_RC=$?
+echo "  bwa-mem2: rc=$M2_RC records=$(grep -vc '^@' "$TMP/w_m2.sam" 2>/dev/null)"
+"$M3" mem -t1 -W 100 testdata/tiny/tiny.fa "$TMP/w_1.fq" >"$TMP/w_m3.sam" 2>/dev/null
+W3_RC=$?
+W3_N=$(grep -vc '^@' "$TMP/w_m3.sam" 2>/dev/null)
+echo "  bwa-mem4: rc=$W3_RC records=$W3_N"
+if [ "$M2_RC" = 0 ]; then
+  echo "  NOTE: the oracle did NOT abort here. Either it was fixed upstream, or this build differs;"
+  echo "        in that case the two outputs should agree and the parity scripts already check that."
+elif [ "$W3_RC" = 0 ] && [ "${W3_N:-0}" -eq 4000 ]; then
+  echo "  -> we align all 4000 reads where the oracle aborts."
+else
+  echo "  -> WE FAILED TOO, which is a regression: this used to complete."
+fi
+
+echo
+echo "======================================================================"
 echo "bwa-mem2 #280 - invalid index created (.amb fails to parse on load)"
 echo "======================================================================"
 # The reporter's own index build printed `pos: 91632415, ref_seq_len__: 91632414` and the aligner

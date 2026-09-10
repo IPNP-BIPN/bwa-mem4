@@ -246,12 +246,17 @@ pub mod rescue_split {
     }
 }
 
+/// Re-exported so the CLI can dump the tracker shape probe without depending on `bwa-extend`
+/// directly; the counters live where the tracker does.
+pub use bwa_extend::sw::subopt_shape;
+
 pub mod across;
 pub mod alt;
 pub mod cigar;
 pub mod emit;
 pub mod pe;
 pub mod primary;
+pub mod seedflt;
 pub use across::align_reads_batched;
 pub use cigar::{cigar_string, reg2aln, MemAln};
 pub use pe::{batch_mate_rescue, mem_pestat, mem_sam_pe, PairRescueData, PeStat};
@@ -923,7 +928,12 @@ pub(crate) fn mem_chain2aln_meta(
 pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec<MemAlnReg> {
     // The read's chains after weak ones are dropped. The trailing 0 to `build_chains` is the seed
     // batch/read id; unused on this scalar path.
-    let chains = mem_chain_flt(opt, build_chains(fm, bns, opt, codes, 0));
+    let mut chains = mem_chain_flt(opt, build_chains(fm, bns, opt, codes, 0));
+    // bwa's second chain-level pass (`bwamem.cpp:1084`), between the chain filter and any
+    // extension: it re-scores every short seed by a local alignment of its own neighbourhood and
+    // drops the ones that do not earn their keep. A no-op below ~690 bp of read, by its own length
+    // test, which is why 150 bp fixtures never saw it.
+    crate::seedflt::mem_flt_chained_seeds(fm, bns, opt, codes, &mut chains);
     // Three parallel arrays filled across ALL chains of the read: the regions themselves, their
     // provenance, and the "was the DP skipped" flag. They stay index-aligned throughout, which is
     // what lets the discard pass below index all three by one position.
@@ -1060,6 +1070,12 @@ pub fn align_read_se(
     let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs);
     crate::primary::stamp_is_alt(bns, &mut regs);
     mem_mark_primary_se(opt, &mut regs, read_id);
+    // `-5` (`MEM_F_PRIMARY5`): make the 5'-most segment of a split alignment the primary, which
+    // score-ranking would not. Runs here, immediately after the marking and before anything reads
+    // the region order.
+    if opt.flag & bwa_core::opt::flags::PRIMARY5 != 0 {
+        crate::primary::mem_reorder_primary5(opt.t, &mut regs);
+    }
     regs
 }
 

@@ -20,6 +20,60 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   le figeage de cette formulation plutot qu'une attente indefinie : si upstream tranche un jour dans
   l'autre sens, c'est cette entree qu'il faudra rouvrir, et l'oracle de reference avec elle.
 
+- **`-p` sur une entree ou deux reads consecutifs ne sont pas des mates : nous refusons, bwa
+  bascule en single-end. ACCEPTE, avec erreur explicite.** `bseq_classify` (bwa) partitionne un
+  lot : les reads dont les noms consecutifs concordent deviennent des paires, les autres passent
+  par le chemin single-end, dans la meme execution. Notre lecteur `-p` s'arrete plutot, avec un
+  message qui nomme les deux reads et dit ce que bwa aurait fait.
+
+  Mesure : sur un fichier de 4 reads aux noms tous distincts, l'oracle emet 4 enregistrements
+  single-end (FLAG 0) et nous n'en emettons aucun. Idem sur un nombre impair de reads.
+
+  Le choix est deliberat : `-p` designe un FASTQ entrelace, ou les mates PARTAGENT leur nom (les
+  suffixes `/1` et `/2` sont deja retires avant la comparaison). Un fichier ou ils ne le partagent
+  pas n'est pas entrelace, et l'apparier silencieusement produirait des paires fausses avec des
+  TLEN et des MAPQ faux, ce qu'aucun lecteur en aval ne peut detecter. Porter `bseq_classify`
+  reste possible ; ce n'est pas fait, et c'est ecrit ici plutot que decouvert.
+
+- **Reads commencant a quelques bases du DEBUT d'un contig : bwa-mem2 les place a POS 1 avec un `NM`
+  absurde, nous suivons bwa 0.7.19. ACCEPTE (4.4.x).** Sur une reference de 80 kb decoupee dans
+  `testdata/tiny`, et des reads de 150 bases pris aux offsets 1 a 11, bwa-mem2 2.3 place **les 11**
+  a POS 1. L'enregistrement se contredit lui-meme : `150M`, `AS:i:150` (le score d'un appariement
+  parfait) et `NM:i:110`. bwa 0.7.19 et nous placons les 11 correctement, avec `NM:i:0`.
+
+  Le declencheur est la reference, pas la taille seule : en balayant les longueurs de 20 kb a 200 kb
+  par tranches de 20 kb, le nombre de reads mal places par l'oracle fait 3, 8, 0, 11, 8, 3, 0, 11, 1,
+  3. Cette irregularite est la signature d'une lecture hors borne, pas d'un seuil. La sortie de
+  l'oracle est **deterministe** (trois executions identiques), donc ce n'est pas une donnee non
+  initialisee au sens le plus simple.
+
+  Le fixture livre (`testdata/tiny/tiny.fa`, 200 001 bases) ne le declenche pas, ce qui est la seule
+  raison pour laquelle nos 76 cas de parite et nos 150 000 paires wgsim restent octet-identiques :
+  wgsim tire bien ~11 reads sur 150 000 dans les 15 premieres bases, et sur CE fixture l'oracle les
+  place correctement.
+
+  Nous ne reproduisons pas. C'est la meme exception que les deux entrees ci-dessous : reproduire une
+  sortie qui se contredit elle-meme n'est pas reproduire une sortie, et l'implementation de
+  reference que bwa-mem2 dit reprendre, bwa 0.7.19, est d'accord avec nous. Le cas est garde dans
+  `scripts/upstream_repros.sh`.
+
+- **Une base `-` dans un read : bwa-mem2 tronque sa propre sortie, nous emettons `N`. ACCEPTE
+  (4.4.x).** `nst_nt4_table` de bwa donne le code **5** au caractere `-` (et 4 a tout le reste), or
+  SEQ est imprime par `"ACGTN"[code]` : l'index 5 lit le terminateur de la chaine, un octet NUL
+  part dans le `kstring`, et `fputs` s'arrete dessus. Le resultat n'est pas un enregistrement
+  different : c'est un SAM **coupe au milieu de la colonne 10**, qui perd aussi tous les
+  enregistrements suivants du meme tampon. Mesure ici sur un read de 150 bases avec un seul `-` en
+  position 10 : la sortie de l'oracle s'arrete apres 10 bases de SEQ.
+
+  Notre table donne 4 (`N`) a `-` comme a n'importe quel autre octet, donc nous emettons un
+  enregistrement complet et valide. C'est la meme exception que les crashs de
+  `scripts/upstream_repros.sh` : reproduire une sortie tronquee n'est pas reproduire une sortie.
+
+  Tous les AUTRES octets hors `ACGTacgt` (`N`, lettres IUPAC, `.`, `*`, espace) donnent `N` des
+  deux cotes, verifie un par un contre l'oracle. C'est notre chemin single-end qui s'en ecartait
+  jusqu'en 4.4.x, en recopiant les octets bruts du FASTQ dans SEQ ; corrige, avec le passage en
+  majuscules que cela impliquait aussi.
+
 - **`@PG` : DECIDE (4.0.0). Nous emettons notre propre identite, definitivement.** Notre sortie
   emet `ID:bwa-mem4 PN:bwa-mem4 VN:<ver> CL:<notre argv>`, l'oracle emet `bwa-mem2`. Exclu du gate
   d'octet-identite (on compare `@SQ` + les lignes d'alignement).
