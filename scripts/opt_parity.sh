@@ -190,6 +190,17 @@ check "-y 10"  se -y 10
 check "-c 100" se -c 100
 check "-D 0.3" se -D 0.3
 check "-W 10"  se -W 10
+# `-W` STRADDLING WHERE THE CHAINED-SEED FILTER SWITCHES ON. `mem_flt_chained_seeds` runs only while
+# `min_l <= 0.05 * l_query`, and `-W` replaces the usual `5.5 * ln(l_query)` with `1.1 * W`. On these
+# 150 bp reads that puts the boundary between `-W 6` (6.6 <= 7.5, filter runs) and `-W 7`
+# (7.7 > 7.5, filter off), which is the only way to exercise the filter's `-W` arm at all: at the
+# default `-W 0` it is the logarithm that decides, and short reads never reach it.
+#
+# It is also where the `1.1f` constant matters. Declared `float` in the C, so `f64::from(1.1_f32)`
+# and not `1.1_f64`, or `min_HSP_score` moves by one exactly on this boundary. Verified to have
+# teeth: with the filter disabled, `-W 6` differs by one record and `-W 7` by none.
+check "-W 6"   se -W 6
+check "-W 7"   se -W 7
 check "-m 20"  pe -m 20
 
 echo "=== scoring ==="
