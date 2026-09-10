@@ -1183,7 +1183,10 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
     // Chains that passed the weight gate, still in input (kbtree) order until the sort below. This
     // vector's indices are what `kept_idx` and the `first` field refer to from here on, so it must not
     // be reordered again after the sort.
-    let mut ranked: Vec<MemChain> = Vec::new();
+    // `with_capacity`, not `new`: this runs once per read, and growing from empty reallocates about
+    // log2(n) times per call for a vector whose element carries its own `Vec<MemSeed>`. The filter
+    // below can only shrink the input, so the input length is an exact upper bound.
+    let mut ranked: Vec<MemChain> = Vec::with_capacity(chains.len());
     for mut c in chains {
         c.first = -1;
         c.kept = 0;
@@ -1206,7 +1209,11 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
     // Indices into `ranked` of the chains accepted so far, ascending (so also weight-descending).
     // Invariant at the top of the `i` loop: `kept_idx` holds exactly the chains in `0..i` that were
     // not shadowed, each with `kept` 2 or 3, and every chain in `i..` still has `kept == 0`.
-    let mut kept_idx: Vec<usize> = vec![0];
+    // Per-thread scratch for the same reason: one allocation per read, and the accepted list is
+    // usually a handful of entries, so the allocation dominated what it held.
+    let mut kept_idx: Vec<usize> = KEPT_IDX.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    kept_idx.clear();
+    kept_idx.push(0);
     // `broke` mirrors the C's `if (k == chains.n)` test after the inner loop (`bwamem.cpp:585`):
     // "the inner loop ran to completion" means "not shadowed", so the chain is accepted. Breaking
     // early means shadowed, so it is silently dropped (its `kept` stays 0 and `retain` removes it).
@@ -1323,7 +1330,15 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
         i += 1;
     }
     ranked.retain(|c| c.kept != 0);
+    // Hand the accepted-list buffer back for the next read on this thread.
+    KEPT_IDX.with(|c| *c.borrow_mut() = kept_idx);
     ranked
+}
+
+thread_local! {
+    /// Per-thread scratch for [`mem_chain_flt`]'s accepted-chain list. See its use: this function
+    /// runs once per read, so a fresh `Vec` here is one allocation per read.
+    static KEPT_IDX: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]

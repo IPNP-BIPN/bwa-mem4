@@ -878,6 +878,49 @@ impl SuboptimalTracker {
         }
     }
 
+    /// `BWA4_SUBOPT_SHAPE` probe: how many candidates a job actually accumulates, and how many rows
+    /// were pushed to produce them.
+    ///
+    /// The question it answers is whether the `score2` pass can move into a GPU thread. The tracker
+    /// is per job and strictly sequential, so a thread that owns a job could run it in registers,
+    /// which would delete both the row-maxima buffer and the host pass that reads it. What stops
+    /// that is `b` being unbounded: a GPU thread needs a fixed-size array. The distribution of
+    /// `b.len()` is therefore the whole feasibility question, and it is measured rather than
+    /// guessed. Rows pushed is recorded beside it because the ratio is the compression a GPU-side
+    /// tracker would buy.
+    pub fn record_shape(&self, rows_pushed: u64) {
+        if !subopt_shape::enabled() {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        subopt_shape::JOBS.fetch_add(1, Relaxed);
+        subopt_shape::ROWS.fetch_add(rows_pushed, Relaxed);
+        subopt_shape::CANDS.fetch_add(self.b.len() as u64, Relaxed);
+        let bucket = match self.b.len() {
+            0 => 0,
+            1 => 1,
+            2..=3 => 2,
+            4..=7 => 3,
+            8..=15 => 4,
+            16..=31 => 5,
+            32..=63 => 6,
+            _ => 7,
+        };
+        subopt_shape::HIST[bucket].fetch_add(1, Relaxed);
+        let mut m = subopt_shape::MAXLEN.load(Relaxed);
+        while (self.b.len() as u64) > m {
+            match subopt_shape::MAXLEN.compare_exchange_weak(
+                m,
+                self.b.len() as u64,
+                Relaxed,
+                Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => m = cur,
+            }
+        }
+    }
+
     /// Best candidate lying outside the exclusion window around `te`, as `(score2, te2)`.
     ///
     /// Both are `-1` when nothing qualifies, **not** `0`: ksw returns
@@ -1445,5 +1488,47 @@ mod tests {
         let r = ksw_extend2(&query, &target, 5, &mat, 6, 1, 6, 1, 100, 0, 100, 1);
         assert_eq!(r.score, 1 + 10); // only the 10 matching bases contribute
         assert_eq!(r.tle, 10);
+    }
+}
+
+/// Counters for [`SuboptimalTracker::record_shape`]. See it for what the question is.
+pub mod subopt_shape {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    pub static ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static CANDS: AtomicU64 = AtomicU64::new(0);
+    pub static MAXLEN: AtomicU64 = AtomicU64::new(0);
+    pub static HIST: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+    /// Whether the probe records. Read once and cached, like every other probe in this workspace.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BWA4_SUBOPT_SHAPE").is_some())
+    }
+
+    /// Print the distribution once at end of run. No-op unless [`enabled`].
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let jobs = JOBS.load(Relaxed).max(1);
+        let labels = ["0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"];
+        let h: Vec<String> = HIST
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}:{}", labels[i], c.load(Relaxed)))
+            .collect();
+        eprintln!(
+            "[subopt-shape] {} jobs, {} rows pushed ({:.1} per job), {} candidates kept ({:.2} per job), longest {}",
+            JOBS.load(Relaxed),
+            ROWS.load(Relaxed),
+            ROWS.load(Relaxed) as f64 / jobs as f64,
+            CANDS.load(Relaxed),
+            CANDS.load(Relaxed) as f64 / jobs as f64,
+            MAXLEN.load(Relaxed),
+        );
+        eprintln!("[subopt-shape] candidates per job: {}", h.join(" "));
     }
 }
