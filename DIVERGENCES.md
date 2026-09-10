@@ -35,6 +35,28 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   TLEN et des MAPQ faux, ce qu'aucun lecteur en aval ne peut detecter. Porter `bseq_classify`
   reste possible ; ce n'est pas fait, et c'est ecrit ici plutot que decouvert.
 
+- **Reads commencant a quelques bases du DEBUT d'un contig : bwa-mem2 les place a POS 1 avec un `NM`
+  absurde, nous suivons bwa 0.7.19. ACCEPTE (4.4.x).** Sur une reference de 80 kb decoupee dans
+  `testdata/tiny`, et des reads de 150 bases pris aux offsets 1 a 11, bwa-mem2 2.3 place **les 11**
+  a POS 1. L'enregistrement se contredit lui-meme : `150M`, `AS:i:150` (le score d'un appariement
+  parfait) et `NM:i:110`. bwa 0.7.19 et nous placons les 11 correctement, avec `NM:i:0`.
+
+  Le declencheur est la reference, pas la taille seule : en balayant les longueurs de 20 kb a 200 kb
+  par tranches de 20 kb, le nombre de reads mal places par l'oracle fait 3, 8, 0, 11, 8, 3, 0, 11, 1,
+  3. Cette irregularite est la signature d'une lecture hors borne, pas d'un seuil. La sortie de
+  l'oracle est **deterministe** (trois executions identiques), donc ce n'est pas une donnee non
+  initialisee au sens le plus simple.
+
+  Le fixture livre (`testdata/tiny/tiny.fa`, 200 001 bases) ne le declenche pas, ce qui est la seule
+  raison pour laquelle nos 76 cas de parite et nos 150 000 paires wgsim restent octet-identiques :
+  wgsim tire bien ~11 reads sur 150 000 dans les 15 premieres bases, et sur CE fixture l'oracle les
+  place correctement.
+
+  Nous ne reproduisons pas. C'est la meme exception que les deux entrees ci-dessous : reproduire une
+  sortie qui se contredit elle-meme n'est pas reproduire une sortie, et l'implementation de
+  reference que bwa-mem2 dit reprendre, bwa 0.7.19, est d'accord avec nous. Le cas est garde dans
+  `scripts/upstream_repros.sh`.
+
 - **Une base `-` dans un read : bwa-mem2 tronque sa propre sortie, nous emettons `N`. ACCEPTE
   (4.4.x).** `nst_nt4_table` de bwa donne le code **5** au caractere `-` (et 4 a tout le reste), or
   SEQ est imprime par `"ACGTN"[code]` : l'index 5 lit le terminateur de la chaine, un octet NUL
