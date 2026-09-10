@@ -20,6 +20,21 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   le figeage de cette formulation plutot qu'une attente indefinie : si upstream tranche un jour dans
   l'autre sens, c'est cette entree qu'il faudra rouvrir, et l'oracle de reference avec elle.
 
+- **`-p` sur une entree ou deux reads consecutifs ne sont pas des mates : nous refusons, bwa
+  bascule en single-end. ACCEPTE, avec erreur explicite.** `bseq_classify` (bwa) partitionne un
+  lot : les reads dont les noms consecutifs concordent deviennent des paires, les autres passent
+  par le chemin single-end, dans la meme execution. Notre lecteur `-p` s'arrete plutot, avec un
+  message qui nomme les deux reads et dit ce que bwa aurait fait.
+
+  Mesure : sur un fichier de 4 reads aux noms tous distincts, l'oracle emet 4 enregistrements
+  single-end (FLAG 0) et nous n'en emettons aucun. Idem sur un nombre impair de reads.
+
+  Le choix est deliberat : `-p` designe un FASTQ entrelace, ou les mates PARTAGENT leur nom (les
+  suffixes `/1` et `/2` sont deja retires avant la comparaison). Un fichier ou ils ne le partagent
+  pas n'est pas entrelace, et l'apparier silencieusement produirait des paires fausses avec des
+  TLEN et des MAPQ faux, ce qu'aucun lecteur en aval ne peut detecter. Porter `bseq_classify`
+  reste possible ; ce n'est pas fait, et c'est ecrit ici plutot que decouvert.
+
 - **Une base `-` dans un read : bwa-mem2 tronque sa propre sortie, nous emettons `N`. ACCEPTE
   (4.4.x).** `nst_nt4_table` de bwa donne le code **5** au caractere `-` (et 4 a tout le reste), or
   SEQ est imprime par `"ACGTN"[code]` : l'index 5 lit le terminateur de la chaine, un octet NUL
