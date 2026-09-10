@@ -1094,11 +1094,37 @@ mod tests {
     /// the parser then reopened the path, which on a FIFO yielded a stream already past its header
     /// and therefore ZERO records, silently: `bwa-mem4 mem ref <(zcat r1.gz)` wrote a SAM header
     /// and no alignments, with no error. bwa-mem2 reads that input, so it was a parity gap too.
+    ///
+    /// WHY THE TIMEOUT, AND WHY THE PATH CARRIES A CLOCK READING. This test could hang forever, and
+    /// it did: once in a `cargo test --workspace` run, blocking the whole gate until it was killed
+    /// by hand. Sampled in that state the reader had consumed all 83890 bytes, the process held one
+    /// fd on the FIFO (`4r`, read-only), and the writer thread no longer existed -- so every writer
+    /// had closed and `read` should have returned 0 rather than blocking. What is known about it:
+    ///
+    /// - it needs the rest of the binary running alongside. 300 runs of this test ALONE, debug, and
+    ///   150 release: no hang. 80 runs of the whole test binary, debug: one hang.
+    /// - it is not the pattern. The same shape in C -- one thread writing 2500 records into a FIFO
+    ///   and closing, the main thread reading to EOF -- reached EOF 400 times out of 400.
+    ///
+    /// That is not enough to name a cause, and the cause may not be ours. What IS ours is that a
+    /// test must not be able to hang a CI job indefinitely, so the read runs on its own thread and
+    /// the assertion waits with a bound. On a timeout the reader thread stays blocked and is
+    /// abandoned; that is safe, because the harness's exit tears the process down regardless.
+    ///
+    /// The path gets a nanosecond stamp alongside the pid because a killed run leaves its FIFO
+    /// behind, and the next process to be handed the same pid then fails at `mkfifo` for a reason
+    /// that has nothing to do with what this test checks.
     #[test]
     #[cfg(unix)]
     fn reads_from_a_non_seekable_fifo() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("bwa4_fifo_{}", std::process::id()));
+        // Nanoseconds since the epoch, purely to make the directory name unrepeatable. A pid alone
+        // is not: pids are recycled, and a hung run leaves its FIFO in place.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("bwa4_fifo_{}_{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("reads.fq");
         let made = std::process::Command::new("mkfifo")
@@ -1108,7 +1134,8 @@ mod tests {
         assert!(made, "mkfifo failed");
 
         // The writer must run concurrently: opening a FIFO for reading blocks until a writer
-        // appears, and opening it for writing blocks until a reader does.
+        // appears, and opening it for writing blocks until a reader does. It also cannot be joined
+        // before the read, because 2500 records are more than a pipe buffer holds.
         let w = fifo.clone();
         let writer = std::thread::spawn(move || {
             let mut f = std::fs::File::create(&w).unwrap();
@@ -1117,15 +1144,52 @@ mod tests {
             }
         });
 
-        let mut r = FastqReader::from_path(&fifo).unwrap();
-        let mut n = 0usize;
-        while let Some(rec) = r.next_record().unwrap() {
-            assert_eq!(rec.name(), format!("read{n}"));
-            n += 1;
+        // The reader, on its own thread, reporting either the record count or the first name that
+        // came out wrong. Anything it can block on is on the far side of this channel.
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<usize, String>>();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let mut r = match FastqReader::from_path(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("from_path: {e}")));
+                    return;
+                }
+            };
+            let mut n = 0usize;
+            loop {
+                match r.next_record() {
+                    Ok(Some(rec)) => {
+                        if rec.name() != format!("read{n}") {
+                            let _ = tx.send(Err(format!(
+                                "record {n} is named {:?}, not read{n}",
+                                rec.name()
+                            )));
+                            return;
+                        }
+                        n += 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("record {n}: {e}")));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(Ok(n));
+        });
+
+        // Generous: the work is 83890 bytes through a pipe, which takes milliseconds. The bound is
+        // here to convert a hang into a failure, not to measure anything.
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("FIFO reader did not finish within 60s (see this test's doc comment)");
+        std::fs::remove_dir_all(&dir).ok();
+        match got {
+            Ok(n) => assert_eq!(n, 2500, "records read from a FIFO"),
+            Err(e) => panic!("{e}"),
         }
         writer.join().unwrap();
-        assert_eq!(n, 2500, "records read from a FIFO");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The header split, on the four shapes that matter: a comment, both read-number suffixes, and
