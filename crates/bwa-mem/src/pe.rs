@@ -229,7 +229,7 @@ fn mem_infer_dir(l_pac: i64, b1: i64, b2: i64) -> (usize, i64) {
 /// RETURNS the *clamped* `(rb, re)` (the caller needs them, since every returned coordinate is
 /// relative to the clamped `rb`), the contig id `rid` (-1 if `mid` falls outside every contig), and
 /// the fetched bases. `rid < 0` cannot match a real `a.rid`, so it fails the caller's guard.
-fn bns_fetch_seq(
+pub(crate) fn bns_fetch_seq(
     fm: &FmIndex,
     bns: &BntSeq,
     rb: i64,

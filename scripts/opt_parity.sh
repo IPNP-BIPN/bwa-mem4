@@ -299,6 +299,49 @@ check "-x intractg (pe)"   pe -x intractg
 # both sides. Neither can change the records; the check is that they parse and route identically.
 # `-f` goes through `check_f` rather than `check`, because a flag that redirects the SAM to a file
 # produces nothing on stdout for `check` to compare.
+# Long reads, on the plain `mem` path (no `-x` preset, so nothing is routed to rammap). Their own
+# section because they need their own FASTQ: every other case here runs 150 bp reads, and 150 bp is
+# below the length at which bwa turns on `mem_flt_chained_seeds`, the per-seed Smith-Waterman filter
+# (`bwamem.cpp:472`). That filter disables itself while `5.5 * ln(l_query) > 0.05 * l_query`, true
+# up to roughly 690 bp, so a 150 bp fixture cannot tell whether it was ported at all -- and until
+# 4.4.x it had not been. The symptom was an `XS` bwa does not emit, from a 20-base seed at a locus
+# the read does not belong to.
+#
+# 800 bp is just past where the filter switches on and 3000 bp is well past it; both are compared
+# against the oracle like any other case.
+check_longread() {
+  local reflen seq
+  # The reference as one line, straight out of the index FASTA the rest of this script uses.
+  seq=$(grep -v '^>' "$IDX" | tr -d '\n' | tr 'acgt' 'ACGT')
+  reflen=${#seq}
+  local fq="$TMP/long.fq"
+  : > "$fq"
+  local len off i
+  for len in 800 3000; do
+    # Four deterministic offsets spread across the contig, far enough in to avoid any leading N run.
+    for i in 1 2 3 4; do
+      off=$(( reflen / 6 * i ))
+      [ $(( off + len )) -le "$reflen" ] || continue
+      printf '@long%s_%s\n%s\n+\n%s\n' "$len" "$i" \
+        "${seq:$off:$len}" "$(printf 'I%.0s' $(seq 1 $len))" >> "$fq"
+    done
+  done
+  local label="long reads (800/3000 bp)"
+  $M2 mem -t2 -K 10000000 "$IDX" "$fq" 2>/dev/null | grep -v '^@PG' > "$TMP/lr_a.sam"
+  $M3 mem -t2 -K 10000000 "$IDX" "$fq" 2>/dev/null | grep -v '^@PG' > "$TMP/lr_b.sam"
+  if cmp -s "$TMP/lr_a.sam" "$TMP/lr_b.sam"; then
+    printf '  %-28s %-3s [PASS]\n' "$label" "se"; pass=$((pass+1))
+  else
+    local d
+    d=$(paste "$TMP/lr_a.sam" "$TMP/lr_b.sam" | awk -F'\t' '{h=NF/2; for(i=1;i<=h;i++) if($i!=$(i+h)){c++; break}} END{print c+0}')
+    printf '  %-28s %-3s [FAIL] %s differing records\n' "$label" "se" "$d"
+    fail=$((fail+1)); failed_opts+=("$label")
+  fi
+}
+
+echo "=== long reads on the bwa path ==="
+check_longread
+
 echo "=== -f alias and -1 ==="
 check "-1 (no_mt_io)"      se -1
 check_f
