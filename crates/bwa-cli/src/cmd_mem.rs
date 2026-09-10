@@ -184,7 +184,20 @@ const CIGAR_LEN_SHIFT: u32 = 4;
 // more. Every other field's clap behaviour when absent IS its `Default`, since they are `Option`
 // or `bool`.
 #[derive(Args, Default)]
-#[command(disable_help_flag = true, disable_version_flag = true)]
+// `args_override_self`: a REPEATED option takes its last value instead of being an error, which is
+// what getopt does and therefore what bwa does. Without it clap rejected `-t 4 -t 8` outright with a
+// usage error and exit code 2, where bwa runs with 8 -- and appending an override to a variable of
+// default options is how most wrapper scripts are written:
+//
+//     bwa-mem4 mem $DEFAULT_OPTS -t 8 ref r1.fq r2.fq        # $DEFAULT_OPTS already holds -t 4
+//
+// Every option here is last-wins for bwa (none of them accumulates, not even `-R` or `-H`), so the
+// setting is right for all of them and not only for the one that exposed it.
+#[command(
+    disable_help_flag = true,
+    disable_version_flag = true,
+    args_override_self = true
+)]
 pub struct MemArgs {
     // `-t INT` -> `opt->n_threads` (`fastmap.cpp:672`). Default 1, clamped to >= 1 by both
     // implementations. Purely a speed knob: unlike most aligners, nothing about the output depends

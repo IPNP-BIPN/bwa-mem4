@@ -498,6 +498,18 @@ check_longread
 
 echo "=== -f alias and -1 ==="
 check "-1 (no_mt_io)"      se -1
+
+# A REPEATED OPTION takes its last value, which is what getopt does and therefore what bwa does.
+# clap rejected these outright with a usage error and exit code 2 until `args_override_self` was set,
+# and appending an override to a variable of default options is how most wrapper scripts are written:
+#
+#     bwa-mem4 mem $DEFAULT_OPTS -t 8 ref r1.fq r2.fq        # $DEFAULT_OPTS already holds -t 4
+#
+# One valued option, one flag and one whose value changes the batching, so a future regression cannot
+# hide in a single argument kind.
+check "-k twice"           se -k 19 -k 25
+check "-a twice"           se -a -a
+check "-K twice"           se -K 10000000 -K 5000
 check_f
 check_o
 check_bgzf
