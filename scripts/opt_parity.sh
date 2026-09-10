@@ -205,6 +205,18 @@ check "-U 10"   pe -U 10
 check "-T 20"   se -T 20
 check "-A 2 -B 3" se -A 2 -B 3
 
+# The same scoring options, PAIRED-END. Not redundant with the single-end block above: mate rescue
+# runs only on a pair, and its kernel is chosen from the SCORES, not from the reads. The u8 rescue
+# kernel biases its substitution table by the mismatch penalty, which needs `a + b <= 6` of byte
+# headroom, and until 4.4.x nothing checked that before dispatching to it: every one of the four
+# cases below aborted the aligner outright on the first rescue batch, `-x intractg (pe)` included,
+# while single-end runs of the identical scores passed. Any option whose only effect is inside a
+# paired-end-only stage needs its own PE case here, and these are that lesson.
+check "-B 6 (pe)"        pe -B 6
+check "-B 9 (pe)"        pe -B 9
+check "-A 3 (pe)"        pe -A 3
+check "-A 10 -B 40 (pe)" pe -A 10 -B 40
+
 echo "=== flags affecting output ==="
 check "-a"     se -a
 check "-M"     se -M
