@@ -151,12 +151,7 @@ fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
     #[cfg(feature = "libsais-c-omp")]
     let build = {
         let build = libsais::SuffixArrayConstruction::for_text(bref).in_owned_buffer();
-        let threads = std::env::var("BWA4_SA_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(|| rayon::current_num_threads().min(8))
-            .max(1);
-        build.multi_threaded(libsais::ThreadCount::fixed(threads as u16))
+        build.multi_threaded(libsais::ThreadCount::fixed(sa_threads() as u16))
     };
     let built: Vec<i64> = build
         .run()
@@ -175,13 +170,62 @@ fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
 fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
     let n = bref.len();
     let mut sa = vec![0i64; n + 1];
+    #[cfg(not(feature = "libsais-omp"))]
     let ret = libsais_rs::libsais64::libsais64(bref, &mut sa[1..], 0, None);
+    // `--features libsais-omp`: the same translation, on several threads, with NO C toolchain. That
+    // combination is the point. The C backend already threads (`libsais-c-omp`), but it needs a C
+    // compiler and libomp, which is exactly what the pure-Rust backend exists to avoid; before this
+    // the escape hatch for a C-free build was also the single-threaded one.
+    //
+    // The route is a CONTEXT, not a threads argument. libsais-rs also exposes
+    // `libsais64_upstream_c_omp`, which takes a thread count directly and is the obvious-looking
+    // choice, but it sits behind the crate's `upstream-c` feature: that pulls in `cc` and compiles
+    // the upstream C, which is the one thing this backend exists to avoid. `create_ctx_main` is the
+    // pure-Rust entry: it allocates per-thread state, and `libsais64_main_ctx` fans out through
+    // rayon on `ctx.threads`.
+    //
+    // It has been reachable since libsais-rs 0.2.2, the version already in Cargo.lock. The
+    // milestone description says the parallelisation is "merged into libsais-rs 0.2.3"; crates.io
+    // publishes no 0.2.3, so nothing here was waiting on a release that does not exist.
+    //
+    // `create_ctx_main` is `#[doc(hidden)] pub`: reachable, and not part of the crate's promised
+    // surface. If a future version removes it, this arm fails to COMPILE rather than silently
+    // dropping back to one thread, which is the failure mode worth having.
+    //
+    // AND IT IS NOT A PORTABLE WIN. On a 100 M-base text with threads = cores, three repetitions:
+    // 1.17x on an Apple M4, and 0.69x on an Intel Xeon 8573C, where the threaded arm is 45% slower
+    // than its own serial path. See the feature's comment in Cargo.toml for the table. This arm is
+    // opt-in for that reason.
+    #[cfg(feature = "libsais-omp")]
+    let ret = {
+        let threads = sa_threads();
+        let mut ctx = libsais_rs::libsais64::create_ctx_main(threads as i64)
+            .expect("libsais64 context allocation failed");
+        let r = libsais_rs::libsais64::libsais64_ctx(&mut ctx, bref, &mut sa[1..], 0, None);
+        libsais_rs::libsais64::free_ctx(ctx);
+        r
+    };
     assert_eq!(
         ret, 0,
         "libsais64 suffix-array construction failed (ret={ret})"
     );
     sa[0] = n as i64;
     sa
+}
+
+/// Threads for a parallel suffix-array build, for whichever backend is compiled in.
+///
+/// One function rather than one per backend, because the policy is the same and the two were
+/// already at risk of drifting: `BWA4_SA_THREADS` if set, otherwise rayon's pool capped at eight.
+/// The cap is measured, not guessed. Past eight, libsais's own parallel sections lose to their
+/// coordination: on the 2L text of chr21 and of chr1, sixteen threads is slower than four.
+#[cfg(any(feature = "libsais-c-omp", feature = "libsais-omp"))]
+fn sa_threads() -> usize {
+    std::env::var("BWA4_SA_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| rayon::current_num_threads().min(8))
+        .max(1)
 }
 
 /// bwa-mem2's fixed RNG seed for ambiguous-base randomization, also echoed as the `.ann` third
