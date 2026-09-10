@@ -449,8 +449,15 @@ mod sort_scratch {
 
     /// Pass 1a's permutation: `re` and the index of the region it came from.
     type PermRe = Vec<(i64, u32)>;
-    /// Pass 3's permutation: the three-field sort key `(score, rb, qb)` and the same index.
+    /// Pass 3's permutation: the sort key and the index of the region it came from.
+    ///
+    /// The key's SHAPE is per-architecture, and that is measured rather than assumed. See the sort
+    /// itself for the numbers; in one line, packing `(score, rb, qb)` into a u128 is a win on
+    /// aarch64 and a 1.27x LOSS on x86-64, which has no 128-bit ALU.
+    #[cfg(target_arch = "x86_64")]
     type PermScore = Vec<((i32, i64, i32), u32)>;
+    #[cfg(not(target_arch = "x86_64"))]
+    type PermScore = Vec<(u128, u32)>;
 
     thread_local! {
         pub static PERM_RE: RefCell<PermRe> = const { RefCell::new(Vec::new()) };
@@ -512,11 +519,14 @@ pub fn mem_sort_dedup_patch(
     // `_by_key` rather than `_by`: same algorithm, same permutation (proved and tested in
     // `bwa-chain`), but the 96-byte `MemAlnReg`s move once at the end instead of twice per swap.
     // This sort and the one in pass 3 are together the most-executed sort in the run.
+    let _t1 = crate::rescue_split::start();
     sort_scratch::PERM_RE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
             ks_introsort_by_key(&mut a, perm, spare, |r| r.re, |x, y| x < y);
         });
     });
+    crate::rescue_split::stop(&crate::rescue_split::T_SORT1, _t1);
+    let _t2 = crate::rescue_split::start();
     // `n_comp` counts how many original regions were folded into this one; it starts at 1 (itself)
     // and the merge branch accumulates. Only `mem_patch_reg` merging changes it.
     for r in &mut a {
@@ -626,10 +636,43 @@ pub fn mem_sort_dedup_patch(
     // and keeps the relative order, which is exactly `retain`'s contract.
     a.retain(|r| r.qe > r.qb);
 
+    crate::rescue_split::stop(&crate::rescue_split::T_SCAN, _t2);
+    let _t3 = crate::rescue_split::start();
     // ---- Pass 3: re-sort by score and drop exact coordinate duplicates ------------------------
     // Sort by score desc, then rb, then qb (`alnreg_slt`), again with bwa's unstable introsort.
+    // The key is per-architecture, and the split is measured, not guessed.
+    //
+    // `(score, rb, qb)` packs EXACTLY into 128 bits: 32 of score, 64 of `rb`, 32 of `qb`. On aarch64
+    // that is a win, because one 128-bit compare replaces a three-field branchy one. On x86-64 it is
+    // a LOSS, because there is no 128-bit ALU: building the key costs two multi-word shifts per
+    // element, and the comparison saving does not repay them. Measured with
+    // `examples/score_sort_bench.rs`, 92 rows per sort and 200k sorts, best of three interleaved:
+    //
+    //   | key           | aarch64 | x86-64-v3 |
+    //   |---------------|---------|-----------|
+    //   | tuple         | 1.00x   | 1.00x     |
+    //   | packed u128   | 0.97x   | **1.27x** |
+    //   | pair of u64   | 1.03x   | 1.10x     |
+    //
+    // The u128 form was introduced on the strength of an aarch64-only measurement, and x86 is the
+    // architecture this project is BEHIND on, so that was the wrong way round.
+    //
+    // Either form is byte-identical to the other and to the original. `ks_introsort_by` is
+    // permutation-observable (which region survives a tie is decided by where the unstable sort
+    // leaves it), so the algorithm may not be swapped; but the permutation depends only on the
+    // BOOLEAN each comparison returns, and an order-preserving encoding returns the same boolean for
+    // every input. The bench asserts the two permutations are equal before timing either.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline(always)]
+    fn score_key(r: &MemAlnReg) -> u128 {
+        let score = !((r.score as u32) ^ 0x8000_0000) as u128;
+        let rb = ((r.rb as u64) ^ 0x8000_0000_0000_0000) as u128;
+        let qb = ((r.qb as u32) ^ 0x8000_0000) as u128;
+        (score << 96) | (rb << 32) | qb
+    }
     sort_scratch::PERM_SCORE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
+            #[cfg(target_arch = "x86_64")]
             ks_introsort_by_key(
                 &mut a,
                 perm,
@@ -637,6 +680,8 @@ pub fn mem_sort_dedup_patch(
                 |r| (r.score, r.rb, r.qb),
                 |x, y| x.0 > y.0 || (x.0 == y.0 && (x.1 < y.1 || (x.1 == y.1 && x.2 < y.2))),
             );
+            #[cfg(not(target_arch = "x86_64"))]
+            ks_introsort_by_key(&mut a, perm, spare, score_key, |x, y| x < y);
         });
     });
     // Exact-duplicate removal (`bwamem.cpp:343`). After the score sort, identical regions are
@@ -652,6 +697,7 @@ pub fn mem_sort_dedup_patch(
     // keeping `a[0]`. That is safe to express as a plain `retain` because the marking loop above
     // also starts at 1 and therefore can never kill `a[0]`.
     a.retain(|r| r.qe > r.qb);
+    crate::rescue_split::stop(&crate::rescue_split::T_SORT3, _t3);
     a
 }
 
@@ -1032,6 +1078,85 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
     mapq as u32
 }
 
+/// Make the 5'-most segment of a split alignment the primary record. Port of
+/// `mem_reorder_primary5` (`bwamem.cpp:1496-1519`), run under `-5` (`MEM_F_PRIMARY5`) immediately
+/// after [`mem_mark_primary_se`] and before anything reads the region order.
+///
+/// WHY IT EXISTS. `mem_mark_primary_se` ranks a read's alignments by SCORE, so the primary record
+/// of a chimeric read is whichever piece happened to align best. For Hi-C and other chimeric
+/// libraries that is the wrong choice: the meaningful segment is the one at the read's 5' end, the
+/// side of the ligation junction the read was sequenced from, and which of the two pieces scores
+/// higher is an accident of where the junction fell. `-5` swaps the leftmost-on-the-query
+/// alignment into slot 0 so it becomes the primary and the rest become supplementary.
+///
+/// WHY IT IS A SWAP AND NOT A SORT. Only slot 0 is privileged; the relative order of everything
+/// else is untouched, and bwa swaps rather than rotates. The `secondary`/`secondary_all` fields
+/// hold INDICES into this same vector, so the two indices that moved have to be exchanged wherever
+/// they are referenced -- which is what the last loop does, and why it must not be replaced with a
+/// stable sort that would renumber more than two slots.
+///
+/// # Parameters
+///
+/// - `t`: `-T`, the minimum score worth reporting. Alignments below it are not candidates and are
+///   not counted, so a read whose only other piece is unreportable is left alone.
+/// - `regs`: one read's regions, already primary-marked. Reordered in place.
+///
+/// # Note
+///
+/// The remapping loop starts at index 1, so the record now in slot 0 keeps whatever
+/// `secondary`/`secondary_all` the alignment carried before the swap. That is the C's behaviour and
+/// it is safe for the same reason the C's assert says: both slot 0 and `left_k` were non-secondary
+/// (`secondary < 0`) before the swap, so neither field can be a stale index.
+pub fn mem_reorder_primary5(t: i32, regs: &mut [MemAlnReg]) {
+    // Whether a region is a candidate to be the 5'-most primary at all: reportable, not shadowed,
+    // not on an ALT contig.
+    let eligible = |r: &MemAlnReg| r.secondary < 0 && !r.is_alt && r.score >= t;
+    // With one candidate or none there is no split to reorder, and the C returns before touching
+    // anything.
+    if regs.iter().filter(|r| eligible(r)).count() <= 1 {
+        return;
+    }
+    // The candidate with the smallest query begin, i.e. the segment closest to the read's 5' end,
+    // and its slot. `<` and not `<=`, so the FIRST region achieving the minimum wins; on equal `qb`
+    // that is the higher-scoring one, since the vector is score-ordered here.
+    let mut left_st = i32::MAX;
+    let mut left_k = usize::MAX;
+    for (k, r) in regs.iter().enumerate() {
+        if !eligible(r) {
+            continue;
+        }
+        if r.qb < left_st {
+            left_st = r.qb;
+            left_k = k;
+        }
+    }
+    debug_assert!(
+        regs.is_empty() || regs[0].secondary < 0,
+        "slot 0 is a primary"
+    );
+    // Already 5'-most: nothing to do. Also covers `left_k == usize::MAX`, which the count test above
+    // has already made unreachable.
+    if left_k == 0 || left_k == usize::MAX {
+        return;
+    }
+    regs.swap(0, left_k);
+    // `secondary`/`secondary_all` are indices into this vector, so every reference to the two slots
+    // that just exchanged places has to follow them. Slot 0 is skipped, as in the C.
+    let left_k = left_k as i32;
+    for r in regs.iter_mut().skip(1) {
+        if r.secondary == 0 {
+            r.secondary = left_k;
+        } else if r.secondary == left_k {
+            r.secondary = 0;
+        }
+        if r.secondary_all == 0 {
+            r.secondary_all = left_k;
+        } else if r.secondary_all == left_k {
+            r.secondary_all = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,6 +1203,63 @@ mod tests {
             hash: 0,
             n_comp: 0,
         }
+    }
+
+    /// `-5` swaps the 5'-most reportable alignment into slot 0 and follows the two moved indices
+    /// through every `secondary`/`secondary_all` that referenced them.
+    ///
+    /// The index remapping is the part worth pinning. `secondary` and `secondary_all` are indices
+    /// INTO THIS VECTOR, so a swap that forgot them would leave a shadowed hit pointing at the
+    /// wrong primary -- which surfaces as an `XA:Z` filed under the wrong record rather than as a
+    /// crash, and only on chimeric reads.
+    #[test]
+    fn primary5_swaps_in_the_leftmost_and_remaps_indices() {
+        // Slot 0: the best-scoring piece, but at query offset 40. Slot 1: the 5'-most piece, at
+        // offset 0 and lower-scoring. Slot 2: a shadowed hit filed under slot 0.
+        let mut regs = vec![
+            reg(100, 0, 0, 0, 60),
+            reg(80, 0, 0, 0, 40),
+            reg(30, 0, 0, 0, 30),
+        ];
+        regs[0].qb = 40;
+        regs[0].qe = 100;
+        regs[1].qb = 0;
+        regs[1].qe = 40;
+        regs[2].qb = 40;
+        regs[2].qe = 70;
+        regs[2].secondary = 0;
+        regs[2].secondary_all = 0;
+
+        mem_reorder_primary5(30, &mut regs);
+
+        // The 5'-most piece is now the primary, and the old primary sits where it came from.
+        assert_eq!(regs[0].qb, 0, "slot 0 is the 5'-most alignment");
+        assert_eq!(regs[1].qb, 40, "the old primary moved to the vacated slot");
+        // The shadowed hit still points at the alignment it was actually shadowed by, which has
+        // moved from slot 0 to slot 1.
+        assert_eq!(regs[2].secondary, 1);
+        assert_eq!(regs[2].secondary_all, 1);
+    }
+
+    /// Two branches that must do nothing: a read with a single reportable alignment, and one whose
+    /// best-scoring alignment is ALREADY the 5'-most.
+    #[test]
+    fn primary5_leaves_unsplit_and_already_ordered_reads_alone() {
+        // One reportable alignment plus one under `-T`: nothing to reorder.
+        let mut regs = vec![reg(100, 0, 0, 0, 60), reg(10, 0, 0, 0, 30)];
+        regs[0].qb = 40;
+        regs[1].qb = 0;
+        mem_reorder_primary5(30, &mut regs);
+        assert_eq!(regs[0].qb, 40, "the sub-threshold hit is not a candidate");
+
+        // Best-scoring alignment already leftmost.
+        let mut regs = vec![reg(100, 0, 0, 0, 60), reg(80, 0, 0, 0, 40)];
+        regs[0].qb = 0;
+        regs[1].qb = 40;
+        regs[1].secondary_all = 0;
+        mem_reorder_primary5(30, &mut regs);
+        assert_eq!(regs[0].qb, 0);
+        assert_eq!(regs[1].secondary_all, 0, "no swap, so no remapping either");
     }
 
     #[test]

@@ -170,6 +170,271 @@ pub struct FastqReader {
     inner: Box<dyn FastxReader>,
 }
 
+/// Bytes peeked from the head of an input to decide whether it needs [`UnwrapFastq`].
+///
+/// 64 KiB is about 200 records of 150 bp, which is ample evidence for a file that is homogeneous --
+/// and real FASTQ is: a writer that wraps wraps everything. It is also small enough to disappear
+/// into the noise. At one megabyte the peek was measurable: `wait_read` went from 20 ms to 34 ms on
+/// a two-file paired run, because the first batch cannot start until both peeks are done, and total
+/// CPU rose 0.7%. At 64 KiB both are back in the noise.
+const WRAP_PEEK: usize = 64 << 10;
+
+/// Whether the input starting at `head` is FASTQ that needs [`UnwrapFastq`] in front of it.
+///
+/// TRUE ONLY ON PROOF. The answer is `true` only when the first record parses cleanly under kseq's
+/// rules AND takes more than four lines; everything else -- FASTA, four-line FASTQ, junk, and
+/// anything malformed -- is `false` and goes to needletail untouched.
+///
+/// That asymmetry is the point, and it was learned the hard way. An earlier version answered "is
+/// this already four-line?" and so returned "needs unwrapping" for MALFORMED files too, since a
+/// quality string of the wrong length looks exactly like a wrapped one from the third line. The
+/// unwrapper then failed on them and needletail reported `Failed to read the first two bytes. Is
+/// the file empty?` for a file that was neither empty nor unreadable, in place of the precise
+/// `Sequence length is 150 but quality length is 100` it gives when it parses the bytes itself.
+/// Diagnosing broken input is needletail's job and it is good at it; this function's only job is to
+/// recognise the one shape it cannot handle.
+///
+/// # Parameters
+///
+/// - `head`: the first bytes of the input.
+/// - `complete`: true when `head` is the WHOLE input rather than a prefix of it. It decides what a
+///   record running off the end means: in a complete file that is malformed input, and in a prefix
+///   it is just the peek ending, so the two cases must not be conflated.
+///
+/// # Returns
+///
+/// Whether to insert [`UnwrapFastq`].
+fn needs_unwrapping(head: &[u8], complete: bool) -> bool {
+    // Tolerate CRLF: a trailing carriage return would otherwise hide the `+` and make every record
+    // look wrapped.
+    let mut lines = head
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let Some(first) = lines.find(|l| !l.is_empty()) else {
+        return false; // nothing to judge
+    };
+    if first[0] != b'@' {
+        return false; // FASTA, whose wrapping needletail handles, or not sequence data at all
+    }
+    // Sequence lines, up to the `+` separator. More than one of them is the wrapped shape.
+    let (mut seq_len, mut seq_lines) = (0usize, 0usize);
+    loop {
+        let Some(line) = lines.next() else {
+            // Ran out before the separator. In a complete file that is malformed; in a prefix it
+            // only means the peek ended, and a sequence already spanning two lines is wrapped.
+            return !complete && seq_lines > 1;
+        };
+        if line.first() == Some(&b'+') {
+            break;
+        }
+        // An empty piece is the trailing newline's split artifact as often as it is a blank line, so
+        // it is treated as the input ending here: malformed in a complete file, just the peek
+        // running out in a prefix. Reading it as a blank line inside a record instead made every
+        // wrapped file whose peek ended on a newline look unwrapped.
+        if line.is_empty() {
+            return !complete && seq_lines > 1;
+        }
+        seq_len += line.len();
+        seq_lines += 1;
+    }
+    if seq_lines == 0 {
+        return false; // `@name` followed immediately by `+`
+    }
+    // Quality lines, until quality is as long as the sequence. kseq's rule, and the reason a
+    // quality line may legally start with `@`.
+    let mut qual_lines = 0usize;
+    let mut qual_len = 0usize;
+    while qual_len < seq_len {
+        let Some(line) = lines.next() else {
+            return !complete && qual_lines > 1;
+        };
+        if line.is_empty() {
+            return !complete && qual_lines > 1;
+        }
+        qual_len += line.len();
+        qual_lines += 1;
+    }
+    // Overshooting means the quality string is longer than the sequence, which is malformed rather
+    // than wrapped, and needletail says so far better than this could.
+    if qual_len != seq_len {
+        return false;
+    }
+    seq_lines > 1 || qual_lines > 1
+}
+
+/// A `Read` that rewrites multi-line FASTQ into the four-line form, and passes everything else
+/// through untouched.
+///
+/// WHY IT EXISTS. bwa reads FASTQ with klib's `kseq`, which accumulates sequence lines until it
+/// meets a line starting with `+` and then accumulates quality lines until quality is as long as
+/// sequence. So `bwa-mem2` aligns a wrapped FASTQ perfectly happily, and its output is
+/// byte-identical to the same reads unwrapped (measured: 2000 records, identical). needletail's
+/// FASTQ parser requires exactly four lines per record and errors on anything else, so until this
+/// existed `bwa-mem4` produced ZERO records and a parse error on a file bwa aligns.
+///
+/// It is placed in front of the parser only when [`needs_unwrapping`] proves the input needs it, so
+/// the ordinary case pays one megabyte of peek at open and nothing per byte after that.
+///
+/// KSEQ'S QUALITY RULE IS THE POINT. Quality is accumulated until it is as long as the sequence,
+/// NOT until a line starting with `@` is seen -- because `@` is a legal quality character and a
+/// quality line may well start with one. Terminating on `@` is the classic FASTQ parsing bug, and
+/// this reproduces bwa's rule rather than inventing one.
+struct UnwrapFastq<R: std::io::BufRead> {
+    /// The wrapped input, read a line at a time.
+    inner: R,
+    /// Normalised bytes not yet handed to the caller, and how far into them we are. Holds at most
+    /// one record.
+    out: Vec<u8>,
+    /// Read cursor into `out`.
+    pos: usize,
+    /// Set once `inner` reports end of input, so `read` stops asking for more.
+    done: bool,
+}
+
+impl<R: std::io::BufRead> UnwrapFastq<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            out: Vec::with_capacity(1024),
+            pos: 0,
+            done: false,
+        }
+    }
+
+    /// Read one line, stripped of its newline (and of a CR before it). `Ok(None)` at end of input.
+    fn line(&mut self, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+        buf.clear();
+        if self.inner.read_until(b'\n', buf)? == 0 {
+            return Ok(false);
+        }
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+        }
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        Ok(true)
+    }
+
+    /// Normalise the next record into `out`. `Ok(false)` at end of input.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        self.out.clear();
+        self.pos = 0;
+        let mut buf = Vec::with_capacity(256);
+        // The header, skipping blank lines before it.
+        loop {
+            if !self.line(&mut buf)? {
+                return Ok(false);
+            }
+            if !buf.is_empty() {
+                break;
+            }
+        }
+        if buf.first() != Some(&b'@') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "expected a FASTQ header starting with '@', found {:?}",
+                    String::from_utf8_lossy(&buf[..buf.len().min(32)])
+                ),
+            ));
+        }
+        self.out.extend_from_slice(&buf);
+        self.out.push(b'\n');
+        // Sequence lines, up to the '+' separator.
+        // `seq_len` is what the quality accumulation below has to match, which is kseq's rule.
+        let mut seq_len = 0usize;
+        loop {
+            if !self.line(&mut buf)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "FASTQ input ended inside a record's sequence",
+                ));
+            }
+            if buf.first() == Some(&b'+') {
+                break;
+            }
+            seq_len += buf.len();
+            self.out.extend_from_slice(&buf);
+        }
+        // The separator is emitted bare: its optional repeat of the name is not data, and bwa does
+        // not read it either.
+        self.out.extend_from_slice(b"\n+\n");
+        // Quality lines, until quality is as long as sequence. See the note above on why the test is
+        // a length and not a leading character.
+        let mut qual_len = 0usize;
+        while qual_len < seq_len {
+            if !self.line(&mut buf)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "FASTQ input ended inside a record's quality string",
+                ));
+            }
+            qual_len += buf.len();
+            self.out.extend_from_slice(&buf);
+        }
+        self.out.push(b'\n');
+        Ok(true)
+    }
+}
+
+impl<R: std::io::BufRead> std::io::Read for UnwrapFastq<R> {
+    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos == self.out.len() {
+            if self.done {
+                return Ok(0);
+            }
+            if !self.fill()? {
+                self.done = true;
+                return Ok(0);
+            }
+        }
+        let n = (self.out.len() - self.pos).min(dst.len());
+        dst[..n].copy_from_slice(&self.out[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Put [`UnwrapFastq`] in front of `r` if, and only if, its first [`WRAP_PEEK`] bytes are FASTQ that
+/// is not already in four-line form.
+///
+/// The peeked bytes are chained back in front of the stream either way, so nothing is consumed: the
+/// same trick `open_reader` already uses to keep the two magic bytes it sniffed.
+///
+/// # Parameters
+///
+/// - `r`: the input, decompressed if it was compressed. Taken by value and returned inside the
+///   result, so callers hand over ownership.
+///
+/// # Returns
+///
+/// A `Read` yielding either exactly `r`'s bytes or its records normalised to four lines each.
+fn unwrap_multiline_fastq<R: std::io::Read + Send + 'static>(
+    mut r: R,
+) -> Result<Box<dyn std::io::Read + Send>> {
+    use std::io::Read;
+    // `take` bounds the peek; a short input simply yields fewer bytes.
+    let mut head = Vec::with_capacity(WRAP_PEEK);
+    (&mut r)
+        .take(WRAP_PEEK as u64)
+        .read_to_end(&mut head)
+        .map_err(|e| Error::Fastq(e.to_string()))?;
+    // `head` shorter than the cap means `read_to_end` hit the end of the input, so this IS the whole
+    // file; that distinction is what lets a record running off the end be read as malformed input
+    // rather than as the peek ending. Decided before `head` is moved into the cursor, so the peek is
+    // not copied.
+    let complete = head.len() < WRAP_PEEK;
+    let wrapped = needs_unwrapping(&head, complete);
+    let rest = std::io::Read::chain(std::io::Cursor::new(head), r);
+    if !wrapped {
+        return Ok(Box::new(rest));
+    }
+    Ok(Box::new(UnwrapFastq::new(
+        std::io::BufReader::with_capacity(1 << 16, rest),
+    )))
+}
+
 /// Open a FASTQ/FASTA file and return the parser for it, whatever its compression.
 ///
 /// Plain and gzip go straight to needletail, which sniffs the magic bytes and builds its own
@@ -223,6 +488,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     if !seekable {
         let head = std::io::Cursor::new(magic.map(Vec::from).unwrap_or_default());
         let stream = std::io::Read::chain(head, opened);
+        let stream = unwrap_multiline_fastq(stream)?;
         return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
     }
 
@@ -239,6 +505,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
         let stream = dec
             .open(path)
             .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+        let stream = unwrap_multiline_fastq(stream)?;
         return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
     }
 
@@ -247,7 +514,26 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // it. See [`spawn_inflate`] for the measurement that motivates it.
     #[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
     if is_gzip {
-        let blocks = spawn_inflate(path)?;
+        let blocks = unwrap_multiline_fastq(spawn_inflate(path)?)?;
+        return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
+    }
+
+    // PLAIN TEXT, AND IT GETS THE SAME READ-AHEAD THREAD THE COMPRESSED PATHS GET.
+    //
+    // `parse_fastx_file` opens the file itself and parses off its own buffer, so reading block N+1
+    // and parsing block N are the same thread's work, one after the other. Every compressed path
+    // above already avoids that: `rapidgzip` decodes on its own threads, and `spawn_inflate` exists
+    // precisely so "inflating block N+1 overlaps parsing block N".
+    //
+    // The asymmetry is measurable and it runs against us. On a four-core runner with the same 5.45M
+    // real pairs, the fork leads by 2.3% when the input is plain FASTQ (3.5 GB) and trails by 3.1%
+    // when it is gzipped (900 MB). Same reads, same binaries; the input format flips the verdict,
+    // and the difference is that our compressed path overlaps its I/O and our plain path does not.
+    //
+    // Byte-identical by construction: the parser sees the same bytes in the same order, only
+    // delivered by a different thread.
+    if !is_gzip && looks_like_text {
+        let blocks = unwrap_multiline_fastq(spawn_plain(path)?)?;
         return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
     }
 
@@ -312,12 +598,10 @@ fn gzip_threads() -> usize {
 /// Decompressed bytes handed over per channel message. 4 MiB is about 12 000 reads at 150 bp, so
 /// the channel is touched ~90 times for a 1 M-pair mate file, and three of them in flight cost
 /// 12 MiB, which is noise next to a batch of records.
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
 const INFLATE_BLOCK: usize = 4 << 20;
 
 /// Blocks the inflater may run ahead. One in flight plus one being parsed is the double buffering
 /// that makes the overlap work; the third absorbs a slow parse without stalling the inflater.
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
 const INFLATE_DEPTH: usize = 3;
 
 /// The decompressed side of a gzipped FASTQ, as a plain [`std::io::Read`] fed by an inflater thread.
@@ -345,7 +629,6 @@ const INFLATE_DEPTH: usize = 3;
 /// Not a parallel decoder. One stream is still inflated by one thread, at the 898 MB/s this
 /// machine measures for `zlib-rs` (`gzcat` on Apple's zlib does 1137 MB/s on the same file). What
 /// is bought here is the overlap, not the throughput.
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
 struct InflatedBlocks {
     /// Blocks from the inflater thread, or the first I/O error it hit.
     rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
@@ -358,7 +641,6 @@ struct InflatedBlocks {
     done: bool,
 }
 
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
 impl std::io::Read for InflatedBlocks {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         loop {
@@ -388,6 +670,57 @@ impl std::io::Read for InflatedBlocks {
             }
         }
     }
+}
+
+/// The plain-text twin of [`spawn_inflate`]: read the file on a thread of its own and hand the
+/// parser the bytes, so that reading block N+1 overlaps parsing block N.
+///
+/// Same block size, same queue depth and the same `InflatedBlocks` consumer as the gzip path, for
+/// the same reason: the point is the overlap, not the decompression. See the call site for the
+/// measurement that motivates it.
+fn spawn_plain(path: &std::path::Path) -> Result<InflatedBlocks> {
+    use std::io::Read;
+    let file =
+        std::fs::File::open(path).map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(INFLATE_DEPTH);
+    std::thread::spawn(move || {
+        let mut src = std::io::BufReader::with_capacity(1 << 20, file);
+        loop {
+            let mut block = vec![0u8; INFLATE_BLOCK];
+            // Fill each block completely unless the file ends, so the parser is handed whole blocks
+            // rather than whatever length a single `read` happened to return.
+            let mut filled = 0;
+            let mut failed = None;
+            while filled < INFLATE_BLOCK {
+                match src.read(&mut block[filled..]) {
+                    Ok(0) => break,
+                    Ok(k) => filled += k,
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            let last = filled < INFLATE_BLOCK;
+            block.truncate(filled);
+            if filled > 0 && tx.send(Ok(block)).is_err() {
+                return; // consumer went away
+            }
+            if let Some(e) = failed {
+                let _ = tx.send(Err(e));
+                return;
+            }
+            if last {
+                return;
+            }
+        }
+    });
+    Ok(InflatedBlocks {
+        rx,
+        cur: Vec::new(),
+        pos: 0,
+        done: false,
+    })
 }
 
 /// Open `path`, inflate it on a fresh thread, and return the decompressed stream.
@@ -939,7 +1272,7 @@ mod multi_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_id, FastqReader, PairedFastqReader};
+    use super::{needs_unwrapping, split_id, FastqReader, PairedFastqReader, UnwrapFastq};
     use std::io::Write;
 
     /// Build a FASTQ of `n` records named `<prefix><i>` with a 4-base sequence, and return its path.
@@ -1023,16 +1356,150 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The detector answers "does this need unwrapping", and it must answer NO unless it can prove
+    /// YES.
+    ///
+    /// A wrong yes is the expensive direction: the unwrapper then meets input it cannot rewrite,
+    /// and needletail's precise complaint about the real problem is replaced by a claim that the
+    /// file was empty. That is exactly what an earlier version did to three malformed shapes, and
+    /// the last group below is those three.
+    #[test]
+    fn unwrap_detection() {
+        // Four-line FASTQ, FASTA and junk all pass straight through.
+        assert!(!needs_unwrapping(
+            b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n",
+            true
+        ));
+        assert!(
+            !needs_unwrapping(b"@r1\r\nACGT\r\n+\r\nIIII\r\n", true),
+            "CRLF"
+        );
+        assert!(
+            !needs_unwrapping(b"@r1\nACGT\n+r1\nIIII\n", true),
+            "separator repeats the name"
+        );
+        assert!(!needs_unwrapping(b"", true), "nothing to judge");
+        assert!(
+            !needs_unwrapping(b">r1\nACGT\nACGT\n", true),
+            "FASTA is needletail's own job"
+        );
+
+        // Genuinely wrapped, on either half of the record.
+        assert!(
+            needs_unwrapping(b"@r1\nAC\nGT\n+\nIIII\n", true),
+            "wrapped sequence"
+        );
+        assert!(
+            needs_unwrapping(b"@r1\nACGT\n+\nII\nII\n", true),
+            "wrapped quality"
+        );
+        assert!(
+            needs_unwrapping(b"@r1\r\nAC\r\nGT\r\n+\r\nIIII\r\n", true),
+            "wrapped, CRLF"
+        );
+
+        // MALFORMED, and every one of these must be handed to needletail rather than rewritten.
+        assert!(
+            !needs_unwrapping(b"@a\nACGTACGT\n+\nIIII\n", true),
+            "quality shorter than sequence"
+        );
+        assert!(
+            !needs_unwrapping(b"@a\nACGT\n+\nIIIIIIII\n", true),
+            "quality longer than sequence"
+        );
+        assert!(
+            !needs_unwrapping(b"@a\nACGT\n+\n", true),
+            "truncated before quality"
+        );
+        assert!(
+            !needs_unwrapping(b"@a\nACGT\nIIII\n", true),
+            "no separator at all"
+        );
+
+        // `complete` is what separates "the file ends here" from "the peek ends here". The same
+        // bytes mean malformed input in a whole file and an unfinished record in a prefix.
+        assert!(
+            !needs_unwrapping(b"@a\nAC\nGT\n", true),
+            "whole file, no separator: malformed"
+        );
+        assert!(
+            needs_unwrapping(b"@a\nAC\nGT\n", false),
+            "prefix, sequence already wrapped"
+        );
+        assert!(
+            !needs_unwrapping(b"@a\nACGT\n", false),
+            "prefix, nothing proven yet"
+        );
+    }
+
+    /// Wrapped FASTQ is rewritten into the four-line form bwa's `kseq` accepts and needletail
+    /// requires.
+    ///
+    /// The `@`-quality case is the one worth pinning. `@` is a legal quality character, so a parser
+    /// that ends the quality block at the first line starting with `@` splits one record into two
+    /// and silently corrupts everything after it. kseq's rule, reproduced here, is to accumulate
+    /// quality until it is as long as the sequence.
+    #[test]
+    fn unwrap_rewrites_wrapped_records() {
+        let read = |src: &[u8]| {
+            use std::io::Read;
+            let mut out = Vec::new();
+            UnwrapFastq::new(std::io::BufReader::new(std::io::Cursor::new(src.to_vec())))
+                .read_to_end(&mut out)
+                .unwrap();
+            out
+        };
+
+        assert_eq!(
+            read(b"@r1\nAC\nGT\n+\nII\nII\n@r2\nACGT\n+\nIIII\n"),
+            b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n"
+        );
+        // Already four-line input passes through unchanged apart from the bare separator.
+        assert_eq!(read(b"@r1\nACGT\n+r1\nIIII\n"), b"@r1\nACGT\n+\nIIII\n");
+        // CRLF, and a quality string that both starts with `@` and is wrapped.
+        assert_eq!(
+            read(b"@r1\r\nACGTAC\r\nGT\r\n+\r\n@@@@\r\n@@@@\r\n"),
+            b"@r1\nACGTACGT\n+\n@@@@@@@@\n"
+        );
+        assert_eq!(read(b""), b"");
+    }
+
     /// A named pipe is not seekable, so the two magic bytes read for format sniffing can never be
     /// re-read. Before the `seekable` split in [`super::open_reader`] the sniff consumed them and
     /// the parser then reopened the path, which on a FIFO yielded a stream already past its header
     /// and therefore ZERO records, silently: `bwa-mem4 mem ref <(zcat r1.gz)` wrote a SAM header
     /// and no alignments, with no error. bwa-mem2 reads that input, so it was a parity gap too.
+    ///
+    /// WHY THE TIMEOUT, AND WHY THE PATH CARRIES A CLOCK READING. This test could hang forever, and
+    /// it did: once in a `cargo test --workspace` run, blocking the whole gate until it was killed
+    /// by hand. Sampled in that state the reader had consumed all 83890 bytes, the process held one
+    /// fd on the FIFO (`4r`, read-only), and the writer thread no longer existed -- so every writer
+    /// had closed and `read` should have returned 0 rather than blocking. What is known about it:
+    ///
+    /// - it needs the rest of the binary running alongside. 300 runs of this test ALONE, debug, and
+    ///   150 release: no hang. 80 runs of the whole test binary, debug: one hang.
+    /// - it is not the pattern. The same shape in C -- one thread writing 2500 records into a FIFO
+    ///   and closing, the main thread reading to EOF -- reached EOF 400 times out of 400.
+    ///
+    /// That is not enough to name a cause, and the cause may not be ours. What IS ours is that a
+    /// test must not be able to hang a CI job indefinitely, so the read runs on its own thread and
+    /// the assertion waits with a bound. On a timeout the reader thread stays blocked and is
+    /// abandoned; that is safe, because the harness's exit tears the process down regardless.
+    ///
+    /// The path gets a nanosecond stamp alongside the pid because a killed run leaves its FIFO
+    /// behind, and the next process to be handed the same pid then fails at `mkfifo` for a reason
+    /// that has nothing to do with what this test checks.
     #[test]
     #[cfg(unix)]
     fn reads_from_a_non_seekable_fifo() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("bwa4_fifo_{}", std::process::id()));
+        // Nanoseconds since the epoch, purely to make the directory name unrepeatable. A pid alone
+        // is not: pids are recycled, and a hung run leaves its FIFO in place.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("bwa4_fifo_{}_{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("reads.fq");
         let made = std::process::Command::new("mkfifo")
@@ -1042,7 +1509,8 @@ mod tests {
         assert!(made, "mkfifo failed");
 
         // The writer must run concurrently: opening a FIFO for reading blocks until a writer
-        // appears, and opening it for writing blocks until a reader does.
+        // appears, and opening it for writing blocks until a reader does. It also cannot be joined
+        // before the read, because 2500 records are more than a pipe buffer holds.
         let w = fifo.clone();
         let writer = std::thread::spawn(move || {
             let mut f = std::fs::File::create(&w).unwrap();
@@ -1051,15 +1519,52 @@ mod tests {
             }
         });
 
-        let mut r = FastqReader::from_path(&fifo).unwrap();
-        let mut n = 0usize;
-        while let Some(rec) = r.next_record().unwrap() {
-            assert_eq!(rec.name(), format!("read{n}"));
-            n += 1;
+        // The reader, on its own thread, reporting either the record count or the first name that
+        // came out wrong. Anything it can block on is on the far side of this channel.
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<usize, String>>();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let mut r = match FastqReader::from_path(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("from_path: {e}")));
+                    return;
+                }
+            };
+            let mut n = 0usize;
+            loop {
+                match r.next_record() {
+                    Ok(Some(rec)) => {
+                        if rec.name() != format!("read{n}") {
+                            let _ = tx.send(Err(format!(
+                                "record {n} is named {:?}, not read{n}",
+                                rec.name()
+                            )));
+                            return;
+                        }
+                        n += 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("record {n}: {e}")));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(Ok(n));
+        });
+
+        // Generous: the work is 83890 bytes through a pipe, which takes milliseconds. The bound is
+        // here to convert a hang into a failure, not to measure anything.
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("FIFO reader did not finish within 60s (see this test's doc comment)");
+        std::fs::remove_dir_all(&dir).ok();
+        match got {
+            Ok(n) => assert_eq!(n, 2500, "records read from a FIFO"),
+            Err(e) => panic!("{e}"),
         }
         writer.join().unwrap();
-        assert_eq!(n, 2500, "records read from a FIFO");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The header split, on the four shapes that matter: a comment, both read-number suffixes, and

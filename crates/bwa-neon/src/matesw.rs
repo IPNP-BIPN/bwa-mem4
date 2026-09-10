@@ -251,11 +251,32 @@ pub mod cells {
     /// cell per lane per cycle. Disassembling the shipped binary confirms it: the quad fast-column
     /// loop is 71 instructions for 64 cells, 63 of them vector, i.e. 1.11 instructions per cell.
     ///
-    /// So the arithmetic is essentially done, and the remaining 36% is NOT in the DP body. It is in
-    /// the per-row and per-group work around it: the 1.09x lane-divergence tax, the row epilogue's
-    /// scalar sixteen-lane loop, the padded tail columns (1.42 instructions per cell against 1.11),
-    /// and the group pack/extract. Anyone chasing the next percent should start there and should not
-    /// try to shorten the cell recurrence.
+    /// So the arithmetic is essentially done. What the 36% actually is, corrected on 2026-08-29
+    /// after two of the four suspects above were measured and cleared:
+    ///
+    /// | | |
+    /// |---|---|
+    /// | measured gap to the ceiling | 1.62x |
+    /// | lane divergence and padding, from this probe's own accounting | 1.08x |
+    /// | leaves | 1.50x |
+    /// | the DP loop's four memory accesses, which the ceiling does not pay | 1.31x |
+    /// | genuinely unexplained | **1.15x** |
+    ///
+    /// **The ceiling was never reachable, and that is the first thing to know before chasing it.**
+    /// It is measured registers-only; the shipped loop is 17 instructions of which 2 loads and 2
+    /// stores, so a register-only twin would be 13, and 17/13 is 1.31x on its own. Every lane of an
+    /// inter-sequence kernel needs its own H and E state across a 150-column query, and that state
+    /// cannot live in registers. The memory is the layout, not slack in it.
+    ///
+    /// Two of the four suspects this note used to name have since been measured and are NOT where
+    /// the time is. The row epilogue's scalar sixteen-lane loop was guarded with a vector test, and
+    /// that was **1.1% slower** (see `docs/kernel-ceiling-and-dead-ends.md`): the horizontal
+    /// reduction costs more than the well-predicted loop it skips. The `score2` walk inside
+    /// `extract_group` had half its work removed by a provable skip, and this probe did not move.
+    ///
+    /// So what remains for the next person is 1.15x, not 1.55x, and the two places left to look are
+    /// the group pack/extract and the padded tail columns. Do not try to shorten the cell
+    /// recurrence, and do not expect the register-only figure to be an achievable target.
     pub fn dump() {
         if !enabled() {
             return;
@@ -842,6 +863,33 @@ const DEAD_CELL_SCORE: i32 = -30_000;
 /// must reproduce bwa's choice rather than ours.
 const U8_SCORE_LIMIT: i32 = 250;
 
+/// Whether the u8 rescue kernels' substitution table can hold this scoring matrix without
+/// saturating, i.e. whether the u8 path is legal AT ALL for these scores.
+///
+/// The u8 kernels apply the substitution score through a 16-entry table biased by the mismatch
+/// penalty, so that every entry is a non-negative magnitude and one saturating add plus one
+/// saturating subtract reproduce `max(0, h + S)`. The bias costs headroom: the largest value the
+/// biased add can produce is `h + mispen + mtch`, and with `h` capped at [`U8_SCORE_LIMIT`] that
+/// must stay inside a byte. Each u8 kernel asserts exactly this, and the assertion is hard rather
+/// than `debug_assert` because the release build's correctness rests on it.
+///
+/// WHY IT IS A GATE AND NOT A PANIC: the score ceiling test next to this one is about the JOBS, and
+/// a batch that fails it falls to the i16 kernel. This test is about the OPTIONS, and until it was
+/// added a batch that failed it reached the assertion instead. `-x intractg` (`-B 9`) and any
+/// `-A 3` or `-B 6` run therefore aborted the whole aligner on the first paired-end rescue batch,
+/// where bwa-mem2 aligns them fine. Falling to i16 is free of output risk: which internal kernel
+/// width runs a batch is invisible to the result, unlike [`ksw_padded_qlen`]'s `lanes`, which is
+/// bwa's own u8/i16 choice and does move the bytes.
+///
+/// `mat` must already have passed [`mat_is_standard`], which is what makes `mat[0]`/`mat[1]` the
+/// match bonus and the (negated) mismatch penalty for every cell of the matrix.
+fn u8_table_has_headroom(mat: &[i8]) -> bool {
+    // Match bonus `a` and mismatch penalty `b`, as the non-negative magnitudes the kernels use.
+    let mtch = i32::from(mat[0]);
+    let mispen = -i32::from(mat[1]);
+    U8_SCORE_LIMIT + mispen + mtch <= 256
+}
+
 /// Score ceiling under which the 8-lane i16 kernel is exact, with headroom left for
 /// [`DEAD_CELL_SCORE`] at the other end of the range. Jobs above this fall back to the scalar path.
 ///
@@ -985,10 +1033,13 @@ fn fwd_local_sw_batch(
             // mismatches and gaps, so `min(len) * max_sc` is a hard ceiling on every H/E/F cell.
             let score_ceiling = |j: &FwdJob| j.query.len().min(j.target.len()) as i32 * max_sc;
             // u8 also holds the argmax query column, so the query must be < 256 too.
-            if jobs.iter().all(|j| {
-                score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
-            }) {
-                // SAFETY: neon detected; every H/E/F cell and query column < 250 fits u8; standard mat.
+            if u8_table_has_headroom(mat)
+                && jobs.iter().all(|j| {
+                    score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
+                })
+            {
+                // SAFETY: neon detected; every H/E/F cell and query column < 250 fits u8; standard
+                // mat; and the biased substitution table has byte headroom for it.
                 return unsafe {
                     fwd_local_sw_neon_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                 };
@@ -1011,9 +1062,10 @@ fn fwd_local_sw_batch(
             // not change when the vector gets twice or four times as wide. See `ksw_padded_qlen` for
             // why deriving any of this from the SIMD width would alter the output.
             let score_ceiling = |j: &FwdJob| j.query.len().min(j.target.len()) as i32 * max_sc;
-            let fits_u8 = jobs.iter().all(|j| {
-                score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
-            });
+            let fits_u8 = u8_table_has_headroom(mat)
+                && jobs.iter().all(|j| {
+                    score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
+                });
             let fits_i16 = jobs.iter().all(|j| {
                 score_ceiling(j) < I16_SCORE_LIMIT && j.target.len() < I16_SCORE_LIMIT as usize
             });
@@ -1427,13 +1479,29 @@ fn extract_group<R: Copy + Into<i32>>(
         // outside the exclusion window around `te`. The tracker is shared with the scalar
         // `ksw_local_fwd` precisely so the merge rule and the window cannot drift between them.
         let mut b = SuboptimalTracker::new();
-        if limit[l] >= 0 {
+        // `best_score` is the maximum of every row's maximum, so when it is below `minsc` no row can
+        // clear `minsc` either, the candidate list is necessarily empty, and `finish` returns
+        // `(-1, -1)` on its `self.b.is_empty()` arm. The whole walk is then provably pointless.
+        //
+        // It is not a rare case, it is the common one: `BWA4_SUBOPT_SHAPE` on 1M chr21 wgsim pairs
+        // counts 4,388,797 jobs pushing 1,694,171,812 rows, and 2,212,629 of those jobs, 50.4%,
+        // keep ZERO candidates. Half the rows pushed in a run are pushed only to be discarded one
+        // at a time, at about 2.9 ns each.
+        //
+        // Provable rather than measured: the test is on the same `minsc` the pushes use, and the
+        // skipped work has no effect other than filling `b`.
+        if limit[l] >= 0 && best_score >= minsc[l] {
             for i in 0..=limit[l] {
                 // Best H anywhere in target row `i` for this lane. Rows past `limit[l]` were never
                 // processed by this lane, so they are not offered as candidates.
                 b.push_row(i, rowmax[i as usize * lanes + l].into(), minsc[l]);
             }
         }
+        b.record_shape(if limit[l] >= 0 {
+            limit[l] as u64 + 1
+        } else {
+            0
+        });
         let (score2, te2) = b.finish(best_score, best_te, max_sc);
         out[group_idx * lanes + l] = (best_score, best_te, best_qe, score2, te2);
     }
@@ -5342,6 +5410,71 @@ mod tests {
             k += 1;
         }
         mat
+    }
+
+    /// Scoring matrices whose match bonus plus mismatch penalty leaves the u8 kernels' biased
+    /// substitution table no byte headroom must still align, on the i16 path, and agree with the
+    /// scalar reference.
+    ///
+    /// This is the regression test for a crash, not for a score. `-x intractg` sets `-B 9`, and
+    /// with the stock `-A 1` that makes `mispen + mtch` 10 where the biased table affords 6. Before
+    /// [`u8_table_has_headroom`] gated the dispatch, such a batch reached the u8 kernel's hard
+    /// assertion and aborted the process on the first paired-end rescue batch, so the whole
+    /// `-x intractg` paired-end mode was unusable while bwa-mem2 aligns it fine. `-A 3 -B 4` and
+    /// `-B 6` are the two other reachable ways to cross the same line, and they are included so a
+    /// future gate that only special-cases `intractg` fails here.
+    #[test]
+    fn saturating_score_matrices_fall_back_instead_of_panicking() {
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        // Deterministic mate-rescue-shaped jobs: a short query planted inside a longer window, so
+        // the local alignment is real and every field (score, te, qe, score2, te2) is exercised.
+        let mut state = 0x0bad_c0de_dead_beefu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut qbufs: Vec<Vec<u8>> = Vec::new();
+        let mut tbufs: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..64 {
+            let qlen = 40 + (next() % 60) as usize;
+            let tlen = qlen + (next() % 200) as usize;
+            let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+            let at = (next() as usize) % (tlen - qlen + 1);
+            t[at..at + qlen].copy_from_slice(&q);
+            qbufs.push(q);
+            tbufs.push(t);
+        }
+
+        // `(a, b)` pairs that all fail the headroom test (`250 + b + a > 256`): `intractg`'s own
+        // scores, then the smallest crossing on each of the two axes.
+        for &(a, b) in &[(1i8, 9i8), (3, 4), (1, 6)] {
+            assert!(
+                !u8_table_has_headroom(&scmat(a, b)),
+                "the point of this case is that (a {a}, b {b}) has no u8 headroom"
+            );
+            let mat = scmat(a, b);
+            let jobs: Vec<FwdJob> = qbufs
+                .iter()
+                .zip(tbufs.iter())
+                .map(|(q, t)| FwdJob {
+                    query: q.as_slice(),
+                    target: t.as_slice(),
+                    minsc: 1,
+                    endsc: i32::MAX,
+                })
+                .collect();
+            let want =
+                fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, i32::from(a));
+            // Before the fix this call aborted the process instead of returning.
+            let got = fwd_local_sw_batch(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, i32::from(a));
+            assert_eq!(got, want, "batched kernel diverged at (a {a}, b {b})");
+        }
+
+        // And the stock scores still take the u8 path, so the gate did not disable it outright.
+        assert!(u8_table_has_headroom(&scmat(1, 4)));
     }
 
     /// Random mate-rescue-shaped jobs (short query, longer window, some shared substring so the SW

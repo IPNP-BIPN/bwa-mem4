@@ -256,6 +256,19 @@ pub fn mem_gen_alt(
     // Selection is done first and in full: `groups[p]` is the final, cap-checked alternate list for
     // primary `p`. `out` is the answer under construction, one slot per region, filled only at the
     // indices that turn out to be XA primaries; every other slot stays `None`.
+    // TRIED AND MEASURED AT ZERO (2026-09-10): skipping this whole function when no region has
+    // `secondary_all >= 0` -- i.e. when the read's hits are all primaries, which is most reads, so
+    // no region can appear under anyone's `XA:Z`. The scan is O(n) and it removes `xa_group`'s
+    // three vectors plus `out`, about four allocations per read: `sam_emit` fell from 3,404,012
+    // allocations to 2,023,572 on 200k pairs, -41%, and the whole run from 12.55M to 11.17M.
+    //
+    // The wall did not move. Five interleaved reps of the `sam_emit` stage, sorted: 0.282 0.290
+    // 0.291 0.293 0.298 without it against 0.283 0.287 0.287 0.291 0.307 with it, which is a tie.
+    // The allocator is not what this stage is spending its time on -- the -10.6% that the `ptmp`
+    // clones and the per-pair buffers bought came from the COPYING and the growth memcpys, not from
+    // the malloc calls. Reverted rather than kept, because it also required `mem_gen_alt` to be
+    // allowed to return a short vector, and a vector whose length no longer matches the region
+    // count is a trap for the next caller to index it.
     let groups = xa_group(opt, regs);
     let mut out = vec![None; regs.len()];
     for (primary_idx, alt_indices) in groups.iter().enumerate() {

@@ -83,3 +83,6 @@ required-features = ["capsa"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "unpack_bench"

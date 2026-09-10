@@ -190,6 +190,17 @@ check "-y 10"  se -y 10
 check "-c 100" se -c 100
 check "-D 0.3" se -D 0.3
 check "-W 10"  se -W 10
+# `-W` STRADDLING WHERE THE CHAINED-SEED FILTER SWITCHES ON. `mem_flt_chained_seeds` runs only while
+# `min_l <= 0.05 * l_query`, and `-W` replaces the usual `5.5 * ln(l_query)` with `1.1 * W`. On these
+# 150 bp reads that puts the boundary between `-W 6` (6.6 <= 7.5, filter runs) and `-W 7`
+# (7.7 > 7.5, filter off), which is the only way to exercise the filter's `-W` arm at all: at the
+# default `-W 0` it is the logarithm that decides, and short reads never reach it.
+#
+# It is also where the `1.1f` constant matters. Declared `float` in the C, so `f64::from(1.1_f32)`
+# and not `1.1_f64`, or `min_HSP_score` moves by one exactly on this boundary. Verified to have
+# teeth: with the filter disabled, `-W 6` differs by one record and `-W 7` by none.
+check "-W 6"   se -W 6
+check "-W 7"   se -W 7
 check "-m 20"  pe -m 20
 
 echo "=== scoring ==="
@@ -204,6 +215,18 @@ check "-L 3,4"  se -L 3,4
 check "-U 10"   pe -U 10
 check "-T 20"   se -T 20
 check "-A 2 -B 3" se -A 2 -B 3
+
+# The same scoring options, PAIRED-END. Not redundant with the single-end block above: mate rescue
+# runs only on a pair, and its kernel is chosen from the SCORES, not from the reads. The u8 rescue
+# kernel biases its substitution table by the mismatch penalty, which needs `a + b <= 6` of byte
+# headroom, and until 4.4.x nothing checked that before dispatching to it: every one of the four
+# cases below aborted the aligner outright on the first rescue batch, `-x intractg (pe)` included,
+# while single-end runs of the identical scores passed. Any option whose only effect is inside a
+# paired-end-only stage needs its own PE case here, and these are that lesson.
+check "-B 6 (pe)"        pe -B 6
+check "-B 9 (pe)"        pe -B 9
+check "-A 3 (pe)"        pe -A 3
+check "-A 10 -B 40 (pe)" pe -A 10 -B 40
 
 echo "=== flags affecting output ==="
 check "-a"     se -a
@@ -222,6 +245,21 @@ check "-P"     pe -P
 echo "=== I/O features ==="
 check "-R rg"  se -R '@RG\tID:foo\tSM:bar'
 check "-I 300" pe -I 300
+# `-I` WITH A ZERO STANDARD DEVIATION. `-I 300` alone cannot reach it: bwa defaults the deviation to
+# a tenth of the mean, so the insert window is wide and every z-score is finite. Pin the deviation to
+# 0 and the window collapses to a single value, the z-score of an insert exactly at the mean becomes
+# `0/0`, and the pair scores exactly zero -- which bwa does NOT accept as a proper pair
+# (`(o = mem_pair(...)) > 0`), falling through to `no_pairing`, where the insert window sets the 0x2
+# bit instead. Testing only that a pair was FOUND took the other branch and lost the bit: 22 records
+# on this fixture at `-I 400,0`, and 600 of 600 on a simulated fixed-insert library, where the
+# INFERRED distribution has no spread either. Amplicon panels are the real-world shape of that.
+#
+# The mean is 394 because the case has to have TEETH: only pairs whose insert lands EXACTLY on the
+# mean hit the `0/0`, so the value has to be one this fixture actually produces. With the pre-fix
+# behaviour restored, `-I 394,0` differs on 204 records here and `-I 394,1` on none, which is the
+# whole point of keeping the second case beside it.
+check "-I 394,0" pe -I 394,0
+check "-I 394,1" pe -I 394,1
 check "-v 1"   se -v 1
 
 # Options that were implemented but NEVER exercised until 2026-07-18. That gap is not academic:
@@ -261,6 +299,80 @@ check "-5 (pe)"  pe -5
 check "-q (pe)"  pe -q
 check "-a -Y (pe)" pe -a -Y
 
+# `-5` WITH A NARROW BAND. Plain `-5` is checked above and passes even when nothing implements it,
+# because at the default `-w` this fixture produces almost no split alignments and the 5'-most
+# segment is already the best-scoring one. `-w 3` forces splits, and then `-5` has something to
+# reorder: `mem_reorder_primary5` was missing entirely until 4.4.x, so `-5` parsed, set its flag and
+# changed nothing. Found by fuzzing option COMBINATIONS, which is the lesson: a flag whose effect
+# needs a second flag to become visible passes a one-option-at-a-time sweep.
+check "-w 3 -5"        se -w 3 -5
+check "-w 3 -5 (pe)"   pe -w 3 -5
+
+# `-5` on reads that really are chimeric, built here because the simulated fixtures do not contain
+# any. Each read is a SHORT piece of the reference followed by a LONG piece from a distant locus, so
+# it splits into two alignments and the 3' one scores higher -- which is exactly the case `-5`
+# exists for, and exactly the case a score-ranked primary gets wrong. The mirrored read (long piece
+# first) is included so the test also covers the "already 5'-most, do not reorder" branch.
+#
+# Verified to have teeth on the committed `testdata/tiny` fixture: with the reorder disabled, 8 of
+# the 16 records differ from the oracle.
+check_primary5() {
+  local seq reflen fq label
+  seq=$(grep -v '^>' "$IDX" | tr -d '\n' | tr 'acgt' 'ACGT')
+  reflen=${#seq}
+  fq="$TMP/chimeric.fq"
+  : > "$fq"
+  # Four (near locus, far locus) pairs spread over the contig, as fractions of its length so this
+  # works on whatever reference $IDX points at.
+  local i a b la lb read
+  for i in 1 2 3 4; do
+    a=$(( reflen / 40 * i ))
+    b=$(( reflen / 2 + reflen / 40 * i ))
+    la=$(( 45 + i * 5 ))
+    lb=$(( 150 - la ))
+    [ $(( b + lb )) -le "$reflen" ] || continue
+    read="${seq:$a:$la}${seq:$b:$lb}"
+    printf '@chim%s\n%s\n+\n%s\n' "$i" "$read" "$(printf 'I%.0s' $(seq 1 150))" >> "$fq"
+    # The same two pieces the other way round: the 5'-most segment is now also the best-scoring one.
+    read="${seq:$b:$lb}${seq:$a:$la}"
+    printf '@chimr%s\n%s\n+\n%s\n' "$i" "$read" "$(printf 'I%.0s' $(seq 1 150))" >> "$fq"
+  done
+  label="-5 on chimeric reads"
+  $M2 mem -t2 -K 10000000 -5 "$IDX" "$fq" 2>/dev/null | grep -v '^@PG' > "$TMP/p5_a.sam"
+  $M3 mem -t2 -K 10000000 -5 "$IDX" "$fq" 2>/dev/null | grep -v '^@PG' > "$TMP/p5_b.sam"
+  if cmp -s "$TMP/p5_a.sam" "$TMP/p5_b.sam"; then
+    printf '  %-28s %-3s [PASS]\n' "$label" "se"; pass=$((pass+1))
+  else
+    local d
+    d=$(paste "$TMP/p5_a.sam" "$TMP/p5_b.sam" | awk -F'\t' '{h=NF/2; for(i=1;i<=h;i++) if($i!=$(i+h)){c++; break}} END{print c+0}')
+    printf '  %-28s %-3s [FAIL] %s differing records\n' "$label" "se" "$d"
+    fail=$((fail+1)); failed_opts+=("$label")
+  fi
+}
+check_primary5
+
+# `-X` ABOVE 1.0, WITH `-M` AND WITH `-q`. `-X` is `mask_level`, the overlap fraction above which an
+# alignment is marked as shadowing another. Push it past 1.0 and the test can never be satisfied, so
+# overlapping alignments all stay non-secondary and a read emits SUPPLEMENTARY records where it
+# normally emits one. That is the only way to reach two branches of `mem_reg2sam` on the paired-end
+# side, and both were wrong until 4.4.x: `-M` was ignored there (the supplementary bit was written
+# unconditionally instead of bwa's internal 0x10000, which prints as SAM's 0x100), and the
+# supplementary MAPQ cap ran even under `-q`/`-5`, which exist to suppress it. The single-end path
+# had both right, which is why one-option-at-a-time never saw it.
+#
+# ONLY THE `-M` CASE GATES ITS FIX. With the pre-fix behaviour restored, `-X 1.2 -M (pe)` fails on
+# 25833 of 25833 records here, while the `-q` and `-5` cases still pass: the MAPQ cap fires only
+# when a supplementary is MORE confident than the primary it was split from, and no input built for
+# this -- simulated reads, chimeric reads, either end of a pair -- produces one. That half of the
+# fix follows `bwamem.cpp:1555` and the single-end path, and is not covered by a fixture. The two
+# cases are kept anyway, as coverage of the `-X > 1` shape itself.
+#
+# `-X` on its own is checked here too, so a future change that breaks it is not blamed on `-M`.
+check "-X 1.2 (pe)"       pe -X 1.2
+check "-X 1.2 -M (pe)"    pe -X 1.2 -M
+check "-X 1.2 -q (pe)"    pe -X 1.2 -q
+check "-X 1.2 -5 (pe)"    pe -X 1.2 -5
+
 echo "=== input and output paths ==="
 check "-p (interleaved)" pi -p
 
@@ -287,8 +399,117 @@ check "-x intractg (pe)"   pe -x intractg
 # both sides. Neither can change the records; the check is that they parse and route identically.
 # `-f` goes through `check_f` rather than `check`, because a flag that redirects the SAM to a file
 # produces nothing on stdout for `check` to compare.
+# Long reads, on the plain `mem` path (no `-x` preset, so nothing is routed to rammap). Their own
+# section because they need their own FASTQ: every other case here runs 150 bp reads, and 150 bp is
+# below the length at which bwa turns on `mem_flt_chained_seeds`, the per-seed Smith-Waterman filter
+# (`bwamem.cpp:472`). That filter disables itself while `5.5 * ln(l_query) > 0.05 * l_query`, true
+# up to roughly 690 bp, so a 150 bp fixture cannot tell whether it was ported at all -- and until
+# 4.4.x it had not been. The symptom was an `XS` bwa does not emit, from a 20-base seed at a locus
+# the read does not belong to.
+#
+# 800 bp is just past where the filter switches on and 3000 bp is well past it; both are compared
+# against the oracle like any other case.
+check_longread() {
+  local reflen seq
+  # The reference as one line, straight out of the index FASTA the rest of this script uses.
+  seq=$(grep -v '^>' "$IDX" | tr -d '\n' | tr 'acgt' 'ACGT')
+  reflen=${#seq}
+  local fq="$TMP/long.fq"
+  : > "$fq"
+  local len off i
+  for len in 800 3000; do
+    # Four deterministic offsets spread across the contig, far enough in to avoid any leading N run.
+    for i in 1 2 3 4; do
+      off=$(( reflen / 6 * i ))
+      [ $(( off + len )) -le "$reflen" ] || continue
+      printf '@long%s_%s\n%s\n+\n%s\n' "$len" "$i" \
+        "${seq:$off:$len}" "$(printf 'I%.0s' $(seq 1 $len))" >> "$fq"
+    done
+  done
+  local label="long reads (800/3000 bp)"
+  $M2 mem -t2 -K 10000000 "$IDX" "$fq" 2>/dev/null | grep -v '^@PG' > "$TMP/lr_a.sam"
+  $M3 mem -t2 -K 10000000 "$IDX" "$fq" 2>/dev/null | grep -v '^@PG' > "$TMP/lr_b.sam"
+  if cmp -s "$TMP/lr_a.sam" "$TMP/lr_b.sam"; then
+    printf '  %-28s %-3s [PASS]\n' "$label" "se"; pass=$((pass+1))
+  else
+    local d
+    d=$(paste "$TMP/lr_a.sam" "$TMP/lr_b.sam" | awk -F'\t' '{h=NF/2; for(i=1;i<=h;i++) if($i!=$(i+h)){c++; break}} END{print c+0}')
+    printf '  %-28s %-3s [FAIL] %s differing records\n' "$label" "se" "$d"
+    fail=$((fail+1)); failed_opts+=("$label")
+  fi
+}
+
+# INPUT SHAPES, not options. bwa reads FASTQ with klib's `kseq`, which accumulates sequence lines
+# until a line starting with `+` and then quality lines until quality is as long as sequence, so it
+# takes a WRAPPED (multi-line) FASTQ without noticing. needletail's FASTQ parser requires exactly
+# four lines per record, and until 4.4.x we answered such a file with a parse error and zero
+# records -- a file bwa aligns perfectly happily.
+#
+# The oracle's output for a wrapped file is byte-identical to its output for the same reads
+# unwrapped, so what is checked here is just that: same reads, two spellings, one answer. Gzip is
+# included because that path decompresses before the parser sees anything, and CRLF because a stray
+# carriage return is what would hide the `+` from the detector.
+check_shapes() {
+  local seq reflen i p line
+  seq=$(grep -v '^>' "$IDX" | tr -d '\n' | tr 'acgt' 'ACGT')
+  reflen=${#seq}
+  : > "$TMP/flat.fq"
+  : > "$TMP/wrap.fq"
+  : > "$TMP/crlf.fq"
+  for i in $(seq 1 300); do
+    p=$(( reflen / 320 * i ))
+    line="${seq:$p:150}"
+    printf '@s%s\n%s\n+\n%s\n' "$i" "$line" "$(printf 'I%.0s' $(seq 1 150))" >> "$TMP/flat.fq"
+    printf '@s%s\r\n%s\r\n+\r\n%s\r\n' "$i" "$line" "$(printf 'I%.0s' $(seq 1 150))" >> "$TMP/crlf.fq"
+    # The same record with sequence and quality wrapped at 60 columns.
+    {
+      printf '@s%s\n' "$i"
+      printf '%s\n' "${line:0:60}" "${line:60:60}" "${line:120:30}"
+      printf '+\n'
+      printf '%s\n' "$(printf 'I%.0s' $(seq 1 60))" "$(printf 'I%.0s' $(seq 1 60))" "$(printf 'I%.0s' $(seq 1 30))"
+    } >> "$TMP/wrap.fq"
+  done
+  gzip -c "$TMP/wrap.fq" > "$TMP/wrap.fq.gz"
+
+  # The oracle's answer for the flat spelling is the reference every shape is held to.
+  $M2 mem -t2 -K 10000000 "$IDX" "$TMP/flat.fq" 2>/dev/null | grep -v '^@PG' > "$TMP/shape_ref.sam"
+  local name file
+  for name in flat wrap crlf wrap.fq.gz; do
+    case "$name" in
+      wrap.fq.gz) file="$TMP/wrap.fq.gz" ;;
+      *)          file="$TMP/$name.fq" ;;
+    esac
+    $M3 mem -t2 -K 10000000 "$IDX" "$file" 2>/dev/null | grep -v '^@PG' > "$TMP/shape_b.sam"
+    if cmp -s "$TMP/shape_ref.sam" "$TMP/shape_b.sam"; then
+      printf '  %-28s %-3s [PASS]\n' "input shape: $name" "se"; pass=$((pass+1))
+    else
+      printf '  %-28s %-3s [FAIL] %s records against the oracle'"'"'s flat run\n' \
+        "input shape: $name" "se" "$(grep -vc '^@' "$TMP/shape_b.sam")"
+      fail=$((fail+1)); failed_opts+=("input shape: $name")
+    fi
+  done
+}
+
+echo "=== input shapes ==="
+check_shapes
+
+echo "=== long reads on the bwa path ==="
+check_longread
+
 echo "=== -f alias and -1 ==="
 check "-1 (no_mt_io)"      se -1
+
+# A REPEATED OPTION takes its last value, which is what getopt does and therefore what bwa does.
+# clap rejected these outright with a usage error and exit code 2 until `args_override_self` was set,
+# and appending an override to a variable of default options is how most wrapper scripts are written:
+#
+#     bwa-mem4 mem $DEFAULT_OPTS -t 8 ref r1.fq r2.fq        # $DEFAULT_OPTS already holds -t 4
+#
+# One valued option, one flag and one whose value changes the batching, so a future regression cannot
+# hide in a single argument kind.
+check "-k twice"           se -k 19 -k 25
+check "-a twice"           se -a -a
+check "-K twice"           se -K 10000000 -K 5000
 check_f
 check_o
 check_bgzf

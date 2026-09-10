@@ -50,6 +50,16 @@ on:
       # kernels turned off, in the same interleaved loop, on the same host: if the lead survives
       # `avx2`, it is not the kernels; if it collapses, it is. Comparing across two runs would not
       # settle it, because the hosts differ more than the arms do.
+      # A SECOND TREE, TIMED IN THE SAME LOOP ON THE SAME MACHINE.
+      #
+      # Comparing a branch against `dev` by dispatching this workflow twice does not work, and the
+      # attempt is on the record: one run drew an EPYC 7763 and the other an EPYC 9V74, which the
+      # invariant third parties made plain (bwa-mem2 at 234 s against 270 s for the same reads). Two
+      # runs are two machines. The only comparison that holds is both binaries in one job.
+      base_ref:
+        description: "Also build this git ref and time it beside ours (empty = do not)"
+        default: ""
+        required: false
       avx2_arm:
         description: "Also time our v3 binary with the kernels forced to avx2 (attributes the AVX-512 share)"
         type: boolean
@@ -127,6 +137,24 @@ jobs:
           cp target-isa/release/bwa-mem4 ./mem4-v3
           ls -la mem4-baseline mem4-v3
 
+      - name: Build the comparison tree (${{ github.event.inputs.base_ref }})
+        if: github.event.inputs.base_ref != ''
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.inputs.base_ref }}
+        run: |
+          set -euo pipefail
+          # A worktree rather than a checkout: the working tree stays on the ref under test, so a
+          # mistake here cannot silently time the wrong binary as ours.
+          git fetch --depth=50 origin "$BASE_REF"
+          git worktree add /tmp/base FETCH_HEAD
+          ( cd /tmp/base
+            RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked -p bwa-mem4 \
+              --jobs 2 --target-dir /tmp/base-target )
+          cp /tmp/base-target/release/bwa-mem4 ./mem4-base-ref
+          echo "base ref: $(git -C /tmp/base rev-parse --short HEAD)"
+          ls -la mem4-base-ref
+
       - name: Reference, index, and both read sets
         run: |
           set -euo pipefail
@@ -162,6 +190,7 @@ jobs:
             for b in ../mem4-baseline ../mem4-v3; do $b mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null; done
             bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
+            [ -x ../mem4-base-ref ] && env BWA4_TIGHT_BAND=1 ../mem4-base-ref mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             if [ "$AVX2_ARM" = "true" ]; then
               env BWA4_TIGHT_BAND=1 BWA4_RESCUE_TIER=avx2 BWA4_EXTEND_TIER=avx2 \
                 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
@@ -173,6 +202,12 @@ jobs:
               fk=$(timed bwa-mem3         mem -t "$T" chr21.fa "$r1" "$r2")
               m2=$(timed bwa-mem2         mem -t "$T" chr21.fa "$r1" "$r2")
               line="rep $rep: baseline ${b0}s | v3 ${b3}s | v3+tight ${tb}s | fork ${fk}s | mem2 ${m2}s"
+              if [ -x ../mem4-base-ref ]; then
+                # Same flags and same tight band as our own `v3+tight` arm, so the only difference
+                # between the two figures is the tree they were built from.
+                br=$(timed env BWA4_TIGHT_BAND=1 ../mem4-base-ref mem -t "$T" chr21.fa "$r1" "$r2")
+                line="$line | base-ref ${br}s"
+              fi
               if [ "$AVX2_ARM" = "true" ]; then
                 # Forced tiers, not a rebuild: the binary is identical, only the dispatch changes,
                 # so the difference is the kernels and nothing else. A forced tier the host lacks
