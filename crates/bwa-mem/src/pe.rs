@@ -2329,6 +2329,20 @@ fn mem_reg2sam(
     }
 }
 
+thread_local! {
+    /// One SAM output buffer per thread, reused across every pair that thread emits.
+    ///
+    /// `mem_sam_pe` used to build each end's records in its own fresh `Vec`, so a pair paid two
+    /// allocations plus the reallocations of growing from empty to a few hundred bytes, and then
+    /// issued two writes. The buffer is taken out here and put back at the end; an early return
+    /// between the two simply drops it and costs one allocation on the next pair, which makes this
+    /// a performance path and never a correctness one.
+    ///
+    /// Per-THREAD and not per-call, so it cannot be shared between the rayon workers that run pairs
+    /// concurrently. Both ends of a pair still go in before anything is written.
+    static SCRATCH_SAM: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Full paired-end SAM for one read pair. Port of `mem_sam_pe` (`bwamem_pair.cpp:353-546`),
 /// non-ALT, without `-a`/`-5`.
 ///
@@ -2351,8 +2365,9 @@ fn mem_reg2sam(
 /// renumber. `rescue_done` is a port-only flag: true when the caller already ran
 /// [`batch_mate_rescue`] over the whole batch, in which case stage 1 is skipped here.
 ///
-/// Records are written to `w` read 1 first, then read 2. Each end's records are built in a private
-/// buffer and written in one call, so a pair's lines cannot interleave with another thread's.
+/// Records are written to `w` read 1 first, then read 2. The whole pair is built in
+/// [`SCRATCH_SAM`], this thread's reusable buffer, and written in ONE call, so a pair's lines
+/// cannot interleave with another thread's.
 ///
 /// RETURNS whatever `w` reported; the only failure mode is the write itself.
 ///
@@ -2652,14 +2667,40 @@ pub fn mem_sam_pe<W: Write>(
                 // bwa's `aa[i]`: every record emitted for this end, primary first. Its LENGTH is
                 // what makes the difference downstream, because `mem_aln2sam` uses it to decide
                 // whether an `SA:Z` is owed and how to clip.
-                let mut aa0 = vec![h0.clone()];
-                aa0.extend(alt_extra(a0, n_pri0, &xa0, seqs[0], 0x40));
-                let mut aa1 = vec![h1.clone()];
-                aa1.extend(alt_extra(a1, n_pri1, &xa1, seqs[1], 0x80));
+                let extra0 = alt_extra(a0, n_pri0, &xa0, seqs[0], 0x40);
+                let extra1 = alt_extra(a1, n_pri1, &xa1, seqs[1], 0x80);
+                // Backing storage for the TWO-record case only. On an index with no ALT contigs
+                // `alt_extra` returns `None` for every read, so `aa0`/`aa1` borrow `h0`/`h1` in
+                // place and nothing is allocated or copied. They used to be
+                // `vec![h0.clone()]`, which on the common path was one `Vec` plus a `MemAln` clone
+                // per end -- and a `MemAln` clone is its CIGAR `Vec`, its `md` String and its `xa`
+                // String, so up to eight allocations per pair to build two one-element lists that
+                // `mem_aln2sam` only ever reads.
+                let (both0, both1);
+                let aa0: &[MemAln] = match extra0 {
+                    None => std::slice::from_ref(&h0),
+                    Some(g) => {
+                        both0 = [h0.clone(), g];
+                        &both0
+                    }
+                };
+                let aa1: &[MemAln] = match extra1 {
+                    None => std::slice::from_ref(&h1),
+                    Some(g) => {
+                        both1 = [h1.clone(), g];
+                        &both1
+                    }
+                };
 
                 // The MATE handed to the other end's records is `h`, the paired primary record,
                 // never the ALT supplementary one (the C passes `&h[1]` and `&h[0]`).
-                let mut buf0 = Vec::new();
+                // ONE buffer for both ends, taken from the per-thread scratch, so a pair costs no
+                // allocation here at all after the first one on this thread. It was two `Vec`s
+                // grown from empty per pair, each reallocating its way up to a few hundred bytes.
+                // Both ends still land in the buffer before anything is written, and now in a
+                // single `write_all` rather than two, so a pair's records cannot be split.
+                let mut buf = SCRATCH_SAM.with(|c| std::mem::take(&mut *c.borrow_mut()));
+                buf.clear();
                 for which in 0..aa0.len() {
                     mem_aln2sam(
                         bns,
@@ -2667,14 +2708,13 @@ pub fn mem_sam_pe<W: Write>(
                         seqs[0],
                         quals[0],
                         comments[0],
-                        &aa0,
+                        aa0,
                         which,
                         Some(&h1),
                         softclip,
-                        &mut buf0,
+                        &mut buf,
                     );
                 }
-                let mut buf1 = Vec::new();
                 for which in 0..aa1.len() {
                     mem_aln2sam(
                         bns,
@@ -2682,16 +2722,16 @@ pub fn mem_sam_pe<W: Write>(
                         seqs[1],
                         quals[1],
                         comments[1],
-                        &aa1,
+                        aa1,
                         which,
                         Some(&h0),
                         softclip,
-                        &mut buf1,
+                        &mut buf,
                     );
                 }
-                w.write_all(&buf0)?;
-                w.write_all(&buf1)?;
-                return Ok(());
+                let wrote = w.write_all(&buf);
+                SCRATCH_SAM.with(|c| *c.borrow_mut() = buf);
+                return wrote;
             }
         }
     }
@@ -2767,7 +2807,8 @@ pub fn mem_sam_pe<W: Write>(
     // carries 0x01 already, so the OR is redundant on that bit; it matters only for 0x2. Each end
     // is handed the OTHER end's picked alignment as its mate. Both buffers are built in full before
     // either is written so a pair's four-or-more lines never interleave with another thread's.
-    let mut buf0 = Vec::new();
+    let mut buf = SCRATCH_SAM.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    buf.clear();
     mem_reg2sam(
         fm,
         bns,
@@ -2779,9 +2820,8 @@ pub fn mem_sam_pe<W: Write>(
         a0,
         0x41 | extra_flag,
         Some(&h1),
-        &mut buf0,
+        &mut buf,
     );
-    let mut buf1 = Vec::new();
     mem_reg2sam(
         fm,
         bns,
@@ -2793,11 +2833,11 @@ pub fn mem_sam_pe<W: Write>(
         a1,
         0x81 | extra_flag,
         Some(&h0),
-        &mut buf1,
+        &mut buf,
     );
-    w.write_all(&buf0)?;
-    w.write_all(&buf1)?;
-    Ok(())
+    let wrote = w.write_all(&buf);
+    SCRATCH_SAM.with(|c| *c.borrow_mut() = buf);
+    wrote
 }
 
 #[cfg(test)]
