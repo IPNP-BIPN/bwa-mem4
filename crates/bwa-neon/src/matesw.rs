@@ -5466,7 +5466,8 @@ mod tests {
                     endsc: i32::MAX,
                 })
                 .collect();
-            let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, i32::from(a));
+            let want =
+                fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, i32::from(a));
             // Before the fix this call aborted the process instead of returning.
             let got = fwd_local_sw_batch(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, i32::from(a));
             assert_eq!(got, want, "batched kernel diverged at (a {a}, b {b})");

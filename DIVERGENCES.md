@@ -20,6 +20,23 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   le figeage de cette formulation plutot qu'une attente indefinie : si upstream tranche un jour dans
   l'autre sens, c'est cette entree qu'il faudra rouvrir, et l'oracle de reference avec elle.
 
+- **Une base `-` dans un read : bwa-mem2 tronque sa propre sortie, nous emettons `N`. ACCEPTE
+  (4.4.x).** `nst_nt4_table` de bwa donne le code **5** au caractere `-` (et 4 a tout le reste), or
+  SEQ est imprime par `"ACGTN"[code]` : l'index 5 lit le terminateur de la chaine, un octet NUL
+  part dans le `kstring`, et `fputs` s'arrete dessus. Le resultat n'est pas un enregistrement
+  different : c'est un SAM **coupe au milieu de la colonne 10**, qui perd aussi tous les
+  enregistrements suivants du meme tampon. Mesure ici sur un read de 150 bases avec un seul `-` en
+  position 10 : la sortie de l'oracle s'arrete apres 10 bases de SEQ.
+
+  Notre table donne 4 (`N`) a `-` comme a n'importe quel autre octet, donc nous emettons un
+  enregistrement complet et valide. C'est la meme exception que les crashs de
+  `scripts/upstream_repros.sh` : reproduire une sortie tronquee n'est pas reproduire une sortie.
+
+  Tous les AUTRES octets hors `ACGTacgt` (`N`, lettres IUPAC, `.`, `*`, espace) donnent `N` des
+  deux cotes, verifie un par un contre l'oracle. C'est notre chemin single-end qui s'en ecartait
+  jusqu'en 4.4.x, en recopiant les octets bruts du FASTQ dans SEQ ; corrige, avec le passage en
+  majuscules que cela impliquait aussi.
+
 - **`@PG` : DECIDE (4.0.0). Nous emettons notre propre identite, definitivement.** Notre sortie
   emet `ID:bwa-mem4 PN:bwa-mem4 VN:<ver> CL:<notre argv>`, l'oracle emet `bwa-mem2`. Exclu du gate
   d'octet-identite (on compare `@SQ` + les lignes d'alignement).

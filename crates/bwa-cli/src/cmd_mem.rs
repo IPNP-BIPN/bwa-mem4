@@ -2538,8 +2538,16 @@ fn finish_se(
     // This read's SAM text, the function's return value.
     let mut buf = Vec::new();
     if alns.is_empty() {
-        sam::write_unmapped(&mut buf, rec.name(), rec.seq(), rec.qual(), rec.comment())
-            .expect("write to Vec");
+        // Same normalisation as a mapped record: an unmapped read still prints SEQ, and bwa still
+        // prints it out of its nt4 codes.
+        sam::write_unmapped(
+            &mut buf,
+            rec.name(),
+            &dna::to_sam_ascii(rec.seq()),
+            rec.qual(),
+            rec.comment(),
+        )
+        .expect("write to Vec");
         return buf;
     }
     for which in 0..alns.len() {
@@ -2789,7 +2797,12 @@ fn write_aln_se(
         (dna::revcomp_ascii(&rec.seq()[qb..qe]), reversed_qual)
     } else {
         (
-            rec.seq()[qb..qe].to_vec(),
+            // `to_sam_ascii`, not `to_vec`: SAM column 10 is bwa's `"ACGTN"[code]` and not the
+            // FASTQ's own bytes, so lowercase input is upper-cased and anything that is not a base
+            // becomes `N`. The reverse branch above gets the same normalisation from
+            // `revcomp_ascii`. Skipping it here leaked raw input into every forward-strand
+            // single-end record.
+            dna::to_sam_ascii(&rec.seq()[qb..qe]),
             rec.qual().map(|quals| quals[qb..qe].to_vec()),
         )
     };
