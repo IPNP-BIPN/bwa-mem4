@@ -196,6 +196,14 @@ bash scripts/check.sh          # fmt, clippy, unit tests
 ```
 
 ```sh
+# Random COMBINATIONS of options against the oracle. Not a gate -- a green run proves little,
+# because the reads are simulated -- but it is what found `-5` doing nothing, `-M` being ignored on
+# the paired-end emitter, and the supplementary MAPQ cap running under `-q`. Each of those needed a
+# second option to become visible, so the per-option sweep below could not see them.
+python3 scripts/opt_fuzz.py --n 400 --reads work/r1.fq,work/r2.fq
+```
+
+```sh
 # Byte-for-byte SAM comparison against bwa-mem2 across 58 option combinations.
 python3 scripts/make_test_reads.py testdata/tiny/tiny.fa /tmp/ci --n 8000
 IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \

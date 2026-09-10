@@ -8,6 +8,10 @@
 #   IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \
 #     bash scripts/opt_parity.sh ./target/release/bwa-mem4
 #
+# And neither of those covers option COMBINATIONS, which is where an option whose effect only shows
+# up in the presence of another one hides. `scripts/opt_fuzz.py` is the hunting tool for that class;
+# it is not a gate (a green run proves little) but every divergence it has found was real.
+#
 # and remember `cargo test` does not relink target/release/bwa-mem4: `cargo build --release` first.
 #
 # It also does NOT cover the AVX-512 kernels, on any machine. Their byte-identity tests self-skip
