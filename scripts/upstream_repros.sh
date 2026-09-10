@@ -61,6 +61,43 @@ echo "        AVX512 build, so this case is a regression guard here, not a repro
 
 echo
 echo "======================================================================"
+echo "bwa-mem2 - assert in bns_fetch_seq_v2 under a large -W"
+echo "======================================================================"
+# NOT a filed issue: found here on 2026-09-10 by `scripts/opt_fuzz.py`, which draws random option
+# combinations. `-W 100` on ordinary 150 bp reads aborts bwa-mem2 2.3 with
+#
+#   Assertion failed: (*beg <= mid && mid < *end), function bns_fetch_seq_v2, bwamem.cpp:1901
+#
+# `-W` is `min_chain_weight`, a chain-filter threshold; a value at or above the read length leaves
+# the chain window degenerate. bwa 0.7.19 runs the same options to completion, so this is bwa-mem2's
+# own regression rather than a property of the algorithm, and there is no output to be
+# byte-identical to. What this case asserts is only that WE keep producing a complete SAM, the same
+# exception the crash cases above run under.
+#
+# It needs the COMMITTED fixture, not a synthetic reference: a random sequence has no repeats, so no
+# chain window ever becomes degenerate and the oracle finishes normally. The threshold is sharp on
+# this fixture -- `-W 60` is fine, `-W 100` aborts.
+python3 scripts/make_test_reads.py testdata/tiny/tiny.fa "$TMP/w" --n 4000 >/dev/null 2>&1
+# The subshell is not decoration: the oracle dies on a SIGABRT and the shell prints its own
+# "Abort trap: 6" job message, which redirecting the command's stderr does not suppress.
+( "$M2" mem -t1 -W 100 testdata/tiny/tiny.fa "$TMP/w_1.fq" >"$TMP/w_m2.sam" 2>/dev/null ) 2>/dev/null
+M2_RC=$?
+echo "  bwa-mem2: rc=$M2_RC records=$(grep -vc '^@' "$TMP/w_m2.sam" 2>/dev/null)"
+"$M3" mem -t1 -W 100 testdata/tiny/tiny.fa "$TMP/w_1.fq" >"$TMP/w_m3.sam" 2>/dev/null
+W3_RC=$?
+W3_N=$(grep -vc '^@' "$TMP/w_m3.sam" 2>/dev/null)
+echo "  bwa-mem4: rc=$W3_RC records=$W3_N"
+if [ "$M2_RC" = 0 ]; then
+  echo "  NOTE: the oracle did NOT abort here. Either it was fixed upstream, or this build differs;"
+  echo "        in that case the two outputs should agree and the parity scripts already check that."
+elif [ "$W3_RC" = 0 ] && [ "${W3_N:-0}" -eq 4000 ]; then
+  echo "  -> we align all 4000 reads where the oracle aborts."
+else
+  echo "  -> WE FAILED TOO, which is a regression: this used to complete."
+fi
+
+echo
+echo "======================================================================"
 echo "bwa-mem2 #280 - invalid index created (.amb fails to parse on load)"
 echo "======================================================================"
 # The reporter's own index build printed `pos: 91632415, ref_seq_len__: 91632414` and the aligner
