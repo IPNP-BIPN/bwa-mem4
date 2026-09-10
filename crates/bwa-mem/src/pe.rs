@@ -2437,6 +2437,13 @@ pub fn mem_sam_pe<W: Write>(
     // `n_pri < a.len()` ALT branches stay meaningful.
     let n_pri0 = mem_mark_primary_se(opt, a0, id << 1) as usize;
     let n_pri1 = mem_mark_primary_se(opt, a1, (id << 1) | 1) as usize;
+    // `-5`: both ends, after the marking and before the `-P` test, exactly where
+    // `bwamem_pair.cpp:419-423` puts it. `n_pri0`/`n_pri1` are computed FIRST and stay valid: the
+    // reorder swaps two slots that were both non-secondary, so it cannot change how many there are.
+    if opt.flag & bwa_core::opt::flags::PRIMARY5 != 0 {
+        crate::primary::mem_reorder_primary5(opt.t, a0);
+        crate::primary::mem_reorder_primary5(opt.t, a1);
+    }
     // 0x1 (paired in sequencing) is stamped on every record either path emits.
     let extra_flag: u32 = 1;
 

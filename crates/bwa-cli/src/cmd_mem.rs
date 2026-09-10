@@ -2452,6 +2452,12 @@ fn finish_se(
     // before any primary marking reads it.
     bwa_mem::stamp_is_alt(bns, &mut regs);
     mem_mark_primary_se(opt, &mut regs, read_id);
+    // `-5` (`MEM_F_PRIMARY5`): make the 5'-most segment of a split alignment the primary, which
+    // score-ranking would not. Runs here, immediately after the marking and before anything reads
+    // the region order.
+    if opt.flag & flags::PRIMARY5 != 0 {
+        bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);
+    }
     if dump_regs_enabled() {
         bwa_mem::dump_regs(bns, "post-dedup+mark", &regs);
     }

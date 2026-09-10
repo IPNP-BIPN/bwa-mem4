@@ -1070,6 +1070,12 @@ pub fn align_read_se(
     let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs);
     crate::primary::stamp_is_alt(bns, &mut regs);
     mem_mark_primary_se(opt, &mut regs, read_id);
+    // `-5` (`MEM_F_PRIMARY5`): make the 5'-most segment of a split alignment the primary, which
+    // score-ranking would not. Runs here, immediately after the marking and before anything reads
+    // the region order.
+    if opt.flag & bwa_core::opt::flags::PRIMARY5 != 0 {
+        crate::primary::mem_reorder_primary5(opt.t, &mut regs);
+    }
     regs
 }
 

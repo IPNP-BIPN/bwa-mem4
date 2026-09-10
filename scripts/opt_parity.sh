@@ -273,6 +273,58 @@ check "-5 (pe)"  pe -5
 check "-q (pe)"  pe -q
 check "-a -Y (pe)" pe -a -Y
 
+# `-5` WITH A NARROW BAND. Plain `-5` is checked above and passes even when nothing implements it,
+# because at the default `-w` this fixture produces almost no split alignments and the 5'-most
+# segment is already the best-scoring one. `-w 3` forces splits, and then `-5` has something to
+# reorder: `mem_reorder_primary5` was missing entirely until 4.4.x, so `-5` parsed, set its flag and
+# changed nothing. Found by fuzzing option COMBINATIONS, which is the lesson: a flag whose effect
+# needs a second flag to become visible passes a one-option-at-a-time sweep.
+check "-w 3 -5"        se -w 3 -5
+check "-w 3 -5 (pe)"   pe -w 3 -5
+
+# `-5` on reads that really are chimeric, built here because the simulated fixtures do not contain
+# any. Each read is a SHORT piece of the reference followed by a LONG piece from a distant locus, so
+# it splits into two alignments and the 3' one scores higher -- which is exactly the case `-5`
+# exists for, and exactly the case a score-ranked primary gets wrong. The mirrored read (long piece
+# first) is included so the test also covers the "already 5'-most, do not reorder" branch.
+#
+# Verified to have teeth on the committed `testdata/tiny` fixture: with the reorder disabled, 8 of
+# the 16 records differ from the oracle.
+check_primary5() {
+  local seq reflen fq label
+  seq=$(grep -v '^>' "$IDX" | tr -d '\n' | tr 'acgt' 'ACGT')
+  reflen=${#seq}
+  fq="$TMP/chimeric.fq"
+  : > "$fq"
+  # Four (near locus, far locus) pairs spread over the contig, as fractions of its length so this
+  # works on whatever reference $IDX points at.
+  local i a b la lb read
+  for i in 1 2 3 4; do
+    a=$(( reflen / 40 * i ))
+    b=$(( reflen / 2 + reflen / 40 * i ))
+    la=$(( 45 + i * 5 ))
+    lb=$(( 150 - la ))
+    [ $(( b + lb )) -le "$reflen" ] || continue
+    read="${seq:$a:$la}${seq:$b:$lb}"
+    printf '@chim%s\n%s\n+\n%s\n' "$i" "$read" "$(printf 'I%.0s' $(seq 1 150))" >> "$fq"
+    # The same two pieces the other way round: the 5'-most segment is now also the best-scoring one.
+    read="${seq:$b:$lb}${seq:$a:$la}"
+    printf '@chimr%s\n%s\n+\n%s\n' "$i" "$read" "$(printf 'I%.0s' $(seq 1 150))" >> "$fq"
+  done
+  label="-5 on chimeric reads"
+  $M2 mem -t2 -K 10000000 -5 "$IDX" "$fq" 2>/dev/null | grep -v '^@PG' > "$TMP/p5_a.sam"
+  $M3 mem -t2 -K 10000000 -5 "$IDX" "$fq" 2>/dev/null | grep -v '^@PG' > "$TMP/p5_b.sam"
+  if cmp -s "$TMP/p5_a.sam" "$TMP/p5_b.sam"; then
+    printf '  %-28s %-3s [PASS]\n' "$label" "se"; pass=$((pass+1))
+  else
+    local d
+    d=$(paste "$TMP/p5_a.sam" "$TMP/p5_b.sam" | awk -F'\t' '{h=NF/2; for(i=1;i<=h;i++) if($i!=$(i+h)){c++; break}} END{print c+0}')
+    printf '  %-28s %-3s [FAIL] %s differing records\n' "$label" "se" "$d"
+    fail=$((fail+1)); failed_opts+=("$label")
+  fi
+}
+check_primary5
+
 echo "=== input and output paths ==="
 check "-p (interleaved)" pi -p
 
