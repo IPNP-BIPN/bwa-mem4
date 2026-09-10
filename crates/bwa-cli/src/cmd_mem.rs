@@ -184,7 +184,20 @@ const CIGAR_LEN_SHIFT: u32 = 4;
 // more. Every other field's clap behaviour when absent IS its `Default`, since they are `Option`
 // or `bool`.
 #[derive(Args, Default)]
-#[command(disable_help_flag = true, disable_version_flag = true)]
+// `args_override_self`: a REPEATED option takes its last value instead of being an error, which is
+// what getopt does and therefore what bwa does. Without it clap rejected `-t 4 -t 8` outright with a
+// usage error and exit code 2, where bwa runs with 8 -- and appending an override to a variable of
+// default options is how most wrapper scripts are written:
+//
+//     bwa-mem4 mem $DEFAULT_OPTS -t 8 ref r1.fq r2.fq        # $DEFAULT_OPTS already holds -t 4
+//
+// Every option here is last-wins for bwa (none of them accumulates, not even `-R` or `-H`), so the
+// setting is right for all of them and not only for the one that exposed it.
+#[command(
+    disable_help_flag = true,
+    disable_version_flag = true,
+    args_override_self = true
+)]
 pub struct MemArgs {
     // `-t INT` -> `opt->n_threads` (`fastmap.cpp:672`). Default 1, clamped to >= 1 by both
     // implementations. Purely a speed knob: unlike most aligners, nothing about the output depends
@@ -2452,6 +2465,12 @@ fn finish_se(
     // before any primary marking reads it.
     bwa_mem::stamp_is_alt(bns, &mut regs);
     mem_mark_primary_se(opt, &mut regs, read_id);
+    // `-5` (`MEM_F_PRIMARY5`): make the 5'-most segment of a split alignment the primary, which
+    // score-ranking would not. Runs here, immediately after the marking and before anything reads
+    // the region order.
+    if opt.flag & flags::PRIMARY5 != 0 {
+        bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);
+    }
     if dump_regs_enabled() {
         bwa_mem::dump_regs(bns, "post-dedup+mark", &regs);
     }
@@ -2538,8 +2557,16 @@ fn finish_se(
     // This read's SAM text, the function's return value.
     let mut buf = Vec::new();
     if alns.is_empty() {
-        sam::write_unmapped(&mut buf, rec.name(), rec.seq(), rec.qual(), rec.comment())
-            .expect("write to Vec");
+        // Same normalisation as a mapped record: an unmapped read still prints SEQ, and bwa still
+        // prints it out of its nt4 codes.
+        sam::write_unmapped(
+            &mut buf,
+            rec.name(),
+            &dna::to_sam_ascii(rec.seq()),
+            rec.qual(),
+            rec.comment(),
+        )
+        .expect("write to Vec");
         return buf;
     }
     for which in 0..alns.len() {
@@ -2789,7 +2816,12 @@ fn write_aln_se(
         (dna::revcomp_ascii(&rec.seq()[qb..qe]), reversed_qual)
     } else {
         (
-            rec.seq()[qb..qe].to_vec(),
+            // `to_sam_ascii`, not `to_vec`: SAM column 10 is bwa's `"ACGTN"[code]` and not the
+            // FASTQ's own bytes, so lowercase input is upper-cased and anything that is not a base
+            // becomes `N`. The reverse branch above gets the same normalisation from
+            // `revcomp_ascii`. Skipping it here leaked raw input into every forward-strand
+            // single-end record.
+            dna::to_sam_ascii(&rec.seq()[qb..qe]),
             rec.qual().map(|quals| quals[qb..qe].to_vec()),
         )
     };

@@ -662,10 +662,23 @@ impl FmIndex {
     /// per access falls while the core still has miss slots to spare and flattens when it does not.
     ///
     /// # Returns
-    /// Nanoseconds per access for each width in `widths`, in order.
+    /// Nanoseconds per access for each width in `widths`, in order. **EMPTY when the index is too
+    /// small to measure anything**, which the caller must read as "use the default width".
+    ///
+    /// The empty return replaces an `assert!`, and the assert was a crash on ordinary input: an
+    /// index whose `cp_occ` holds 1024 blocks or fewer is about 64 kbp of reference, so aligning
+    /// against a plasmid, a single gene, an amplicon panel or any small contig set aborted the
+    /// process with `index too small to probe` where bwa-mem2 aligns normally. Nothing about the
+    /// probe is load-bearing -- it picks a lockstep WIDTH, which is scheduling and cannot move a
+    /// byte of output -- so having no measurement is a reason to fall back, never to stop.
     pub fn probe_concurrency(&self, widths: &[usize], accesses_per_width: usize) -> Vec<f64> {
         let n_blocks = self.cp_occ.len();
-        assert!(n_blocks > 1024, "index too small to probe");
+        // Below this the chains cannot be spread far enough apart to be independent, and the whole
+        // array sits in cache anyway, so any number measured here would describe the cache rather
+        // than the memory system the width is meant to match.
+        if n_blocks <= 1024 {
+            return Vec::new();
+        }
         let mut out = Vec::with_capacity(widths.len());
         for &k in widths {
             // Chains start spread across the array so they do not share lines.

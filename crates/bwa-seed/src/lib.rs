@@ -265,6 +265,8 @@ fn probe_lockstep_width(fm: &FmIndex) -> usize {
     /// Accesses per candidate. Equal across widths, so no candidate is measured warmer than another.
     const ACCESSES: usize = 200_000;
 
+    // Empty means the index is too small to measure (see `probe_concurrency`); the `find` below
+    // then yields nothing and the default width is used, which is exactly the intended fallback.
     let times = fm.probe_concurrency(&CANDIDATES, ACCESSES);
     let best = times.iter().cloned().fold(f64::MAX, f64::min);
     // Smallest width within 5% of the best: on a flat top, fewer slots means less scratch memory and
