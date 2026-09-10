@@ -9,8 +9,12 @@
 #     bash scripts/opt_parity.sh ./target/release/bwa-mem4
 #
 # And neither of those covers option COMBINATIONS, which is where an option whose effect only shows
-# up in the presence of another one hides. `scripts/opt_fuzz.py` is the hunting tool for that class;
-# it is not a gate (a green run proves little) but every divergence it has found was real.
+# up in the presence of another one hides, nor the INPUTS, which the whole suite holds fixed. Two
+# hunting tools for those classes, neither a gate (a green run proves little) but each of which has
+# found real divergences:
+#
+#   python3 scripts/opt_fuzz.py --n 400        # random combinations of options
+#   python3 scripts/shape_fuzz.py              # input, reference and paired-end shapes
 #
 # and remember `cargo test` does not relink target/release/bwa-mem4: `cargo build --release` first.
 #
