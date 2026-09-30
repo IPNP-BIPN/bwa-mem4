@@ -5294,6 +5294,134 @@ chacun au lieu d'une journee de noyau chacun, et le fichier porte les trois chif
 intuitions. Ce qui reste ouvert cote GPU est donc **la raison des 50 Gcell/s, qui n'est ni la bande
 passante, ni l'emission d'acces, ni le gather de query**.
 
+## GPU portable, co-ordonnancement CPU+GPU, et une session Intel sans SMT (2026-09-30)
+
+Machine de la session : Xeon Sapphire Rapids, 4 coeurs **sans SMT** (1 thread par coeur), AVX-512
+complet, 16 GB, **aucun GPU**. Les hotes de donnees genomiques (UCSC, Ensembl, NCBI) sont bloques par
+le proxy, et la politique de la session interdit de compiler et d'executer du code tiers : **ni
+l'oracle bwa-mem2 ni le fork bwa-mem3 n'ont tourne ici**. Tout ce qui suit est donc prouve contre le
+binaire lui-meme (md5 GPU off/on, avant/apres) et contre les barrieres scalaires. Rien n'est un
+chiffre contre le fork.
+
+### GPU : `bwa-wgpu`, un noyau pour Vulkan, Metal et DX12
+
+Le port WGSL de `ksw_extend2` (un job par invocation, rails column-major, zero flottant, bande
+serree par l'hote) est compile par le pilote a l'execution. Une seule source couvre les serveurs x86
+Linux a GPU NVIDIA/AMD que visait #56, sans toolkit CUDA.
+
+**Prouve sans GPU.** Lavapipe (Mesa) est un pilote Vulkan conforme qui s'execute sur le CPU : le
+vrai shader passe par le vrai chemin SPIR-V. Les cinq barrieres `SwBackend` passent (scalaire, lot,
+regle d'egalite, frontiere de saturation, invariance d'ordre). Deux mutations volontaires du noyau
+sont detectees : `>` remplace par `>=` sur l'argmax, et gap ouvert depuis `H` au lieu de `M`, qui
+est le bug historique du shader Metal retire. Un job CI `gpu-lavapipe` rejoue tout cela a chaque
+push.
+
+**Le co-ordonnanceur (#57 niveaux 1 et 2)**, dans `bwa-gpu` :
+
+- chaque `extend_batch` est coupe en deux : une fraction part a un thread de service GPU unique,
+  et le thread appelant calcule le reste sur son noyau SIMD pendant ce temps ;
+- le service fusionne en **un seul lancement** toutes les requetes arrivees pendant le lancement
+  precedent. C'est l'agregation inter-threads que la mesure du 2026-08-09 designait comme la
+  condition pour que le GPU paie au-dela de `-t4`. Sur la barriere a 8 appelants concurrents :
+  1 481 lancements pour 3 928 requetes ;
+- la fraction est fixe (`BWA4_GPU_SPLIT`) ou adaptative (moyenne mobile sur les debits mesures).
+  Un appareil qui echoue rend la main au CPU, avec la meme sortie.
+
+**Octet-identite de bout en bout** (`scripts/gpu_parity.sh`, lavapipe, 20k paires) :
+
+- md5 identique avec le GPU coupe et active ;
+- md5 identique pour les fractions 0 / 0,25 / 0,5 / 0,75 / 1 / adaptative ;
+- verifie a la bande par defaut et a `-w 5`, qui force des requeues au round 1 (#54 piege 5) ;
+- verifie en PE et en SE.
+
+**Ce qui n'est pas mesure : la vitesse.** Il n'y a pas de GPU sur cette machine, et lavapipe est
+exact mais lent. Le chiffre qui manque est celui d'un GPU discret, avec `BWA4_GPU=wgpu` contre
+`BWA4_GPU=off`, en A/B entrelace a plusieurs `-t`.
+
+### Un banc Intel sans index humain : `scripts/make_synth_genome.py`
+
+L'index GRCh38 ne tient pas dans 16 GB. Pour avoir un index plus gros que le L3 (260 MB ici), le
+script genere un genome synthetique de 120 Mb avec un paysage de repetitions de type humain :
+
+- isochores (GC variable par blocs) ;
+- une famille type Alu (une copie par 3 kb) et une famille type L1, souvent tronquee ;
+- des microsatellites ;
+- des duplications segmentaires divergentes de 1 a 5 %.
+
+L'index fait 630 MB. Les lectures sont 500k paires `make_test_reads.py`. Ce banc sert aux A/B
+relatifs sur un meme hote, jamais a un chiffre de tete.
+
+### Profil a chaud, `-t4` PE, perf
+
+| fonction | part |
+|---|---|
+| `batched_extend_avx2_u8` | 16,6 % |
+| `LsSlot::step` (seeding) | 15,5 % |
+| `clear_page_erms` (noyau Linux) | **9,3 %** |
+| `get_sa_batch` | 6,7 % |
+| `mem_sort_dedup_patch` | 5,7 % |
+| `fwd_local_sw_batch` | 5,6 % |
+| `ksw_global2` | 4,9 % |
+
+### L'allocateur : purger par `MADV_FREE` et non par `MADV_DONTNEED`, -3 a -4 %
+
+`clear_page_erms` est le noyau qui met a zero une page fraichement faultee. mimalloc rend les
+pages inactives par *decommit* (`MADV_DONTNEED`), donc le lot suivant qui les reutilise les fait
+remettre a zero par le noyau avant de les ecraser lui-meme. En *reset* (`MADV_FREE`), le contenu
+reste en place tant que le noyau n'a pas besoin de la memoire.
+
+Cinq repetitions entrelacees, medianes :
+
+| | defaut | `purge_decommits = 0` |
+|---|---|---|
+| PE, mur | 19,22 s | **18,64 s (-3,0 %)** |
+| PE, sys | 4,35 s | 3,80 s |
+| PE, RSS | 1,90 GB | 1,96 GB |
+| SE, mur | 7,40 s | **7,10 s (-4,1 %)** |
+| SE, sys | 1,61 s | 1,07 s |
+| SE, RSS | 1,46 GB | 1,47 GB |
+
+Le defaut est aussi **bimodal** sur cet hote : une course PE sur cinq a passe 8,6 s en systeme.
+Le reglage est applique au demarrage par `mi_option_set`. Il ne change aucun octet (md5
+identique), et `MIMALLOC_PURGE_DECOMMITS` dans l'environnement garde le dernier mot.
+
+Trois leviers voisins ont ete mesures au passage :
+
+- **`MIMALLOC_PURGE_DELAY`** (100, 1000, -1) : pas de gain au-dela du bruit une fois le premier
+  run a froid ecarte. Le premier chiffre (-9 %) etait un artefact d'ordre, retire ;
+- **`MIMALLOC_ALLOW_THP=0`** : +8 % de CPU utilisateur, a rejeter ;
+- **`MIMALLOC_ARENA_EAGER_COMMIT=1`** : equivalent au reset, mais la memoire reste engagee.
+
+### AVX-512 contre AVX2 sur l'extension : egalite, la calibration a raison
+
+La calibration au demarrage choisit AVX2 sur ce Sapphire Rapids. Tracee huit fois, elle mesure
+~172 us pour AVX2 contre ~192 us pour AVX-512 sur son lot de 64 jobs. La sonde
+`x86_extend_ab` (8192 jobs aux formes de production, trois passes) donne une egalite :
+
+| passe | AVX2 | AVX-512 |
+|---|---|---|
+| 1 | 2,78 Gcell/s | 2,70 |
+| 2 | 3,00 | 3,00 |
+| 3 | 2,48 | 2,46 |
+
+Sur le pipeline, `BWA4_EXTEND_TIER=avx512` gagnait 3 fois sur 3 en mur, mais a CPU egal : c'est du
+bruit. Il ne faut rien changer, et cela confirme le 0,99x de la partie B de #44, cette fois sur
+Sapphire Rapids.
+
+### RAM : l'etat, mesure ici
+
+Pic RSS, 500k paires, avec et sans `BWA4_NO_BATCH_OVERLAP=1` :
+
+| `-t` | defaut | sans recouvrement | mur (defaut / sans) |
+|---|---|---|---|
+| 1 | 1,04 GB | 0,92 GB | 69,15 / 70,83 s |
+| 2 | 1,50 GB | 1,17 GB | 36,74 / 36,95 s |
+| 4 | 1,94 GB | 1,52 GB | 18,49 / 18,67 s |
+
+C'est exactement le constat de #25 : le deuxieme lot en vol coute -22 % de RSS a `-t4` pour ~1 %
+de mur, et le choix du defaut reste une decision, pas une mesure. Le reglage allocateur ci-dessus
+ajoute au plus 0,06 GB de pages que le noyau peut reprendre.
+
 ## Ce qui reste
 
 1. **Le chiffre de tete WGS x86 (#32)** : exige toujours une machine dediee, et le fait que les
