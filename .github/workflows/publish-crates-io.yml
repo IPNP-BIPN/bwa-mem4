@@ -97,7 +97,7 @@ jobs:
           }
           # Dependency order, computed once and written down rather than rediscovered: a crate
           # cannot be published before everything it depends on is already on the registry.
-          CRATES="bwa-mem4-core bwa-mem4-index bwa-mem4-extend bwa-mem4-neon bwa-mem4-seed \
+          CRATES="bwa-mem4-core bwa-mem4-index bwa-mem4-extend bwa-mem4-neon bwa-mem4-gpu bwa-mem4-wgpu bwa-mem4-seed \
                   bwa-mem4-chain bwa-mem4-io bwa-mem4-mem bwa-mem4 bwa-mem4-diff"
 
           if [ "$DRY" = "true" ]; then

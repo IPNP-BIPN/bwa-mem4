@@ -15,7 +15,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-bwa-mem4-extend = { path = "../bwa-extend", version = "4.3.1" }
+bwa-mem4-extend = { path = "../bwa-extend", version = "4.4.0" }
 
 [features]
 # Both empty on purpose. The concrete backends live in their own crates and are wired in behind

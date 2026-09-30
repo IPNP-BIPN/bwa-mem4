@@ -32,6 +32,12 @@
 
 use bwa_mem4_extend::{ExtendJob, ExtendResult, ScalarBackend, SwBackendAsync, SyncAsAsync};
 
+pub mod cosched;
+pub use cosched::{
+    clamp_band, CoSched, CpuDevice, DeviceKernel, FlatBatch, FlatJob, GpuService, Scoring,
+    ServiceStats, Split,
+};
+
 /// One batch of [`ExtendJob`]s copied into a single flat allocation, with offsets.
 ///
 /// # Layout
@@ -168,6 +174,8 @@ pub enum GpuRequest {
     Metal,
     /// NVIDIA CUDA (issue #56).
     Cuda,
+    /// Portable WebGPU compute: Vulkan (NVIDIA, AMD, Intel, lavapipe), Metal, DX12. `bwa-wgpu`.
+    Wgpu,
 }
 
 /// Parse `BWA4_GPU`. Unset, empty, `off`, or anything unrecognised gives [`GpuRequest::Off`].
@@ -179,6 +187,7 @@ pub fn requested() -> GpuRequest {
     match std::env::var("BWA4_GPU").ok().as_deref() {
         Some("metal") => GpuRequest::Metal,
         Some("cuda") => GpuRequest::Cuda,
+        Some("wgpu") | Some("vulkan") => GpuRequest::Wgpu,
         _ => GpuRequest::Off,
     }
 }
@@ -236,6 +245,9 @@ pub fn select() -> Selection {
                 Fallback::NotCompiledIn
             }
         }
+        // Constructed by the binary, which links `bwa-wgpu`; this crate cannot see it (it would be a
+        // dependency cycle), so from here the request is always "not honoured by `select`".
+        GpuRequest::Wgpu => Fallback::NotCompiledIn,
     };
     Selection {
         backend: SyncAsAsync::new(ScalarBackend),
@@ -436,6 +448,7 @@ mod tests {
                     Fallback::NotCompiledIn
                 },
             ),
+            (Some("wgpu"), GpuRequest::Wgpu, Fallback::NotCompiledIn),
         ] {
             match val {
                 Some(v) => std::env::set_var("BWA4_GPU", v),

@@ -104,7 +104,6 @@ use bwa_mem::{
     cigar::MemAln, cigar_string, mem_approx_mapq_se, mem_mark_primary_se, mem_pestat, mem_sam_pe,
     mem_sort_dedup_patch, reg2aln, MemAlnReg, PairRescueData, PeStat,
 };
-use bwa_neon::NeonBackend;
 
 use crate::stage_time::{self, Stage};
 
@@ -2267,7 +2266,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_mem::pe::anchor_spread::dump();
         bwa_chain::chain_time::dump();
         bwa_chain::smem_dup::dump();
-        bwa_chain::smem_dup::dump();
+        crate::gpu::dump();
         bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
         // Last, because it is the widest view: the others break down one stage, this one accounts
         // for all of them. Runs on the main thread, where the stage accumulators live.
@@ -2347,6 +2346,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     reader.join().expect("reader thread panicked")?;
     bwa_chain::chain_time::dump();
     bwa_chain::smem_dup::dump();
+    crate::gpu::dump();
     bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
     // Last, because it is the widest view: the others break down one stage, this one accounts for
     // all of them. Runs on the main thread, where the stage accumulators live.
@@ -2400,8 +2400,10 @@ fn batched_regs(
         codes
             .par_chunks(reads_per_chunk)
             .flat_map(|chunk| {
-                crate::stage_time::barrier::worker(|| {
-                    align_reads_batched(fm, bns, opt, chunk, &NeonBackend)
+                crate::stage_time::barrier::worker(|| match crate::gpu::backend() {
+                    crate::gpu::Backend::Cpu(cpu) => align_reads_batched(fm, bns, opt, chunk, cpu),
+                    #[cfg(feature = "gpu")]
+                    crate::gpu::Backend::Shared(cs) => align_reads_batched(fm, bns, opt, chunk, cs),
                 })
             })
             .collect()
