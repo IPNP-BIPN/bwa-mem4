@@ -13,10 +13,15 @@
 #      GPU over 0.0, 0.25, 0.5, 0.75, 1.0 and all five md5s must be equal. If that passes, dynamic
 #      CPU/GPU co-scheduling is safe by construction and never has to be re-proved.
 #
-# Steps 2 and 3 SKIP, loudly, until a GPU backend exists. Step 1 runs today and is a real gate.
+# Steps 2 and 3 SKIP, loudly, when the binary cannot honour the request (built without `--features
+# gpu`, or no usable adapter). Step 1 always runs and is a real gate.
+#
+# On a machine WITHOUT a GPU, `BWA4_GPU_SOFTWARE=1` accepts Mesa's lavapipe, a conforming Vulkan
+# driver that runs on the CPU: slow, but it executes the real shader through the real SPIR-V path,
+# which is how CI runs steps 2 and 3 on every push.
 #
 # Usage: scripts/gpu_parity.sh [backend]
-#   backend: metal | cuda, default taken from BWA4_GPU_BACKEND, else "metal"
+#   backend: wgpu (default, from BWA4_GPU_BACKEND)
 # Environment:
 #   IDX      reference index                (default work/genome.fa)
 #   R1, R2   paired FASTQ                   (default work/r1_500k.fq / work/r2_500k.fq)
@@ -25,7 +30,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BACKEND="${1:-${BWA4_GPU_BACKEND:-metal}}"
+BACKEND="${1:-${BWA4_GPU_BACKEND:-wgpu}}"
 IDX="${IDX:-work/genome.fa}"
 R1="${R1:-work/r1_500k.fq}"
 R2="${R2:-work/r2_500k.fq}"
@@ -36,7 +41,7 @@ BIN=target/release/bwa-mem4
 [ -f "$IDX.ann" ] || { echo "missing index $IDX (set IDX=)" >&2; exit 1; }
 for f in "$R1" "$R2"; do [ -f "$f" ] || { echo "missing reads $f" >&2; exit 1; }; done
 
-cargo build --release --quiet
+cargo build --release --quiet -p bwa-mem4 --features gpu
 
 # md5 of the ALIGNMENT RECORDS only. The @PG header carries the command line, which differs between
 # any two invocations that pass different options, so including it would make every comparison here
@@ -74,14 +79,17 @@ for EXTRA_ARM in "" "-w 5"; do
 done
 echo "  determinism: PASS"
 
-# `version` lists the backends the binary was built with. Until a GPU one appears, the two gates
-# below cannot run, and they say so rather than passing vacuously.
-if ! "$BIN" version 2>&1 | grep -qi "$BACKEND"; then
+# The binary announces on stderr whether it honoured BWA4_GPU. If it did not (no feature, no
+# adapter), the two gates below cannot run, and they say so rather than passing vacuously.
+PROBE=$(BWA4_GPU="$BACKEND" "$BIN" mem -t1 "$IDX" "$R1" 2>&1 >/dev/null | grep '^\[M::gpu\]' | head -1 || true)
+echo "  probe: ${PROBE:-<no GPU line>}"
+if ! printf '%s' "$PROBE" | grep -q 'seed extension shared'; then
   echo
-  echo "[2/3] parity vs $BACKEND: SKIPPED, no $BACKEND backend in this binary"
+  echo "[2/3] parity vs $BACKEND: SKIPPED, the binary did not take the GPU path"
   echo "[3/3] BWA4_GPU_SPLIT sweep:  SKIPPED, same reason"
   echo
-  echo "GPU PARITY GATE: reference md5 $REF (default band) / $REF_W5 (-w 5); determinism only, the GPU arms are not built yet"
+  echo "GPU PARITY GATE: reference md5 $REF (default band) / $REF_W5 (-w 5); determinism only"
+  [ "${REQUIRE_GPU:-0}" = 1 ] && { echo "REQUIRE_GPU=1: failing" >&2; exit 1; }
   exit 0
 fi
 
@@ -98,12 +106,12 @@ done
 echo "  parity: PASS"
 
 echo
-echo "[3/3] split invariance: BWA4_GPU_SPLIT in 0.0 0.25 0.5 0.75 1.0, at both band widths"
+echo "[3/3] split invariance: BWA4_GPU_SPLIT in 0.0 0.25 0.5 0.75 1.0 auto, at both band widths"
 for EXTRA_ARM in "" "-w 5"; do
   EXTRA="$EXTRA_ARM"
   label="${EXTRA_ARM:-default band}"
   want="$REF"; [ -n "$EXTRA_ARM" ] && want="$REF_W5"
-  for sp in 0.0 0.25 0.5 0.75 1.0; do
+  for sp in 0.0 0.25 0.5 0.75 1.0 auto; do
     M=$(body_md5 "BWA4_GPU=$BACKEND" "BWA4_GPU_SPLIT=$sp")
     printf '  [%s] split %-5s %s\n' "$label" "$sp" "$M"
     [ "$want" = "$M" ] || { echo "SPLIT INVARIANCE: FAIL at $sp, $label" >&2; exit 1; }

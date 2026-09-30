@@ -116,6 +116,36 @@ jobs:
       - name: Test (release)
         run: cargo test --workspace --release
 
+  # The GPU backend, on a runner with no GPU. Mesa's lavapipe is a conforming Vulkan driver that
+  # runs on the CPU, so the WGSL kernel is compiled by the real SPIR-V path and executed for real:
+  # the five SwBackend gates, the co-scheduler under concurrent callers, and the end-to-end md5
+  # gate (determinism, GPU on/off parity, BWA4_GPU_SPLIT sweep, at the default band and at -w 5).
+  # Slow per cell and irrelevant for speed; the point is that the kernel is proved on every push,
+  # not on the machine of whoever has a GPU.
+  gpu-lavapipe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lavapipe
+        run: sudo apt-get update -q && sudo apt-get install -y -q mesa-vulkan-drivers libvulkan1
+      - name: Clippy (gpu feature)
+        run: cargo clippy -p bwa-mem4 -p bwa-mem4-wgpu -p bwa-mem4-gpu --all-targets --features bwa-mem4/gpu,bwa-mem4-wgpu/wgpu -- -D warnings
+      - name: Kernel and co-scheduler gates on lavapipe
+        run: cargo test --release -p bwa-mem4-gpu -p bwa-mem4-wgpu --features bwa-mem4-wgpu/wgpu -- --nocapture
+      - name: End-to-end GPU parity gate on lavapipe
+        run: |
+          mkdir -p work
+          python3 scripts/make_test_reads.py testdata/tiny/tiny.fa work/gpu --n 20000
+          IDX=testdata/tiny/tiny.fa R1=work/gpu_1.fq R2=work/gpu_2.fq T=4 \
+            BWA4_GPU_SOFTWARE=1 REQUIRE_GPU=1 bash scripts/gpu_parity.sh wgpu
+
   # WHY THIS EXISTS. Everything above pins 1.96.1, which is correct for a release gate: it is the
   # MSRV, and a matrix that floats would make a red tick mean "someone upstream shipped a lint"
   # rather than "this change is broken". The cost of that pin is a blind spot, and it was not

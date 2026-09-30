@@ -33,6 +33,8 @@ rayon = { workspace = true }
 bgzf = { workspace = true }
 rust-htslib = { workspace = true, optional = true }
 rammap-core = "1.1.2"
+bwa-gpu = { workspace = true, optional = true }
+bwa-wgpu = { workspace = true, optional = true }
 
 [features]
 # Per-stage timing counters in bwa-mem4-mem. Off by default: the wrapper is a barrier the inliner
@@ -113,6 +115,15 @@ fast-gzip = ["bwa-io/fast-gzip"]
 # zlib-rs inflater, which is still on its own thread. See crates/bwa-io/Cargo.toml for the measured
 # decode rates and for why this is a latency lever rather than a throughput one.
 parallel-gzip = ["bwa-io/parallel-gzip"]
+
+# Seed extension on a GPU, through wgpu (Vulkan on Linux: NVIDIA, AMD, Intel; Metal on Apple; DX12
+# on Windows). Off by default: it adds wgpu to the build, and on a machine without a usable GPU it
+# can only fall back. Selected at run time by `BWA4_GPU=wgpu`; work is shared between the GPU and
+# the CPU threads by `BWA4_GPU_SPLIT` (adaptive by default). Byte-identical at every split, by
+# construction and by test (crates/bwa-gpu/src/cosched.rs, crates/bwa-wgpu):
+#
+#     cargo build --release -p bwa-mem4 --features gpu
+gpu = ["dep:bwa-gpu", "dep:bwa-wgpu", "bwa-wgpu/wgpu"]
 
 [lints]
 workspace = true
