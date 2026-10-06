@@ -93,6 +93,9 @@
 //! always means "the vector register holding one of these per lane".
 
 use bwa_extend::{KswAlignResult, SuboptimalTracker};
+use std::sync::OnceLock;
+
+use crate::rescue_prune;
 
 /// One mate-rescue local-SW job: align `query` against `target` (both `0..=4` codes).
 ///
@@ -208,6 +211,13 @@ pub mod cells {
     /// nothing, which is the ceiling on what a sound pre-filter could remove.
     pub static ACCEPTED: AtomicU64 = AtomicU64::new(0);
     pub static SCORED: AtomicU64 = AtomicU64::new(0);
+    /// Exact pruning ([`super::rescue_prune`]): jobs proven below `minsc` and skipped, jobs cut to
+    /// a hull, jobs run in full, and the target rows of the hull jobs before and after the cut.
+    pub static PRUNE_FAIL: AtomicU64 = AtomicU64::new(0);
+    pub static PRUNE_HULL: AtomicU64 = AtomicU64::new(0);
+    pub static PRUNE_FULL: AtomicU64 = AtomicU64::new(0);
+    pub static HULL_ROWS_IN: AtomicU64 = AtomicU64::new(0);
+    pub static HULL_ROWS_KEPT: AtomicU64 = AtomicU64::new(0);
 
     /// Record one rescue DP's outcome. No-op unless `BWA4_MATESW_TIME` is set.
     pub fn count_outcome(accepted: bool) {
@@ -372,6 +382,23 @@ pub mod cells {
             "[matesw] duplicate jobs within a call: {dup} of {jobs} ({:.1}%)",
             100.0 * dup as f64 / jobs.max(1) as f64
         );
+        let (fail, hull, full) = (
+            PRUNE_FAIL.load(Ordering::Relaxed),
+            PRUNE_HULL.load(Ordering::Relaxed),
+            PRUNE_FULL.load(Ordering::Relaxed),
+        );
+        if fail + hull + full > 0 {
+            let (rin, rkept) = (
+                HULL_ROWS_IN.load(Ordering::Relaxed),
+                HULL_ROWS_KEPT.load(Ordering::Relaxed),
+            );
+            eprintln!(
+                "[matesw] prune: {fail} proven failing, {hull} narrowed (rows kept {:.1}%), \
+                 {full} full, of {} filtered",
+                100.0 * rkept as f64 / rin.max(1) as f64,
+                fail + hull + full
+            );
+        }
     }
 }
 
@@ -429,6 +456,54 @@ pub fn batched_ksw_align2(
     e_ins: i32,
     minsc: i32,
     max_sc: i32,
+) -> Vec<KswAlignResult> {
+    batched_align(
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, None,
+    )
+}
+
+/// [`batched_ksw_align2`] for mate rescue, where only alignments scoring `>= minsc` are ever
+/// consumed: windows are first run through the exact K-mer filter of [`rescue_prune`], which skips
+/// the jobs it proves cannot reach `minsc` and narrows the others to the rows that can.
+///
+/// # Returns
+/// One [`KswAlignResult`] per job, in input order. For a job whose `ksw_align2` score is
+/// `>= minsc`, every field is byte-identical to [`bwa_extend::ksw_align2`]'s. For any other job,
+/// `score < minsc` and `qb = tb = -1`, which is all `mem_matesw` reads of it (it accepts a rescue
+/// only when `qb >= 0`, and `qb` is only ever set at `score >= minsc`); the other fields are
+/// unspecified. `BWA4_RESCUE_PRUNE=0` turns the filter off, making this exactly
+/// [`batched_ksw_align2`].
+#[allow(clippy::too_many_arguments)]
+pub fn batched_mate_rescue(
+    jobs: &[KswJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    minsc: i32,
+    max_sc: i32,
+) -> Vec<KswAlignResult> {
+    let prune = prune_params(m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
+    batched_align(
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, prune,
+    )
+}
+
+/// The body of both entry points; `prune` is the pruning bound, `None` for the exact-everywhere path.
+#[allow(clippy::too_many_arguments)]
+fn batched_align(
+    jobs: &[KswJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    minsc: i32,
+    max_sc: i32,
+    prune: Option<rescue_prune::Params>,
 ) -> Vec<KswAlignResult> {
     // `Some(start instant)` only when BWA4_MATESW_TIME is set; `None` disables all accounting so the
     // stock path pays one cached bool load and nothing else.
@@ -495,19 +570,46 @@ pub fn batched_ksw_align2(
     // `Some(start instant)` only when BWA4_MATESW_TIME is set; `None` disables all accounting so the
     // stock path pays one cached bool load and nothing else.
     let timer = probing.then(std::time::Instant::now);
-    // ---- Pass 1: forward over all jobs. Finds the score and where each alignment ENDS. ----
-    // Same sequences as `jobs`, with the pass-specific stop conditions attached: collect `score2`
-    // candidates at `minsc`, and never stop early (`endsc = i32::MAX`) because the forward pass does
-    // not yet know what score to aim for.
-    let fwd_jobs: Vec<FwdJob> = jobs
-        .iter()
-        .map(|j| FwdJob {
+    // ---- Exact pruning (`rescue_prune`): drop the jobs proven to score below `minsc`, and cut the
+    //      others down to the target rows that can hold a row max reaching it. `run_of[k]` is the
+    //      job the k-th forward job came from and `hb_of[k]` the first target row it kept; a job
+    //      not in `run_of` keeps the "nothing found" result below, which `mem_matesw` drops exactly
+    //      as it drops a rescue scoring under `minsc`. ----
+    let mut run_of: Vec<u32> = Vec::with_capacity(jobs.len());
+    let mut hb_of: Vec<u32> = Vec::with_capacity(jobs.len());
+    // ---- Pass 1: forward over the surviving jobs. Finds the score and where each alignment ENDS.
+    // The pass-specific stop conditions: collect `score2` candidates at `minsc`, and never stop
+    // early (`endsc = i32::MAX`) because the forward pass does not yet know what score to aim for.
+    let mut fwd_jobs: Vec<FwdJob> = Vec::with_capacity(jobs.len());
+    for (i, j) in jobs.iter().enumerate() {
+        let decision = prune.map(|p| rescue_prune::decide(j.target, j.query, &p, prune_max_hits()));
+        if probing {
+            use std::sync::atomic::Ordering::Relaxed;
+            match decision {
+                Some(rescue_prune::Decision::Fail) => cells::PRUNE_FAIL.fetch_add(1, Relaxed),
+                Some(rescue_prune::Decision::Hull { hb, he }) => {
+                    cells::HULL_ROWS_IN.fetch_add(j.target.len() as u64, Relaxed);
+                    cells::HULL_ROWS_KEPT.fetch_add((he + 1 - hb) as u64, Relaxed);
+                    cells::PRUNE_HULL.fetch_add(1, Relaxed)
+                }
+                Some(rescue_prune::Decision::Full) => cells::PRUNE_FULL.fetch_add(1, Relaxed),
+                None => 0,
+            };
+        }
+        let (hb, target) = match decision {
+            Some(rescue_prune::Decision::Fail) => continue,
+            Some(rescue_prune::Decision::Hull { hb, he }) => (hb, &j.target[hb..=he]),
+            Some(rescue_prune::Decision::Full) | None => (0, j.target),
+        };
+        run_of.push(i as u32);
+        hb_of.push(hb as u32);
+        fwd_jobs.push(FwdJob {
             query: j.query,
-            target: j.target,
+            target,
             minsc,
             endsc: i32::MAX,
-        })
-        .collect();
+        });
+    }
     // One `(score, te, qe, score2, te2)` per job, in job order.
     //
     // Length-sorted before the kernel sees it. The kernel takes `jobs.chunks(LANES)` in caller
@@ -549,19 +651,34 @@ pub fn batched_ksw_align2(
     };
 
     // The final answers, complete except for the start coordinates: `qb`/`tb` stay at the -1 sentinel
-    // until pass 2 fills them, and stay -1 forever for jobs pass 2 skips or disagrees with.
-    let mut out: Vec<KswAlignResult> = fwd_results
-        .iter()
-        .map(|&(score, te, qe, score2, te2)| KswAlignResult {
+    // until pass 2 fills them, and stay -1 forever for jobs pass 2 skips or disagrees with. Pruned
+    // jobs keep the all-sentinel result of a window where nothing scored, and a hull's rows are
+    // shifted back to the full window, so pass 2 and the caller see full-window coordinates.
+    let mut out: Vec<KswAlignResult> = vec![
+        KswAlignResult {
+            score: 0,
+            qb: -1,
+            qe: -1,
+            tb: -1,
+            te: -1,
+            score2: -1,
+            te2: -1,
+        };
+        jobs.len()
+    ];
+    for (k, &(score, te, qe, score2, te2)) in fwd_results.iter().enumerate() {
+        let hb = hb_of[k] as i32;
+        let shift = |row: i32| if row >= 0 { row + hb } else { row };
+        out[run_of[k] as usize] = KswAlignResult {
             score,
             qb: -1,
             qe,
             tb: -1,
-            te,
+            te: shift(te),
             score2,
-            te2,
-        })
-        .collect();
+            te2: shift(te2),
+        };
+    }
 
     // ---- Pass 2 (KSW_XSTART): reversed prefixes, to recover where each alignment BEGINS. ----
     // Reverse pass (KSW_XSTART): for each qualifying job, align the reversed prefixes ending at
@@ -689,6 +806,57 @@ pub fn batched_ksw_align2(
         );
     }
     out
+}
+
+/// The pruning bound for this batch's scoring, or `None` when pruning is off (`BWA4_RESCUE_PRUNE=0`)
+/// or the lemma does not cover the scoring. The lemma needs every A/C/G/T cell of `mat` to score at
+/// most `max_sc` on the diagonal and at most `-b` off it; `b` is read off the matrix as its weakest
+/// mismatch penalty, so a non-uniform matrix is bounded by its kindest mismatch. N cells do not
+/// matter: a job holding an N is never pruned.
+#[allow(clippy::too_many_arguments)]
+fn prune_params(
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    minsc: i32,
+    max_sc: i32,
+) -> Option<rescue_prune::Params> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_PRUNE").is_none_or(|v| v != "0")) || m < 4
+    {
+        return None;
+    }
+    let mut b = i32::MAX;
+    for t in 0..4 {
+        for q in 0..4 {
+            let v = mat[t * m + q] as i32;
+            if t == q {
+                if v > max_sc {
+                    return None;
+                }
+            } else {
+                b = b.min(-v);
+            }
+        }
+    }
+    rescue_prune::Params::from(max_sc, b, o_del, e_del, o_ins, e_ins, minsc)
+}
+
+/// The hit gate of [`rescue_prune::decide`]: a window sharing more K-mer hits than this with its
+/// mate runs in full, because enumerating them would cost more than the rows the bound could save.
+/// fg-labs/bwa-mem3 measured 400 best for the hull-only path. Changes speed only, never output.
+/// `BWA4_RESCUE_PRUNE_MAX_HITS` overrides it.
+fn prune_max_hits() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BWA4_RESCUE_PRUNE_MAX_HITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400)
+    })
 }
 
 /// Whether the reverse (`KSW_XSTART`) pass truncates its target by the alignment-span bound

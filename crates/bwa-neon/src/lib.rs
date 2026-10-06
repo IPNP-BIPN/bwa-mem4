@@ -126,13 +126,15 @@ pub mod batched;
 /// Mate rescue: the lane-parallel `ksw_align2` equivalent. Public because the paired-end code calls
 /// it directly (there is no `SwBackend` method for whole-read local alignment).
 pub mod matesw;
+/// Exact K-mer pruning of mate-rescue windows, consulted by [`matesw::batched_ksw_align2`].
+mod rescue_prune;
 
 /// Mate-rescue entry points, re-exported at the crate root so `bwa-mem`'s paired-end path can say
 /// `bwa_neon::batched_ksw_align2` without naming the module. [`batched_ksw_align2`] takes a slice of
 /// [`KswJob`] (one unmapped mate against one reference window each) and returns one alignment per
 /// job. Note this kernel opens gaps from `H`, not from `M` like [`batched`]: that asymmetry is
 /// deliberate and mirrors the two different C originals (`ksw_u8` vs `ksw_extend2`).
-pub use matesw::{batched_ksw_align2, KswJob};
+pub use matesw::{batched_ksw_align2, batched_mate_rescue, KswJob};
 
 /// The NEON seed-extension backend. See the module docs: it delegates to the scalar kernel today
 /// and is the drop-in point for the lane-parallel NEON DP (phase 9a).
