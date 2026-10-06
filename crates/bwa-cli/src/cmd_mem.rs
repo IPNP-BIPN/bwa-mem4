@@ -527,26 +527,31 @@ pub struct MemArgs {
 /// second one only when the next byte is punctuation *followed by a digit*
 /// (`if (*p != 0 && ispunct(*p) && isdigit(p[1]))`); anything else leaves the second value unset.
 ///
-/// Used by `-O`, `-E`, `-L` and `-h`. The odd rule is worth reproducing exactly: it means `6,6`,
-/// `6:6`, `6/6` and `6-6` are ALL accepted as pairs (any punctuation separates), while `6,` and
-/// `6x6` silently parse as the single value 6 rather than erroring. A user who typos `-O 6.5`
-/// gets `o_del=6, o_ins=5` from both implementations.
+/// Used by `-O`, `-E`, `-L` and `-h`. The separator rule is kept: `6,6`, `6:6`, `6/6` and `6-6` are
+/// ALL accepted as pairs (any punctuation separates), and a user who types `-O 6.5` gets
+/// `o_del=6, o_ins=5` from both implementations.
+///
+/// What is NOT kept is `strtol`'s silence about the rest of the string. bwa reads `6x6` and `6,` as
+/// the single value 6, and `-O 8,-1` as `-O 8` (the `,-` fails the digit test), so a typo runs to
+/// completion with a penalty the user never asked for. Anything left over after the recognised
+/// number(s) is an error here, as in fg-labs/bwa-mem3 0.12/0.14 (#501, #554). No input bwa accepts
+/// *as intended* is refused, so no valid command line changes output.
 ///
 /// Returns `(first, Some(second))` or `(first, None)`; the caller decides that `None` means "use
 /// `first` for both", which is what the C's `opt->o_del = opt->o_ins = strtol(...)` does up front.
-/// Errors only when no leading integer is present at all.
+/// Errors when no leading integer is present or when anything trails the number(s). Ranges are
+/// the caller's business (see [`validate_scoring`]).
 ///
 /// # Parameters
 ///
 /// - `s`: the raw option argument exactly as the user typed it, straight out of clap (never `None`,
-///   since the caller only reaches here for options that were supplied). Any trailing junk after
-///   the recognised digits is ignored rather than rejected, matching `strtol`.
+///   since the caller only reaches here for options that were supplied).
 ///
 /// # Returns
 ///
 /// `(first, second)` in score units for `-O`/`-E`/`-L` and in hit counts for `-h`; this function
-/// does not know or care which. `Err` only for "no leading integer at all"; overflow of `i32` also
-/// errors, via `parse`.
+/// does not know or care which. `Err` for "no leading integer at all" and for trailing characters;
+/// overflow of `i32` also errors, via `parse`.
 fn parse_int_pair(s: &str) -> anyhow::Result<(i32, Option<i32>)> {
     // Byte view of the argument: the scan is ASCII-only (digits, sign, punctuation), so indexing
     // bytes cannot split a multi-byte char in any string that parses.
@@ -576,15 +581,24 @@ fn parse_int_pair(s: &str) -> anyhow::Result<(i32, Option<i32>)> {
     if pos + 1 < bytes.len() && bytes[pos].is_ascii_punctuation() && bytes[pos + 1].is_ascii_digit()
     {
         // First byte of the second number: one past the separating punctuation, and already known
-        // to be a digit (the guard above tested it), so no sign is accepted here. That asymmetry is
-        // bwa's, not ours: `-O 6,-2` parses as `(6, None)`, the `,-` failing the digit test.
+        // to be a digit (the guard above tested it), so no sign is accepted here. bwa then reads
+        // `-O 6,-2` as `(6, None)`; we reach the trailing check below with `,-2` left and refuse it.
         let second_start = pos + 1;
         // One past the second number's last digit; grows in the loop below.
         let mut second_end = second_start;
         while second_end < bytes.len() && bytes[second_end].is_ascii_digit() {
             second_end += 1;
         }
+        if second_end != bytes.len() {
+            anyhow::bail!(
+                "unexpected '{}' after the integers in '{s}'",
+                &s[second_end..]
+            );
+        }
         return Ok((first, Some(s[second_start..second_end].parse()?)));
+    }
+    if pos != bytes.len() {
+        anyhow::bail!("unexpected '{}' after the integer in '{s}'", &s[pos..]);
     }
     Ok((first, None))
 }
@@ -614,13 +628,15 @@ fn parse_int_pair(s: &str) -> anyhow::Result<(i32, Option<i32>)> {
 ///
 /// - `s`: the raw `-I` argument as typed. One to four numbers, in the fixed order mean, std, max,
 ///   min, separated by any punctuation. Extra numbers past the fourth are parsed and then ignored,
-///   as in the C.
+///   as in the C. Trailing characters that are not a further number are refused (the C ignores
+///   them), and so are a non-positive mean or std: the std divides every pair's insert-size
+///   deviation, so `-I 300,0` would score every pair against an infinite z-score.
 ///
 /// # Returns
 ///
 /// All four orientation slots, of which only `pes[ORIENTATION_FR]` is usable; the other three carry
-/// `failed = true`. Errors when `s` contains no leading number at all, or when a number does not
-/// parse as `f64`.
+/// `failed = true`. Errors when `s` contains no leading number at all, when a number does not
+/// parse as `f64`, on trailing characters, or when the mean or std is not strictly positive.
 fn parse_insert_size(s: &str) -> anyhow::Result<[PeStat; 4]> {
     // ---- Walk successive numbers, using bwa's "punctuation then digit" continuation rule ----
     // The numbers as typed, in order: [0] mean, [1] std, [2] max, [3] min, all in bases. Length
@@ -655,6 +671,13 @@ fn parse_insert_size(s: &str) -> anyhow::Result<[PeStat; 4]> {
     }
     if values.is_empty() {
         anyhow::bail!("-I: expected at least the mean insert size");
+    }
+    if pos != bytes.len() {
+        anyhow::bail!("-I: unexpected '{}' after the numbers in '{s}'", &s[pos..]);
+    }
+    // The scan above only admits digits, '.' and a sign, so no NaN can reach this comparison.
+    if values[0] <= 0.0 || values.get(1).is_some_and(|&std| std <= 0.0) {
+        anyhow::bail!("-I: the mean and standard deviation must be positive, got '{s}'");
     }
 
     // ---- All four orientations start `failed`; only FR is describable through `-I` ----
@@ -854,27 +877,27 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     if let Some(s) = &args.gap_open {
         // `-O`: gap-open magnitudes in score units (default 6,6), deletion then insertion. A second
         // value is optional; absent, the first applies to both.
-        let (open_del, open_ins) = parse_int_pair(s)?;
+        let (open_del, open_ins) = parse_int_pair(s).map_err(|e| anyhow::anyhow!("-O: {e}"))?;
         opt.o_del = open_del;
         opt.o_ins = open_ins.unwrap_or(open_del);
     }
     if let Some(s) = &args.gap_extend {
         // `-E`: gap-extend magnitudes per gap base (default 1,1), so a length-k gap costs o + e*k.
-        let (extend_del, extend_ins) = parse_int_pair(s)?;
+        let (extend_del, extend_ins) = parse_int_pair(s).map_err(|e| anyhow::anyhow!("-E: {e}"))?;
         opt.e_del = extend_del;
         opt.e_ins = extend_ins.unwrap_or(extend_del);
     }
     if let Some(s) = &args.clip_penalty {
         // `-L`: clipping penalties (default 5,5), 5' end then 3'. Steers local vs glocal only; not
         // deducted from the reported AS:i score.
-        let (clip5, clip3) = parse_int_pair(s)?;
+        let (clip5, clip3) = parse_int_pair(s).map_err(|e| anyhow::anyhow!("-L: {e}"))?;
         opt.pen_clip5 = clip5;
         opt.pen_clip3 = clip3.unwrap_or(clip5);
     }
     if let Some(s) = &args.xa_hits {
         // `-h`: XA:Z listing limits in hit counts (default 5,200), primary assembly then ALT. Counts,
         // not scores, so phase 2 never touches them. The ALT limit is currently unreachable, see -j.
-        let (xa_hits, xa_hits_alt) = parse_int_pair(s)?;
+        let (xa_hits, xa_hits_alt) = parse_int_pair(s).map_err(|e| anyhow::anyhow!("-h: {e}"))?;
         opt.max_xa_hits = xa_hits;
         opt.max_xa_hits_alt = xa_hits_alt.unwrap_or(xa_hits);
     }
@@ -1032,7 +1055,51 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     // From the POST-rescale a/b. Doing this earlier would leave the SIMD kernel scoring with
     // pre-rescale values while the gap logic used post-rescale scalars.
     opt.fill_scmat();
+    validate_scoring(&opt)?;
     Ok(opt)
+}
+
+/// Refuse gap and clipping penalties the aligner cannot run with. Checked on the FINAL options,
+/// after presets and `-A` rescaling, so the check sees exactly what the kernels will.
+///
+/// bwa accepts all of these and then either crashes or runs with a meaningless score:
+/// * `-E 0` divides by zero: in `cal_max_gap` in the C (SIGFPE), in the rescue's reverse-span
+///   bound here (a panic, exit 134, found while comparing against fg-labs/bwa-mem3 0.12's #460).
+/// * a negative `-O` makes opening a gap a bonus, which the u8 kernels' saturating arithmetic does
+///   not model, so scalar and SIMD backends could disagree.
+/// * a negative `-L` or `-h` has no meaning (a clipping bonus, a negative hit count).
+///
+/// None of these is reachable from a valid bwa command line, so no output changes.
+fn validate_scoring(opt: &MemOpt) -> anyhow::Result<()> {
+    if opt.o_del < 0 || opt.o_ins < 0 {
+        anyhow::bail!(
+            "-O: gap open penalties must be >= 0, got {},{}",
+            opt.o_del,
+            opt.o_ins
+        );
+    }
+    if opt.e_del < 1 || opt.e_ins < 1 {
+        anyhow::bail!(
+            "-E: gap extension penalties must be >= 1, got {},{}",
+            opt.e_del,
+            opt.e_ins
+        );
+    }
+    if opt.pen_clip5 < 0 || opt.pen_clip3 < 0 {
+        anyhow::bail!(
+            "-L: clipping penalties must be >= 0, got {},{}",
+            opt.pen_clip5,
+            opt.pen_clip3
+        );
+    }
+    if opt.max_xa_hits < 0 || opt.max_xa_hits_alt < 0 {
+        anyhow::bail!(
+            "-h: XA hit limits must be >= 0, got {},{}",
+            opt.max_xa_hits,
+            opt.max_xa_hits_alt
+        );
+    }
+    Ok(())
 }
 
 /// The SAM output sink: plain (stdout or an uncompressed file), parallel BGZF (block-gzip), or a
@@ -3284,6 +3351,50 @@ struct PrepPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The separator rule is bwa's; the trailing-character refusal is ours (see [`parse_int_pair`]).
+    #[test]
+    fn int_pair_keeps_bwa_separators_and_refuses_trailing_junk() {
+        assert_eq!(parse_int_pair("6").unwrap(), (6, None));
+        assert_eq!(parse_int_pair("6,7").unwrap(), (6, Some(7)));
+        assert_eq!(parse_int_pair("6:7").unwrap(), (6, Some(7)));
+        assert_eq!(parse_int_pair("6.5").unwrap(), (6, Some(5)));
+        assert_eq!(parse_int_pair("-3").unwrap(), (-3, None));
+        for bad in ["", "x", "6x", "6,", "6x6", "8,-1", "6,7x", "6,7,8"] {
+            assert!(parse_int_pair(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn insert_size_refuses_zero_std_and_trailing_junk() {
+        let pes = parse_insert_size("300,30,500,100").unwrap();
+        assert_eq!(pes[ORIENTATION_FR].avg, 300.0);
+        assert_eq!(pes[ORIENTATION_FR].high, 500);
+        assert!(parse_insert_size("300.5").is_ok());
+        for bad in ["300,0", "0", "-300", "300,-1", "300x", "300,30,"] {
+            assert!(parse_insert_size(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    /// `-E 0` used to reach a division by zero in the rescue; `-O`/`-L`/`-h` below zero are
+    /// meaningless. All four are refused once presets and `-A` rescaling are applied.
+    #[test]
+    fn scoring_validation_refuses_unrunnable_penalties() {
+        let base = MemOpt::default();
+        assert!(validate_scoring(&base).is_ok());
+        let mut o = base.clone();
+        o.e_ins = 0;
+        assert!(validate_scoring(&o).is_err());
+        let mut o = base.clone();
+        o.o_del = -1;
+        assert!(validate_scoring(&o).is_err());
+        let mut o = base.clone();
+        o.pen_clip3 = -1;
+        assert!(validate_scoring(&o).is_err());
+        let mut o = base;
+        o.max_xa_hits = -1;
+        assert!(validate_scoring(&o).is_err());
+    }
 
     /// The queue depths are a memory decision that is invisible in the output, so nothing else
     /// would catch a regression here. What is pinned is that the default is double buffering and
