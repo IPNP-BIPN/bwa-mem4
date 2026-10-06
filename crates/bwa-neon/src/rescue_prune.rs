@@ -154,14 +154,21 @@ struct Scratch {
     nxt: Vec<i16>,
     /// Codes set by the cached query, so a new query clears only those.
     touched: Vec<u32>,
-    /// The query the tables describe, and its K.
+    /// The query the tables describe, its K, and whether it holds an N.
     qcache: Vec<u8>,
     qk: usize,
-    /// Per diagonal: hit count, first row of its first hit, Kadane sums ending / starting there.
+    q_has_n: bool,
+    /// Per diagonal: hit count, and first row of its first hit (valid where `cnt != 0`).
     cnt: Vec<u16>,
     minrow: Vec<i32>,
-    fwd: Vec<i32>,
-    bwd: Vec<i32>,
+    /// The current window's K-mer codes ([`window_codes`]).
+    codes: Vec<u16>,
+    /// One bit per diagonal holding a hit, and those diagonals in ascending order.
+    occ_bits: Vec<u64>,
+    occ: Vec<u32>,
+    /// Kadane sums ending at (`fo`) and starting at (`bo`) each diagonal of `occ`, index-parallel.
+    fo: Vec<i32>,
+    bo: Vec<i32>,
 }
 
 impl Scratch {
@@ -173,18 +180,27 @@ impl Scratch {
             touched: Vec::with_capacity(QCAP),
             qcache: Vec::with_capacity(QCAP),
             qk: 0,
+            q_has_n: false,
             cnt: Vec::new(),
             minrow: Vec::new(),
-            fwd: Vec::new(),
-            bwd: Vec::new(),
+            codes: Vec::new(),
+            occ_bits: Vec::new(),
+            occ: Vec::new(),
+            fo: Vec::new(),
+            bo: Vec::new(),
         }
     }
 
-    /// Index the query's K-mers, unless the tables already describe this query at this K.
+    /// Index the query's K-mers, unless the tables already describe this query at this K. A query
+    /// holding an N is only flagged: the caller returns `Full` for it.
     fn load_query(&mut self, q: &[u8], k: usize) {
         if self.qk == k && self.qcache == q {
             return;
         }
+        self.qcache.clear();
+        self.qcache.extend_from_slice(q);
+        self.qk = k;
+        self.q_has_n = q.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0;
         let ncode = 1usize << (2 * k);
         if self.head.len() < ncode {
             self.head = vec![-1; ncode];
@@ -196,6 +212,9 @@ impl Scratch {
             }
         }
         self.touched.clear();
+        if self.q_has_n {
+            return;
+        }
         let mask = (ncode - 1) as u32;
         let mut code = 0u32;
         for &b in &q[..k - 1] {
@@ -211,9 +230,6 @@ impl Scratch {
             self.head[c] = j as i16;
             self.qcnt[c] += 1;
         }
-        self.qcache.clear();
-        self.qcache.extend_from_slice(q);
-        self.qk = k;
     }
 }
 
@@ -234,35 +250,70 @@ pub(crate) fn decide(t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Decisio
     if len1 < k || len2 < k || len1 > WCAP || len2 > QCAP {
         return Decision::Full;
     }
-    if t.iter().chain(q).fold(0u8, |acc, &b| acc | b) & !3 != 0 {
-        return Decision::Full;
-    }
-    SCRATCH.with(|s| decide_in(&mut s.borrow_mut(), t, q, p, max_hits))
+    SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
+        match count_hits(s, t, q, p, max_hits) {
+            Some(nd) => sparse_decision(s, p, len1, nd),
+            None => Decision::Full,
+        }
+    })
 }
 
-fn decide_in(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Decision {
+/// The hit gate, then the per-diagonal hit counts. Returns the number of diagonal slots, or
+/// `None` when the job is not filtered (an N in either sequence, or more hits than `max_hits`).
+/// A job proven to fail by the hit total alone comes back with no diagonal occupied.
+fn count_hits(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Option<usize> {
     let (len1, len2, k) = (t.len(), q.len(), p.k);
     s.load_query(q, k);
-    let mask = ((1u64 << (2 * k)) - 1) as u32;
-    let mut code0 = 0u32;
-    for &b in &t[..k - 1] {
-        code0 = (code0 << 2) | b as u32;
+    if s.q_has_n {
+        return None;
     }
+    // ---- The window's K-mer codes, once, for the gate and the enumeration. Each code is built
+    //      from its own K bytes rather than rolled from the previous one, so the loop carries no
+    //      dependency and vectorises; `& 3` keeps an N's code in range, and an N sends the job to
+    //      `Full` anyway ----
+    if t.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0 {
+        return None;
+    }
+    let mut codes = std::mem::take(&mut s.codes);
+    match k {
+        5 => window_codes::<5>(t, &mut codes),
+        6 => window_codes::<6>(t, &mut codes),
+        7 => window_codes::<7>(t, &mut codes),
+        _ => window_codes::<8>(t, &mut codes),
+    }
+    let verdict = count_hits_from(s, &codes, len1, len2, p, max_hits);
+    s.codes = codes;
+    verdict
+}
 
+/// `out[i]` = the 2-bit code of `t[i..i + K]`, for every K-mer of `t`.
+fn window_codes<const K: usize>(t: &[u8], out: &mut Vec<u16>) {
+    out.clear();
+    out.extend(t.windows(K).map(|w| {
+        let mut c = 0u16;
+        for &b in w {
+            c = (c << 2) | (b & 3) as u16;
+        }
+        c
+    }));
+}
+
+/// [`count_hits`] past the N test, on the window's K-mer codes (`codes[i]` ends at row
+/// `i + K - 1`).
+fn count_hits_from(
+    s: &mut Scratch,
+    codes: &[u16],
+    len1: usize,
+    len2: usize,
+    p: &Params,
+    max_hits: usize,
+) -> Option<usize> {
+    let k = p.k;
     // ---- Hit gate, from per-code counts, without enumerating the hits ----
-    let mut code = code0;
-    let mut nhits = 0usize;
-    for &b in &t[k - 1..] {
-        code = ((code << 2) | b as u32) & mask;
-        nhits += s.qcnt[code as usize] as usize;
-    }
+    let nhits: usize = codes.iter().map(|&c| s.qcnt[c as usize] as usize).sum();
     if nhits > max_hits {
-        return Decision::Full;
-    }
-    // Early fail: every interval is non-empty and sums `a * cnt - c` over its diagonals, so no
-    // interval can beat `base + a * nhits - c`.
-    if p.base() + p.a * nhits as i32 - p.c < p.minsc {
-        return Decision::Fail;
+        return None;
     }
 
     // ---- Per-diagonal hit counts. Diagonal `d = i - j` is stored at `d + off`, with `off` the
@@ -272,11 +323,15 @@ fn decide_in(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) -
     s.cnt.clear();
     s.cnt.resize(nd, 0);
     s.minrow.resize(nd, 0);
-    s.fwd.resize(nd, 0);
-    s.bwd.resize(nd, 0);
-    code = code0;
-    for i in k - 1..len1 {
-        code = ((code << 2) | t[i] as u32) & mask;
+    s.occ_bits.clear();
+    s.occ_bits.resize(nd.div_ceil(64), 0);
+    // Early fail: every interval is non-empty and sums `a * cnt - c` over its diagonals, so no
+    // interval can beat `base + a * nhits - c`. Leaving every diagonal empty says exactly that.
+    if p.base() + p.a * nhits as i32 - p.c < p.minsc {
+        return Some(nd);
+    }
+    for (r, &code) in codes.iter().enumerate() {
+        let i = r + k - 1;
         let mut j = s.head[code as usize];
         while j >= 0 {
             let d = i + off - j as usize;
@@ -284,62 +339,121 @@ fn decide_in(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) -
                 // Rows ascend, so the first hit seen on a diagonal is its earliest; its K-mer
                 // starts K - 1 rows above the row where it ends.
                 s.minrow[d] = (i + 1 - k) as i32;
+                s.occ_bits[d / 64] |= 1 << (d % 64);
             }
             s.cnt[d] += 1;
             j = s.nxt[j as usize];
         }
     }
+    Some(nd)
+}
 
-    // ---- Kadane: best interval sums ending at (fwd) and starting at (bwd) each diagonal ----
-    let base = p.base();
-    let mut best = -p.c;
-    let mut f = 0i32;
-    for d in 0..nd {
-        f = p.weight(s.cnt[d]) + f.max(0);
-        s.fwd[d] = f;
-        best = best.max(f);
+/// The decision from the per-diagonal counts, walking only the diagonals that hold a hit.
+///
+/// The bound is a Kadane scan over all `nd` diagonals with weight `a * cnt - c`, but between two
+/// occupied diagonals every weight is `-c`, so the scan across a gap has a closed form, and so
+/// does the bound on each empty diagonal of the gap. Three facts make the occupied diagonals
+/// enough, each checked against the dense scan ([`tests::dense_decision`]):
+///
+/// * a component's best bound is reached on an occupied diagonal: the best interval through an
+///   empty diagonal holds an occupied one (an all-empty interval is worth `base - c * len`, below
+///   any valid `minsc`), and that interval lies inside the component, so the occupied diagonal's
+///   bound is at least as high;
+/// * a component without a hit contributes nothing (the dense scan skips it too);
+/// * two consecutive occupied diagonals share a component exactly when every empty diagonal
+///   between them reaches `minsc`, and the bound across a gap is convex, so its minimum is at an
+///   end or next to a breakpoint ([`gap_min`]).
+fn sparse_decision(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decision {
+    let (base, c, minsc) = (p.base(), p.c, p.minsc);
+    s.occ.clear();
+    for (w, &bits) in s.occ_bits.iter().enumerate() {
+        let mut bits = bits;
+        while bits != 0 {
+            s.occ.push((w * 64) as u32 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
     }
-    if base + best < p.minsc {
+    let n = s.occ.len();
+    if n == 0 {
+        // Only hit-free intervals, worth at most `base - c = (K-1)a < minsc`.
         return Decision::Fail;
     }
-    let mut b = 0i32;
-    for d in (0..nd).rev() {
-        b = p.weight(s.cnt[d]) + b.max(0);
-        s.bwd[d] = b;
+    debug_assert!((*s.occ.last().unwrap() as usize) < nd);
+    // ---- Forward Kadane over the occupied diagonals. After `g` empty diagonals a positive sum
+    //      `x` has decayed to `max(x - g c, 0)` before it is carried ----
+    s.fo.clear();
+    s.fo.reserve(n);
+    let mut best = i32::MIN;
+    let (mut prev_d, mut prev_f) = (0u32, 0i32);
+    for (idx, &d) in s.occ.iter().enumerate() {
+        let carry = if idx == 0 {
+            0
+        } else {
+            let gap = (d - prev_d - 1) as i32;
+            (prev_f.max(0) - gap * c).max(0)
+        };
+        let f = p.weight(s.cnt[d as usize]) + carry;
+        s.fo.push(f);
+        best = best.max(f);
+        (prev_d, prev_f) = (d, f);
+    }
+    if base + best < minsc {
+        return Decision::Fail;
+    }
+    // ---- Backward Kadane, the mirror image ----
+    s.bo.clear();
+    s.bo.resize(n, 0);
+    let (mut next_d, mut next_b) = (0u32, 0i32);
+    for idx in (0..n).rev() {
+        let d = s.occ[idx];
+        let carry = if idx == n - 1 {
+            0
+        } else {
+            let gap = (next_d - d - 1) as i32;
+            (next_b.max(0) - gap * c).max(0)
+        };
+        let b = p.weight(s.cnt[d as usize]) + carry;
+        s.bo[idx] = b;
+        (next_d, next_b) = (d, b);
     }
 
-    // ---- Components: maximal runs of diagonals whose best interval through them reaches
-    //      `minsc`. The hull spans from the earliest hit row of any component to the last row its
-    //      last hit diagonal can reach, through the pad columns and a deletion tail ----
-    // `bound(d)`: the best interval bound over intervals containing diagonal `d`.
-    let bound = |s: &Scratch, d: usize| base + s.fwd[d] + s.bwd[d] - p.weight(s.cnt[d]);
+    // ---- Components, as in the dense scan: runs of diagonals whose bound reaches `minsc` ----
     let (mut lo, mut hi) = (len1 as i64, -1i64);
-    let mut d = 0;
-    while d < nd {
-        if bound(s, d) < p.minsc {
-            d += 1;
-            continue;
-        }
-        let (mut ub, mut i0, mut dmax) = (0i32, len1 as i64, -1i64);
-        while d < nd {
-            let bnd = bound(s, d);
-            if bnd < p.minsc {
-                break;
-            }
-            ub = ub.max(bnd);
-            if s.cnt[d] != 0 {
-                i0 = i0.min(s.minrow[d] as i64);
-                dmax = d as i64;
-            }
-            d += 1;
-        }
-        if dmax < 0 {
-            continue;
-        }
-        lo = lo.min(i0);
+    // The open component: its best bound, earliest hit row and last hit diagonal.
+    let mut open: Option<(i32, i64, i64)> = None;
+    let close = |comp: (i32, i64, i64), lo: &mut i64, hi: &mut i64| {
+        let (ub, i0, dmax) = comp;
+        *lo = (*lo).min(i0);
         // The last hit diagonal `dmax - off` reaches row `(dmax - off) + (off - 1)` at the last pad
         // column (`off` is the padded query length), then `tail` more rows through a deletion.
-        hi = hi.max(dmax - 1 + p.tail(ub) as i64);
+        *hi = (*hi).max(dmax - 1 + p.tail(ub) as i64);
+    };
+    for idx in 0..n {
+        let d = s.occ[idx];
+        let bnd = base + s.fo[idx] + s.bo[idx] - p.weight(s.cnt[d as usize]);
+        if bnd < minsc {
+            if let Some(comp) = open.take() {
+                close(comp, &mut lo, &mut hi);
+            }
+            continue;
+        }
+        let (row, dd) = (s.minrow[d as usize] as i64, d as i64);
+        open = match open {
+            Some((ub, i0, _))
+                if gap_min(p, s.fo[idx - 1], s.bo[idx], d - s.occ[idx - 1] - 1) >= minsc =>
+            {
+                Some((ub.max(bnd), i0.min(row), dd))
+            }
+            prev => {
+                if let Some(comp) = prev {
+                    close(comp, &mut lo, &mut hi);
+                }
+                Some((bnd, row, dd))
+            }
+        };
+    }
+    if let Some(comp) = open {
+        close(comp, &mut lo, &mut hi);
     }
     if hi < 0 {
         return Decision::Fail;
@@ -348,6 +462,32 @@ fn decide_in(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) -
         hb: lo.max(0) as usize,
         he: hi.min(len1 as i64 - 1) as usize,
     }
+}
+
+/// The smallest interval bound on the `gap` empty diagonals between two occupied ones, the left
+/// with forward sum `f_left`, the right with backward sum `b_right`; `i32::MAX` for no gap.
+///
+/// On the k-th empty diagonal (`1 <= k <= gap`) the forward sum is `max(p - (k-1)c, 0) - c` with
+/// `p = max(f_left, 0)`, the backward sum `max(q - (gap-k)c, 0) - c` with `q = max(b_right, 0)`,
+/// and the weight `-c`, so the bound is `base - c + max(p - (k-1)c, 0) + max(q - (gap-k)c, 0)`:
+/// a convex function of k, whose integer minimum sits at an end of `[1, gap]` or on either side of
+/// one of its two breakpoints.
+fn gap_min(p: &Params, f_left: i32, b_right: i32, gap: u32) -> i32 {
+    if gap == 0 {
+        return i32::MAX;
+    }
+    let (c, g) = (p.c, gap as i32);
+    let (pl, qr) = (f_left.max(0), b_right.max(0));
+    let at = |k: i32| {
+        let k = k.clamp(1, g);
+        p.base() - c + (pl - (k - 1) * c).max(0) + (qr - (g - k) * c).max(0)
+    };
+    let (k1, k2) = (1 + pl / c, g - qr / c);
+    [1, g, k1, k1 + 1, k2, k2 - 1]
+        .into_iter()
+        .map(at)
+        .min()
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -371,6 +511,108 @@ mod tests {
         m
     }
 
+    /// The dense Kadane scan over every diagonal, the specification [`sparse_decision`] must
+    /// reproduce: the fork's scalar filter, transcribed.
+    pub(super) fn dense_decision(s: &Scratch, p: &Params, len1: usize, nd: usize) -> Decision {
+        let base = p.base();
+        let (mut fwd, mut bwd) = (vec![0i32; nd], vec![0i32; nd]);
+        let (mut best, mut f) = (-p.c, 0i32);
+        for d in 0..nd {
+            f = p.weight(s.cnt[d]) + f.max(0);
+            fwd[d] = f;
+            best = best.max(f);
+        }
+        if base + best < p.minsc {
+            return Decision::Fail;
+        }
+        let mut b = 0i32;
+        for d in (0..nd).rev() {
+            b = p.weight(s.cnt[d]) + b.max(0);
+            bwd[d] = b;
+        }
+        let bound = |d: usize| base + fwd[d] + bwd[d] - p.weight(s.cnt[d]);
+        let (mut lo, mut hi) = (len1 as i64, -1i64);
+        let mut d = 0;
+        while d < nd {
+            if bound(d) < p.minsc {
+                d += 1;
+                continue;
+            }
+            let (mut ub, mut i0, mut dmax) = (0i32, len1 as i64, -1i64);
+            while d < nd && bound(d) >= p.minsc {
+                ub = ub.max(bound(d));
+                if s.cnt[d] != 0 {
+                    i0 = i0.min(s.minrow[d] as i64);
+                    dmax = d as i64;
+                }
+                d += 1;
+            }
+            if dmax >= 0 {
+                lo = lo.min(i0);
+                hi = hi.max(dmax - 1 + p.tail(ub) as i64);
+            }
+        }
+        if hi < 0 {
+            return Decision::Fail;
+        }
+        Decision::Hull {
+            hb: lo.max(0) as usize,
+            he: hi.min(len1 as i64 - 1) as usize,
+        }
+    }
+
+    /// Sparse and dense scans agree on every job, including clustered, repetitive and hit-dense
+    /// windows and every scoring of the other tests.
+    #[test]
+    fn sparse_scan_equals_dense_scan() {
+        let mut state = 0x5555_0123_dead_beefu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let params: Vec<Params> = [
+            (1, 4, 6, 1, 6, 1, 19),
+            (1, 4, 6, 1, 6, 1, 7),
+            (1, 6, 6, 1, 6, 1, 19),
+            (1, 4, 8, 2, 8, 2, 30),
+            (2, 8, 12, 2, 12, 2, 38),
+            (1, 5, 5, 3, 7, 1, 12),
+        ]
+        .iter()
+        .filter_map(|&(a, b, o, e, oi, ei, m)| Params::from(a, b, o, e, oi, ei, m))
+        .collect();
+        let mut s = Scratch::new();
+        let (mut hulls, mut fails) = (0, 0);
+        for iter in 0..20000 {
+            let qlen = 10 + next() % 200;
+            let tlen = qlen + next() % 1500;
+            let alpha = [4, 4, 4, 2, 3][next() % 5];
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % alpha) as u8).collect();
+            let q: Vec<u8> = (0..qlen).map(|_| (next() % alpha) as u8).collect();
+            for _ in 0..next() % 4 {
+                let l = (5 + next() % 60).min(qlen);
+                let (qs, at) = (next() % (qlen - l + 1), next() % (tlen - l + 1));
+                t[at..at + l].copy_from_slice(&q[qs..qs + l]);
+                for _ in 0..next() % 3 {
+                    t[at + next() % l] = (next() % 4) as u8;
+                }
+            }
+            let p = &params[iter % params.len()];
+            if let Some(nd) = count_hits(&mut s, &t, &q, p, usize::MAX) {
+                let want = dense_decision(&s, p, tlen, nd);
+                assert_eq!(sparse_decision(&mut s, p, tlen, nd), want, "iter {iter}");
+                match want {
+                    Decision::Hull { .. } => hulls += 1,
+                    Decision::Fail => fails += 1,
+                    Decision::Full => {}
+                }
+            }
+        }
+        assert!(hulls > 2000 && fails > 2000, "hulls {hulls}, fails {fails}");
+    }
+
     #[test]
     fn params_match_the_lemma_at_known_scorings() {
         let p = Params::from(1, 4, 6, 1, 6, 1, 19).unwrap();
@@ -386,7 +628,7 @@ mod tests {
     /// Generated rescue-shaped jobs, many of them near the threshold: every `Fail` must be a job
     /// whose real score is below `minsc`, and every `Hull` must reproduce `score`, `qe`, `score2`
     /// and the shifted `te`/`te2` of the full window, at several scorings and thresholds.
-    /// The whole rescue entry point on one mixed batch: wherever `ksw_align2` scores `>= minsc`,
+    /// The whole pruned rescue path on one mixed batch: wherever `ksw_align2` scores `>= minsc`,
     /// every field matches; everywhere else the job is rejected the way `mem_matesw` rejects it.
     #[test]
     fn batched_mate_rescue_keeps_every_consumed_field() {
@@ -425,7 +667,10 @@ mod tests {
             .collect();
         for &(a, b, o, e, minsc) in &[(1i8, 4i8, 6, 1, 19), (1, 6, 6, 1, 19), (2, 8, 12, 2, 38)] {
             let mat = scmat(a, b);
-            let got = crate::batched_mate_rescue(&jobs, 5, &mat, o, e, o, e, minsc, a as i32);
+            // The pruned path itself, whatever `BWA4_RESCUE_PRUNE` says.
+            let p = Params::from(a as i32, b as i32, o, e, o, e, minsc);
+            assert!(p.is_some());
+            let got = crate::matesw::batched_align(&jobs, 5, &mat, o, e, o, e, minsc, a as i32, p);
             for (i, j) in jobs.iter().enumerate() {
                 let lanes = if (j.query.len() as i32) * (a as i32) < 250 {
                     16

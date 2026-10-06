@@ -101,6 +101,56 @@ pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
 (upstream `bwa-mem2#297`, ouvert depuis ce projet).
 
+## Ce que fg-labs/bwa-mem3 a publie de v0.10.0 a v0.14.0, et ce qu'on en a pris (2026-10-07)
+
+La derniere comparaison au fork datait de v0.9.0. Cinq releases plus tard, tri fait PR par PR.
+
+**Corrections de bugs : presque rien ne nous concerne.** Leurs bugs de sortie viennent de leurs
+propres raccourcis (echelle de relance a un barreau #543, arret precoce de l'echelle #540, chemin
+rapide sans gap #544, enveloppe 8 bits w=124 #422, derive du z-drop 16 bits #471) ou de la surete
+memoire du C. Classes rejouees contre bwa-mem2 2.3 sur `testdata/tiny`, 3 jeux (150, 250, 400 pb,
+mutations, indels, 10 % de mates aleatoires) x 13 jeux de parametres (defaut, `-w 0/1/150/300`,
+`-L 0`, `-O 25`, `-O 20 -E 3`, `-d 5`, `-d 20 -E 4`, `-B 6`, `-O 8 -E 2`, `-A 2`) : **39/39
+octet-identiques**.
+
+**Pris : la validation de la CLI** (leurs #460, #501, #554). `-E 0` faisait paniquer le rescue (division
+par zero dans `rev_span_bound`, exit 134 ; bwa fait un SIGFPE au meme endroit). `-O 8,-1` tournait
+silencieusement en `-O 8`, `-O 6x` en `-O 6`, `-I 300,0` divisait chaque z-score par zero. Tout cela
+est maintenant refuse ; aucune ligne de commande valide ne change de sortie.
+
+**Pris, en opt-in : l'elagage exact du mate rescue** (leurs #533, #541). Un filtre sur les K-mers
+communs au mate et a la fenetre prouve qu'un job ne peut pas atteindre `min_seed_len * a` (on ne le
+lance pas) ou borne les lignes de la fenetre qui peuvent porter un maximum de ligne au-dessus (on ne
+calcule qu'elles). Port Rust du filtre scalaire, Kadane creux sur les seules diagonales occupees
+(egal au balayage dense sur 20 000 jobs generes), decisions verifiees contre `ksw_align2` (6 000
+jobs, 5 scorings, 4 mutations deliberees de la borne toutes detectees). Sortie octet-identique a
+bwa-mem2 sur hg38 chr20 : 500 k paires wgsim, 300 k paires a 2 % d'erreur, 200 k paires avec 15 % de
+mates aleatoires.
+
+Mais **il ne paie pas encore**, d'ou `BWA4_RESCUE_PRUNE=1` pour l'activer. A `-t1` sur M4 Max, 200 k
+paires chr20 :
+
+| jeu | jobs prouves en echec | temps user, filtre / sans | ecart |
+|---|---|---|---|
+| wgsim propre | 1,3 % | 20,05 / 19,82 s | **+1,2 %** |
+| 15 % de mates aleatoires | 20 % | 18,44 / 18,67 s | **-1,2 %** |
+
+Le filtre coute 0,7 us par job pour le seul comptage des hits, puis ~3 us par job filtre, contre
+~13 us de DP de rescue par job a 8 Gcell/s : il faut qu'environ 15 % du DP soit elaguable pour
+rentrer dans ses frais. Les fenetres simulees contiennent presque toujours le vrai mate, et la coque
+d'un job qui reussit garde ~91 % des lignes (la queue de deletion autorisee croit avec le score). Le
+fork, lui, mesure 15 % de jobs elagues en WGS reel et 33 % en WES, et rentabilise avec un filtre NEON
+/ SSE ~4x plus rapide et un DP en bandes sur les composantes (#535) ; il note lui-meme que son filtre
+scalaire « coute plus qu'il ne rapporte » face aux noyaux x86.
+
+**Reste a faire, dans l'ordre** : (1) mesurer `BWA4_RESCUE_PRUNE=1` sur les vraies lectures GIAB, ou
+la part de rescues voues a l'echec est la vraie inconnue ; (2) si c'est prometteur, filtre SIMD
+(presence bitmap + Kadane vectorise, cf. `rescue_prune_neon.h`) ; (3) DP en bandes sur les
+composantes. Non pris, faute de mesure : allocateur sans purge (#523, `MIMALLOC_PURGE_DELAY`), SA
+echantillonne tous les 2 rangs (#510, notre `SA_SAMPLE_STRIDE = 8`), chainage par marche run-length
+(#531). Deja chez nous : saut des graines contenues, dedup des jobs DP, cellule de rescue USQADD et
+deux lignes par passe, encodage SEQ/QUAL par blocs, BGZF parallele.
+
 ## hyalite 0.3.0 : nos deux corrections sont remontees en amont (2026-08-09)
 
 Mise a jour de la section ci-dessous. Le pin de developpement passe de `0.2` a **`0.3.0`**, et

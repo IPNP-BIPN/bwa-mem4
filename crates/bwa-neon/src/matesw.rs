@@ -218,6 +218,8 @@ pub mod cells {
     pub static PRUNE_FULL: AtomicU64 = AtomicU64::new(0);
     pub static HULL_ROWS_IN: AtomicU64 = AtomicU64::new(0);
     pub static HULL_ROWS_KEPT: AtomicU64 = AtomicU64::new(0);
+    /// Summed time inside the filter's decisions, all threads, in nanoseconds.
+    pub static PRUNE_NS: AtomicU64 = AtomicU64::new(0);
 
     /// Record one rescue DP's outcome. No-op unless `BWA4_MATESW_TIME` is set.
     pub fn count_outcome(accepted: bool) {
@@ -393,10 +395,12 @@ pub mod cells {
                 HULL_ROWS_KEPT.load(Ordering::Relaxed),
             );
             eprintln!(
-                "[matesw] prune: {fail} proven failing, {hull} narrowed (rows kept {:.1}%), \
-                 {full} full, of {} filtered",
+                "[matesw] prune: {fail} proven failing, {hull} narrowed (rows kept {:.1}%), {full} full, \
+                 of {} filtered, in {:.2}s CPU ({:.2} us/job)",
                 100.0 * rkept as f64 / rin.max(1) as f64,
-                fail + hull + full
+                fail + hull + full,
+                PRUNE_NS.load(Ordering::Relaxed) as f64 / 1e9,
+                PRUNE_NS.load(Ordering::Relaxed) as f64 / 1e3 / (fail + hull + full).max(1) as f64
             );
         }
     }
@@ -471,8 +475,15 @@ pub fn batched_ksw_align2(
 /// `>= minsc`, every field is byte-identical to [`bwa_extend::ksw_align2`]'s. For any other job,
 /// `score < minsc` and `qb = tb = -1`, which is all `mem_matesw` reads of it (it accepts a rescue
 /// only when `qb >= 0`, and `qb` is only ever set at `score >= minsc`); the other fields are
-/// unspecified. `BWA4_RESCUE_PRUNE=0` turns the filter off, making this exactly
-/// [`batched_ksw_align2`].
+/// unspecified.
+///
+/// The filter is OFF by default (`BWA4_RESCUE_PRUNE=1` turns it on), which makes this exactly
+/// [`batched_ksw_align2`]. Measured on hg38 chr20 with 200 k wgsim pairs at `-t1` (M4 Max), the
+/// scalar filter costs 0.7 us per job to gate and about 3 us more per job it filters, against a
+/// ~13 us rescue DP, so it pays only when many windows are prunable: user time -1.2 % with 15 %
+/// of mates replaced by random sequence, +1.2 % on clean simulated pairs (hit gate 200). The fork
+/// makes it pay with a SIMD filter and banded DP over the hull; until that exists, or a
+/// measurement on real reads says otherwise, it stays opt-in.
 #[allow(clippy::too_many_arguments)]
 pub fn batched_mate_rescue(
     jobs: &[KswJob],
@@ -493,7 +504,7 @@ pub fn batched_mate_rescue(
 
 /// The body of both entry points; `prune` is the pruning bound, `None` for the exact-everywhere path.
 #[allow(clippy::too_many_arguments)]
-fn batched_align(
+pub(crate) fn batched_align(
     jobs: &[KswJob],
     m: usize,
     mat: &[i8],
@@ -582,9 +593,11 @@ fn batched_align(
     // early (`endsc = i32::MAX`) because the forward pass does not yet know what score to aim for.
     let mut fwd_jobs: Vec<FwdJob> = Vec::with_capacity(jobs.len());
     for (i, j) in jobs.iter().enumerate() {
+        let t_decide = probing.then(std::time::Instant::now);
         let decision = prune.map(|p| rescue_prune::decide(j.target, j.query, &p, prune_max_hits()));
-        if probing {
+        if let Some(t0) = t_decide {
             use std::sync::atomic::Ordering::Relaxed;
+            cells::PRUNE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
             match decision {
                 Some(rescue_prune::Decision::Fail) => cells::PRUNE_FAIL.fetch_add(1, Relaxed),
                 Some(rescue_prune::Decision::Hull { hb, he }) => {
@@ -808,7 +821,8 @@ fn batched_align(
     out
 }
 
-/// The pruning bound for this batch's scoring, or `None` when pruning is off (`BWA4_RESCUE_PRUNE=0`)
+/// The pruning bound for this batch's scoring, or `None` when pruning is off (the default; on with
+/// `BWA4_RESCUE_PRUNE=1`)
 /// or the lemma does not cover the scoring. The lemma needs every A/C/G/T cell of `mat` to score at
 /// most `max_sc` on the diagonal and at most `-b` off it; `b` is read off the matrix as its weakest
 /// mismatch penalty, so a non-uniform matrix is bounded by its kindest mismatch. N cells do not
@@ -825,7 +839,7 @@ fn prune_params(
     max_sc: i32,
 ) -> Option<rescue_prune::Params> {
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_PRUNE").is_none_or(|v| v != "0")) || m < 4
+    if !*ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_PRUNE").is_some_and(|v| v == "1")) || m < 4
     {
         return None;
     }
@@ -847,15 +861,15 @@ fn prune_params(
 
 /// The hit gate of [`rescue_prune::decide`]: a window sharing more K-mer hits than this with its
 /// mate runs in full, because enumerating them would cost more than the rows the bound could save.
-/// fg-labs/bwa-mem3 measured 400 best for the hull-only path. Changes speed only, never output.
-/// `BWA4_RESCUE_PRUNE_MAX_HITS` overrides it.
+/// 200 beat 400 on chr20 (see [`batched_mate_rescue`]; fg-labs/bwa-mem3 uses 400 behind a NEON
+/// filter). Changes speed only, never output. `BWA4_RESCUE_PRUNE_MAX_HITS` overrides it.
 fn prune_max_hits() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("BWA4_RESCUE_PRUNE_MAX_HITS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(400)
+            .unwrap_or(200)
     })
 }
 
