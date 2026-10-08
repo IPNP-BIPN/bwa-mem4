@@ -146,14 +146,21 @@ pub(crate) enum Decision {
 /// Per-thread scratch. The query tables depend only on the oriented mate, which repeats across
 /// every anchor rescued with it, so they are rebuilt only when the mate or K changes.
 struct Scratch {
-    /// Last query position (`j`) whose K-mer has this code, or -1; chained through `nxt`.
-    head: Vec<i16>,
-    /// Number of query K-mers with this code, for the hit gate.
-    qcnt: Vec<u16>,
+    /// Per code, `gen << 16 | n`: the cached query holds `n` K-mers with this code. An entry from an
+    /// older generation reads as 0, so a new query costs no clearing pass.
+    qtab: Vec<u32>,
+    /// Per code, the latest query position with this code or -1, chained to earlier ones through
+    /// `nxt`. Built only for jobs that pass the hit gate ([`Scratch::ensure_chains`]); `touched`
+    /// lists the codes it set, so the next build clears only those.
+    htab: Vec<i16>,
+    touched: Vec<u16>,
     /// Previous query position with the same K-mer code, or -1.
     nxt: Vec<i16>,
-    /// Codes set by the cached query, so a new query clears only those.
-    touched: Vec<u32>,
+    /// The cached query's K-mer codes, by end position.
+    qcodes: Vec<u16>,
+    /// The tag of the cached query's entries, and whether `htab`/`nxt` describe it yet.
+    gen: u32,
+    chains: bool,
     /// The query the tables describe, its K, and whether it holds an N.
     qcache: Vec<u8>,
     qk: usize,
@@ -174,10 +181,13 @@ struct Scratch {
 impl Scratch {
     fn new() -> Scratch {
         Scratch {
-            head: Vec::new(),
-            qcnt: Vec::new(),
-            nxt: vec![-1; QCAP],
+            qtab: Vec::new(),
+            htab: Vec::new(),
             touched: Vec::with_capacity(QCAP),
+            nxt: vec![-1; QCAP],
+            qcodes: vec![0; QCAP],
+            gen: 0,
+            chains: false,
             qcache: Vec::with_capacity(QCAP),
             qk: 0,
             q_has_n: false,
@@ -202,19 +212,23 @@ impl Scratch {
         self.qk = k;
         self.q_has_n = q.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0;
         let ncode = 1usize << (2 * k);
-        if self.head.len() < ncode {
-            self.head = vec![-1; ncode];
-            self.qcnt = vec![0; ncode];
-        } else {
-            for &c in &self.touched {
-                self.head[c as usize] = -1;
-                self.qcnt[c as usize] = 0;
-            }
+        if self.qtab.len() < ncode {
+            self.qtab = vec![0; ncode];
+            self.htab = vec![-1; ncode];
+            self.touched.clear();
+            self.gen = 0;
         }
-        self.touched.clear();
+        // A fresh tag per query; on the 16-bit wrap, clear for real so no stale entry can match.
+        self.gen = (self.gen + 1) & 0xffff;
+        if self.gen == 0 {
+            self.qtab.fill(0);
+            self.gen = 1;
+        }
+        self.chains = false;
         if self.q_has_n {
             return;
         }
+        let tag = self.gen << 16;
         let mask = (ncode - 1) as u32;
         let mut code = 0u32;
         for &b in &q[..k - 1] {
@@ -222,14 +236,47 @@ impl Scratch {
         }
         for j in k - 1..q.len() {
             code = ((code << 2) | q[j] as u32) & mask;
-            let c = code as usize;
-            if self.qcnt[c] == 0 {
-                self.touched.push(code);
-            }
-            self.nxt[j] = self.head[c];
-            self.head[c] = j as i16;
-            self.qcnt[c] += 1;
+            self.qcodes[j] = code as u16;
+            let v = self.qtab[code as usize];
+            self.qtab[code as usize] = if v & !0xffff == tag { v + 1 } else { tag | 1 };
         }
+    }
+
+    /// How many K-mers of the cached query have this code.
+    #[inline(always)]
+    fn count(&self, code: usize) -> u16 {
+        let v = self.qtab[code];
+        if v >> 16 == self.gen {
+            v as u16
+        } else {
+            0
+        }
+    }
+
+    /// The latest query position with this code, or -1 (after [`Scratch::ensure_chains`]).
+    #[inline(always)]
+    fn head(&self, code: usize) -> i16 {
+        self.htab[code]
+    }
+
+    /// Build the per-code occurrence chains of the cached query, once per query.
+    fn ensure_chains(&mut self) {
+        if self.chains {
+            return;
+        }
+        for &c in &self.touched {
+            self.htab[c as usize] = -1;
+        }
+        self.touched.clear();
+        for j in self.qk - 1..self.qcache.len() {
+            let c = self.qcodes[j] as usize;
+            if self.htab[c] < 0 {
+                self.touched.push(c as u16);
+            }
+            self.nxt[j] = self.htab[c];
+            self.htab[c] = j as i16;
+        }
+        self.chains = true;
     }
 }
 
@@ -275,6 +322,19 @@ fn count_hits(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) 
     if t.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0 {
         return None;
     }
+    // ---- Hit gate, ESTIMATED from every 4th row. It only decides whether filtering is worth its
+    //      cost, never a decision's correctness, so an estimate is enough, and most jobs stop here:
+    //      on real reads ~80 % of windows are over the gate, and they now pay for a quarter of the
+    //      rows instead of all of them ----
+    let est = match k {
+        5 => sampled_hits::<5>(t, s),
+        6 => sampled_hits::<6>(t, s),
+        7 => sampled_hits::<7>(t, s),
+        _ => sampled_hits::<8>(t, s),
+    };
+    if est > max_hits {
+        return None;
+    }
     let mut codes = std::mem::take(&mut s.codes);
     match k {
         5 => window_codes::<5>(t, &mut codes),
@@ -282,9 +342,23 @@ fn count_hits(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) 
         7 => window_codes::<7>(t, &mut codes),
         _ => window_codes::<8>(t, &mut codes),
     }
-    let verdict = count_hits_from(s, &codes, len1, len2, p, max_hits);
+    let verdict = count_hits_from(s, &codes, len1, len2, p);
     s.codes = codes;
     verdict
+}
+
+/// Four times the query K-mer hits of the window rows `r = 0, 4, 8, ...` (`t[r..r + K]`), an
+/// estimate of the window's total hits.
+fn sampled_hits<const K: usize>(t: &[u8], s: &Scratch) -> usize {
+    let mut n = 0usize;
+    for r in (0..=t.len() - K).step_by(4) {
+        let mut c = 0usize;
+        for &b in &t[r..r + K] {
+            c = (c << 2) | b as usize;
+        }
+        n += s.count(c) as usize;
+    }
+    4 * n
 }
 
 /// `out[i]` = the 2-bit code of `t[i..i + K]`, for every K-mer of `t`.
@@ -307,14 +381,10 @@ fn count_hits_from(
     len1: usize,
     len2: usize,
     p: &Params,
-    max_hits: usize,
 ) -> Option<usize> {
     let k = p.k;
-    // ---- Hit gate, from per-code counts, without enumerating the hits ----
-    let nhits: usize = codes.iter().map(|&c| s.qcnt[c as usize] as usize).sum();
-    if nhits > max_hits {
-        return None;
-    }
+    // ---- The exact hit total, for the early fail below (the gate was the caller's estimate) ----
+    let nhits: usize = codes.iter().map(|&c| s.count(c as usize) as usize).sum();
 
     // ---- Per-diagonal hit counts. Diagonal `d = i - j` is stored at `d + off`, with `off` the
     //      query rounded up to 16 so the pad columns' diagonals have slots too ----
@@ -330,9 +400,10 @@ fn count_hits_from(
     if p.base() + p.a * nhits as i32 - p.c < p.minsc {
         return Some(nd);
     }
+    s.ensure_chains();
     for (r, &code) in codes.iter().enumerate() {
         let i = r + k - 1;
-        let mut j = s.head[code as usize];
+        let mut j = s.head(code as usize);
         while j >= 0 {
             let d = i + off - j as usize;
             if s.cnt[d] == 0 {
@@ -611,6 +682,207 @@ mod tests {
             }
         }
         assert!(hulls > 2000 && fails > 2000, "hulls {hulls}, fails {fails}");
+    }
+
+    /// Real rescue jobs dumped by `BWA4_RESCUE_DUMP` (u32 tlen, u32 qlen, target, query), for
+    /// offline timing: `BWA4_PRUNE_BENCH=jobs.bin cargo test --release -p bwa-mem4-neon
+    /// prune_bench -- --ignored --nocapture`.
+    pub(super) fn load_dump(path: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let raw = std::fs::read(path).unwrap();
+        let (mut out, mut at) = (Vec::new(), 0);
+        while at + 8 <= raw.len() {
+            let tl = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            let ql = u32::from_le_bytes(raw[at + 4..at + 8].try_into().unwrap()) as usize;
+            at += 8;
+            out.push((
+                raw[at..at + tl].to_vec(),
+                raw[at + tl..at + tl + ql].to_vec(),
+            ));
+            at += tl + ql;
+        }
+        out
+    }
+
+    /// The per-hit enumeration the run-collapsed one must reproduce: `(cnt, minrow where cnt > 0)`.
+    fn naive_counts(t: &[u8], q: &[u8], k: usize) -> (Vec<u16>, Vec<i32>) {
+        let off = q.len().div_ceil(16) * 16;
+        let nd = t.len() + off + 1;
+        let (mut cnt, mut minrow) = (vec![0u16; nd], vec![i32::MAX; nd]);
+        for i in k - 1..t.len() {
+            for j in k - 1..q.len() {
+                if t[i + 1 - k..=i] == q[j + 1 - k..=j] {
+                    let d = i + off - j;
+                    cnt[d] += 1;
+                    minrow[d] = minrow[d].min((i + 1 - k) as i32);
+                }
+            }
+        }
+        for d in 0..nd {
+            if cnt[d] == 0 {
+                minrow[d] = 0;
+            }
+        }
+        (cnt, minrow)
+    }
+
+    /// Run-collapsed counting equals per-hit counting, on generated jobs with planted runs,
+    /// repeated query K-mers (tandem and poly-A mates) and, when `BWA4_PRUNE_BENCH` points at a
+    /// dump, on the first real jobs of it.
+    #[test]
+    fn run_counts_equal_naive_counts() {
+        let mut state = 0xabcd_ef01_2345_6789u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mut jobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for _ in 0..3000 {
+            let qlen = 10 + next() % 150;
+            let tlen = qlen + next() % 600;
+            let alpha = [4, 4, 2, 1, 3][next() % 5].max(1);
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+            let q: Vec<u8> = (0..qlen).map(|_| (next() % alpha) as u8).collect();
+            for _ in 0..next() % 4 {
+                let l = (5 + next() % 80).min(qlen);
+                let (qs, at) = (next() % (qlen - l + 1), next() % (tlen - l + 1));
+                t[at..at + l].copy_from_slice(&q[qs..qs + l]);
+            }
+            jobs.push((t, q));
+        }
+        if let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") {
+            jobs.extend(load_dump(&path).into_iter().take(3000));
+        }
+        let mut s = Scratch::new();
+        for k in [5usize, 7] {
+            let p = Params {
+                k,
+                a: 1,
+                c: 1,
+                o_del: 6,
+                e_del: 1,
+                minsc: 1,
+            };
+            for (n, (t, q)) in jobs.iter().enumerate() {
+                if t.len() < k || q.len() < k {
+                    continue;
+                }
+                // A threshold of 1 so the early fail never skips the enumeration.
+                let p = Params { minsc: 1, ..p };
+                let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX) else {
+                    continue;
+                };
+                let (cnt, minrow) = naive_counts(t, q, k);
+                assert_eq!(&s.cnt[..nd], &cnt[..], "job {n}, k {k}: cnt");
+                let got: Vec<i32> = (0..nd)
+                    .map(|d| if s.cnt[d] > 0 { s.minrow[d] } else { 0 })
+                    .collect();
+                assert_eq!(got, minrow, "job {n}, k {k}: minrow");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn prune_bench() {
+        let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") else {
+            return;
+        };
+        let jobs = load_dump(&path);
+        let p = Params::from(1, 4, 6, 1, 6, 1, 19).unwrap();
+        for mh in [0usize, 400, 1000, 100_000] {
+            for _rep in 0..2 {
+                let t0 = std::time::Instant::now();
+                let (mut fail, mut hull, mut full) = (0, 0, 0);
+                for (t, q) in &jobs {
+                    match decide(t, q, &p, mh) {
+                        Decision::Fail => fail += 1,
+                        Decision::Hull { .. } => hull += 1,
+                        Decision::Full => full += 1,
+                    }
+                }
+                let ns = t0.elapsed().as_nanos() as f64 / jobs.len() as f64;
+                eprintln!("BENCH mh={mh:>6} {ns:7.0} ns/job  fail {fail} hull {hull} full {full}");
+            }
+        }
+        // Shape of the hits: per job, rows, rows with a primary hit, runs, repeated-occurrence hits.
+        {
+            let k = 5;
+            let (mut rows, mut prim, mut runs, mut multi, mut nhits) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut s = Scratch::new();
+            for (t, q) in &jobs {
+                if t.iter().chain(q.iter()).any(|&b| b > 3) {
+                    continue;
+                }
+                s.load_query(q, k);
+                s.ensure_chains();
+                let off = q.len().div_ceil(16) * 16;
+                let mut last: Option<(usize, usize)> = None;
+                for i in k - 1..t.len() {
+                    rows += 1;
+                    let code = t[i + 1 - k..=i]
+                        .iter()
+                        .fold(0usize, |c, &b| (c << 2) | b as usize);
+                    let j = s.head(code);
+                    if j < 0 {
+                        continue;
+                    }
+                    prim += 1;
+                    nhits += s.count(code) as u64;
+                    multi += s.count(code) as u64 - 1;
+                    let d = i + off - j as usize;
+                    if last != Some((d, i - 1)) {
+                        runs += 1;
+                    }
+                    last = Some((d, i));
+                }
+            }
+            let n = jobs.len() as f64;
+            eprintln!(
+                "BENCH shape/job: rows {:.0}, primary rows {:.0}, runs {:.0}, repeat hits {:.0}, hits {:.0}",
+                rows as f64 / n, prim as f64 / n, runs as f64 / n, multi as f64 / n, nhits as f64 / n
+            );
+        }
+        // The query-table rebuild alone, in the dump's order (as production sees it).
+        {
+            let mut s = Scratch::new();
+            let t0 = std::time::Instant::now();
+            for (_, q) in &jobs {
+                s.load_query(q, 5);
+            }
+            eprintln!(
+                "BENCH load_query: {:.0} ns/job",
+                t0.elapsed().as_nanos() as f64 / jobs.len() as f64
+            );
+            let t0 = std::time::Instant::now();
+            let mut acc = 0u8;
+            for (t, q) in &jobs {
+                acc |= t.iter().chain(q.iter()).fold(0u8, |a, &b| a | b);
+            }
+            std::hint::black_box(acc);
+            eprintln!(
+                "BENCH N scan: {:.0} ns/job",
+                t0.elapsed().as_nanos() as f64 / jobs.len() as f64
+            );
+        }
+        // Phase split at an open gate: counting alone (gate + enumeration) vs the whole decision.
+        let mut s = Scratch::new();
+        let t0 = std::time::Instant::now();
+        let mut nds = Vec::with_capacity(jobs.len());
+        for (t, q) in &jobs {
+            nds.push(count_hits(&mut s, t, q, &p, 100_000));
+        }
+        let count_ns = t0.elapsed().as_nanos() as f64 / jobs.len() as f64;
+        let t0 = std::time::Instant::now();
+        for ((t, q), _) in jobs.iter().zip(&nds) {
+            if let Some(nd) = count_hits(&mut s, t, q, &p, 100_000) {
+                std::hint::black_box(sparse_decision(&mut s, &p, t.len(), nd));
+            }
+        }
+        let all_ns = t0.elapsed().as_nanos() as f64 / jobs.len() as f64;
+        eprintln!("BENCH split: count_hits {count_ns:.0} ns/job, + sparse = {all_ns:.0} ns/job");
     }
 
     #[test]

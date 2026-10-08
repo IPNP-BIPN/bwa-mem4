@@ -499,6 +499,27 @@ pub fn batched_mate_rescue(
     max_sc: i32,
 ) -> Vec<KswAlignResult> {
     let prune = prune_params(m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
+    // `BWA4_RESCUE_DUMP=path`: append every rescue job (u32 target length, u32 query length,
+    // target bytes, query bytes, little-endian) to `path`, the input of `rescue_prune`'s offline
+    // bench. A debugging aid; off unless set.
+    static DUMP: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    if let Some(f) = DUMP.get_or_init(|| {
+        std::env::var_os("BWA4_RESCUE_DUMP")
+            .map(|p| std::sync::Mutex::new(std::fs::File::create(p).expect("BWA4_RESCUE_DUMP")))
+    }) {
+        use std::io::Write;
+        let mut f = f.lock().unwrap();
+        for j in jobs {
+            for part in [
+                &(j.target.len() as u32).to_le_bytes()[..],
+                &(j.query.len() as u32).to_le_bytes()[..],
+                j.target,
+                j.query,
+            ] {
+                f.write_all(part).expect("BWA4_RESCUE_DUMP write");
+            }
+        }
+    }
     batched_align(
         jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, prune,
     )

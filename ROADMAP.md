@@ -146,9 +146,25 @@ A `-t12` le gain est sous le bruit (-0,6 % user, -0,1 % mur, 3 tirages entrelace
 octet-identique a bwa-mem2 sur ces 2 M paires (`703b1bd7cf97`), comme sur les jeux chr20. Au-dela de
 400, la coque des jobs qui reussissent garde 80 % des lignes et le filtre coute plus qu'il ne sauve.
 
-**Reste a faire, dans l'ordre** : (1) filtre SIMD (presence bitmap + Kadane vectorise, cf.
-`rescue_prune_neon.h`), qui rendrait rentables les seuils plus hauts ; (2) DP en bandes sur les
-composantes. Non pris, faute de mesure : allocateur sans purge (#523, `MIMALLOC_PURGE_DELAY`), SA
+**Un filtre plus rapide ne rapporte presque plus rien : le plafond est mesure.** Banc hors ligne sur
+347 k vrais jobs captures (`BWA4_RESCUE_DUMP`, test ignore `prune_bench`) : les fenetres reelles sont
+repetitives, 1 646 hits par job en moyenne dont 1 100 viennent de K-mers repetes dans le mate, et les
+series de hits consecutifs ne font que 2,1 lignes. A la porte 400 le filtre entier ne coute que 1,15 us
+par job, soit ~2 % du temps total : un filtre gratuit gagnerait ~2 %, un filtre SIMD 2x (ce que le
+fork annonce pour NEON) ~1 %. Monter la porte ne paie pas davantage : 400 -> 1000 economise 8,5 s de DP
+sur 380 s (1,2 us/job) pour 29 s de filtre (4,2 us/job), il faudrait un filtre 3,5x moins cher sur les
+fenetres denses. Essais faits : series par diagonale (neutre), series par couche d'occurrence comme le
+fork (plus lent, 7,3 contre 6,0 us de comptage, les series sont trop courtes). Pris : porte estimee sur
+une ligne sur quatre (c'est une heuristique de cout, sans effet sur l'exactitude), compteurs du mate
+etiquetes par generation au lieu d'etre remis a zero (la requete change a CHAQUE job : un mate revient
+~14 fois mais a plus de 16 jobs d'ecart, les ancres etant traitees par tours), chaines construites
+seulement pour les jobs qui passent la porte. Filtre a la porte 400 : 1,29 -> 1,13 us/job, porte
+0,74 -> 0,43 us ; sur 2 M paires GIAB 11,0 -> 10,2 s de filtre, sortie toujours `703b1bd7cf97`. De bout
+en bout c'est sous le bruit (-0,3 % attendu).
+
+**Reste a faire, dans l'ordre** : (1) le levier qui reste est cote DP, pas filtre : un DP en bandes sur
+les composantes (#535 du fork) au lieu de la coque entiere, qui garde 80 % des lignes sur les fenetres
+denses ; (2) filtre SIMD, seulement si (1) rend les portes hautes rentables. Non pris, faute de mesure : allocateur sans purge (#523, `MIMALLOC_PURGE_DELAY`), SA
 echantillonne tous les 2 rangs (#510, notre `SA_SAMPLE_STRIDE = 8`), chainage par marche run-length
 (#531). Deja chez nous : saut des graines contenues, dedup des jobs DP, cellule de rescue USQADD et
 deux lignes par passe, encodage SEQ/QUAL par blocs, BGZF parallele.
