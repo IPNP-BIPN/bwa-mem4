@@ -115,8 +115,10 @@ octet-identiques**.
 
 **Pris : la validation de la CLI** (leurs #460, #501, #554). `-E 0` faisait paniquer le rescue (division
 par zero dans `rev_span_bound`, exit 134 ; bwa fait un SIGFPE au meme endroit). `-O 8,-1` tournait
-silencieusement en `-O 8`, `-O 6x` en `-O 6`, `-I 300,0` divisait chaque z-score par zero. Tout cela
-est maintenant refuse ; aucune ligne de commande valide ne change de sortie.
+silencieusement en `-O 8`, `-O 6x` en `-O 6`. Tout cela est maintenant refuse, ainsi qu'une moyenne
+`-I` non positive ou un ecart-type negatif ; aucune ligne de commande valide ne change de sortie. Le
+fork refuse aussi `-I mean,0`, pas nous : un ecart-type nul est une librairie a insert fixe (panels
+amplicon), bwa le traite de facon deterministe et `opt_parity.sh` l'epingle (`-I 394,0`).
 
 **Pris, en opt-in : l'elagage exact du mate rescue** (leurs #533, #541). Un filtre sur les K-mers
 communs au mate et a la fenetre prouve qu'un job ne peut pas atteindre `min_seed_len * a` (on ne le

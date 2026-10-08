@@ -629,14 +629,15 @@ fn parse_int_pair(s: &str) -> anyhow::Result<(i32, Option<i32>)> {
 /// - `s`: the raw `-I` argument as typed. One to four numbers, in the fixed order mean, std, max,
 ///   min, separated by any punctuation. Extra numbers past the fourth are parsed and then ignored,
 ///   as in the C. Trailing characters that are not a further number are refused (the C ignores
-///   them), and so are a non-positive mean or std: the std divides every pair's insert-size
-///   deviation, so `-I 300,0` would score every pair against an infinite z-score.
+///   them), and so are a non-positive mean and a negative std. A std of exactly 0 is accepted: it
+///   is a fixed-insert library (amplicon panels), bwa handles it deterministically, and
+///   `scripts/opt_parity.sh` pins `-I 394,0` against bwa-mem2.
 ///
 /// # Returns
 ///
 /// All four orientation slots, of which only `pes[ORIENTATION_FR]` is usable; the other three carry
 /// `failed = true`. Errors when `s` contains no leading number at all, when a number does not
-/// parse as `f64`, on trailing characters, or when the mean or std is not strictly positive.
+/// parse as `f64`, on trailing characters, on a non-positive mean or on a negative std.
 fn parse_insert_size(s: &str) -> anyhow::Result<[PeStat; 4]> {
     // ---- Walk successive numbers, using bwa's "punctuation then digit" continuation rule ----
     // The numbers as typed, in order: [0] mean, [1] std, [2] max, [3] min, all in bases. Length
@@ -676,8 +677,8 @@ fn parse_insert_size(s: &str) -> anyhow::Result<[PeStat; 4]> {
         anyhow::bail!("-I: unexpected '{}' after the numbers in '{s}'", &s[pos..]);
     }
     // The scan above only admits digits, '.' and a sign, so no NaN can reach this comparison.
-    if values[0] <= 0.0 || values.get(1).is_some_and(|&std| std <= 0.0) {
-        anyhow::bail!("-I: the mean and standard deviation must be positive, got '{s}'");
+    if values[0] <= 0.0 || values.get(1).is_some_and(|&std| std < 0.0) {
+        anyhow::bail!("-I: the mean must be positive and the deviation non-negative, got '{s}'");
     }
 
     // ---- All four orientations start `failed`; only FR is describable through `-I` ----
@@ -3366,12 +3367,14 @@ mod tests {
     }
 
     #[test]
-    fn insert_size_refuses_zero_std_and_trailing_junk() {
+    fn insert_size_refuses_bad_values_and_trailing_junk() {
         let pes = parse_insert_size("300,30,500,100").unwrap();
         assert_eq!(pes[ORIENTATION_FR].avg, 300.0);
         assert_eq!(pes[ORIENTATION_FR].high, 500);
         assert!(parse_insert_size("300.5").is_ok());
-        for bad in ["300,0", "0", "-300", "300,-1", "300x", "300,30,"] {
+        // A fixed-insert library: kept, bwa-mem2 parity pins it (scripts/opt_parity.sh).
+        assert!(parse_insert_size("394,0").is_ok());
+        for bad in ["0", "-300", "300,-1", "300x", "300,30,"] {
             assert!(parse_insert_size(bad).is_err(), "{bad:?} should be refused");
         }
     }
