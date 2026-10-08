@@ -477,13 +477,15 @@ pub fn batched_ksw_align2(
 /// only when `qb >= 0`, and `qb` is only ever set at `score >= minsc`); the other fields are
 /// unspecified.
 ///
-/// The filter is OFF by default (`BWA4_RESCUE_PRUNE=1` turns it on), which makes this exactly
-/// [`batched_ksw_align2`]. Measured on hg38 chr20 with 200 k wgsim pairs at `-t1` (M4 Max), the
-/// scalar filter costs 0.7 us per job to gate and about 3 us more per job it filters, against a
-/// ~13 us rescue DP, so it pays only when many windows are prunable: user time -1.2 % with 15 %
-/// of mates replaced by random sequence, +1.2 % on clean simulated pairs (hit gate 200). The fork
-/// makes it pay with a SIMD filter and banded DP over the hull; until that exists, or a
-/// measurement on real reads says otherwise, it stays opt-in.
+/// The filter is ON by default; `BWA4_RESCUE_PRUNE=0` turns it off, which makes this exactly
+/// [`batched_ksw_align2`]. It costs about 1 us per job to gate and about 3 us more per job it
+/// filters, against a ~19 us rescue DP on real reads, so it pays exactly as far as real windows are
+/// prunable. On 2 M real GIAB HG002 pairs against hg38 (M4 Max), 15.1 % of the 6.9 M rescue jobs
+/// are proven failing; at `-t1` on 300 k of those pairs, median user time is -1.6 % (hit gate
+/// 400), and output is byte-identical to bwa-mem2. On simulated pairs, whose windows nearly always
+/// hold the true mate, it is a small loss instead (+1 to +3 % on hg38 chr20 wgsim). The fork makes
+/// the filter itself ~4x cheaper with SIMD and saves more per window with a banded DP; neither is
+/// here yet.
 #[allow(clippy::too_many_arguments)]
 pub fn batched_mate_rescue(
     jobs: &[KswJob],
@@ -821,8 +823,7 @@ pub(crate) fn batched_align(
     out
 }
 
-/// The pruning bound for this batch's scoring, or `None` when pruning is off (the default; on with
-/// `BWA4_RESCUE_PRUNE=1`)
+/// The pruning bound for this batch's scoring, or `None` when pruning is off (`BWA4_RESCUE_PRUNE=0`)
 /// or the lemma does not cover the scoring. The lemma needs every A/C/G/T cell of `mat` to score at
 /// most `max_sc` on the diagonal and at most `-b` off it; `b` is read off the matrix as its weakest
 /// mismatch penalty, so a non-uniform matrix is bounded by its kindest mismatch. N cells do not
@@ -839,7 +840,7 @@ fn prune_params(
     max_sc: i32,
 ) -> Option<rescue_prune::Params> {
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_PRUNE").is_some_and(|v| v == "1")) || m < 4
+    if !*ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_PRUNE").is_none_or(|v| v != "0")) || m < 4
     {
         return None;
     }
@@ -861,15 +862,16 @@ fn prune_params(
 
 /// The hit gate of [`rescue_prune::decide`]: a window sharing more K-mer hits than this with its
 /// mate runs in full, because enumerating them would cost more than the rows the bound could save.
-/// 200 beat 400 on chr20 (see [`batched_mate_rescue`]; fg-labs/bwa-mem3 uses 400 behind a NEON
-/// filter). Changes speed only, never output. `BWA4_RESCUE_PRUNE_MAX_HITS` overrides it.
+/// 400 is the best of {300, 400, 600, 1000} on real GIAB reads, where a 1.4 kb window shares ~200
+/// random 5-mer hits with its mate (fg-labs/bwa-mem3 also lands on 400). Changes speed only, never
+/// output. `BWA4_RESCUE_PRUNE_MAX_HITS` overrides it.
 fn prune_max_hits() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("BWA4_RESCUE_PRUNE_MAX_HITS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(200)
+            .unwrap_or(400)
     })
 }
 

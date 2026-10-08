@@ -120,34 +120,34 @@ silencieusement en `-O 8`, `-O 6x` en `-O 6`. Tout cela est maintenant refuse, a
 fork refuse aussi `-I mean,0`, pas nous : un ecart-type nul est une librairie a insert fixe (panels
 amplicon), bwa le traite de facon deterministe et `opt_parity.sh` l'epingle (`-I 394,0`).
 
-**Pris, en opt-in : l'elagage exact du mate rescue** (leurs #533, #541). Un filtre sur les K-mers
-communs au mate et a la fenetre prouve qu'un job ne peut pas atteindre `min_seed_len * a` (on ne le
-lance pas) ou borne les lignes de la fenetre qui peuvent porter un maximum de ligne au-dessus (on ne
-calcule qu'elles). Port Rust du filtre scalaire, Kadane creux sur les seules diagonales occupees
-(egal au balayage dense sur 20 000 jobs generes), decisions verifiees contre `ksw_align2` (6 000
-jobs, 5 scorings, 4 mutations deliberees de la borne toutes detectees). Sortie octet-identique a
-bwa-mem2 sur hg38 chr20 : 500 k paires wgsim, 300 k paires a 2 % d'erreur, 200 k paires avec 15 % de
-mates aleatoires.
+**Pris : l'elagage exact du mate rescue** (leurs #533, #541). Un filtre sur les K-mers communs au
+mate et a la fenetre prouve qu'un job ne peut pas atteindre `min_seed_len * a` (on ne le lance pas)
+ou borne les lignes de la fenetre qui peuvent porter un maximum de ligne au-dessus (on ne calcule
+qu'elles). Port Rust du filtre scalaire, Kadane creux sur les seules diagonales occupees (egal au
+balayage dense sur 20 000 jobs generes), decisions verifiees contre `ksw_align2` (6 000 jobs, 5
+scorings, 4 mutations deliberees de la borne toutes detectees). Actif par defaut, seuil de hits 400 ;
+`BWA4_RESCUE_PRUNE=0` le coupe.
 
-Mais **il ne paie pas encore**, d'ou `BWA4_RESCUE_PRUNE=1` pour l'activer. A `-t1` sur M4 Max, 200 k
-paires chr20 :
+**Le verdict depend entierement des donnees, et seules les vraies lectures tranchent.** Sur des
+lectures simulees la fenetre contient presque toujours le vrai mate : 1,3 % de jobs elagues sur
+chr20 wgsim, et le filtre coute plus qu'il ne rapporte (+1 a +3 % de temps user a `-t1`). Sur 2 M
+paires GIAB HG002 HiSeq reelles contre hg38 entier, le rescue pese **33 % du CPU** (126 s sur 380 a
+`-t12`, fenetres de 1 396 pb) et le filtre prouve en echec **15,1 % des 6,9 M jobs**, exactement le
+chiffre du fork en WGS :
 
-| jeu | jobs prouves en echec | temps user, filtre / sans | ecart |
+| seuil de hits | jobs prouves en echec | DP + filtre (compteurs) | user `-t1`, 300 k paires, mediane de 3 |
 |---|---|---|---|
-| wgsim propre | 1,3 % | 20,05 / 19,82 s | **+1,2 %** |
-| 15 % de mates aleatoires | 20 % | 18,44 / 18,67 s | **-1,2 %** |
+| sans filtre | 0 | 126,1 s | 47,40 s |
+| 300 | | | 47,17 s |
+| **400** | **947 841 (13,6 %)** | **120,3 s, dont 11,0 s de filtre** | **46,64 s (-1,6 %)** |
+| 1000 | 1 052 068 | 140,7 s | |
 
-Le filtre coute 0,7 us par job pour le seul comptage des hits, puis ~3 us par job filtre, contre
-~13 us de DP de rescue par job a 8 Gcell/s : il faut qu'environ 15 % du DP soit elaguable pour
-rentrer dans ses frais. Les fenetres simulees contiennent presque toujours le vrai mate, et la coque
-d'un job qui reussit garde ~91 % des lignes (la queue de deletion autorisee croit avec le score). Le
-fork, lui, mesure 15 % de jobs elagues en WGS reel et 33 % en WES, et rentabilise avec un filtre NEON
-/ SSE ~4x plus rapide et un DP en bandes sur les composantes (#535) ; il note lui-meme que son filtre
-scalaire « coute plus qu'il ne rapporte » face aux noyaux x86.
+A `-t12` le gain est sous le bruit (-0,6 % user, -0,1 % mur, 3 tirages entrelaces). Sortie
+octet-identique a bwa-mem2 sur ces 2 M paires (`703b1bd7cf97`), comme sur les jeux chr20. Au-dela de
+400, la coque des jobs qui reussissent garde 80 % des lignes et le filtre coute plus qu'il ne sauve.
 
-**Reste a faire, dans l'ordre** : (1) mesurer `BWA4_RESCUE_PRUNE=1` sur les vraies lectures GIAB, ou
-la part de rescues voues a l'echec est la vraie inconnue ; (2) si c'est prometteur, filtre SIMD
-(presence bitmap + Kadane vectorise, cf. `rescue_prune_neon.h`) ; (3) DP en bandes sur les
+**Reste a faire, dans l'ordre** : (1) filtre SIMD (presence bitmap + Kadane vectorise, cf.
+`rescue_prune_neon.h`), qui rendrait rentables les seuils plus hauts ; (2) DP en bandes sur les
 composantes. Non pris, faute de mesure : allocateur sans purge (#523, `MIMALLOC_PURGE_DELAY`), SA
 echantillonne tous les 2 rangs (#510, notre `SA_SAMPLE_STRIDE = 8`), chainage par marche run-length
 (#531). Deja chez nous : saut des graines contenues, dedup des jobs DP, cellule de rescue USQADD et
