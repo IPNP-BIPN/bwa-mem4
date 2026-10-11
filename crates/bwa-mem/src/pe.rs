@@ -1249,17 +1249,7 @@ pub fn batch_mate_rescue(
         crate::rescue_split::stop(&crate::rescue_split::COLLECT_NS, t_collect);
         let t_kernel = crate::rescue_split::start();
         // `alns`: one result per job, index-aligned with `jobs`.
-        let alns = batched_ksw_align2(
-            &jobs,
-            5,
-            &opt.mat,
-            opt.o_del,
-            opt.e_del,
-            opt.o_ins,
-            opt.e_ins,
-            opt.min_seed_len * opt.a,
-            opt.a,
-        );
+        let alns = rescue_kernel(&jobs, opt);
         crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
         let t_apply = crate::rescue_split::start();
         for (idx, (pi, dir, call)) in calls.iter().enumerate() {
@@ -1276,6 +1266,94 @@ pub fn batch_mate_rescue(
         }
         crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
     }
+}
+
+/// Run a round's rescue jobs, after exact pruning ([`bwa_neon::rescue_prune`]): a job proven unable
+/// to reach `minsc = min_seed_len * a` is not run and gets ksw's empty result, which
+/// [`matesw_apply`] rejects exactly as it would have rejected the real one (it reads nothing of a
+/// result scoring below `minsc`); a job whose rows `hb..=he` hold every cell that can matter runs on
+/// that sub-window, and its target coordinates are shifted back by `hb`. Every field `matesw_apply`
+/// consumes is therefore the full-window kernel's.
+///
+/// RETURNS one result per job, index-aligned with `jobs`.
+fn rescue_kernel(jobs: &[KswJob], opt: &MemOpt) -> Vec<KswAlignResult> {
+    use bwa_neon::rescue_prune::{self, stats, Prune, PruneParams, PruneScratch};
+    use std::cell::RefCell;
+    let minsc = opt.min_seed_len * opt.a;
+    let run = |jobs: &[KswJob]| {
+        batched_ksw_align2(
+            jobs, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc, opt.a,
+        )
+    };
+    let params = PruneParams::new(
+        &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc, 5, 5,
+    );
+    if !rescue_prune::enabled() || !params.valid {
+        return run(jobs);
+    }
+    thread_local! {
+        static SCRATCH: RefCell<PruneScratch> = RefCell::new(PruneScratch::default());
+    }
+    let probing = bwa_neon::matesw::cells::enabled();
+    let max_hits = rescue_prune::max_hits();
+    // `route[k]`: `None` for a job proven failing, else its index among the kernel's jobs and the
+    // row offset its target coordinates must be shifted back by.
+    let mut kept: Vec<KswJob> = Vec::with_capacity(jobs.len());
+    let mut route: Vec<Option<(usize, i32)>> = Vec::with_capacity(jobs.len());
+    SCRATCH.with_borrow_mut(|s| {
+        for job in jobs {
+            let decision = rescue_prune::prune_window(job.target, job.query, &params, max_hits, s);
+            let (r, sub) = match decision {
+                Prune::Fail => (None, &job.target[..0]),
+                Prune::Full => (Some((kept.len(), 0)), job.target),
+                Prune::Rows(hb, he) => (Some((kept.len(), hb as i32)), &job.target[hb..=he]),
+            };
+            if probing {
+                use std::sync::atomic::Ordering::Relaxed;
+                match decision {
+                    Prune::Fail => &stats::FAIL,
+                    Prune::Full => &stats::FULL,
+                    Prune::Rows(..) => &stats::ROWS,
+                }
+                .fetch_add(1, Relaxed);
+                stats::ROWS_IN.fetch_add(job.target.len() as u64, Relaxed);
+                stats::ROWS_KEPT.fetch_add(sub.len() as u64, Relaxed);
+            }
+            if r.is_some() {
+                kept.push(KswJob {
+                    query: job.query,
+                    target: sub,
+                });
+            }
+            route.push(r);
+        }
+    });
+    let alns = run(&kept);
+    let shift = |x: i32, hb: i32| if x >= 0 { x + hb } else { x };
+    route
+        .into_iter()
+        .map(|r| match r {
+            // ksw's `g_defr`: score 0, everything else -1.
+            None => KswAlignResult {
+                score: 0,
+                qb: -1,
+                qe: -1,
+                tb: -1,
+                te: -1,
+                score2: -1,
+                te2: -1,
+            },
+            Some((k, hb)) => {
+                let a = alns[k];
+                KswAlignResult {
+                    tb: shift(a.tb, hb),
+                    te: shift(a.te, hb),
+                    te2: shift(a.te2, hb),
+                    ..a
+                }
+            }
+        })
+        .collect()
 }
 
 /// bwa's `id << 8`, reproduced with its C integer width.
