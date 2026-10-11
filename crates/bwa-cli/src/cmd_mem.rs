@@ -2245,6 +2245,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         )?;
         reader.join().expect("reader thread panicked")?;
         bwa_neon::matesw::cells::dump();
+        bwa_neon::rescue_prune::stats::dump();
         bwa_neon::batched::extend_shape::dump();
         bwa_neon::batched::bin_split::dump();
         bwa_neon::batched::job_dup::dump();

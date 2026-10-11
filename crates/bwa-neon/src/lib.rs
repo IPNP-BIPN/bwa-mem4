@@ -126,6 +126,9 @@ pub mod batched;
 /// Mate rescue: the lane-parallel `ksw_align2` equivalent. Public because the paired-end code calls
 /// it directly (there is no `SwBackend` method for whole-read local alignment).
 pub mod matesw;
+/// Exact mate-rescue window pruning: which rescue jobs provably fail, and which rows of the others
+/// can matter (fg-labs/bwa-mem3 `rescue_prune.h`).
+pub mod rescue_prune;
 
 /// Mate-rescue entry points, re-exported at the crate root so `bwa-mem`'s paired-end path can say
 /// `bwa_neon::batched_ksw_align2` without naming the module. [`batched_ksw_align2`] takes a slice of
