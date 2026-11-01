@@ -15,7 +15,7 @@ Versions exactes gelees dans `Cargo.lock` (pin de record). Justifications :
 | `rust-htslib` | sortie BAM/CRAM (`mem -o out.bam` / `out.cram`) | MIT |
 | `rammap-core` | mapping long-read (`mem -x pacbio\|pbref\|ont2d`), voir plus bas | MIT |
 
-Dev-only (jamais dans le binaire livre) : `noodles-*` (validation SAM/BAM cote test), `rust-bio` /
+Dev-only (jamais dans le binaire livre) : `noodles-*` (validation SAM/BAM cote test), `gungraun` (comptes d'instructions sous Valgrind, `docker_gates.sh icount`), `rust-bio` /
 `block-aligner` (bootstrap de seeding/SW).
 
 ## Provenance des contributions externes

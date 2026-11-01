@@ -16,3 +16,10 @@ workspace = true
 
 [dev-dependencies]
 hyalite = "0.4"
+# Pinned exactly: it refuses to run unless `gungraun-runner` is the same version, and the image in
+# scripts/docker_gates.Dockerfile installs that one.
+gungraun = "=0.19.3"
+
+[[bench]]
+name = "global_icount"
+harness = false

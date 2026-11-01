@@ -794,6 +794,97 @@ pub fn ksw_global2(
     })
 }
 
+/// The narrowest half band that [`ksw_global2`] can be given without changing a byte of its result,
+/// and the score of a real alignment that proves it. Not in the C: this only decides how few cells
+/// the DP needs to visit.
+///
+/// `S` is the score of the best alignment with a single gap of exactly the length difference (no gap
+/// at all for equal lengths), found by one linear scan. The optimum is at least `S`. A path that
+/// strays `v >= 1` columns past the offsets the length difference requires carries at least `v` of
+/// the short-side gap and `|D| + v` of the long-side one, and two gap opens, so with `a` the largest
+/// matrix cell and `L` the shorter length its score is at most
+///
+/// ```text
+/// (L - v) * a - (o_del + o_ins + |D| * e_long + v * (e_del + e_ins))
+/// ```
+///
+/// That falls strictly below `S` once `v` exceeds the `v_max` computed below, so a band of
+/// `|D| + v_max` holds every path scoring `S` or better. The bound counts gaps and pairs and nothing else, so it
+/// also covers a D directly followed by an I, which the recurrence forbids but the traceback can
+/// walk: when a gap was opened from M and H(i, j) came from F, the traceback reads H's bits and
+/// leaves the path the score was computed on.
+///
+/// Why byte-identical, including every tie: narrowing a band can only lower a cell. Take any cell
+/// and state the traceback stands on, with the suffix walked so far. Each candidate it compares has
+/// a value which, joined to that suffix, either reaches at least the optimum or does not. Those that
+/// do are paths scoring at least `S`, so all of them lie inside the narrow band and keep their exact
+/// value; the rest were already strictly lower and can only drop further. Every comparison therefore
+/// resolves as it did, ties included, and the walk reads the same bits. `tests::
+/// tightened_band_is_byte_identical` holds this against scoring chosen to force ties.
+///
+/// # Returns
+///
+/// `(w, S)` with `w <= w_` the band to use. `w == 0` happens only for equal lengths and means the
+/// diagonal is the sole path scoring `S` or better, so the result is `S` and a single `M` run and
+/// the DP can be skipped. Returns `(w_, S)` unchanged for a matrix with no positive cell or negative
+/// gap penalties, where the bound's monotonicity does not hold.
+///
+/// # Parameters
+///
+/// As [`ksw_global2`], whose `w` is `w_` here and must span the length difference, which is what
+/// keeps the single-gap path inside the original band.
+#[allow(clippy::too_many_arguments)]
+pub fn tightened_global_band(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w_: i32,
+) -> (i32, i32) {
+    let (qlen, tlen) = (query.len(), target.len());
+    // `short_len`: the shorter length, which caps the aligned pairs. `gap`: the length difference.
+    let short_len = qlen.min(tlen);
+    let gap = qlen.abs_diff(tlen);
+    let cell = |pos_q: usize, pos_t: usize| -> i32 {
+        i32::from(mat[target[pos_t] as usize * m + query[pos_q] as usize])
+    };
+    // Walk the gap's position left to right: `run` starts with every pair on the far diagonal and
+    // moves one pair per step onto the near one. `best` keeps the highest total seen.
+    let (t_shift, q_shift) = if tlen >= qlen { (gap, 0) } else { (0, gap) };
+    let mut run: i32 = (0..short_len).map(|k| cell(k + q_shift, k + t_shift)).sum();
+    let mut best = run;
+    if gap != 0 {
+        for k in 0..short_len {
+            run += cell(k, k) - cell(k + q_shift, k + t_shift);
+            best = best.max(run);
+        }
+    }
+    let gap = gap as i32;
+    // `gap_cost`: what the one mandatory gap costs, and the extend penalty of its side.
+    let (gap_cost, e_long) = if gap == 0 {
+        (0, 0)
+    } else if tlen > qlen {
+        (o_del + gap * e_del, e_del)
+    } else {
+        (o_ins + gap * e_ins, e_ins)
+    };
+    let score = best - gap_cost;
+
+    let a = i32::from(*mat[..m * m].iter().max().expect("non-empty matrix"));
+    if a <= 0 || o_del < 0 || e_del < 0 || o_ins < 0 || e_ins < 0 {
+        return (w_, score);
+    }
+    let denom = a + e_del + e_ins;
+    let budget = short_len as i32 * a - score - (o_del + o_ins) - gap * e_long;
+    // `v_max`: the largest overshoot whose ceiling still reaches `score`.
+    let v_max = (budget / denom).max(0);
+    ((gap + v_max).min(w_), score)
+}
+
 /// Result of `ksw_align2`: a local (Smith-Waterman) alignment with start/end coordinates and the
 /// 2nd-best score. Mirrors bwa's `kswr_t` (the fields `mem_matesw` uses), whose all-miss default is
 /// `g_defr = { 0, -1, -1, -1, -1, -1, -1 }` (`ksw.h:52`), i.e. score 0 and everything else -1.
@@ -1307,6 +1398,78 @@ mod tests {
             k += 1;
         }
         mat
+    }
+
+    /// `tightened_global_band` promises the same score and CIGAR, ties included, as the band it
+    /// replaces. A two-letter alphabet, cheap gaps and low-complexity targets are what make ties and
+    /// gap-adjacent paths common; matching bwa's defaults alone would hardly exercise them.
+    #[test]
+    fn tightened_band_is_byte_identical() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| -> u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let (mut narrowed, mut skipped) = (0u64, 0u64);
+        for _ in 0..300_000 {
+            let a = 1 + next(3) as i8;
+            let b = 1 + next(6) as i8;
+            let mat = scmat(a, b);
+            let (o_del, e_del) = (next(9) as i32, 1 + next(3) as i32);
+            let (o_ins, e_ins) = if next(2) == 0 {
+                (o_del, e_del)
+            } else {
+                (next(9) as i32, 1 + next(3) as i32)
+            };
+            let alphabet = 2 + next(3);
+            let len = 1 + next(60) as usize;
+            let target: Vec<u8> = (0..len).map(|_| next(alphabet) as u8).collect();
+            // The query is the target through a few edits, so it stays near enough to tighten.
+            let mut query = Vec::with_capacity(len + 8);
+            let rate = [0, 20, 60, 200][next(4) as usize];
+            let mut i = 0;
+            while i < target.len() {
+                match next(1000) {
+                    x if x < rate => query.push(next(alphabet) as u8),
+                    x if x < rate + rate / 4 => query.push(4),
+                    x if x < rate + rate / 2 => i += next(5) as usize,
+                    x if x < rate + 3 * rate / 4 => {
+                        for _ in 0..next(5) {
+                            query.push(next(alphabet) as u8);
+                        }
+                        query.push(target[i]);
+                    }
+                    _ => query.push(target[i]),
+                }
+                i += 1;
+            }
+            if query.is_empty() {
+                continue;
+            }
+            let span = query.len().abs_diff(target.len()) as i32;
+            let w_ = span + next(40) as i32;
+            let (w, lower_bound) =
+                tightened_global_band(&query, &target, 5, &mat, o_del, e_del, o_ins, e_ins, w_);
+            let wide = ksw_global2(&query, &target, 5, &mat, o_del, e_del, o_ins, e_ins, w_);
+            let tight = ksw_global2(&query, &target, 5, &mat, o_del, e_del, o_ins, e_ins, w);
+            assert_eq!(
+                wide, tight,
+                "w_={w_} w={w} q={query:?} t={target:?} a={a} b={b} O={o_del},{o_ins} E={e_del},{e_ins}"
+            );
+            assert!(lower_bound <= wide.0 || w == w_, "bound above the optimum");
+            narrowed += u64::from(w < w_);
+            if w == 0 {
+                skipped += 1;
+                assert_eq!(wide, (lower_bound, vec![(query.len() as u32) << 4]));
+            }
+        }
+        // Guards the test itself: a generator that never narrows would pass by doing nothing.
+        assert!(
+            narrowed > 100_000 && skipped > 1_000,
+            "{narrowed} {skipped}"
+        );
     }
 
     #[test]

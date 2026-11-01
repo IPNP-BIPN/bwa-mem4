@@ -21,6 +21,7 @@
 #   scripts/docker_gates.sh parity    # opt_parity.sh against the platform's bwa-mem2 oracle
 #   scripts/docker_gates.sh rss       # peak RSS vs -t, bwa-mem4 against the fork, both -K regimes
 #   scripts/docker_gates.sh bench     # wall time, N reps alternated, median reported
+#   scripts/docker_gates.sh icount    # exact instruction counts of the kernels, immune to host load
 #   scripts/docker_gates.sh all       # build, check, parity, rss
 #   scripts/docker_gates.sh shell     # interactive container, both binaries on PATH
 #
@@ -95,6 +96,13 @@ cmd_check() {
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace 2>&1 | grep -E "^test result" \
       | awk -F"[ ;]" "{p+=\$4; f+=\$7} END {print \"tests: \" p \" passed, \" f \" failed\"}"'
+}
+
+# Instruction counts under Callgrind: the one measurement here a loaded host cannot disturb. Valgrind
+# disables ASLR through personality(2), which Docker's default seccomp profile refuses. Counts differ
+# between ARCH values, so compare them within one.
+cmd_icount() {
+  run --security-opt seccomp=unconfined "$IMAGE" bash -c 'cd /work && cargo bench -p bwa-mem4-extend --bench global_icount'
 }
 
 # Fixture shared by the measurements: the committed tiny index plus reads generated from it, kept in
@@ -193,7 +201,8 @@ case "${1:-}" in
   fork)   cmd_fork ;;
   rss)    cmd_rss ;;
   bench)  cmd_bench ;;
+  icount) cmd_icount ;;
   shell)  cmd_shell ;;
   all)    cmd_build; cmd_check; cmd_parity; cmd_rss ;;
-  *) sed -n '2,28p' "$0"; exit 1 ;;
+  *) sed -n '2,29p' "$0"; exit 1 ;;
 esac

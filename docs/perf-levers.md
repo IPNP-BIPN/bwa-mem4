@@ -1470,3 +1470,50 @@ on the input data:
 Gates at the end of the session: `check.sh` (fmt, clippy `-D warnings`, workspace tests, x86_64
 cross-check, x86_64 tests under Rosetta), `scripts/opt_parity.sh` **58 passed / 0 failed** across SE,
 PE, interleaved, `-a -M -Y -5 -q -H -w -t`, file and BGZF output, and the oracle md5 at fixed `-K`.
+
+## `ksw_global2`: a band bounded by a real alignment's score (-69% on wgsim, kept)
+
+`gen_cigar2` sizes its band from what half the read could pay for, which is far wider than the read
+can use. `tightened_global_band` scans for the best alignment with one gap of exactly the length
+difference, and that score bounds how far off those diagonals any competing path can profit. A
+`w == 0` result means the diagonal is the only candidate, so the DP is skipped. The docs on the
+function give the argument that this holds for every tie and for the traceback's walk across a gap
+opened from M; `tightened_band_is_byte_identical` holds it to scoring chosen to force ties, and ran
+once at 30M cases.
+
+M4 Max, `-t4 -K 10000000`, interleaved x3, medians, md5 without `@PG` equal to bwa-mem2's on both:
+
+| reads | `ksw_global2` CPU | whole run, user CPU |
+|---|---|---|
+| wgsim, 1M pairs, 150 bp, chr20+21 (GRCh37), `-e 0.01 -r 0.001` | 2.40 -> 0.74 s (-69%) | 40.54 -> 38.99 s (-3.8%) |
+| real mouse RNA-seq, 3M pairs, 58 bp, chr14 (GRCm39) | 0.31 -> 0.14 s (-54%) | 52.72 -> 52.67 s (-0.1%) |
+
+x86 not measured, and that is where this should matter more: the function was 11.9% of the Zen 3
+profile (`docs/x86-side-by-side-profile.md`).
+
+**Rejected on the way, as replacement kernels.** `ksw2rs` (`ksw_extz2`): it opens gaps from H where
+bwa opens from M, and its 16-cell blocks reach outside the requested band, so its score or CIGAR
+differed from `ksw_global2` on up to 25% of synthetic cases at narrow bands and on 0.015% even at
+wide ones. It was also 1.2-1.6x slower at `w <= 8` and only won from about `w >= 20`, a range this
+change now removes. `hyalite`, read but not run for this: no band, no extension, and by its own docs
+its `score2` agrees with bwa's only for some query lengths. It stays what it already is here, a
+third-party oracle in `crates/bwa-extend/tests/third_party_oracle.rs`.
+
+## Tooling tried against this workload (2026-11-01)
+
+Each was run on the same data as the section above, on the M4 Max or in a native arm64 Linux
+container. "Kept" means it is wired in or worth reaching for; none of them touches the shipped binary.
+
+| tool | what it showed here | verdict |
+|---|---|---|
+| `gungraun` | `ksw_global2` + tightened band: 132,350 -> 36,411 instructions at 3 mismatches, 266,470 -> 86,202 at 6, 102,964 -> 50,170 with a 2 bp deletion | **kept**, `scripts/docker_gates.sh icount`. Needs Valgrind, so Linux only here |
+| `samply` | `LsSlot::step` 32%, `batched_extend_neon_u8` 25%, `get_sa_batch` 8%, `fwd_local_sw_neon_u8` 5%, allocator about 1% (-t4, 1M wgsim pairs, 110 Mb reference) | **kept** for profiling. `samply setup` once, then `record --save-only` |
+| `dhat-rs` | 54 allocations per read, and 22% of them are the one-seed `vec![seed]` at `bwa-chain/src/lib.rs:773`. Allocator CPU is about 1%, so removing those is worth about 0.2%: left alone. Peak heap is index, then the FASTQ read-ahead | used once in a scratch copy, not wired in |
+| `cargo-show-asm` | installed, not needed: hot-instruction histograms from the `samply` profile answered the question | available |
+| BOLT through `cargo-pgo` | Linux arm64, 4 interleaved reps, md5 identical: CPU medians 43.50 -> 43.05 s and 59.50 -> 59.50 s, overlapping reps, with training on a subset of the first set. Binary 4.3 -> 7.4 MB | **rejected on arm64**. x86 not measured: Rosetta timings say nothing |
+| `qwt` | 73-82 ns per 4-symbol rank against 8.9 ns for `FmIndex::get_occ`, random positions over 222 M symbols | **rejected**, 8-9x slower |
+| `paraseq` | 29 ms against 51 ms for `needletail` to parse 1M reads, which is 22 ms in a 10 s run | **rejected**, real but invisible |
+| `genedex` | needs C libsais with OpenMP, which does not build on this host's toolchain | not measured |
+
+`samply` also settled where to look next: `step`'s time is spread over its branches with no single
+hot load, so no cheap win is left there.

@@ -21,5 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # `-Cprofile-generate` build writes. Needed by the `pgo` step; harmless otherwise.
 RUN rustup component add llvm-tools-preview
 
+# Valgrind and its driver, for the instruction counts of the `icount` step. The runner's version must
+# equal the `gungraun` pin in crates/bwa-extend/Cargo.toml.
+RUN apt-get update && apt-get install -y --no-install-recommends valgrind && rm -rf /var/lib/apt/lists/*
+RUN cargo install --version 0.19.3 --locked gungraun-runner
+
 ENV CARGO_TARGET_DIR=/build/target
 WORKDIR /work
