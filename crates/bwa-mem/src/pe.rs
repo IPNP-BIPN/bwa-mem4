@@ -69,7 +69,7 @@ use std::io::{self, Write};
 use bwa_core::MemOpt;
 use bwa_extend::{ksw_align2, KswAlignResult};
 use bwa_index::{BntSeq, FmIndex};
-use bwa_neon::{batched_ksw_align2, KswJob};
+use bwa_neon::{batched_mate_rescue, KswJob};
 
 use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
@@ -553,7 +553,7 @@ struct Orient {
 
 /// One anchor's mate rescue, split into the SW-independent `collect` (which orientations to run) and
 /// the SW-dependent `apply` (insert the hits). Mirrors [`mem_matesw`] exactly but lets the SW of many
-/// anchors, across the whole pair batch, run through one vectorized [`batched_ksw_align2`].
+/// anchors, across the whole pair batch, run through one vectorized [`batched_mate_rescue`].
 struct RescueCall {
     /// `skip[r] != 0` means orientation `r` runs no SW. `matesw_apply` re-walks this so its
     /// per-orientation dedup fires on exactly the same iterations as the C's loop.
@@ -844,7 +844,7 @@ pub struct PairRescueData<'a> {
 
 /// `BWA4_RESCUE_ROUNDS=1` probe: is the per-ROUND batching starving the rescue kernel's SIMD lanes?
 ///
-/// [`batch_mate_rescue`] issues ONE [`batched_ksw_align2`] call per round, and a round only holds the
+/// [`batch_mate_rescue`] issues ONE [`batched_mate_rescue`] call per round, and a round only holds the
 /// pairs whose anchor list is still that deep. Round 0 batches every pair; round 20 batches only the
 /// few with 20+ anchors. `fg-labs/bwa-mem3` instead flattens every (pair, anchor) into a single array
 /// and calls its kernel once (`mem_sam_pe_batch_pre`, `bwamem_pair.cpp:733-745`), which cannot empty
@@ -1107,7 +1107,7 @@ pub mod rescue_rounds {
 
 /// Batched mate rescue across a whole pair batch: identical to running [`mem_matesw`] inside each
 /// pair's `mem_sam_pe`, but every anchor's insert-window SW (across all pairs) runs in one vectorized
-/// [`batched_ksw_align2`], filling the SIMD lanes that a single pair's <=4 orientations cannot.
+/// [`batched_mate_rescue`], filling the SIMD lanes that a single pair's <=4 orientations cannot.
 ///
 /// bwa-mem2's rescue snapshots each read's near-best regions as anchors (before any rescue), then, per
 /// anchor, SW-rescues the mate in each missing orientation. Anchors of one read against one mate are
@@ -1224,7 +1224,7 @@ pub fn batch_mate_rescue(
             spans.push((start, jobs.len() - start));
         }
         // No `lanes` argument here, unlike the scalar [`mem_matesw`] call, which passes 16 or 8 from
-        // bwa's `l_ms * a < 250` KSW_XBYTE test. `batched_ksw_align2` instead bins jobs by length
+        // bwa's `l_ms * a < 250` KSW_XBYTE test. `batched_mate_rescue` instead bins jobs by length
         // internally and its u8 kernel uses *unsigned* saturating lanes, so it covers scores in
         // [128, 255] that bwa-mem2 would have routed to int16 (see the `define_sw_kernel!` u8
         // instantiation in `bwa-neon/src/batched.rs`). The batched kernels are documented there as
@@ -1249,7 +1249,7 @@ pub fn batch_mate_rescue(
         crate::rescue_split::stop(&crate::rescue_split::COLLECT_NS, t_collect);
         let t_kernel = crate::rescue_split::start();
         // `alns`: one result per job, index-aligned with `jobs`.
-        let alns = batched_ksw_align2(
+        let alns = batched_mate_rescue(
             &jobs,
             5,
             &opt.mat,

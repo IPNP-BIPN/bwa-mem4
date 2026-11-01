@@ -101,6 +101,74 @@ pas avec lui-meme** entre x86_64 et arm64 sous scoring non defaut (`-A 2`), et c
 qui respecte la loi d'echelle imposee par l'algorithme. Notre parite est enoncee contre lui
 (upstream `bwa-mem2#297`, ouvert depuis ce projet).
 
+## Ce que fg-labs/bwa-mem3 a publie de v0.10.0 a v0.14.0, et ce qu'on en a pris (2026-10-07)
+
+La derniere comparaison au fork datait de v0.9.0. Cinq releases plus tard, tri fait PR par PR.
+
+**Corrections de bugs : presque rien ne nous concerne.** Leurs bugs de sortie viennent de leurs
+propres raccourcis (echelle de relance a un barreau #543, arret precoce de l'echelle #540, chemin
+rapide sans gap #544, enveloppe 8 bits w=124 #422, derive du z-drop 16 bits #471) ou de la surete
+memoire du C. Classes rejouees contre bwa-mem2 2.3 sur `testdata/tiny`, 3 jeux (150, 250, 400 pb,
+mutations, indels, 10 % de mates aleatoires) x 13 jeux de parametres (defaut, `-w 0/1/150/300`,
+`-L 0`, `-O 25`, `-O 20 -E 3`, `-d 5`, `-d 20 -E 4`, `-B 6`, `-O 8 -E 2`, `-A 2`) : **39/39
+octet-identiques**.
+
+**Pris : la validation de la CLI** (leurs #460, #501, #554). `-E 0` faisait paniquer le rescue (division
+par zero dans `rev_span_bound`, exit 134 ; bwa fait un SIGFPE au meme endroit). `-O 8,-1` tournait
+silencieusement en `-O 8`, `-O 6x` en `-O 6`. Tout cela est maintenant refuse, ainsi qu'une moyenne
+`-I` non positive ou un ecart-type negatif ; aucune ligne de commande valide ne change de sortie. Le
+fork refuse aussi `-I mean,0`, pas nous : un ecart-type nul est une librairie a insert fixe (panels
+amplicon), bwa le traite de facon deterministe et `opt_parity.sh` l'epingle (`-I 394,0`).
+
+**Pris : l'elagage exact du mate rescue** (leurs #533, #541). Un filtre sur les K-mers communs au
+mate et a la fenetre prouve qu'un job ne peut pas atteindre `min_seed_len * a` (on ne le lance pas)
+ou borne les lignes de la fenetre qui peuvent porter un maximum de ligne au-dessus (on ne calcule
+qu'elles). Port Rust du filtre scalaire, Kadane creux sur les seules diagonales occupees (egal au
+balayage dense sur 20 000 jobs generes), decisions verifiees contre `ksw_align2` (6 000 jobs, 5
+scorings, 4 mutations deliberees de la borne toutes detectees). Actif par defaut, seuil de hits 400 ;
+`BWA4_RESCUE_PRUNE=0` le coupe.
+
+**Le verdict depend entierement des donnees, et seules les vraies lectures tranchent.** Sur des
+lectures simulees la fenetre contient presque toujours le vrai mate : 1,3 % de jobs elagues sur
+chr20 wgsim, et le filtre coute plus qu'il ne rapporte (+1 a +3 % de temps user a `-t1`). Sur 2 M
+paires GIAB HG002 HiSeq reelles contre hg38 entier, le rescue pese **33 % du CPU** (126 s sur 380 a
+`-t12`, fenetres de 1 396 pb) et le filtre prouve en echec **15,1 % des 6,9 M jobs**, exactement le
+chiffre du fork en WGS :
+
+| seuil de hits | jobs prouves en echec | DP + filtre (compteurs) | user `-t1`, 300 k paires, mediane de 3 |
+|---|---|---|---|
+| sans filtre | 0 | 126,1 s | 47,40 s |
+| 300 | | | 47,17 s |
+| **400** | **947 841 (13,6 %)** | **120,3 s, dont 11,0 s de filtre** | **46,64 s (-1,6 %)** |
+| 1000 | 1 052 068 | 140,7 s | |
+
+A `-t12` le gain est sous le bruit (-0,6 % user, -0,1 % mur, 3 tirages entrelaces). Sortie
+octet-identique a bwa-mem2 sur ces 2 M paires (`703b1bd7cf97`), comme sur les jeux chr20. Au-dela de
+400, la coque des jobs qui reussissent garde 80 % des lignes et le filtre coute plus qu'il ne sauve.
+
+**Un filtre plus rapide ne rapporte presque plus rien : le plafond est mesure.** Banc hors ligne sur
+347 k vrais jobs captures (`BWA4_RESCUE_DUMP`, test ignore `prune_bench`) : les fenetres reelles sont
+repetitives, 1 646 hits par job en moyenne dont 1 100 viennent de K-mers repetes dans le mate, et les
+series de hits consecutifs ne font que 2,1 lignes. A la porte 400 le filtre entier ne coute que 1,15 us
+par job, soit ~2 % du temps total : un filtre gratuit gagnerait ~2 %, un filtre SIMD 2x (ce que le
+fork annonce pour NEON) ~1 %. Monter la porte ne paie pas davantage : 400 -> 1000 economise 8,5 s de DP
+sur 380 s (1,2 us/job) pour 29 s de filtre (4,2 us/job), il faudrait un filtre 3,5x moins cher sur les
+fenetres denses. Essais faits : series par diagonale (neutre), series par couche d'occurrence comme le
+fork (plus lent, 7,3 contre 6,0 us de comptage, les series sont trop courtes). Pris : porte estimee sur
+une ligne sur quatre (c'est une heuristique de cout, sans effet sur l'exactitude), compteurs du mate
+etiquetes par generation au lieu d'etre remis a zero (la requete change a CHAQUE job : un mate revient
+~14 fois mais a plus de 16 jobs d'ecart, les ancres etant traitees par tours), chaines construites
+seulement pour les jobs qui passent la porte. Filtre a la porte 400 : 1,29 -> 1,13 us/job, porte
+0,74 -> 0,43 us ; sur 2 M paires GIAB 11,0 -> 10,2 s de filtre, sortie toujours `703b1bd7cf97`. De bout
+en bout c'est sous le bruit (-0,3 % attendu).
+
+**Reste a faire, dans l'ordre** : (1) le levier qui reste est cote DP, pas filtre : un DP en bandes sur
+les composantes (#535 du fork) au lieu de la coque entiere, qui garde 80 % des lignes sur les fenetres
+denses ; (2) filtre SIMD, seulement si (1) rend les portes hautes rentables. Non pris, faute de mesure : allocateur sans purge (#523, `MIMALLOC_PURGE_DELAY`), SA
+echantillonne tous les 2 rangs (#510, notre `SA_SAMPLE_STRIDE = 8`), chainage par marche run-length
+(#531). Deja chez nous : saut des graines contenues, dedup des jobs DP, cellule de rescue USQADD et
+deux lignes par passe, encodage SEQ/QUAL par blocs, BGZF parallele.
+
 ## hyalite 0.3.0 : nos deux corrections sont remontees en amont (2026-08-09)
 
 Mise a jour de la section ci-dessous. Le pin de developpement passe de `0.2` a **`0.3.0`**, et
