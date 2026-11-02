@@ -2876,6 +2876,12 @@ fn write_aln_se(
             tags.push_str(comment);
         }
     }
+    // `-V` closes the record, after even the comment (`bwamem.cpp:1721`). The comment is in whatever
+    // encoding the FASTA was, so from here `tags` is bytes.
+    let mut tags = tags.into_bytes();
+    if opt.flag & flags::REF_HDR != 0 {
+        bwa_mem::emit::push_xr(&mut tags, bns.contigs[aln.rid as usize].comment());
+    }
 
     // ---- Remaining columns, then hand the finished pieces to the byte formatter ----
     // SAM column 6, already converted: `cigar_string_which` is what turns bwa's `H` into `S` for a

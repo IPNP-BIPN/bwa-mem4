@@ -241,6 +241,21 @@ pub fn push_qual_rev(out: &mut Vec<u8>, qual: &[u8]) {
     }
 }
 
+/// Append the `-V` tag for a contig's FASTA comment, or nothing when it has none (`bwamem.cpp:1721`).
+///
+/// # Parameters
+///
+/// - `out`: the SAM record under construction.
+/// - `anno`: `Contig::comment` of the contig the record is placed on.
+pub fn push_xr(out: &mut Vec<u8>, anno: &[u8]) {
+    if anno.is_empty() {
+        return;
+    }
+    out.extend_from_slice(b"\tXR:Z:");
+    // A TAB would end the tag, so the C turns it into a space.
+    out.extend(anno.iter().map(|&c| if c == b'\t' { b' ' } else { c }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
