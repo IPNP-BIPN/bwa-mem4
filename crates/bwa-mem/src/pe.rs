@@ -73,7 +73,9 @@ use bwa_neon::{batched_mate_rescue, KswJob};
 
 use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
-use crate::primary::{hash_64, mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch};
+use crate::primary::{
+    hash_64, insert_into_settled, mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch,
+};
 use crate::MemAlnReg;
 
 extern "C" {
@@ -712,7 +714,9 @@ fn rescue_jobs(call: &RescueCall) -> impl Iterator<Item = KswJob<'_>> {
 /// for `l_pac`. `call` is the matching [`matesw_collect`] output (its `skip` drives the loop, its
 /// `per_r` the coordinate mapping, its `rid`/`is_alt` the new regions' fields). `alns` are the SW
 /// results for that call's jobs, in orientation order. `ma` is the mate's region vector, mutated in
-/// place and left sorted score-descending.
+/// place and left sorted score-descending. `ma_settled` says whether `ma` is what
+/// [`insert_into_settled`] requires, starts false for a list fresh from the first dedup, and is kept
+/// up to date here.
 fn matesw_apply(
     fm: &FmIndex,
     bns: &BntSeq,
@@ -720,6 +724,7 @@ fn matesw_apply(
     call: &RescueCall,
     alns: &[KswAlignResult],
     ma: &mut Vec<MemAlnReg>,
+    ma_settled: &mut bool,
 ) {
     let l_pac = bns.l_pac;
     let l_ms = call.l_ms;
@@ -805,6 +810,18 @@ fn matesw_apply(
                     hash: 0,
                     n_comp: 0,
                 };
+                // A settled list can often take the hit without the full pass. See the function.
+                let b = if *ma_settled {
+                    match insert_into_settled(opt, ma, b) {
+                        Ok(()) => {
+                            n += 1;
+                            continue;
+                        }
+                        Err(b) => b,
+                    }
+                } else {
+                    b
+                };
                 let mut ins = 0;
                 while ins < ma.len() && ma[ins].score >= b.score {
                     ins += 1;
@@ -822,6 +839,8 @@ fn matesw_apply(
                 crate::rescue_split::APPLY_DEDUP_ROWS.fetch_add(ma.len() as u64, Relaxed);
             }
             let taken = std::mem::take(ma);
+            // Below two regions the pass returns its input as it found it, so that proves nothing.
+            *ma_settled = taken.len() >= 2;
             *ma = mem_sort_dedup_patch(fm, opt, &[], taken);
             crate::rescue_split::stop(&crate::rescue_split::APPLY_DEDUP_NS, t_dd);
             dirty = false;
@@ -1183,6 +1202,8 @@ pub fn batch_mate_rescue(
     // Round k processes the k-th anchor of every (pair, direction) that still has one. Pairs with
     // fewer anchors simply drop out of later rounds; the loop count is the deepest anchor list.
     rescue_rounds::record_chunk(max_rounds);
+    // Whether each pair's `[a1, a0]` is settled in the sense of `matesw_apply`, indexed by `dir`.
+    let mut settled = vec![[false; 2]; pairs.len()];
     for round in 0..max_rounds {
         // Collect this round's rescue calls across all pairs and both directions.
         // `calls`: every rescue this round will perform, tagged with the pair index and direction it
@@ -1272,7 +1293,15 @@ pub fn batch_mate_rescue(
             } else {
                 &mut *pairs[*pi].a0
             };
-            matesw_apply(fm, bns, opt, call, &alns[start..start + count], target);
+            matesw_apply(
+                fm,
+                bns,
+                opt,
+                call,
+                &alns[start..start + count],
+                target,
+                &mut settled[*pi][*dir],
+            );
         }
         crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
     }

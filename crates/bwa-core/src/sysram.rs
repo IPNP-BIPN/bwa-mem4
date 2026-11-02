@@ -143,9 +143,10 @@ const BATCH_BYTES_PER_BASE: f64 = 24.0;
 
 /// Resident bytes the loaded index costs, per base of the FORWARD strand (`l_pac`).
 ///
-/// Also measured, from the same probe's index baseline: 0.181 GB for chr21 (3.9 bytes per base) and
-/// 10.47 GB for GRCh38 (3.4). Rounded UP for the same reason as above.
-const INDEX_BYTES_PER_PAC_BASE: f64 = 4.0;
+/// Also measured: 6.4 GB of RSS for GRCh38 (2.1 bytes per base) once `FmIndex` held its checkpoints
+/// in 32 bytes rather than the file's 64. Small genomes run higher on the probe's fixed allocations,
+/// and this is rounded UP for the same reason as above.
+const INDEX_BYTES_PER_PAC_BASE: f64 = 2.4;
 
 /// What the aligner should do about holding a second batch in flight.
 ///
@@ -207,10 +208,10 @@ mod tests {
     #[test]
     fn overlap_is_dropped_only_when_the_machine_is_actually_tight() {
         // GRCh38 (l_pac 3.1e9) at the default -K for 8 threads (80M bases): the index alone is
-        // ~12.4 GB by this estimate, two batches ~3.8 GB, so a 16 GB host cannot hold it and a
-        // 128 GB one can, comfortably.
+        // ~7.4 GB by this estimate, two batches ~3.8 GB, and 1.25x of headroom on that is ~14 GB, so
+        // a 8 GB host cannot hold it and a 128 GB one can, comfortably.
         let d = batch_overlap_fits(3_100_000_000, 80_000_000);
-        assert!(d.need_gb > 16.0 && d.need_gb < 32.0, "need {}", d.need_gb);
+        assert!(d.need_gb > 8.0 && d.need_gb < 32.0, "need {}", d.need_gb);
 
         // chr21 (l_pac 46.7e6) at -K 100M, the CI measurement: 6 GB of need, so any real machine
         // keeps the overlap.

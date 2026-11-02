@@ -366,6 +366,20 @@ impl BntSeq {
         mid
     }
 
+    /// Whether forward position `pos_f` lies in contig `rid`: what [`pos2rid`](Self::pos2rid) would
+    /// answer `rid` for, given the offsets' ascending invariant. `rid` may be its -1.
+    #[inline]
+    fn in_contig(&self, rid: i32, pos_f: i64) -> bool {
+        if rid < 0 {
+            return false;
+        }
+        let end = self
+            .contigs
+            .get(rid as usize + 1)
+            .map_or(self.l_pac, |next| next.offset);
+        (self.contigs[rid as usize].offset..end).contains(&pos_f)
+    }
+
     /// Contig index for the interval `[rb, re)` in 2L space, or a negative code if it bridges a
     /// contig boundary (-1) or the forward/reverse midpoint (-2). Mirrors `bns_intv2rid`.
     ///
@@ -395,9 +409,16 @@ impl BntSeq {
         }
         // Contig index of the interval's first base, resolved in FORWARD space via `depos`.
         let rid_b = self.pos2rid(self.depos(rb).0);
-        // Contig index of the interval's LAST base (`re - 1`, since `re` is exclusive).
+        // Contig index of the interval's LAST base (`re - 1`, since `re` is exclusive). A seed is
+        // short, so that is nearly always the contig just found, and testing it costs two compares
+        // where a second search costs a mispredicted branch per probe.
         let rid_e = if rb < re {
-            self.pos2rid(self.depos(re - 1).0)
+            let last = self.depos(re - 1).0;
+            if self.in_contig(rid_b, last) {
+                rid_b
+            } else {
+                self.pos2rid(last)
+            }
         } else {
             rid_b
         };
@@ -615,5 +636,56 @@ mod tests {
         assert_eq!(bns.contigs[0].name, "20:2000000-2200000");
         assert_eq!(bns.contigs[0].len, 200_001);
         assert_eq!(bns.contigs[0].offset, 0);
+    }
+
+    #[test]
+    fn intv2rid_agrees_with_two_searches() {
+        let lens = [5, 1, 7, 2];
+        let mut offset = 0;
+        let contigs = lens
+            .iter()
+            .map(|&len| {
+                let contig = Contig {
+                    gi: 0,
+                    name: String::new(),
+                    anno: String::new(),
+                    offset,
+                    len,
+                    n_ambs: 0,
+                    is_alt: false,
+                };
+                offset += i64::from(len);
+                contig
+            })
+            .collect();
+        let bns = BntSeq {
+            l_pac: offset,
+            n_seqs: lens.len() as i32,
+            seed: 0,
+            contigs,
+            n_holes: 0,
+            ambs: Vec::new(),
+        };
+        for rb in 0..2 * bns.l_pac {
+            for re in rb..=2 * bns.l_pac {
+                // The C's shape, with both ends searched.
+                let expected = if rb < bns.l_pac && re > bns.l_pac {
+                    -2
+                } else {
+                    let rid_b = bns.pos2rid(bns.depos(rb).0);
+                    let rid_e = if rb < re {
+                        bns.pos2rid(bns.depos(re - 1).0)
+                    } else {
+                        rid_b
+                    };
+                    if rid_b == rid_e {
+                        rid_b
+                    } else {
+                        -1
+                    }
+                };
+                assert_eq!(bns.intv2rid(rb, re), expected, "[{rb}, {re})");
+            }
+        }
     }
 }

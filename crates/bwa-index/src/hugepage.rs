@@ -2,10 +2,10 @@
 //!
 //! # Why this exists
 //!
-//! Seeding is ~78% of single-end wall, and it is a random walk over `cp_occ`: 6.2 GB on GRCh38,
+//! Seeding is ~78% of single-end wall, and it is a random walk over `cp_occ`: 3.1 GB on GRCh38,
 //! touched one 64-byte cache line at a time at addresses the FM recurrence *computes*, so no
 //! prefetcher can help and every access is a fresh page-table lookup. With Linux's 4 KiB base page
-//! a 64-entry L1 dTLB covers **256 KiB** of that 6.2 GB array, i.e. essentially nothing: virtually
+//! a 64-entry L1 dTLB covers **256 KiB** of that 3.1 GB array, i.e. essentially nothing: virtually
 //! every `get_occ` pays a hardware page-table walk on top of its cache miss.
 //!
 //! This is also why the effect is invisible in this project's own history of measurements. It is

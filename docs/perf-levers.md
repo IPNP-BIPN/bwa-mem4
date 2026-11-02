@@ -706,6 +706,11 @@ inserted, and their permutation is output-observable so the algorithm cannot be 
 needs an incremental structure that reproduces klib's exact tie order, which is a much larger and
 riskier piece of work than anything attempted here.
 
+**Update (2026-10-31): done, without reproducing the tie order.** `insert_into_settled`
+(`bwa-mem/src/primary.rs`) places a rescue hit directly into a list that is already a fixed point of
+`mem_sort_dedup_patch`, and rescue dedup calls fall from ~1.42M to ~92k on 500k GIAB pairs. Paired-end
+cycles drop 11 to 17% with byte-identical output; `ROADMAP.md` has the table.
+
 ### Flat arena for the mate-rescue reverse pass: NULL
 
 The reverse pass of the batched mate-rescue kernel (`bwa-neon/src/matesw.rs`) materialised the
@@ -1545,19 +1550,34 @@ compilation. `opt_parity.sh` reports two x86 failures, `-A 2` and `-A 2 -B 3`, a
 our x86 output equals both our arm64 output and the arm64 oracle, and only the x86 oracle differs. The
 same holds on the larger fixture for `-A2 -B8 -O12 -E2` (2825 records) and `-A1 -B1 -O1 -E1` (2).
 
-**This catch-up is incomplete, and the largest gain is not in it.** #595, #599, #619 and part of #609 exist
-here only in `7be7754`, on the unmerged `claude/optimize-speed-ram-37aa71` (32-byte checkpoints,
-`sa_ms_byte` as a bit, per-chunk dedup, freeing each pair at emit). Three interleaved passes against
-that commit's parent, records still identical to `bwa-mem2`:
+**The largest gain came from porting our own `7be7754`**, which covers #595, #599, #619 and part of #609
+(32-byte checkpoints, `sa_hi` at a bit per sample, per-chunk dedup, freeing each pair at emit). An earlier
+decision not to stack it rested on small references, where it does not win on cycles. On top of the
+catch-up, `-t4`, interleaved, records identical to `bwa-mem2` in every pass:
 
-| `7be7754` against its parent | cycles | instructions | peak RSS |
-|---|---|---|---|
-| whole GRCm39, wgsim 1M | **-14.9%** | -6.5% | **-30.6%** (11.8 -> 8.2 GB) |
-| chr14, RNA-seq 3M | +2.5% | +5.1% | -13.0% |
+| against the catch-up | passes | cycles, median (min) | instructions | peak RSS |
+|---|---|---|---|---|
+| whole GRCm39, wgsim 1M, PE | 6 | **-11.5%** (-14.8%) | -6.4% | **-29.4%** (11.7 -> 8.3 GB) |
+| whole GRCm39, wgsim 1M, SE | 3 | -2.1% (-2.6%) | +5.2% | **-29.7%** |
+| chr14, RNA-seq 3M, PE | 6 | +1.0% (+3.8%) | +5.5% | -14.7% |
+| chr20+21, wgsim 200k, PE | 6 | -2.1% (+1.2%) | +7.2% | -18.3% |
 
-An earlier decision not to stack it rested on small references, which is exactly where it loses. Those
-two binaries predate #83, so this is not yet the gain on the current tree. It merges with no textual
-conflict against this commit, not checked against the uncommitted catch-up.
+Some passes on both sides were disturbed by other work on the host (context switches tripled, one run took
+81 s against 39 s), so wall time means nothing here and the GRCm39 median understates the gain: its two
+quiet pairs give -15%. On a small index it costs instructions and gains nothing clear on cycles; the memory
+saving holds everywhere. x86 timing is **not measured**: the two bit planes there go through scalar
+popcounts, and the emulated x86 of `docker_gates.sh` could only give a ratio.
+
+Output of that port: 66 of 66 arm64 runs match `bwa-mem2` (three inputs, 18 option sets including `-5`,
+`-S`, `-P`, `-Y`, plus SE, `-t1`, `-t16` and the default `-K`). On x86 under Rosetta it matches the pre-port
+tree on 12 of 12 cases. Its 32-bit count path past 2^32 occurrences has still never seen a real genome of
+that size. Rescue is thin on these reads, and no real human reads are on this machine for
+`insert_into_settled`, whose randomised test compares it to the full pass.
+
+The x86 oracle is not stable under Rosetta. On chr20+21, with identical arguments, it alternates between
+two outputs differing on 90 of 100,002 records (`-t1` too). One of them equals the arm64 oracle and both of
+our builds, which never moved. The cause was not established, so a one-off x86 `DIFF` on that index
+proves nothing.
 
 Already covered here, not ported: #626 (`mem_collect_smem_batched` refills in the same pass), #618
 (`get_sa_batch` already runs 128 lanes), #624 (our chain filter runs right after chaining the same
@@ -1584,5 +1604,5 @@ and #586, #587, #590, #610, #611 were not tried. #583, #593 and #601 are documen
 #589 was a real bug here too: `advise_hugepage` passed unaligned starts, which `madvise` rejects with
 `EINVAL` (checked on Linux arm64: offset 16 gives `EINVAL`, offset 0 succeeds). Our binary never noticed,
 since mimalloc obtains the huge pages itself, but a library consumer on the system allocator lost the hint
-on the three heap arrays (`cp_occ`, `sa_ms_byte`, `sa_ls_word`); `pac` is an aligned mapping and was fine.
+on the three heap arrays (`cp_occ`, `sa_hi`, `sa_ls_word`); `pac` is an aligned mapping and was fine.
 Fixed by rounding the range inward. The huge-page effect of the fix is not measured.

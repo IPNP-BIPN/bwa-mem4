@@ -2378,9 +2378,10 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         if crate::stage_alloc::enabled() {
             crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
         }
-        // Per-read candidate alignments BEFORE dedup and primary marking, also parallel to `batch`.
-        let regs_all =
-            stage_time::measure(Stage::Align, || batched_regs(&fm, &bns, &opt, &all_codes));
+        // Per-read alignments after dedup and before primary marking, also parallel to `batch`.
+        let regs_all = stage_time::measure(Stage::Align, || {
+            batched_regs(&fm, &bns, &opt, &all_codes, dump_regs_enabled())
+        });
         // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
         // `into_par_iter` yields the owned `Vec<MemAlnReg>`, dropping a per-read Vec allocation+copy.
         // One entry per read: that read's finished SAM records (possibly several, possibly one
@@ -2391,14 +2392,14 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
                 .zip(all_codes.par_iter())
                 .zip(regs_all.into_par_iter())
                 .enumerate()
-                .map(|(read_in_batch, ((rec, codes), regs_pre))| {
+                .map(|(read_in_batch, ((rec, codes), regs))| {
                     finish_se(
                         &fm,
                         &bns,
                         &opt,
                         rec,
                         codes,
-                        regs_pre,
+                        regs,
                         base_id + read_in_batch as u64,
                     )
                 })
@@ -2424,7 +2425,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Seed + chain + batched extension for a whole read batch, returning each read's pre-dedup regions
+/// Seed + chain + batched extension + dedup for a whole read batch, returning each read's regions
 /// (byte-identical to `align_read` per read). Chunked across the rayon pool so extension batches run
 /// in parallel; per-read results are independent of the chunking.
 ///
@@ -2435,17 +2436,19 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
 /// - `opt`: the fully-derived options; read-only.
 /// - `codes`: one nt4-coded sequence per read (A=0, C=1, G=2, T=3, else 4). For paired-end this is
 ///   the interleaved c1,c2,c1,c2,... list, so its length is twice the pair count.
-/// - `backend`: which seed-extension implementation to call. Byte-identical either way.
+/// - `leave_undeduped`: return the regions before dedup, so the caller owes that too. For
+///   `BWA4_DUMP_REGS`, whose single-end dump prints both sides of it.
 ///
 /// # Returns
 ///
-/// One `Vec<MemAlnReg>` per entry of `codes`, in the same order. These are PRE-dedup and unmarked:
-/// the caller still owes `mem_sort_dedup_patch` and `mem_mark_primary_se`.
+/// One `Vec<MemAlnReg>` per entry of `codes`, in the same order. These are deduped, stamped and
+/// unmarked: the caller still owes `mem_mark_primary_se`.
 fn batched_regs(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
     codes: &[Vec<u8>],
+    leave_undeduped: bool,
 ) -> Vec<Vec<MemAlnReg>> {
     // One chunk per worker, so every thread gets a slice big enough to fill the SIMD lanes.
     // Size of the rayon pool, i.e. effectively `-t`. Clamped so the division below cannot divide
@@ -2469,7 +2472,24 @@ fn batched_regs(
             .par_chunks(reads_per_chunk)
             .flat_map(|chunk| {
                 crate::stage_time::barrier::worker(|| {
-                    align_reads_batched(fm, bns, opt, chunk, &NeonBackend)
+                    let mut regs = align_reads_batched(fm, bns, opt, chunk, &NeonBackend);
+                    // Dedup here, chunk by chunk, not once the whole batch has aligned. The pass is
+                    // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
+                    // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
+                    // apiece, and most die here. Held to the end of the batch they were the largest
+                    // live item in the run, and doing it late also kept their capacity, so the
+                    // survivors' lists are given back too.
+                    if !leave_undeduped {
+                        for (r, codes) in regs.iter_mut().zip(chunk) {
+                            let mut kept = mem_sort_dedup_patch(fm, opt, codes, std::mem::take(r));
+                            // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
+                            // the dedup and before any primary marking reads it.
+                            bwa_mem::stamp_is_alt(bns, &mut kept);
+                            kept.shrink_to_fit();
+                            *r = kept;
+                        }
+                    }
+                    regs
                 })
             })
             .collect()
@@ -2493,7 +2513,7 @@ fn dump_regs_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_DUMP_REGS").is_some())
 }
 
-/// Deduplicate + primary-mark a read's batched regions, then format its SAM record. Pure (no shared
+/// Primary-mark a read's batched regions, then format its SAM record. Pure (no shared
 /// state beyond the immutable index/options), so it is safe across rayon workers.
 ///
 /// # Parameters
@@ -2501,8 +2521,7 @@ fn dump_regs_enabled() -> bool {
 /// - `fm`, `bns`, `opt`: the shared immutable index halves and options.
 /// - `rec`: the original read, for QNAME, SEQ, QUAL and the `-C` comment.
 /// - `codes`: `rec.seq` in nt4 coding, same length; the alignment code works on this, not on ASCII.
-/// - `regs_pre`: this read's pre-dedup candidate regions from [`batched_regs`], CONSUMED here
-///   (`mem_sort_dedup_patch` takes ownership) to avoid a per-read clone.
+/// - `regs`: this read's regions from [`batched_regs`], CONSUMED here to avoid a per-read clone.
 /// - `read_id`: the read's global 0-based index across the whole input, not its index within the
 ///   batch. Load-bearing: `mem_mark_primary_se` hashes it to break score ties, so a per-batch id
 ///   would change the output.
@@ -2517,21 +2536,20 @@ fn finish_se(
     opt: &MemOpt,
     rec: &Record,
     codes: &[u8],
-    regs_pre: Vec<MemAlnReg>,
+    regs: Vec<MemAlnReg>,
     read_id: u64,
 ) -> Vec<u8> {
-    // ---- Deduplicate overlapping candidate regions, then mark which is primary ----
-    if dump_regs_enabled() {
-        eprintln!("=== read {} ===", rec.name());
-        bwa_mem::dump_regs(bns, "pre-dedup", &regs_pre);
-    }
+    // ---- Mark which region is primary. The dedup already ran in `batched_regs` ----
     // The read's regions after redundant ones have been merged away, sorted, and then annotated by
     // `mem_mark_primary_se` with `secondary` (-1 = unshadowed, else the index of the shadower).
     // After marking, `regs[0]` is the highest-scoring primary.
-    let mut regs = mem_sort_dedup_patch(fm, opt, codes, regs_pre);
-    // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after the dedup and
-    // before any primary marking reads it.
-    bwa_mem::stamp_is_alt(bns, &mut regs);
+    let mut regs = regs;
+    if dump_regs_enabled() {
+        eprintln!("=== read {} ===", rec.name());
+        bwa_mem::dump_regs(bns, "pre-dedup", &regs);
+        regs = mem_sort_dedup_patch(fm, opt, codes, regs);
+        bwa_mem::stamp_is_alt(bns, &mut regs);
+    }
     mem_mark_primary_se(opt, &mut regs, read_id);
     // `-5` (`MEM_F_PRIMARY5`): make the 5'-most segment of a split alignment the primary, which
     // score-ranking would not. Runs here, immediately after the marking and before anything reads
@@ -3038,8 +3056,10 @@ fn run_pe(
         if crate::stage_alloc::enabled() {
             crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
         }
-        // Pre-dedup regions, in the same interleaved order as `all_codes`.
-        let regs_all = stage_time::measure(Stage::Align, || batched_regs(fm, bns, opt, &all_codes));
+        // Deduped regions, in the same interleaved order as `all_codes`.
+        let regs_all = stage_time::measure(Stage::Align, || {
+            batched_regs(fm, bns, opt, &all_codes, false)
+        });
 
         // ---- De-interleave: pair up each mate's owned codes + regions by sequential moves (no
         //      content copy), so the parallel prep can consume them instead of cloning
@@ -3065,8 +3085,7 @@ fn run_pe(
                     .collect()
             });
 
-        // ---- Per-mate dedup. Regions are per-read independent, so this is byte-identical to the
-        //      single-end path; pairing decisions come later ----
+        // ---- Reunite each pair with its records ----
         // Everything the pairing and output stages need, one entry per pair in pair order. Mutable
         // because mate rescue writes new regions into it and `mem_sam_pe` then rewrites them again.
         let mut prepared: Vec<PrepPair> = stage_time::measure(Stage::DedupPrep, || {
@@ -3079,25 +3098,16 @@ fn run_pe(
                 batch
                     .into_par_iter()
                     .zip(paired.into_par_iter())
-                    .map(
-                        |((rec1, rec2), ((codes1, codes2), (regs_pre1, regs_pre2)))| {
-                            stage_time::barrier::worker(|| {
-                                let mut regs1 = mem_sort_dedup_patch(fm, opt, &codes1, regs_pre1);
-                                let mut regs2 = mem_sort_dedup_patch(fm, opt, &codes2, regs_pre2);
-                                // `bwamem.cpp:1161`, applied to both mates of the pair.
-                                bwa_mem::stamp_is_alt(bns, &mut regs1);
-                                bwa_mem::stamp_is_alt(bns, &mut regs2);
-                                PrepPair {
-                                    codes1,
-                                    codes2,
-                                    regs1,
-                                    regs2,
-                                    rec1,
-                                    rec2,
-                                }
-                            })
-                        },
-                    )
+                    .map(|((rec1, rec2), ((codes1, codes2), (regs1, regs2)))| {
+                        stage_time::barrier::worker(|| PrepPair {
+                            codes1,
+                            codes2,
+                            regs1,
+                            regs2,
+                            rec1,
+                            rec2,
+                        })
+                    })
                     .collect()
             })
         });
@@ -3171,10 +3181,12 @@ fn run_pe(
         // mate is split). rayon's indexed parallel iterator preserves the order.
         let bufs: Vec<Vec<u8>> = stage_time::measure(Stage::SamEmit, || {
             stage_time::barrier::region(Stage::SamEmit, || {
+                // `into_par_iter`, so each pair's records and regions are freed as its text appears.
+                // Batch N's tail overlaps batch N+1's align, and that is where the run's peak is.
                 prepared
-                    .par_iter_mut()
+                    .into_par_iter()
                     .enumerate()
-                    .map(|(pair_in_batch, pair)| {
+                    .map(|(pair_in_batch, mut pair)| {
                         stage_time::barrier::worker(|| {
                             // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
                             // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
