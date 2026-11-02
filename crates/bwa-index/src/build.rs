@@ -263,8 +263,9 @@ struct FastaContig {
     name: String,
     /// Everything on the header line after the first space/tab, verbatim (may itself contain
     /// spaces, may be empty when the header was just `>name`). Empty is turned into the literal
-    /// `(null)` when it is copied into [`AnnRec::anno`], never here.
-    comment: String,
+    /// `(null)` when it is copied into [`AnnRec::anno`], never here. Bytes, since a comment can be in
+    /// any encoding and the C never looks.
+    comment: Vec<u8>,
     /// The contig's sequence lines concatenated with all ASCII whitespace removed, still as RAW
     /// FASTA bytes: mixed case and IUPAC ambiguity codes are preserved, NOT decoded to 0..4 yet.
     /// [`build_index`] needs the raw byte because an `.amb` hole continues only while the literal
@@ -281,7 +282,7 @@ struct AnnRec {
     /// `strdup("(null)")` (`bntseq.cpp:261`) rather than an empty string, so the field is never
     /// empty and `bns_dump`'s `if (p->anno[0])` branch always takes the "print it" path. Emitting a
     /// bare empty string here would drop a space and break `.ann` byte-identity.
-    anno: String,
+    anno: Vec<u8>,
     /// Start of this contig in forward (1L) coordinates, i.e. the sum of all previous contig
     /// lengths. Contig 0 starts at 0. Range `[0, l_pac)`. This is a reference POSITION, not a
     /// suffix-array row. Set once when the contig's bases have all been encoded; read back by
@@ -422,7 +423,7 @@ pub fn build_index_with_prefix(fasta: &Path, prefix: &Path) -> Result<()> {
         // the ambiguous ones (they were replaced, not dropped), so this equals `c.seq.len()`.
         let len = (forward.len() - start) as i32;
         let anno = if c.comment.is_empty() {
-            "(null)".to_string()
+            b"(null)".to_vec()
         } else {
             c.comment.clone()
         };
@@ -524,24 +525,40 @@ fn sibling(prefix: &Path, ext: &str) -> PathBuf {
 /// `contigs.last_mut()` to append to). An empty or headerless file yields an empty vector, which
 /// [`build_index`] rejects. Records with a header but no sequence lines are kept with `seq` empty.
 fn read_fasta(path: &Path) -> Result<Vec<FastaContig>> {
-    let text = std::fs::read_to_string(path)?;
+    let text = std::fs::read(path)?;
     let mut contigs: Vec<FastaContig> = Vec::new();
-    for line in text.lines() {
-        if let Some(header) = line.strip_prefix('>') {
+    for line in text.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(header) = line.strip_prefix(b">") {
             // `header` is the line minus the leading `>`. Split at the FIRST space or tab: name
             // before it, comment after it (comments may contain further spaces, names may not).
-            let (name, comment) = match header.find([' ', '\t']) {
-                Some(i) => (header[..i].to_string(), header[i + 1..].to_string()),
-                None => (header.to_string(), String::new()),
+            let (name, comment) = match header.iter().position(|&b| b == b' ' || b == b'\t') {
+                Some(i) => (&header[..i], header[i + 1..].to_vec()),
+                None => (header, Vec::new()),
             };
+            // The name goes to `@SQ SN:` and every RNAME, which are text throughout this tool.
+            let name = String::from_utf8(name.to_vec()).map_err(|_| {
+                Error::IndexFormat(format!(
+                    "contig name is not UTF-8: {}",
+                    String::from_utf8_lossy(name)
+                ))
+            })?;
             contigs.push(FastaContig {
                 name,
                 comment,
                 seq: Vec::new(),
             });
         } else if let Some(cur) = contigs.last_mut() {
+            // Not DNA, and nothing to match: the C indexes its table with a signed `char`
+            // (`bntseq.cpp:265`), so such a byte reads outside it.
+            if !line.is_ascii() {
+                return Err(Error::IndexFormat(format!(
+                    "non-ASCII byte in the sequence of contig {}",
+                    cur.name
+                )));
+            }
             cur.seq
-                .extend(line.bytes().filter(|b| !b.is_ascii_whitespace()));
+                .extend(line.iter().filter(|b| !b.is_ascii_whitespace()));
         }
     }
     Ok(contigs)
@@ -647,7 +664,9 @@ fn write_ann(path: &Path, l_pac: i64, n_seqs: i32, anns: &[AnnRec]) -> Result<()
     writeln!(w, "{l_pac} {n_seqs} {SEED}")?;
     for a in anns {
         // gi is always 0; anno is always non-empty ("(null)" when absent) so it is always printed.
-        writeln!(w, "0 {} {}", a.name, a.anno)?;
+        write!(w, "0 {} ", a.name)?;
+        w.write_all(&a.anno)?;
+        w.write_all(b"\n")?;
         writeln!(w, "{} {} {}", a.offset, a.len, a.n_ambs)?;
     }
     w.flush()?;
@@ -1085,6 +1104,33 @@ mod tests {
     /// An N-run must NOT be merged across a contig boundary: bwa-mem2's `add1` resets its
     /// `lasts` tracker to 0 at the start of every contig, so N at the end of one contig and N at
     /// the start of the next are recorded as two separate `.amb` holes, not one.
+    #[test]
+    fn fasta_comment_reaches_ann_as_the_bytes_it_was() {
+        let dir = std::env::temp_dir().join(format!("bwa-ann-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fasta = dir.join("t.fa");
+        // Latin-1, then CRLF line ends, whose `\r` the C does not keep, then no comment at all.
+        std::fs::write(&fasta, b">c1 caf\xe9 x\nACGT\n>c2 dna\r\nACGT\r\n>c3\nACGT").unwrap();
+
+        build_index(&fasta).unwrap();
+        let ann = std::fs::read(dir.join("t.fa.ann")).unwrap();
+        let lines: Vec<&[u8]> = ann.split(|&b| b == b'\n').collect();
+
+        assert_eq!(lines[1], b"0 c1 caf\xe9 x");
+        assert_eq!(lines[3], b"0 c2 dna");
+        assert_eq!(lines[5], b"0 c3 (null)");
+        // And the loader has to take back what the indexer wrote.
+        let bns = crate::bntseq::BntSeq::load(&fasta).unwrap();
+        assert_eq!(bns.contigs[0].comment(), b"caf\xe9 x");
+
+        std::fs::write(&fasta, b">c\xe9\nACGT\n").unwrap();
+        assert!(build_index(&fasta).is_err(), "a name has to be text");
+        std::fs::write(&fasta, b">c\nAC\xe9GT\n").unwrap();
+        assert!(build_index(&fasta).is_err(), "a base has to be ASCII");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn amb_holes_not_merged_across_contig_boundary() {
         let dir = std::env::temp_dir().join(format!(

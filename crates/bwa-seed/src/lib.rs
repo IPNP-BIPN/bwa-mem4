@@ -756,6 +756,12 @@ impl LsSlot {
                 self.prev[..self.num_prev].reverse();
                 self.jj = self.x as i64 - 1;
                 self.phase = LsPhase::Bwd;
+                // The next step extends these, and this step was the last chance to warn the cache:
+                // without it the first backward round only prefetches right before its own loads.
+                // From fg-labs/bwa-mem3 PR #600. A hint, so it cannot change a result.
+                for c in self.prev[..self.num_prev.min(pf_ahead)].iter() {
+                    fm.prefetch_occ(c.k, c.k + c.s);
+                }
             }
             LsPhase::Bwd => {
                 if self.jj < 0 {

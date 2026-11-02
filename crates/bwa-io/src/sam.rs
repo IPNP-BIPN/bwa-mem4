@@ -304,7 +304,7 @@ pub fn write_mapped_se<W: Write>(
     cigar: &str,
     seq: &[u8],
     qual: Option<&[u8]>,
-    tags: &str,
+    tags: &[u8],
 ) -> io::Result<()> {
     // ---- Columns 1-6 (QNAME..CIGAR), then 7-9 hard-coded to the single-end mate defaults
     //      (RNEXT `*`, PNEXT 0, TLEN 0); the paired-end path formats its own line ----
@@ -335,7 +335,7 @@ pub fn write_mapped_se<W: Write>(
     // ---- Optional tags, preformatted by the caller; the leading tab belongs to us ----
     if !tags.is_empty() {
         w.write_all(b"\t")?;
-        w.write_all(tags.as_bytes())?;
+        w.write_all(tags)?;
     }
     w.write_all(b"\n")?;
     Ok(())

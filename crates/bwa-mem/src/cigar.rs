@@ -111,7 +111,7 @@ const SAM_FLAG_UNMAPPED: u32 = 0x4;
 const SAM_FLAG_SECONDARY: u32 = 0x100;
 
 use bwa_core::MemOpt;
-use bwa_extend::ksw_global2;
+use bwa_extend::{ksw_global2, tightened_global_band};
 use bwa_index::{BntSeq, FmIndex};
 
 use crate::primary::mem_approx_mapq_se;
@@ -463,9 +463,18 @@ pub(crate) fn gen_cigar2(
             &crate::emit_split::GLOBAL_NS,
             &crate::emit_split::GLOBAL_CALLS,
             || {
-                ksw_global2(
+                // A real alignment's score bounds how far off its diagonals the DP can profit, which
+                // is far tighter than `w` and changes no byte.
+                let (w, lower_bound) = tightened_global_band(
                     &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
-                )
+                );
+                if w == 0 {
+                    (lower_bound, vec![(l_query as u32) << 4])
+                } else {
+                    ksw_global2(
+                        &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
+                    )
+                }
             },
         )
     };

@@ -64,8 +64,8 @@ const LCG_MULTIPLIER: u64 = 6364136223846793005;
 const LCG_INCREMENT: u64 = 1442695040888963407;
 
 pub use sw::{
-    ksw_align2, ksw_extend2, ksw_global2, ksw_local_fwd, ExtendResult, KswAlignResult,
-    SuboptimalTracker,
+    ksw_align2, ksw_extend2, ksw_global2, ksw_local_fwd, tightened_global_band, ExtendResult,
+    KswAlignResult, SuboptimalTracker,
 };
 
 /// A banded Smith-Waterman seed-extension backend.

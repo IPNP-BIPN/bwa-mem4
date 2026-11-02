@@ -73,8 +73,10 @@ pub struct Contig {
     /// The contig name, i.e. the FASTA header up to the first space. This becomes SAM `@SQ SN:` and
     /// the RNAME column, so it must round-trip verbatim.
     pub name: String,
-    /// The rest of the FASTA header line, or the literal `(null)` when there was none. Never empty.
-    pub anno: String,
+    /// The rest of the FASTA header line, or the literal `(null)` when there was none. Verbatim, so
+    /// that `.ann` round-trips; [`Contig::comment`] is what the C would hold. Bytes, since a FASTA
+    /// comment can be in any encoding and the C never looks.
+    pub anno: Vec<u8>,
     /// Start of this contig in FORWARD space. Contigs tile `[0, l_pac)` in ascending order with no
     /// gaps, which is the invariant [`BntSeq::pos2rid`]'s binary search depends on.
     pub offset: i64,
@@ -127,6 +129,18 @@ pub struct BntSeq {
     pub ambs: Vec<Amb>,
 }
 
+impl Contig {
+    /// The FASTA comment as the C holds it after reading `.ann`, which is what `-V` prints: empty for
+    /// the `(null)` placeholder (`bntseq.cpp:142`). Past 8190 bytes the C aborts on its own `assert`,
+    /// so there is no output to match and the comment comes back whole.
+    pub fn comment(&self) -> &[u8] {
+        if self.anno == b"(null)" {
+            return &[];
+        }
+        &self.anno
+    }
+}
+
 impl BntSeq {
     /// Load `<prefix>.ann` and `<prefix>.amb`. `prefix` is the FASTA path passed to `index`; the
     /// index files are siblings named `<prefix>.ann`, `<prefix>.amb`, ...
@@ -143,7 +157,7 @@ impl BntSeq {
     /// A fully populated `BntSeq` (both the contig table and the hole table). Errors are I/O errors
     /// from either file, or [`Error::IndexFormat`] when a field is missing or unparseable.
     pub fn load(prefix: &Path) -> Result<Self> {
-        let ann = std::fs::read_to_string(sibling(prefix, "ann"))?;
+        let ann = std::fs::read(sibling(prefix, "ann"))?;
         let amb = std::fs::read_to_string(sibling(prefix, "amb"))?;
         let mut bns = parse_ann(&ann)?;
         parse_amb(&amb, &mut bns)?;
@@ -366,6 +380,20 @@ impl BntSeq {
         mid
     }
 
+    /// Whether forward position `pos_f` lies in contig `rid`: what [`pos2rid`](Self::pos2rid) would
+    /// answer `rid` for, given the offsets' ascending invariant. `rid` may be its -1.
+    #[inline]
+    fn in_contig(&self, rid: i32, pos_f: i64) -> bool {
+        if rid < 0 {
+            return false;
+        }
+        let end = self
+            .contigs
+            .get(rid as usize + 1)
+            .map_or(self.l_pac, |next| next.offset);
+        (self.contigs[rid as usize].offset..end).contains(&pos_f)
+    }
+
     /// Contig index for the interval `[rb, re)` in 2L space, or a negative code if it bridges a
     /// contig boundary (-1) or the forward/reverse midpoint (-2). Mirrors `bns_intv2rid`.
     ///
@@ -395,9 +423,16 @@ impl BntSeq {
         }
         // Contig index of the interval's first base, resolved in FORWARD space via `depos`.
         let rid_b = self.pos2rid(self.depos(rb).0);
-        // Contig index of the interval's LAST base (`re - 1`, since `re` is exclusive).
+        // Contig index of the interval's LAST base (`re - 1`, since `re` is exclusive). A seed is
+        // short, so that is nearly always the contig just found, and testing it costs two compares
+        // where a second search costs a mispredicted branch per probe.
         let rid_e = if rb < re {
-            self.pos2rid(self.depos(re - 1).0)
+            let last = self.depos(re - 1).0;
+            if self.in_contig(rid_b, last) {
+                rid_b
+            } else {
+                self.pos2rid(last)
+            }
         } else {
             rid_b
         };
@@ -446,7 +481,7 @@ fn fmt_err(what: &str) -> Error {
 ///
 /// # Parameters
 ///
-/// * `text`: the entire `.ann` file as UTF-8 text, already read into memory by [`BntSeq::load`].
+/// * `text`: the entire `.ann` file as bytes, already read into memory by [`BntSeq::load`].
 ///   Expected shape is one header line then exactly `2 * n_seqs` further lines; a short file is
 ///   reported as [`Error::IndexFormat`] rather than truncating the contig table.
 ///
@@ -454,9 +489,16 @@ fn fmt_err(what: &str) -> Error {
 ///
 /// A `BntSeq` whose `l_pac`, `n_seqs`, `seed` and `contigs` are populated and whose `n_holes` /
 /// `ambs` are still zero/empty.
-fn parse_ann(text: &str) -> Result<BntSeq> {
-    let mut lines = text.lines();
-    let header = lines.next().ok_or_else(|| fmt_err(".ann: empty file"))?;
+fn parse_ann(text: &[u8]) -> Result<BntSeq> {
+    // On `\n` alone, not `lines()`: a CRLF FASTA leaves `\r` at the end of a comment, the C keeps it,
+    // and `-V` prints it.
+    let mut lines = text.split(|&b| b == b'\n');
+    // Everything but a comment is numbers and contig names, so it has to be text.
+    let utf8 = |bytes: &[u8]| -> Result<String> {
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| fmt_err(".ann: invalid UTF-8 outside a comment"))
+    };
+    let header = utf8(lines.next().ok_or_else(|| fmt_err(".ann: empty file"))?)?;
     let mut header_fields = header.split_whitespace();
     // Header line 1 of `.ann`: total FORWARD reference length in bases, contig count, build seed.
     let l_pac: i64 = next_parse(&mut header_fields, ".ann l_pac")?;
@@ -474,26 +516,28 @@ fn parse_ann(text: &str) -> Result<BntSeq> {
         // `splitn(3, ' ')` (not `split_whitespace`) is required: the annotation is free text that
         // may contain spaces AND tabs, and must be captured verbatim as one field. Splitting on all
         // whitespace would truncate it at the first space and change the SAM header we emit.
-        let mut name_fields = name_line.splitn(3, ' ');
-        let gi: i64 = name_fields
-            .next()
-            .and_then(|x| x.parse().ok())
-            .ok_or_else(|| fmt_err(".ann: bad gi"))?;
-        let name = name_fields
-            .next()
-            .ok_or_else(|| fmt_err(".ann: bad name"))?
-            .to_string();
+        let mut name_fields = name_line.splitn(3, |&b| b == b' ');
+        let gi: i64 = utf8(name_fields.next().unwrap_or(&[]))?
+            .parse()
+            .map_err(|_| fmt_err(".ann: bad gi"))?;
+        let name = utf8(
+            name_fields
+                .next()
+                .ok_or_else(|| fmt_err(".ann: bad name"))?,
+        )?
+        .trim_end_matches('\r')
+        .to_string();
         // DIVERGENCE (benign, and deliberate): the C NORMALIZES on read, turning the placeholder
         // back into an empty string (`if (q - str > 1 && strcmp(str, " (null)") != 0)
         // p->anno = strdup(str + 1); else p->anno = strdup("");`, `bntseq.cpp:143`). We keep the
-        // literal `(null)`, which round-trips `.ann` verbatim if it is ever rewritten. Safe because
-        // nothing downstream reads `anno`: the only consumer in the tree is `build::write_ann`,
-        // and the SAM header uses `name`/`len` only.
-        let anno = name_fields.next().unwrap_or("").to_string();
+        // literal `(null)`, which round-trips `.ann` verbatim if it is ever rewritten. `build::write_ann`
+        // reads this field; `-V` reads the normalized form through `Contig::comment`.
+        let anno = name_fields.next().unwrap_or(&[]).to_vec();
 
         let stat_line = lines
             .next()
             .ok_or_else(|| fmt_err(&format!(".ann: missing offset line for contig {i}")))?;
+        let stat_line = utf8(stat_line)?;
         let mut stat_fields = stat_line.split_whitespace();
         // Second line per contig: start in FORWARD space (bases, `[0, l_pac)`), length in bases,
         // and the count of ambiguous RUNS inside this contig. All three are plain integers here,
@@ -615,5 +659,76 @@ mod tests {
         assert_eq!(bns.contigs[0].name, "20:2000000-2200000");
         assert_eq!(bns.contigs[0].len, 200_001);
         assert_eq!(bns.contigs[0].offset, 0);
+    }
+
+    #[test]
+    fn comment_is_what_the_c_reads_back_from_ann() {
+        let long = "x".repeat(9000);
+        let text = format!(
+            "40 5 11\n0 a (null)\n0 8 0\n0 b dna:chr\tb c\r\n8 8 0\n0 c\r\n16 8 0\n0 d {long}\n24 8 0\n0 e \n32 8 0\n"
+        );
+        let mut text = text.into_bytes();
+        text.extend_from_slice(b"0 f caf\xe9\n40 8 0\n");
+        text[3] = b'6'; // n_seqs
+        let bns = parse_ann(&text).unwrap();
+        let comments: Vec<&[u8]> = bns.contigs.iter().map(Contig::comment).collect();
+        assert_eq!(comments[0], b"");
+        assert_eq!(comments[1], b"dna:chr\tb c\r");
+        assert_eq!(comments[2], b"");
+        assert_eq!(bns.contigs[2].name, "c");
+        assert_eq!(comments[3].len(), 9000);
+        assert_eq!(comments[4], b"");
+        assert_eq!(comments[5], b"caf\xe9");
+    }
+
+    #[test]
+    fn intv2rid_agrees_with_two_searches() {
+        let lens = [5, 1, 7, 2];
+        let mut offset = 0;
+        let contigs = lens
+            .iter()
+            .map(|&len| {
+                let contig = Contig {
+                    gi: 0,
+                    name: String::new(),
+                    anno: Vec::new(),
+                    offset,
+                    len,
+                    n_ambs: 0,
+                    is_alt: false,
+                };
+                offset += i64::from(len);
+                contig
+            })
+            .collect();
+        let bns = BntSeq {
+            l_pac: offset,
+            n_seqs: lens.len() as i32,
+            seed: 0,
+            contigs,
+            n_holes: 0,
+            ambs: Vec::new(),
+        };
+        for rb in 0..2 * bns.l_pac {
+            for re in rb..=2 * bns.l_pac {
+                // The C's shape, with both ends searched.
+                let expected = if rb < bns.l_pac && re > bns.l_pac {
+                    -2
+                } else {
+                    let rid_b = bns.pos2rid(bns.depos(rb).0);
+                    let rid_e = if rb < re {
+                        bns.pos2rid(bns.depos(re - 1).0)
+                    } else {
+                        rid_b
+                    };
+                    if rid_b == rid_e {
+                        rid_b
+                    } else {
+                        -1
+                    }
+                };
+                assert_eq!(bns.intv2rid(rb, re), expected, "[{rb}, {re})");
+            }
+        }
     }
 }

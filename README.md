@@ -97,7 +97,7 @@ byte-identical to the oracle with and without it. `BWA4_NO_PCORE_CAP=1` disables
 The pipeline keeps TWO batches in flight: batch N's thin, low-occupancy tail (dedup at 69% pool
 occupancy, encode at 29%) runs against batch N+1's extension, which is the one stage that can fill
 every core. It costs one more resident batch, and on a human genome at the default `-K` that is the
-difference between 14.7 GB and 13.3 GB of peak RSS.
+difference between about 11 GB and 9.5 GB of peak RSS.
 
 That second batch is taken **only when the machine can hold it**: at startup the aligner compares
 detected RAM against the index plus two batches with headroom, and drops the overlap when it does

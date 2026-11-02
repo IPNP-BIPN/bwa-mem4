@@ -949,9 +949,10 @@ fn dispatch_bins(
     const MAX_SEQ_LEN16: usize = 32768;
     // Largest single-cell score the matrix can award, feeding `cell_bound`'s worst case.
     let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
-    // Headroom the kernels' BIASED substitution form needs on top of the value ceiling. They compute
-    // `(m + (bias + score)) - bias`, so on the saturating u8 path the intermediate `m + bias + a`
-    // must not clip at 255 or the sub would take the bias off a saturated value and land low. `bias`
+    // Headroom the x86 u8 kernels' BIASED substitution form needs on top of the value ceiling. They
+    // compute `(m + (bias + score)) - bias`, so on the saturating u8 path the intermediate `m + bias + a`
+    // must not clip at 255 or the sub would take the bias off a saturated value and land low. NEON's
+    // USQADD has no such intermediate but shares these bins, so a job routes alike on both. `bias`
     // is the larger penalty magnitude, exactly as the kernel derives it. Costs nothing in practice:
     // for bwa's defaults it is 5 (bias 4, a 1), and a job whose cell bound is within 5 of 256 would
     // need a ~250-base perfect match, which is far past where these bins already send work to i16.
@@ -1702,7 +1703,10 @@ fn clamp_band(
 ///   `(j >= beg) & (j < end)` band test, per ISA because its best spelling differs (issue #48C),
 ///   and `$bbias` the constant XOR-ed into `j`/`beg`/`end` to make that spelling legal (0x80 for
 ///   the AVX2 and SSE4.1 u8 kernels, 0 everywhere else); `$orru`/`$andu`
-///   bitwise or/and on masks; `$bsl(mask, a, b)` = per-lane `mask ? a : b`.
+///   bitwise or/and on masks; `$bsl(mask, a, b)` = per-lane `mask ? a : b`. `$bwidth` says `$band`
+///   takes the band's width as its third argument and already covers `active` (NEON u8 only, see
+///   `band_u8`); `$diag` is the diagonal `M` from H, the score lane and the bias; `$sbias` picks the
+///   bias those score lanes carry, given the larger penalty magnitude.
 ///
 /// # Invariants the caller must uphold
 ///
@@ -1713,9 +1717,9 @@ fn clamp_band(
 ///   recomputed from three broadcast constants instead of being read from `mat`.
 /// - `query`/`target` codes must be in `0..=4`. Code 4 (N) is detected by a `>= 4` compare, so a
 ///   stray code 5 would be scored as N rather than rejected.
-/// - For the u8 instantiation, `$add`/`$sub` must be the *saturating* unsigned intrinsics: the
-///   kernel relies on `sub` clamping at 0 to realize the `max(0, .)` in the E/F recurrences, and on
-///   `add` never wrapping past 255. With wrapping ops a mismatch at score 0 would wrap to 251.
+/// - For the u8 instantiation, `$sub` and `$diag` must saturate: the kernel relies on `sub` clamping
+///   at 0 to realize the `max(0, .)` in the E/F recurrences, and on `$diag` neither wrapping past 255
+///   nor below 0. With wrapping ops a mismatch at score 0 would wrap to 251.
 /// - No alignment requirement: all vector loads/stores here are the unaligned forms, and the SoA
 ///   buffers are plain `Vec`s. Their length is always a multiple of `$lanes`, which is what keeps
 ///   the pointer arithmetic (`ptr.add(j * LANES)`) in bounds for a full-width access.
@@ -1723,11 +1727,13 @@ macro_rules! define_sw_kernel {
     (
             $name:ident, $elem:ty, $umask:ty, $lanes:expr, feat = $feat:literal,
             dup = $dup:path, lds = $lds:path, sts = $sts:path, ldu = $ldu:path,
-            add = $add:path, sub = $sub:path, max = $max:path,
+            sub = $sub:path, max = $max:path,
             ceqz = $ceqz:path, cge = $cge:path,
             ceq = $ceq:path, orru = $orru:path,
             andu = $andu:path, bsl = $bsl:path,
-            band = $band:path, band_bias = $bbias:expr
+            band = $band:path, band_bias = $bbias:expr,
+            band_width = $bwidth:expr, diag = |$dm:ident, $ds:ident, $db:ident| $diag:expr,
+            sbt_bias = |$bb:ident| $sbias:expr
         ) => {
         /// # Safety
         /// Requires the `$feat` target feature; all vector loads/stores use fixed-size
@@ -1801,15 +1807,21 @@ macro_rules! define_sw_kernel {
                                  // identity needs `m + bias + a <= 255` so the add cannot clip before the sub takes the
                                  // bias back off; `dispatch_bins` reserves exactly that headroom when it chooses the bin
                                  // (see its `bias + max_sc` term), and the assert below is the other half of that contract.
-            let bias = (-i32::from(mat[1])).max(-i32::from(mat[m - 1])).max(0);
+            let full_bias = (-i32::from(mat[1])).max(-i32::from(mat[m - 1])).max(0);
+            let bias = {
+                let $bb = full_bias;
+                $sbias
+            };
             let sbt_bias_v = $dup(bias as $elem);
             let sbt_match_v = $dup((bias + i32::from(mat[0])) as $elem); // bias + a
             let sbt_mism_v = $dup((bias + i32::from(mat[1])) as $elem); // bias - |mm|
             let sbt_npen_v = $dup((bias + i32::from(mat[m - 1])) as $elem); // bias - |npen|
+            // Only a kernel that keeps the bias needs non-negative lanes; USQADD's are signed.
             debug_assert!(
-                bias + i32::from(mat[0]) >= 0
-                    && bias + i32::from(mat[1]) >= 0
-                    && bias + i32::from(mat[m - 1]) >= 0,
+                bias != full_bias
+                    || bias + i32::from(mat[0]) >= 0
+                        && bias + i32::from(mat[1]) >= 0
+                        && bias + i32::from(mat[m - 1]) >= 0,
                 "biased substitution scores must be non-negative"
             );
 
@@ -1991,7 +2003,7 @@ macro_rules! define_sw_kernel {
                     // must fit `$elem` too, which is the second reason the u8 kernel caps lengths at
                     // 256. An inactive lane gets an all-zero mask (`beg = end = 0` would also make
                     // the range empty, but the explicit `active_v` is what keeps a *finished* lane's
-                    // stale state from being rewritten).
+                    // stale state from being rewritten; under `$bwidth` the empty range is the mask).
                     let mut beg_lane = [0 as $elem; LANES];
                     let mut end_lane = [0 as $elem; LANES];
                     let mut active_lane = [0 as $umask; LANES];
@@ -2029,7 +2041,13 @@ macro_rules! define_sw_kernel {
                             // XOR-ed into signed space when `$bbias` is non-zero (issue #48C).
                             // Free here: these two scalar stores happen once per row anyway.
                             beg_lane[l] = (beg[l] as $elem) ^ ($bbias as $elem);
-                            end_lane[l] = (end[l] as $elem) ^ ($bbias as $elem);
+                            // Under `$bwidth` this lane holds the band's WIDTH instead of its end, which
+                            // an inactive lane leaves at 0 and so never matches: see `band_u8`.
+                            end_lane[l] = if $bwidth {
+                                (end[l] - beg[l]).max(0) as $elem
+                            } else {
+                                (end[l] as $elem) ^ ($bbias as $elem)
+                            };
                             // All-ones = "true" in the blend/and convention used throughout.
                             active_lane[l] = <$umask>::MAX;
                         }
@@ -2081,7 +2099,7 @@ macro_rules! define_sw_kernel {
                     // all-ones, so all nine fold away. Same shape as the rescue kernel's padding regime, and
                     // the same byte-identity argument: a provably constant mask folded, not a mask dropped.
                     macro_rules! column {
-                                ($j:expr, $masked:literal) => {{
+                                ($j:expr, $masked:literal, $share_oe:literal) => {{
                                     let j = $j;
                                 // Byte offset of column `j` in every SoA buffer (all lanes of that column
                                 // sit contiguously, which is the whole point of the layout).
@@ -2105,7 +2123,11 @@ macro_rules! define_sw_kernel {
                                 // `band_bias` is 0. NEON likewise has native `vcgeq_u8`/`vcltq_u8`.
                                 let j_band_v = $dup((j as $elem) ^ ($bbias as $elem));
                                 let band = if $masked {
-                                        $andu(active_v, $band(j_band_v, beg_v, end_v))
+                                        if $bwidth {
+                                            $band(j_band_v, beg_v, end_v)
+                                        } else {
+                                            $andu(active_v, $band(j_band_v, beg_v, end_v))
+                                        }
                                     } else {
                                         // Unreachable in the unmasked range and folded away there; naming it
                                         // keeps the two arms textually one body.
@@ -2145,7 +2167,10 @@ macro_rules! define_sw_kernel {
                                 // M = ((m + (bias + score)) - bias); m==0 -> local restart (0). Saturating
                                 // for u8, plain for signed; identical either way in the guaranteed range,
                                 // which for u8 is what `dispatch_bins` reserves headroom for.
-                                let bigm_pre = $sub($add(m_v, sbt), sbt_bias_v);
+                                let bigm_pre = {
+                                    let ($dm, $ds, $db) = (m_v, sbt, sbt_bias_v);
+                                    $diag
+                                };
                                 // The local restart: `ceqz` finds the lanes whose diagonal predecessor was
                                 // already 0 and forces M back to 0 there (`ksw.cpp:487`,
                                 // `bandedSWA.cpp:334-335` which does the same `cmpeq h00, zero` + blend).
@@ -2193,7 +2218,11 @@ macro_rules! define_sw_kernel {
                                 // Mirror of the pair above for the insertion: `open_ins_v` lane l is the
                                 // cost-adjusted score of opening one here, `f_new` lane l is F(i, j+1),
                                 // which the next iteration will read as its carried `f_v`.
-                                let open_ins_v = $max($sub(bigm_v, oe_ins_v), zero_v);
+                                let open_ins_v = if $share_oe {
+                                    open_del_v
+                                } else {
+                                    $max($sub(bigm_v, oe_ins_v), zero_v)
+                                };
                                 let f_new = $max($sub(f_v, e_ins_v), open_ins_v);
                                 f_v = if $masked { $bsl(band, f_new, f_v) } else { f_new };
                                 }};
@@ -2206,14 +2235,29 @@ macro_rules! define_sw_kernel {
                     } else {
                         (gbeg, gbeg)
                     };
-                    for j in gbeg..fast_lo {
-                        column!(j, true);
-                    }
-                    for j in fast_lo..fast_hi {
-                        column!(j, false);
-                    }
-                    for j in fast_hi.max(fast_lo)..gend {
-                        column!(j, true);
+                    // bwa's stock `-O 6,6 -E 1,1` opens both gap kinds at one cost, so one `M - oe` feeds both
+                    // recurrences. Tested per row, not per cell: this branch never moves and the column
+                    // loops below stay free of it.
+                    if oe_del == oe_ins {
+                        for j in gbeg..fast_lo {
+                            column!(j, true, true);
+                        }
+                        for j in fast_lo..fast_hi {
+                            column!(j, false, true);
+                        }
+                        for j in fast_hi.max(fast_lo)..gend {
+                            column!(j, true, true);
+                        }
+                    } else {
+                        for j in gbeg..fast_lo {
+                            column!(j, true, false);
+                        }
+                        for j in fast_lo..fast_hi {
+                            column!(j, false, false);
+                        }
+                        for j in fast_hi.max(fast_lo)..gend {
+                            column!(j, true, false);
+                        }
                     }
 
                     // --- row epilogue (scalar, per lane): mirrors batched_extend_scalar ---
@@ -2313,12 +2357,15 @@ macro_rules! define_sw_kernel {
 mod neon {
     use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
 
-    /// `(j >= beg) & (j < end)` for the NEON u8 kernel. NEON has native UNSIGNED byte compares, so
-    /// the portable form is already one instruction each and `band_bias` is 0: the signed rewrite of
-    /// issue #48C is an x86 fix, not a portable one.
+    /// `active & (j >= beg) & (j < end)` for the NEON u8 kernel, as ONE range compare: `band_width`
+    /// makes the third argument `end - beg`, and `(j - beg) mod 256 < width` holds exactly on
+    /// `[beg, end)` because `width <= 255` (`dispatch_bins` caps lengths below `U8_LEN`). An inactive
+    /// lane or an empty band has width 0 and never matches, so the `active` AND folds in too: two
+    /// operations where there were four, in the masked columns, which are most of them. From
+    /// fg-labs/bwa-mem3 PR #616. `band_bias` is 0: NEON has native unsigned byte compares.
     #[target_feature(enable = "neon")]
-    unsafe fn band_u8(j: uint8x16_t, beg: uint8x16_t, end: uint8x16_t) -> uint8x16_t {
-        vandq_u8(vcgeq_u8(j, beg), vcltq_u8(j, end))
+    pub(super) unsafe fn band_u8(j: uint8x16_t, beg: uint8x16_t, width: uint8x16_t) -> uint8x16_t {
+        vcltq_u8(vsubq_u8(j, beg), width)
     }
 
     /// `(j >= beg) & (j < end)` for the NEON i16 kernel. Native signed compares, `band_bias` 0.
@@ -2345,7 +2392,6 @@ mod neon {
         lds = vld1q_s16,
         sts = vst1q_s16,
         ldu = vld1q_u16,
-        add = vaddq_s16,
         sub = vsubq_s16,
         max = vmaxq_s16,
         ceqz = vceqzq_s16,
@@ -2355,22 +2401,30 @@ mod neon {
         andu = vandq_u16,
         bsl = vbslq_s16,
         band = band_s16,
-        band_bias = 0
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| vsubq_s16(vaddq_s16(m, s), bias),
+        sbt_bias = |bias| bias
     );
 
     // 8-bit kernel: **unsigned** u8 [0,255] with saturating add/sub, so a local extension whose score
     // ceiling lands in [128,255] (bwa-mem2 would route it to int16) still runs in 16 lanes. Values are
     // non-negative and positions are `< 256`, so u8 holds both. This is bwa-mem2's `smithWaterman*_8`.
     //
-    // Unsigned works here only because the split into `sbt_pos`/`sbt_neg` above avoids ever forming a
-    // negative intermediate: `(M + a) - |mm|` saturates at 0 on the way down, which is exactly the
-    // `max(0, .)` the recurrence wants, whereas a signed `M + (-b)` would need a real signed type.
+    // Unsigned works here because `USQADD` takes the signed score directly and clamps at 0, which is
+    // exactly the `max(0, .)` the recurrence wants, with no negative intermediate in an unsigned lane.
     // The payoff is 16 lanes instead of 8, and mate-rescue-sized and read-sized jobs almost always
     // qualify, so this is the kernel that actually runs in production.
     //
     // bwa-mem2 keeps its 8-bit path *signed* and therefore caps at `MAX_SEQ_LEN8 = 128`
     // (`bandedSWA.h:82`); going unsigned doubles the reach to 256 and pulls many more jobs into the
     // wide kernel. Both are exact in their range, so this is a scheduling change, not a scoring one.
+    //
+    // `USQADD` adds the SIGNED score to the unsigned H in one operation, clamped to `[0, 255]`, where
+    // the biased form takes a saturating add then a saturating subtract. So `sbt_bias` is 0 here and
+    // the score lanes hold the score itself. Same value: the add never clips (`dispatch_bins`' headroom)
+    // and the floor at 0 is what the subtract did. `mat` is `i8`, so every score fits the signed
+    // addend. From fg-labs/bwa-mem3 PR #616; the rescue kernel already does this.
     define_sw_kernel!(
         batched_extend_neon_u8,
         u8,
@@ -2381,7 +2435,6 @@ mod neon {
         lds = vld1q_u8,
         sts = vst1q_u8,
         ldu = vld1q_u8,
-        add = vqaddq_u8,
         sub = vqsubq_u8,
         max = vmaxq_u8,
         ceqz = vceqzq_u8,
@@ -2391,7 +2444,10 @@ mod neon {
         andu = vandq_u8,
         bsl = vbslq_u8,
         band = band_u8,
-        band_bias = 0
+        band_bias = 0,
+        band_width = true,
+        diag = |m, s, _bias| vsqaddq_u8(m, vreinterpretq_s8_u8(s)),
+        sbt_bias = |_bias| 0
     );
 }
 
@@ -2547,7 +2603,6 @@ mod avx2 {
         lds = loadu_i16,
         sts = storeu_i16,
         ldu = loadu_u16,
-        add = _mm256_add_epi16,
         sub = _mm256_sub_epi16,
         max = _mm256_max_epi16,
         ceqz = ceqz16,
@@ -2557,7 +2612,10 @@ mod avx2 {
         andu = _mm256_and_si256,
         bsl = bsl256,
         band = band_epi16,
-        band_bias = 0
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm256_sub_epi16(_mm256_add_epi16(m, s), bias),
+        sbt_bias = |bias| bias
     );
 
     define_sw_kernel!(
@@ -2570,7 +2628,6 @@ mod avx2 {
         lds = loadu_u8,
         sts = storeu_u8,
         ldu = loadu_u8,
-        add = _mm256_adds_epu8,
         sub = _mm256_subs_epu8,
         max = _mm256_max_epu8,
         ceqz = ceqz8,
@@ -2580,7 +2637,10 @@ mod avx2 {
         andu = _mm256_and_si256,
         bsl = bsl256,
         band = band_epi8,
-        band_bias = 0x80
+        band_bias = 0x80,
+        band_width = false,
+        diag = |m, s, bias| _mm256_subs_epu8(_mm256_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias
     );
 }
 
@@ -2719,7 +2779,6 @@ mod sse41 {
         lds = loadu_i16,
         sts = storeu_i16,
         ldu = loadu_u16,
-        add = _mm_add_epi16,
         sub = _mm_sub_epi16,
         max = _mm_max_epi16,
         ceqz = ceqz16,
@@ -2729,7 +2788,10 @@ mod sse41 {
         andu = _mm_and_si128,
         bsl = bsl128,
         band = band_epi16,
-        band_bias = 0
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm_sub_epi16(_mm_add_epi16(m, s), bias),
+        sbt_bias = |bias| bias
     );
 
     define_sw_kernel!(
@@ -2742,7 +2804,6 @@ mod sse41 {
         lds = loadu_u8,
         sts = storeu_u8,
         ldu = loadu_u8,
-        add = _mm_adds_epu8,
         sub = _mm_subs_epu8,
         max = _mm_max_epu8,
         ceqz = ceqz8,
@@ -2752,7 +2813,10 @@ mod sse41 {
         andu = _mm_and_si128,
         bsl = bsl128,
         band = band_epi8,
-        band_bias = 0x80
+        band_bias = 0x80,
+        band_width = false,
+        diag = |m, s, bias| _mm_subs_epu8(_mm_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias
     );
 }
 
@@ -2893,7 +2957,6 @@ mod avx512 {
         lds = loadu_i16,
         sts = storeu_i16,
         ldu = loadu_u16,
-        add = _mm512_add_epi16,
         sub = _mm512_sub_epi16,
         max = _mm512_max_epi16,
         ceqz = ceqz16,
@@ -2903,7 +2966,10 @@ mod avx512 {
         andu = _mm512_and_si512,
         bsl = bsl512,
         band = band_epi16,
-        band_bias = 0
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm512_sub_epi16(_mm512_add_epi16(m, s), bias),
+        sbt_bias = |bias| bias
     );
 
     define_sw_kernel!(
@@ -2916,7 +2982,6 @@ mod avx512 {
         lds = loadu_u8,
         sts = storeu_u8,
         ldu = loadu_u8,
-        add = _mm512_adds_epu8,
         sub = _mm512_subs_epu8,
         max = _mm512_max_epu8,
         ceqz = ceqz8,
@@ -2926,7 +2991,10 @@ mod avx512 {
         andu = _mm512_and_si512,
         bsl = bsl512,
         band = band_epu8,
-        band_bias = 0
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm512_subs_epu8(_mm512_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias
     );
 }
 
@@ -3131,6 +3199,140 @@ mod avx2_verify {
 mod neon_verify {
     use super::neon::{batched_extend_neon_i16, batched_extend_neon_u8};
     use bwa_extend::{ksw_extend2, ExtendJob};
+
+    /// `band_u8`'s range compare equals the two compares it replaced, on every band and column the
+    /// u8 kernel can see: `beg` and `end` up to 255 (empty and inverted bands included), `j` up to 254.
+    #[test]
+    fn band_u8_range_compare_is_exhaustively_the_two_compares() {
+        use std::arch::aarch64::{vdupq_n_u8, vgetq_lane_u8};
+        for beg in 0..=255i32 {
+            for end in 0..=255i32 {
+                for j in 0..=254i32 {
+                    let width = (end - beg).max(0) as u8;
+                    // SAFETY: NEON is baseline on aarch64, and these only touch values.
+                    let got = unsafe {
+                        let mask = super::neon::band_u8(
+                            vdupq_n_u8(j as u8),
+                            vdupq_n_u8(beg as u8),
+                            vdupq_n_u8(width),
+                        );
+                        vgetq_lane_u8::<0>(mask)
+                    };
+                    assert_eq!(got == 255, j >= beg && j < end, "j {j} beg {beg} end {end}");
+                }
+            }
+        }
+    }
+
+    /// The u8 kernel against scalar where the shared property test does not go: columns past 128,
+    /// where a signed compare would break, unequal gap costs, where the `M - oe` sharing must not
+    /// apply, non-default scores, and `N` bases. Lengths stay inside `dispatch_bins`' u8 bound.
+    #[test]
+    fn u8_kernel_matches_scalar_on_long_jobs_and_unequal_gaps() {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let gaps = [(6, 1, 6, 1), (6, 1, 5, 2), (3, 2, 7, 1), (5, 2, 6, 1)];
+        let scores = [(1i8, 4i8), (2, 8), (1, 1)];
+        let (mut shared, mut unshared) = (0u32, 0u32);
+        for round in 0..1200u32 {
+            let (o_del, e_del, o_ins, e_ins) = gaps[(next() % 4) as usize];
+            let (a, b) = scores[(next() % 3) as usize];
+            let mut mat = vec![-1i8; 25];
+            for i in 0..4 {
+                for j in 0..4 {
+                    mat[i * 5 + j] = if i == j { a } else { -b };
+                }
+            }
+            // The largest query whose score still clears the u8 bound with h0 at most 20.
+            let max_q = ((225 - i32::from(b)) / i32::from(a)) as u64;
+            let w = 1 + (next() % 150) as i32;
+            let zdrop = (next() % 200) as i32;
+            let end_bonus = (next() % 12) as i32;
+            let batch = [1usize, 15, 16, 17, 33][(next() % 5) as usize];
+            let (mut queries, mut targets, mut h0s) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..batch {
+                // Half near the top of the range, so columns past 128 run; half anywhere, so
+                // lanes end at different rows and the masked columns see inactive lanes.
+                let qlen = if next() % 2 == 0 {
+                    (max_q - next() % (max_q / 3)) as usize
+                } else {
+                    1 + (next() % max_q) as usize
+                };
+                let base = |r: u64, n: u64| {
+                    if n.is_multiple_of(100) {
+                        4u8
+                    } else {
+                        (r % 4) as u8
+                    }
+                };
+                let q: Vec<u8> = (0..qlen).map(|_| base(next(), next())).collect();
+                let tlen = qlen + (next() % 29) as usize;
+                let mut t = Vec::with_capacity(tlen);
+                let mut qi = 0usize;
+                while t.len() < tlen {
+                    if qi < q.len() && next() % 100 >= 5 {
+                        t.push(q[qi]);
+                        qi += 1;
+                    } else {
+                        t.push(base(next(), next()));
+                        if next() % 2 == 0 {
+                            qi += 1;
+                        }
+                    }
+                }
+                queries.push(q);
+                targets.push(t);
+                h0s.push(1 + (next() % 20) as i32);
+            }
+            let jobs: Vec<ExtendJob> = (0..batch)
+                .map(|i| ExtendJob {
+                    query: &queries[i],
+                    target: &targets[i],
+                    h0: h0s[i],
+                })
+                .collect();
+            if o_del + e_del == o_ins + e_ins {
+                shared += 1;
+            } else {
+                unshared += 1;
+            }
+            // SAFETY: NEON is baseline on aarch64, and the jobs respect the u8 bounds above.
+            let (inline, buffered) = unsafe {
+                (
+                    batched_extend_neon_u8::<true>(
+                        &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                    ),
+                    batched_extend_neon_u8::<false>(
+                        &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop,
+                    ),
+                )
+            };
+            for i in 0..batch {
+                let expected = ksw_extend2(
+                    &queries[i],
+                    &targets[i],
+                    5,
+                    &mat,
+                    o_del,
+                    e_del,
+                    o_ins,
+                    e_ins,
+                    w,
+                    end_bonus,
+                    zdrop,
+                    h0s[i],
+                );
+                assert_eq!(inline[i], expected, "round {round} job {i}");
+                assert_eq!(buffered[i], expected, "round {round} job {i}");
+            }
+        }
+        assert!(shared > 0 && unshared > 0);
+    }
 
     /// bwa's default DNA scoring matrix, built the way `bwa_fill_scmat` does.
     ///

@@ -356,6 +356,11 @@ pub(crate) fn discard_contained(
     // Invariant: `purged[i]` is true exactly when slot `i` is pre-skipped or has been tombstoned by
     // an earlier iteration of this pass. Read back in step 2, where a purged seed may not vouch.
     let mut purged: Vec<bool> = preskip.to_vec();
+    // The four bounds the containment scan tests, apart from the rest of each region. Nearly every
+    // comparison ends at them, and over a repeat's hundreds of regions a walk over 96-byte records is
+    // a line per region where this is three to a line.
+    let mut bounds: Vec<(i64, i64, i32, i32)> =
+        regs.iter().map(|r| (r.rb, r.re, r.qb, r.qe)).collect();
     for idx in 0..n_slots {
         if purged[idx] {
             continue; // pre-skipped: never extended, and contributes no `lim`
@@ -381,24 +386,25 @@ pub(crate) fn discard_contained(
         let mut n_rejected: i32 = 0;
         let mut scan_idx = 0usize;
         while scan_idx < n_slots && n_rejected < lim {
-            // `prior` is the C's `p`: an already-emitted region of this same read.
-            let prior = &regs[scan_idx];
-            if prior.qb == -1 && prior.qe == -1 {
+            // `prior`'s bounds; `prior` is the C's `p`, an already-emitted region of this same read.
+            let (rb, re, qb, qe) = bounds[scan_idx];
+            if qb == -1 && qe == -1 {
                 scan_idx += 1;
                 continue; // already purged: not counted against `lim`
             }
             // The seed's [qbeg, qbeg+len) x [rbeg, rbeg+len) box must lie wholly inside `prior`
             // on *both* axes (`bwamem.cpp:2941-2942`). Note the asymmetric widths: `qb/qe` are i32
             // query offsets, `rb/re` i64 positions in the doubled pac, hence the `i64::from`.
-            if seed.rbeg < prior.rb
-                || seed.rbeg + i64::from(seed.len) > prior.re
-                || seed.qbeg < prior.qb
-                || seed.qbeg + seed.len > prior.qe
+            if seed.rbeg < rb
+                || seed.rbeg + i64::from(seed.len) > re
+                || seed.qbeg < qb
+                || seed.qbeg + seed.len > qe
             {
                 n_rejected += 1;
                 scan_idx += 1;
                 continue; // not fully contained
             }
+            let prior = &regs[scan_idx];
             // `bwamem.cpp:2943`: `if (s->len - p->seedlen0 > .1 * l_query)`. `seedlen0` is the length
             // of the seed that *founded* `prior`. If this seed is more than 10% of the read longer
             // than that founder, it is materially better evidence and could pull out a better
@@ -511,6 +517,8 @@ pub(crate) fn discard_contained(
                 // Option.
                 regs[idx].qb = -1;
                 regs[idx].qe = -1;
+                bounds[idx].2 = -1;
+                bounds[idx].3 = -1;
                 purged[idx] = true;
                 continue; // purged seeds do not count towards `lim`
             }
@@ -1132,6 +1140,17 @@ fn align_reads_batched_inner<B: SwBackend>(
         // right-side decision below compares against.
         let l_query = codes.len() as i32;
         let chains = &per_read_chains[r];
+        // The next read's reference windows are random DRAM misses the loop below takes one at a
+        // time, and a read's own chains are too few and too close to warn each other. Hint them a
+        // whole read ahead. Approximates each window by its first seed with no gap room, which is
+        // close enough for a hint. From fg-labs/bwa-mem3 PR #625.
+        if let Some(next) = per_read_chains.get(r + 1) {
+            let next_len = i64::from(reads[r + 1].len() as u32);
+            for seed in next.iter().take(4).filter_map(|c| c.seeds.first()) {
+                let rb = seed.rbeg - i64::from(seed.qbeg);
+                fm.prefetch_pac(rb, rb + next_len);
+            }
+        }
         for (ci, chain) in chains.iter().enumerate() {
             if chain.seeds.is_empty() {
                 continue;

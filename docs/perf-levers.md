@@ -706,6 +706,11 @@ inserted, and their permutation is output-observable so the algorithm cannot be 
 needs an incremental structure that reproduces klib's exact tie order, which is a much larger and
 riskier piece of work than anything attempted here.
 
+**Update (2026-10-31): done, without reproducing the tie order.** `insert_into_settled`
+(`bwa-mem/src/primary.rs`) places a rescue hit directly into a list that is already a fixed point of
+`mem_sort_dedup_patch`, and rescue dedup calls fall from ~1.42M to ~92k on 500k GIAB pairs. Paired-end
+cycles drop 11 to 17% with byte-identical output; `ROADMAP.md` has the table.
+
 ### Flat arena for the mate-rescue reverse pass: NULL
 
 The reverse pass of the batched mate-rescue kernel (`bwa-neon/src/matesw.rs`) materialised the
@@ -1470,3 +1475,140 @@ on the input data:
 Gates at the end of the session: `check.sh` (fmt, clippy `-D warnings`, workspace tests, x86_64
 cross-check, x86_64 tests under Rosetta), `scripts/opt_parity.sh` **58 passed / 0 failed** across SE,
 PE, interleaved, `-a -M -Y -5 -q -H -w -t`, file and BGZF output, and the oracle md5 at fixed `-K`.
+
+## `ksw_global2`: a band bounded by a real alignment's score (-69% on wgsim, kept)
+
+`gen_cigar2` sizes its band from what half the read could pay for, which is far wider than the read
+can use. `tightened_global_band` scans for the best alignment with one gap of exactly the length
+difference, and that score bounds how far off those diagonals any competing path can profit. A
+`w == 0` result means the diagonal is the only candidate, so the DP is skipped. The docs on the
+function give the argument that this holds for every tie and for the traceback's walk across a gap
+opened from M; `tightened_band_is_byte_identical` holds it to scoring chosen to force ties, and ran
+once at 30M cases.
+
+M4 Max, `-t4 -K 10000000`, interleaved x3, medians, md5 without `@PG` equal to bwa-mem2's on both:
+
+| reads | `ksw_global2` CPU | whole run, user CPU |
+|---|---|---|
+| wgsim, 1M pairs, 150 bp, chr20+21 (GRCh37), `-e 0.01 -r 0.001` | 2.40 -> 0.74 s (-69%) | 40.54 -> 38.99 s (-3.8%) |
+| real mouse RNA-seq, 3M pairs, 58 bp, chr14 (GRCm39) | 0.31 -> 0.14 s (-54%) | 52.72 -> 52.67 s (-0.1%) |
+
+x86 not measured, and that is where this should matter more: the function was 11.9% of the Zen 3
+profile (`docs/x86-side-by-side-profile.md`).
+
+**Rejected on the way, as replacement kernels.** `ksw2rs` (`ksw_extz2`): it opens gaps from H where
+bwa opens from M, and its 16-cell blocks reach outside the requested band, so its score or CIGAR
+differed from `ksw_global2` on up to 25% of synthetic cases at narrow bands and on 0.015% even at
+wide ones. It was also 1.2-1.6x slower at `w <= 8` and only won from about `w >= 20`, a range this
+change now removes. `hyalite`, read but not run for this: no band, no extension, and by its own docs
+its `score2` agrees with bwa's only for some query lengths. It stays what it already is here, a
+third-party oracle in `crates/bwa-extend/tests/third_party_oracle.rs`.
+
+## Tooling tried against this workload (2026-11-01)
+
+Each was run on the same data as the section above, on the M4 Max or in a native arm64 Linux
+container. "Kept" means it is wired in or worth reaching for; none of them touches the shipped binary.
+
+| tool | what it showed here | verdict |
+|---|---|---|
+| `gungraun` | `ksw_global2` + tightened band: 132,350 -> 36,411 instructions at 3 mismatches, 266,470 -> 86,202 at 6, 102,964 -> 50,170 with a 2 bp deletion | **kept**, `scripts/docker_gates.sh icount`. Needs Valgrind, so Linux only here |
+| `samply` | `LsSlot::step` 32%, `batched_extend_neon_u8` 25%, `get_sa_batch` 8%, `fwd_local_sw_neon_u8` 5%, allocator about 1% (-t4, 1M wgsim pairs, 110 Mb reference) | **kept** for profiling. `samply setup` once, then `record --save-only` |
+| `dhat-rs` | 54 allocations per read, and 22% of them are the one-seed `vec![seed]` at `bwa-chain/src/lib.rs:773`. Allocator CPU is about 1%, so removing those is worth about 0.2%: left alone. Peak heap is index, then the FASTQ read-ahead | used once in a scratch copy, not wired in |
+| `cargo-show-asm` | installed, not needed: hot-instruction histograms from the `samply` profile answered the question | available |
+| BOLT through `cargo-pgo` | Linux arm64, 4 interleaved reps, md5 identical: CPU medians 43.50 -> 43.05 s and 59.50 -> 59.50 s, overlapping reps, with training on a subset of the first set. Binary 4.3 -> 7.4 MB | **rejected on arm64**. x86 not measured: Rosetta timings say nothing |
+| `qwt` | 73-82 ns per 4-symbol rank against 8.9 ns for `FmIndex::get_occ`, random positions over 222 M symbols | **rejected**, 8-9x slower |
+| `paraseq` | 29 ms against 51 ms for `needletail` to parse 1M reads, which is 22 ms in a 10 s run | **rejected**, real but invisible |
+| `genedex` | needs C libsais with OpenMP, which does not build on this host's toolchain | not measured |
+
+`samply` also settled where to look next: `step`'s time is spread over its branches with no single
+hot load, so no cheap win is left there.
+
+## Catching up with fg-labs/bwa-mem3 v0.15.0 and v0.15.1 (2026-11-01)
+
+The fork's notes claim 1.24x on Zen 5 and 1.08x on Graviton4 for v0.15.1. Neither host is available
+here, so those numbers are not ours to quote. Three levers ported, stacked and measured on an M-series
+host at `-t4`, four interleaved passes, median `cycles elapsed`. Records (md5 without `@PG`) are
+identical to `bwa-mem2` in every run on all three inputs:
+
+| stacked on HEAD | chr20+21, wgsim 200k | chr14, RNA-seq 3M | **whole GRCm39, wgsim 1M** |
+|---|---|---|---|
+| prefetch when preparing the backward phase (#600) | -1.8% | -3.1% | -0.4% |
+| + NEON 8-bit kernel: USQADD and one band compare (#616), plus a shared `M - oe` (all kernels; not from the fork, it is our rescue kernel's `BWA4_RESCUE_SHAREOE` idea) | -2.1% | -3.5% | -0.9% |
+| + hint the next read's reference windows (#625) | -2.6% | -3.6% | **-1.7%** |
+
+Only the whole-genome column has a realistic memory hierarchy; instructions retired are -0.95% there,
+all from the kernel. Peak RSS does not move beyond noise. Timings are arm64 only.
+
+The tree as finally reviewed, six more interleaved passes against HEAD, median: whole GRCm39 cycles
+-1.04%, instructions -0.96%; chr14 RNA-seq cycles -3.78%, instructions +0.23%. Peak RSS stays in noise
+(-1.0% and +1.2%).
+
+Output checks on that tree. On arm64, 45 of 45 runs match `bwa-mem2` (three inputs, twelve option sets
+including unequal gaps, plus SE, `-t1` and `-t16`). On x86_64 under Rosetta, the AVX2 kernels match the
+pre-catch-up tree on 15 of 15 cases. AVX-512 kernels cannot run there, so they are tested by nothing but
+compilation. `opt_parity.sh` reports two x86 failures, `-A 2` and `-A 2 -B 3`, and they are not ours:
+our x86 output equals both our arm64 output and the arm64 oracle, and only the x86 oracle differs. The
+same holds on the larger fixture for `-A2 -B8 -O12 -E2` (2825 records) and `-A1 -B1 -O1 -E1` (2).
+
+**The largest gain came from porting our own `7be7754`**, which covers #595, #599, #619 and part of #609
+(32-byte checkpoints, `sa_hi` at a bit per sample, per-chunk dedup, freeing each pair at emit). An earlier
+decision not to stack it rested on small references, where it does not win on cycles. On top of the
+catch-up, `-t4`, interleaved, records identical to `bwa-mem2` in every pass:
+
+| against the catch-up | passes | cycles, median (min) | instructions | peak RSS |
+|---|---|---|---|---|
+| whole GRCm39, wgsim 1M, PE | 6 | **-11.5%** (-14.8%) | -6.4% | **-29.4%** (11.7 -> 8.3 GB) |
+| whole GRCm39, wgsim 1M, SE | 3 | -2.1% (-2.6%) | +5.2% | **-29.7%** |
+| chr14, RNA-seq 3M, PE | 6 | +1.0% (+3.8%) | +5.5% | -14.7% |
+| chr20+21, wgsim 200k, PE | 6 | -2.1% (+1.2%) | +7.2% | -18.3% |
+
+Some passes on both sides were disturbed by other work on the host (context switches tripled, one run took
+81 s against 39 s), so wall time means nothing here and the GRCm39 median understates the gain: its two
+quiet pairs give -15%. On a small index it costs instructions and gains nothing clear on cycles; the memory
+saving holds everywhere.
+
+x86, `bench-x86` on a shared runner (Xeon 8370C with `avx512bw`, chr21, 1M simulated pairs), this whole
+branch against `41b4612`: wall 100.50 s to 86.47 s (-13.96%), winning 3 of 3, records identical. The two bit
+planes go through scalar popcounts there and it still gains. One chromosome, not a whole genome. In the
+same job `bwa-mem3` takes 36.8 s, so the fork stays 2.4x ahead on this input.
+
+Output of that port: 66 of 66 arm64 runs match `bwa-mem2` (three inputs, 18 option sets including `-5`,
+`-S`, `-P`, `-Y`, plus SE, `-t1`, `-t16` and the default `-K`). On x86 under Rosetta it matches the pre-port
+tree on 12 of 12 cases. Its 32-bit count path past 2^32 occurrences has still never seen a real genome of
+that size. Rescue is thin on these reads, and no real human reads are on this machine for
+`insert_into_settled`, whose randomised test compares it to the full pass. `giab-gate` on the same branch
+(1.09M real HG002 pairs, chr21:20-30 Mb) gives BAM and VCF records identical to `bwa-mem2`, though rescue
+activity on those reads was not counted.
+
+The x86 oracle is not stable under Rosetta. On chr20+21, with identical arguments, it alternates between
+two outputs differing on 90 of 100,002 records (`-t1` too). One of them equals the arm64 oracle and both of
+our builds, which never moved. The cause was not established, so a one-off x86 `DIFF` on that index
+proves nothing.
+
+Already covered here, not ported: #626 (`mem_collect_smem_batched` refills in the same pass), #618
+(`get_sa_batch` already runs 128 lanes), #624 (our chain filter runs right after chaining the same
+read, so its list is still in cache), #603 (no per-cell query-end capture in our kernel), #597 (`u128`
+sort key in `primary.rs`).
+
+Ported in part: #616 (USQADD and the single band compare, not the CMTST assembly of its part 2), #625
+(a read-level approximation of its first part).
+
+Not ported, judged too small on evidence here: #612 (no MD for XA hits; `gen_cigar2` is 1.8% of the run
+and XA hits are a fraction of it), #614 (seed pool; about 0.2% estimated from dhat), #615 (the fork
+itself announces about 0.02%). #596, #604 and #617 target `ksw_global2`, already cut by 54-69% here.
+
+Not ported and not settled: #602 (`pos2rid` prefetch; `intv2rid` and `fetch_bounds` still do the lookup).
+#606: an earlier row-major `score2` scan regressed here, not re-evaluated against the fork's version.
+#605 looks C-specific (`pe.rs` builds both buffers), not proven.
+
+Not ported, **not measured here**: the rescue PRs #607, #613, #620 and #623. Rescue is about half of real
+GIAB paired-end compute and dead code on wgsim, and no real human reads were found on this machine (the
+search covered files over 500 MB and was not exhaustive), so a port would ship unmeasured.
+`scripts/fetch_giab30x.sh` can fetch them. #588 (Zen 5 lockstep width) needs a Zen 5 host. #584's selects
+and #586, #587, #590, #610, #611 were not tried. #583, #593 and #601 are documentation.
+
+#589 was a real bug here too: `advise_hugepage` passed unaligned starts, which `madvise` rejects with
+`EINVAL` (checked on Linux arm64: offset 16 gives `EINVAL`, offset 0 succeeds). Our binary never noticed,
+since mimalloc obtains the huge pages itself, but a library consumer on the system allocator lost the hint
+on the three heap arrays (`cp_occ`, `sa_hi`, `sa_ls_word`); `pac` is an aligned mapping and was fine.
+Fixed by rounding the range inward. The huge-page effect of the fix is not measured.

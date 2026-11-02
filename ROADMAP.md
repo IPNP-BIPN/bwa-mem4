@@ -39,7 +39,7 @@ rapprochees.
 | 4.3.1 | 2026-08-14 | couche mecanique Rust sur les 10 crates (preparee le 2026-08-04, publiee ici) ; lecteur hors du chemin critique et entree FIFO reparee, lecture parallele des deux fichiers de mates, une allocation par read au lieu de trois, tri par longueur du lot de rescue, backend C libsais par defaut (+ OpenMP en option), PGO reparee sur macos-14 |
 | 4.3.2 | 2026-08-14 | cible bibliotheque : les implementations de commandes sont appelables sans sous-processus, et `MemArgs` derive `Default` pour etre constructible par un embarqueur |
 | 4.3.3 | 2026-08-15 | le crate est enfin dependable : xz de needletail, sortie BAM/CRAM et mimalloc passent en features, donc la cible bibliotheque se compile sans toolchain C, sans conflit de lien lzma et sans allocateur global impose (#62, #63, #64) |
-| 4.4.0 | 2026-08-27 | la bande resserree devient le defaut, jobs DP dedupliques, marches SA evitees, ecriture SAM sans allocation, second lot en vol seulement si la RAM est la ; noyaux AVX-512BW d'extension et table de score par XOR au rescue, dispatch a l'execution, verifies sous Intel SDE ; position x86 mesuree par machine (#20, #25, #27, #33, #44, #46, #48) |
+| 4.4.0 | 2026-11-02 | la bande resserree devient le defaut, jobs DP dedupliques, marches SA evitees, ecriture SAM sans allocation, second lot en vol seulement si la RAM est la ; noyaux AVX-512BW d'extension et table de score par XOR au rescue, dispatch a l'execution, verifies sous Intel SDE ; position x86 mesuree par machine (#20, #25, #27, #33, #44, #46, #48) ; index compact en memoire (checkpoints de 32 octets) et rescue incremental, rattrapage de bwa-mem3 v0.15, `-V` ecrit enfin `XR:Z`, l'indexeur accepte un commentaire FASTA non UTF-8 |
 
 ## Jalons ouverts (GitHub Projects nº3)
 
@@ -5437,3 +5437,75 @@ Ce qui reste ouvert est une **mesure, pas du code** : #32, le chiffre de tete WG
 bwa-mem2 sur une machine x86_64 dediee. Un runner heberge ne peut ni construire l'index GRCh38
 (pic 92 GB contre 16 GB de RAM) ni mesurer la colle scalaire sans la taxe SMT, et il est detruit
 avant la fin d'un run 30x. La condition de fermeture est chiffree dans l'issue.
+
+## Moins de memoire et moins de cycles : l'index perd un tiers, le rescue ne retrie plus (2026-10-31)
+
+Le fichier `.bwt.2bit.64` reste celui de bwa-mem2, octet pour octet. Ce qui change est ce que
+`FmIndex::load` en garde : le fichier etait recopie tel quel, et deux de ses formats depensaient de
+la memoire pour rien.
+
+- **Les checkpoints passent de 64 a 32 octets** : quatre compteurs `u32` et deux plans de bits au
+  lieu de quatre `i64` et quatre masques one-hot. Sur GRCh38 : 6,2 -> 3,1 GB. Un genome dont une base
+  depasse 2^32 occurrences passe par une table de bases par tranche (`count_base`).
+- **`sa_ms_byte` passe d'un octet a un bit** par echantillon, puisqu'une position humaine n'a qu'un
+  bit au-dela des 32 bas : 0,78 GB -> 97 MB. La largeur suit la taille du genome.
+- **Le dedup se fait par chunk d'alignement**, et non une fois le batch aligne, et la capacite des
+  listes survivantes est rendue. Il est pur par read, donc sa place ne peut pas deplacer un octet.
+- **L'emission paired-end libere chaque paire** au fur et a mesure que son texte apparait.
+
+Du cote des cycles, le premier etat de ces changements etait neutre a +3 % : l'economie de memoire ne
+payait pas sa facture. Ce qui l'a renverse :
+
+- **Le rescue n'appelle plus le dedup complet a chaque insertion** (`insert_into_settled`). Une liste
+  deja passee par `mem_sort_dedup_patch` est un point fixe : on peut y placer un nouvel alignement en
+  place, et on ne retombe sur le passage complet que si le test de redondance le touche. Les appels passent
+  de 1,42 M a 92 k sur 500k paires, et le n moyen de 105 a 22. Le tri etant instable, sa permutation se
+  voit dans le SAM : un test compare les deux chemins sur listes aleatoires (500k tours passes une fois
+  en release, 1000 dans la suite). C'est la quasi-totalite du gain paired-end.
+- **`get_sa_batch` differe ses lectures d'echantillons d'un tour**, le temps que le prefetch arrive.
+- **`discard_contained` balaie un tableau compact de bornes** au lieu des structures de chaines.
+- **Les plis de `occ4_narrow` tiennent en trois additions par paires** (`addp`, `uaddlp`, `uadalp`),
+  la derniere s'accumulant directement sur les compteurs du checkpoint, contre six instructions avant.
+- **Le chemin `wide` sort de la boucle de seeding**, hors ligne, ce qui retire ses `popcount`
+  scalaires de `LsSlot::step` sur tous les autres genomes.
+- **`intv2rid` ne cherche plus la fin d'une graine** quand elle tombe dans le contig de son debut :
+  deux comparaisons au lieu d'une recherche binaire. `pos2rid` reste une transcription litterale.
+
+Mesure : M4 Max, bras entrelaces, min de 2 a 4, `/usr/bin/time -l`, index construits par ce binaire,
+**machine chargee** (charge moyenne de 10 a 90, d'autres sessions tournaient). Les cycles sont le
+chiffre a lire ; les temps muraux restent indicatifs sur cet hote. Le RSS est celui du dernier passage.
+
+| jeu | RSS avant | RSS apres | | Gcycles avant | Gcycles apres | |
+|---|---|---|---|---|---|---|
+| GRCh38, GIAB HG002 PE, 2M paires, `-t16` | 20,36 | **16,23** | -20 % | 1486 | **1284** | -13,6 % |
+| GRCh38, GIAB PE, 500k paires, `-t8` | 14,51 | **10,46** | -28 % | 358,7 | **312,1** | -13,0 % |
+| GRCh38, GIAB SE, 500k reads, `-t8` | 12,65 | **8,59** | -32 % | 86,2 | **84,8** | -1,6 % |
+| GRCm39, wgsim PE, 1M paires, `-t16` | 18,18 | **14,13** | -22 % | 593,1 | **492,8** | -16,9 % |
+| GRCm39, RNA reel PE 59 bp, 1M paires, `-t16` | 13,21 | **9,32** | -29 % | 130,7 | **116,5** | -10,9 % |
+| GRCh38, chargement seul, `-t16` | 10,08 | **6,39** | -37 % | 9,8 | 9,7 | 0,26 s contre 0,31 s |
+
+**Le paired-end gagne nettement, le single-end de peu.** Le single-end n'a pas de rescue : ses -1,6 %
+sont proches du bruit, et ses instructions restent a +5 % (303 contre 288 G), car deux plans de bits
+demandent plus de calcul que quatre masques one-hot. Qu'il reste devant en cycles tient sans doute au
+checkpoint de 32 octets, moins couteux en cache, mais cela n'a pas ete mesure et la marge est mince.
+
+**Essaye et retire, faute de gain mesurable.** Un chemin rapide pour les intervalles d'une ligne dans
+`backward_ext` (0,5 % d'instructions, rien en cycles) et un autre pour les intervalles tenant dans un
+seul bloc. Les fenetres de `BWA4_SA_WINDOW` (64 a 256) et `BWA4_LOCKSTEP_N` (16 a 96) sont plates : les
+valeurs par defaut ne bougent pas.
+
+**Le pic vivant du batch** (`BWA4_STAGE_ALLOC=overlap`, 2M paires, mesure avant le travail sur les
+cycles) passe de 7,45 a 6,84 GB. C'est
+moins que ce que le dedup avance semblait promettre : le pic est maintenant dans `rescue`, ou le
+vivant monte de 2,7 a 4,1 GB dans le mode serialise. C'est la prochaine piste memoire, et elle n'a
+pas ete touchee ici.
+
+**Identite.** md5 hors `@PG` identique a l'oracle `bwa-mem2` sur GRCh38 : PE 500k paires par defaut et
+`-a`, SE 500k reads, PE 100k paires `-M` et `-5`. Identique au binaire d'avant sur 2M paires GIAB et
+sur 1M paires GRCm39. `opt_parity.sh` : 87 sur 87. `scripts/check.sh` passe, sa verification croisee
+x86_64 ayant ete sautee sur cette machine, faute de toolchain.
+
+**Ce que cela ne dit pas.** Aucune mesure sur x86 ni sur Linux : le chemin x86 reste scalaire et n'a
+pas ete chronometre, et la CI est son premier juge. Le chemin `wide` n'a jamais vu de vrai genome de
+cette taille : un test le couvre en reduisant la tranche, avec des compteurs pousses au-dela de 2^32
+a la main.

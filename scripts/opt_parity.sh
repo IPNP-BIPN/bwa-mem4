@@ -234,6 +234,19 @@ check "-M"     se -M
 check "-Y"     se -Y
 check "-C"     se -C
 check "-V"     se -V
+# `-V` prints the FASTA comment, and these fixtures have none, so the case above cannot see whether the
+# flag does anything: it passed for as long as the tag was never written. Comments live in `.ann` alone,
+# so a copy of that one file gives every other index file a commented reference, a TAB included because
+# the C rewrites it, without building anything.
+case "$IDX" in /*) IDX_ABS="$IDX" ;; *) IDX_ABS="$PWD/$IDX" ;; esac
+ANNOT="$TMP/annot.fa"
+for ext in 0123 amb bwt.2bit.64 pac; do ln -s "$IDX_ABS.$ext" "$ANNOT.$ext"; done
+awk 'NR>1 && NR%2==0 {printf "%s %s dna:chromosome chromosome:test\tbuild:1\n", $1, $2; next} {print}' \
+  "$IDX.ann" > "$ANNOT.ann"
+IDX="$ANNOT" check "-V, FASTA comment"    se -V
+IDX="$ANNOT" check "-V, FASTA comment pe" pe -V
+IDX="$ANNOT" check "-V -a, FASTA comment" pe -V -a
+IDX="$ANNOT" check "-V -C, FASTA comment" pe -V -C
 check "-5"     se -5
 check "-q"     se -q
 check "-j"     se -j

@@ -701,6 +701,124 @@ pub fn mem_sort_dedup_patch(
     a
 }
 
+/// Add one rescued region to a list [`mem_sort_dedup_patch`] already settled, when that can be proved
+/// to give exactly what re-running it would, and hand the region back otherwise.
+///
+/// Mate rescue inserts one hit at a time and re-sorts the whole list after each, about a hundred
+/// regions twice over, 4.9M times per million real pairs: a fifth of the rescue stage. Almost always
+/// the hit interacts with nothing, and then the full pass can only do one thing.
+///
+/// # Why the answer is the same
+///
+/// `ma` is the output of a query-less pass (`codes` empty, so no merging and no coordinate moves), and
+/// that output is a fixed point: every pair of survivors within reach failed the redundancy test,
+/// because a pair that passed it kills one of the two. Re-running on `ma` plus `b` differs only where:
+///
+/// - **A pair of `ma` could flip outcome.** Its scan order can change for two regions with equal `re`,
+///   since the unstable sort's permutation depends on the list length. It does not matter: with `re`
+///   tied, both overlaps are at least the shorter span on their axis in either orientation, so the
+///   test reads the same both ways. And reach is monotone along the sorted list, because a contig's
+///   regions are contiguous in `re`, which is why a region with no contig sends us to the full pass.
+/// - **`b` could pass the test against something.** Checked here, ignoring reach, so only
+///   conservatively. Passing means the full pass decides, with one exception: a `b` equal in every
+///   field to a region it meets. One of the two dies and which one cannot be observed, leaving `ma`.
+/// - **The final sort could order `b` differently.** `(score desc, rb, qb)` is a strict total order on
+///   whatever survives, since equal triples would have passed the test above. So the position is
+///   unique, whatever the permutation before it.
+///
+/// The full pass also sets `n_comp` to 1, which `ma`'s regions already hold.
+///
+/// # Parameters
+/// * `opt`: for `mask_level_redun`.
+/// * `ma`: a list returned by [`mem_sort_dedup_patch`] with empty `codes` from at least two regions.
+///   The caller tracks that: a shorter input returns early, without the `n_comp` reset, and a pass
+///   with `codes` can leave pairs it merged untested.
+/// * `b`: the new region.
+///
+/// # Returns
+/// `Ok` with `ma` updated, or `Err(b)` with `ma` untouched when the full pass has to decide.
+pub(crate) fn insert_into_settled(
+    opt: &MemOpt,
+    ma: &mut Vec<MemAlnReg>,
+    mut b: MemAlnReg,
+) -> Result<(), MemAlnReg> {
+    let mask_level_redun = opt.mask_level_redun;
+    // Below 1 is what makes the tied-`re` argument hold, and a zero-length `b` is the compaction's.
+    if mask_level_redun >= 1.0
+        || mask_level_redun.is_nan()
+        || ma.is_empty()
+        || b.rid < 0
+        || b.qe <= b.qb
+        || b.re <= b.rb
+    {
+        return Err(b);
+    }
+    let mut identical = false;
+    for q in ma.iter() {
+        if q.rid < 0 || q.re <= q.rb {
+            return Err(b);
+        }
+        // The same arithmetic as the scan, with the later `re` in the role of `p`. Its f32 is why this
+        // is not written over integers: see `mem_sort_dedup_patch`.
+        let or_ = if q.re <= b.re {
+            q.re - b.rb
+        } else {
+            b.re - q.rb
+        };
+        let oq = if q.re <= b.re {
+            if q.qb < b.qb {
+                q.qe - b.qb
+            } else {
+                b.qe - q.qb
+            }
+        } else if b.qb < q.qb {
+            b.qe - q.qb
+        } else {
+            q.qe - b.qb
+        };
+        let mr = (q.re - q.rb).min(b.re - b.rb);
+        let mq = (q.qe - q.qb).min(b.qe - b.qb);
+        if or_ as f32 > mask_level_redun * mr as f32 && oq as f32 > mask_level_redun * mq as f32 {
+            if !same_but_n_comp(q, &b) {
+                return Err(b);
+            }
+            identical = true;
+        }
+    }
+    if !identical {
+        b.n_comp = 1;
+        let at = ma.partition_point(|r| {
+            (-i64::from(r.score), r.rb, r.qb) < (-i64::from(b.score), b.rb, b.qb)
+        });
+        ma.insert(at, b);
+    }
+    Ok(())
+}
+
+/// Whether two regions are indistinguishable to everything after the dedup. `n_comp` is left out
+/// because the pass resets it on both.
+fn same_but_n_comp(x: &MemAlnReg, y: &MemAlnReg) -> bool {
+    x.rb == y.rb
+        && x.re == y.re
+        && x.qb == y.qb
+        && x.qe == y.qe
+        && x.rid == y.rid
+        && x.score == y.score
+        && x.truesc == y.truesc
+        && x.sub == y.sub
+        && x.csub == y.csub
+        && x.sub_n == y.sub_n
+        && x.seedcov == y.seedcov
+        && x.seedlen0 == y.seedlen0
+        && x.secondary == y.secondary
+        && x.secondary_all == y.secondary_all
+        && x.w == y.w
+        && x.frac_rep.to_bits() == y.frac_rep.to_bits()
+        && x.is_alt == y.is_alt
+        && x.alt_sc == y.alt_sc
+        && x.hash == y.hash
+}
+
 /// Assign each region a primary, or promote it to primary itself. Port of
 /// `mem_mark_primary_se_core` (`bwamem.cpp:1392`).
 ///
@@ -1160,6 +1278,88 @@ pub fn mem_reorder_primary5(t: i32, regs: &mut [MemAlnReg]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The incremental insert against the pass it stands in for, on lists built to hit every case its
+    /// proof names: tied `re`, tied scores, exact duplicates, near-duplicates differing in one field,
+    /// and regions just either side of the redundancy threshold. Every field is compared, since the
+    /// proof claims the full pass cannot be told apart, and a test on the SAM alone could not see that.
+    #[test]
+    fn insert_into_settled_matches_the_full_pass() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let fm = FmIndex::load(std::path::Path::new(prefix)).unwrap();
+        let opt = MemOpt::default();
+        // xorshift: a fixed stream, so a failure reproduces.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let region = |next: &mut dyn FnMut(u64) -> u64| {
+            // A narrow range and a few lengths, so ties and overlaps are the common case. Far apart
+            // on occasion, because the scan's reach is part of what is being claimed.
+            let rb = next(40) as i64 * 5 + next(3) as i64 * 20_000;
+            let len = 20 + next(6) as i64 * 20;
+            let qb = next(4) as i32 * 10;
+            let qlen = (len as i32 + next(3) as i32 * 2).min(148 - qb);
+            let mut r = reg(30 + next(5) as i32 * 5, 0, 0, 0, 1);
+            r.rb = rb;
+            r.re = rb + len;
+            r.qb = qb;
+            r.qe = qb + qlen;
+            // From the coordinates, as on a real reference, where a contig is one contiguous range.
+            r.rid = (rb / 20_000) as i32;
+            r.truesc = 0;
+            r.csub = next(3) as i32;
+            r.seedcov = next(2) as i32;
+            r.n_comp = 0;
+            r
+        };
+        let same = |x: &[MemAlnReg], y: &[MemAlnReg]| format!("{x:?}") == format!("{y:?}");
+        let (mut taken, mut declined) = (0u32, 0u32);
+        const ROUNDS: u32 = 1000;
+        for _ in 0..ROUNDS {
+            let n = 2 + next(120) as usize;
+            let pool: Vec<MemAlnReg> = (0..n).map(|_| region(&mut next)).collect();
+            let settled = mem_sort_dedup_patch(&fm, &opt, &[], pool);
+            for _ in 0..4 {
+                // Half the time a copy of something already there, with a field possibly nudged.
+                let mut b = region(&mut next);
+                if next(2) == 0 {
+                    b = settled[next(settled.len() as u64) as usize].clone();
+                    b.n_comp = 0;
+                    match next(4) {
+                        0 => b.csub += 1,
+                        1 => b.re += 1,
+                        2 => b.score += 1,
+                        _ => {}
+                    }
+                }
+                let mut fast = settled.clone();
+                let mut full = settled.clone();
+                // The caller's own insert, then the pass: what `matesw_apply` runs when declined.
+                let at = full.iter().take_while(|r| r.score >= b.score).count();
+                full.insert(at, b.clone());
+                let full = mem_sort_dedup_patch(&fm, &opt, &[], full);
+                match insert_into_settled(&opt, &mut fast, b.clone()) {
+                    Ok(()) => {
+                        taken += 1;
+                        assert!(same(&fast, &full), "b {b:?}\nfast {fast:?}\nfull {full:?}");
+                    }
+                    Err(_) => {
+                        declined += 1;
+                        assert!(same(&fast, &settled), "a declined insert touched the list");
+                    }
+                }
+            }
+        }
+        // A test that always took one branch would prove nothing about the other.
+        assert!(
+            taken > 1000 && declined > 1000,
+            "taken {taken}, declined {declined}"
+        );
+    }
 
     #[test]
     fn hash_64_is_wang() {
