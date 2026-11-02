@@ -96,7 +96,7 @@ pub fn copy_comment() -> bool {
 ///
 /// Writes nothing at all unless `-C` is on AND the read carried a comment, so both a `None` and a
 /// disabled flag leave `out` byte-for-byte untouched.
-pub fn append_comment(out: &mut Vec<u8>, comment: Option<&str>) {
+pub fn append_comment(out: &mut Vec<u8>, comment: Option<&[u8]>) {
     // Two independent reasons to write nothing, checked separately: the flag is off, or this
     // particular read had no comment.
     //
@@ -106,11 +106,10 @@ pub fn append_comment(out: &mut Vec<u8>, comment: Option<&str>) {
         return;
     }
     // Rust: unwraps the `Option`, running the body only when there is a comment, with `c` bound to
-    // it. `.as_bytes()` reinterprets the text as raw bytes without copying, because the SAM record
-    // is being assembled as bytes rather than as text.
+    // it. Raw bytes, copied as they came: a FASTQ header need not be valid UTF-8.
     if let Some(c) = comment {
         out.push(b'\t');
-        out.extend_from_slice(c.as_bytes());
+        out.extend_from_slice(c);
     }
 }
 

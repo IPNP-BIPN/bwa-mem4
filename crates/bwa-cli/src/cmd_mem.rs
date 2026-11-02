@@ -2141,11 +2141,12 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Batch size in INPUT BASES, not reads. Default `chunk_size * -t` (10M per thread), mirroring
     // bwa's `aux.task_size`; `-K` overrides it. Load-bearing for paired-end reproducibility: the
     // insert-size model is re-estimated per batch, so the boundary this fixes is visible in the
-    // output. Clamped to >= 1 so a zero or negative `-K` cannot stall the reader.
+    // output. A zero or negative `-K` means "not set" and `-t 0` means one thread, both as in bwa
+    // (`fixed_chunk_size > 0`, `n_threads` clamped before `task_size`).
     let k_batch = args
         .k_batch
-        .unwrap_or(opt.chunk_size * i64::from(args.threads))
-        .max(1) as usize;
+        .filter(|&k| k > 0)
+        .unwrap_or(opt.chunk_size * i64::from(opt.n_threads)) as usize;
 
     // ================= Start reading before loading the index =================
     //
@@ -2545,7 +2546,7 @@ fn finish_se(
     // After marking, `regs[0]` is the highest-scoring primary.
     let mut regs = regs;
     if dump_regs_enabled() {
-        eprintln!("=== read {} ===", rec.name());
+        eprintln!("=== read {} ===", String::from_utf8_lossy(rec.name()));
         bwa_mem::dump_regs(bns, "pre-dedup", &regs);
         regs = mem_sort_dedup_patch(fm, opt, codes, regs);
         bwa_mem::stamp_is_alt(bns, &mut regs);
@@ -2869,16 +2870,11 @@ fn write_aln_se(
         tags.push_str("\tXA:Z:");
         tags.push_str(xa_string);
     }
-    // `-C`: bwa appends the FASTQ comment after everything else.
-    if bwa_core::rg::copy_comment() {
-        if let Some(comment) = rec.comment() {
-            tags.push('\t');
-            tags.push_str(comment);
-        }
-    }
-    // `-V` closes the record, after even the comment (`bwamem.cpp:1721`). The comment is in whatever
-    // encoding the FASTA was, so from here `tags` is bytes.
+    // Both trailers below are in whatever encoding their file was, so from here `tags` is bytes.
     let mut tags = tags.into_bytes();
+    // `-C`: bwa appends the FASTQ comment after everything else.
+    bwa_core::rg::append_comment(&mut tags, rec.comment());
+    // `-V` closes the record, after even the comment (`bwamem.cpp:1721`).
     if opt.flag & flags::REF_HDR != 0 {
         bwa_mem::emit::push_xr(&mut tags, bns.contigs[aln.rid as usize].comment());
     }

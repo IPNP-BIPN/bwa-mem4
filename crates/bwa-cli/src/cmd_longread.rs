@@ -90,9 +90,13 @@ fn reference_fasta(prefix: &Path) -> Result<std::path::PathBuf> {
     if prefix.is_file() {
         return Ok(prefix.to_path_buf());
     }
-    // A few conventional spellings, in case the prefix was given without its extension.
+    // A few conventional spellings, in case the prefix was given without its extension. Appended,
+    // never `with_extension`: that would turn the prefix `GRCh38.p14` into another build's `GRCh38.fa`.
     for ext in ["fa", "fasta", "fna", "fa.gz", "fasta.gz"] {
-        let candidate = prefix.with_extension(ext);
+        let mut candidate = prefix.as_os_str().to_os_string();
+        candidate.push(".");
+        candidate.push(ext);
+        let candidate = std::path::PathBuf::from(candidate);
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -226,11 +230,15 @@ fn map_batch(
                 // definition, so this is lossless; a malformed file that is not gets its QUAL
                 // dropped rather than the run aborted.
                 let qual = rec.qual().and_then(|q| std::str::from_utf8(q).ok());
+                // rammap's formatter also wants `&str` here. This path is not byte-identical to
+                // bwa anyway, so a stray byte is replaced rather than refused.
+                let name = String::from_utf8_lossy(rec.name());
+                let comment = rec.comment().map(String::from_utf8_lossy);
                 let read = ReadInfo {
-                    qname: rec.name(),
+                    qname: &name,
                     qseq: rec.seq(),
                     qual,
-                    comment: rec.comment(),
+                    comment: comment.as_deref(),
                     n_seg: 1,
                     seg_idx: 0,
                 };
@@ -432,6 +440,22 @@ fn rammap_version() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// A dotted prefix names its own FASTA, never a sibling that shares its stem.
+    #[test]
+    fn dotted_prefix_does_not_select_another_reference() {
+        let dir = std::env::temp_dir().join(format!("bwa4_lr_ref_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("GRCh38.fa"), ">other\nACGT\n").unwrap();
+        let prefix = dir.join("GRCh38.p14");
+        assert!(super::reference_fasta(&prefix).is_err());
+        std::fs::write(dir.join("GRCh38.p14.fa"), ">own\nACGT\n").unwrap();
+        assert_eq!(
+            super::reference_fasta(&prefix).unwrap(),
+            dir.join("GRCh38.p14.fa")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The `@PG VN:` we write must be the version actually linked.
     ///
     /// `rammap_version` is a literal because the crate does not expose its own `CARGO_PKG_VERSION`,
