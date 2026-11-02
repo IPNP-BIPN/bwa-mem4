@@ -380,7 +380,8 @@ the same session, and the file says what would have to be new for one to be wort
 
 Whether a GPU could help without giving up byte-identity, how much (2.45x, and an integrated GPU
 already reaches it), and what would have to be built first, is in
-[docs/gpu-plan.md](docs/gpu-plan.md). Nothing there is implemented.
+[docs/gpu-plan.md](docs/gpu-plan.md). None of it is on this branch: the Metal backend is parked on
+branch `gpu`.
 
 A read of fg-labs/bwa-mem3's source, asking why it is faster than us on x86_64 while we are at
 parity on Apple Silicon, is in [docs/fork-teardown.md](docs/fork-teardown.md). The short answer is

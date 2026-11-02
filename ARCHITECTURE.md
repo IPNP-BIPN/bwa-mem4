@@ -847,7 +847,7 @@ Dumps and timers (read-only): `BWA4_DUMP_SMEMS`, `BWA4_DUMP_CHAINS`, `BWA4_DUMP_
 `BWA4_DUMP_PRESORT` (takes a read id, dumps that read's regions immediately before the hash sort,
 which is where parity investigations usually start), `BWA4_DUMP_BW` (band-retry trace in bwa's
 `-v 4` format, so it diffs directly against the oracle), `BWA4_DUMP_PESTAT`, `BWA4_CHAIN_TIME`,
-`BWA4_MATESW_TIME`, `BWA4_TRAFFIC`, `BWA4_GPU_STATS`.
+`BWA4_MATESW_TIME`, `BWA4_TRAFFIC`.
 
 ### The method that actually cracks a divergence
 
