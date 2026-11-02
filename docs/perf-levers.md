@@ -1565,14 +1565,20 @@ catch-up, `-t4`, interleaved, records identical to `bwa-mem2` in every pass:
 Some passes on both sides were disturbed by other work on the host (context switches tripled, one run took
 81 s against 39 s), so wall time means nothing here and the GRCm39 median understates the gain: its two
 quiet pairs give -15%. On a small index it costs instructions and gains nothing clear on cycles; the memory
-saving holds everywhere. x86 timing is **not measured**: the two bit planes there go through scalar
-popcounts, and the emulated x86 of `docker_gates.sh` could only give a ratio.
+saving holds everywhere.
+
+x86, `bench-x86` on a shared runner (Xeon 8370C with `avx512bw`, chr21, 1M simulated pairs), this whole
+branch against `41b4612`: wall 100.50 s to 86.47 s (-13.96%), winning 3 of 3, records identical. The two bit
+planes go through scalar popcounts there and it still gains. One chromosome, not a whole genome. In the
+same job `bwa-mem3` takes 36.8 s, so the fork stays 2.4x ahead on this input.
 
 Output of that port: 66 of 66 arm64 runs match `bwa-mem2` (three inputs, 18 option sets including `-5`,
 `-S`, `-P`, `-Y`, plus SE, `-t1`, `-t16` and the default `-K`). On x86 under Rosetta it matches the pre-port
 tree on 12 of 12 cases. Its 32-bit count path past 2^32 occurrences has still never seen a real genome of
 that size. Rescue is thin on these reads, and no real human reads are on this machine for
-`insert_into_settled`, whose randomised test compares it to the full pass.
+`insert_into_settled`, whose randomised test compares it to the full pass. `giab-gate` on the same branch
+(1.09M real HG002 pairs, chr21:20-30 Mb) gives BAM and VCF records identical to `bwa-mem2`, though rescue
+activity on those reads was not counted.
 
 The x86 oracle is not stable under Rosetta. On chr20+21, with identical arguments, it alternates between
 two outputs differing on 90 of 100,002 records (`-t1` too). One of them equals the arm64 oracle and both of
