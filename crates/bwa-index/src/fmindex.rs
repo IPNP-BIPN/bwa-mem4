@@ -1249,6 +1249,42 @@ impl FmIndex {
         unpack_pac_range_into(&self.pac, self.l_pac(), rb, re, out);
     }
 
+    /// Prefetch the `.pac` lines of the window `[rb, re)` that [`bases_into`] will unpack. `rb` and
+    /// `re` are 2L-space positions on one strand; out-of-range values waste a fetch at worst, because
+    /// a prefetch never faults. Only the first and last line are hinted, which covers all of a
+    /// short read's first-seed window (150 bases are 38 bytes, so one or two lines) and just the ends
+    /// of a long one.
+    #[inline]
+    pub fn prefetch_pac(&self, rb: i64, re: i64) {
+        let l_pac = self.l_pac();
+        // A reverse-strand window reads the forward bytes it mirrors, as `unpack_pac_range_into`.
+        let (lo, hi) = if rb >= l_pac {
+            ((l_pac << 1) - re, (l_pac << 1) - rb)
+        } else {
+            (rb, re)
+        };
+        let base = self.pac.as_ptr();
+        let line = |p: i64| base.wrapping_add((p.max(0) >> 2) as usize);
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: a prefetch is a hint that never faults or writes.
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) line(lo), options(nostack, readonly, preserves_flags));
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) line(hi), options(nostack, readonly, preserves_flags));
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch is a hint that never faults or writes.
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(line(lo) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(line(hi) as *const i8, _MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            // No portable prefetch intrinsic: discard the values to silence the unused warning.
+            let _ = (line, lo, hi);
+        }
+    }
+
     /// The loaded cumulative base counts (already `+1`, as bwa-mem2's `load_index`).
     ///
     /// # Returns

@@ -1132,6 +1132,17 @@ fn align_reads_batched_inner<B: SwBackend>(
         // right-side decision below compares against.
         let l_query = codes.len() as i32;
         let chains = &per_read_chains[r];
+        // The next read's reference windows are random DRAM misses the loop below takes one at a
+        // time, and a read's own chains are too few and too close to warn each other. Hint them a
+        // whole read ahead. Approximates each window by its first seed with no gap room, which is
+        // close enough for a hint. From fg-labs/bwa-mem3 PR #625.
+        if let Some(next) = per_read_chains.get(r + 1) {
+            let next_len = i64::from(reads[r + 1].len() as u32);
+            for seed in next.iter().take(4).filter_map(|c| c.seeds.first()) {
+                let rb = seed.rbeg - i64::from(seed.qbeg);
+                fm.prefetch_pac(rb, rb + next_len);
+            }
+        }
         for (ci, chain) in chains.iter().enumerate() {
             if chain.seeds.is_empty() {
                 continue;

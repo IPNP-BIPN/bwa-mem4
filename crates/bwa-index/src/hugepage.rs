@@ -55,8 +55,11 @@
 //! # Why the call is kept anyway
 //!
 //! It is retained, not deleted, for one reason: `bwa-mem4-index` is published as a LIBRARY, and a
-//! consumer using the system allocator gets none of mimalloc's hinting. For them this is the 1.7x.
-//! Inside our own binary it is one ignored syscall per array at load time and nothing else. Do not
+//! consumer using the system allocator gets none of mimalloc's hinting, and for them this hint is
+//! what can obtain the huge pages. The 1.7x was measured between THP `never` and THP on, not on such
+//! a consumer. Until the range was page-aligned, the kernel refused this call on any array that did
+//! not start on a page, which a large system-`malloc` block does not; the table above predates that
+//! fix. Inside our own binary it is one redundant syscall per array at load time. Do not
 //! expect it to move a number in `bwa-mem4` itself, and do not re-measure it hoping otherwise.
 //!
 //! # Why it cannot change output
@@ -92,6 +95,25 @@ extern "C" {
     /// libc's `madvise(2)`. Declared here rather than pulled from the `libc` crate so this costs
     /// the workspace no new dependency; the signature is fixed by POSIX and the Linux uapi.
     fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
+    /// libc's `sysconf(3)`, for the page size, which is not always 4 KiB on arm64 Linux.
+    fn sysconf(name: core::ffi::c_int) -> core::ffi::c_long;
+}
+
+/// `_SC_PAGESIZE` in the Linux libc headers.
+#[cfg(target_os = "linux")]
+const SC_PAGESIZE: core::ffi::c_int = 30;
+
+/// The whole pages inside `[addr, addr + len)`, as `(start, len)`. `page` must be a power of two.
+///
+/// `madvise` rejects an unaligned start with `EINVAL` rather than rounding it, and a large `malloc`
+/// block starts just past a page boundary, so an unrounded call quietly does nothing. Rounds inward so
+/// the hint never reaches memory the caller does not own. The fork fixed the same thing in
+/// fg-labs/bwa-mem3 PR #589.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn page_aligned_range(addr: usize, len: usize, page: usize) -> (usize, usize) {
+    let start = addr.saturating_add(page - 1) & !(page - 1);
+    let end = addr.saturating_add(len) & !(page - 1);
+    (start, end.saturating_sub(start))
 }
 
 /// Hint that `[ptr, ptr + len)` should be backed by transparent huge pages.
@@ -102,7 +124,7 @@ extern "C" {
 ///
 /// # Parameters
 ///
-/// * `ptr`: start of the range. Need not be page-aligned; the kernel rounds down. Only the
+/// * `ptr`: start of the range. Need not be page-aligned; it is rounded inward here. Only the
 ///   2 MiB-aligned interior of the range can actually be promoted, which is why this is worth
 ///   calling on multi-gigabyte arrays and pointless on small ones.
 /// * `len`: length in BYTES.
@@ -127,12 +149,35 @@ pub unsafe fn advise_hugepage(ptr: *const u8, len: usize) {
         if !ptr.is_null() && len > 0 && !disabled() {
             // Cast away const: `madvise` takes `void *` by POSIX convention even though this
             // particular advice does not modify the range.
-            madvise(ptr as *mut core::ffi::c_void, len, MADV_HUGEPAGE);
+            let (start, aligned_len) =
+                page_aligned_range(ptr as usize, len, sysconf(SC_PAGESIZE).max(1) as usize);
+            if aligned_len > 0 {
+                madvise(start as *mut core::ffi::c_void, aligned_len, MADV_HUGEPAGE);
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
         // Referenced so the parameters are not dead on macOS/Windows.
         let _ = (ptr, len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_aligned_range;
+
+    #[test]
+    fn page_aligned_range_rounds_inward() {
+        const PAGE: usize = 4096;
+        // Already aligned: untouched.
+        assert_eq!(page_aligned_range(PAGE, 3 * PAGE, PAGE), (PAGE, 3 * PAGE));
+        // What a large `malloc` returns: both ends move inward to a page boundary.
+        assert_eq!(
+            page_aligned_range(PAGE + 16, 3 * PAGE, PAGE),
+            (2 * PAGE, 2 * PAGE)
+        );
+        // No whole page inside: nothing to advise.
+        assert_eq!(page_aligned_range(PAGE + 16, 100, PAGE).1, 0);
     }
 }
