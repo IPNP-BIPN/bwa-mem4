@@ -567,17 +567,31 @@ impl FmIndex {
         // which the file's offset-48 layout denies an in-place mmap, is satisfied because the
         // destination `Vec<CpOcc>` is freshly allocated and therefore aligned.
         let bwt_file = std::fs::File::open(sibling(prefix, "bwt.2bit.64"))?;
+        let bwt_len = bwt_file.metadata()?.len();
+        // Named here because the alternative is a bare "failed to fill whole buffer".
+        let damaged = |what: String| {
+            bwa_core::Error::IndexFormat(format!(
+                "index {}: {what}. The file is damaged or incomplete; re-run `bwa-mem4 index`.",
+                prefix.display()
+            ))
+        };
         /// Bytes before the first payload array: `ref_seq_len` plus `count[5]`, six little-endian
         /// i64. Every payload offset below is measured from here.
         const HEADER_BYTES: u64 = 48;
 
         // ---- Header: ref_seq_len, then count[5] (six i64, little-endian, 48 bytes) -----------
         let mut header = [0u8; 48];
+        if bwt_len < HEADER_BYTES {
+            return Err(damaged(format!(".bwt.2bit.64 is only {bwt_len} bytes")));
+        }
         read_at_parallel(&bwt_file, 0, &mut header)?;
         let mut cursor = 0usize;
         // First header field: the BWT ROW count, 2L + 1 (2L reference bases plus the sentinel row).
         // Every later size in the file is derived from it, so it is read before anything else.
         let ref_seq_len = rd_i64(&header, &mut cursor);
+        if ref_seq_len < 1 {
+            return Err(damaged(format!(".bwt.2bit.64 declares {ref_seq_len} rows")));
+        }
         // `count[c]`: rows whose suffix starts with a base < c. Index 4 is the total (all rows).
         // Read as written by the builder, i.e. WITHOUT the sentinel adjustment applied below.
         let mut count = [0i64; 5];
@@ -607,6 +621,12 @@ impl FmIndex {
         const FILE_CP_BYTES: usize = 64;
         let cp_bytes = cp_size * FILE_CP_BYTES;
         let ls_bytes = sa_size * 4;
+        let bwt_need = HEADER_BYTES + cp_bytes as u64 + sa_size as u64 + ls_bytes as u64 + 8;
+        if bwt_len < bwt_need {
+            return Err(damaged(format!(
+                ".bwt.2bit.64 is {bwt_len} bytes and its header needs {bwt_need}"
+            )));
+        }
 
         // Trailing header field, read first because the checkpoints are built with it in hand:
         // the one BWT ROW (not a reference position) whose suffix is the whole text, i.e. the row
@@ -770,6 +790,13 @@ impl FmIndex {
         // SAFETY: the index files are not mutated while a run holds them open; a concurrent external
         // truncation is out of scope (same assumption as bwa-mem2's mmap'd index).
         let pac = unsafe { Mmap::map(&pac_file)? };
+        let pac_need = ((ref_seq_len as u64 - 1) / 2).div_ceil(4) as usize;
+        if pac.len() < pac_need {
+            return Err(damaged(format!(
+                ".pac is {} bytes and the reference needs {pac_need}",
+                pac.len()
+            )));
+        }
         // ~800 MB on GRCh38, read at extension time at positions derived from seed hits, i.e. also
         // effectively random. A file-backed mapping only takes huge pages on a kernel and
         // filesystem that support it (Linux >= 5.7 plus a THP-capable fs), so treat this one as a

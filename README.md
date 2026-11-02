@@ -84,13 +84,13 @@ and Sapphire Rapids, and the full 58-case parity gate has been run on a host tha
 with the 512-bit dispatch forced (64 cases, 0 failures). Byte-identity to bwa-mem2 holds on every
 architecture regardless.
 
-On Apple Silicon the worker pool is capped at the Performance-core count, because the Efficiency
-cores measurably do not help. Measured on an M4 Max (12 P + 4 E), 500k pairs against GRCh38, three
-repetitions: `-t16` and `-t12` finish in the same wall time (6.1 s, the difference inside the
-spread) while `-t16` burns 8% more CPU. Driven onto E cores deliberately, the same work takes 5.75x
-longer, so rayon's even split leaves their chunk straggling while everything else waits. The cap
-applies to the pool only: `-t` still sets the default `-K`, so the output is unchanged, verified
-byte-identical to the oracle with and without it. `BWA4_NO_PCORE_CAP=1` disables it.
+On Apple Silicon the worker pool uses every core you ask for, Efficiency cores included. Capping it
+at the Performance cores looked free on a small simulated benchmark and was the default for a while,
+until the real workload said otherwise. Measured on an M4 Max (12 P + 4 E), 1M real GIAB pairs,
+gzipped, `-t16`, three alternating repetitions: 23.30 s uncapped against 25.65 s capped, 9.2% faster
+in all three, for more CPU, because a slow core doing some of the work beats an idle one.
+`BWA4_PCORE_CAP=1` restores the cap. It applies to the pool only: `-t` still sets the default `-K`,
+so the output is unchanged, verified byte-identical to the oracle with and without it.
 
 ### Trading a batch of memory for a little wall clock
 

@@ -117,6 +117,8 @@ fn reference_fasta(prefix: &Path) -> Result<std::path::PathBuf> {
 /// - `prefix`: the index prefix, resolved to a FASTA by [`reference_fasta`].
 /// - `reads`: the read files. A second file is mapped as independent single-end reads: pairing is a
 ///   short-read concept and rammap's own CLI treats long reads as fragments.
+/// - `extra_header`: the `-H` and `-R` lines, written after the `@SQ` lines. The caller has already
+///   installed `-R`'s ID, which every record then carries as `RG:Z`.
 /// - `out`: where the SAM goes, already opened by the caller (stdout or `-o`).
 /// - `argv`: the full command line, for the `@PG CL:` field.
 pub fn run(
@@ -124,6 +126,7 @@ pub fn run(
     mode: &str,
     prefix: &Path,
     reads: &[std::path::PathBuf],
+    extra_header: &[String],
     out: &mut dyn Write,
     argv: &[String],
 ) -> Result<()> {
@@ -147,11 +150,11 @@ pub fn run(
         do_ds: false,
         eqx: false,
         output_sam: true,
-        rg_id: None,
+        rg_id: bwa_core::rg::rg_id().map(Into::into),
         split_mode: false,
     };
 
-    write_header(out, aligner.index(), argv)?;
+    write_header(out, aligner.index(), extra_header, argv)?;
 
     // Records emitted, for the closing log line.
     let mut n_reads = 0u64;
@@ -415,16 +418,25 @@ fn preset_slug(preset: Preset) -> &'static str {
 /// Mirrors rammap's own header (`rammap/src/main.rs`), because the records under it are rammap's.
 /// The `@PG` deliberately does NOT say `bwa-mem4`: the file should name the mapper that produced
 /// its alignments.
-fn write_header(out: &mut dyn Write, index: &Index, argv: &[String]) -> Result<()> {
+fn write_header(
+    out: &mut dyn Write,
+    index: &Index,
+    extra_header: &[String],
+    argv: &[String],
+) -> Result<()> {
     writeln!(out, "@HD\tVN:1.6\tSO:unsorted\tGO:query")?;
     for s in &index.seqs {
         writeln!(out, "@SQ\tSN:{}\tLN:{}", s.name, s.len)?;
     }
+    for line in extra_header {
+        writeln!(out, "{line}")?;
+    }
+    // Tabs escaped for the same reason as the short-read `@PG`: a real one would split the field.
     writeln!(
         out,
         "@PG\tID:rammap\tPN:rammap\tVN:{}\tCL:{}",
         rammap_version(),
-        argv.join(" ")
+        argv.join(" ").replace('\t', "\\t")
     )?;
     Ok(())
 }

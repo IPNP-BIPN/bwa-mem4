@@ -418,7 +418,7 @@ correlated. Exploiting that is worth a lot of accuracy.
    distribution says within a few hundred bases where the mate must be, so a full local
    Smith-Waterman (`bwa_extend::ksw_align2`) over that small window finds it. On real data this is
    roughly 47% of paired-end wall time, which is why it has its own vectorized kernel
-   (`crates/bwa-neon/src/matesw.rs`) and its own kill switch (`-S`, or `BWA4_NO_RESCUE`).
+   (`crates/bwa-neon/src/matesw.rs`) and its own kill switch (`-S`).
 
 3. **`mem_pair` (`pe.rs:1042`).** Build one flat list of every candidate placement from both reads,
    packed into two `u64`s so a plain sort orders them by genomic position, then sweep left to right.
@@ -840,7 +840,7 @@ made the `mem_gen_alt` work tractable (`DIVERGENCES.md`).
 
 The code carries built-in tracing, all gated on environment variables so they cost nothing when
 unset. Behaviour gates (these change output or skip work, so never leave one set during a parity
-run): `BWA4_NO_RESCUE`, `BWA4_NO_DISCARD`, `BWA4_NO_SKIP_CONTAINED`, `BWA4_SCALAR_RESCUE`,
+run): `BWA4_NO_DISCARD`, `BWA4_NO_SKIP_CONTAINED`, `BWA4_SCALAR_RESCUE`,
 `BWA4_SEED_R2_SERIAL`, `BWA4_LOCKSTEP_N`, `BWA4_SA_SORT`, `BWA4_SA_PER_READ`.
 
 Dumps and timers (read-only): `BWA4_DUMP_SMEMS`, `BWA4_DUMP_CHAINS`, `BWA4_DUMP_REGS`,

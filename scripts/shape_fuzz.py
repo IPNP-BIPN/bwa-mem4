@@ -166,6 +166,13 @@ def group_input(args, tmp, ref, rep):
         _, w, _ = run(args.oracle, ref, [f"{tmp}/{name}"])
         _, g, _ = run(args.ours, ref, [f"{tmp}/{name}"])
         rep.check(f"input: {name}", g == w)
+    # A first read shorter than the wrap width sits on one line: only later records show the wrapping.
+    short = [(recs[0][0], recs[0][1][:40], recs[0][2][:40])] + recs[1:]
+    write_fastq(f"{tmp}/short_flat.fq", short)
+    write_fastq(f"{tmp}/short_wrapped.fq", short, wrap=60)
+    _, w, _ = run(args.oracle, ref, [f"{tmp}/short_flat.fq"])
+    _, g, _ = run(args.ours, ref, [f"{tmp}/short_wrapped.fq"])
+    rep.check("input: wrapped after a short first read", g == w)
 
 
 def group_reference(args, tmp, _ref, rep):
