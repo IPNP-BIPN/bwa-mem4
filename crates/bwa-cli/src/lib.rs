@@ -30,5 +30,6 @@
 pub mod cmd_index;
 pub mod cmd_longread;
 pub mod cmd_mem;
+pub mod gpu;
 pub mod stage_alloc;
 pub mod stage_time;

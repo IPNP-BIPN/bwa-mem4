@@ -51,6 +51,8 @@ bwa-extend = { package = "bwa-mem4-extend", path = "crates/bwa-extend", version 
 bwa-mem = { package = "bwa-mem4-mem", path = "crates/bwa-mem", version = "4.4.0" }
 bwa-diff = { package = "bwa-mem4-diff", path = "crates/bwa-diff", version = "4.4.0" }
 bwa-neon = { package = "bwa-mem4-neon", path = "crates/bwa-neon", version = "4.4.0" }
+bwa-gpu = { package = "bwa-mem4-gpu", path = "crates/bwa-gpu", version = "4.4.0" }
+bwa-wgpu = { package = "bwa-mem4-wgpu", path = "crates/bwa-wgpu", version = "4.4.0" }
 # --- external ---
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

@@ -1,0 +1,28 @@
+[package]
+name = "bwa-mem4-wgpu"
+description = "Portable GPU backend for bwa-mem4's seed extension: WGSL compute on Vulkan, Metal or DX12, off by default."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "gpu", "vulkan"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bwa-mem4-extend = { path = "../bwa-extend", version = "4.4.0" }
+bwa-mem4-gpu = { path = "../bwa-gpu", version = "4.4.0" }
+# OPTIONAL and OFF by default, like `metal` for bwa-metal: without the `wgpu` feature this crate has
+# no dependency and `WgpuExtend::new` returns `None`, which is the CPU path the aligner already takes.
+# The browser backend is not wanted; only the native ones, and the WGSL front end.
+wgpu = { version = "30", optional = true, default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal", "dx12"] }
+pollster = { version = "1", optional = true }
+
+[features]
+default = []
+wgpu = ["dep:wgpu", "dep:pollster"]

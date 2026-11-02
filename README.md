@@ -262,12 +262,25 @@ the rules for changing this code without breaking parity.
 
 ## GPU
 
-There is none, deliberately. A Metal backend existed and was removed: on a whole genome the
-Smith-Waterman kernel is about **4%** of runtime, while seeding is about 78%. Amdahl caps any
-SW-offload backend at a few percent, and each one adds a byte-identity surface that must be proven
-against the scalar reference. The Metal shader had shipped a real bug (it opened gaps from `H`
-instead of `M`) precisely because that proof was too weak. It is in the git history if the profile
-ever changes.
+Optional, off by default, and byte-identical by construction and by test. Build with
+`--features gpu` and run with `BWA4_GPU=wgpu`: seed extension is then shared between the CPU
+threads and the GPU. The kernel is WGSL, compiled by the driver at run time, so one source runs on
+Vulkan (NVIDIA, AMD, Intel), Metal and DX12, with no CUDA toolkit or Xcode needed at build time.
+
+- Every worker's extension batch is split: one share goes to a single GPU service thread, and the
+  worker runs the rest on its own SIMD kernel at the same time. The service merges the shares of all
+  workers that queued during its previous launch into one launch, which is what a GPU needs to be
+  busy. `BWA4_GPU_SPLIT=<0..1>` fixes the share; unset, it adapts to the measured rates.
+- A device that is missing or fails falls back to the CPU silently, and the output is the same.
+- The kernel passes the same five acceptance gates as the CPU kernels. In CI it runs on Mesa's
+  lavapipe, a Vulkan driver that executes on the CPU (`BWA4_GPU_SOFTWARE=1`), so the real shader is
+  checked on every push. `scripts/gpu_parity.sh` then requires the same SAM md5 with the GPU off and
+  on, and across splits 0, 0.25, 0.5, 0.75, 1 and adaptive.
+
+What this buys depends on the machine. Extension is 20-30% of the CPU time, so the ceiling is
+Amdahl's (see [docs/gpu-plan.md](docs/gpu-plan.md)). On the 2026-08 integrated-GPU measurements,
+the GPU took about a fifth of the CPU time, but the wall clock only improved at low thread counts.
+No discrete-GPU number has been measured yet.
 
 ## Output formats
 
@@ -380,7 +393,8 @@ the same session, and the file says what would have to be new for one to be wort
 
 Whether a GPU could help without giving up byte-identity, how much (2.45x, and an integrated GPU
 already reaches it), and what would have to be built first, is in
-[docs/gpu-plan.md](docs/gpu-plan.md). Nothing there is implemented.
+[docs/gpu-plan.md](docs/gpu-plan.md). The seam, the gates and the co-scheduler (#53, #54, #57) and
+a portable extension backend are implemented; see the GPU section above.
 
 A read of fg-labs/bwa-mem3's source, asking why it is faster than us on x86_64 while we are at
 parity on Apple Silicon, is in [docs/fork-teardown.md](docs/fork-teardown.md). The short answer is

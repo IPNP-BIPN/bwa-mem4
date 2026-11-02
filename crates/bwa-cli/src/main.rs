@@ -109,6 +109,8 @@ fn main() -> anyhow::Result<()> {
     // reads the environment (which allocates) and the allocator must never do that itself; every
     // allocation before this line goes uncounted, which is clap's parsing and nothing else.
     bwa_mem4::stage_alloc::init();
+    #[cfg(feature = "mimalloc")]
+    tune_mimalloc();
     match Cli::parse().cmd {
         Cmd::Index(args) => cmd_index::run(args),
         Cmd::Mem(args) => cmd_mem::run(args, &argv),
@@ -116,5 +118,36 @@ fn main() -> anyhow::Result<()> {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+    }
+}
+
+/// Purge freed memory with `MADV_FREE` (mimalloc's "reset") instead of `MADV_DONTNEED` ("decommit").
+///
+/// mimalloc hands idle pages back to the kernel after its purge delay. With decommit, the next batch
+/// that reuses those addresses takes a page fault and the kernel ZEROES the page first
+/// (`clear_page_erms`, 9% of a 4-thread PE profile on a Sapphire Rapids host), then the pipeline
+/// overwrites it anyway. Reset leaves the contents in place unless the kernel actually needs the
+/// memory, so a reuse costs nothing. Measured on that host, 500k synthetic pairs on a 120 Mb
+/// genome, `-t4`, five interleaved reps (ROADMAP, 2026-09-30): PE wall median 19.22 -> 18.64 s
+/// (-3.0%), SE 7.40 -> 7.10 s (-4.1%), system time 4.35 -> 3.80 s PE and 1.61 -> 1.07 s SE. The
+/// default policy is also bimodal there (one PE run in five spent 8.6 s in the kernel); this one
+/// was not. Peak RSS: +0.06 GB PE, unchanged SE, for pages the kernel can reclaim at any time.
+///
+/// Cannot change a byte of output: it is the allocator's page-return policy. An explicit
+/// `MIMALLOC_PURGE_DECOMMITS` in the environment still wins, so the old behaviour is one variable
+/// away.
+#[cfg(feature = "mimalloc")]
+fn tune_mimalloc() {
+    // `mi_option_purge_decommits`: index 5 of `mi_option_e` in both the v2 and v3 headers vendored
+    // by libmimalloc-sys. Declared here rather than through the sys crate's `extended` feature,
+    // whose constants follow the v2 numbering for other options.
+    const MI_OPTION_PURGE_DECOMMITS: std::ffi::c_int = 5;
+    extern "C" {
+        fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
+    }
+    if std::env::var_os("MIMALLOC_PURGE_DECOMMITS").is_none() {
+        // SAFETY: plain option setter of the allocator linked into this binary; valid index, and
+        // the option is read at each purge, so setting it after the first allocations is fine.
+        unsafe { mi_option_set(MI_OPTION_PURGE_DECOMMITS, 0) };
     }
 }
