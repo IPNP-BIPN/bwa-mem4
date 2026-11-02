@@ -86,8 +86,17 @@ jobs:
       # Off-by-default features are invisible to the line above, so they rot. This one swaps the
       # global allocator (`BWA4_STAGE_ALLOC`, see crates/bwa-cli/src/stage_alloc.rs), which is
       # exactly the kind of code that must not be discovered broken the day someone needs it.
+      #
+      # A scheduled run builds `main` with THIS file from `dev`, and `main` gets a feature only at its
+      # next release. Asking for one it lacks stopped that run here, before Build and Test, every
+      # Monday from 2026-08-24: the watch on `main` was red for a reason that said nothing about it.
       - name: Clippy (stage-alloc feature)
-        run: cargo clippy -p bwa-mem4 --all-targets --features stage-alloc -- -D warnings
+        run: |
+          if grep -q '^stage-alloc' crates/bwa-cli/Cargo.toml; then
+            cargo clippy -p bwa-mem4 --all-targets --features stage-alloc -- -D warnings
+          else
+            echo "::notice::This ref has no stage-alloc feature yet; skipped."
+          fi
 
       - name: Build (release)
         run: cargo build --workspace --release
