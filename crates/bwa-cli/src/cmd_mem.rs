@@ -204,7 +204,8 @@ pub struct MemArgs {
     // on it here, because reads are numbered globally and emitted in input order.
     /// Number of threads [1]. Output order and global read ids are independent of it, so
     /// byte-identity holds at any `-t` once `-K` fixes the batch boundaries.
-    #[arg(short = 't', default_value_t = 1)]
+    // bwa reads this with `atoi`, so a negative is a value there; clap would call it an unknown flag.
+    #[arg(short = 't', default_value_t = 1, allow_negative_numbers = true)]
     pub threads: i32,
     // `-K INT` -> the batch size in input bases. bwa stores it in a local `fixed_chunk_size`
     // (`fastmap.cpp:709`) rather than in `opt`, then folds it into `opt->chunk_size` at
@@ -215,7 +216,7 @@ pub struct MemArgs {
     // distribution once per batch, so moving a batch boundary can change MAPQ and pairing decisions
     // for the reads near it. Pin `-K` to make a run reproducible across `-t` values.
     /// Process INT input bases per batch (fixes batch boundaries for reproducibility).
-    #[arg(short = 'K')]
+    #[arg(short = 'K', allow_negative_numbers = true)]
     pub k_batch: Option<i64>,
 
     // ---- Algorithm options ----

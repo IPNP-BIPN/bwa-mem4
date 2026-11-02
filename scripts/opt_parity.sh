@@ -293,6 +293,8 @@ check "-t 4"    'se!' -t4 -K 10000000
 # Paired, because that is where the batch size shows: the insert-size model is per batch.
 check "-t 0"    'pe!' -t0
 check "-K 0"    'pe!' -t2 -K 0
+check "-t -3"   'pe!' -t -3
+check "-K -5"   'pe!' -t2 -K -5
 check "-H hdr"  se -H '@CO\textra header line'
 # `-w 1` pins the band-retry `prev` semantics: with w <= 1 the `max_off < (w>>1)+(w>>2)` acceptance
 # test degenerates to `0 < 0`, so only the C's `prev = a->score` (not -1) accepts at round 0.

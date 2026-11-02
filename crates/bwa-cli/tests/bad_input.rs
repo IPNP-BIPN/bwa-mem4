@@ -158,3 +158,12 @@ fn long_read_mode_carries_the_read_group_and_extra_header() {
     assert!(record.contains("\tRG:Z:lane1"), "{record}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_is_an_error_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::OsStr::from_bytes(b"/nonexistent/caf\xE9.fq");
+    let out = mem(&[tiny().as_os_str(), path]);
+    assert_refused(&out, "No such file");
+}
