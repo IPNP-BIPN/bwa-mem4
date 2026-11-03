@@ -204,7 +204,8 @@ pub struct MemArgs {
     // on it here, because reads are numbered globally and emitted in input order.
     /// Number of threads [1]. Output order and global read ids are independent of it, so
     /// byte-identity holds at any `-t` once `-K` fixes the batch boundaries.
-    #[arg(short = 't', default_value_t = 1)]
+    // bwa reads this with `atoi`, so a negative is a value there; clap would call it an unknown flag.
+    #[arg(short = 't', default_value_t = 1, allow_negative_numbers = true)]
     pub threads: i32,
     // `-K INT` -> the batch size in input bases. bwa stores it in a local `fixed_chunk_size`
     // (`fastmap.cpp:709`) rather than in `opt`, then folds it into `opt->chunk_size` at
@@ -215,7 +216,7 @@ pub struct MemArgs {
     // distribution once per batch, so moving a batch boundary can change MAPQ and pairing decisions
     // for the reads near it. Pin `-K` to make a run reproducible across `-t` values.
     /// Process INT input bases per batch (fixes batch boundaries for reproducibility).
-    #[arg(short = 'K')]
+    #[arg(short = 'K', allow_negative_numbers = true)]
     pub k_batch: Option<i64>,
 
     // ---- Algorithm options ----
@@ -1274,6 +1275,22 @@ impl HtsWriter {
         threads: usize,
         header_text: &[u8],
     ) -> anyhow::Result<Self> {
+        // `HeaderView::from_bytes` dereferences htslib's answer unchecked, and a line htslib cannot
+        // parse (`-H` is free text) makes that answer null. Asked first, before a file exists.
+        let header_c = std::ffi::CString::new(header_text)
+            .map_err(|_| anyhow::anyhow!("the SAM header contains a NUL byte"))?;
+        // SAFETY: `header_c` is a valid NUL-terminated string of the given length, htslib only reads
+        // it, and the header it returns is ours to destroy.
+        unsafe {
+            let parsed = htslib::sam_hdr_parse(header_text.len() + 1, header_c.as_ptr());
+            if parsed.is_null() {
+                anyhow::bail!(
+                    "-o {}: htslib cannot parse the SAM header. Check the lines given to -H and -R.",
+                    path.display()
+                );
+            }
+            htslib::sam_hdr_destroy(parsed);
+        }
         // Paths cross the FFI boundary as NUL-terminated bytes; an embedded NUL is the one thing a
         // Rust path can hold that a C string cannot.
         let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
@@ -1997,6 +2014,42 @@ fn forget_index(fm: bwa_index::FmIndex, bns: bwa_index::BntSeq) {
     std::mem::forget(bns);
 }
 
+/// The header lines `-H` and `-R` add, in emission order: `-H` first, then `-R` appended to it.
+/// `main_mem` builds hdr_line during getopt and only after the loop does
+/// `hdr_line = bwa_insert_header(rg_line, hdr_line)`, so @RG lands last.
+///
+/// # Returns
+///
+/// One complete, already-escape-expanded header line per entry, without its newline. Empty when
+/// neither option was given. Errors on an unreadable `-H` file or a malformed `-R`.
+fn extra_header_lines(args: &MemArgs) -> anyhow::Result<Vec<String>> {
+    let mut hdr_parts: Vec<String> = Vec::new();
+    if let Some(header_arg) = &args.header_insert {
+        if let Some(rest) = header_arg.strip_prefix('@') {
+            hdr_parts.push(bwa_core::rg::escape(&format!("@{rest}")));
+        } else {
+            // Not starting with '@': bwa treats it as a FILE of header lines.
+            // Whole file slurped; non-`@` lines are skipped below rather than rejected.
+            let text = std::fs::read_to_string(header_arg)
+                .map_err(|e| anyhow::anyhow!("-H: cannot read '{header_arg}': {e}"))?;
+            for line in text.lines() {
+                if line.starts_with('@') {
+                    hdr_parts.push(bwa_core::rg::escape(line));
+                }
+            }
+        }
+    }
+    if let Some(rg_arg) = &args.read_group {
+        // Installs the parsed ID process-wide as a side effect, and returns the header line.
+        // The escape-expanded `@RG` line; the ID it also installed is what every record's `RG:Z:`
+        // tag will carry, so this call must happen before any record is written.
+        let rg_header_line =
+            bwa_core::rg::set_rg(rg_arg).map_err(|e| anyhow::anyhow!("-R: {e}"))?;
+        hdr_parts.push(rg_header_line);
+    }
+    Ok(hdr_parts)
+}
+
 /// Run `bwa-mem4 mem` end to end: build options, load the index, write the SAM header, then stream
 /// batches through the align-and-format pipeline (single-end here, paired-end via [`run_pe`]).
 ///
@@ -2019,21 +2072,6 @@ fn forget_index(fm: bwa_index::FmIndex, bns: bwa_index::BntSeq) {
 pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Wall-clock origin for the end-of-run traffic dump only; not on any hot path.
     let t_run = std::time::Instant::now();
-    // Options we parse for CLI compatibility but do not yet honour. Failing loudly is the point: an
-    // aligner that accepts `-a` and silently emits only primaries hands back a result the user
-    // believes is something it is not. Refuse rather than mislead.
-    // Each tuple is (was the flag given, its spelling for the message, what it would have done).
-    // Currently EMPTY: every option this port accepts is now honoured. The machinery is kept
-    // because it is the place to re-add an entry the moment a new flag is parsed ahead of being
-    // implemented.
-    let unimplemented: &[(bool, &str, &str)] = &[];
-    if let Some((_, flag, what)) = unimplemented.iter().find(|(given, _, _)| *given) {
-        anyhow::bail!(
-            "{flag} is not implemented yet ({what}). bwa-mem4 parses it for CLI compatibility but \
-             would ignore it, so it refuses rather than emit output that silently differs from \
-             bwa-mem2."
-        );
-    }
 
     // ================= Long-read routing, before any bwa work =================
     //
@@ -2042,14 +2080,29 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // the reasoning, the preset mapping and what it does to the output contract. `-x intractg` is
     // NOT routed and continues below on the bwa-identical path.
     //
-    // Placed before `build_opt` because none of bwa's options apply to a different mapper; the only
-    // thing consumed here is `-o` (where the SAM goes) and the read paths.
+    // Placed before `build_opt` because bwa's alignment options do not apply to a different mapper.
+    // What still applies is what describes the file rather than the alignment: `-o`, `-R` and `-H`.
     if let Some(mode) = args.read_type.as_deref() {
         if let Some(preset) = crate::cmd_longread::preset_for(mode) {
             let mut reads = vec![args.reads.clone()];
             if let Some(r2) = args.reads2.clone() {
                 reads.push(r2);
             }
+            // rammap's records go out as SAM text, so a binary or compressed name would be a lie.
+            if let Some(path) = &args.output {
+                let ext = path.extension().unwrap_or_default();
+                if ["bam", "cram", "gz", "bgz"]
+                    .iter()
+                    .any(|want| ext.eq_ignore_ascii_case(want))
+                {
+                    anyhow::bail!(
+                        "-o {}: long-read mode (-x {mode}) writes SAM text only. Name the file \
+                         .sam, or convert it afterwards with samtools.",
+                        path.display()
+                    );
+                }
+            }
+            let hdr_parts = extra_header_lines(&args)?;
             // Same sink choice as the short-read path: a file when `-o` was given, else stdout.
             let mut out: Box<dyn std::io::Write> = match &args.output {
                 Some(path) => Box::new(std::io::BufWriter::new(
@@ -2066,7 +2119,15 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
                 .num_threads(args.threads.max(1) as usize)
                 .build_global()
                 .ok();
-            crate::cmd_longread::run(preset, mode, &args.index_prefix, &reads, &mut out, argv)?;
+            crate::cmd_longread::run(
+                preset,
+                mode,
+                &args.index_prefix,
+                &reads,
+                &hdr_parts,
+                &mut out,
+                argv,
+            )?;
             out.flush()?;
             return Ok(());
         }
@@ -2141,11 +2202,12 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Batch size in INPUT BASES, not reads. Default `chunk_size * -t` (10M per thread), mirroring
     // bwa's `aux.task_size`; `-K` overrides it. Load-bearing for paired-end reproducibility: the
     // insert-size model is re-estimated per batch, so the boundary this fixes is visible in the
-    // output. Clamped to >= 1 so a zero or negative `-K` cannot stall the reader.
+    // output. A zero or negative `-K` means "not set" and `-t 0` means one thread, both as in bwa
+    // (`fixed_chunk_size > 0`, `n_threads` clamped before `task_size`).
     let k_batch = args
         .k_batch
-        .unwrap_or(opt.chunk_size * i64::from(args.threads))
-        .max(1) as usize;
+        .filter(|&k| k > 0)
+        .unwrap_or(opt.chunk_size * i64::from(opt.n_threads)) as usize;
 
     // ================= Start reading before loading the index =================
     //
@@ -2185,6 +2247,17 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Together they are several GB for a human genome (memory-mapped where possible).
     let fm = FmIndex::load(&args.index_prefix)?;
     let mut bns = BntSeq::load(&args.index_prefix)?;
+    // The two halves are separate files. Left to disagree, the first read past the shorter one
+    // panics, with nothing to say that the index is what is wrong.
+    if bns.l_pac != fm.l_pac() {
+        anyhow::bail!(
+            "index {}: .ann says the reference is {} bases and .bwt.2bit.64 says {}. These files \
+             are not from the same build; re-run `bwa-mem4 index`.",
+            args.index_prefix.display(),
+            bns.l_pac,
+            fm.l_pac()
+        );
+    }
     // `-j`: clear the ALT flags the loader just read from `<prefix>.alt`, so every contig counts as
     // primary assembly. Done here, after loading, exactly as `fastmap.cpp:907` does it.
     if args.ignore_alt {
@@ -2202,10 +2275,6 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     crate::stage_alloc::mark_baseline();
     // One `@SQ` line per contig, in index order. That order comes from the FASTA and must be
     // preserved: downstream tools treat @SQ order as the coordinate sort order.
-    //
-    // Known gap vs the C: `bwa_print_sam_hdr` also appends `\tAH:*` to an ALT contig's @SQ line
-    // (`bwa.cpp:530`). `Contig` here has no `is_alt` field, so that suffix is never emitted. It is
-    // unreachable in practice because no `.alt` file is read at all (see `-j`).
     // The `@SQ` payload: (name, length in bases) per contig, index order preserved. Used only to
     // write the header, then dropped.
     let sqs: Vec<SqRecord> = bns
@@ -2219,36 +2288,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         .collect();
 
     // ================= Assemble the SAM header =================
-    //
-    // `-H` first, then `-R` appended to it: `main_mem` builds hdr_line during getopt and only after
-    // the loop does `hdr_line = bwa_insert_header(rg_line, hdr_line)`, so @RG lands last.
-    // Extra header lines in emission order: the `-H` lines first, then the `-R` @RG line. Each entry
-    // is one complete, already-escape-expanded header line without its newline. Empty when neither
-    // option was given.
-    let mut hdr_parts: Vec<String> = Vec::new();
-    if let Some(header_arg) = &args.header_insert {
-        if let Some(rest) = header_arg.strip_prefix('@') {
-            hdr_parts.push(bwa_core::rg::escape(&format!("@{rest}")));
-        } else {
-            // Not starting with '@': bwa treats it as a FILE of header lines.
-            // Whole file slurped; non-`@` lines are skipped below rather than rejected.
-            let text = std::fs::read_to_string(header_arg)
-                .map_err(|e| anyhow::anyhow!("-H: cannot read '{header_arg}': {e}"))?;
-            for line in text.lines() {
-                if line.starts_with('@') {
-                    hdr_parts.push(bwa_core::rg::escape(line));
-                }
-            }
-        }
-    }
-    if let Some(rg_arg) = &args.read_group {
-        // Installs the parsed ID process-wide as a side effect, and returns the header line.
-        // The escape-expanded `@RG` line; the ID it also installed is what every record's `RG:Z:`
-        // tag will carry, so this call must happen before any record is written.
-        let rg_header_line =
-            bwa_core::rg::set_rg(rg_arg).map_err(|e| anyhow::anyhow!("-R: {e}"))?;
-        hdr_parts.push(rg_header_line);
-    }
+    let hdr_parts = extra_header_lines(&args)?;
     // The extra header block as one newline-joined string, or `None` for "no extra lines" (which is
     // what `write_header` needs to distinguish, since an empty string would emit a blank line).
     let hdr_lines = if hdr_parts.is_empty() {
@@ -2322,11 +2362,6 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_mem::cigar::global_fp::dump();
         bwa_mem::rescue_split::dump();
         bwa_mem::subopt_shape::dump();
-        bwa_mem::rescue_split::dump();
-        bwa_mem::emit_split::dump();
-        bwa_neon::batched::tight_ceil::dump();
-        bwa_neon::batched::job_dup::dump();
-        bwa_neon::batched::bin_split::dump();
         bwa_mem::across::align_split::dump();
         bwa_mem::seed_stats_dump();
         bwa_mem::pe::rescue_rounds::dump();
@@ -2335,14 +2370,12 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_mem::pe::anchor_spread::dump();
         bwa_chain::chain_time::dump();
         bwa_chain::smem_dup::dump();
-        bwa_chain::smem_dup::dump();
         bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
         // Last, because it is the widest view: the others break down one stage, this one accounts
         // for all of them. Runs on the main thread, where the stage accumulators live.
         stage_time::dump(t_run.elapsed());
         stage_time::barrier::dump();
-        // Where the BYTES went, next to where the wall clock went. The line above was duplicated,
-        // which printed the occupancy table twice.
+        // Where the BYTES went, next to where the wall clock went.
         crate::stage_alloc::dump();
         forget_index(fm, bns);
         return Ok(());
@@ -2545,7 +2578,7 @@ fn finish_se(
     // After marking, `regs[0]` is the highest-scoring primary.
     let mut regs = regs;
     if dump_regs_enabled() {
-        eprintln!("=== read {} ===", rec.name());
+        eprintln!("=== read {} ===", String::from_utf8_lossy(rec.name()));
         bwa_mem::dump_regs(bns, "pre-dedup", &regs);
         regs = mem_sort_dedup_patch(fm, opt, codes, regs);
         bwa_mem::stamp_is_alt(bns, &mut regs);
@@ -2869,16 +2902,11 @@ fn write_aln_se(
         tags.push_str("\tXA:Z:");
         tags.push_str(xa_string);
     }
-    // `-C`: bwa appends the FASTQ comment after everything else.
-    if bwa_core::rg::copy_comment() {
-        if let Some(comment) = rec.comment() {
-            tags.push('\t');
-            tags.push_str(comment);
-        }
-    }
-    // `-V` closes the record, after even the comment (`bwamem.cpp:1721`). The comment is in whatever
-    // encoding the FASTA was, so from here `tags` is bytes.
+    // Both trailers below are in whatever encoding their file was, so from here `tags` is bytes.
     let mut tags = tags.into_bytes();
+    // `-C`: bwa appends the FASTQ comment after everything else.
+    bwa_core::rg::append_comment(&mut tags, rec.comment());
+    // `-V` closes the record, after even the comment (`bwamem.cpp:1721`).
     if opt.flag & flags::REF_HDR != 0 {
         bwa_mem::emit::push_xr(&mut tags, bns.contigs[aln.rid as usize].comment());
     }
@@ -3145,16 +3173,8 @@ fn run_pe(
         // batched pass here and let `mem_sam_pe` do its original per-pair rescue instead. Default
         // off. An A/B verification switch: both paths are byte-identical, only the speed differs.
         let scalar_rescue = std::env::var_os("BWA4_SCALAR_RESCUE").is_some();
-        // `BWA4_NO_RESCUE=1` skips mate rescue entirely, the analogue of bwa-mem2's `-S`. It is a
-        // MEASUREMENT gate, not a lever: it changes the output by design, exactly as `-S` does. It
-        // exists so our rescue cost can be measured DIRECTLY and compared like-for-like against
-        // `bwa-mem2 -S`, instead of decomposed as `PE - 2 x SE` (which assumes a read costs the same
-        // to seed and extend in SE as in PE -- unverified).
-        // `-S` (MEM_F_NO_RESCUE) is the user-facing form of the same gate.
-        // Presence-only, like the gate above; the documented spelling is `BWA4_NO_RESCUE=1` but any
-        // value works. Default off. True here means NO rescue happens anywhere, batched or per-pair.
-        let no_rescue =
-            std::env::var_os("BWA4_NO_RESCUE").is_some() || opt.flag & flags::NO_RESCUE != 0;
+        // `-S` (MEM_F_NO_RESCUE): no rescue happens anywhere, batched or per-pair.
+        let no_rescue = opt.flag & flags::NO_RESCUE != 0;
         if !scalar_rescue && !no_rescue {
             stage_time::measure(Stage::Rescue, || {
                 // One rescue job per pair: each mate's codes plus a MUTABLE borrow of its region list,
@@ -3215,7 +3235,7 @@ fn run_pe(
                                 &mut pair.regs1,
                                 &mut pair.regs2,
                                 // rescue_done: true when nothing further should rescue -- either the batched
-                                // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
+                                // pass already did it, or `-S` suppressed it outright.
                                 !scalar_rescue || no_rescue,
                                 &mut buf,
                             )
