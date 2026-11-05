@@ -819,8 +819,8 @@ directory.
 | Script | What it does |
 |---|---|
 | `check.sh` | `fmt --check` + `clippy -D warnings` + `cargo test --workspace`. Must be green on every PR |
-| `oracle_diff.sh` | End-to-end single-end SAM diff versus the installed `bwa-mem2`. Preflights that the oracle really is version 2.3, gates `@SQ` byte-identity, then runs `sam-diff`. Must not regress |
-| `index_diff.sh` | `cmp` our five index files against `bwa-mem2 index`. Exits 0 with SKIP if `bwa-mem4 index` is a stub |
+| `oracle_diff.sh` | End-to-end single-end SAM diff versus the installed `bwa-mem2`. Preflights that the oracle really is version 2.3, then gates `@SQ` and every record byte-identical, SE and PE (when `work/r2.fq` exists); `sam-diff` explains a failure. Must not regress |
+| `index_diff.sh` | `cmp` our five index files against `bwa-mem2 index` on a region of `REF`. Fails if either index fails or any file differs |
 | `scale_test.sh` | Whole-chromosome gate: index byte-identity (hard fail) then paired-end concordance |
 | `setup_reference.sh` | Recreates the gitignored `reference/`: clones bwa-mem2 at rev `7aa5ff6c`, downloads and sha256-verifies the two patches, applies them. This is what makes the oracle reproducible |
 | `make_testdata.sh` | Builds `work/`: a chr20 slice, its index, and wgsim reads (seed 11) |

@@ -57,8 +57,9 @@ jobs:
             channels:
               - conda-forge
               - bioconda
+          # The oracle is pinned, as in parity.yml: an upstream release must not move the gate.
           create-args: >-
-            bwa-mem2
+            bwa-mem2=2.3
             samtools
             bcftools
             rtg-tools
