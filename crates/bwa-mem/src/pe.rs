@@ -750,9 +750,13 @@ fn matesw_apply(
     // determined by the surviving set alone, not by the input permutation, even though the sort
     // itself is unstable. Feeding that result back in therefore cannot reorder it, and the
     // redundancy scan cannot kill anything either, since every surviving pair already failed that
-    // test in the run that produced them. Verified, not just argued: oracle-clean on 2,013,247 real
-    // GIAB paired-end records and on the wgsim genome set.
-    let mut dirty = false;
+    // test in the run that produced them.
+    //
+    // That fixed point holds only for this null-query mode's OWN output. A list that is not yet
+    // settled comes from the single-end dedup, which ran WITH the query and so may have patched two
+    // regions into one that now contains a third; the first null-query pass drops that third, so it
+    // must run even when no hit was inserted (1 read in 173M of HG002 30x lost an XA hit to this).
+    let mut dirty = !*ma_settled;
     for r in 0..4 {
         if call.skip[r] != 0 {
             continue;
@@ -3049,5 +3053,79 @@ pub mod anchor_spread {
             span as f64 / union.max(1) as f64,
             100.0 * tight as f64 / groups.max(1) as f64,
         );
+    }
+}
+
+#[cfg(test)]
+mod matesw_apply_tests {
+    use super::*;
+
+    /// The C dedups the mate's list once any orientation has run SW, even when it found nothing
+    /// (`if (n)`, `bwamem_pair.cpp:277`). A list fresh from the single-end dedup is not yet a fixed
+    /// point of that null-query pass, so the batched path must run it too: here it drops a duplicate.
+    #[test]
+    fn unsettled_list_is_deduped_even_without_a_hit() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let fm = FmIndex::load(std::path::Path::new(prefix)).unwrap();
+        let bns = BntSeq::load(std::path::Path::new(prefix)).unwrap();
+        let opt = MemOpt::default();
+        let region = |score: i32| MemAlnReg {
+            rb: 100,
+            re: 200,
+            qb: 0,
+            qe: 100,
+            rid: 0,
+            score,
+            truesc: score,
+            sub: 0,
+            csub: 0,
+            sub_n: 0,
+            seedcov: 50,
+            seedlen0: 0,
+            secondary: -1,
+            secondary_all: 0,
+            w: 0,
+            frac_rep: 0.0,
+            is_alt: false,
+            alt_sc: 0,
+            hash: 0,
+            n_comp: 0,
+        };
+        let ma0 = vec![region(90), region(80)];
+        let want = mem_sort_dedup_patch(&fm, &opt, &[], ma0.clone());
+        assert_eq!(
+            want.len(),
+            1,
+            "the case must be one the null-query pass changes"
+        );
+        let call = RescueCall {
+            skip: [0, 1, 1, 1],
+            per_r: [
+                Some(Orient {
+                    query: vec![0; 20],
+                    target: vec![0; 40],
+                    rb: 0,
+                    is_rev: false,
+                }),
+                None,
+                None,
+                None,
+            ],
+            l_ms: 20,
+            rid: 0,
+            is_alt: false,
+        };
+        let miss = KswAlignResult {
+            score: 0,
+            qb: -1,
+            qe: -1,
+            tb: -1,
+            te: -1,
+            score2: -1,
+            te2: -1,
+        };
+        let (mut ma, mut settled) = (ma0, false);
+        matesw_apply(&fm, &bns, &opt, &call, &[miss], &mut ma, &mut settled);
+        assert_eq!(format!("{ma:?}"), format!("{want:?}"));
     }
 }
