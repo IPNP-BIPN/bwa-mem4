@@ -53,7 +53,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use bwa_core::Result;
+use bwa_core::{Error, Result};
 use memmap2::Mmap;
 use rayon::prelude::*;
 
@@ -598,8 +598,26 @@ impl FmIndex {
         // count. `cp_size` = one 64-byte checkpoint per 64 rows, `+1` so that a query at row
         // `ref_seq_len` itself (interval ENDS are passed to `get_occ`) still indexes a real block.
         // `sa_size` = one sampled suffix-array entry per 8 rows, `+1` for the same edge row.
+        // A garbage header would size the allocations below; an even or non-positive row count is
+        // not `2L + 1`.
+        if ref_seq_len < 1 || ref_seq_len % 2 == 0 {
+            return Err(Error::IndexFormat(format!(
+                "{}: row count {ref_seq_len} is not 2L+1",
+                sibling(prefix, "bwt.2bit.64").display()
+            )));
+        }
         let cp_size = ((ref_seq_len >> CP_SHIFT) + 1) as usize;
         let sa_size = ((ref_seq_len >> SA_SHIFT) + 1) as usize;
+        // The file size is fixed by the row count (see `build::write_fm_index`). A short file is a
+        // build that died mid-write; a long one belongs to another reference.
+        let want = 48 + 64 * cp_size as u64 + 5 * sa_size as u64 + 8;
+        let got = bwt_file.metadata()?.len();
+        if got != want {
+            return Err(Error::IndexFormat(format!(
+                "{}: {got} bytes, expected {want} for {ref_seq_len} rows (truncated or mixed index; rebuild it)",
+                sibling(prefix, "bwt.2bit.64").display()
+            )));
+        }
 
         // ---- Payload: checkpoints, then the two sampled-SA arrays, then the sentinel row ------
         // BYTE lengths in the file, which is what the offsets are made of. A file record is 64 bytes
@@ -770,6 +788,19 @@ impl FmIndex {
         // SAFETY: the index files are not mutated while a run holds them open; a concurrent external
         // truncation is out of scope (same assumption as bwa-mem2's mmap'd index).
         let pac = unsafe { Mmap::map(&pac_file)? };
+        // The unpack loops read `.pac` with unchecked SIMD loads sized from the BWT's `l_pac`, so
+        // a `.pac` from another reference (or a truncated one) must be refused here. bwa's layout:
+        // ceil(L/4) packed bytes, a zero byte when L % 4 == 0, then the byte L % 4: always L/4 + 2.
+        let l_pac = (ref_seq_len - 1) / 2;
+        if pac.len() as u64 != (l_pac as u64 >> 2) + 2 {
+            return Err(Error::IndexFormat(format!(
+                "{}: {} bytes, expected {} for the {l_pac}-base reference of the .bwt.2bit.64 \
+                 (truncated or mixed index; rebuild it)",
+                sibling(prefix, "pac").display(),
+                pac.len(),
+                (l_pac >> 2) + 2
+            )));
+        }
         // ~800 MB on GRCh38, read at extension time at positions derived from seed hits, i.e. also
         // effectively random. A file-backed mapping only takes huge pages on a kernel and
         // filesystem that support it (Linux >= 5.7 plus a THP-capable fs), so treat this one as a
@@ -1643,6 +1674,44 @@ mod tests {
         // Absolute path built at compile time, so the test does not depend on the working directory.
         let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
         FmIndex::load(Path::new(prefix)).unwrap()
+    }
+
+    /// A `.bwt.2bit.64` cut short (a build that died mid-write) or a `.pac` from another reference
+    /// must fail to load, not be read past its end by the unchecked SIMD unpack.
+    #[test]
+    fn load_refuses_truncated_or_mixed_files() {
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let dir = std::env::temp_dir().join(format!("bwa4_mixed_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("t.fa");
+        for ext in ["bwt.2bit.64", "pac"] {
+            std::fs::copy(
+                format!("{src}.{ext}"),
+                format!("{}.{ext}", prefix.display()),
+            )
+            .unwrap();
+        }
+        assert!(FmIndex::load(&prefix).is_ok(), "an intact copy must load");
+
+        let bwt = std::fs::read(format!("{src}.bwt.2bit.64")).unwrap();
+        std::fs::write(
+            format!("{}.bwt.2bit.64", prefix.display()),
+            &bwt[..bwt.len() - 8],
+        )
+        .unwrap();
+        let e = FmIndex::load(&prefix)
+            .err()
+            .expect("a truncated .bwt must not load");
+        assert!(e.to_string().contains("truncated or mixed"), "{e}");
+
+        std::fs::write(format!("{}.bwt.2bit.64", prefix.display()), &bwt).unwrap();
+        let pac = std::fs::read(format!("{src}.pac")).unwrap();
+        std::fs::write(format!("{}.pac", prefix.display()), &pac[..pac.len() - 1]).unwrap();
+        let e = FmIndex::load(&prefix)
+            .err()
+            .expect("a short .pac must not load");
+        assert!(e.to_string().contains("truncated or mixed"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The 2-bit `.pac` (forward only) must reproduce the one-byte-per-base `.0123` (forward ++

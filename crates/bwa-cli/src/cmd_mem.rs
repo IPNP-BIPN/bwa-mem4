@@ -2185,6 +2185,15 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Together they are several GB for a human genome (memory-mapped where possible).
     let fm = FmIndex::load(&args.index_prefix)?;
     let mut bns = BntSeq::load(&args.index_prefix)?;
+    // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
+    anyhow::ensure!(
+        fm.l_pac() == bns.l_pac,
+        "{}: the .ann describes a {}-base reference but the .bwt.2bit.64 a {}-base one \
+         (mixed index from two builds; rebuild it)",
+        args.index_prefix.display(),
+        bns.l_pac,
+        fm.l_pac()
+    );
     // `-j`: clear the ALT flags the loader just read from `<prefix>.alt`, so every contig counts as
     // primary assembly. Done here, after loading, exactly as `fastmap.cpp:907` does it.
     if args.ignore_alt {
