@@ -167,7 +167,8 @@ pub struct FastqReader {
     /// decompressor. Boxed because the concrete parser type depends on the compression needletail
     /// sniffed from the file's magic bytes. Advanced only by [`FastqReader::next_record`]; holds
     /// all the reader's position state, so this struct has no offset of its own.
-    inner: Box<dyn FastxReader>,
+    /// `None` for an empty input: it yields no records.
+    inner: Option<Box<dyn FastxReader>>,
 }
 
 /// Bytes peeked from the head of an input to decide whether it needs [`UnwrapFastq`].
@@ -453,7 +454,20 @@ fn unwrap_multiline_fastq<R: std::io::Read + Send + 'static>(
 /// [`Error::Fastq`] if the file cannot be opened, is empty, or is not a format any enabled backend
 /// recognises. The message names the path, since a user who passed the wrong file gets nothing else
 /// to go on.
-fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
+/// needletail's parser, or `None` for an input with no bytes at all. bwa-mem2 treats an empty FASTQ
+/// (or an empty `.gz`) as zero reads, writes the header and exits 0; needletail refuses it with
+/// `EmptyFile`, which would fail a pipeline that feeds us one empty chunk among many.
+fn parsed(
+    r: std::result::Result<Box<dyn FastxReader>, needletail::errors::ParseError>,
+) -> Result<Option<Box<dyn FastxReader>>> {
+    match r {
+        Ok(r) => Ok(Some(r)),
+        Err(e) if e.kind == needletail::errors::ParseErrorKind::EmptyFile => Ok(None),
+        Err(e) => Err(Error::Fastq(e.to_string())),
+    }
+}
+
+fn open_reader(path: &std::path::Path) -> Result<Option<Box<dyn FastxReader>>> {
     // Whether the path can be opened a second time and read from the start. A regular file can; a
     // FIFO, a process substitution (`<(zcat r1.gz)`) or a character device cannot, because the two
     // magic bytes read below are consumed from the stream and never come back.
@@ -470,15 +484,17 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // text.
     let magic = {
         use std::io::Read;
-        let mut buf = [0u8; 2];
-        // A file shorter than two bytes cannot be a FASTQ; let needletail produce that error.
-        let n = opened.read(&mut buf).unwrap_or(0);
-        if n == 2 {
-            Some(buf)
-        } else {
-            None
-        }
+        let mut buf = Vec::with_capacity(2);
+        // `take(2).read_to_end`, not one `read`: a pipe can hand over a single byte first, and
+        // that byte must still go back in front of the stream below.
+        (&mut opened)
+            .take(2)
+            .read_to_end(&mut buf)
+            .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+        buf
     };
+    let head_bytes = magic.clone();
+    let magic: Option<[u8; 2]> = magic.try_into().ok();
     let is_gzip = magic == Some([0x1f, 0x8b]);
     let looks_like_text = magic.is_some_and(|m| m[0] == b'@' || m[0] == b'>');
 
@@ -486,10 +502,10 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // let it sniff compression itself. Sequential by construction, which is also what any parallel
     // decoder would have to fall back to on a stream it cannot seek in.
     if !seekable {
-        let head = std::io::Cursor::new(magic.map(Vec::from).unwrap_or_default());
+        let head = std::io::Cursor::new(head_bytes);
         let stream = std::io::Read::chain(head, opened);
         let stream = unwrap_multiline_fastq(stream)?;
-        return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(needletail::parse_fastx_reader(stream));
     }
 
     // Gzipped input, parallel path: rapidgzip decodes ONE stream on several threads and hands back
@@ -506,7 +522,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
             .open(path)
             .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
         let stream = unwrap_multiline_fastq(stream)?;
-        return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(needletail::parse_fastx_reader(stream));
     }
 
     // Gzipped input, single-thread fallback: inflate on a thread of its own and hand needletail the
@@ -515,7 +531,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     #[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
     if is_gzip {
         let blocks = unwrap_multiline_fastq(spawn_inflate(path)?)?;
-        return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(needletail::parse_fastx_reader(blocks));
     }
 
     // PLAIN TEXT, AND IT GETS THE SAME READ-AHEAD THREAD THE COMPRESSED PATHS GET.
@@ -534,11 +550,11 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // delivered by a different thread.
     if !is_gzip && looks_like_text {
         let blocks = unwrap_multiline_fastq(spawn_plain(path)?)?;
-        return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(needletail::parse_fastx_reader(blocks));
     }
 
     if is_gzip || looks_like_text || cfg!(not(feature = "multi-format")) {
-        return parse_fastx_file(path).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(parse_fastx_file(path));
     }
 
     #[cfg(feature = "multi-format")]
@@ -547,7 +563,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
         // needletail then parses the decompressed stream exactly as it would a plain file.
         let (reader, _format) = niffler::send::from_path(path)
             .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
-        needletail::parse_fastx_reader(reader).map_err(|e| Error::Fastq(e.to_string()))
+        parsed(needletail::parse_fastx_reader(reader))
     }
     #[cfg(not(feature = "multi-format"))]
     unreachable!("the branch above returns when the feature is off")
@@ -798,7 +814,10 @@ impl FastqReader {
     /// with all four FASTQ lines already split into [`Record`] fields, or [`Error::Fastq`] on a
     /// malformed record.
     pub fn next_record(&mut self) -> Result<Option<Record>> {
-        match self.inner.next() {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        match inner.next() {
             None => Ok(None),
             Some(rec) => {
                 // One parsed record, borrowing needletail's internal buffer: everything taken from
@@ -1274,6 +1293,29 @@ mod multi_format_tests {
 mod tests {
     use super::{needs_unwrapping, split_id, FastqReader, PairedFastqReader, UnwrapFastq};
     use std::io::Write;
+
+    /// An empty FASTQ, plain or gzipped, is zero reads (bwa-mem2 exits 0 on it), not an error.
+    #[test]
+    fn empty_input_is_zero_records() {
+        let dir = std::env::temp_dir().join(format!("bwa4_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("e.fq");
+        std::fs::write(&plain, b"").unwrap();
+        // A valid gzip stream of zero bytes (`gzip -n < /dev/null`): header, empty block, trailer.
+        let gz = dir.join("e.fq.gz");
+        std::fs::write(
+            &gz,
+            [
+                0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        for p in [&plain, &gz] {
+            let mut r = FastqReader::from_path(p).unwrap();
+            assert!(r.next_record().unwrap().is_none(), "{}", p.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Build a FASTQ of `n` records named `<prefix><i>` with a 4-base sequence, and return its path.
     fn write_fastq(

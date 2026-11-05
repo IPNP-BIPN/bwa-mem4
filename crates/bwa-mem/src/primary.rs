@@ -120,6 +120,9 @@ const ROUND_BIAS: f64 = 0.499;
 /// points. It is not derived from anything documented in the C.
 const MAPQ_SCORE_COEF: f64 = 6.02;
 
+/// bwa's `MEM_MAPQ_COEF` (`bwamem.h`), the scale of the `-Q 0` MAPQ branch (`bwamem.cpp:1485`).
+const MAPQ_SEEDCOV_COEF: f64 = 30.0;
+
 /// `10 / ln(10)`, so `MAPQ_SUB_N_COEF * ln(sub_n + 1)` is `10 * log10(sub_n + 1)` phred points
 /// (`bwamem.cpp:1487`). The C writes the rounded literal 4.343, not the exact ratio, so we do too.
 const MAPQ_SUB_N_COEF: f64 = 4.343;
@@ -1153,11 +1156,20 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
     let mut mapq: i32;
     if a.score == 0 {
         mapq = 0;
+    } else if opt.mapq_coef_len <= 0.0 {
+        // The C's other branch (`bwamem.cpp:1485`), taken under `-Q 0` or a negative `-Q`: the
+        // margin over the competitor scaled by how much of the read the seeds cover, then the
+        // same identity shrink as below but squared once and only under 95% identity.
+        mapq = (MAPQ_SEEDCOV_COEF
+            * (1.0 - f64::from(sub) / f64::from(a.score))
+            * f64::from(a.seedcov).ln()
+            + ROUND_BIAS) as i32;
+        if identity < 0.95 {
+            mapq = (f64::from(mapq) * identity * identity + ROUND_BIAS) as i32;
+        }
     } else {
-        // `mapQ_coef_len > 0` always holds for the default options (it is set to 50 at
-        // `bwamem.cpp:140`), so only the C's first branch (`bwamem.cpp:1480`) is ported. The
-        // `else` branch at `bwamem.cpp:1485`, which uses `MEM_MAPQ_COEF` and `log(seedcov)`, is
-        // dead code under any reachable option set.
+        // `mapQ_coef_len > 0` (the default, 50 at `bwamem.cpp:140`): the C's first branch
+        // (`bwamem.cpp:1480`).
         //
         // Length discount (the C's first `tmp`): short alignments (below 50bp) get no discount,
         // longer ones get `log(50) / log(l)`, which decays slowly. The intuition is that a long
@@ -1470,5 +1482,19 @@ mod tests {
         let opt = MemOpt::default();
         let a = reg(145, 140, 1, 323, 150);
         assert_eq!(mem_approx_mapq_se(&opt, &a), 8);
+    }
+
+    /// `-Q 0` takes the C's seed-coverage branch (`bwamem.cpp:1485`); it used to give MAPQ 0 to
+    /// every read. Expected values worked by hand from the C; the whole range 0..=60 also matched
+    /// bwa-mem2 byte for byte on a repeat-rich simulated genome.
+    #[test]
+    fn mapq_q0_uses_seedcov_branch() {
+        let mut opt = MemOpt::default();
+        opt.mapq_coef_len = 0.0;
+        opt.mapq_coef_fac = 0.0;
+        // identity >= 0.95: 30 * (1 - 140/145) * ln(323) -> 6, minus the sub_n penalty 3.
+        assert_eq!(mem_approx_mapq_se(&opt, &reg(145, 140, 1, 323, 150)), 3);
+        // identity 0.933 < 0.95: 30 * 0.5 * ln(30) -> 51, then * identity^2 -> 44.
+        assert_eq!(mem_approx_mapq_se(&opt, &reg(100, 50, 0, 30, 150)), 44);
     }
 }

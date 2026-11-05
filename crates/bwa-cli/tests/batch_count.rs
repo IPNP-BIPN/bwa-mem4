@@ -89,3 +89,28 @@ fn batch_count_respects_verbosity() {
         "batch count leaked at -v 2:\n{err}"
     );
 }
+
+/// `-K 0` and `-t 0` fall back to bwa's default batch, `chunk_size * max(-t, 1)` = 10M bases, as
+/// `fastmap.cpp` does. They used to give one-read batches, which re-estimates the insert size per
+/// pair and changes paired-end output.
+#[test]
+fn zero_k_and_zero_t_use_the_default_batch() {
+    let dir = std::env::temp_dir().join("bwa4_batch_zero_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fq = dir.join("r.fq");
+    write_reads(&fq, 100, 100);
+    for args in [["-t1", "-K", "0"], ["-t0", "-K", "0"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_bwa-mem4"))
+            .arg("mem")
+            .args(args)
+            .arg(repo_root().join("testdata/tiny/tiny.fa"))
+            .arg(&fq)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("processed 1 batches (-K 10000000)"),
+            "{args:?}: expected the default 10M-base batch:\n{err}"
+        );
+    }
+}
