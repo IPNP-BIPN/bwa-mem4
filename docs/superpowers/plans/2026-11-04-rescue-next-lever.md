@@ -1,5 +1,8 @@
 # Mate rescue: the next lever, priced before it is built
 
+> **Result (2026-11-05): NO-GO at Phase 1.** Bands keep 70.6% of cells against the hull's 71.4%.
+> Numbers in `docs/perf-levers.md`, "Rescue component bands". Phases 2-3 are not to be built.
+
 **Goal:** cut the CPU the paired-end path spends on mate rescue, byte-identical to bwa-mem2.
 
 **Why now.** Publication run of 2026-11-04 (2M real HG002 pairs, GRCh38, `-t12`, non-PGO, median of

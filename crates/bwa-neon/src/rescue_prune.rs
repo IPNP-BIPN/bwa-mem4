@@ -795,15 +795,35 @@ mod tests {
             for _rep in 0..2 {
                 let t0 = std::time::Instant::now();
                 let (mut fail, mut hull, mut full) = (0, 0, 0);
+                // DP cells (target rows x query length): all of them, then those each decision keeps.
+                let (mut c_all, mut c_hull_in, mut c_hull_kept, mut c_full) =
+                    (0u64, 0u64, 0u64, 0u64);
                 for (t, q) in &jobs {
+                    let cells = (t.len() * q.len()) as u64;
+                    c_all += cells;
                     match decide(t, q, &p, mh) {
                         Decision::Fail => fail += 1,
-                        Decision::Hull { .. } => hull += 1,
-                        Decision::Full => full += 1,
+                        Decision::Hull { hb, he } => {
+                            hull += 1;
+                            c_hull_in += cells;
+                            c_hull_kept += ((he + 1 - hb) * q.len()) as u64;
+                        }
+                        Decision::Full => {
+                            full += 1;
+                            c_full += cells;
+                        }
                     }
                 }
                 let ns = t0.elapsed().as_nanos() as f64 / jobs.len() as f64;
-                eprintln!("BENCH mh={mh:>6} {ns:7.0} ns/job  fail {fail} hull {hull} full {full}");
+                let pc = |x: u64| 100.0 * x as f64 / c_all as f64;
+                eprintln!(
+                    "BENCH mh={mh:>6} {ns:7.0} ns/job  fail {fail} hull {hull} full {full}  cells: \
+                     full {:.1}%  hull jobs {:.1}% -> kept {:.1}%  run {:.1}%",
+                    pc(c_full),
+                    pc(c_hull_in),
+                    pc(c_hull_kept),
+                    pc(c_full + c_hull_kept)
+                );
             }
         }
         // Shape of the hits: per job, rows, rows with a primary hit, runs, repeated-occurrence hits.
