@@ -783,6 +783,180 @@ mod tests {
         }
     }
 
+    /// The diagonal components at threshold `tau` from the counts `count_hits` left in `s`:
+    /// `(ub, first row, first diagonal slot, last diagonal slot, tail rows)`. Same walk as
+    /// [`sparse_decision`], with `tau` in place of `minsc`.
+    fn components_at(s: &Scratch, p: &Params, tau: i32) -> Vec<(i32, i64, i64, i64, i64)> {
+        let (base, mut out) = (p.base(), Vec::new());
+        let n = s.occ.len();
+        let mut open: Option<(i32, i64, i64, i64)> = None;
+        let tail = |ub: i32| {
+            let x = ub - tau - p.o_del + (p.k as i32 - 1) * p.a;
+            if x <= 0 {
+                0
+            } else {
+                (x / p.e_del) as i64
+            }
+        };
+        let gap_min_tau = |fl: i32, br: i32, gap: u32| {
+            if gap == 0 {
+                return i32::MAX;
+            }
+            let (c, g) = (p.c, gap as i32);
+            let (pl, qr) = (fl.max(0), br.max(0));
+            let at = |k: i32| {
+                let k = k.clamp(1, g);
+                base - c + (pl - (k - 1) * c).max(0) + (qr - (g - k) * c).max(0)
+            };
+            let (k1, k2) = (1 + pl / c, g - qr / c);
+            [1, g, k1, k1 + 1, k2, k2 - 1]
+                .into_iter()
+                .map(at)
+                .min()
+                .unwrap()
+        };
+        for idx in 0..n {
+            let d = s.occ[idx];
+            let bnd = base + s.fo[idx] + s.bo[idx] - p.weight(s.cnt[d as usize]);
+            if bnd < tau {
+                if let Some((ub, i0, lo, hi)) = open.take() {
+                    out.push((ub, i0, lo, hi, tail(ub)));
+                }
+                continue;
+            }
+            let (row, dd) = (s.minrow[d as usize] as i64, d as i64);
+            open = match open {
+                Some((ub, i0, lo, _))
+                    if gap_min_tau(s.fo[idx - 1], s.bo[idx], d - s.occ[idx - 1] - 1) >= tau =>
+                {
+                    Some((ub.max(bnd), i0.min(row), lo, dd))
+                }
+                prev => {
+                    if let Some((ub, i0, lo, hi)) = prev {
+                        out.push((ub, i0, lo, hi, tail(ub)));
+                    }
+                    Some((bnd, row, dd, dd))
+                }
+            };
+        }
+        if let Some((ub, i0, lo, hi)) = open {
+            out.push((ub, i0, lo, hi, tail(ub)));
+        }
+        out
+    }
+
+    /// Prices fg-labs/bwa-mem3's round-1 rescue bands offline (no kernel): per job, the hull our
+    /// filter keeps against the diagonal bands of the components at `T1 = max(minsc, ub2 / 2)`, and
+    /// how many jobs round 1 cannot finish (checked with the scalar DP on every `STRIDE`-th job).
+    /// `BWA4_PRUNE_BENCH=jobs.bin cargo test --release -p bwa-mem4-neon band_t1_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn band_t1_bench() {
+        let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") else {
+            return;
+        };
+        let stride: usize = std::env::var("STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let jobs = load_dump(&path);
+        let p = Params::from(1, 4, 6, 1, 6, 1, 19).unwrap();
+        let mat = {
+            let mut m = [0i8; 25];
+            for i in 0..5 {
+                for j in 0..5 {
+                    m[i * 5 + j] = if i == 4 || j == 4 {
+                        -1
+                    } else if i == j {
+                        1
+                    } else {
+                        -4
+                    };
+                }
+            }
+            m
+        };
+        let mut s = Scratch::new();
+        let (mut c_all, mut c_now, mut c_band, mut c_band_r2) = (0u64, 0u64, 0u64, 0u64);
+        let (mut n, mut nhull, mut nr1, mut nfinal, mut nchk, mut nsingle) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        for (idx, (t, q)) in jobs.iter().enumerate() {
+            if idx % stride != 0 {
+                continue;
+            }
+            n += 1;
+            let ql = q.len() as u64;
+            let cells = t.len() as u64 * ql;
+            c_all += cells;
+            let mh: usize = std::env::var("MH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(400);
+            let dec = decide(t, q, &p, mh);
+            let (hb, he) = match dec {
+                Decision::Fail => continue,
+                Decision::Full => {
+                    c_now += cells;
+                    c_band += cells;
+                    c_band_r2 += cells;
+                    continue;
+                }
+                Decision::Hull { hb, he } => (hb, he),
+            };
+            nhull += 1;
+            let hull = (he + 1 - hb) as u64 * ql;
+            c_now += hull;
+            // Rebuild the counts and Kadane sums (decide's scratch is thread-local, not `s`).
+            let nd = count_hits(&mut s, t, q, &p, usize::MAX).unwrap();
+            let _ = sparse_decision(&mut s, &p, t.len(), nd);
+            let c0 = components_at(&s, &p, p.minsc);
+            let mut ubs: Vec<i32> = c0.iter().map(|c| c.0).collect();
+            ubs.sort_unstable_by(|a, b| b.cmp(a));
+            let ub2 = ubs.get(1).copied().unwrap_or(0);
+            if c0.len() == 1 {
+                nsingle += 1;
+            }
+            let t1 = p.minsc.max(ub2 / 2);
+            let band_cells = |cs: &[(i32, i64, i64, i64, i64)]| -> u64 {
+                cs.iter().map(|c| (c.3 - c.2 + 1 + c.4) as u64 * ql).sum()
+            };
+            let b1 = band_cells(&components_at(&s, &p, t1));
+            let b0 = band_cells(&c0);
+            // Round 1 is final iff T1 == minsc, or S >= T1 and (score2 >= T1 or the hull lies in
+            // the zone around te); otherwise round 2 adds the components at minsc.
+            let mut need_r2 = false;
+            if t1 > p.minsc {
+                nr1 += 1;
+                if idx % (stride * 4) == 0 {
+                    nchk += 1;
+                    let lanes = if ql < 250 { 16 } else { 8 };
+                    let r = ksw_align2(q, t, 5, &mat, 6, 1, 6, 1, p.minsc, 1, lanes);
+                    let z = r.score as i64;
+                    let in_zone = hb as i64 >= r.te as i64 - z && he as i64 <= r.te as i64 + z;
+                    if r.score >= t1 && (r.score2 >= t1 || in_zone) {
+                        nfinal += 1;
+                    } else {
+                        need_r2 = true;
+                    }
+                }
+            }
+            c_band += b1.min(hull);
+            c_band_r2 += if need_r2 {
+                (b1 + b0).min(hull + b1)
+            } else {
+                b1.min(hull)
+            };
+        }
+        let pc = |x: u64| 100.0 * x as f64 / c_all as f64;
+        eprintln!(
+            "BAND jobs {n} hull {nhull} single-comp {nsingle} T1>minsc {nr1} (checked {nchk}, final {nfinal})\n\
+             cells of all: now {:.1}%  band-r1 {:.1}%  band with sampled r2 {:.1}%",
+            pc(c_now),
+            pc(c_band),
+            pc(c_band_r2)
+        );
+    }
+
     #[test]
     #[ignore]
     fn prune_bench() {
