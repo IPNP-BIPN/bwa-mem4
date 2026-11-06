@@ -25,6 +25,7 @@ FULL1="${FULL1:-$DATA/giab30x/HG002_30x_R1.fastq.gz}"; FULL2="${FULL2:-$DATA/gia
 T="${T:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || nproc)}"   # all performance cores
 K=100000000            # fixed batch size: output is then independent of -t for both tools
 SUB_REPS="${SUB_REPS:-5}"; FULL_REPS="${FULL_REPS:-1}"
+BUILD="${BUILD:-}"     # how $M4 was built, for the log (e.g. BUILD="scripts/pgo.sh")
 QUIET="${QUIET:-4}"    # 1-min load average a run waits for before starting (an idle desktop sits at 2-4)
 SKIP_FULL="${SKIP_FULL:-0}"
 
@@ -73,7 +74,7 @@ say "date:        $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 say "host:        $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), $(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null)P+$(sysctl -n hw.perflevel1.physicalcpu 2>/dev/null)E cores, $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB RAM"
 say "os:          $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null) ($(uname -r))"
 say "bwa-mem4:    $(git rev-parse HEAD)$( [ -n "$(git status --porcelain --untracked-files=no)" ] && echo ' (DIRTY TREE)'), $(rustc -V)"
-say "             build: cargo build --release (lto=fat, codegen-units=1, panic=abort, .cargo/config: target-cpu=native)"
+say "             build: ${BUILD:-cargo build --release (lto=fat, codegen-units=1, panic=abort, .cargo/config: target-cpu=native)}"
 say "             sha256 $(shasum -a 256 "$M4" | cut -d' ' -f1)"
 say "bwa-mem2:    $("$M2" version 2>/dev/null) ($(readlink -f "$M2"))"
 say "             sha256 $(shasum -a 256 "$(readlink -f "$M2")" | cut -d' ' -f1)"

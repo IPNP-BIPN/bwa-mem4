@@ -1,0 +1,65 @@
+# bwa-mem4 vs bwa-mem2 publication benchmark, GIAB HG002
+date:        2026-11-05T20:47:03Z
+host:        Apple M4 Max, 12P+4E cores, 128 GiB RAM
+os:          macOS 27.2 (27.2.0)
+bwa-mem4:    2e1a12493e81f282ae63e4dd65338426e2ba28c9, rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)
+             build: cargo build --release (lto=fat, codegen-units=1, panic=abort, .cargo/config: target-cpu=native)
+             sha256 6f10b25070529d2300b01fd4bde63626c4ae42857f96adf34433b8046da2a1b3
+bwa-mem2:    2.2.1 (/opt/homebrew/Cellar/bwa-mem2/2.3/bin/bwa-mem2)
+             sha256 4bbd7e37516842be78630a6fba37e2f751516a2ae96750071ef350aff085c30c
+threads:     -t12   batch: -K 100000000
+reference:   $DATA/genome.fa  md5 a65212262de00761b43869d5c08c8e4d  >1 dna:chromosome chromosome:GRCh38:1:1:248956422:1 REF
+subset:      $DATA/g2m_1.fq + _2: 2000000 pairs, md5 275ac2fe79beaa9a211c375422c36ab8 / 557552216e5d197bc52818de5298f624
+full sample: $DATA/giab30x/HG002_30x_R1.fastq.gz + R2, md5 bd3dc57472c522a93c133e1bd2d6d624 / 2052a991633bed8f7738053d6b2c33b0
+             source FASTQ URLs: r1_urls.txt (213 R1 files)
+
+== 1. index (each tool, same FASTA) ==
+  m4  wall=149.54s user=229.55s rss=73.82GB
+  m2  wall=551.50s user=501.75s rss=74.40GB
+  .pac identical
+  .ann identical
+  .amb identical
+  .bwt.2bit.64 identical
+  .0123 identical
+
+== 2. warm-up (discarded) ==
+  warmup se m4 rep0  wall=7.56s user=83.66s rss=10.96GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=3.69
+  warmup se m2 rep0  wall=30.93s user=328.71s rss=21.12GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=5.44
+
+== 3. subset x5, interleaved ==
+  subset se m2 rep1  wall=31.38s user=336.88s rss=21.13GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=8.72
+  subset se m4 rep1  wall=8.15s user=89.89s rss=10.99GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=11.70
+  subset pe m2 rep1  wall=102.55s user=1187.29s rss=21.45GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=13.01
+  subset pe m4 rep1  wall=28.41s user=330.16s rss=13.37GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=14.96
+  subset se m4 rep2  wall=7.66s user=85.39s rss=11.00GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=16.05
+  subset se m2 rep2  wall=29.88s user=320.63s rss=21.11GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=15.75
+  subset pe m4 rep2  wall=29.44s user=340.39s rss=13.37GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=16.53
+  subset pe m2 rep2  wall=103.37s user=1194.73s rss=21.44GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=19.21
+  subset se m2 rep3  wall=29.98s user=320.90s rss=21.11GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=20.20
+  subset se m4 rep3  wall=7.77s user=85.38s rss=10.98GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=19.81
+  subset pe m2 rep3  wall=102.89s user=1191.82s rss=21.44GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=19.67
+  subset pe m4 rep3  wall=28.98s user=335.16s rss=13.27GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=19.80
+  subset se m4 rep4  wall=7.73s user=86.00s rss=10.97GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=20.96
+  subset se m2 rep4  wall=30.08s user=322.77s rss=21.11GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=19.47
+  subset pe m4 rep4  wall=29.70s user=344.70s rss=13.25GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=18.90
+  subset pe m2 rep4  wall=103.00s user=1190.47s rss=21.40GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=19.93
+  subset se m2 rep5  wall=29.89s user=319.40s rss=21.11GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=20.35
+  subset se m4 rep5  wall=7.85s user=86.94s rss=10.95GB records=2012637 md5=27f439b2e517d00826348982a0be081a load_start=21.26
+  subset pe m2 rep5  wall=101.07s user=1168.87s rss=21.43GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=21.94
+  subset pe m4 rep5  wall=28.72s user=324.89s rss=12.68GB records=4026317 md5=42e1a795a5bfa57d744bae5d4f7ec083 load_start=19.88
+
+== 4. full sample x1 ==
+  full   se m4 rep1  wall=1335.67s user=16407.82s rss=11.71GB records=353517767 md5=364e14c4ff387803d41e4ca8234b708c load_start=19.43
+  full   se m2 rep1  wall=4854.50s user=56920.24s rss=25.03GB records=353517767 md5=364e14c4ff387803d41e4ca8234b708c load_start=16.64
+  full   pe m4 rep1  wall=4725.32s user=56705.63s rss=13.90GB records=707312349 md5=d818f019363f6879e52d5a9825f88fcf load_start=13.16
+  full   pe m2 rep1  wall=16476.00s user=197592.14s rss=32.83GB records=707312349 md5=d818f019363f6879e52d5a9825f88fcf load_start=14.81
+
+== summary (median over reps; speedup = bwa-mem2 / bwa-mem4) ==
+phase/mode      reps    mem2 wall    mem4 wall  speedup   mem2 RSS   mem4 RSS  identity
+full/pe            1     16476.0s      4725.3s    3.49x      32.8G      13.9G  records identical
+full/se            1      4854.5s      1335.7s    3.63x      25.0G      11.7G  records identical
+index/build        1       551.5s       149.5s    3.69x      74.4G      73.8G  files identical
+subset/pe          5       102.9s        29.0s    3.55x      21.4G      13.3G  records identical
+subset/se          5        30.0s         7.8s    3.86x      21.1G      11.0G  records identical
+
+PUBLICATION_BENCH_DONE  $DATA/publication_20261105_214703

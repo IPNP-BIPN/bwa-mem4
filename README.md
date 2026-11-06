@@ -18,12 +18,36 @@ code tells you not to use them.
 | Single-end | byte-identical on **353,517,767** records |
 | Paired-end | byte-identical on **707,312,349** records |
 | ALT contigs | byte-identical on the real GRCh38 analysis set, 261 ALT contigs |
-| Speed | SE **2.62x**, PE **1.85x** vs bwa-mem2 at `-t8` |
+| Speed | SE **3.63x**, PE **3.49x** vs bwa-mem2 2.3 on the full 30x sample at `-t12`; index build **3.69x** |
+| Memory | peak RSS SE **11.7 GB** vs 25.0, PE **13.9 GB** vs 32.8; index build 73.8 GB vs 74.4 |
 | Output | SAM, BGZF-compressed SAM, BAM, CRAM |
 | Option surface | all three subcommands, and **every one of the 35 options `bwa-mem2 mem` accepts**; 64 of 64 per-option SAM parity cases pass |
 
 Measured on a real 32.9x human WGS (GIAB HG002, 2x150), not simulated reads and not a sampled
-subset. Both aligners read the same on-disk index. Reproduce with `scripts/giab30x_pe.sh`.
+subset, on 5 Nov 2026 with `scripts/giab_publication.sh` (raw log and per-run table in
+[docs/bench/giab-hg002-2026-11-05](docs/bench/giab-hg002-2026-11-05/)). Each tool builds its own
+GRCh38 index from the same FASTA (the five files compare identical) and aligns against it. Every run
+records wall, CPU, peak RSS and the md5 of its records, so identity is checked on each run, not
+once:
+
+| run | bwa-mem2 | bwa-mem4 | speedup | peak RSS, bwa-mem2 / bwa-mem4 | output |
+|---|---|---|---|---|---|
+| index build, GRCh38 | 551.5 s | 149.5 s | 3.69x | 74.4 / 73.8 GB | 5 files identical |
+| 2M pairs SE, median of 5 | 30.0 s | 7.8 s | 3.86x | 21.1 / 11.0 GB | identical |
+| 2M pairs PE, median of 5 | 102.9 s | 29.0 s | 3.55x | 21.4 / 13.3 GB | identical |
+| full 30x SE, 353,517,767 records | 4854.5 s | 1335.7 s | 3.63x | 25.0 / 11.7 GB | identical |
+| full 30x PE, 707,312,349 records | 16476.0 s | 4725.3 s | 3.49x | 32.8 / 13.9 GB | identical |
+
+What that run is and is not:
+
+- Apple M4 Max (12P + 4E, 128 GiB), `-t12 -K 100000000`, bwa-mem2 2.3 from Homebrew (its
+  `version` prints 2.2.1). bwa-mem4 is
+  the PGO build from `scripts/pgo.sh` (sha256 `6f10b250...`), not a plain `cargo build --release`;
+  the log's build line said otherwise, a bug since fixed.
+- The full sample ran once per tool. The 2M-pair subset ran 5 times, interleaved, and each tool's
+  fastest and slowest reps are within 7%.
+- No wait for an idle host: the 1-min load average was 13-22 at each run's start, which is mostly
+  the previous 12-thread run winding down. Both tools ran interleaved under the same conditions.
 
 Speed is on an Apple M4 Max. The ratio is not constant across thread counts: it decays as `-t`
 rises, so quote it with the thread count attached.
@@ -221,7 +245,7 @@ IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \
 
 ```sh
 bash scripts/alt_parity.sh     # ALT contigs: real GRCh38 analysis set + the real bwakit .alt
-bash scripts/giab30x_pe.sh     # the real thing: a full 30x WGS, several hours
+bash scripts/giab_publication.sh   # the real thing: index + full 30x SE/PE, both tools, ~8 h
 ```
 
 ```sh
