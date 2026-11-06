@@ -61,13 +61,15 @@ is. The `bench-x86` workflow records directional x86 signals on GitHub-hosted ru
 scalar/AVX2/AVX-512 rescue-kernel A/B, and a single-chromosome bwa-mem4-vs-bwa-mem2 run; both are
 cloud-noisy and small-scale, not the headline ratio.
 
-Two such draws, both with AVX-512, chr21, 1M simulated pairs, `-t8`, interleaved, every binary
-producing identical records:
+Such draws, chr21, 1M simulated pairs, interleaved, every binary producing identical records (the
+two August rows at `-t8`, the November ones at the runners' 4 threads):
 
 | host | bwa-mem2 | bwa-mem4 | with the archive's `x86-64-v3` | ratio |
 |---|---|---|---|---|
-| Intel Xeon Platinum 8573C (Emerald Rapids) | 128.80 s | 93.17 s | 88.28 s | 1.38x |
-| AMD EPYC 9V74 (Zen 4) | 129.31 s | 76.10 s | 73.12 s | 1.70x |
+| Intel Xeon Platinum 8573C (Emerald Rapids), Aug 2026 | 128.80 s | 93.17 s | 88.28 s | 1.38x |
+| AMD EPYC 9V74 (Zen 4), Aug 2026 | 129.31 s | 76.10 s | 73.12 s | 1.70x |
+| AMD EPYC 9V74 (Zen 4), 6 Nov 2026 | 129.90 s | 68.33 s | - | 1.90x |
+| AMD EPYC 7763 (Zen 3, AVX2 only), 6 Nov 2026 | 165.67 s | 86.30 s | - | 1.92x |
 
 The ratio is a property of the host as much as of the code (bwa-mem2 takes the same time on both;
 we do not), which is why both rows are here rather than an average that would describe neither. What
@@ -76,19 +78,30 @@ against 97.14 on the Intel part, 76.29 against 79.35 on the AMD one), and the 51
 1.20x the AVX2 ones on the kernel A/B. Directional and narrow: one chromosome of simulated reads on
 cloud runners, not the headline ratio.
 
-On real reads the picture on x86 is the other way round from simulated ones: on an AMD EPYC 9V74
-with `avx512bw`, a GIAB slice, three interleaved repetitions, the archive's `x86-64-v3` binary takes
-86.91 s against fg-labs/bwa-mem3's 99.41 s and bwa-mem2's 209.88 s, i.e. **1.15x the fork and 2.43x
-bwa-mem2**, with identical records from all three. On simulated reads the fork is ahead by 1.21x,
-measured five times on three microarchitectures (Emerald Rapids, Zen 4, Granite Rapids) and spread
-over one percent. Both belong in the same paragraph: which one describes your
-workload depends on your reads, not on the aligner.
+**On x86 the fork, fg-labs/bwa-mem3, is now about twice as fast as bwa-mem4.** Measured on 6 Nov
+2026 with the `head-to-head` workflow on an AMD EPYC 9V74 (Zen 4, `avx512bw`, 4 threads), three
+interleaved repetitions, best of three; the fork is bioconda's 0.16.0 run with `--compat=bwa-mem2`,
+its mode that reproduces bwa-mem2, and its records are identical to ours on both datasets:
 
-What the AVX-512 kernels contribute to that lead was measured directly, by timing the same binary
+| reads | bwa-mem2 | bwa-mem4 (`x86-64-v3`) | bwa-mem3 0.16.0 `--compat=bwa-mem2` | bwa-mem4 vs bwa-mem2 | fork vs bwa-mem4 |
+|---|---|---|---|---|---|
+| chr21, 2M simulated pairs | 250.58 s | 125.82 s | 55.80 s | 1.99x | 2.25x faster |
+| real GIAB HG002 slice | 215.33 s | 81.29 s | 44.57 s | 2.65x | 1.82x faster |
+
+In August this paragraph said the opposite: on the same CPU and the same real reads we took 86.91 s
+against the fork's 99.41 s, 1.15x ahead. That was bwa-mem3 0.10.0. Its releases since (0.12 to
+0.16) each cut wall time on x86, and on these reads it went from 99.41 s to 44.57 s while we went
+from 86.91 s to 81.29 s. Its compat mode costs it 1-4% over its default mode here, so the gap is
+not a mode that skips work. The `bench-x86` run of the same day agrees: 28.53 s for the fork against
+68.33 s for us on chr21, records identical across all three tools. The x86 workflows now pin the
+fork's version and time it in `--compat=bwa-mem2`, so a new bioconda release can no longer move the
+comparison silently. None of this has been measured against the fork on Apple Silicon.
+
+What the AVX-512 kernels contributed to the August lead over fork 0.10.0 was measured directly, by timing the same binary
 with the kernels forced down to AVX2 in the same interleaved loop, and the answer **depends on the
 host, by an order of magnitude**:
 
-| host | real reads, 512-bit | forced AVX2 | tier is worth | vs the fork, with / without |
+| host | real reads, 512-bit | forced AVX2 | tier is worth | vs the fork 0.10.0, with / without |
 |---|---|---|---|---|
 | AMD EPYC 9V74 (Zen 4) | 87.62 s | 88.23 s | 0.7% | 1.120x / 1.113x |
 | Intel Xeon 6973P-C (Granite Rapids) | 78.16 s | 83.47 s | 6.8% | 1.135x / 1.063x |
