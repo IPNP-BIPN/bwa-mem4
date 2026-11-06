@@ -89,7 +89,7 @@ jobs:
               - bioconda
           create-args: >-
             bwa-mem2
-            bwa-mem3
+            bwa-mem3=0.16.0
             wgsim
           init-shell: bash
 
@@ -133,7 +133,7 @@ jobs:
           echo "threads=$T"
           for rep in 1 2 3; do
             m4=$(timed $M4 mem -t "$T" chr21.fa r1.fq r2.fq)
-            fk=$(timed bwa-mem3 mem -t "$T" chr21.fa r1.fq r2.fq)
+            fk=$(timed bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa r1.fq r2.fq)
             m2=$(timed bwa-mem2 mem -t "$T" chr21.fa r1.fq r2.fq)
             echo "rep $rep: bwa-mem4 ${m4}s | bwa-mem3 ${fk}s | bwa-mem2 ${m2}s"
           done
@@ -224,7 +224,7 @@ jobs:
               - bioconda
           create-args: >-
             bwa-mem2
-            bwa-mem3
+            bwa-mem3=0.16.0
             samtools
           init-shell: bash
 
@@ -262,7 +262,7 @@ jobs:
           $M4 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz >/dev/null 2>/dev/null   # warm
           for rep in 1 2 3; do
             m4=$(timed $M4 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
-            fk=$(timed bwa-mem3 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
+            fk=$(timed bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
             m2=$(timed bwa-mem2 mem -t "$T" chr21.fa g1.fq.gz g2.fq.gz)
             echo "rep $rep: bwa-mem4 ${m4}s | bwa-mem3 ${fk}s | bwa-mem2 ${m2}s"
           done

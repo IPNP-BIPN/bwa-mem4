@@ -225,7 +225,7 @@ jobs:
               - bioconda
           create-args: >-
             bwa-mem2
-            bwa-mem3
+            bwa-mem3=0.16.0
             wgsim
             samtools
           init-shell: bash
@@ -316,7 +316,7 @@ jobs:
           echo "== warm-up (untimed, verifies all three aligners read the index) =="
           run_one "warmup bwa-mem2" $M2 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
           $M2 mem -t "$T" chr21.fa r1.fq r2.fq > m2.sam 2>/dev/null
-          run_one "warmup bwa-mem3" $FORK mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
+          run_one "warmup bwa-mem3" $FORK mem --compat=bwa-mem2 -t "$T" chr21.fa r1.fq r2.fq > /dev/null
           run_one "warmup bwa-mem4" $M4 mem -t "$T" chr21.fa r1.fq r2.fq > /dev/null
           $M4 mem -t "$T" chr21.fa r1.fq r2.fq > m4.sam 2>/dev/null
 
@@ -324,6 +324,9 @@ jobs:
           m2md5=$(grep -v '^@' m2.sam | md5sum | cut -d' ' -f1)
           m4md5=$(grep -v '^@' m4.sam | md5sum | cut -d' ' -f1)
           if [ "$m2md5" = "$m4md5" ]; then echo "records byte-identical ($m2md5)"; else echo "records DIFFER: mem2=$m2md5 mem4=$m4md5"; fi
+          # The fork is timed in --compat=bwa-mem2, its only mode that claims bwa-mem2's bytes; say whether it delivers.
+          $FORK mem --compat=bwa-mem2 -t "$T" chr21.fa r1.fq r2.fq 2>/dev/null | grep -v '^@' | md5sum | cut -d' ' -f1 > fk.md5
+          if [ "$(cat fk.md5)" = "$m2md5" ]; then echo "fork records byte-identical"; else echo "fork records DIFFER from bwa-mem2: $(cat fk.md5)"; fi
 
           # The tier variants, when any were asked for: same source, narrower CPU, timed in the SAME
           # interleaved loop so a machine that drifts drifts under all of them.
@@ -353,7 +356,7 @@ jobs:
           rm -f best-*.txt
           for rep in 1 2; do
             r2=$(run_one "mem2 rep$rep" $M2 mem -t "$T" chr21.fa r1.fq r2.fq); w2=${r2%% *}
-            rf=$(run_one "fork rep$rep" $FORK mem -t "$T" chr21.fa r1.fq r2.fq); wf=${rf%% *}
+            rf=$(run_one "fork rep$rep" $FORK mem --compat=bwa-mem2 -t "$T" chr21.fa r1.fq r2.fq); wf=${rf%% *}
             r4=$(run_one "mem4 rep$rep" $M4 mem -t "$T" chr21.fa r1.fq r2.fq); w4=${r4%% *}
             line="rep $rep: bwa-mem2 ${r2} | bwa-mem3 ${rf} | bwa-mem4 ${r4}"
             for cpu in $VARIANTS; do

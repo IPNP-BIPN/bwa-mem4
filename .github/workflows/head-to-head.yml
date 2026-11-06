@@ -118,7 +118,7 @@ jobs:
               - bioconda
           create-args: >-
             bwa-mem2
-            bwa-mem3
+            bwa-mem3=0.16.0
             wgsim
             samtools
           init-shell: bash
@@ -188,7 +188,7 @@ jobs:
             # Warm every binary: on a cold page cache the first of four looks slower for reasons
             # that have nothing to do with the aligner.
             for b in ../mem4-baseline ../mem4-v3; do $b mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null; done
-            bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
+            bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             [ -x ../mem4-base-ref ] && env BWA4_TIGHT_BAND=1 ../mem4-base-ref mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             if [ "$AVX2_ARM" = "true" ]; then
@@ -199,7 +199,7 @@ jobs:
               b0=$(timed ../mem4-baseline mem -t "$T" chr21.fa "$r1" "$r2")
               b3=$(timed ../mem4-v3       mem -t "$T" chr21.fa "$r1" "$r2")
               tb=$(timed env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2")
-              fk=$(timed bwa-mem3         mem -t "$T" chr21.fa "$r1" "$r2")
+              fk=$(timed bwa-mem3         mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2")
               m2=$(timed bwa-mem2         mem -t "$T" chr21.fa "$r1" "$r2")
               line="rep $rep: baseline ${b0}s | v3 ${b3}s | v3+tight ${tb}s | fork ${fk}s | mem2 ${m2}s"
               if [ -x ../mem4-base-ref ]; then
@@ -234,7 +234,7 @@ jobs:
           for set in sim real; do
             r1="${set}1.fq"; r2="${set}2.fq"
             echo; echo "===== $set: the fork's own profile ====="
-            bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> fk.err || { tail -5 fk.err; exit 1; }
+            bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> fk.err || { tail -5 fk.err; exit 1; }
             sed -n '/Runtime profile/,/Important parameter/p' fk.err | grep -vE '^\s*$' | head -30
             echo; echo "===== $set: ours (v3 build, one batch in flight so shares are exact) ====="
             env BWA4_NO_BATCH_OVERLAP=1 BWA4_STAGE_TIME=1 BWA4_CHAIN_TIME=1 BWA4_EMIT_SPLIT=1 BWA4_RESCUE_SPLIT=1 \
@@ -254,4 +254,8 @@ jobs:
             [ "$a" = "$b" ] || { echo "::error::$set: v3 output differs from baseline"; exit 1; }
             [ "$a" = "$c" ] || { echo "::error::$set: TIGHT BAND output differs from baseline"; exit 1; }
             echo "$set: identical across all three ($a)"
+            f=$(bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@' | md5sum)
+            o=$(../mem4-baseline mem -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@' | md5sum)
+            # Informational: the fork's --compat=bwa-mem2 records against ours (= bwa-mem2's, per parity.yml).
+            [ "$f" = "$o" ] && echo "$set: fork records identical to ours" || echo "$set: fork records DIFFER from ours"
           done
