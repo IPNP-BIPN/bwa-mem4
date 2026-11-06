@@ -783,6 +783,39 @@ mod tests {
         }
     }
 
+    /// Per-row maxima of the full window's zero-state DP (gaps opened from H, query padded to 16
+    /// columns of score 0), the rows `ksw_local_fwd` feeds its tracker. Default scoring.
+    fn row_maxima(q: &[u8], t: &[u8]) -> Vec<i32> {
+        let qp = q.len().div_ceil(16) * 16;
+        let (mut hp, mut hc, mut e) = (vec![0i32; qp], vec![0i32; qp], vec![0i32; qp]);
+        let mut out = Vec::with_capacity(t.len());
+        for &tb in t {
+            let (mut f, mut hd, mut im) = (0i32, 0i32, 0i32);
+            for j in 0..qp {
+                let sc = if j < q.len() {
+                    if tb > 3 || q[j] > 3 {
+                        -1
+                    } else if tb == q[j] {
+                        1
+                    } else {
+                        -4
+                    }
+                } else {
+                    0
+                };
+                let h = (hd + sc).max(0).max(e[j]).max(f);
+                im = im.max(h);
+                hc[j] = h;
+                e[j] = (e[j] - 1).max(h - 7).max(0);
+                f = (f - 1).max(h - 7).max(0);
+                hd = hp[j];
+            }
+            out.push(im);
+            std::mem::swap(&mut hp, &mut hc);
+        }
+        out
+    }
+
     /// The diagonal components at threshold `tau` from the counts `count_hits` left in `s`:
     /// `(ub, first row, first diagonal slot, last diagonal slot, tail rows)`. Same walk as
     /// [`sparse_decision`], with `tau` in place of `minsc`.
@@ -845,6 +878,274 @@ mod tests {
         out
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Scalar prototype of banded rescue (the fork's rescue_band, against OUR score2 rule).
+    // ---------------------------------------------------------------------------------------
+
+    /// A component of the dense bound at some threshold: diagonal slots `[xlo, xhi]` (slot =
+    /// `i - j + off`), best bound, earliest hit start row, last slot holding a hit.
+    #[derive(Clone, Copy, Debug)]
+    struct BComp {
+        xlo: usize,
+        xhi: usize,
+        ub: i32,
+        i0: i64,
+        xmaxhit: usize,
+    }
+
+    /// Dense per-diagonal bound `base + fwd + bwd - w` from the counts `count_hits` left in `s`.
+    fn dense_bound(s: &Scratch, p: &Params, nd: usize) -> Vec<i32> {
+        let w = |x: usize| p.weight(s.cnt[x]);
+        let (mut fw, mut bw) = (vec![0i32; nd], vec![0i32; nd]);
+        for x in 0..nd {
+            fw[x] = w(x) + if x > 0 { fw[x - 1].max(0) } else { 0 };
+        }
+        for x in (0..nd).rev() {
+            bw[x] = w(x) + if x + 1 < nd { bw[x + 1].max(0) } else { 0 };
+        }
+        (0..nd).map(|x| p.base() + fw[x] + bw[x] - w(x)).collect()
+    }
+
+    fn bcomps(s: &Scratch, bnd: &[i32], tau: i32) -> Vec<BComp> {
+        let mut out = Vec::new();
+        let mut x = 0;
+        while x < bnd.len() {
+            if bnd[x] < tau {
+                x += 1;
+                continue;
+            }
+            let a = x;
+            let (mut ub, mut i0, mut xm) = (i32::MIN, i64::MAX, usize::MAX);
+            while x < bnd.len() && bnd[x] >= tau {
+                ub = ub.max(bnd[x]);
+                if s.cnt[x] > 0 {
+                    i0 = i0.min(s.minrow[x] as i64);
+                    xm = x;
+                }
+                x += 1;
+            }
+            if xm != usize::MAX {
+                out.push(BComp {
+                    xlo: a,
+                    xhi: x - 1,
+                    ub,
+                    i0,
+                    xmaxhit: xm,
+                });
+            }
+        }
+        out
+    }
+
+    /// Rows `[r0, r1]` and diagonals `[dlo, dhi]` (`d = i - j`) of a component's band at `tau`.
+    fn band_of(
+        c: &BComp,
+        p: &Params,
+        tau: i32,
+        len1: usize,
+        off: usize,
+    ) -> Option<(i64, i64, i64, i64)> {
+        let tail = {
+            let x = c.ub - tau - p.o_del + (p.k as i32 - 1) * p.a;
+            if x <= 0 {
+                0
+            } else {
+                (x / p.e_del) as i64
+            }
+        };
+        let off = off as i64;
+        let r0 = c.i0.max(0);
+        let r1 = (len1 as i64 - 1).min(c.xmaxhit as i64 - 1 + tail);
+        let dlo = (c.xlo as i64 - off).max(r0 - off + 1);
+        let dhi = (c.xhi as i64 - off).min(r1);
+        let (r0, r1) = (r0.max(dlo), r1.min(dhi + off - 1));
+        (r0 <= r1 && dlo <= dhi).then_some((r0, r1, dlo, dhi))
+    }
+
+    /// Zero-state DP restricted to one band, default scoring, query padded to `off` columns of
+    /// score 0 (our kernels' 16-lane pad). Merges each row's max (and its smallest column) into
+    /// `rmax` / `rcol`.
+    fn band_dp(
+        q: &[u8],
+        t: &[u8],
+        off: usize,
+        b: (i64, i64, i64, i64),
+        rmax: &mut [i32],
+        rcol: &mut [i32],
+    ) {
+        let (r0, r1, dlo, dhi) = b;
+        let (mut hp, mut hc, mut e) = (vec![0i32; off], vec![0i32; off], vec![0i32; off]);
+        let inb = |i: i64, j: i64| j >= 0 && (j as usize) < off && (dlo..=dhi).contains(&(i - j));
+        for i in r0..=r1 {
+            let tb = t[i as usize];
+            let (mut f, mut hd, mut im, mut ic) = (0i32, 0i32, 0i32, -1i32);
+            for j in 0..off {
+                if !inb(i, j as i64) {
+                    // Nonexistent cell: H = E = F = 0.
+                    hc[j] = 0;
+                    e[j] = 0;
+                    f = 0;
+                    hd = hp[j];
+                    continue;
+                }
+                let sc = if j < q.len() {
+                    if tb > 3 || q[j] > 3 {
+                        -1
+                    } else if tb == q[j] {
+                        1
+                    } else {
+                        -4
+                    }
+                } else {
+                    0
+                };
+                let h = (hd + sc).max(0).max(e[j]).max(f);
+                if h > im {
+                    (im, ic) = (h, j as i32);
+                }
+                hc[j] = h;
+                e[j] = (e[j] - 1).max(h - 7).max(0);
+                f = (f - 1).max(h - 7).max(0);
+                hd = hp[j];
+            }
+            let r = i as usize;
+            if im > rmax[r] || (im == rmax[r] && im > 0 && ic < rcol[r]) {
+                (rmax[r], rcol[r]) = (im, ic);
+            }
+            std::mem::swap(&mut hp, &mut hc);
+        }
+    }
+
+    /// `(score, te, qe, score2, te2)` from merged row maxima, by `ksw_local_fwd`'s own rules.
+    fn epilogue(rmax: &[i32], rcol: &[i32], minsc: i32) -> (i32, i32, i32, i32, i32) {
+        let (mut g, mut te) = (0i32, -1i32);
+        let mut b = bwa_extend::SuboptimalTracker::new();
+        for (i, &v) in rmax.iter().enumerate() {
+            b.push_row(i as i32, v, minsc);
+            if v > g {
+                (g, te) = (v, i as i32);
+            }
+        }
+        let qe = if te >= 0 { rcol[te as usize] } else { -1 };
+        let (s2, t2) = b.finish(g, te, 1);
+        (g, te, qe, s2, t2)
+    }
+
+    /// The prototype against `ksw_local_fwd` on every `STRIDE`-th dumped job: round 2 (bands at
+    /// `minsc`) must always match, and round 1 (bands at `T1`) must match whenever the fork's
+    /// finality rule accepts it.
+    ///
+    /// Why that rule holds under OUR score2 (ksw_u8's, not kswv's): band row maxima never exceed the
+    /// true ones and equal them on every row whose true max is `>= T1` (its alignment lies in a `T1`
+    /// band). A tracker entry moves to row `r` only if `r` directly follows the stored row and is
+    /// strictly higher, so whether a row `>= T1` ends up stored depends only on its neighbours' values
+    /// when those are `>= T1` (exact on both sides) and otherwise on their being lower (true on both
+    /// sides). So the entries `>= T1` are the same in both, as are `S`, `te` and `qe`; if `S >= T1`
+    /// and the banded `score2 >= T1`, the true `score2`/`te2` are the same entry. If instead every row
+    /// that can reach `minsc` lies inside the exclusion zone, neither side has an entry outside it.
+    /// `BWA4_PRUNE_BENCH=jobs.bin STRIDE=50 cargo test --release -p bwa-mem4-neon band_proto -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn band_proto() {
+        let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") else {
+            return;
+        };
+        let stride: usize = std::env::var("STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let jobs = load_dump(&path);
+        let p = Params::from(1, 4, 6, 1, 6, 1, 19).unwrap();
+        let mat: Vec<i8> = (0..25)
+            .map(|k| {
+                let (i, j) = (k / 5, k % 5);
+                if i == 4 || j == 4 {
+                    -1
+                } else if i == j {
+                    1
+                } else {
+                    -4
+                }
+            })
+            .collect();
+        let mut s = Scratch::new();
+        let (mut n, mut r1n, mut fin, mut bad, mut r2_bad) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut c_hull, mut c_band) = (0u64, 0u64);
+        let consumed = |x: (i32, i32, i32, i32, i32)| if x.0 >= p.minsc { Some(x) } else { None };
+        for (idx, (t, q)) in jobs.iter().enumerate() {
+            if idx % stride != 0 || q.len() >= 250 {
+                continue;
+            }
+            let off = q.len().div_ceil(16) * 16;
+            let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX) else {
+                continue;
+            };
+            let bnd = dense_bound(&s, &p, nd);
+            let c0 = bcomps(&s, &bnd, p.minsc);
+            if c0.is_empty() {
+                continue;
+            }
+            n += 1;
+            let full =
+                bwa_extend::ksw_local_fwd(q, t, 5, &mat, 6, 1, 6, 1, p.minsc, i32::MAX, 1, 16);
+            let run = |tau: i32, comps: &[BComp]| {
+                let (mut rm, mut rc) = (vec![0i32; t.len()], vec![i32::MAX; t.len()]);
+                let mut cells = 0u64;
+                for c in comps {
+                    if let Some(b) = band_of(c, &p, tau, t.len(), off) {
+                        cells += ((b.1 - b.0 + 1) * (b.3 - b.2 + 1).min(off as i64)) as u64;
+                        band_dp(q, t, off, b, &mut rm, &mut rc);
+                    }
+                }
+                (rm, rc, cells)
+            };
+            let b0: Vec<_> = c0
+                .iter()
+                .filter_map(|c| band_of(c, &p, p.minsc, t.len(), off))
+                .collect();
+            let (hlo, hhi) = (
+                b0.iter().map(|b| b.0).min().unwrap_or(0),
+                b0.iter().map(|b| b.1).max().unwrap_or(-1),
+            );
+            c_hull += (hhi - hlo + 1).max(0) as u64 * off as u64;
+            let mut ubs: Vec<i32> = c0.iter().map(|c| c.ub).collect();
+            ubs.sort_unstable_by(|a, b| b.cmp(a));
+            let t1 = p.minsc.max(ubs.get(1).copied().unwrap_or(0) / 2);
+            let round2 = || {
+                let (rm, rc, cells) = run(p.minsc, &c0);
+                (epilogue(&rm, &rc, p.minsc), cells)
+            };
+            if t1 == p.minsc {
+                let (r2, cells) = round2();
+                r2_bad += (consumed(r2) != consumed(full)) as u64;
+                c_band += cells;
+                continue;
+            }
+            r1n += 1;
+            let (rm1, rc1, cells1) = run(t1, &bcomps(&s, &bnd, t1));
+            let r1 = epilogue(&rm1, &rc1, p.minsc);
+            let (zl, zh) = (r1.1 as i64 - r1.0 as i64, r1.1 as i64 + r1.0 as i64);
+            c_band += cells1;
+            if r1.0 >= t1 && (r1.3 >= t1 || (hlo >= zl && hhi <= zh)) {
+                fin += 1;
+                if consumed(r1) != consumed(full) {
+                    bad += 1;
+                    eprintln!("ROUND 1 WRONG job {idx}: band {r1:?} full {full:?} T1 {t1}");
+                }
+            } else {
+                let (r2, cells) = round2();
+                r2_bad += (consumed(r2) != consumed(full)) as u64;
+                c_band += cells;
+            }
+        }
+        eprintln!(
+            "PROTO jobs {n} (T1 > minsc {r1n}, round 1 final {fin}, wrong {bad})  round-2 mismatches {r2_bad}\n\
+             band cells {:.1}% of the minsc hull",
+            100.0 * c_band as f64 / c_hull.max(1) as f64
+        );
+        assert_eq!((bad, r2_bad), (0, 0));
+    }
+
     /// Prices fg-labs/bwa-mem3's round-1 rescue bands offline (no kernel): per job, the hull our
     /// filter keeps against the diagonal bands of the components at `T1 = max(minsc, ub2 / 2)`, and
     /// how many jobs round 1 cannot finish (checked with the scalar DP on every `STRIDE`-th job).
@@ -878,6 +1179,8 @@ mod tests {
         };
         let mut s = Scratch::new();
         let (mut c_all, mut c_now, mut c_band, mut c_band_r2) = (0u64, 0u64, 0u64, 0u64);
+        let mut nzone = 0u64;
+        let mut nsafe = 0u64;
         let (mut n, mut nhull, mut nr1, mut nfinal, mut nchk, mut nsingle) =
             (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         for (idx, (t, q)) in jobs.iter().enumerate() {
@@ -933,6 +1236,54 @@ mod tests {
                     let r = ksw_align2(q, t, 5, &mat, 6, 1, 6, 1, p.minsc, 1, lanes);
                     let z = r.score as i64;
                     let in_zone = hb as i64 >= r.te as i64 - z && he as i64 <= r.te as i64 + z;
+                    // Sound variant: no stretch of rows covered by a minsc component crosses the
+                    // zone's edge, so no true row run can merge across it.
+                    let (zl, zh) = (r.te as i64 - z, r.te as i64 + z);
+                    let mut spans: Vec<(i64, i64)> =
+                        c0.iter().map(|c| (c.1, c.3 - 1 + c.4)).collect();
+                    spans.sort_unstable();
+                    let mut crossing = false;
+                    let mut cur: Option<(i64, i64)> = None;
+                    for (a0, a1) in spans
+                        .into_iter()
+                        .chain(std::iter::once((i64::MAX, i64::MAX)))
+                    {
+                        match cur {
+                            Some((c0s, c1)) if a0 <= c1 + 1 => cur = Some((c0s, c1.max(a1))),
+                            Some((c0s, c1)) => {
+                                if (c0s < zl && c1 >= zl) || (c0s <= zh && c1 > zh) {
+                                    crossing = true;
+                                }
+                                cur = Some((a0, a1));
+                            }
+                            None => cur = Some((a0, a1)),
+                        }
+                    }
+                    // Refined: unsafe only if a crossing stretch holds a row >= T1 outside the zone.
+                    let rm = row_maxima(q, t);
+                    let mut spans2: Vec<(i64, i64)> =
+                        c0.iter().map(|c| (c.1, c.3 - 1 + c.4)).collect();
+                    spans2.sort_unstable();
+                    let mut merged: Vec<(i64, i64)> = Vec::new();
+                    for (a0, a1) in spans2 {
+                        match merged.last_mut() {
+                            Some(m) if a0 <= m.1 + 1 => m.1 = m.1.max(a1),
+                            _ => merged.push((a0, a1)),
+                        }
+                    }
+                    let unsafe_cross = merged.iter().any(|&(s0, s1)| {
+                        let crosses = (s0 < zl && s1 >= zl) || (s0 <= zh && s1 > zh);
+                        crosses
+                            && (s0.max(0)..=s1.min(t.len() as i64 - 1))
+                                .any(|row| (row < zl || row > zh) && rm[row as usize] >= t1)
+                    });
+                    if r.score >= t1 && r.score2 >= t1 && !unsafe_cross {
+                        nsafe += 1;
+                    }
+                    let _ = crossing;
+                    if r.score >= t1 && r.score2 >= t1 && !crossing {
+                        nzone += 1;
+                    }
                     if r.score >= t1 && (r.score2 >= t1 || in_zone) {
                         nfinal += 1;
                     } else {
@@ -949,7 +1300,7 @@ mod tests {
         }
         let pc = |x: u64| 100.0 * x as f64 / c_all as f64;
         eprintln!(
-            "BAND jobs {n} hull {nhull} single-comp {nsingle} T1>minsc {nr1} (checked {nchk}, final {nfinal})\n\
+            "BAND jobs {n} hull {nhull} single-comp {nsingle} T1>minsc {nr1} (checked {nchk}, final {nfinal}, no crossing {nzone}, no high crossing {nsafe})\n\
              cells of all: now {:.1}%  band-r1 {:.1}%  band with sampled r2 {:.1}%",
             pc(c_now),
             pc(c_band),

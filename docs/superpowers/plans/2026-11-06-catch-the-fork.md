@@ -45,6 +45,37 @@ Band cells are counted as width x query length, without the kernel's lane paddin
 
 Expected: rescue kernel CPU down by about 45%, M4 PE from ~29 s to ~24 s.
 
+### Measured against the fork (same 2M PE pairs, M4, `-t12`, CPU seconds)
+
+| | bwa-mem4 (gate 400) | bwa-mem4 (gate 1000) | bwa-mem3 0.16 |
+|---|---|---|---|
+| jobs proven failing / hull / full window | 0.95M / 0.31M / 6.08M | 1.06M / 5.04M / 1.24M | 1.06M / 5.06M / 1.29M |
+| K-mer filter | 8.5 s | 41.1 s | 8.7 s |
+| DP | 108 s | 98 s | 43 s (kswv 15.3 + bands 26.0 + pass 1 2.0) |
+
+At gate 1000 our filter decides exactly what the fork's does, so the K-mer bound is the same; the
+gaps are (a) our scalar filter, 4.7x the fork's NEON one, which is what our gate hides, and (b) the
+cells: the fork replaces 850G hull cells with 389G band cells. Per-cell kernel speed is close (ours
+13 Gcell/s/thread, the fork's ~15).
+
+### The round-1 rule is exact under our score2 too
+
+Our score2 is ksw_u8's (the M4 oracle has no AVX-512), not kswv's, so the fork's proof does not
+carry over as is. It holds anyway: band row maxima never exceed the true ones and equal them on
+every row whose true max is `>= T1`. The tracker moves an entry to row `r` only when `r` directly
+follows the stored row and is strictly higher, so whether a row `>= T1` is stored depends on
+neighbours that are either `>= T1` (exact on both sides) or lower (on both sides). The entries
+`>= T1` are therefore identical, and with `S >= T1` and banded `score2 >= T1` so are `score2` and
+`te2`. Checked on 62,433 real jobs (`band_proto`, stride 10): round 1 final for 34,580 of the
+36,135 with `T1 > minsc`, 0 wrong, round 2 0 mismatches, band cells 66.6% of the minsc hull.
+
+### Order of work, revised
+
+1. NEON K-mer filter at the fork's cost (~9 s), so the gate can go to 1000: the bands need the
+   filter's components on every job.
+2. Banded NEON kernel (phase 2 above), round 1 / round 2 wiring (phase 3).
+3. AVX2 (phase 4).
+
 Phases, each gated on byte-identity before the next:
 
 1. Scalar reference: components at a threshold, banded zero-state DP returning per-row maxima and
