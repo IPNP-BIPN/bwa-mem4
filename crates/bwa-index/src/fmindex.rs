@@ -1635,9 +1635,10 @@ impl FmIndex {
     /// appended on the right, `n` unchanged. The same result as swapping `k`/`l`, calling
     /// [`backward_ext`](Self::backward_ext) with the complement `3 - aj` and swapping back.
     ///
-    /// On AArch64 for a genome that is not `wide`, only what the swapped-back result reads is
+    /// For a genome that is not `wide`, only what the swapped-back result reads is
     /// computed: base `c`'s count and size, and the summed sizes of the bases above it (the `l`
-    /// recurrence), as three vector reductions of the two blocks' counts. `backward_ext` builds all
+    /// recurrence), on AArch64 as three vector reductions of the two blocks' counts, elsewhere as
+    /// scalar popcounts. `backward_ext` builds all
     /// four `k`, `s` and `l` and picks one lane through the stack, three times the instructions on
     /// round 3's walks, which are compute-bound.
     #[inline(always)]
@@ -1669,6 +1670,38 @@ impl FmIndex {
                 k: smem.k + so + sgt as i64,
                 l: self.count[c] + i64::from(kc),
                 s: i64::from(sc),
+                ..smem
+            };
+        }
+        // Elsewhere the same three quantities from scalar popcounts: base `c`'s count at each end,
+        // and the rows above `c` (planes `hi | lo`, `hi`, `hi & lo` for `c` = A, C, G).
+        #[cfg(not(target_arch = "aarch64"))]
+        if !self.wide {
+            let (hx, lx) = (
+                ((c as u64 >> 1) & 1).wrapping_sub(1),
+                (c as u64 & 1).wrapping_sub(1),
+            );
+            let cp = &self.cp_occ[..];
+            let gt = |row: i64| {
+                let b = &cp[(row >> CP_SHIFT) as usize];
+                let plane = match c {
+                    0 => b.hi | b.lo,
+                    1 => b.hi,
+                    2 => b.hi & b.lo,
+                    _ => 0,
+                };
+                // In i64: three counts of a human genome overflow u32.
+                let before: i64 = b.cp_count[c + 1..].iter().map(|&x| i64::from(x)).sum();
+                before + i64::from((plane & rows_before(row & CP_MASK)).count_ones())
+            };
+            let (sp, ep) = (smem.l, smem.l + smem.s);
+            let kc = self.occ_hoisted(cp, sp, c, hx, lx);
+            let sc = self.occ_hoisted(cp, ep, c, hx, lx) - kc;
+            let so = i64::from((sp <= self.sentinel_index) & (ep > self.sentinel_index));
+            return Smem {
+                k: smem.k + so + gt(ep) - gt(sp),
+                l: self.count[c] + kc,
+                s: sc,
                 ..smem
             };
         }
