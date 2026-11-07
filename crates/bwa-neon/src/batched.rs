@@ -2011,6 +2011,9 @@ macro_rules! define_sw_kernel {
                 // Job index of the slot's lane, `u32::MAX` once it moved away or for padding.
                 jid: [u32; LANES],
                 run: bool,
+                // `rowvec`: the lanes live into the next row (not done, row `i + 1` exists), from
+                // the row's prologue and epilogue, so the compaction need not scan the lanes.
+                nxt: u64,
             }
             let mut vs: Vec<Vs> = (0..kmax)
                 .map(|_| Vs {
@@ -2035,6 +2038,7 @@ macro_rules! define_sw_kernel {
                     done: [true; LANES],
                     jid: [u32::MAX; LANES],
                     run: false,
+                    nxt: 0,
                 })
                 .collect();
             // Substitution-score pre-pass buffer (bwa-mem2's `sbt_buf`, `bandedSWA.cpp:1183-1214`):
@@ -2170,7 +2174,7 @@ macro_rules! define_sw_kernel {
                     #[allow(unused_variables)]
                     let Vs {
                         eh_h, eh_e, qcode, tcode, qlen, tlen, qlen32, tlen32, h0, w, beg, end, max,
-                        max_i, max_j, max_ie, gscore, max_off, done, run, ..
+                        max_i, max_j, max_ie, gscore, max_off, done, run, nxt, ..
                     } = &mut vs[v];
                     // Plain slices, so the column loop keeps their pointers in registers: through the
                     // `Vec` headers, which sit in the heap like the cells, every store would force a reload.
@@ -2194,10 +2198,12 @@ macro_rules! define_sw_kernel {
                         let (gbeg, gend, fast_lo_raw, fast_hi_raw);
                         #[allow(unused_assignments)]
                         let mut active_bits = 0u64;
+                        #[allow(unused_assignments)]
+                        let mut next_bits = 0u64;
                         if $rowvec {
                             // SAFETY: `rowvec` is set only on the NEON u8 kernel, where LANES == 16,
                             // `$elem` and `$umask` are u8, `band_width` holds and `band_bias` is 0.
-                            (gbeg, gend, fast_lo_raw, fast_hi_raw, active_bits) = unsafe {
+                            (gbeg, gend, fast_lo_raw, fast_hi_raw, active_bits, next_bits) = unsafe {
                                 super::$rowmod::prologue::<LANES>(
                                     i,
                                     done.as_ptr(),
@@ -2557,6 +2563,7 @@ macro_rules! define_sw_kernel {
                             // runs as deep as the deepest lane and measured 1.5x slower. Unchecked
                             // indexing: every column touched is in `[beg, end] <= qlen < stride`,
                             // the buffers' column count, and `last_live >= beg >= 0` is tested first.
+                            *nxt = live & next_bits;
                             let (hp, ep) = (eh_h.as_mut_ptr(), eh_e.as_mut_ptr());
                             let mut am = active_bits;
                             while am != 0 {
@@ -2683,7 +2690,9 @@ macro_rules! define_sw_kernel {
                     let mut runv = [false; super::COMPACT_MAX];
                     for v in 0..nvec {
                         runv[v] = vs[v].run;
-                        if runv[v] {
+                        if runv[v] && $rowvec {
+                            live[v] = vs[v].nxt;
+                        } else if runv[v] {
                             let st = &vs[v];
                             for l in 0..LANES {
                                 if !st.done[l] && (i + 1) < st.tlen32[l] {
@@ -2856,8 +2865,10 @@ mod x86_row {
         end_lane: *mut u8,
         active_lane: *mut u8,
         bias: u8,
-    ) -> (i32, i32, i32, i32, u64) {
+    ) -> (i32, i32, i32, i32, u64, u64) {
         let iv = _mm256_set1_epi32(i);
+        let i1 = _mm256_set1_epi32(i + 1);
+        let mut nbits = 0u64;
         let zero = _mm256_setzero_si256();
         let (one, ff) = (_mm256_set1_epi32(1), _mm256_set1_epi32(0xff));
         let biasv = _mm256_set1_epi32(i32::from(bias));
@@ -2866,10 +2877,12 @@ mod x86_row {
         let (mut gb, mut ge, mut fl, mut fh) = (vmax, zero, vmin, vmax);
         let mut abits = 0u64;
         for o in (0..N).step_by(8) {
+            let tl = ld(tlen.add(o));
             let a = _mm256_andnot_si256(
                 _mm256_cmpgt_epi32(widen8(done.add(o) as *const u8), zero),
-                _mm256_cmpgt_epi32(ld(tlen.add(o)), iv),
+                _mm256_cmpgt_epi32(tl, iv),
             );
+            nbits |= bits8(_mm256_and_si256(a, _mm256_cmpgt_epi32(tl, i1))) << o;
             let wv = ld(w.add(o));
             let (b0, e0) = (ld(beg.add(o)), ld(end.add(o)));
             let b = _mm256_max_epi32(b0, _mm256_sub_epi32(iv, wv));
@@ -2894,7 +2907,7 @@ mod x86_row {
             narrow8(active.add(o) as *mut u8, _mm256_and_si256(a, one));
             abits |= bits8(a) << o;
         }
-        (hmin(gb), hmax(ge), hmax(fl), hmin(fh), abits)
+        (hmin(gb), hmax(ge), hmax(fl), hmin(fh), abits, nbits)
     }
 
     /// As `neon_row::epilogue`, over `N` lanes; returns one bit per lane still live.
@@ -3074,8 +3087,10 @@ mod neon_row {
         end_lane: *mut u8,
         active_lane: *mut u8,
         _bias: u8,
-    ) -> (i32, i32, i32, i32, u64) {
+    ) -> (i32, i32, i32, i32, u64, u64) {
         debug_assert!(N == 16 && _bias == 0);
+        let i1 = vdupq_n_s32(i + 1);
+        let mut nxt = [vdupq_n_u32(0); 4];
         let iv = vdupq_n_s32(i);
         let not_done = widen_mask(vceqzq_u8(vld1q_u8(done as *const u8)));
         let (mut gb, mut ge, mut fl, mut fh) = (i32::MAX, 0i32, i32::MIN, i32::MAX);
@@ -3113,6 +3128,7 @@ mod neon_row {
                 vreinterpretq_s32_u32(a),
             );
             act[q] = a;
+            nxt[q] = vandq_u32(a, vcltq_s32(i1, vld1q_s32(tlen.add(o))));
         }
         vst1q_u8(h1, narrow_u8(hq));
         vst1q_u8(beg_lane, narrow_u8(bq));
@@ -3125,7 +3141,13 @@ mod neon_row {
         ]);
         vst1q_u8(active_lane, a8);
         vst1q_u8(active as *mut u8, vandq_u8(a8, vdupq_n_u8(1)));
-        (gb, ge, fl, fh, u64::from(bits(a8)))
+        let n8 = narrow_u8([
+            vreinterpretq_s32_u32(nxt[0]),
+            vreinterpretq_s32_u32(nxt[1]),
+            vreinterpretq_s32_u32(nxt[2]),
+            vreinterpretq_s32_u32(nxt[3]),
+        ]);
+        (gb, ge, fl, fh, u64::from(bits(a8)), u64::from(bits(n8)))
     }
 
     /// Fill the chunk's SoA buffers (`cols` query positions, `rows` target positions, both
