@@ -59,6 +59,7 @@ jobs:
       - name: What machine is this
         run: |
           awk -F': ' '/^model name/{print "cpu: "$2; exit}' /proc/cpuinfo
+          lscpu | grep -E '^(Model name|Vendor ID)' || true
           echo "cores: $(nproc)"
           grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
 
@@ -97,7 +98,9 @@ jobs:
           # `-C force-frame-pointers=yes` so `perf` can walk the stack without DWARF unwinding, and
           # debug symbols so the report carries names rather than addresses. Neither changes which
           # code runs; both change what the profile can say about it.
-          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C debuginfo=1" \
+          # The x86 artefact tier; aarch64 (runner=ubuntu-24.04-arm) builds at its baseline, NEON.
+          tier=""; [ "$(uname -m)" = x86_64 ] && tier="-C target-cpu=x86-64-v3"
+          RUSTFLAGS="$tier -C force-frame-pointers=yes -C debuginfo=1" \
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf
           cp target-perf/release/bwa-mem4 ./mem4-v3
 
@@ -137,8 +140,9 @@ jobs:
             echo "::endgroup::"
             echo
             echo "===== $arm: top symbols by self time ====="
-            "$PERF" report -i "$arm.data" --stdio --no-children --percent-limit 0.4 2>/dev/null \
-              | grep -E '^\s+[0-9]+\.[0-9]+%' | head -30 || echo "(perf report produced nothing)"
+            # Sample counts too: percentages alone cannot compare the two binaries' CPU time.
+            "$PERF" report -i "$arm.data" --stdio --no-children --show-nr-samples --percent-limit 0.4 2>/dev/null \
+              | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -32 || echo "(perf report produced nothing)"
           done
 
       - name: Keep the recordings
