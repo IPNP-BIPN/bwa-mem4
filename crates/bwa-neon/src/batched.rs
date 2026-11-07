@@ -1524,6 +1524,82 @@ fn default_result() -> ExtendResult {
     }
 }
 
+/// Most vectors in one lane-compaction superblock (see `compact_plan`).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const COMPACT_MAX: usize = 16;
+
+/// Vectors per lane-compaction superblock for a kernel of `lanes` lanes: fg-labs/bwa-mem3's per-tier
+/// defaults (8 for 16 lanes, 6 for 32, 4 for 64). `BWA4_COMPACT_K` overrides it, 1 turns it off.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn compact_groups(lanes: usize) -> usize {
+    use std::sync::OnceLock;
+    static K: OnceLock<Option<usize>> = OnceLock::new();
+    let over = *K.get_or_init(|| {
+        std::env::var("BWA4_COMPACT_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|k: usize| k.clamp(1, COMPACT_MAX))
+    });
+    over.unwrap_or(match lanes {
+        64 => 4,
+        32 => 6,
+        _ => 8,
+    })
+}
+
+/// The compaction plan of fg-labs/bwa-mem3's `bsw_compact_plan`. `live[v]` has bit `l` set iff lane
+/// `l` of vector `v` is live, `run[v]` iff the vector still runs. Vectors with no live lane stop
+/// first; then, while more vectors run than `ceil(live lanes / lanes)`, the running vector with the
+/// fewest live lanes (lowest index on ties) is emptied, each live lane in order going to the first
+/// dead slot of the other running vectors (lowest vector, then lowest lane), and stops. The moves are
+/// appended to `moves` as `(source vector, lane, destination vector, lane)`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn compact_plan(
+    live: &mut [u64],
+    run: &mut [bool],
+    lanes: usize,
+    moves: &mut Vec<(u8, u8, u8, u8)>,
+) {
+    let full = if lanes >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << lanes) - 1
+    };
+    let (mut total, mut nact) = (0usize, 0usize);
+    for v in 0..live.len() {
+        if run[v] && live[v] == 0 {
+            run[v] = false;
+        }
+        if run[v] {
+            nact += 1;
+            total += live[v].count_ones() as usize;
+        }
+    }
+    while nact > total.div_ceil(lanes) {
+        let mut d = usize::MAX;
+        for v in 0..live.len() {
+            if run[v] && (d == usize::MAX || live[v].count_ones() < live[d].count_ones()) {
+                d = v;
+            }
+        }
+        let mut src = live[d];
+        while src != 0 {
+            let s = src.trailing_zeros() as usize;
+            src &= src - 1;
+            // `nact > ceil(total / lanes)` leaves the other running vectors at least as many holes.
+            let rv = (0..live.len())
+                .find(|&v| run[v] && v != d && live[v] != full)
+                .expect("a hole");
+            let rl = (!live[rv] & full).trailing_zeros() as usize;
+            moves.push((d as u8, s as u8, rv as u8, rl as u8));
+            live[rv] |= 1 << rl;
+        }
+        live[d] = 0;
+        run[d] = false;
+        nact -= 1;
+    }
+}
+
 /// Whether the extension kernels give the fully-in-band columns their own unmasked regime.
 /// `BWA4_EXTEND_BANDFAST=0` sends every column through the masked body. Read once, cached.
 fn band_fast_enabled() -> bool {
@@ -1885,146 +1961,179 @@ macro_rules! define_sw_kernel {
                 "biased substitution scores must be non-negative"
             );
 
-            // Per-chunk DP scratch, allocated once and reused across chunks (clear+resize keeps the
-            // capacity, so it grows to the largest chunk's size then stops reallocating). Byte-safe:
-            // resize-from-empty zero-fills, identical to the old per-chunk `vec![0; ..]`.
-            let mut eh_h: Vec<$elem> = Vec::new();
-            let mut eh_e: Vec<$elem> = Vec::new();
-            let mut qcode: Vec<$elem> = Vec::new();
-            let mut tcode: Vec<$elem> = Vec::new();
-            // Substitution-score pre-pass buffers (bwa-mem2's `sbt_buf`, `bandedSWA.cpp:1183-1214`):
+            // Superblocks of `kmax` vectors walk the rows in lockstep, so every lane of a superblock
+            // is at the same row `i`. When lanes finish (z-drop, end of target), the live lanes of
+            // the emptiest vector move into dead slots of the others and it stops running: the same-row
+            // lane compaction of fg-labs/bwa-mem3 (`bsw_compact.h`). A moved lane carries its whole
+            // slot (every SoA column, its remaining target rows, its trackers), so it computes exactly
+            // what it would have in place: a lane never reads another lane's slot, and the shared
+            // column range only has to cover its band, which the union over the vector's lanes does.
+            // Measured on GIAB lanes (BWA4_LANE_TRACE): 16 lanes compute 3.0x the useful cells,
+            // 2.05x with 8-vector superblocks.
+            let kmax = super::compact_groups(LANES);
+            struct Vs {
+                eh_h: Vec<$elem>,
+                eh_e: Vec<$elem>,
+                qcode: Vec<$elem>,
+                tcode: Vec<$elem>,
+                qlen: [usize; LANES],
+                tlen: [usize; LANES],
+                qlen32: [i32; LANES],
+                tlen32: [i32; LANES],
+                h0: [i32; LANES],
+                w: [i32; LANES],
+                beg: [i32; LANES],
+                end: [i32; LANES],
+                max: [i32; LANES],
+                max_i: [i32; LANES],
+                max_j: [i32; LANES],
+                max_ie: [i32; LANES],
+                gscore: [i32; LANES],
+                max_off: [i32; LANES],
+                done: [bool; LANES],
+                // Job index of the slot's lane, `u32::MAX` once it moved away or for padding.
+                jid: [u32; LANES],
+                run: bool,
+            }
+            let mut vs: Vec<Vs> = (0..kmax)
+                .map(|_| Vs {
+                    eh_h: Vec::new(),
+                    eh_e: Vec::new(),
+                    qcode: Vec::new(),
+                    tcode: Vec::new(),
+                    qlen: [0; LANES],
+                    tlen: [0; LANES],
+                    qlen32: [0; LANES],
+                    tlen32: [0; LANES],
+                    h0: [0; LANES],
+                    w: [0; LANES],
+                    beg: [0; LANES],
+                    end: [0; LANES],
+                    max: [0; LANES],
+                    max_i: [-1; LANES],
+                    max_j: [-1; LANES],
+                    max_ie: [-1; LANES],
+                    gscore: [-1; LANES],
+                    max_off: [0; LANES],
+                    done: [true; LANES],
+                    jid: [u32::MAX; LANES],
+                    run: false,
+                })
+                .collect();
+            // Substitution-score pre-pass buffer (bwa-mem2's `sbt_buf`, `bandedSWA.cpp:1183-1214`):
             // the DNA match/mismatch/N score of each band column depends only on this row's target
             // base and the column's query base, never on the DP recurrence. Computing it in a
             // separate per-row loop and loading it in the DP body lifts ~7 vector ALU ops off the
-            // serial H/E/F critical path, where on x86 (fewer vector-ALU ports than lanes) they
-            // otherwise contend with the recurrence. Byte-identical: same values, only reordered.
+            // serial H/E/F critical path. Refilled per vector and row, so one serves them all.
             let mut sbt_buf: Vec<$elem> = Vec::new();
+            let mut moves: Vec<(u8, u8, u8, u8)> = Vec::new();
 
-            // =======================================================================
-            // One chunk = one register's worth of independent alignments.
-            // =======================================================================
-            for chunk_start in (0..jobs.len()).step_by(LANES) {
-                // Jobs in this chunk: LANES except for a partial final chunk. Lanes
-                // `nlane..LANES` are never marked active, so their garbage never reaches `out`.
-                let nlane = (jobs.len() - chunk_start).min(LANES);
-
-                // --- chunk setup: per-lane lengths, h0 and band --------------------
-                // Indexed by lane `l`: sequence lengths in bases, the seed's starting score, and
-                // this lane's clamped band half-width in cells.
-                let mut qlen = [0usize; LANES];
-                let mut tlen = [0usize; LANES];
-                let mut h0 = [0i32; LANES];
-                let mut w = [0i32; LANES];
-                for l in 0..nlane {
-                    let job = &jobs[chunk_start + l];
-                    qlen[l] = job.query.len();
-                    tlen[l] = job.target.len();
-                    h0[l] = job.h0;
-                    w[l] = clamp_band(w0, qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del);
-                    // `BWA4_TIGHT_BAND`: clamp this lane's band by the ungapped-score bound. The
-                    // row loop below derives `beg[l]`/`end[l]` from `w[l]` and `gbeg`/`gend` as
-                    // their union, so a tighter lane narrows the walked columns wherever the whole
-                    // chunk is tight, which the ceiling probe says is nearly everywhere. The walk
-                    // is O(min_len) against the O(len^2) it removes.
-                    if tight_band_enabled() {
-                        let bound = tight_band_bound(
-                            job.query,
-                            job.target,
-                            job.h0,
-                            i32::from(mat[0]),
-                            i32::from(mat[1]),
-                            (o_del.min(o_ins), e_del.min(e_ins)),
-                            end_bonus,
-                        );
-                        w[l] = w[l].min(bound);
-                    }
-                }
-                // Longest query and target in this chunk, in bases: `max_q` sizes the shared row,
-                // `max_t` is the number of lockstep row iterations every lane pays for.
-                let max_q = qlen[..nlane].iter().copied().max().unwrap_or(0);
-                let max_t = tlen[..nlane].iter().copied().max().unwrap_or(0);
-                // The lengths as i32, for the vector row prologue and epilogue (`rowvec`).
-                let qlen32: [i32; LANES] = std::array::from_fn(|l| qlen[l] as i32);
-                let tlen32: [i32; LANES] = std::array::from_fn(|l| tlen[l] as i32);
-
+            for sb_start in (0..jobs.len()).step_by(LANES * kmax) {
+                let sb_end = (sb_start + LANES * kmax).min(jobs.len());
+                let nvec = (sb_end - sb_start).div_ceil(LANES);
+                // Longest query and target in the superblock: every vector is sized alike so a
+                // moved lane's slot is a plain copy. `max_t` bounds the lockstep rows.
+                let max_q = jobs[sb_start..sb_end].iter().map(|j| j.query.len()).max().unwrap_or(0);
+                let max_t = jobs[sb_start..sb_end].iter().map(|j| j.target.len()).max().unwrap_or(0);
                 // Columns per SoA buffer: `max_q + 1` because the row epilogue writes `eh_h[end]`
-                // with `end == qlen` possible. Buffers are therefore `stride * LANES` elements,
-                // element `j * LANES + l` being column `j` of lane `l`.
+                // with `end == qlen` possible. Element `j * LANES + l` is column `j` of lane `l`.
                 let stride = max_q + 1;
-                eh_h.clear();
-                eh_h.resize(stride * LANES, 0 as $elem);
-                eh_e.clear();
-                eh_e.resize(stride * LANES, 0 as $elem);
-
-                // Transpose the per-job sequences into SoA: `qcode[j * LANES + l]` is job `l`'s base
-                // at query column `j`. One vector load then yields "column j of all lanes", which is
-                // the whole reason for the layout (bwa-mem2's `seq1SoA`/`seq2SoA`, `bandedSWA.cpp:449`).
-                // Padding is code 0 (an ordinary base), not a sentinel: padded lanes are masked out
-                // of every write by `band`, so whatever score they compute is discarded. The point of
-                // padding is only that the load stays in bounds and branch-free.
-                // The NEON u8 kernel fills them through a lane-major staging area and 16x16
-                // transposes (whole 16-position blocks, hence the rounded sizes); the others per
-                // base.
+                // The NEON u8 kernel fills the codes through a lane-major staging area and 16x16
+                // transposes (whole 16-position blocks, hence the rounded sizes); the others per base.
+                // Padding is code 0, masked out of every write by `band`.
                 let soa_cols = if $rowvec { stride.next_multiple_of(16) } else { stride };
                 let soa_rows = if $rowvec { (max_t + 1).next_multiple_of(16) } else { max_t + 1 };
-                qcode.clear();
-                qcode.resize(soa_cols * LANES, 0 as $elem);
-                tcode.clear();
-                tcode.resize(soa_rows * LANES, 0 as $elem);
-                // Same column layout as `qcode`; refilled per row by the substitution pre-pass.
                 sbt_buf.clear();
                 sbt_buf.resize(stride * LANES, 0 as $elem);
-                if $rowvec {
-                    // SAFETY: `rowvec` is the NEON u8 kernel: LANES == 16, `$elem` is u8.
-                    unsafe {
-                        super::neon_row::fill_soa16(
-                            &jobs[chunk_start..chunk_start + nlane],
-                            soa_cols,
-                            soa_rows,
-                            qcode.as_mut_ptr() as *mut u8,
-                            tcode.as_mut_ptr() as *mut u8,
-                        );
-                    }
-                } else {
+                for (v, st) in vs[..nvec].iter_mut().enumerate() {
+                    let chunk_start = sb_start + v * LANES;
+                    let nlane = (sb_end - chunk_start).min(LANES);
+                    st.qlen = [0; LANES];
+                    st.tlen = [0; LANES];
+                    st.h0 = [0; LANES];
+                    st.w = [0; LANES];
+                    st.beg = [0; LANES];
+                    st.end = [0; LANES];
+                    st.max = [0; LANES];
+                    st.max_i = [-1; LANES];
+                    st.max_j = [-1; LANES];
+                    st.max_ie = [-1; LANES];
+                    st.gscore = [-1; LANES];
+                    st.max_off = [0; LANES];
+                    st.done = [true; LANES];
+                    st.jid = [u32::MAX; LANES];
+                    st.run = true;
                     for l in 0..nlane {
-                        for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
-                            qcode[ju * LANES + l] = c as $elem;
+                        let job = &jobs[chunk_start + l];
+                        st.jid[l] = (chunk_start + l) as u32;
+                        st.qlen[l] = job.query.len();
+                        st.tlen[l] = job.target.len();
+                        st.h0[l] = job.h0;
+                        st.w[l] = clamp_band(w0, st.qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del);
+                        // `BWA4_TIGHT_BAND`: clamp this lane's band by the ungapped-score bound.
+                        if tight_band_enabled() {
+                            let bound = tight_band_bound(
+                                job.query,
+                                job.target,
+                                job.h0,
+                                i32::from(mat[0]),
+                                i32::from(mat[1]),
+                                (o_del.min(o_ins), e_del.min(e_ins)),
+                                end_bonus,
+                            );
+                            st.w[l] = st.w[l].min(bound);
                         }
-                        for (iu, &c) in jobs[chunk_start + l].target.iter().enumerate() {
-                            tcode[iu * LANES + l] = c as $elem;
+                    }
+                    st.qlen32 = std::array::from_fn(|l| st.qlen[l] as i32);
+                    st.tlen32 = std::array::from_fn(|l| st.tlen[l] as i32);
+                    st.eh_h.clear();
+                    st.eh_h.resize(stride * LANES, 0 as $elem);
+                    st.eh_e.clear();
+                    st.eh_e.resize(stride * LANES, 0 as $elem);
+                    st.qcode.clear();
+                    st.qcode.resize(soa_cols * LANES, 0 as $elem);
+                    st.tcode.clear();
+                    st.tcode.resize(soa_rows * LANES, 0 as $elem);
+                    if $rowvec {
+                        // SAFETY: `rowvec` is the NEON u8 kernel: LANES == 16, `$elem` is u8.
+                        unsafe {
+                            super::neon_row::fill_soa16(
+                                &jobs[chunk_start..chunk_start + nlane],
+                                soa_cols,
+                                soa_rows,
+                                st.qcode.as_mut_ptr() as *mut u8,
+                                st.tcode.as_mut_ptr() as *mut u8,
+                            );
+                        }
+                    } else {
+                        for l in 0..nlane {
+                            for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
+                                st.qcode[ju * LANES + l] = c as $elem;
+                            }
+                            for (iu, &c) in jobs[chunk_start + l].target.iter().enumerate() {
+                                st.tcode[iu * LANES + l] = c as $elem;
+                            }
                         }
                     }
-                }
-
-                // --- per-lane band and result trackers (same meaning as the scalar path) ---
-                let mut beg = [0i32; LANES];
-                let mut end = [0i32; LANES];
-                let mut max = [0i32; LANES];
-                let mut max_i = [-1i32; LANES];
-                let mut max_j = [-1i32; LANES];
-                let mut max_ie = [-1i32; LANES];
-                let mut gscore = [-1i32; LANES];
-                let mut max_off = [0i32; LANES];
-                let mut done = [true; LANES];
-
-                // --- row -1: the leading-insertion run that seeds the first real row ---
-                for l in 0..nlane {
-                    eh_h[l] = h0[l] as $elem; // column 0
-                    if qlen[l] >= 1 {
-                        eh_h[LANES + l] = if h0[l] > oe_ins {
-                            (h0[l] - oe_ins) as $elem
-                        } else {
-                            0
-                        };
+                    // --- row -1: the leading-insertion run that seeds the first real row ---
+                    for l in 0..nlane {
+                        st.eh_h[l] = st.h0[l] as $elem; // column 0
+                        if st.qlen[l] >= 1 {
+                            st.eh_h[LANES + l] = if st.h0[l] > oe_ins {
+                                (st.h0[l] - oe_ins) as $elem
+                            } else {
+                                0
+                            };
+                        }
+                        let mut j = 2usize;
+                        while j <= st.qlen[l] && i32::from(st.eh_h[(j - 1) * LANES + l]) > e_ins {
+                            st.eh_h[j * LANES + l] = st.eh_h[(j - 1) * LANES + l] - e_ins as $elem;
+                            j += 1;
+                        }
+                        st.max[l] = st.h0[l];
+                        st.end[l] = st.qlen[l] as i32;
+                        st.done[l] = false;
                     }
-                    let mut j = 2usize;
-                    while j <= qlen[l] && i32::from(eh_h[(j - 1) * LANES + l]) > e_ins {
-                        eh_h[j * LANES + l] = eh_h[(j - 1) * LANES + l] - e_ins as $elem;
-                        j += 1;
-                    }
-                    max[l] = h0[l];
-                    end[l] = qlen[l] as i32;
-                    done[l] = false;
                 }
 
                 // =================================================================
@@ -2037,393 +2146,475 @@ macro_rules! define_sw_kernel {
                 // the i32 trackers summarize rows `0..i`; `beg`/`end` are the previous row's
                 // tightened range, not yet intersected with row `i`'s band.
                 for i in 0..max_t as i32 {
-                    // --- row prologue (per lane): band intersection, left edge. `h1[l]` = H(i,
-                    //     beg[l]-1), the value carried into the row's first column; `active[l]`:
-                    //     this lane has a row `i` and has not terminated; `gbeg`/`gend`: the union
-                    //     of the active lanes' bands, the half-open column range the shared vector
-                    //     loop must cover; `fast_lo`/`fast_hi`: their intersection. The NEON u8
-                    //     kernel does this in i32 vector lanes (`rowvec`), the others per lane. ---
-                    let mut h1 = [0 as $elem; LANES];
-                    let mut active = [false; LANES];
-                    let mut beg_lane = [0 as $elem; LANES];
-                    let mut end_lane = [0 as $elem; LANES];
-                    let mut active_lane = [0 as $umask; LANES];
-                    let (gbeg, gend, fast_lo_raw, fast_hi_raw);
-                    #[allow(unused_assignments)]
-                    let mut active_bits = 0u32;
-                    if $rowvec {
-                        // SAFETY: `rowvec` is set only on the NEON u8 kernel, where LANES == 16,
-                        // `$elem` and `$umask` are u8, `band_width` holds and `band_bias` is 0.
-                        (gbeg, gend, fast_lo_raw, fast_hi_raw, active_bits) = unsafe {
-                            super::neon_row::prologue16(
-                                i,
-                                done.as_ptr(),
-                                tlen32.as_ptr(),
-                                qlen32.as_ptr(),
-                                w.as_ptr(),
-                                h0.as_ptr(),
-                                beg.as_mut_ptr(),
-                                end.as_mut_ptr(),
-                                o_del,
-                                e_del,
-                                h1.as_mut_ptr() as *mut u8,
-                                active.as_mut_ptr(),
-                                beg_lane.as_mut_ptr() as *mut u8,
-                                end_lane.as_mut_ptr() as *mut u8,
-                                active_lane.as_mut_ptr() as *mut u8,
-                            )
-                        };
-                    } else {
-                        let (mut gb, mut ge) = (i32::MAX, 0i32);
-                        let (mut fl, mut fh) = (i32::MIN, i32::MAX);
-                        for l in 0..nlane {
-                            if done[l] || i >= tlen[l] as i32 {
-                                continue;
-                            }
-                            active[l] = true;
-                            if beg[l] < i - w[l] {
-                                beg[l] = i - w[l];
-                            }
-                            if end[l] > i + w[l] + 1 {
-                                end[l] = i + w[l] + 1;
-                            }
-                            if end[l] > qlen[l] as i32 {
-                                end[l] = qlen[l] as i32;
-                            }
-                            h1[l] = if beg[l] == 0 {
-                                (h0[l] - (o_del + e_del * (i + 1))).max(0) as $elem
-                            } else {
-                                0
+                    for v in 0..nvec {
+                    if !vs[v].run {
+                        continue;
+                    }
+                    #[allow(unused_variables)]
+                    let Vs {
+                        eh_h, eh_e, qcode, tcode, qlen, tlen, qlen32, tlen32, h0, w, beg, end, max,
+                        max_i, max_j, max_ie, gscore, max_off, done, run, ..
+                    } = &mut vs[v];
+                    // Plain slices, so the column loop keeps their pointers in registers: through the
+                    // `Vec` headers, which sit in the heap like the cells, every store would force a reload.
+                    let (eh_h, eh_e) = (&mut eh_h[..], &mut eh_e[..]);
+                    let (qcode, tcode) = (&qcode[..], &tcode[..]);
+                    // Local copies of the per-lane inputs, for the same reason; they never change mid-row.
+                    let (qlen, tlen, qlen32, tlen32, h0, w) = (*qlen, *tlen, *qlen32, *tlen32, *h0, *w);
+                    // Padding lanes are `done` from the start, so the per-lane loops cover them all.
+                    let nlane = LANES;
+                        // --- row prologue (per lane): band intersection, left edge. `h1[l]` = H(i,
+                        //     beg[l]-1), the value carried into the row's first column; `active[l]`:
+                        //     this lane has a row `i` and has not terminated; `gbeg`/`gend`: the union
+                        //     of the active lanes' bands, the half-open column range the shared vector
+                        //     loop must cover; `fast_lo`/`fast_hi`: their intersection. The NEON u8
+                        //     kernel does this in i32 vector lanes (`rowvec`), the others per lane. ---
+                        let mut h1 = [0 as $elem; LANES];
+                        let mut active = [false; LANES];
+                        let mut beg_lane = [0 as $elem; LANES];
+                        let mut end_lane = [0 as $elem; LANES];
+                        let mut active_lane = [0 as $umask; LANES];
+                        let (gbeg, gend, fast_lo_raw, fast_hi_raw);
+                        #[allow(unused_assignments)]
+                        let mut active_bits = 0u32;
+                        if $rowvec {
+                            // SAFETY: `rowvec` is set only on the NEON u8 kernel, where LANES == 16,
+                            // `$elem` and `$umask` are u8, `band_width` holds and `band_bias` is 0.
+                            (gbeg, gend, fast_lo_raw, fast_hi_raw, active_bits) = unsafe {
+                                super::neon_row::prologue16(
+                                    i,
+                                    done.as_ptr(),
+                                    tlen32.as_ptr(),
+                                    qlen32.as_ptr(),
+                                    w.as_ptr(),
+                                    h0.as_ptr(),
+                                    beg.as_mut_ptr(),
+                                    end.as_mut_ptr(),
+                                    o_del,
+                                    e_del,
+                                    h1.as_mut_ptr() as *mut u8,
+                                    active.as_mut_ptr(),
+                                    beg_lane.as_mut_ptr() as *mut u8,
+                                    end_lane.as_mut_ptr() as *mut u8,
+                                    active_lane.as_mut_ptr() as *mut u8,
+                                )
                             };
-                            gb = gb.min(beg[l]);
-                            ge = ge.max(end[l]);
-                            fl = fl.max(beg[l]);
-                            fh = fh.min(end[l]);
-                        }
-                        for l in 0..nlane {
-                            if active[l] {
-                                // XOR-ed into signed space when `$bbias` is non-zero (issue #48C).
-                                beg_lane[l] = (beg[l] as $elem) ^ ($bbias as $elem);
-                                // Under `$bwidth` this lane holds the band's WIDTH instead of its
-                                // end, which an inactive lane leaves at 0 and so never matches.
-                                end_lane[l] = if $bwidth {
-                                    (end[l] - beg[l]).max(0) as $elem
+                        } else {
+                            let (mut gb, mut ge) = (i32::MAX, 0i32);
+                            let (mut fl, mut fh) = (i32::MIN, i32::MAX);
+                            for l in 0..nlane {
+                                if done[l] || i >= tlen[l] as i32 {
+                                    continue;
+                                }
+                                active[l] = true;
+                                if beg[l] < i - w[l] {
+                                    beg[l] = i - w[l];
+                                }
+                                if end[l] > i + w[l] + 1 {
+                                    end[l] = i + w[l] + 1;
+                                }
+                                if end[l] > qlen[l] as i32 {
+                                    end[l] = qlen[l] as i32;
+                                }
+                                h1[l] = if beg[l] == 0 {
+                                    (h0[l] - (o_del + e_del * (i + 1))).max(0) as $elem
                                 } else {
-                                    (end[l] as $elem) ^ ($bbias as $elem)
+                                    0
                                 };
-                                active_lane[l] = <$umask>::MAX;
+                                gb = gb.min(beg[l]);
+                                ge = ge.max(end[l]);
+                                fl = fl.max(beg[l]);
+                                fh = fh.min(end[l]);
+                            }
+                            for l in 0..nlane {
+                                if active[l] {
+                                    // XOR-ed into signed space when `$bbias` is non-zero (issue #48C).
+                                    beg_lane[l] = (beg[l] as $elem) ^ ($bbias as $elem);
+                                    // Under `$bwidth` this lane holds the band's WIDTH instead of its
+                                    // end, which an inactive lane leaves at 0 and so never matches.
+                                    end_lane[l] = if $bwidth {
+                                        (end[l] - beg[l]).max(0) as $elem
+                                    } else {
+                                        (end[l] as $elem) ^ ($bbias as $elem)
+                                    };
+                                    active_lane[l] = <$umask>::MAX;
+                                }
+                            }
+                            (gbeg, gend, fast_lo_raw, fast_hi_raw) = (gb, ge, fl, fh);
+                        }
+                        if gbeg == i32::MAX {
+                            // No lane is active, and none can become so (`done` and `i >= tlen` are
+                            // monotone): this vector is finished.
+                            *run = false;
+                            continue;
+                        }
+
+                        // Move the row-local scalars into vectors. `h1_v` was just computed per lane
+                        // (the first-column value), the rest start at their identity.
+                        let mut h1_v = $lds(h1.as_ptr());
+                        let mut f_v = zero_v;
+                        let mut rowmax_v = zero_v;
+                        // `mj = -1` as the C does; for the u8 kernel this is 255, which is fine because
+                        // it is only ever read after `rowmax > 0` has proved some column updated it.
+                        let mut mj_v = $dup((-1i32) as $elem);
+                        // The per-lane band as vectors, so the inner loop masks with compares instead
+                        // of a branch per lane. `beg`/`end` must fit `$elem` too, the second reason the
+                        // u8 kernel caps lengths at 256. An inactive lane has an all-zero mask and an
+                        // empty band. Inactive lanes' slots are written with computed values in the
+                        // unmasked range and never read again: a lane never reactivates, and every
+                        // reader is under `active`.
+                        let beg_v = $lds(beg_lane.as_ptr());
+                        let end_v = $lds(end_lane.as_ptr());
+                        let active_v = $ldu(active_lane.as_ptr());
+                        // All-ones, the value `band` provably takes in the unmasked range.
+                        let ones_v = $ldu([<$umask>::MAX; LANES].as_ptr());
+                        // First and last column of this row whose stored H or E is non-zero, per lane,
+                        // kept by the column loop so the band tightening below reads them instead of
+                        // scanning the row (fg-labs/bwa-mem3's `BSW8_NF_TRACK`). `unseen_v` is all-ones
+                        // in a lane until its first such column; `first_v` follows `j` until then.
+                        let mut unseen_v = ones_v;
+                        let mut first_v = zero_v;
+                        let mut last_v = zero_v;
+                        let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
+                        let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
+
+                        // --- substitution pre-pass (vector, off the critical path) ---
+                        // For every band column, compute the same `sbt_pos`/`sbt_neg` the DP body used to
+                        // compute inline, and stash them. These ops depend only on `t_v` (fixed this row)
+                        // and the column's query base, so they carry no DP dependency and the scheduler
+                        // runs them at throughput here instead of braided into the H/E/F chain below.
+                        // Issue #48B: with `INL_SBT` the pre-pass does not run at all and its body moves
+                        // into the column loop below. It is the same expression on the same inputs, so
+                        // byte-identity is immediate; what it removes is one full-width STORE here and
+                        // one full-width LOAD there, per column, which exist only to shuttle a value
+                        // between two loops of the same iteration. That is the one thing the compiler
+                        // cannot do itself, unlike the ALU rewrites of #48A and #48D which it had
+                        // already done.
+                        if !INL_SBT {
+                            for j in gbeg..gend {
+                                let col_base = j as usize * LANES;
+                                let q_v = $lds(qcode.as_ptr().add(col_base));
+                                let is_eq = $ceq(t_v, q_v);
+                                let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                                // One biased value per cell: N wins over the equality test, exactly as
+                                // the split form's `is_n` blend sat outermost on both halves.
+                                let sbt = $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v));
+                                $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
                             }
                         }
-                        (gbeg, gend, fast_lo_raw, fast_hi_raw) = (gb, ge, fl, fh);
-                    }
-                    if gbeg == i32::MAX {
-                        // No lane is active, and none can become so (`done` and `i >= tlen` are
-                        // monotone): the chunk is finished.
-                        break;
-                    }
 
-                    // Move the row-local scalars into vectors. `h1_v` was just computed per lane
-                    // (the first-column value), the rest start at their identity.
-                    let mut h1_v = $lds(h1.as_ptr());
-                    let mut f_v = zero_v;
-                    let mut rowmax_v = zero_v;
-                    // `mj = -1` as the C does; for the u8 kernel this is 255, which is fine because
-                    // it is only ever read after `rowmax > 0` has proved some column updated it.
-                    let mut mj_v = $dup((-1i32) as $elem);
-                    // The per-lane band as vectors, so the inner loop masks with compares instead
-                    // of a branch per lane. `beg`/`end` must fit `$elem` too, the second reason the
-                    // u8 kernel caps lengths at 256. An inactive lane has an all-zero mask and an
-                    // empty band. Inactive lanes' slots are written with computed values in the
-                    // unmasked range and never read again: a lane never reactivates, and every
-                    // reader is under `active`.
-                    let beg_v = $lds(beg_lane.as_ptr());
-                    let end_v = $lds(end_lane.as_ptr());
-                    let active_v = $ldu(active_lane.as_ptr());
-                    // All-ones, the value `band` provably takes in the unmasked range.
-                    let ones_v = $ldu([<$umask>::MAX; LANES].as_ptr());
-                    // First and last column of this row whose stored H or E is non-zero, per lane,
-                    // kept by the column loop so the band tightening below reads them instead of
-                    // scanning the row (fg-labs/bwa-mem3's `BSW8_NF_TRACK`). `unseen_v` is all-ones
-                    // in a lane until its first such column; `first_v` follows `j` until then.
-                    let mut unseen_v = ones_v;
-                    let mut first_v = zero_v;
-                    let mut last_v = zero_v;
-                    let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
-                    let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
-
-                    // --- substitution pre-pass (vector, off the critical path) ---
-                    // For every band column, compute the same `sbt_pos`/`sbt_neg` the DP body used to
-                    // compute inline, and stash them. These ops depend only on `t_v` (fixed this row)
-                    // and the column's query base, so they carry no DP dependency and the scheduler
-                    // runs them at throughput here instead of braided into the H/E/F chain below.
-                    // Issue #48B: with `INL_SBT` the pre-pass does not run at all and its body moves
-                    // into the column loop below. It is the same expression on the same inputs, so
-                    // byte-identity is immediate; what it removes is one full-width STORE here and
-                    // one full-width LOAD there, per column, which exist only to shuttle a value
-                    // between two loops of the same iteration. That is the one thing the compiler
-                    // cannot do itself, unlike the ALU rewrites of #48A and #48D which it had
-                    // already done.
-                    if !INL_SBT {
-                        for j in gbeg..gend {
-                            let col_base = j as usize * LANES;
-                            let q_v = $lds(qcode.as_ptr().add(col_base));
-                            let is_eq = $ceq(t_v, q_v);
-                            let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                            // One biased value per cell: N wins over the equality test, exactly as
-                            // the split form's `is_n` blend sat outermost on both halves.
-                            let sbt = $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v));
-                            $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
-                        }
-                    }
-
-                    // The shared column loop over the union band. Every lane executes every column;
-                    // `band` decides whether the lane keeps the result. This is the core trade of
-                    // inter-sequence batching: uniform control flow at the cost of some wasted lanes.
-                    // --- inner loop (vector): one column of all lanes per iteration ---
-                    // Invariant at the top of each `j` iteration: lane `l` of `h1_v` holds
-                    // H(i, j-1), lane `l` of `f_v` holds F(i, j) carried from the left, and lane
-                    // `l` of `rowmax_v`/`mj_v` holds the best H in columns `beg[l]..j` of this row
-                    // and its column index (only meaningful for lanes that were in band).
-                    // ISSUE: the band mask and the five blends it drives are nine of the twenty-six vector ops
-                    // this loop emits per column of sixteen cells (counted in the shipped disassembly, not in
-                    // the source). In the columns where EVERY live lane is in band, that mask is provably
-                    // all-ones, so all nine fold away. Same shape as the rescue kernel's padding regime, and
-                    // the same byte-identity argument: a provably constant mask folded, not a mask dropped.
-                    macro_rules! column {
-                                ($j:expr, $masked:literal, $share_oe:literal) => {{
-                                    let j = $j;
-                                // Byte offset of column `j` in every SoA buffer (all lanes of that column
-                                // sit contiguously, which is the whole point of the layout).
-                                let col_base = j as usize * LANES;
-                                // The column index itself broadcast to every lane, so the band compares
-                                // and the `mj` update can be done lane-wise against per-lane bounds.
-                                let j_v = $dup(j as $elem);
-                                // band = active && beg <= j < end, as an all-ones/all-zero mask per lane.
-                                // Two compares rather than a shift-based window because `beg`/`end` differ
-                                // per lane.
-                                //
-                                // ISSUE #48C. `$band` is the per-ISA spelling of `(j >= beg) & (j < end)`,
-                                // because the good spelling is not the same everywhere and the disassembly
-                                // says so: AVX2 and SSE4.1 have no unsigned byte compare, so the portable
-                                // form is emulated as two `vpmaxub` plus two `vpcmpeqb` plus an `vpandn`,
-                                // about 6 of the 54 instructions in their column loop. XOR-ing `j`, `beg`
-                                // and `end` by 0x80 (an order-preserving bijection between u8 and i8) makes
-                                // the native signed `vpcmpgtb` legal and takes it to two compares and one
-                                // `vpandn`. AVX-512 needs none of this: it has `vpcmpltub` and LLVM already
-                                // emits it, which is why its column loop is 38 instructions and its
-                                // `band_bias` is 0. NEON likewise has native `vcgeq_u8`/`vcltq_u8`.
-                                let j_band_v = $dup((j as $elem) ^ ($bbias as $elem));
-                                let band = if $masked {
-                                        if $bwidth {
-                                            $band(j_band_v, beg_v, end_v)
+                        // The shared column loop over the union band. Every lane executes every column;
+                        // `band` decides whether the lane keeps the result. This is the core trade of
+                        // inter-sequence batching: uniform control flow at the cost of some wasted lanes.
+                        // --- inner loop (vector): one column of all lanes per iteration ---
+                        // Invariant at the top of each `j` iteration: lane `l` of `h1_v` holds
+                        // H(i, j-1), lane `l` of `f_v` holds F(i, j) carried from the left, and lane
+                        // `l` of `rowmax_v`/`mj_v` holds the best H in columns `beg[l]..j` of this row
+                        // and its column index (only meaningful for lanes that were in band).
+                        // ISSUE: the band mask and the five blends it drives are nine of the twenty-six vector ops
+                        // this loop emits per column of sixteen cells (counted in the shipped disassembly, not in
+                        // the source). In the columns where EVERY live lane is in band, that mask is provably
+                        // all-ones, so all nine fold away. Same shape as the rescue kernel's padding regime, and
+                        // the same byte-identity argument: a provably constant mask folded, not a mask dropped.
+                        macro_rules! column {
+                                    ($j:expr, $masked:literal, $share_oe:literal) => {{
+                                        let j = $j;
+                                    // Byte offset of column `j` in every SoA buffer (all lanes of that column
+                                    // sit contiguously, which is the whole point of the layout).
+                                    let col_base = j as usize * LANES;
+                                    // The column index itself broadcast to every lane, so the band compares
+                                    // and the `mj` update can be done lane-wise against per-lane bounds.
+                                    let j_v = $dup(j as $elem);
+                                    // band = active && beg <= j < end, as an all-ones/all-zero mask per lane.
+                                    // Two compares rather than a shift-based window because `beg`/`end` differ
+                                    // per lane.
+                                    //
+                                    // ISSUE #48C. `$band` is the per-ISA spelling of `(j >= beg) & (j < end)`,
+                                    // because the good spelling is not the same everywhere and the disassembly
+                                    // says so: AVX2 and SSE4.1 have no unsigned byte compare, so the portable
+                                    // form is emulated as two `vpmaxub` plus two `vpcmpeqb` plus an `vpandn`,
+                                    // about 6 of the 54 instructions in their column loop. XOR-ing `j`, `beg`
+                                    // and `end` by 0x80 (an order-preserving bijection between u8 and i8) makes
+                                    // the native signed `vpcmpgtb` legal and takes it to two compares and one
+                                    // `vpandn`. AVX-512 needs none of this: it has `vpcmpltub` and LLVM already
+                                    // emits it, which is why its column loop is 38 instructions and its
+                                    // `band_bias` is 0. NEON likewise has native `vcgeq_u8`/`vcltq_u8`.
+                                    let j_band_v = $dup((j as $elem) ^ ($bbias as $elem));
+                                    let band = if $masked {
+                                            if $bwidth {
+                                                $band(j_band_v, beg_v, end_v)
+                                            } else {
+                                                $andu(active_v, $band(j_band_v, beg_v, end_v))
+                                            }
                                         } else {
-                                            $andu(active_v, $band(j_band_v, beg_v, end_v))
-                                        }
+                                            // Unreachable in the unmasked range and folded away there; naming it
+                                            // keeps the two arms textually one body.
+                                            ones_v
+                                        };
+
+                                    // This column's biased substitution score, from the pre-pass above. One
+                                    // load replaces the ~7 ALU ops that used to sit on the critical path here,
+                                    // and, since the pre-pass went from a pair of values to one, half the loads
+                                    // and half the stores the pre-pass form originally cost.
+                                    let sbt = if INL_SBT {
+                                        let q_v = $lds(qcode.as_ptr().add(col_base));
+                                        let is_eq = $ceq(t_v, q_v);
+                                        let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                                        $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
                                     } else {
-                                        // Unreachable in the unmasked range and folded away there; naming it
-                                        // keeps the two arms textually one body.
-                                        ones_v
+                                        $lds(sbt_buf.as_ptr().add(col_base))
                                     };
 
-                                // This column's biased substitution score, from the pre-pass above. One
-                                // load replaces the ~7 ALU ops that used to sit on the critical path here,
-                                // and, since the pre-pass went from a pair of values to one, half the loads
-                                // and half the stores the pre-pass form originally cost.
-                                let sbt = if INL_SBT {
-                                    let q_v = $lds(qcode.as_ptr().add(col_base));
-                                    let is_eq = $ceq(t_v, q_v);
-                                    let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                                    $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
-                                } else {
-                                    $lds(sbt_buf.as_ptr().add(col_base))
-                                };
+                                    let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
+                                                                                 // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
+                                                                                 // deletion state ENTERING cell (i, j), so it is indexed (i, j) here and in
+                                                                                 // the scalar path. Same convention as the C ("eh[j] = { H(i-1,j-1), E(i,j) }",
+                                                                                 // `ksw.cpp:479`); labelling it E(i-1, j) would make the two paths look like
+                                                                                 // they hold different values when they hold the same one.
+                                    let e_v = $lds(eh_e.as_ptr().add(col_base)); // E(i, j)
 
-                                let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
-                                                                             // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
-                                                                             // deletion state ENTERING cell (i, j), so it is indexed (i, j) here and in
-                                                                             // the scalar path. Same convention as the C ("eh[j] = { H(i-1,j-1), E(i,j) }",
-                                                                             // `ksw.cpp:479`); labelling it E(i-1, j) would make the two paths look like
-                                                                             // they hold different values when they hold the same one.
-                                let e_v = $lds(eh_e.as_ptr().add(col_base)); // E(i, j)
+                                    // eh_h[j] <- h1 (old) for in-band lanes; out-of-band keep old m_v.
+                                    // The mask has to be applied on the *store*, not skipped around, because all
+                                    // lanes share the store instruction: writing back the value just loaded is
+                                    // how an out-of-band lane is left untouched.
+                                    let h_st = if $masked { $bsl(band, h1_v, m_v) } else { h1_v };
+                                    $sts(eh_h.as_mut_ptr().add(col_base), h_st);
 
-                                // eh_h[j] <- h1 (old) for in-band lanes; out-of-band keep old m_v.
-                                // The mask has to be applied on the *store*, not skipped around, because all
-                                // lanes share the store instruction: writing back the value just loaded is
-                                // how an out-of-band lane is left untouched.
-                                let h_st = if $masked { $bsl(band, h1_v, m_v) } else { h1_v };
-                                $sts(eh_h.as_mut_ptr().add(col_base), h_st);
+                                    // M = ((m + (bias + score)) - bias); m==0 -> local restart (0). Saturating
+                                    // for u8, plain for signed; identical either way in the guaranteed range,
+                                    // which for u8 is what `dispatch_bins` reserves headroom for.
+                                    let bigm_pre = {
+                                        let ($dm, $ds, $db) = (m_v, sbt, sbt_bias_v);
+                                        $diag
+                                    };
+                                    // The local restart: `ceqz` finds the lanes whose diagonal predecessor was
+                                    // already 0 and forces M back to 0 there (`ksw.cpp:487`,
+                                    // `bandedSWA.cpp:334-335` which does the same `cmpeq h00, zero` + blend).
+                                    let bigm_v = $bsl($ceqz(m_v), zero_v, bigm_pre);
 
-                                // M = ((m + (bias + score)) - bias); m==0 -> local restart (0). Saturating
-                                // for u8, plain for signed; identical either way in the guaranteed range,
-                                // which for u8 is what `dispatch_bins` reserves headroom for.
-                                let bigm_pre = {
-                                    let ($dm, $ds, $db) = (m_v, sbt, sbt_bias_v);
-                                    $diag
-                                };
-                                // The local restart: `ceqz` finds the lanes whose diagonal predecessor was
-                                // already 0 and forces M back to 0 there (`ksw.cpp:487`,
-                                // `bandedSWA.cpp:334-335` which does the same `cmpeq h00, zero` + blend).
-                                let bigm_v = $bsl($ceqz(m_v), zero_v, bigm_pre);
+                                    // max(M, E) is only an intermediate on the way to H; gaps open from M, not
+                                    // from this (see below).
+                                    let m_or_e_v = $max(bigm_v, e_v);
+                                    let h_v = $max(m_or_e_v, f_v);
+                                    h1_v = if $masked { $bsl(band, h_v, h1_v) } else { h_v };
 
-                                // max(M, E) is only an intermediate on the way to H; gaps open from M, not
-                                // from this (see below).
-                                let m_or_e_v = $max(bigm_v, e_v);
-                                let h_v = $max(m_or_e_v, f_v);
-                                h1_v = if $masked { $bsl(band, h_v, h1_v) } else { h_v };
+                                    // if row_max <= h { mj = j; row_max = h } (ties take larger j)
+                                    // `$cge` gives the non-strict compare, matching the scalar `row_max <= h`
+                                    // and `ksw.cpp:491`. Because `j` increases monotonically, the last lane to
+                                    // satisfy it wins, which reproduces the C's "later column keeps the tie".
+                                    // All-ones in the lanes that are in band *and* whose new H ties or beats
+                                    // this row's running best, i.e. exactly the lanes whose `rowmax`/`mj` the
+                                    // two blends below should replace.
+                                    let cmp = $cge(h_v, rowmax_v);
+                                    let upd = if $masked { $andu(band, cmp) } else { cmp };
+                                    rowmax_v = $bsl(upd, h_v, rowmax_v);
+                                    mj_v = $bsl(upd, j_v, mj_v);
 
-                                // if row_max <= h { mj = j; row_max = h } (ties take larger j)
-                                // `$cge` gives the non-strict compare, matching the scalar `row_max <= h`
-                                // and `ksw.cpp:491`. Because `j` increases monotonically, the last lane to
-                                // satisfy it wins, which reproduces the C's "later column keeps the tie".
-                                // All-ones in the lanes that are in band *and* whose new H ties or beats
-                                // this row's running best, i.e. exactly the lanes whose `rowmax`/`mj` the
-                                // two blends below should replace.
-                                let cmp = $cge(h_v, rowmax_v);
-                                let upd = if $masked { $andu(band, cmp) } else { cmp };
-                                rowmax_v = $bsl(upd, h_v, rowmax_v);
-                                mj_v = $bsl(upd, j_v, mj_v);
+                                    // e = max(e - e_del, max(M - oe_del, 0)); bandedSWA's MAIN_CODE16 opens the
+                                    // gap from `m11`, not `h11` (`bandedSWA.cpp:342-345`). The explicit
+                                    // `max(., zero)` is redundant for the u8 kernel (saturating `sub` already
+                                    // floors at 0) but free, and required for i16 where `sub` wraps.
+                                    // `open_del_v` lane l = the score of opening a fresh deletion here,
+                                    // M - (o_del + e_del), floored at 0; `e_new` lane l = E(i+1, j), the better
+                                    // of extending the deletion already open in this column and that open.
+                                    let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
+                                    let e_new = $max($sub(e_v, e_del_v), open_del_v);
+                                    let e_st = if $masked { $bsl(band, e_new, e_v) } else { e_new };
+                                    $sts(eh_e.as_mut_ptr().add(col_base), e_st);
+                                    // What the C's band scans test at this column, `eh[j].h == 0 &&
+                                    // eh[j].e == 0`, on the values just stored.
+                                    let dead = $ceqz($orr(h_st, e_st));
+                                    last_v = $bsl(dead, last_v, j_v);
+                                    first_v = $bsl(unseen_v, j_v, first_v);
+                                    unseen_v = $andu(unseen_v, dead);
 
-                                // e = max(e - e_del, max(M - oe_del, 0)); bandedSWA's MAIN_CODE16 opens the
-                                // gap from `m11`, not `h11` (`bandedSWA.cpp:342-345`). The explicit
-                                // `max(., zero)` is redundant for the u8 kernel (saturating `sub` already
-                                // floors at 0) but free, and required for i16 where `sub` wraps.
-                                // `open_del_v` lane l = the score of opening a fresh deletion here,
-                                // M - (o_del + e_del), floored at 0; `e_new` lane l = E(i+1, j), the better
-                                // of extending the deletion already open in this column and that open.
-                                let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
-                                let e_new = $max($sub(e_v, e_del_v), open_del_v);
-                                let e_st = if $masked { $bsl(band, e_new, e_v) } else { e_new };
-                                $sts(eh_e.as_mut_ptr().add(col_base), e_st);
-                                // What the C's band scans test at this column, `eh[j].h == 0 &&
-                                // eh[j].e == 0`, on the values just stored.
-                                let dead = $ceqz($orr(h_st, e_st));
-                                last_v = $bsl(dead, last_v, j_v);
-                                first_v = $bsl(unseen_v, j_v, first_v);
-                                unseen_v = $andu(unseen_v, dead);
-
-                                // f = max(f - e_ins, max(M - oe_ins, 0)). M does not depend on the carried f,
-                                // so the carried chain is just sub+max (~2 ops) with no f->h->f dependency.
-                                // This is the whole reason the F recurrence needs no lazy-F fixup loop of the
-                                // kind striped kernels use (`ksw.cpp:179-190`): striped layouts break the
-                                // left-to-right order of F, inter-sequence layouts do not. F is genuinely
-                                // sequential along the row, and that sequential chain is this kernel's
-                                // critical path, which is why shortening it to sub+max was a measurable win.
-                                // Mirror of the pair above for the insertion: `open_ins_v` lane l is the
-                                // cost-adjusted score of opening one here, `f_new` lane l is F(i, j+1),
-                                // which the next iteration will read as its carried `f_v`.
-                                let open_ins_v = if $share_oe {
-                                    open_del_v
-                                } else {
-                                    $max($sub(bigm_v, oe_ins_v), zero_v)
-                                };
-                                let f_new = $max($sub(f_v, e_ins_v), open_ins_v);
-                                f_v = if $masked { $bsl(band, f_new, f_v) } else { f_new };
-                                }};
-                            }
-                    // `[fast_lo, fast_hi)` is where every lane is active and in band, so the mask is all-ones.
-                    // Empty the moment one lane has finished, which is why it is recomputed per row rather than
-                    // assumed: `run_side` re-collects active jobs per ROUND, but a lane can go inactive mid-DP.
-                    let (fast_lo, fast_hi) = if super::band_fast_enabled() {
-                        (fast_lo_raw.max(gbeg), fast_hi_raw.min(gend))
-                    } else {
-                        (gbeg, gbeg)
-                    };
-                    // bwa's stock `-O 6,6 -E 1,1` opens both gap kinds at one cost, so one `M - oe` feeds both
-                    // recurrences. Tested per row, not per cell: this branch never moves and the column
-                    // loops below stay free of it.
-                    if oe_del == oe_ins {
-                        for j in gbeg..fast_lo {
-                            column!(j, true, true);
-                        }
-                        for j in fast_lo..fast_hi {
-                            column!(j, false, true);
-                        }
-                        for j in fast_hi.max(fast_lo)..gend {
-                            column!(j, true, true);
-                        }
-                    } else {
-                        for j in gbeg..fast_lo {
-                            column!(j, true, false);
-                        }
-                        for j in fast_lo..fast_hi {
-                            column!(j, false, false);
-                        }
-                        for j in fast_hi.max(fast_lo)..gend {
-                            column!(j, true, false);
-                        }
-                    }
-
-                    // --- row epilogue: mirrors batched_extend_scalar ---
-                    // Spill the three row results back to scalars. The trackers (`max`, `gscore`,
-                    // `max_i`, ..., termination) are per-row work with data-dependent tests; the
-                    // NEON u8 kernel updates them in i32 vector lanes with the tests as selects
-                    // (`rowvec`), the others per lane. The scatter stores and the band-tightening
-                    // scans stay scalar everywhere. Widened to i32 before any comparison: the
-                    // trackers hold values like -1 that `$elem` cannot express. The logic is
-                    // identical to `batched_extend_scalar`'s epilogue, whose comments apply.
-                    let mut h1_out = [0 as $elem; LANES];
-                    let mut rowmax_out = [0 as $elem; LANES];
-                    let mut mj_out = [0 as $elem; LANES];
-                    $sts(h1_out.as_mut_ptr(), h1_v);
-                    $sts(rowmax_out.as_mut_ptr(), rowmax_v);
-                    $sts(mj_out.as_mut_ptr(), mj_v);
-                    let mut first_out = [0 as $elem; LANES];
-                    let mut last_out = [0 as $elem; LANES];
-                    let mut seen_out = [0 as $elem; LANES];
-                    $sts(first_out.as_mut_ptr(), first_v);
-                    $sts(last_out.as_mut_ptr(), last_v);
-                    $sts(seen_out.as_mut_ptr(), $bsl(unseen_v, zero_v, $dup(1 as $elem)));
-
-                    if $rowvec {
-                        // SAFETY: as for `prologue16`.
-                        let live = unsafe {
-                            super::neon_row::epilogue16(
-                                i,
-                                active.as_ptr(),
-                                h1_out.as_ptr() as *const u8,
-                                rowmax_out.as_ptr() as *const u8,
-                                mj_out.as_ptr() as *const u8,
-                                end.as_ptr(),
-                                qlen32.as_ptr(),
-                                zdrop,
-                                e_del,
-                                e_ins,
-                                max.as_mut_ptr(),
-                                max_i.as_mut_ptr(),
-                                max_j.as_mut_ptr(),
-                                max_ie.as_mut_ptr(),
-                                gscore.as_mut_ptr(),
-                                max_off.as_mut_ptr(),
-                                done.as_mut_ptr(),
-                            )
+                                    // f = max(f - e_ins, max(M - oe_ins, 0)). M does not depend on the carried f,
+                                    // so the carried chain is just sub+max (~2 ops) with no f->h->f dependency.
+                                    // This is the whole reason the F recurrence needs no lazy-F fixup loop of the
+                                    // kind striped kernels use (`ksw.cpp:179-190`): striped layouts break the
+                                    // left-to-right order of F, inter-sequence layouts do not. F is genuinely
+                                    // sequential along the row, and that sequential chain is this kernel's
+                                    // critical path, which is why shortening it to sub+max was a measurable win.
+                                    // Mirror of the pair above for the insertion: `open_ins_v` lane l is the
+                                    // cost-adjusted score of opening one here, `f_new` lane l is F(i, j+1),
+                                    // which the next iteration will read as its carried `f_v`.
+                                    let open_ins_v = if $share_oe {
+                                        open_del_v
+                                    } else {
+                                        $max($sub(bigm_v, oe_ins_v), zero_v)
+                                    };
+                                    let f_new = $max($sub(f_v, e_ins_v), open_ins_v);
+                                    f_v = if $masked { $bsl(band, f_new, f_v) } else { f_new };
+                                    }};
+                                }
+                        // `[fast_lo, fast_hi)` is where every lane is active and in band, so the mask is all-ones.
+                        // Empty the moment one lane has finished, which is why it is recomputed per row rather than
+                        // assumed: `run_side` re-collects active jobs per ROUND, but a lane can go inactive mid-DP.
+                        let (fast_lo, fast_hi) = if super::band_fast_enabled() {
+                            (fast_lo_raw.max(gbeg), fast_hi_raw.min(gend))
+                        } else {
+                            (gbeg, gbeg)
                         };
-                        // The band-tightening scans stay scalar per lane: a 16-lane vector scan
-                        // runs as deep as the deepest lane and measured 1.5x slower. Unchecked
-                        // indexing: every column touched is in `[beg, end] <= qlen < stride`,
-                        // the buffers' column count, and `last_live >= beg >= 0` is tested first.
-                        let (hp, ep) = (eh_h.as_mut_ptr(), eh_e.as_mut_ptr());
-                        let mut am = active_bits;
-                        while am != 0 {
-                            let l = am.trailing_zeros() as usize;
-                            am &= am - 1;
-                            // SAFETY: see above.
-                            unsafe {
-                                *hp.add(end[l] as usize * LANES + l) = h1_out[l];
-                                *ep.add(end[l] as usize * LANES + l) = 0;
+                        // bwa's stock `-O 6,6 -E 1,1` opens both gap kinds at one cost, so one `M - oe` feeds both
+                        // recurrences. Tested per row, not per cell: this branch never moves and the column
+                        // loops below stay free of it.
+                        if oe_del == oe_ins {
+                            for j in gbeg..fast_lo {
+                                column!(j, true, true);
                             }
-                            if live & (1 << l) == 0 {
+                            for j in fast_lo..fast_hi {
+                                column!(j, false, true);
+                            }
+                            for j in fast_hi.max(fast_lo)..gend {
+                                column!(j, true, true);
+                            }
+                        } else {
+                            for j in gbeg..fast_lo {
+                                column!(j, true, false);
+                            }
+                            for j in fast_lo..fast_hi {
+                                column!(j, false, false);
+                            }
+                            for j in fast_hi.max(fast_lo)..gend {
+                                column!(j, true, false);
+                            }
+                        }
+
+                        // --- row epilogue: mirrors batched_extend_scalar ---
+                        // Spill the three row results back to scalars. The trackers (`max`, `gscore`,
+                        // `max_i`, ..., termination) are per-row work with data-dependent tests; the
+                        // NEON u8 kernel updates them in i32 vector lanes with the tests as selects
+                        // (`rowvec`), the others per lane. The scatter stores and the band-tightening
+                        // scans stay scalar everywhere. Widened to i32 before any comparison: the
+                        // trackers hold values like -1 that `$elem` cannot express. The logic is
+                        // identical to `batched_extend_scalar`'s epilogue, whose comments apply.
+                        let mut h1_out = [0 as $elem; LANES];
+                        let mut rowmax_out = [0 as $elem; LANES];
+                        let mut mj_out = [0 as $elem; LANES];
+                        $sts(h1_out.as_mut_ptr(), h1_v);
+                        $sts(rowmax_out.as_mut_ptr(), rowmax_v);
+                        $sts(mj_out.as_mut_ptr(), mj_v);
+                        let mut first_out = [0 as $elem; LANES];
+                        let mut last_out = [0 as $elem; LANES];
+                        let mut seen_out = [0 as $elem; LANES];
+                        $sts(first_out.as_mut_ptr(), first_v);
+                        $sts(last_out.as_mut_ptr(), last_v);
+                        $sts(seen_out.as_mut_ptr(), $bsl(unseen_v, zero_v, $dup(1 as $elem)));
+
+                        if $rowvec {
+                            // SAFETY: as for `prologue16`.
+                            let live = unsafe {
+                                super::neon_row::epilogue16(
+                                    i,
+                                    active.as_ptr(),
+                                    h1_out.as_ptr() as *const u8,
+                                    rowmax_out.as_ptr() as *const u8,
+                                    mj_out.as_ptr() as *const u8,
+                                    end.as_ptr(),
+                                    qlen32.as_ptr(),
+                                    zdrop,
+                                    e_del,
+                                    e_ins,
+                                    max.as_mut_ptr(),
+                                    max_i.as_mut_ptr(),
+                                    max_j.as_mut_ptr(),
+                                    max_ie.as_mut_ptr(),
+                                    gscore.as_mut_ptr(),
+                                    max_off.as_mut_ptr(),
+                                    done.as_mut_ptr(),
+                                )
+                            };
+                            // The band-tightening scans stay scalar per lane: a 16-lane vector scan
+                            // runs as deep as the deepest lane and measured 1.5x slower. Unchecked
+                            // indexing: every column touched is in `[beg, end] <= qlen < stride`,
+                            // the buffers' column count, and `last_live >= beg >= 0` is tested first.
+                            let (hp, ep) = (eh_h.as_mut_ptr(), eh_e.as_mut_ptr());
+                            let mut am = active_bits;
+                            while am != 0 {
+                                let l = am.trailing_zeros() as usize;
+                                am &= am - 1;
+                                // SAFETY: see above.
+                                unsafe {
+                                    *hp.add(end[l] as usize * LANES + l) = h1_out[l];
+                                    *ep.add(end[l] as usize * LANES + l) = 0;
+                                }
+                                if live & (1 << l) == 0 {
+                                    continue;
+                                }
+                                let dead = |j: i32| unsafe {
+                                    *hp.add(j as usize * LANES + l) == 0
+                                        && *ep.add(j as usize * LANES + l) == 0
+                                };
+                                // The C's scans from the trackers. Columns outside `[beg, end)` hold
+                                // zeros from this chunk (a cell leaves the band dead and is not written
+                                // again) except at `end` itself, which keeps last row's `h1` when the
+                                // `qlen` clamp held `end` still, and past `qlen`, where another lane's
+                                // columns may hold a previous chunk's values: a tracker that points at or
+                                // past `end` is answered by the scan it would have replaced.
+                                let first_live = if seen_out[l] != 0 {
+                                    (first_out[l] as i32).min(end[l])
+                                } else {
+                                    end[l]
+                                };
+                                beg[l] = first_live;
+                                let last_live = if h1_out[l] != 0 {
+                                    end[l]
+                                } else if seen_out[l] == 0 {
+                                    first_live - 1
+                                } else if (last_out[l] as i32) < end[l] {
+                                    last_out[l] as i32
+                                } else {
+                                    let mut last_live = end[l] - 1;
+                                    while last_live >= first_live && dead(last_live) {
+                                        last_live -= 1;
+                                    }
+                                    last_live
+                                };
+                                end[l] = if last_live + 2 < qlen[l] as i32 {
+                                    last_live + 2
+                                } else {
+                                    qlen[l] as i32
+                                };
+                            }
+                            continue;
+                        }
+                        for l in 0..nlane {
+                            if !active[l] {
                                 continue;
                             }
-                            let dead = |j: i32| unsafe {
-                                *hp.add(j as usize * LANES + l) == 0
-                                    && *ep.add(j as usize * LANES + l) == 0
-                            };
-                            // The C's scans from the trackers. Columns outside `[beg, end)` hold
-                            // zeros from this chunk (a cell leaves the band dead and is not written
-                            // again) except at `end` itself, which keeps last row's `h1` when the
-                            // `qlen` clamp held `end` still, and past `qlen`, where another lane's
-                            // columns may hold a previous chunk's values: a tracker that points at or
-                            // past `end` is answered by the scan it would have replaced.
+                            let h1_l = i32::from(h1_out[l]);
+                            let row_max_l = i32::from(rowmax_out[l]);
+                            let mj_l = i32::from(mj_out[l]);
+                            eh_h[end[l] as usize * LANES + l] = h1_l as $elem;
+                            eh_e[end[l] as usize * LANES + l] = 0;
+                            if end[l] == qlen[l] as i32 && gscore[l] <= h1_l {
+                                max_ie[l] = i;
+                                gscore[l] = h1_l;
+                            }
+                            if row_max_l == 0 {
+                                done[l] = true;
+                                continue;
+                            }
+                            if row_max_l > max[l] {
+                                max[l] = row_max_l;
+                                max_i[l] = i;
+                                max_j[l] = mj_l;
+                                let off = (mj_l - i).abs();
+                                if off > max_off[l] {
+                                    max_off[l] = off;
+                                }
+                            } else if zdrop > 0 {
+                                let drop = if i - max_i[l] > mj_l - max_j[l] {
+                                    max[l] - row_max_l - ((i - max_i[l]) - (mj_l - max_j[l])) * e_del
+                                } else {
+                                    max[l] - row_max_l - ((mj_l - max_j[l]) - (i - max_i[l])) * e_ins
+                                };
+                                if drop > zdrop {
+                                    done[l] = true;
+                                    continue;
+                                }
+                            }
+                            // From the trackers; see the `rowvec` arm for the two stale cases.
                             let first_live = if seen_out[l] != 0 {
                                 (first_out[l] as i32).min(end[l])
                             } else {
@@ -2438,7 +2629,10 @@ macro_rules! define_sw_kernel {
                                 last_out[l] as i32
                             } else {
                                 let mut last_live = end[l] - 1;
-                                while last_live >= first_live && dead(last_live) {
+                                while last_live >= first_live
+                                    && eh_h[last_live as usize * LANES + l] == 0
+                                    && eh_e[last_live as usize * LANES + l] == 0
+                                {
                                     last_live -= 1;
                                 }
                                 last_live
@@ -2449,84 +2643,97 @@ macro_rules! define_sw_kernel {
                                 qlen[l] as i32
                             };
                         }
+
+                    }
+                    if nvec < 2 {
                         continue;
                     }
-                    for l in 0..nlane {
-                        if !active[l] {
-                            continue;
-                        }
-                        let h1_l = i32::from(h1_out[l]);
-                        let row_max_l = i32::from(rowmax_out[l]);
-                        let mj_l = i32::from(mj_out[l]);
-                        eh_h[end[l] as usize * LANES + l] = h1_l as $elem;
-                        eh_e[end[l] as usize * LANES + l] = 0;
-                        if end[l] == qlen[l] as i32 && gscore[l] <= h1_l {
-                            max_ie[l] = i;
-                            gscore[l] = h1_l;
-                        }
-                        if row_max_l == 0 {
-                            done[l] = true;
-                            continue;
-                        }
-                        if row_max_l > max[l] {
-                            max[l] = row_max_l;
-                            max_i[l] = i;
-                            max_j[l] = mj_l;
-                            let off = (mj_l - i).abs();
-                            if off > max_off[l] {
-                                max_off[l] = off;
+                    // --- compaction between rows ---
+                    // A lane stays live into row i + 1 iff it is not done and has that row.
+                    let mut live = [0u64; super::COMPACT_MAX];
+                    let mut runv = [false; super::COMPACT_MAX];
+                    for v in 0..nvec {
+                        runv[v] = vs[v].run;
+                        if runv[v] {
+                            let st = &vs[v];
+                            for l in 0..LANES {
+                                if !st.done[l] && (i + 1) < st.tlen32[l] {
+                                    live[v] |= 1u64 << l;
+                                }
                             }
-                        } else if zdrop > 0 {
-                            let drop = if i - max_i[l] > mj_l - max_j[l] {
-                                max[l] - row_max_l - ((i - max_i[l]) - (mj_l - max_j[l])) * e_del
-                            } else {
-                                max[l] - row_max_l - ((mj_l - max_j[l]) - (i - max_i[l])) * e_ins
+                        }
+                    }
+                    moves.clear();
+                    super::compact_plan(&mut live[..nvec], &mut runv[..nvec], LANES, &mut moves);
+                    for &(sv, sl, dv, dl) in &moves {
+                        let (sv, sl, dv, dl) = (sv as usize, sl as usize, dv as usize, dl as usize);
+                        let (src, dst) = if sv < dv {
+                            let (a, b) = vs.split_at_mut(dv);
+                            (&mut a[sv], &mut b[0])
+                        } else {
+                            let (a, b) = vs.split_at_mut(sv);
+                            (&mut b[0], &mut a[dv])
+                        };
+                        // The slot being overwritten holds a finished lane: its result first.
+                        let k = dst.jid[dl];
+                        if k != u32::MAX {
+                            out[k as usize] = ExtendResult {
+                                score: dst.max[dl],
+                                qle: dst.max_j[dl] + 1,
+                                tle: dst.max_i[dl] + 1,
+                                gtle: dst.max_ie[dl] + 1,
+                                gscore: dst.gscore[dl],
+                                max_off: dst.max_off[dl],
                             };
-                            if drop > zdrop {
-                                done[l] = true;
-                                continue;
-                            }
                         }
-                        // From the trackers; see the `rowvec` arm for the two stale cases.
-                        let first_live = if seen_out[l] != 0 {
-                            (first_out[l] as i32).min(end[l])
-                        } else {
-                            end[l]
-                        };
-                        beg[l] = first_live;
-                        let last_live = if h1_out[l] != 0 {
-                            end[l]
-                        } else if seen_out[l] == 0 {
-                            first_live - 1
-                        } else if (last_out[l] as i32) < end[l] {
-                            last_out[l] as i32
-                        } else {
-                            let mut last_live = end[l] - 1;
-                            while last_live >= first_live
-                                && eh_h[last_live as usize * LANES + l] == 0
-                                && eh_e[last_live as usize * LANES + l] == 0
-                            {
-                                last_live -= 1;
-                            }
-                            last_live
-                        };
-                        end[l] = if last_live + 2 < qlen[l] as i32 {
-                            last_live + 2
-                        } else {
-                            qlen[l] as i32
-                        };
+                        for c in 0..stride {
+                            dst.eh_h[c * LANES + dl] = src.eh_h[c * LANES + sl];
+                            dst.eh_e[c * LANES + dl] = src.eh_e[c * LANES + sl];
+                        }
+                        for c in 0..soa_cols {
+                            dst.qcode[c * LANES + dl] = src.qcode[c * LANES + sl];
+                        }
+                        for r in (i as usize + 1)..soa_rows {
+                            dst.tcode[r * LANES + dl] = src.tcode[r * LANES + sl];
+                        }
+                        dst.qlen[dl] = src.qlen[sl];
+                        dst.tlen[dl] = src.tlen[sl];
+                        dst.qlen32[dl] = src.qlen32[sl];
+                        dst.tlen32[dl] = src.tlen32[sl];
+                        dst.h0[dl] = src.h0[sl];
+                        dst.w[dl] = src.w[sl];
+                        dst.beg[dl] = src.beg[sl];
+                        dst.end[dl] = src.end[sl];
+                        dst.max[dl] = src.max[sl];
+                        dst.max_i[dl] = src.max_i[sl];
+                        dst.max_j[dl] = src.max_j[sl];
+                        dst.max_ie[dl] = src.max_ie[sl];
+                        dst.gscore[dl] = src.gscore[sl];
+                        dst.max_off[dl] = src.max_off[sl];
+                        dst.done[dl] = false;
+                        dst.jid[dl] = src.jid[sl];
+                        src.jid[sl] = u32::MAX;
+                        src.done[sl] = true;
+                    }
+                    for v in 0..nvec {
+                        vs[v].run = runv[v];
                     }
                 }
 
-                for l in 0..nlane {
-                    out[chunk_start + l] = ExtendResult {
-                        score: max[l],
-                        qle: max_j[l] + 1,
-                        tle: max_i[l] + 1,
-                        gtle: max_ie[l] + 1,
-                        gscore: gscore[l],
-                        max_off: max_off[l],
-                    };
+                for st in &vs[..nvec] {
+                    for l in 0..LANES {
+                        let k = st.jid[l];
+                        if k != u32::MAX {
+                            out[k as usize] = ExtendResult {
+                                score: st.max[l],
+                                qle: st.max_j[l] + 1,
+                                tle: st.max_i[l] + 1,
+                                gtle: st.max_ie[l] + 1,
+                                gscore: st.gscore[l],
+                                max_off: st.max_off[l],
+                            };
+                        }
+                    }
                 }
             }
 
