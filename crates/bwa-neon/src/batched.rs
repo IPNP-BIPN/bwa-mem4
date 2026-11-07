@@ -1600,14 +1600,6 @@ fn compact_plan(
     }
 }
 
-/// Whether the extension kernels pipeline the column loop two columns deep (`range!` in
-/// [`define_sw_kernel!`]). `BWA4_SKEW=0` keeps the plain loop. Read once, cached.
-fn skew_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_SKEW").is_none_or(|v| v != "0"))
-}
-
 /// Whether the extension kernels give the fully-in-band columns their own unmasked regime.
 /// `BWA4_EXTEND_BANDFAST=0` sends every column through the masked body. Read once, cached.
 fn band_fast_enabled() -> bool {
@@ -2491,120 +2483,6 @@ macro_rules! define_sw_kernel {
                                     f_v = if $masked { $bsl(band, f_new, f_v) } else { f_new };
                                     }};
                                 }
-                        let skew = super::skew_enabled();
-                        // The same column split in three stages for the software-pipelined loop
-                        // (fg-labs/bwa-mem3's `BSW8_SKEW`): `s1` the loads, the score and M; `s2` the
-                        // terms that need no carried value (E and its store, max(M, E), the insertion
-                        // open); `fin` the carried chain (H, F, the H store, the row max and the band
-                        // trackers). Same expressions on the same inputs as `column!`. A row runs S1 of
-                        // column j + 2, S2 of j + 1 and the finish of j per iteration, so each column's
-                        // load-to-store chain overlaps the two before it: on Neoverse the vector issue
-                        // queue is too small to find that overlap in the plain loop.
-                        macro_rules! s1 {
-                            ($j:expr) => {{
-                                let col_base = $j as usize * LANES;
-                                let sbt = if INL_SBT {
-                                    let q_v = $lds(qcode.as_ptr().add(col_base));
-                                    if $sbt_tbl {
-                                        let ($tt, $tk, $tq) = (tab_v, t_key, q_v);
-                                        $tblx
-                                    } else {
-                                        let is_eq = $ceq(t_v, q_v);
-                                        let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                                        $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
-                                    }
-                                } else {
-                                    $lds(sbt_buf.as_ptr().add(col_base))
-                                };
-                                let m_v = $lds(eh_h.as_ptr().add(col_base));
-                                let e_v = $lds(eh_e.as_ptr().add(col_base));
-                                let bigm_pre = {
-                                    let ($dm, $ds, $db) = (m_v, sbt, sbt_bias_v);
-                                    $diag
-                                };
-                                (m_v, e_v, $bsl($ceqz(m_v), zero_v, bigm_pre))
-                            }};
-                        }
-                        macro_rules! s2 {
-                            ($st:expr, $share_oe:literal) => {{
-                                let (m_v, e_v, bigm_v) = $st;
-                                let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
-                                let e_new = $max($sub(e_v, e_del_v), open_del_v);
-                                let open_ins_v = if $share_oe {
-                                    open_del_v
-                                } else {
-                                    $max($sub(bigm_v, oe_ins_v), zero_v)
-                                };
-                                (m_v, e_v, $max(bigm_v, e_v), open_ins_v, e_new)
-                            }};
-                        }
-                        // The band mask is recomputed here rather than carried from `s2`: carried
-                        // through the pipeline LLVM keeps it as a vector of booleans and rebuilds it.
-                        macro_rules! fin {
-                            ($j:expr, $st:expr, $masked:literal) => {{
-                                let j = $j;
-                                let col_base = j as usize * LANES;
-                                let (m_v, e_v, m_or_e_v, open_ins_v, e_new) = $st;
-                                let band = if $masked {
-                                    let j_band_v = $dup((j as $elem) ^ ($bbias as $elem));
-                                    if $bwidth {
-                                        $band(j_band_v, beg_v, end_v)
-                                    } else {
-                                        $andu(active_v, $band(j_band_v, beg_v, end_v))
-                                    }
-                                } else {
-                                    ones_v
-                                };
-                                let e_st = if $masked { $bsl(band, e_new, e_v) } else { e_new };
-                                $sts(eh_e.as_mut_ptr().add(col_base), e_st);
-                                let j_v = $dup(j as $elem);
-                                let h_st = if $masked { $bsl(band, h1_v, m_v) } else { h1_v };
-                                $sts(eh_h.as_mut_ptr().add(col_base), h_st);
-                                let h_v = $max(m_or_e_v, f_v);
-                                h1_v = if $masked { $bsl(band, h_v, h1_v) } else { h_v };
-                                let cmp = $cge(h_v, rowmax_v);
-                                let upd = if $masked { $andu(band, cmp) } else { cmp };
-                                rowmax_v = $bsl(upd, h_v, rowmax_v);
-                                mj_v = $bsl(upd, j_v, mj_v);
-                                let dead = $ceqz($orr(h_st, e_st));
-                                last_v = $bsl(dead, last_v, j_v);
-                                first_v = $bsl(unseen_v, j_v, first_v);
-                                unseen_v = $andu(unseen_v, dead);
-                                let f_new = $max($sub(f_v, e_ins_v), open_ins_v);
-                                // The row's last finish leaves `f_v` unread.
-                                #[allow(unused_assignments)]
-                                {
-                                    f_v = if $masked { $bsl(band, f_new, f_v) } else { f_new };
-                                }
-                            }};
-                        }
-                        // Columns `[lo, hi)`: pipelined from `SKEW_MIN` columns up, the plain body below
-                        // that (the fill and drain cost more than they save on a short run).
-                        macro_rules! range {
-                            ($lo:expr, $hi:expr, $masked:literal, $share_oe:literal) => {{
-                                let (lo, hi) = ($lo, $hi);
-                                if !skew || hi - lo < 4 {
-                                    for j in lo..hi {
-                                        column!(j, $masked, $share_oe);
-                                    }
-                                } else {
-                                    let mut b = s1!(lo + 1);
-                                    let mut a2 = s2!(s1!(lo), $share_oe);
-                                    let mut j = lo;
-                                    while j + 2 < hi {
-                                        let c = s1!(j + 2);
-                                        let b2 = s2!(b, $share_oe);
-                                        fin!(j, a2, $masked);
-                                        b = c;
-                                        a2 = b2;
-                                        j += 1;
-                                    }
-                                    let b2 = s2!(b, $share_oe);
-                                    fin!(j, a2, $masked);
-                                    fin!(j + 1, b2, $masked);
-                                }
-                            }};
-                        }
                         // `[fast_lo, fast_hi)` is where every lane is active and in band, so the mask is all-ones.
                         // Empty the moment one lane has finished, which is why it is recomputed per row rather than
                         // assumed: `run_side` re-collects active jobs per ROUND, but a lane can go inactive mid-DP.
@@ -2617,13 +2495,25 @@ macro_rules! define_sw_kernel {
                         // recurrences. Tested per row, not per cell: this branch never moves and the column
                         // loops below stay free of it.
                         if oe_del == oe_ins {
-                            range!(gbeg, fast_lo, true, true);
-                            range!(fast_lo, fast_hi, false, true);
-                            range!(fast_hi.max(fast_lo), gend, true, true);
+                            for j in gbeg..fast_lo {
+                                column!(j, true, true);
+                            }
+                            for j in fast_lo..fast_hi {
+                                column!(j, false, true);
+                            }
+                            for j in fast_hi.max(fast_lo)..gend {
+                                column!(j, true, true);
+                            }
                         } else {
-                            range!(gbeg, fast_lo, true, false);
-                            range!(fast_lo, fast_hi, false, false);
-                            range!(fast_hi.max(fast_lo), gend, true, false);
+                            for j in gbeg..fast_lo {
+                                column!(j, true, false);
+                            }
+                            for j in fast_lo..fast_hi {
+                                column!(j, false, false);
+                            }
+                            for j in fast_hi.max(fast_lo)..gend {
+                                column!(j, true, false);
+                            }
                         }
 
                         // --- row epilogue: mirrors batched_extend_scalar ---
