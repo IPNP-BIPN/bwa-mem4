@@ -213,7 +213,9 @@ jobs:
       - name: Build ours at the tier we ship
         run: |
           set -euo pipefail
-          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked -p bwa-mem4 \
+          # x86 builds at the shipped v3 tier; an arm runner builds for its own baseline.
+          rf=""; [ "$(uname -m)" = x86_64 ] && rf="-C target-cpu=x86-64-v3"
+          RUSTFLAGS="$rf" cargo build --release --locked -p bwa-mem4 \
             --jobs 2 --target-dir target-knobs
           cp target-knobs/release/bwa-mem4 ./mem4-v3
 
@@ -243,7 +245,10 @@ jobs:
           # The extension tier too: the start-up calibration times a synthetic batch with no z-drop
           # deaths, while real batches waste more lanes the wider the vector (BWA4_LANE_TRACE model:
           # 3.0x executed/useful cells at 16 lanes, 3.9x at 32, 6.05x at 64).
-          for arm in "BWA4_EXTEND_TIER=avx512" "BWA4_EXTEND_TIER=avx2" "BWA4_EXTEND_TIER=sse41" \
+          # BWA4_SKEW=0: the extension column loop without its two-column software pipeline;
+          # BWA4_COMPACT_K=1: without same-row lane compaction.
+          for arm in "BWA4_SKEW=0" "BWA4_COMPACT_K=1" \
+                     "BWA4_EXTEND_TIER=avx512" "BWA4_EXTEND_TIER=avx2" "BWA4_EXTEND_TIER=sse41" \
                      "BWA4_LOCKSTEP_N=16" "BWA4_LOCKSTEP_N=32" "BWA4_LOCKSTEP_N=64" \
                      "BWA4_SA_WINDOW=32" "BWA4_SA_WINDOW=64" "BWA4_SA_WINDOW=256" \
                      "BWA4_SEED_PREFETCH=0" "BWA4_SEED_PREFETCH=16" "BWA4_SEED_PREFETCH=32"; do
