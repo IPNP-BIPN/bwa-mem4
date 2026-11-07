@@ -2198,13 +2198,11 @@ macro_rules! define_sw_kernel {
                         let mut active_lane = [0 as $umask; LANES];
                         let (gbeg, gend, fast_lo_raw, fast_hi_raw);
                         #[allow(unused_assignments)]
-                        let mut active_bits = 0u64;
-                        #[allow(unused_assignments)]
                         let mut next_bits = 0u64;
                         if $rowvec {
                             // SAFETY: `rowvec` is set only on the NEON u8 kernel, where LANES == 16,
                             // `$elem` and `$umask` are u8, `band_width` holds and `band_bias` is 0.
-                            (gbeg, gend, fast_lo_raw, fast_hi_raw, active_bits, next_bits) = unsafe {
+                            (gbeg, gend, fast_lo_raw, fast_hi_raw, next_bits) = unsafe {
                                 super::$rowmod::prologue::<LANES>(
                                     i,
                                     done.as_ptr(),
@@ -2571,14 +2569,16 @@ macro_rules! define_sw_kernel {
                             // stride`, the buffers' column count, and `last_live >= beg` is tested first.
                             *nxt = live & next_bits;
                             let (hp, ep) = (eh_h.as_mut_ptr(), eh_e.as_mut_ptr());
-                            let mut am = active_bits;
-                            while am != 0 {
-                                let l = am.trailing_zeros() as usize;
-                                am &= am - 1;
+                            // `eh[end] = {h1, 0}` for every lane, branch-free: an inactive lane's
+                            // slot is never read again (a lane moved in brings its own columns), and
+                            // its `end` is in `0..=qlen` all the same.
+                            let off: [u32; LANES] =
+                                std::array::from_fn(|l| end[l] as u32 * LANES as u32 + l as u32);
+                            for l in 0..LANES {
                                 // SAFETY: see above.
                                 unsafe {
-                                    *hp.add(end[l] as usize * LANES + l) = h1_out[l];
-                                    *ep.add(end[l] as usize * LANES + l) = 0;
+                                    *hp.add(off[l] as usize) = h1_out[l];
+                                    *ep.add(off[l] as usize) = 0;
                                 }
                             }
                             // SAFETY: as for `prologue16`; the outputs are u8 (`rowvec`).
@@ -2910,7 +2910,7 @@ mod x86_row {
         end_lane: *mut u8,
         active_lane: *mut u8,
         bias: u8,
-    ) -> (i32, i32, i32, i32, u64, u64) {
+    ) -> (i32, i32, i32, i32, u64) {
         let iv = _mm256_set1_epi32(i);
         let i1 = _mm256_set1_epi32(i + 1);
         let mut nbits = 0u64;
@@ -2920,7 +2920,6 @@ mod x86_row {
         let pen = _mm256_set1_epi32(o_del + e_del * (i + 1));
         let (vmax, vmin) = (_mm256_set1_epi32(i32::MAX), _mm256_set1_epi32(i32::MIN));
         let (mut gb, mut ge, mut fl, mut fh) = (vmax, zero, vmin, vmax);
-        let mut abits = 0u64;
         for o in (0..N).step_by(8) {
             let tl = ld(tlen.add(o));
             let a = _mm256_andnot_si256(
@@ -2950,9 +2949,8 @@ mod x86_row {
             narrow8(end_lane.add(o), xe);
             narrow8(active_lane.add(o), _mm256_and_si256(a, ff));
             narrow8(active.add(o) as *mut u8, _mm256_and_si256(a, one));
-            abits |= bits8(a) << o;
         }
-        (hmin(gb), hmax(ge), hmax(fl), hmin(fh), abits, nbits)
+        (hmin(gb), hmax(ge), hmax(fl), hmin(fh), nbits)
     }
 
     /// As `neon_row::epilogue`, over `N` lanes; returns one bit per lane still live.
@@ -3352,7 +3350,8 @@ mod neon_row {
         ((n | n >> 24) & 0xffff) as u32
     }
 
-    /// The row prologue: `(gbeg, gend, fast_lo, fast_hi)`, with `beg`/`end` intersected with
+    /// The row prologue: `(gbeg, gend, fast_lo, fast_hi, next)` (`next`: the active lanes that
+    /// have a row `i + 1`), with `beg`/`end` intersected with
     /// row `i`'s band for the active lanes, `h1` the left-edge value, and the lane vectors the
     /// column loop masks with (`beg`, band width, active).
     ///
@@ -3377,7 +3376,7 @@ mod neon_row {
         end_lane: *mut u8,
         active_lane: *mut u8,
         _bias: u8,
-    ) -> (i32, i32, i32, i32, u64, u64) {
+    ) -> (i32, i32, i32, i32, u64) {
         debug_assert!(N == 16 && _bias == 0);
         let i1 = vdupq_n_s32(i + 1);
         let mut nxt = [vdupq_n_u32(0); 4];
@@ -3437,7 +3436,7 @@ mod neon_row {
             vreinterpretq_s32_u32(nxt[2]),
             vreinterpretq_s32_u32(nxt[3]),
         ]);
-        (gb, ge, fl, fh, u64::from(bits(a8)), u64::from(bits(n8)))
+        (gb, ge, fl, fh, u64::from(bits(n8)))
     }
 
     /// Fill the chunk's SoA buffers (`cols` query positions, `rows` target positions, both
