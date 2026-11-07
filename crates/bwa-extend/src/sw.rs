@@ -523,6 +523,95 @@ fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
     cigar.push((len << 4) | op);
 }
 
+/// Gap costs of [`ksw_global2`]'s cell: first base (open + extend) and each further base.
+struct GlobalGaps {
+    oe_del: i32,
+    e_del: i32,
+    oe_ins: i32,
+    e_ins: i32,
+}
+
+/// One cell of [`ksw_global2`]'s forward pass. `mm` is H(i-1, j-1) and `e` E(i, j) on entry, `s`
+/// the score of (target[i], query[j]); updates `f` (to F(i, j+1)) and `h1` (to H(i, j)) and
+/// returns the traceback byte and E(i+1, j).
+///
+/// Direction bits 0-1 say how H was reached (0 = M, 1 = E, 2 = F); `>=` throughout means ties
+/// prefer M over E over F (`ksw.cpp:613-616`), which is part of the output CIGAR. E and F open from
+/// M, never from H (`ksw.cpp:604-607`); bit 2 records a continued deletion, bit 4 a continued
+/// insertion, two bits per field so the traceback shifts by `which << 1` uniformly. Every select
+/// goes through `select_unpredictable`: the conditions flip on mismatch positions, and LLVM's x86
+/// backend otherwise compiled them into branches (~21 cycles per cell on Zen 3 at ~50%
+/// misprediction). The hint forces conditional moves; the values are untouched.
+#[inline(always)]
+fn global_cell(mm: i32, e: i32, s: i8, f: &mut i32, h1: &mut i32, g: &GlobalGaps) -> (u8, i32) {
+    use std::hint::select_unpredictable;
+    let mm = mm + i32::from(s);
+    let mut d: u8 = u8::from(mm < e);
+    let mut h = select_unpredictable(mm >= e, mm, e);
+    d = select_unpredictable(h >= *f, d, 2);
+    h = select_unpredictable(h >= *f, h, *f);
+    *h1 = h;
+    let t = mm - g.oe_del;
+    let e = e - g.e_del;
+    d |= select_unpredictable(e > t, 1 << 2, 0);
+    let e = select_unpredictable(e > t, e, t);
+    let t = mm - g.oe_ins;
+    *f -= g.e_ins;
+    d |= select_unpredictable(*f > t, 2 << 4, 0);
+    *f = select_unpredictable(*f > t, *f, t);
+    (d, e)
+}
+
+/// The interior rows `[i0, i1)` of [`ksw_global2`] at band `w = (N - 1) / 2`: each row is the full
+/// `N` cells `[i - w, i + w]` with `h1` and `f` starting at MINUS_INF, reads `eh[i-w ..= i+w]`, and
+/// writes back the same span plus `eh[i+w+1] = {h1, MINUS_INF}`. Row `i + 1` reads only what row
+/// `i` wrote and nothing reads `eh[i-w]` again, so the window stays in registers, shifted by one
+/// cell per row, and is stored back after the last row. Same cells, same order as the row loop.
+#[allow(clippy::type_complexity)]
+#[inline(always)]
+fn global_mid_rows<const N: usize>(
+    (eh_h, eh_e, qp, target, z, qlen, g): (
+        &mut [i32],
+        &mut [i32],
+        &[i8],
+        &[u8],
+        &mut [u8],
+        usize,
+        &GlobalGaps,
+    ),
+    i0: usize,
+    i1: usize,
+) {
+    let w = (N - 1) / 2;
+    let mut wh = [0i32; N];
+    let mut we = [0i32; N];
+    wh.copy_from_slice(&eh_h[i0 - w..i0 - w + N]);
+    we.copy_from_slice(&eh_e[i0 - w..i0 - w + N]);
+    for i in i0..i1 {
+        let tc = target[i] as usize;
+        let q: &[i8; N] = qp[tc * qlen + i - w..][..N].try_into().unwrap();
+        let zi: &mut [u8; N] = (&mut z[i * N..][..N]).try_into().unwrap();
+        let (mut f, mut h1) = (MINUS_INF, MINUS_INF);
+        let (mut nh, mut ne) = ([0i32; N], [0i32; N]);
+        for k in 0..N {
+            let s = h1;
+            let (d, e) = global_cell(wh[k], we[k], q[k], &mut f, &mut h1, g);
+            zi[k] = d;
+            // eh[beg + k] becomes {s, e}; the next row's window starts one cell later.
+            if k > 0 {
+                nh[k - 1] = s;
+                ne[k - 1] = e;
+            }
+        }
+        nh[N - 1] = h1;
+        ne[N - 1] = MINUS_INF;
+        wh = nh;
+        we = ne;
+    }
+    eh_h[i1 - w..i1 - w + N].copy_from_slice(&wh);
+    eh_e[i1 - w..i1 - w + N].copy_from_slice(&we);
+}
+
 /// Banded **global** (end-to-end, Needleman-Wunsch with affine gaps) alignment with traceback: a
 /// faithful port of `ksw_global2` (`ksw.cpp:558-668`). Returns the score of aligning all of `query`
 /// against all of `target` and the CIGAR realising it (`len<<4 | op`, op 0=M/1=I/2=D).
@@ -661,7 +750,33 @@ pub fn ksw_global2(
         // ===========================================================================================
         // Forward pass: fill the score arrays and record, per cell, how each of H/E/F was reached
         // ===========================================================================================
-        for i in 0..tlen {
+        // Rows strictly inside the band (`w < i`, `i + w + 1 < qlen`) cover exactly `2w + 1` cells
+        // each, and each one reads only what the row before wrote; for a narrow band those rows run
+        // in a register window instead (`global_mid_rows`, fg-labs/bwa-mem3's `mid_rows`).
+        let mid_lo = (w + 1).min(tlen);
+        let mid_hi = qlen.saturating_sub(w + 1).min(tlen).max(mid_lo);
+        let g = GlobalGaps {
+            oe_del,
+            e_del,
+            oe_ins,
+            e_ins,
+        };
+        let mut i = 0;
+        while i < tlen {
+            if i == mid_lo && mid_hi > mid_lo && (1..=7).contains(&w) {
+                let rows = (&mut *eh_h, &mut *eh_e, &*qp, target, &mut *z, qlen, &g);
+                match w {
+                    1 => global_mid_rows::<3>(rows, mid_lo, mid_hi),
+                    2 => global_mid_rows::<5>(rows, mid_lo, mid_hi),
+                    3 => global_mid_rows::<7>(rows, mid_lo, mid_hi),
+                    4 => global_mid_rows::<9>(rows, mid_lo, mid_hi),
+                    5 => global_mid_rows::<11>(rows, mid_lo, mid_hi),
+                    6 => global_mid_rows::<13>(rows, mid_lo, mid_hi),
+                    _ => global_mid_rows::<15>(rows, mid_lo, mid_hi),
+                }
+                i = mid_hi;
+                continue;
+            }
             // F(i, beg): no insertion can be open at the row's left edge, and "impossible" is MINUS_INF
             // here rather than 0, since a global alignment has no local floor.
             let mut f = MINUS_INF;
@@ -693,50 +808,16 @@ pub fn ksw_global2(
                 // previous row) and `e` is E(i, j); after the `+= q[j]` below, `mm` is M(i,j). The
                 // store of `h1` into `eh_h[j]` publishes H(i, j-1), which is what row i+1 will read as
                 // *its* diagonal predecessor, so both reads must happen before it.
-                let mut mm = eh_h[j];
-                let mut e = eh_e[j];
+                let (mm, e) = (eh_h[j], eh_e[j]);
                 eh_h[j] = h1;
-                mm += i32::from(q[j]);
-                // Direction bits 0-1. `>=` throughout means ties prefer M over E over F, in that order
-                // (`ksw.cpp:613-616`). Tie order is part of the output CIGAR, so it is not free choice.
-                // `d` accumulates this cell's traceback byte: bits 0-1 (set here) say how H(i,j) was
-                // reached, 0 = from M, 1 = from E, 2 = from F. `h` becomes H(i,j) = max(M, E, F).
-                // Every select in this body goes through `select_unpredictable`, and that hint is the
-                // whole x86 story: the conditions flip on mismatch positions, i.e. randomly, and LLVM's
-                // x86 backend was compiling these `if`s into BRANCHES (64 branches, 12 cmov in the v3
-                // asm of this function). At ~50% misprediction and ~17 cycles each on Zen 3 that is
-                // ~21 cycles per cell, the measured 30.6 us per call against 5.4 us for the same call
-                // on an M4, whose predictor absorbs it. The hint forces conditional moves; the VALUES
-                // are untouched, so this cannot move a byte, and the tie-break comments still hold.
-                use std::hint::select_unpredictable;
-                let mut d: u8 = u8::from(mm < e);
-                let mut h = select_unpredictable(mm >= e, mm, e);
-                d = select_unpredictable(h >= f, d, 2);
-                h = select_unpredictable(h >= f, h, f);
-                h1 = h;
-                // Outgoing E/F, again opening from M (`mm`), never from `h`: same "no 100M3I3D20M" rule
-                // as the local kernel, spelled out in the C's comment at `ksw.cpp:604-607`. Bit 2 records
-                // "the deletion was continued rather than opened", bit 4 the same for the insertion; the
-                // C uses two bits per field (`1<<2`, `2<<4`) purely so the traceback can shift by
-                // `which<<1` uniformly (`ksw.cpp:625` notes one bit would do).
-                // `t` is the "open a fresh deletion here" candidate, M(i,j) minus the first gap base;
-                // `e` becomes the "keep the deletion already open" candidate. The larger is E(i+1, j).
-                let t = mm - oe_del;
-                e -= e_del;
-                d |= select_unpredictable(e > t, 1 << 2, 0);
-                e = select_unpredictable(e > t, e, t);
+                let (d, e) = global_cell(mm, e, q[j], &mut f, &mut h1, &g);
                 eh_e[j] = e;
-                // Same for the insertion side: `t` opens a fresh one from M(i,j), `f` extends the one
-                // already open. The larger is F(i, j+1), which flows rightward in this register only.
-                let t = mm - oe_ins;
-                f -= e_ins;
-                d |= select_unpredictable(f > t, 2 << 4, 0);
-                f = select_unpredictable(f > t, f, t);
                 // Stored band-relative: column j of row i lives at offset j - beg.
                 z[z_row_offset + (j - beg)] = d;
             }
             eh_h[end] = h1;
             eh_e[end] = MINUS_INF;
+            i += 1;
         }
         // H(tlen-1, qlen-1) as flushed by the last row's epilogue: the score of aligning all of `query`
         // against all of `target`. May be negative.
