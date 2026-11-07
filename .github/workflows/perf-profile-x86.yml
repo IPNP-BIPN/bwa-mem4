@@ -183,7 +183,7 @@ jobs:
       - name: What machine is this
         run: |
           awk -F': ' '/^model name/{print "cpu: "$2; exit}' /proc/cpuinfo
-          echo "cores: $(nproc)"
+          echo "cores: $(nproc)"; grep -o -m1 avx512bw /proc/cpuinfo || echo "no avx512bw"
 
       - name: Install bwa-mem2 + wgsim (bioconda)
         uses: mamba-org/setup-micromamba@v2
@@ -228,7 +228,11 @@ jobs:
           # every one of these knobs is documented as scheduling-only.
           base=$(timed BWA4_NOOP=1); ref_md5=$(grep -v '^@PG' out.sam | md5sum | cut -d' ' -f1)
           echo "control (defaults): ${base}s  md5=${ref_md5}"
-          for arm in "BWA4_LOCKSTEP_N=16" "BWA4_LOCKSTEP_N=32" "BWA4_LOCKSTEP_N=64" \
+          # The extension tier too: the start-up calibration times a synthetic batch with no z-drop
+          # deaths, while real batches waste more lanes the wider the vector (BWA4_LANE_TRACE model:
+          # 3.0x executed/useful cells at 16 lanes, 3.9x at 32, 6.05x at 64).
+          for arm in "BWA4_EXTEND_TIER=avx512" "BWA4_EXTEND_TIER=avx2" "BWA4_EXTEND_TIER=sse41" \
+                     "BWA4_LOCKSTEP_N=16" "BWA4_LOCKSTEP_N=32" "BWA4_LOCKSTEP_N=64" \
                      "BWA4_SA_WINDOW=32" "BWA4_SA_WINDOW=64" "BWA4_SA_WINDOW=256" \
                      "BWA4_SEED_PREFETCH=0" "BWA4_SEED_PREFETCH=16" "BWA4_SEED_PREFETCH=32"; do
             t=$(timed "$arm")
