@@ -892,11 +892,16 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
         }
         let mut t =
             acc[0] ^ acc[1].rotate_left(13) ^ acc[2].rotate_left(29) ^ acc[3].rotate_left(43);
-        for w in rest.chunks(8) {
-            let mut v = 0u64;
-            for (i, &b) in w.iter().enumerate() {
-                v |= u64::from(b) << (8 * i);
-            }
+        let (words, tail) = rest.as_chunks::<8>();
+        for w in words {
+            t = (t ^ u64::from_le_bytes(*w)).wrapping_mul(P);
+        }
+        if !tail.is_empty() {
+            // The last eight bytes, overlapping the words before: the lengths are already in `h`.
+            let v = match s.len().checked_sub(8) {
+                Some(at) => word(&s[at..]),
+                None => tail.iter().rev().fold(0, |v, &b| v << 8 | u64::from(b)),
+            };
             t = (t ^ v).wrapping_mul(P);
         }
         *h = (t ^ t >> 29).wrapping_mul(P);
