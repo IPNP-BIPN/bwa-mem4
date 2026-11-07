@@ -1835,8 +1835,19 @@ fn window_hash(b: &[u8]) -> u64 {
                 .rotate_left(31);
         }
     }
-    for (i, &x) in rest.iter().enumerate() {
-        h[i & 3] = (h[i & 3] ^ u64::from(x)).wrapping_mul(M).rotate_left(31);
+    let (tail_words, tail) = rest.as_chunks::<8>();
+    for (l, x) in h.iter_mut().zip(tail_words) {
+        *l = (*l ^ u64::from_le_bytes(*x))
+            .wrapping_mul(M)
+            .rotate_left(31);
+    }
+    if !tail.is_empty() {
+        // The last eight bytes, overlapping the words before; the length is already in `h[0]`.
+        let x = match b.len().checked_sub(8) {
+            Some(at) => u64::from_le_bytes(b[at..].try_into().unwrap()),
+            None => tail.iter().rev().fold(0, |v, &x| v << 8 | u64::from(x)),
+        };
+        h[3] = (h[3] ^ x).wrapping_mul(M).rotate_left(31);
     }
     (h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48)).wrapping_mul(M)
 }

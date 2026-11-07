@@ -69,7 +69,7 @@ pub enum Stage {
     Align = 2,
     /// Paired-end de-interleave of the flat interleaved code/region lists back into pairs.
     Deinterleave = 3,
-    /// Per-read dedup and primary patching (`mem_sort_dedup_patch` + `stamp_is_alt`), parallel.
+    /// Paired-end: the borrowed per-mate view of the batch's regions that `mem_pestat` reads.
     DedupPrep = 4,
     /// `mem_pestat`: the per-batch insert-size model. Serial, and it sorts the whole batch.
     Pestat = 5,

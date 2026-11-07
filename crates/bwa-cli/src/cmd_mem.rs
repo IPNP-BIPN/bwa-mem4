@@ -2961,7 +2961,6 @@ fn pe_read_batches(
             if batch.is_empty() {
                 break;
             }
-            // Pair count, saved before the move so `base_pair` can advance after the send.
             let n = batch.len() as u64;
             if tx.send((batch, base_pair)).is_err() {
                 break;
@@ -3050,7 +3049,7 @@ fn run_pe(
         // ---- De-interleave each mate's regions by sequential moves (no content copy) ----
         // Invariant: the two `next()` calls take mate 1's and mate 2's regions of the SAME pair;
         // each `unwrap` is sound because the list holds exactly `2 * batch.len()` items.
-        let paired: Vec<(Vec<MemAlnReg>, Vec<MemAlnReg>)> =
+        let mut paired: Vec<(Vec<MemAlnReg>, Vec<MemAlnReg>)> =
             stage_time::measure(Stage::Deinterleave, || {
                 let mut regs_iter = regs_all.into_iter();
                 (0..batch.len())
@@ -3058,37 +3057,16 @@ fn run_pe(
                     .collect()
             });
 
-        // ---- Reunite each pair with its records ----
-        // Everything the pairing and output stages need, one entry per pair in pair order. Mutable
-        // because mate rescue writes new regions into it and `mem_sam_pe` then rewrites them again.
-        let mut prepared: Vec<PrepPair> = stage_time::measure(Stage::DedupPrep, || {
-            stage_time::barrier::region(Stage::DedupPrep, || {
-                // `into_par_iter`: `batch` is dead after this stage, so the records are MOVED.
-                batch
-                    .into_par_iter()
-                    .zip(paired.into_par_iter())
-                    .map(|((rec1, rec2), (regs1, regs2))| {
-                        stage_time::barrier::worker(|| PrepPair {
-                            regs1,
-                            regs2,
-                            rec1,
-                            rec2,
-                        })
-                    })
-                    .collect()
-            })
-        });
-
         // ---- Insert-size distribution, estimated once over the WHOLE batch. This is why batch
         //      boundaries (`-K`) are visible in paired-end output ----
         // Borrowed view of every mate's regions, re-interleaved, as `mem_pestat` expects: it reads
         // consecutive pairs of entries as the two ends of one pair.
-        // Charged to `pestat` rather than to a row of its own: it exists only to feed `mem_pestat`
-        // and shares its fate under any fix.
-        let regs_ref: Vec<&[MemAlnReg]> = stage_time::measure(Stage::Pestat, || {
-            prepared
+        // Charged to `dedup_prep`, the row that used to move every pair into one struct with its
+        // records: the stages below zip `batch` with `paired` instead.
+        let regs_ref: Vec<&[MemAlnReg]> = stage_time::measure(Stage::DedupPrep, || {
+            paired
                 .iter()
-                .flat_map(|pair| [pair.regs1.as_slice(), pair.regs2.as_slice()])
+                .flat_map(|(regs1, regs2)| [regs1.as_slice(), regs2.as_slice()])
                 .collect()
         });
         // The insert-size model in force for THIS batch: the four orientations' mean, std and the
@@ -3119,15 +3097,15 @@ fn run_pe(
         if !scalar_rescue && !no_rescue {
             stage_time::measure(Stage::Rescue, || {
                 // One rescue job per pair: each mate's codes plus a MUTABLE borrow of its region list,
-                // which the rescue appends newly found alignments to. Borrowing `prepared` mutably is
-                // why this vector exists at all rather than the rescue reading `prepared` directly.
-                let mut rescue_jobs: Vec<PairRescueData> = prepared
-                    .iter_mut()
-                    .map(|pair| PairRescueData {
-                        seq0: pair.rec1.seq(),
-                        seq1: pair.rec2.seq(),
-                        a0: &mut pair.regs1,
-                        a1: &mut pair.regs2,
+                // which the rescue appends newly found alignments to.
+                let mut rescue_jobs: Vec<PairRescueData> = batch
+                    .iter()
+                    .zip(paired.iter_mut())
+                    .map(|((rec1, rec2), (regs1, regs2))| PairRescueData {
+                        seq0: rec1.seq(),
+                        seq1: rec2.seq(),
+                        a0: regs1,
+                        a1: regs2,
                     })
                     .collect();
                 // Each pair's rescue is independent, so run chunks in parallel; a chunk of a few hundred
@@ -3150,17 +3128,18 @@ fn run_pe(
             stage_time::barrier::region(Stage::SamEmit, || {
                 // `into_par_iter`, so each pair's records and regions are freed as its text appears.
                 // Batch N's tail overlaps batch N+1's align, and that is where the run's peak is.
-                prepared
+                batch
                     .into_par_iter()
+                    .zip(paired.into_par_iter())
                     .enumerate()
-                    .map(|(pair_in_batch, mut pair)| {
+                    .map(|(pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
                         stage_time::barrier::worker(|| {
                             // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
                             // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
-                            let names = [pair.rec1.name(), pair.rec2.name()];
-                            let seqs = [pair.rec1.seq(), pair.rec2.seq()];
-                            let quals = [pair.rec1.qual(), pair.rec2.qual()];
-                            let comments = [pair.rec1.comment(), pair.rec2.comment()];
+                            let names = [rec1.name(), rec2.name()];
+                            let seqs = [rec1.seq(), rec2.seq()];
+                            let quals = [rec1.qual(), rec2.qual()];
+                            let comments = [rec1.comment(), rec2.comment()];
                             // This pair's SAM text.
                             let mut buf = Vec::new();
                             mem_sam_pe(
@@ -3173,8 +3152,8 @@ fn run_pe(
                                 &seqs,
                                 &quals,
                                 &comments,
-                                &mut pair.regs1,
-                                &mut pair.regs2,
+                                &mut regs1,
+                                &mut regs2,
                                 // rescue_done: true when nothing further should rescue -- either the batched
                                 // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
                                 !scalar_rescue || no_rescue,
@@ -3301,26 +3280,6 @@ fn rescue_pairs_override() -> Option<usize> {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
     })
-}
-
-/// One read pair prepared for the pairing/output stage: dedup'd regions and the two records.
-struct PrepPair {
-    /// Each mate's deduplicated candidate alignments, still unpaired at this point. Mutated twice
-    /// more: mate rescue may append to them, then `mem_sam_pe` marks primaries and pairs them.
-    regs1: Vec<MemAlnReg>,
-    regs2: Vec<MemAlnReg>,
-    /// The two input records, MOVED out of the batch rather than copied field by field.
-    ///
-    /// This used to be six owned fields (`name1/2`, `qual1/2`, `comment1/2`) cloned out of the
-    /// records, which is six allocations per pair. Since `Record` became one buffer plus offsets
-    /// the whole record is 32 bytes and moving it is strictly cheaper than copying any one of its
-    /// parts. `seq()` holds nt4 codes (A=0, C=1, G=2, T=3, else 4), recoded in place at encode.
-    ///
-    /// `name()` is the QNAME: bwa emits the SAME name on both records of a pair, so any `/1`, `/2`
-    /// suffix has already been stripped by the reader. `qual()` is the per-base ASCII quality, or
-    /// `None` for FASTA input (SAM column 11 becomes `*`), always as long as `seq()`. `comment()` is the `-C` trailer.
-    rec1: Record,
-    rec2: Record,
 }
 
 #[cfg(test)]
