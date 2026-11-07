@@ -1504,6 +1504,270 @@ mod dense {
     }
 }
 
+/// [`dense`] on x86 in SSSE3/SSE4.1: the same segments, scans and carries, vector for vector
+/// (`int16x8_t` and `__m128i` hold the same eight lanes), so the same bounds and components.
+#[cfg(target_arch = "x86_64")]
+mod dense {
+    use super::{Comp, Params, Scratch};
+    use std::arch::x86_64::*;
+
+    /// Transpose 8 vectors of 8 lanes.
+    #[inline(always)]
+    unsafe fn tr8(v: &mut [__m128i; 8]) {
+        let a = [
+            _mm_unpacklo_epi16(v[0], v[1]),
+            _mm_unpackhi_epi16(v[0], v[1]),
+            _mm_unpacklo_epi16(v[2], v[3]),
+            _mm_unpackhi_epi16(v[2], v[3]),
+            _mm_unpacklo_epi16(v[4], v[5]),
+            _mm_unpackhi_epi16(v[4], v[5]),
+            _mm_unpacklo_epi16(v[6], v[7]),
+            _mm_unpackhi_epi16(v[6], v[7]),
+        ];
+        let b = [
+            _mm_unpacklo_epi32(a[0], a[2]),
+            _mm_unpackhi_epi32(a[0], a[2]),
+            _mm_unpacklo_epi32(a[1], a[3]),
+            _mm_unpackhi_epi32(a[1], a[3]),
+            _mm_unpacklo_epi32(a[4], a[6]),
+            _mm_unpackhi_epi32(a[4], a[6]),
+            _mm_unpacklo_epi32(a[5], a[7]),
+            _mm_unpackhi_epi32(a[5], a[7]),
+        ];
+        for k in 0..4 {
+            v[2 * k] = _mm_unpacklo_epi64(b[k], b[k + 4]);
+            v[2 * k + 1] = _mm_unpackhi_epi64(b[k], b[k + 4]);
+        }
+    }
+
+    /// NEON's `vextq_s16::<N>(a, b)`: lanes `a[N..8]` then `b[0..N]`.
+    macro_rules! ext {
+        ($n:literal, $a:expr, $b:expr) => {
+            _mm_alignr_epi8::<{ 2 * $n }>($b, $a)
+        };
+    }
+
+    #[inline(always)]
+    unsafe fn ld(p: *const i16) -> __m128i {
+        _mm_loadu_si128(p as *const __m128i)
+    }
+
+    #[inline(always)]
+    unsafe fn st(p: *mut i16, v: __m128i) {
+        _mm_storeu_si128(p as *mut __m128i, v)
+    }
+
+    /// Signed `a >= b` per lane.
+    #[inline(always)]
+    unsafe fn cge(a: __m128i, b: __m128i) -> __m128i {
+        _mm_cmpeq_epi16(_mm_max_epi16(a, b), a)
+    }
+
+    /// Horizontal signed max, through the unsigned horizontal min (32767 - v reverses the order).
+    #[inline(always)]
+    unsafe fn hmax(v: __m128i) -> i16 {
+        let k = _mm_set1_epi16(i16::MAX);
+        (32767 - i32::from(_mm_extract_epi16::<0>(_mm_minpos_epu16(_mm_sub_epi16(k, v))) as u16))
+            as i16
+    }
+
+    /// See the NEON `bounds`; same results.
+    ///
+    /// # Safety
+    /// SSSE3 and SSE4.1; `s.cnt` holds the count of `nd` diagonals, zero up to the next multiple
+    /// of 64.
+    #[target_feature(enable = "ssse3,sse4.1")]
+    pub(super) unsafe fn bounds(s: &mut Scratch, p: &Params, nd: usize) -> Option<bool> {
+        let l = nd.div_ceil(64) * 8;
+        let nt = 8 * l;
+        if i64::from(p.a) * s.nhits as i64 + i64::from(p.c) * (nt + l) as i64 > 32000 {
+            return None;
+        }
+        debug_assert!(s.cnt.len() >= nt && s.minrow.len() >= nt);
+        for v in [&mut s.dp, &mut s.dm, &mut s.bnd] {
+            if v.len() < nt {
+                v.resize(nt, 0);
+            }
+        }
+        let (zero, big, small) = (
+            _mm_setzero_si128(),
+            _mm_set1_epi16(i16::MAX),
+            _mm_set1_epi16(i16::MIN),
+        );
+        let (wa, wc) = (_mm_set1_epi16(p.a as i16), _mm_set1_epi16(p.c as i16));
+        let cnt = s.cnt.as_ptr() as *const i16;
+        let (dp, dm) = (s.dp.as_mut_ptr(), s.dm.as_mut_ptr());
+        let (cp, mb, xa);
+        {
+            let (mut pv, mut rm, mut mx, mut bestl) = (zero, big, small, small);
+            let mut t = 0;
+            while t < l {
+                let mut c: [__m128i; 8] = std::array::from_fn(|k| ld(cnt.add(k * l + t)));
+                tr8(&mut c);
+                for (k, &ck) in c.iter().enumerate() {
+                    pv = _mm_add_epi16(pv, _mm_sub_epi16(_mm_mullo_epi16(ck, wa), wc));
+                    st(dp.add((t + k) * 8), pv);
+                    st(dm.add((t + k) * 8), rm);
+                    bestl = _mm_max_epi16(bestl, _mm_subs_epi16(pv, rm));
+                    rm = _mm_min_epi16(rm, pv);
+                    mx = _mm_max_epi16(mx, pv);
+                }
+                t += 8;
+            }
+            let mut x = pv;
+            x = _mm_add_epi16(x, ext!(7, zero, x));
+            x = _mm_add_epi16(x, ext!(6, zero, x));
+            x = _mm_add_epi16(x, ext!(4, zero, x));
+            cp = ext!(7, zero, x);
+            let mut g = _mm_add_epi16(cp, rm);
+            g = _mm_min_epi16(g, ext!(7, big, g));
+            g = _mm_min_epi16(g, ext!(6, big, g));
+            g = _mm_min_epi16(g, ext!(4, big, g));
+            mb = _mm_min_epi16(ext!(7, zero, g), zero);
+            let h = _mm_add_epi16(cp, mx);
+            let mut hs = _mm_max_epi16(h, ext!(1, h, small));
+            hs = _mm_max_epi16(hs, ext!(2, hs, small));
+            hs = _mm_max_epi16(hs, ext!(4, hs, small));
+            xa = ext!(1, hs, small);
+            let best = _mm_max_epi16(bestl, _mm_sub_epi16(h, mb));
+            if p.base() + i32::from(hmax(best)) < p.minsc {
+                return Some(false);
+            }
+        }
+        let basev = _mm_set1_epi16(p.base() as i16);
+        let ml = _mm_sub_epi16(mb, cp);
+        let mut sx = _mm_subs_epi16(xa, cp);
+        let bnd = s.bnd.as_mut_ptr();
+        let mut t = l;
+        while t > 0 {
+            t -= 8;
+            let mut bd = [zero; 8];
+            for k in (0..8).rev() {
+                let o = (t + k) * 8;
+                sx = _mm_max_epi16(sx, ld(dp.add(o)));
+                bd[k] = _mm_add_epi16(basev, _mm_sub_epi16(sx, _mm_min_epi16(ml, ld(dm.add(o)))));
+            }
+            tr8(&mut bd);
+            for (k, &b) in bd.iter().enumerate() {
+                st(bnd.add(k * l + t), b);
+            }
+        }
+        Some(true)
+    }
+
+    /// See the NEON `components`; same results.
+    ///
+    /// # Safety
+    /// SSSE3 and SSE4.1, after `bounds(s, _, nd)` returned `Some(true)`.
+    #[target_feature(enable = "ssse3,sse4.1")]
+    pub(super) unsafe fn components(
+        s: &mut Scratch,
+        tau: i32,
+        off: i32,
+        nd: usize,
+        out: &mut Vec<Comp>,
+    ) {
+        out.clear();
+        let nw = nd.div_ceil(64);
+        for v in [&mut s.mw, &mut s.hw] {
+            v.clear();
+            v.resize(nw, 0);
+        }
+        let tv = _mm_set1_epi16(tau.clamp(-32768, 32767) as i16);
+        let zero = _mm_setzero_si128();
+        let (bnd, cnt) = (s.bnd.as_ptr(), s.cnt.as_ptr() as *const i16);
+        for w in 0..nw {
+            let (mut mwb, mut hwb) = (0u64, 0u64);
+            for g in 0..4 {
+                let at = w * 64 + g * 16;
+                let ge = _mm_packs_epi16(cge(ld(bnd.add(at)), tv), cge(ld(bnd.add(at + 8)), tv));
+                let empty = _mm_packs_epi16(
+                    _mm_cmpeq_epi16(ld(cnt.add(at)), zero),
+                    _mm_cmpeq_epi16(ld(cnt.add(at + 8)), zero),
+                );
+                mwb |= u64::from(_mm_movemask_epi8(ge) as u32 as u16) << (16 * g);
+                hwb |= u64::from(_mm_movemask_epi8(_mm_andnot_si128(empty, ge)) as u32 as u16)
+                    << (16 * g);
+            }
+            s.mw[w] = mwb;
+            s.hw[w] = hwb;
+        }
+        if !nd.is_multiple_of(64) {
+            let keep = (1u64 << (nd % 64)) - 1;
+            s.mw[nw - 1] &= keep;
+            s.hw[nw - 1] &= keep;
+        }
+        let next = |bits: &[u64], from: usize, inv: u64| -> usize {
+            let mut w = from / 64;
+            if w >= nw {
+                return nd;
+            }
+            let mut x = (bits[w] ^ inv) & (!0u64 << (from % 64));
+            loop {
+                if x != 0 {
+                    return (w * 64 + x.trailing_zeros() as usize).min(nd);
+                }
+                w += 1;
+                if w >= nw {
+                    return nd;
+                }
+                x = bits[w] ^ inv;
+            }
+        };
+        const IO: [i16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let io = ld(IO.as_ptr());
+        let minrow = s.minrow.as_ptr() as *const i16;
+        let mut d = next(&s.mw, 0, 0);
+        while d < nd {
+            let (a, b) = (d, next(&s.mw, d, !0));
+            let mut dmax = None;
+            let mut w = (b - 1) / 64;
+            loop {
+                let lo_mask = if w == a / 64 { !0u64 << (a % 64) } else { !0 };
+                let hi_mask = if w == (b - 1) / 64 {
+                    !0u64 >> (63 - (b - 1) % 64)
+                } else {
+                    !0
+                };
+                let x = s.hw[w] & lo_mask & hi_mask;
+                if x != 0 {
+                    dmax = Some(w * 64 + 63 - x.leading_zeros() as usize);
+                    break;
+                }
+                if w == a / 64 {
+                    break;
+                }
+                w -= 1;
+            }
+            if let Some(dmax) = dmax {
+                let (va, vb) = (_mm_set1_epi16(a as i16), _mm_set1_epi16(b as i16));
+                let (mut mx, mut mn) = (_mm_set1_epi16(i16::MIN), _mm_set1_epi16(-1));
+                let (smin, umax) = (_mm_set1_epi16(i16::MIN), _mm_set1_epi16(-1));
+                let mut x = a & !7;
+                while x < b {
+                    let pos = _mm_add_epi16(io, _mm_set1_epi16(x as i16));
+                    let inr = _mm_andnot_si128(cge(pos, vb), cge(pos, va));
+                    let c = ld(cnt.add(x));
+                    mx = _mm_max_epi16(mx, _mm_blendv_epi8(smin, ld(bnd.add(x)), inr));
+                    let take = _mm_andnot_si128(_mm_cmpeq_epi16(c, zero), inr);
+                    mn = _mm_min_epu16(mn, _mm_blendv_epi8(umax, ld(minrow.add(x)), take));
+                    x += 8;
+                }
+                out.push(Comp {
+                    ub: i32::from(hmax(mx)),
+                    i0: i32::from(_mm_extract_epi16::<0>(_mm_minpos_epu16(mn)) as u16),
+                    dlo: a as i32 - off,
+                    dhi: b as i32 - 1 - off,
+                    dmaxhit: dmax as i32 - off,
+                    kf: 0,
+                    kl: 0,
+                });
+            }
+            d = next(&s.mw, b, 0);
+        }
+    }
+}
+
 /// The decision from the per-diagonal counts, walking only the diagonals that hold a hit.
 ///
 /// The bound is a Kadane scan over all `nd` diagonals with weight `a * cnt - c`, but between two
@@ -1593,10 +1857,10 @@ fn occ_ready(s: &mut Scratch) {
 /// [`sparse_decision`]. Both leave the components at `minsc` in `s.c19`; `s.dense` says which.
 fn decide_counts(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decision {
     s.dense = false;
-    #[cfg(target_arch = "aarch64")]
     // A stale `occ_bits` means the counter got past its early returns: some diagonal holds a hit.
     if dense_enabled() && (s.occ_stale || s.occ_bits.iter().any(|&w| w != 0)) {
-        // SAFETY: NEON is part of the aarch64 baseline; the count just filled `s` for `nd`.
+        // SAFETY: `dense_enabled` holds NEON (aarch64 baseline) or SSSE3+SSE4.1 (checked on x86);
+        // the count just filled `s` for `nd`.
         match unsafe { dense::bounds(s, p, nd) } {
             Some(false) => return Decision::Fail,
             Some(true) => {
@@ -1614,11 +1878,17 @@ fn decide_counts(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decisio
     sparse_decision(s, p, len1, nd)
 }
 
-/// `BWA4_PRUNE_DENSE=0` keeps the sparse scan everywhere (A/B handle).
-#[cfg(target_arch = "aarch64")]
+/// `BWA4_PRUNE_DENSE=0` keeps the sparse scan everywhere (A/B handle). On x86 the scan also
+/// needs SSSE3 and SSE4.1, which the dense calls below rely on.
 fn dense_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_PRUNE_DENSE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        if !sse::available() {
+            return false;
+        }
+        std::env::var_os("BWA4_PRUNE_DENSE").is_none_or(|v| v != "0")
+    })
 }
 
 /// The hull of the components at `minsc`, or `Fail` when there is none.
@@ -1838,11 +2108,10 @@ pub(crate) fn decide_bands(
         }
         let t1 = p.minsc.max(ub2 / 2);
         std::mem::swap(&mut s.c19, c19);
-        #[cfg(target_arch = "aarch64")]
         if s.dense {
             // The dense components are the threshold's whole runs: already extended.
             if t1 > p.minsc {
-                // SAFETY: NEON is part of the aarch64 baseline; `bounds` filled `s` for `nd`.
+                // SAFETY: `s.dense` means `dense_enabled` held (see `decide_counts`); `bounds` filled `s`.
                 unsafe { dense::components(s, t1, off, nd, ct) };
             }
             return (dec, t1);
@@ -2038,7 +2307,6 @@ pub(crate) mod tests {
 
     /// The dense scan gives the sparse scan's decision and components (at `minsc` after
     /// [`extend`], and at the band threshold `T1`) on every job it takes.
-    #[cfg(target_arch = "aarch64")]
     #[test]
     fn dense_scan_equals_sparse_scan() {
         let mut state = 0x0bad_cafe_1234_5678u64;
