@@ -145,6 +145,18 @@ jobs:
               | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -32 || echo "(perf report produced nothing)"
           done
 
+          # Where inside our u8 extension kernel the time goes: perf's per-source-line summary.
+          sym=$("$PERF" report -i ours.data --stdio --no-children 2>/dev/null \
+            | grep -o 'bwa_neon::batched::[a-z0-9_]*::batched_extend_[a-z0-9_]*_u8' | head -1 || true)
+          if [ -n "$sym" ]; then
+            echo "===== ours: hottest source lines of $sym ====="
+            "$PERF" annotate -i ours.data --stdio -l "$sym" 2>/dev/null \
+              | grep -E '^\s+[0-9]+\.[0-9]+ ' | sort -rn | head -60 || true
+            echo "===== ours: hottest instructions of $sym ====="
+            "$PERF" annotate -i ours.data --stdio --no-source "$sym" 2>/dev/null \
+              | grep -E '^\s+[0-9]+\.[0-9]+ +:' | sort -rn | head -60 || true
+          fi
+
       - name: Keep the recordings
         if: always()
         uses: actions/upload-artifact@v4
