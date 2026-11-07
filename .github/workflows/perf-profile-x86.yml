@@ -164,7 +164,7 @@ jobs:
           # The fork's extension kernel, every sampled instruction in address order, beside ours:
           # the two column loops instruction by instruction.
           # Mangled names: the fork's are C++ with spaces once demangled.
-          for side in "ours:_R[0-9A-Za-z_]*batched_extend_[a-z0-9]*_u8[0-9A-Za-z_]*" \
+          for side in "ours:_[RZ][0-9A-Za-z_]*batched_extend_[a-z0-9]*_u8[0-9A-Za-z_]*" \
                       "fork:_Z[0-9A-Za-z_]*smithWatermanBatchWrapper8Compact[0-9A-Za-z_]*"; do
             bin=${side%%:*}; pat=${side#*:}
             sym=$("$PERF" report -i "$bin.data" --stdio --no-children --no-demangle 2>/dev/null \
