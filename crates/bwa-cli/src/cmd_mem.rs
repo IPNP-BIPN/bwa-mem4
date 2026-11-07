@@ -1713,58 +1713,23 @@ fn spawn_reader<B: Send + 'static>(
 
 /// Whether the pipeline holds a second batch in flight, deciding it once for the process.
 ///
-/// Three inputs, in priority order, because two of them are the user saying they know better:
-///
-/// 1. `BWA4_NO_BATCH_OVERLAP` set: one batch. Half the batch memory, about 1.1% of wall.
-/// 2. `BWA4_BATCH_OVERLAP` set: two batches, whatever the machine looks like.
-/// 3. Otherwise the RAM policy in [`bwa_core::sysram::batch_overlap_fits`]: overlap when the host
-///    can hold the index plus two batches with headroom, one batch when it cannot.
-///
-/// The policy exists because the two ways of being wrong are not symmetric. Dropping the overlap on
-/// a machine that could have afforded it costs 1.1% of wall; keeping it on one that cannot costs a
-/// run that swaps, and the user has no way to guess that an environment variable would have saved
-/// them. Machine-dependent, and legitimately so: the number of batches in flight is not observable
-/// in the SAM, since batch order comes from joining a batch before sending its bytes.
-///
-/// Read once and cached, like every other environment gate here.
-///
-/// # Parameters
-///
-/// - `l_pac`: forward-strand reference length, for the index footprint estimate.
-/// - `k_batch`: `-K` in bases, i.e. one batch's input size.
-/// - `verbose`: `-v`; at 3 or more the decision and the two figures behind it are printed, in bwa's
-///   own progress-line style, so a surprising memory or wall figure can be explained afterwards.
-///
-/// # Returns
-///
-/// True to overlap batch N's tail with batch N+1's alignment.
-fn batch_overlap_enabled(l_pac: u64, k_batch: usize, verbose: i32) -> bool {
+/// Off unless `BWA4_BATCH_OVERLAP` is set. The second batch is worth at most ~1% of wall (within
+/// run-to-run noise on GIAB PE at `-t8` and `-t12` on an M4 Max) and costs a whole resident batch:
+/// 0.8 GB on chr21, 1.4 GB on GIAB `-t8`, 2.3 GB at `-t12`, where it put peak RSS above
+/// fg-labs/bwa-mem3 (14.0 vs 13.8 GB, against 11.6 GB with one batch). The number of batches in
+/// flight is not observable in the SAM. `BWA4_NO_BATCH_OVERLAP` still wins, for old scripts.
+fn batch_overlap_enabled(verbose: i32) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if std::env::var_os("BWA4_NO_BATCH_OVERLAP").is_some() {
-            if verbose >= 3 {
-                eprintln!("[M::main_mem] batch overlap off (BWA4_NO_BATCH_OVERLAP)");
-            }
-            return false;
-        }
-        let forced = std::env::var_os("BWA4_BATCH_OVERLAP").is_some();
-        let d = bwa_core::sysram::batch_overlap_fits(l_pac, k_batch as u64);
-        let overlap = forced || d.overlap;
+        let on = std::env::var_os("BWA4_BATCH_OVERLAP").is_some()
+            && std::env::var_os("BWA4_NO_BATCH_OVERLAP").is_none();
         if verbose >= 3 {
-            // `?` for undetectable RAM: the figure is genuinely unknown there, and printing a zero
-            // would read as "this machine has no memory" rather than "the probe did not answer".
-            let have = d
-                .ram_gb
-                .map_or_else(|| "?".to_string(), |g| format!("{g:.1}"));
             eprintln!(
-                "[M::main_mem] batch overlap {} (RAM {} GB, needs {:.1} GB for index + 2 batches){}",
-                if overlap { "on" } else { "off" },
-                have,
-                d.need_gb,
-                if forced { ", forced" } else { "" },
+                "[M::main_mem] batch overlap {}",
+                if on { "on (BWA4_BATCH_OVERLAP)" } else { "off" }
             );
         }
-        overlap
+        on
     })
 }
 
@@ -1897,9 +1862,8 @@ fn run_pipeline<B: Send>(
         // (chr21, 2M pairs, `-K` 100M, 4 threads): resident memory is live memory there, 1.02x, so
         // the 2.02x we carry against fg-labs/bwa-mem3 (4.78 GB against 2.36 GB) is not allocator
         // retention and not a fatter batch. It is THIS line: with one batch in flight the same run
-        // takes 2.49 GB, which is 1.05x the fork rather than 2.02x. `BWA4_NO_BATCH_OVERLAP=1` is
-        // how that half of the memory is handed back, for a caller who would rather have it than
-        // the overlap.
+        // takes 2.49 GB, which is 1.05x the fork rather than 2.02x. Hence one batch by default,
+        // and `BWA4_BATCH_OVERLAP=1` for a caller who would rather spend that memory.
         let mut inflight: Option<std::thread::ScopedJoinHandle<'_, Vec<Vec<u8>>>> = None;
         loop {
             // Blocked here == starved by the reader. Charged to `wait_read`, which is the one
@@ -1921,8 +1885,8 @@ fn run_pipeline<B: Send>(
             let process_ref = &process;
             let started = scope.spawn(move || process_ref(batch, base_id));
             // Two reasons to retire this batch before reading the next one, and they meet here.
-            // `BWA4_NO_BATCH_OVERLAP` is the user-facing one: it halves resident memory (see the
-            // block above). `BWA4_STAGE_ALLOC` is the probe's: it tags allocations with a
+            // The default (no `BWA4_BATCH_OVERLAP`) is the user-facing one: it halves resident
+            // memory (see the block above). `BWA4_STAGE_ALLOC` is the probe's: it tags allocations with a
             // PROCESS-WIDE stage, so two batches in flight would each overwrite the other's tag and
             // every per-stage byte count would be a blend of two stages.
             //
@@ -2427,7 +2391,7 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     };
 
     let verbose = args.verbose.unwrap_or(3);
-    let overlap = batch_overlap_enabled(bns.l_pac as u64, k_batch, verbose);
+    let overlap = batch_overlap_enabled(verbose);
     run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)?;
     reader.join().expect("reader thread panicked")?;
     bwa_chain::chain_time::dump();
@@ -3249,7 +3213,7 @@ fn run_pe(
 
     // The reader is joined by `run`, which owns its handle: it started the thread before the index
     // load, so it is also the place that observes a reader error.
-    let overlap = batch_overlap_enabled(bns.l_pac as u64, k_batch, verbose);
+    let overlap = batch_overlap_enabled(verbose);
     run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)
 }
 

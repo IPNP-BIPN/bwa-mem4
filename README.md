@@ -131,22 +131,13 @@ byte-identical to the oracle with and without it. `BWA4_NO_PCORE_CAP=1` disables
 
 ### Trading a batch of memory for a little wall clock
 
-The pipeline keeps TWO batches in flight: batch N's thin, low-occupancy tail (dedup at 69% pool
-occupancy, encode at 29%) runs against batch N+1's extension, which is the one stage that can fill
-every core. It costs one more resident batch, and on a human genome at the default `-K` that is the
-difference between about 11 GB and 9.5 GB of peak RSS.
-
-That second batch is taken **only when the machine can hold it**: at startup the aligner compares
-detected RAM against the index plus two batches with headroom, and drops the overlap when it does
-not fit, printing which it chose at `-v 3`. `BWA4_NO_BATCH_OVERLAP=1` forces one batch,
-`BWA4_BATCH_OVERLAP=1` forces two. Nothing about the choice is observable in the SAM, so the same
-input still yields the same bytes on every machine.
-
-`BWA4_NO_BATCH_OVERLAP=1` gives that batch back. Measured on an M4 Max, `-t8`, 500k real GIAB pairs
-against GRCh38, six interleaved repetitions: **13.27 GB instead of 14.73 GB, for about 1.5% of wall**.
-What it returns is one batch, so the saving scales with `-K`: 1.46 GB at the default, 0.19 GB at
-`-K` 10M. Output is unaffected, and not by luck: batch order comes from joining a batch before
-sending its bytes, never from how many are in flight, and no batch's result depends on another's.
+The pipeline can keep TWO batches in flight: batch N's thin, low-occupancy tail (dedup, encode)
+runs against batch N+1's extension. It costs one more resident batch and buys at most ~1% of wall,
+within noise on GIAB at `-t8` and `-t12` (M4 Max), while peak RSS grows by 0.8 GB on chr21 and
+1.4 to 2.3 GB on GRCh38, enough at `-t12` to exceed fg-labs/bwa-mem3. So it is **off by default**;
+`BWA4_BATCH_OVERLAP=1` turns it on. Output is unaffected either way: batch order comes from joining
+a batch before sending its bytes, never from how many are in flight, and no batch's result depends
+on another's.
 Lowering `-K` is NOT the same lever, since it moves batch boundaries and with them the per-batch
 insert-size model, which does change the SAM.
 
