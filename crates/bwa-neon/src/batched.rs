@@ -2123,10 +2123,11 @@ macro_rules! define_sw_kernel {
                     st.qcode.resize(soa_cols * LANES, 0 as $elem);
                     st.tcode.clear();
                     st.tcode.resize(soa_rows * LANES, 0 as $elem);
-                    if $rowvec && LANES == 16 && cfg!(target_arch = "aarch64") {
-                        // SAFETY: the NEON u8 kernel: LANES == 16, `$elem` is u8.
+                    if $rowvec {
+                        // SAFETY: `rowvec` kernels are u8 (`$elem` is u8), and both SoA sizes are
+                        // multiples of 16 under `rowvec`.
                         unsafe {
-                            super::$rowmod::fill_soa16(
+                            super::$rowmod::fill_soa::<LANES>(
                                 &jobs[chunk_start..chunk_start + nlane],
                                 soa_cols,
                                 soa_rows,
@@ -3109,15 +3110,138 @@ mod x86_row {
         live_bits
     }
 
-    /// Never called: the SoA fill is vectorised on NEON only.
-    pub(super) unsafe fn fill_soa16(
-        _jobs: &[bwa_extend::ExtendJob],
-        _cols: usize,
-        _rows: usize,
-        _qcode: *mut u8,
-        _tcode: *mut u8,
+    /// Where the SSE2 unpack network below leaves column `c`: vector `BITREV[c]`.
+    const BITREV: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+
+    /// `n` positions (a multiple of 16) of 16 lane-major rows of `stride` bytes at `src`, stored
+    /// position-major into lanes `off..off + 16` of `N`-lane vectors at `dst`. Four rounds of
+    /// unpacks pair rows `2k`/`2k + 1` at widths 1, 2, 4, 8 bytes: a 16x16 byte transpose whose
+    /// columns come out in bit-reversed order.
+    ///
+    /// # Safety
+    /// `src` holds `16 * stride` bytes with `n <= stride`; `dst` holds `n * N` bytes.
+    unsafe fn transpose_to<const N: usize>(
+        src: *const u8,
+        stride: usize,
+        n: usize,
+        dst: *mut u8,
+        off: usize,
     ) {
-        unreachable!("fill_soa16 is NEON-only")
+        macro_rules! round {
+            ($v:ident, $lo:ident, $hi:ident) => {{
+                let mut o = [_mm_setzero_si128(); 16];
+                for k in 0..8 {
+                    o[k] = $lo($v[2 * k], $v[2 * k + 1]);
+                    o[k + 8] = $hi($v[2 * k], $v[2 * k + 1]);
+                }
+                o
+            }};
+        }
+        let mut b = 0;
+        while b < n {
+            let mut v = [_mm_setzero_si128(); 16];
+            for (l, x) in v.iter_mut().enumerate() {
+                *x = _mm_loadu_si128(src.add(l * stride + b) as *const __m128i);
+            }
+            let v = round!(v, _mm_unpacklo_epi8, _mm_unpackhi_epi8);
+            let v = round!(v, _mm_unpacklo_epi16, _mm_unpackhi_epi16);
+            let v = round!(v, _mm_unpacklo_epi32, _mm_unpackhi_epi32);
+            let v = round!(v, _mm_unpacklo_epi64, _mm_unpackhi_epi64);
+            for (c, &r) in BITREV.iter().enumerate() {
+                _mm_storeu_si128(dst.add((b + c) * N + off) as *mut __m128i, v[r]);
+            }
+            b += 16;
+        }
+    }
+
+    /// Fill a chunk's SoA buffers (`cols` query positions, `rows` target positions, both multiples
+    /// of 16, `N` lanes each) from the jobs, 16 lanes at a time: each sequence is copied into a
+    /// lane-major staging row, zero past its end, then transposed 16 positions at a time. Lanes
+    /// past `jobs` are left as they are (the caller's zeros).
+    ///
+    /// # Safety
+    /// `qcode` holds `cols * N` bytes and `tcode` `rows * N`; every sequence fits; `N` is a
+    /// multiple of 16 and `jobs.len() <= N`.
+    pub(super) unsafe fn fill_soa<const N: usize>(
+        jobs: &[bwa_extend::ExtendJob],
+        cols: usize,
+        rows: usize,
+        qcode: *mut u8,
+        tcode: *mut u8,
+    ) {
+        let stride = cols.max(rows);
+        STAGE.with(|st| {
+            let st = &mut *st.borrow_mut();
+            st.clear();
+            st.resize(16 * stride, 0);
+            for (blk, js) in jobs.chunks(16).enumerate() {
+                for (l, j) in js.iter().enumerate() {
+                    st[l * stride..(l + 1) * stride].fill(0);
+                    st[l * stride..l * stride + j.query.len()].copy_from_slice(j.query);
+                }
+                if js.len() < 16 {
+                    st[js.len() * stride..].fill(0);
+                }
+                transpose_to::<N>(st.as_ptr(), stride, cols, qcode, blk * 16);
+                for (l, j) in js.iter().enumerate() {
+                    st[l * stride..(l + 1) * stride].fill(0);
+                    st[l * stride..l * stride + j.target.len()].copy_from_slice(j.target);
+                }
+                transpose_to::<N>(st.as_ptr(), stride, rows, tcode, blk * 16);
+            }
+        });
+    }
+
+    thread_local! {
+        /// The lane-major staging area of [`fill_soa`].
+        static STAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// The SSE2 transpose against the plain per-byte scatter, 32 lanes over two blocks.
+        #[test]
+        fn fill_soa_matches_scatter() {
+            let mut x = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as usize
+            };
+            let seqs: Vec<(Vec<u8>, Vec<u8>)> = (0..27)
+                .map(|_| {
+                    let q = (0..1 + next() % 90).map(|_| (next() % 5) as u8).collect();
+                    let t = (0..1 + next() % 120).map(|_| (next() % 5) as u8).collect();
+                    (q, t)
+                })
+                .collect();
+            let jobs: Vec<bwa_extend::ExtendJob> = seqs
+                .iter()
+                .map(|(q, t)| bwa_extend::ExtendJob {
+                    query: q,
+                    target: t,
+                    h0: 1,
+                })
+                .collect();
+            let cols = (jobs.iter().map(|j| j.query.len()).max().unwrap() + 1).next_multiple_of(16);
+            let rows =
+                (jobs.iter().map(|j| j.target.len()).max().unwrap() + 1).next_multiple_of(16);
+            const N: usize = 32;
+            let (mut q, mut t) = (vec![0u8; cols * N], vec![0u8; rows * N]);
+            unsafe { super::fill_soa::<N>(&jobs, cols, rows, q.as_mut_ptr(), t.as_mut_ptr()) };
+            let (mut q0, mut t0) = (vec![0u8; cols * N], vec![0u8; rows * N]);
+            for (l, j) in jobs.iter().enumerate() {
+                for (k, &c) in j.query.iter().enumerate() {
+                    q0[k * N + l] = c;
+                }
+                for (k, &c) in j.target.iter().enumerate() {
+                    t0[k * N + l] = c;
+                }
+            }
+            assert_eq!(q, q0);
+            assert_eq!(t, t0);
+        }
     }
 }
 
@@ -3267,13 +3391,14 @@ mod neon_row {
     /// # Safety
     /// NEON; `qcode` holds `cols * 16` bytes and `tcode` `rows * 16`; every sequence fits.
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn fill_soa16(
+    pub(super) unsafe fn fill_soa<const N: usize>(
         jobs: &[bwa_extend::ExtendJob],
         cols: usize,
         rows: usize,
         qcode: *mut u8,
         tcode: *mut u8,
     ) {
+        debug_assert!(N == 16);
         let stride = cols.max(rows);
         STAGE.with(|st| {
             let st = &mut *st.borrow_mut();
@@ -3292,7 +3417,7 @@ mod neon_row {
     }
 
     thread_local! {
-        /// The lane-major staging area of [`fill_soa16`].
+        /// The lane-major staging area of [`fill_soa`].
         static STAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
