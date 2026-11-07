@@ -350,6 +350,11 @@ fn count_hits(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) 
         // SAFETY: NEON is part of the aarch64 baseline.
         return unsafe { neon::count_hits(s, t, q, p, max_hits) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if p.k == 5 && sse::available() {
+        // SAFETY: SSSE3 and SSE4.1 were just detected.
+        return unsafe { sse::count_hits(s, t, q, p, max_hits) };
+    }
     count_hits_scalar(s, t, q, p, max_hits)
 }
 
@@ -881,6 +886,360 @@ mod neon {
     }
 }
 
+/// [`neon`]'s K = 5 hit counter on x86 in SSSE3/SSE4.1, after fg-labs/bwa-mem3's `lean_x86`
+/// (`src/rescue_prune_x86.h`): the same layout and passes lane for lane, so the same `cnt`,
+/// `minrow` and `occ_bits`. The 128-byte presence lookup is eight 16-byte PSHUFBs joined by a
+/// blend tree on the index bits 4 to 6; masks come from MOVEMASK instead of pairwise adds.
+#[cfg(target_arch = "x86_64")]
+mod sse {
+    use super::{Params, Scratch, TAB_MULTI, TAB_POS};
+    use std::arch::x86_64::*;
+
+    /// Whether the host runs this counter. Cached by `std`'s feature detection.
+    pub(super) fn available() -> bool {
+        is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1")
+    }
+
+    /// `SHUF[m]`: the PSHUFB indices that left-pack the u16 lanes set in `m` (0x80 zeroes a lane).
+    static SHUF: [[u8; 16]; 256] = {
+        let mut t = [[0x80u8; 16]; 256];
+        let mut m = 0;
+        while m < 256 {
+            let (mut n, mut l) = (0, 0);
+            while l < 8 {
+                if (m >> l) & 1 == 1 {
+                    t[m][2 * n] = 2 * l as u8;
+                    t[m][2 * n + 1] = 2 * l as u8 + 1;
+                    n += 1;
+                }
+                l += 1;
+            }
+            m += 1;
+        }
+        t
+    };
+
+    /// `PC[m]`: the number of lanes set in `m`.
+    static PC: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut m = 0;
+        while m < 256 {
+            t[m] = (m as u32).count_ones() as u8;
+            m += 1;
+        }
+        t
+    };
+
+    /// Writes 8 lanes: `out` needs 8 lanes of slack past the last packed one.
+    #[inline(always)]
+    unsafe fn pack(out: &mut [u16], at: usize, v: __m128i, m: u32) -> usize {
+        debug_assert!(at + 8 <= out.len());
+        let sh = _mm_loadu_si128(SHUF[m as usize].as_ptr() as *const __m128i);
+        _mm_storeu_si128(
+            out.as_mut_ptr().add(at) as *mut __m128i,
+            _mm_shuffle_epi8(v, sh),
+        );
+        at + PC[m as usize] as usize
+    }
+
+    #[inline(always)]
+    fn grow(v: &mut Vec<u16>, n: usize) {
+        if v.len() < n {
+            v.resize(n, 0);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn ld(p: *const u8) -> __m128i {
+        _mm_loadu_si128(p as *const __m128i)
+    }
+
+    /// Eight u16 lanes from two u64s (low lanes first).
+    #[inline(always)]
+    unsafe fn from2(a: u64, b: u64) -> __m128i {
+        _mm_set_epi64x(b as i64, a as i64)
+    }
+
+    /// Lanes `(prev[7], cur[0..7])`, NEON's `vextq_u16::<7>(prev, cur)`.
+    #[inline(always)]
+    unsafe fn shift_in(prev: __m128i, cur: __m128i) -> __m128i {
+        _mm_alignr_epi8::<14>(cur, prev)
+    }
+
+    /// See [`super::neon::count_hits`]; same results.
+    ///
+    /// # Safety
+    /// SSSE3 and SSE4.1.
+    #[target_feature(enable = "ssse3,sse4.1")]
+    pub(super) unsafe fn count_hits(
+        s: &mut Scratch,
+        t: &[u8],
+        q: &[u8],
+        p: &Params,
+        max_hits: usize,
+    ) -> Option<usize> {
+        const K: usize = 5;
+        let (len1, len2) = (t.len(), q.len());
+        s.load_query(q, K);
+        // ---- 1. N check while copying the window into a zero-padded buffer ----
+        if s.rbuf.len() < len1 + 32 {
+            s.rbuf.resize(len1 + 32, 0);
+        }
+        let rb = s.rbuf.as_mut_ptr();
+        let mut ov = _mm_setzero_si128();
+        let mut i = 0;
+        while i + 16 <= len1 {
+            let x = ld(t.as_ptr().add(i));
+            ov = _mm_or_si128(ov, x);
+            _mm_storeu_si128(rb.add(i) as *mut __m128i, x);
+            i += 16;
+        }
+        let mut tail = 0u8;
+        while i < len1 {
+            tail |= t[i];
+            *rb.add(i) = t[i];
+            i += 1;
+        }
+        _mm_storeu_si128(rb.add(len1) as *mut __m128i, _mm_setzero_si128());
+        _mm_storeu_si128(rb.add(len1 + 16) as *mut __m128i, _mm_setzero_si128());
+        if s.q_has_n || _mm_testz_si128(ov, _mm_set1_epi8(!3)) == 0 || tail & !3 != 0 {
+            return None;
+        }
+        let off = len2.div_ceil(16) * 16;
+        let nd = len1 + off + 1;
+        let nw = nd.div_ceil(64);
+        let span = nw * 64;
+        s.occ_bits.clear();
+        s.occ_bits.resize(nw, 0);
+        s.occ_stale = false;
+        // ---- 3. hit rows, 16 at a time ----
+        let nrow = len1 + 1 - K;
+        grow(&mut s.hrow, nrow + 16);
+        grow(&mut s.hcode, nrow + 16);
+        let mut np = 0usize;
+        {
+            let pr = s.pres.as_ptr();
+            let pt: [__m128i; 8] = std::array::from_fn(|x| ld(pr.add(16 * x)));
+            const P2: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let p2 = ld(P2.as_ptr());
+            let (k7, k1f, k8) = (_mm_set1_epi8(7), _mm_set1_epi8(0x1F), _mm_set1_epi16(8));
+            let mut pos = ld(IO.as_ptr() as *const u8);
+            let rb = s.rbuf.as_ptr();
+            let mut b = 0usize;
+            while b < nrow {
+                let buf = rb.add(b);
+                let a0 = ld(buf);
+                let (a1, a2, a3, a4) = (
+                    ld(buf.add(1)),
+                    ld(buf.add(2)),
+                    ld(buf.add(3)),
+                    ld(buf.add(4)),
+                );
+                // Bases are 0..=3, so the 16-bit shifts never carry across bytes.
+                let lo = _mm_or_si128(
+                    _mm_or_si128(_mm_slli_epi16::<6>(a1), _mm_slli_epi16::<4>(a2)),
+                    _mm_or_si128(_mm_slli_epi16::<2>(a3), a4),
+                );
+                // code >> 3 = a0 << 5 | lo >> 3, below 128
+                let idx = _mm_or_si128(
+                    _mm_slli_epi16::<5>(a0),
+                    _mm_and_si128(_mm_srli_epi16::<3>(lo), k1f),
+                );
+                // PSHUFB reads index bits 0-3 (bit 7 is clear); bits 4, 5, 6 pick the table,
+                // each moved to bit 7 for BLENDV (the 16-bit shifts only spill into lower bits).
+                let t: [__m128i; 8] = std::array::from_fn(|x| _mm_shuffle_epi8(pt[x], idx));
+                let (s4, s5, s6) = (
+                    _mm_slli_epi16::<3>(idx),
+                    _mm_slli_epi16::<2>(idx),
+                    _mm_slli_epi16::<1>(idx),
+                );
+                let u0 = _mm_blendv_epi8(t[0], t[1], s4);
+                let u1 = _mm_blendv_epi8(t[2], t[3], s4);
+                let u2 = _mm_blendv_epi8(t[4], t[5], s4);
+                let u3 = _mm_blendv_epi8(t[6], t[7], s4);
+                let v0 = _mm_blendv_epi8(u0, u1, s5);
+                let v1 = _mm_blendv_epi8(u2, u3, s5);
+                let byte = _mm_blendv_epi8(v0, v1, s6);
+                let bit = _mm_shuffle_epi8(p2, _mm_and_si128(lo, k7));
+                let hit = _mm_cmpeq_epi8(_mm_and_si128(byte, bit), bit);
+                let mut m16 = _mm_movemask_epi8(hit) as u32;
+                if b + 16 > nrow {
+                    m16 &= (1u32 << (nrow - b)) - 1;
+                }
+                let c0 = _mm_unpacklo_epi8(lo, a0);
+                let c1 = _mm_unpackhi_epi8(lo, a0);
+                let (ml, mh) = (m16 & 0xFF, m16 >> 8);
+                let at = pack(&mut s.hrow, np, pos, ml);
+                pack(&mut s.hcode, np, c0, ml);
+                let pos8 = _mm_add_epi16(pos, k8);
+                np = pack(&mut s.hrow, at, pos8, mh);
+                pack(&mut s.hcode, at, c1, mh);
+                pos = _mm_add_epi16(pos8, k8);
+                b += 16;
+            }
+        }
+        if np == 0 {
+            return Some(nd);
+        }
+        if np > max_hits {
+            return None;
+        }
+        // ---- 4. layer 1, 8 hit rows at a time (see the NEON counter) ----
+        grow(&mut s.rb_idx, np + 16);
+        grow(&mut s.rb_d, np + 16);
+        grow(&mut s.rb_r, np + 16);
+        grow(&mut s.mrow, np + 16);
+        grow(&mut s.mj, np + 16);
+        let (mut nb, mut nm) = (0usize, 0usize);
+        let mut extra = _mm_setzero_si128();
+        {
+            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let mut idx = ld(IO.as_ptr() as *const u8);
+            let (k8, one) = (_mm_set1_epi16(8), _mm_set1_epi16(1));
+            let koff = _mm_set1_epi16((off + K - 1) as i16);
+            let kpos = _mm_set1_epi16(TAB_POS as i16);
+            let kmulti = _mm_set1_epi16(TAB_MULTI as u16 as i16);
+            let low16 = _mm_set1_epi32(0xFFFF);
+            // Below 32768 (np <= WCAP), so the signed compare is the unsigned one.
+            let vn = _mm_set1_epi16(np as i16);
+            let (mut prev_r, mut prev_d) = (_mm_setzero_si128(), _mm_set1_epi16(-1));
+            let tab = s.tab.as_ptr();
+            // Codes past `np` are stale but in range (< 1024); their lanes are masked.
+            let look4 = |c: *const u16| -> __m128i {
+                let x = (c as *const u64).read_unaligned();
+                let e = |sh: u32| u64::from(*tab.add(((x >> sh) & 1023) as usize));
+                from2(e(0) | e(16) << 32, e(32) | e(48) << 32)
+            };
+            let mut k0 = 0usize;
+            while k0 < np {
+                let r = ld(s.hrow.as_ptr().add(k0) as *const u8);
+                let e0 = look4(s.hcode.as_ptr().add(k0));
+                let e1 = look4(s.hcode.as_ptr().add(k0 + 4));
+                let lo = _mm_packus_epi32(_mm_and_si128(e0, low16), _mm_and_si128(e1, low16));
+                let occ = _mm_packus_epi32(_mm_srli_epi32::<16>(e0), _mm_srli_epi32::<16>(e1));
+                let j = _mm_and_si128(lo, kpos);
+                let d = _mm_sub_epi16(_mm_add_epi16(r, koff), j);
+                let rp = shift_in(prev_r, r);
+                let dp = shift_in(prev_d, d);
+                (prev_r, prev_d) = (r, d);
+                let valid = _mm_cmplt_epi16(idx, vn);
+                let cont = _mm_and_si128(
+                    _mm_cmpeq_epi16(r, _mm_add_epi16(rp, one)),
+                    _mm_cmpeq_epi16(d, dp),
+                );
+                let bd = _mm_andnot_si128(cont, valid);
+                let mu = _mm_and_si128(_mm_cmpeq_epi16(_mm_and_si128(lo, kmulti), kmulti), valid);
+                extra = _mm_add_epi32(
+                    extra,
+                    _mm_madd_epi16(_mm_and_si128(_mm_sub_epi16(occ, one), valid), one),
+                );
+                let m = _mm_movemask_epi8(_mm_packs_epi16(bd, mu)) as u32;
+                let (mb, mm) = (m & 0xFF, m >> 8);
+                pack(&mut s.rb_idx, nb, idx, mb);
+                pack(&mut s.rb_d, nb, d, mb);
+                nb = pack(&mut s.rb_r, nb, r, mb);
+                pack(&mut s.mrow, nm, r, mm);
+                nm = pack(&mut s.mj, nm, j, mm);
+                idx = _mm_add_epi16(idx, k8);
+                k0 += 8;
+            }
+        }
+        let ex: [u32; 4] = std::mem::transmute(extra);
+        let nhits = np + ex.iter().map(|&x| x as usize).sum::<usize>();
+        s.nhits = nhits;
+        if nhits > max_hits {
+            return None;
+        }
+        if p.base() + p.a * nhits as i32 - p.c < p.minsc {
+            return Some(nd);
+        }
+        s.cnt.clear();
+        s.cnt.resize(span, 0);
+        if s.minrow.len() < span {
+            s.minrow.resize(span, 0);
+        }
+        // ---- 5. layer 1's runs, last to first; then the repeated codes' other occurrences ----
+        s.rb_idx[nb] = np as u16;
+        {
+            let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
+            let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
+            for x in (0..nb).rev() {
+                let d = *bd.add(x) as usize;
+                *cnt.add(d) += *bi.add(x + 1) - *bi.add(x);
+                *minrow.add(d) = *br.add(x);
+            }
+        }
+        let nxt = s.nxt.as_ptr();
+        let nxt4 = |j: *const u16| -> u64 {
+            let x = (j as *const u64).read_unaligned();
+            let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
+            e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
+        };
+        for x in 0..nm {
+            s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+        }
+        let mut n = nm;
+        grow(&mut s.hrow, n + 16);
+        grow(&mut s.hcode, n + 16);
+        let (mut rows, mut js) = (std::mem::take(&mut s.mrow), std::mem::take(&mut s.mj));
+        let (mut rows2, mut js2) = (std::mem::take(&mut s.hrow), std::mem::take(&mut s.hcode));
+        {
+            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let (k8, one, neg1) = (_mm_set1_epi16(8), _mm_set1_epi16(1), _mm_set1_epi16(-1));
+            let koff = _mm_set1_epi16((off + K - 1) as i16);
+            while n > 0 {
+                let vn = _mm_set1_epi16(n as i16);
+                let mut idx = ld(IO.as_ptr() as *const u8);
+                let (mut prev_r, mut prev_d) = (_mm_setzero_si128(), _mm_set1_epi16(-1));
+                let (mut nb, mut n2) = (0usize, 0usize);
+                let mut k0 = 0usize;
+                while k0 < n {
+                    let r = ld(rows.as_ptr().add(k0) as *const u8);
+                    let j = ld(js.as_ptr().add(k0) as *const u8);
+                    let jn = from2(nxt4(js.as_ptr().add(k0)), nxt4(js.as_ptr().add(k0 + 4)));
+                    let d = _mm_sub_epi16(_mm_add_epi16(r, koff), j);
+                    let rp = shift_in(prev_r, r);
+                    let dp = shift_in(prev_d, d);
+                    (prev_r, prev_d) = (r, d);
+                    let valid = _mm_cmplt_epi16(idx, vn);
+                    let cont = _mm_and_si128(
+                        _mm_cmpeq_epi16(r, _mm_add_epi16(rp, one)),
+                        _mm_cmpeq_epi16(d, dp),
+                    );
+                    let keep = _mm_and_si128(_mm_cmpgt_epi16(jn, neg1), valid);
+                    let m = _mm_movemask_epi8(_mm_packs_epi16(_mm_andnot_si128(cont, valid), keep))
+                        as u32;
+                    let (mb, mk) = (m & 0xFF, m >> 8);
+                    pack(&mut s.rb_idx, nb, idx, mb);
+                    pack(&mut s.rb_d, nb, d, mb);
+                    nb = pack(&mut s.rb_r, nb, r, mb);
+                    pack(&mut rows2, n2, r, mk);
+                    n2 = pack(&mut js2, n2, jn, mk);
+                    idx = _mm_add_epi16(idx, k8);
+                    k0 += 8;
+                }
+                s.rb_idx[nb] = n as u16;
+                let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
+                let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
+                for x in 0..nb {
+                    let (d, row) = (*bd.add(x) as usize, *br.add(x));
+                    let c = *cnt.add(d);
+                    let stale = u16::from(c == 0).wrapping_neg();
+                    *minrow.add(d) = (*minrow.add(d) | stale).min(row);
+                    *cnt.add(d) = c + *bi.add(x + 1) - *bi.add(x);
+                }
+                n = n2;
+                std::mem::swap(&mut rows, &mut rows2);
+                std::mem::swap(&mut js, &mut js2);
+            }
+        }
+        (s.mrow, s.mj, s.hrow, s.hcode) = (rows, js, rows2, js2);
+        s.occ_stale = true;
+        Some(nd)
+    }
+}
+
 /// The interval bounds and components as dense scans over every diagonal (fg-labs/bwa-mem3's
 /// `lean_neon_core` steps 6 and 7), for jobs whose sums fit in `i16`. With `P` the prefix sum of the
 /// weights `a cnt - c`, the bound is `base + max P[d..] - min(0, P[..d])` and the best Kadane sum is
@@ -1215,13 +1574,18 @@ fn sparse_decision(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decis
 }
 
 /// Derive `occ_bits` if the counter left it to its reader.
-#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
 fn occ_ready(s: &mut Scratch) {
-    #[cfg(target_arch = "aarch64")]
     if s.occ_stale {
         s.occ_stale = false;
+        #[cfg(target_arch = "aarch64")]
         // SAFETY: NEON is part of the aarch64 baseline; the counter sized `cnt` to the words.
-        unsafe { neon::occ_from_cnt(s) };
+        unsafe {
+            neon::occ_from_cnt(s)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        for (w, bits) in s.occ_bits.iter_mut().enumerate() {
+            *bits = occupied_word(&s.cnt[w * 64..w * 64 + 64]);
+        }
     }
 }
 
