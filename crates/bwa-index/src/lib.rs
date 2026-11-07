@@ -95,5 +95,5 @@ pub mod sais;
 // are what the aligner needs to turn a read into a reference coordinate.
 pub use bntseq::{Amb, BntSeq, Contig};
 pub use build::{build_index, build_index_with_prefix};
-pub use fmindex::{traffic, FmIndex, Smem};
+pub use fmindex::{traffic, FmIndex, SeedJump, Smem, SEED_JUMP_DEPTH};
 pub use lisa::LearnedSa;

@@ -58,12 +58,12 @@ const WCAP: usize = 30_000;
 /// The bound's scoring parameters, all in score units. See the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Params {
-    k: usize,
-    a: i32,
-    c: i32,
-    o_del: i32,
-    e_del: i32,
-    minsc: i32,
+    pub(crate) k: usize,
+    pub(crate) a: i32,
+    pub(crate) c: i32,
+    pub(crate) o_del: i32,
+    pub(crate) e_del: i32,
+    pub(crate) minsc: i32,
 }
 
 impl Params {
@@ -115,6 +115,7 @@ impl Params {
     }
 
     /// One diagonal's contribution to an interval bound, `a * cnt - c`.
+    #[cfg(test)]
     fn weight(&self, cnt: u16) -> i32 {
         self.a * cnt as i32 - self.c
     }
@@ -123,7 +124,12 @@ impl Params {
     /// reach at a score `>= tau`: each such row is a deleted base, and the deletion has to be paid
     /// for out of the bound's margin (`ub - tau`) plus the `(K-1)a` slack a trailing run carries.
     fn tail(&self, ub: i32) -> i32 {
-        let n = ub - self.minsc - self.o_del + (self.k as i32 - 1) * self.a;
+        self.tail_at(ub, self.minsc)
+    }
+
+    /// [`Self::tail`] at threshold `tau` in place of `minsc`.
+    pub(crate) fn tail_at(&self, ub: i32, tau: i32) -> i32 {
+        let n = ub - tau - self.o_del + (self.k as i32 - 1) * self.a;
         if n <= 0 {
             0
         } else {
@@ -143,65 +149,95 @@ pub(crate) enum Decision {
     Hull { hb: usize, he: usize },
 }
 
-/// Per-thread scratch. The query tables depend only on the oriented mate, which repeats across
-/// every anchor rescued with it, so they are rebuilt only when the mate or K changes.
+/// Per-thread scratch. The query table depends only on the oriented mate, which repeats across
+/// every anchor rescued with it, so it is rebuilt only when the mate or K changes.
+// The NEON counter's buffers are unused on other targets, which run the scalar counter.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 struct Scratch {
-    /// Per code, `gen << 16 | n`: the cached query holds `n` K-mers with this code. An entry from an
-    /// older generation reads as 0, so a new query costs no clearing pass.
-    qtab: Vec<u32>,
-    /// Per code, the latest query position with this code or -1, chained to earlier ones through
-    /// `nxt`. Built only for jobs that pass the hit gate ([`Scratch::ensure_chains`]); `touched`
-    /// lists the codes it set, so the next build clears only those.
-    htab: Vec<i16>,
+    /// Per K-mer code, 0 when the cached query does not hold it, else
+    /// `n << 16 | (n > 1) << 15 | j`: `n` occurrences, the latest ending at query position `j`.
+    /// `touched` lists the codes set, so the next query clears only those.
+    tab: Vec<u32>,
     touched: Vec<u16>,
     /// Previous query position with the same K-mer code, or -1.
     nxt: Vec<i16>,
-    /// The cached query's K-mer codes, by end position.
-    qcodes: Vec<u16>,
-    /// The tag of the cached query's entries, and whether `htab`/`nxt` describe it yet.
-    gen: u32,
-    chains: bool,
-    /// The query the tables describe, its K, and whether it holds an N.
+    /// The query the table describes, its K, and whether it holds an N.
     qcache: Vec<u8>,
     qk: usize,
     q_has_n: bool,
     /// Per diagonal: hit count, and first row of its first hit (valid where `cnt != 0`).
     cnt: Vec<u16>,
-    minrow: Vec<i32>,
-    /// The current window's K-mer codes ([`window_codes`]).
+    minrow: Vec<u16>,
+    /// Four partial hit counts, one per window row modulo 4, `stride` apart, each with a trash slot
+    /// past the diagonals for rows without a hit. Consecutive rows of a run hit one diagonal, and a
+    /// single counter would chain each increment on the previous store. All zero between jobs.
+    cnt4: Vec<u16>,
+    /// One bit per window row whose K-mer occurs more than once in the query, 64 rows a word.
+    multi: Vec<u64>,
+    /// The current window's K-mer codes, `codes[r]` for `t[r..r + K]`.
     codes: Vec<u16>,
-    /// One bit per diagonal holding a hit, and those diagonals in ascending order.
+    /// At K = 5, one bit per 5-mer code the cached query holds (bit `c & 7` of byte `c >> 3`).
+    pres: [u8; 128],
+    /// The NEON counter's buffers: the zero-padded window, the hit rows and their codes, the run
+    /// boundaries (list index, diagonal, row) and the rows of repeated codes with their position.
+    rbuf: Vec<u8>,
+    hrow: Vec<u16>,
+    hcode: Vec<u16>,
+    rb_idx: Vec<u16>,
+    rb_d: Vec<u16>,
+    rb_r: Vec<u16>,
+    mrow: Vec<u16>,
+    mj: Vec<u16>,
+    /// One bit per diagonal holding a hit.
     occ_bits: Vec<u64>,
-    occ: Vec<u32>,
-    /// Kadane sums ending at (`fo`) and starting at (`bo`) each diagonal of `occ`, index-parallel.
-    fo: Vec<i32>,
-    bo: Vec<i32>,
+    /// [`sparse_decision`]'s lists: per occupied diagonal in ascending order `[d, P, M, X]` (`n_occ`
+    /// of them), and per occupied diagonal whose bound reaches `minsc`, in descending order,
+    /// `[index, X, bound, 0]` (`n_hot` of them).
+    fw: Vec<[i32; 4]>,
+    hot: Vec<[i32; 4]>,
+    n_occ: usize,
+    n_hot: usize,
+    /// The components at `minsc`.
+    c19: Vec<Comp>,
 }
+
+/// [`Scratch::tab`]'s flag for a code the query holds more than once, and its position field.
+const TAB_MULTI: u32 = 1 << 15;
+const TAB_POS: u32 = TAB_MULTI - 1;
 
 impl Scratch {
     fn new() -> Scratch {
         Scratch {
-            qtab: Vec::new(),
-            htab: Vec::new(),
+            tab: Vec::new(),
             touched: Vec::with_capacity(QCAP),
             nxt: vec![-1; QCAP],
-            qcodes: vec![0; QCAP],
-            gen: 0,
-            chains: false,
             qcache: Vec::with_capacity(QCAP),
             qk: 0,
             q_has_n: false,
             cnt: Vec::new(),
             minrow: Vec::new(),
+            cnt4: Vec::new(),
+            multi: Vec::new(),
             codes: Vec::new(),
+            pres: [0; 128],
+            rbuf: Vec::new(),
+            hrow: Vec::new(),
+            hcode: Vec::new(),
+            rb_idx: Vec::new(),
+            rb_d: Vec::new(),
+            rb_r: Vec::new(),
+            mrow: Vec::new(),
+            mj: Vec::new(),
             occ_bits: Vec::new(),
-            occ: Vec::new(),
-            fo: Vec::new(),
-            bo: Vec::new(),
+            fw: Vec::new(),
+            hot: Vec::new(),
+            n_occ: 0,
+            n_hot: 0,
+            c19: Vec::new(),
         }
     }
 
-    /// Index the query's K-mers, unless the tables already describe this query at this K. A query
+    /// Index the query's K-mers, unless the table already describes this query at this K. A query
     /// holding an N is only flagged: the caller returns `Full` for it.
     fn load_query(&mut self, q: &[u8], k: usize) {
         if self.qk == k && self.qcache == q {
@@ -212,23 +248,18 @@ impl Scratch {
         self.qk = k;
         self.q_has_n = q.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0;
         let ncode = 1usize << (2 * k);
-        if self.qtab.len() < ncode {
-            self.qtab = vec![0; ncode];
-            self.htab = vec![-1; ncode];
+        if self.tab.len() != ncode {
+            self.tab = vec![0; ncode];
             self.touched.clear();
-            self.gen = 0;
         }
-        // A fresh tag per query; on the 16-bit wrap, clear for real so no stale entry can match.
-        self.gen = (self.gen + 1) & 0xffff;
-        if self.gen == 0 {
-            self.qtab.fill(0);
-            self.gen = 1;
+        for &c in &self.touched {
+            self.tab[c as usize] = 0;
         }
-        self.chains = false;
+        self.touched.clear();
+        self.pres = [0; 128];
         if self.q_has_n {
             return;
         }
-        let tag = self.gen << 16;
         let mask = (ncode - 1) as u32;
         let mut code = 0u32;
         for &b in &q[..k - 1] {
@@ -236,47 +267,19 @@ impl Scratch {
         }
         for j in k - 1..q.len() {
             code = ((code << 2) | q[j] as u32) & mask;
-            self.qcodes[j] = code as u16;
-            let v = self.qtab[code as usize];
-            self.qtab[code as usize] = if v & !0xffff == tag { v + 1 } else { tag | 1 };
-        }
-    }
-
-    /// How many K-mers of the cached query have this code.
-    #[inline(always)]
-    fn count(&self, code: usize) -> u16 {
-        let v = self.qtab[code];
-        if v >> 16 == self.gen {
-            v as u16
-        } else {
-            0
-        }
-    }
-
-    /// The latest query position with this code, or -1 (after [`Scratch::ensure_chains`]).
-    #[inline(always)]
-    fn head(&self, code: usize) -> i16 {
-        self.htab[code]
-    }
-
-    /// Build the per-code occurrence chains of the cached query, once per query.
-    fn ensure_chains(&mut self) {
-        if self.chains {
-            return;
-        }
-        for &c in &self.touched {
-            self.htab[c as usize] = -1;
-        }
-        self.touched.clear();
-        for j in self.qk - 1..self.qcache.len() {
-            let c = self.qcodes[j] as usize;
-            if self.htab[c] < 0 {
-                self.touched.push(c as u16);
+            let v = self.tab[code as usize];
+            if k == 5 {
+                self.pres[(code >> 3) as usize] |= 1 << (code & 7);
             }
-            self.nxt[j] = self.htab[c];
-            self.htab[c] = j as i16;
+            if v == 0 {
+                self.touched.push(code as u16);
+                self.nxt[j] = -1;
+                self.tab[code as usize] = 1 << 16 | j as u32;
+            } else {
+                self.nxt[j] = (v & TAB_POS) as i16;
+                self.tab[code as usize] = ((v >> 16) + 1) << 16 | TAB_MULTI | j as u32;
+            }
         }
-        self.chains = true;
     }
 }
 
@@ -290,7 +293,7 @@ thread_local! {
 /// - `t`, `q`: target window and oriented mate, bases 0..=3, 4 = N (any N gives `Full`).
 /// - `p`: the scoring's bound, from [`Params::from`].
 /// - `max_hits`: return `Full` when `t` and `q` share more K-mer hits than this; a dense window
-///   costs the filter more than the rows it can save. Changes speed only, never a decision's
+///   costs the bound more than the rows it can save. Changes speed only, never a decision's
 ///   correctness.
 pub(crate) fn decide(t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Decision {
     let (len1, len2, k) = (t.len(), q.len(), p.k);
@@ -306,117 +309,477 @@ pub(crate) fn decide(t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Decisio
     })
 }
 
-/// The hit gate, then the per-diagonal hit counts. Returns the number of diagonal slots, or
-/// `None` when the job is not filtered (an N in either sequence, or more hits than `max_hits`).
-/// A job proven to fail by the hit total alone comes back with no diagonal occupied.
+/// The per-diagonal hit counts (`cnt`, `minrow` where `cnt != 0`, `occ_bits`). Returns the number of
+/// diagonal slots, or `None` when the job is not filtered (an N in either sequence, or more hits than
+/// `max_hits`). A job proven to fail by the hit total alone comes back with no diagonal occupied.
 fn count_hits(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    if p.k == 5 {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        return unsafe { neon::count_hits(s, t, q, p, max_hits) };
+    }
+    count_hits_scalar(s, t, q, p, max_hits)
+}
+
+/// [`count_hits`] in portable code: the reference the NEON counter is checked against, and the
+/// counter for every K on other targets and for K > 5.
+fn count_hits_scalar(
+    s: &mut Scratch,
+    t: &[u8],
+    q: &[u8],
+    p: &Params,
+    max_hits: usize,
+) -> Option<usize> {
     let (len1, len2, k) = (t.len(), q.len(), p.k);
     s.load_query(q, k);
-    if s.q_has_n {
+    if s.q_has_n || t.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0 {
         return None;
     }
-    // ---- The window's K-mer codes, once, for the gate and the enumeration. Each code is built
-    //      from its own K bytes rather than rolled from the previous one, so the loop carries no
-    //      dependency and vectorises; `& 3` keeps an N's code in range, and an N sends the job to
-    //      `Full` anyway ----
-    if t.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0 {
-        return None;
-    }
-    // ---- Hit gate, ESTIMATED from every 4th row. It only decides whether filtering is worth its
-    //      cost, never a decision's correctness, so an estimate is enough, and most jobs stop here:
-    //      on real reads ~80 % of windows are over the gate, and they now pay for a quarter of the
-    //      rows instead of all of them ----
-    let est = match k {
-        5 => sampled_hits::<5>(t, s),
-        6 => sampled_hits::<6>(t, s),
-        7 => sampled_hits::<7>(t, s),
-        _ => sampled_hits::<8>(t, s),
-    };
-    if est > max_hits {
-        return None;
-    }
-    let mut codes = std::mem::take(&mut s.codes);
-    match k {
-        5 => window_codes::<5>(t, &mut codes),
-        6 => window_codes::<6>(t, &mut codes),
-        7 => window_codes::<7>(t, &mut codes),
-        _ => window_codes::<8>(t, &mut codes),
-    }
-    let verdict = count_hits_from(s, &codes, len1, len2, p);
-    s.codes = codes;
-    verdict
-}
-
-/// Four times the query K-mer hits of the window rows `r = 0, 4, 8, ...` (`t[r..r + K]`), an
-/// estimate of the window's total hits.
-fn sampled_hits<const K: usize>(t: &[u8], s: &Scratch) -> usize {
-    let mut n = 0usize;
-    for r in (0..=t.len() - K).step_by(4) {
-        let mut c = 0usize;
-        for &b in &t[r..r + K] {
-            c = (c << 2) | b as usize;
-        }
-        n += s.count(c) as usize;
-    }
-    4 * n
-}
-
-/// `out[i]` = the 2-bit code of `t[i..i + K]`, for every K-mer of `t`.
-fn window_codes<const K: usize>(t: &[u8], out: &mut Vec<u16>) {
-    out.clear();
-    out.extend(t.windows(K).map(|w| {
-        let mut c = 0u16;
-        for &b in w {
-            c = (c << 2) | (b & 3) as u16;
-        }
-        c
-    }));
-}
-
-/// [`count_hits`] past the N test, on the window's K-mer codes (`codes[i]` ends at row
-/// `i + K - 1`).
-fn count_hits_from(
-    s: &mut Scratch,
-    codes: &[u16],
-    len1: usize,
-    len2: usize,
-    p: &Params,
-) -> Option<usize> {
-    let k = p.k;
-    // ---- The exact hit total, for the early fail below (the gate was the caller's estimate) ----
-    let nhits: usize = codes.iter().map(|&c| s.count(c as usize) as usize).sum();
-
-    // ---- Per-diagonal hit counts. Diagonal `d = i - j` is stored at `d + off`, with `off` the
-    //      query rounded up to 16 so the pad columns' diagonals have slots too ----
+    // ---- Diagonal `d = i - j` is stored at `d + off`, with `off` the query rounded up to 16 so
+    //      the pad columns' diagonals have slots too. `span`: the diagonals rounded up to whole
+    //      bitmap words; `trash`: the slot rows without a hit count into, past every word ----
     let off = len2.div_ceil(16) * 16;
     let nd = len1 + off + 1;
-    s.cnt.clear();
-    s.cnt.resize(nd, 0);
-    s.minrow.resize(nd, 0);
+    let nw = nd.div_ceil(64);
+    let span = nw * 64;
+    let (stride, trash) = (span + 8, span);
+    if s.cnt4.len() < 4 * stride {
+        s.cnt4.resize(4 * stride, 0);
+    }
+    s.minrow.clear();
+    s.minrow.resize(span + 1, u16::MAX);
+    s.multi.clear();
+    s.multi.resize((len1 + 1 - k).div_ceil(64), 0);
+    // Each code from its own K bytes rather than rolled from the previous one, so the loop carries
+    // no dependency and vectorises.
+    let mut codes = std::mem::take(&mut s.codes);
+    codes.clear();
+    match k {
+        5 => codes.extend(t.windows(5).map(code_of)),
+        6 => codes.extend(t.windows(6).map(code_of)),
+        7 => codes.extend(t.windows(7).map(code_of)),
+        _ => codes.extend(t.windows(8).map(code_of)),
+    }
+    let nhits = primary_hits(s, &codes, k, off, stride, trash);
     s.occ_bits.clear();
-    s.occ_bits.resize(nd.div_ceil(64), 0);
+    s.occ_bits.resize(nw, 0);
+    s.cnt.clear();
+    s.cnt.resize(span, 0);
     // Early fail: every interval is non-empty and sums `a * cnt - c` over its diagonals, so no
     // interval can beat `base + a * nhits - c`. Leaving every diagonal empty says exactly that.
-    if p.base() + p.a * nhits as i32 - p.c < p.minsc {
-        return Some(nd);
+    let early_fail = p.base() + p.a * nhits as i32 - p.c < p.minsc;
+    if nhits > max_hits || early_fail {
+        for c in s.cnt4.chunks_exact_mut(stride).take(4) {
+            c[..=trash].fill(0);
+        }
+        s.codes = codes;
+        return (nhits <= max_hits).then_some(nd);
     }
-    s.ensure_chains();
-    for (r, &code) in codes.iter().enumerate() {
-        let i = r + k - 1;
-        let mut j = s.head(code as usize);
-        while j >= 0 {
-            let d = i + off - j as usize;
-            if s.cnt[d] == 0 {
-                // Rows ascend, so the first hit seen on a diagonal is its earliest; its K-mer
-                // starts K - 1 rows above the row where it ends.
-                s.minrow[d] = (i + 1 - k) as i32;
-                s.occ_bits[d / 64] |= 1 << (d % 64);
+    // ---- The other occurrences of repeated K-mers, in any order (`minrow` takes the min) ----
+    {
+        let (tab, nxt) = (&s.tab[..], &s.nxt[..]);
+        let (cnt4, minrow) = (&mut s.cnt4[..], &mut s.minrow[..]);
+        for (w, &word) in s.multi.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                let r = w * 64 + word.trailing_zeros() as usize;
+                word &= word - 1;
+                let mut j = nxt[(tab[codes[r] as usize] & TAB_POS) as usize];
+                while j >= 0 {
+                    let d = r + k - 1 + off - j as usize;
+                    cnt4[(r & 3) * stride + d] += 1;
+                    minrow[d] = minrow[d].min(r as u16);
+                    j = nxt[j as usize];
+                }
             }
-            s.cnt[d] += 1;
-            j = s.nxt[j as usize];
         }
     }
+    // ---- Fold the four partial counts into `cnt`, zero them again, and mark the occupied
+    //      diagonals ----
+    {
+        let (c0, rest) = s.cnt4.split_at_mut(stride);
+        let (c1, rest) = rest.split_at_mut(stride);
+        let (c2, c3) = rest.split_at_mut(stride);
+        for d in 0..span {
+            s.cnt[d] = c0[d] + c1[d] + c2[d] + c3[d];
+        }
+        for c in [c0, c1, c2, &mut c3[..stride]] {
+            c[..=trash].fill(0);
+        }
+    }
+    for (w, bits) in s.occ_bits.iter_mut().enumerate() {
+        *bits = occupied_word(&s.cnt[w * 64..w * 64 + 64]);
+    }
+    s.codes = codes;
     Some(nd)
+}
+
+/// The 2-bit code of a K-mer, first base highest.
+#[inline(always)]
+fn code_of(w: &[u8]) -> u16 {
+    w.iter().fold(0u16, |c, &b| (c << 2) | b as u16)
+}
+
+/// One pass over the window rows, latest first: each row's K-mer hit at its latest query
+/// occurrence counts into `cnt4` and `minrow` (rows descending, so the last store to `minrow[d]` is
+/// the diagonal's earliest row), and a row whose K-mer occurs again in the query gets a `multi`
+/// bit. Returns the exact hit total. No branch per row: a row without a hit counts into `trash`.
+/// The `multi` bits stay in a register for 64 rows: a list indexed by a running count would make
+/// every row's loads wait for the previous row's store address, which depends on its own loads.
+#[inline(always)]
+fn primary_hits(
+    s: &mut Scratch,
+    codes: &[u16],
+    k: usize,
+    off: usize,
+    stride: usize,
+    trash: usize,
+) -> usize {
+    let (tab, cnt4, minrow, multi) = (
+        &s.tab[..],
+        &mut s.cnt4[..],
+        &mut s.minrow[..],
+        &mut s.multi[..],
+    );
+    let base = k - 1 + off;
+    let mut nhits = 0usize;
+    for w in (0..multi.len()).rev() {
+        let mut bits = 0u64;
+        let chunk = &codes[w * 64..codes.len().min(w * 64 + 64)];
+        for (x, &code) in chunk.iter().enumerate().rev() {
+            let r = w * 64 + x;
+            let v = tab[code as usize];
+            nhits += (v >> 16) as usize;
+            let d = if v != 0 {
+                r + base - (v & TAB_POS) as usize
+            } else {
+                trash
+            };
+            cnt4[(r & 3) * stride + d] += 1;
+            minrow[d] = r as u16;
+            bits |= u64::from((v & TAB_MULTI) != 0) << x;
+        }
+        multi[w] = bits;
+    }
+    nhits
+}
+
+/// One bit per nonzero count, bit `x` for `cnt[x]`.
+#[inline]
+fn occupied_word(cnt: &[u16]) -> u64 {
+    let mut bits = 0u64;
+    for (x, &c) in cnt[..64].iter().enumerate() {
+        bits |= u64::from(c != 0) << x;
+    }
+    bits
+}
+
+/// The K = 5 hit counter in NEON, after fg-labs/bwa-mem3's `lean_neon` (`src/rescue_prune_neon.h`,
+/// steps 1 to 5): the window's rows are tested 16 at a time against the query's 5-mer presence
+/// bitmap and only the rows with a hit (about a third) are kept; their hits at the latest query
+/// occurrence are taken 8 rows at a time, and rows that continue a run along one diagonal fold into
+/// the run, so `cnt` takes one store per run rather than one per hit. Repeated codes' other
+/// occurrences go through the scalar chain walk. Same `cnt`, `minrow` and `occ_bits` as
+/// [`count_hits_scalar`].
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::{Params, Scratch, TAB_MULTI, TAB_POS};
+    use std::arch::aarch64::*;
+
+    /// `SHUF[m]`: the `vqtbl1q_u8` indices that left-pack the u16 lanes set in `m`.
+    static SHUF: [[u8; 16]; 256] = {
+        let mut t = [[0xFFu8; 16]; 256];
+        let mut m = 0;
+        while m < 256 {
+            let (mut n, mut l) = (0, 0);
+            while l < 8 {
+                if (m >> l) & 1 == 1 {
+                    t[m][2 * n] = 2 * l as u8;
+                    t[m][2 * n + 1] = 2 * l as u8 + 1;
+                    n += 1;
+                }
+                l += 1;
+            }
+            m += 1;
+        }
+        t
+    };
+
+    /// Store the lanes of `v` selected by `m` to `out[at..]`, packed, and return the new `at`.
+    /// Writes 8 lanes: `out` needs 8 lanes of slack past the last packed one.
+    #[inline(always)]
+    unsafe fn pack(out: &mut [u16], at: usize, v: uint16x8_t, m: u32) -> usize {
+        debug_assert!(at + 8 <= out.len());
+        let sh = vld1q_u8(SHUF[m as usize].as_ptr());
+        let x = vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(v), sh));
+        vst1q_u16(out.as_mut_ptr().add(at), x);
+        at + m.count_ones() as usize
+    }
+
+    #[inline(always)]
+    fn grow(v: &mut Vec<u16>, n: usize) {
+        if v.len() < n {
+            v.resize(n, 0);
+        }
+    }
+
+    pub(super) unsafe fn count_hits(
+        s: &mut Scratch,
+        t: &[u8],
+        q: &[u8],
+        p: &Params,
+        max_hits: usize,
+    ) -> Option<usize> {
+        const K: usize = 5;
+        let (len1, len2) = (t.len(), q.len());
+        s.load_query(q, K);
+        // ---- 1. N check while copying the window into a zero-padded buffer, so the 16-row code
+        //      blocks never read past it ----
+        s.rbuf.clear();
+        s.rbuf.extend_from_slice(t);
+        s.rbuf.resize(len1 + 32, 0);
+        let mut ov = vdupq_n_u8(0);
+        let mut i = 0;
+        while i + 16 <= len1 {
+            ov = vorrq_u8(ov, vld1q_u8(s.rbuf.as_ptr().add(i)));
+            i += 16;
+        }
+        let tail = t[i..].iter().fold(0u8, |a, &b| a | b);
+        if s.q_has_n || (vmaxvq_u8(ov) | tail) & !3 != 0 {
+            return None;
+        }
+        let off = len2.div_ceil(16) * 16;
+        let nd = len1 + off + 1;
+        let nw = nd.div_ceil(64);
+        let span = nw * 64;
+        s.occ_bits.clear();
+        s.occ_bits.resize(nw, 0);
+        s.cnt.clear();
+        s.cnt.resize(span, 0);
+        if s.minrow.len() < span {
+            s.minrow.resize(span, 0);
+        }
+        // ---- 3. hit rows, 16 at a time: 5-mer codes and a presence-bitmap lookup (two 64-byte
+        //      TBLs), the rows with a hit and their codes left-packed ----
+        let nrow = len1 + 1 - K;
+        grow(&mut s.hrow, nrow + 16);
+        grow(&mut s.hcode, nrow + 16);
+        let mut np = 0usize;
+        {
+            let pr = s.pres.as_ptr();
+            let plo = uint8x16x4_t(
+                vld1q_u8(pr),
+                vld1q_u8(pr.add(16)),
+                vld1q_u8(pr.add(32)),
+                vld1q_u8(pr.add(48)),
+            );
+            let phi = uint8x16x4_t(
+                vld1q_u8(pr.add(64)),
+                vld1q_u8(pr.add(80)),
+                vld1q_u8(pr.add(96)),
+                vld1q_u8(pr.add(112)),
+            );
+            const P2: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+            const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let (p2, bw) = (vld1q_u8(P2.as_ptr()), vld1q_u8(BW.as_ptr()));
+            let (k64, k7, k8) = (vdupq_n_u8(64), vdupq_n_u8(7), vdupq_n_u16(8));
+            let mut pos = vld1q_u16(IO.as_ptr());
+            let rb = s.rbuf.as_ptr();
+            let mut b = 0usize;
+            while b < nrow {
+                let buf = rb.add(b);
+                let a0 = vld1q_u8(buf);
+                let a1 = vld1q_u8(buf.add(1));
+                let a2 = vld1q_u8(buf.add(2));
+                let a3 = vld1q_u8(buf.add(3));
+                let a4 = vld1q_u8(buf.add(4));
+                // code & 255 = a1 a2 a3 a4 (2 bits each), code >> 8 = a0
+                let lo = vsliq_n_u8::<6>(vsliq_n_u8::<4>(vsliq_n_u8::<2>(a4, a3), a2), a1);
+                let idx = vsraq_n_u8::<3>(vshlq_n_u8::<5>(a0), lo); // code >> 3
+                                                                    // idx >= 64 wraps to >= 192 under the subtraction for idx < 64, which TBX leaves
+                let byte = vqtbx4q_u8(vqtbl4q_u8(plo, idx), phi, vsubq_u8(idx, k64));
+                let hit = vtstq_u8(byte, vqtbl1q_u8(p2, vandq_u8(lo, k7)));
+                let mut m = vandq_u8(hit, bw);
+                m = vpaddq_u8(m, m);
+                m = vpaddq_u8(m, m);
+                m = vpaddq_u8(m, m);
+                let mut m16 = u32::from(vgetq_lane_u16::<0>(vreinterpretq_u16_u8(m)));
+                if b + 16 > nrow {
+                    m16 &= (1u32 << (nrow - b)) - 1;
+                }
+                let c0 = vreinterpretq_u16_u8(vzip1q_u8(lo, a0));
+                let c1 = vreinterpretq_u16_u8(vzip2q_u8(lo, a0));
+                let (ml, mh) = (m16 & 0xFF, m16 >> 8);
+                let at = pack(&mut s.hrow, np, pos, ml);
+                pack(&mut s.hcode, np, c0, ml);
+                let pos8 = vaddq_u16(pos, k8);
+                np = pack(&mut s.hrow, at, pos8, mh);
+                pack(&mut s.hcode, at, c1, mh);
+                pos = vaddq_u16(pos8, k8);
+                b += 16;
+            }
+        }
+        if np == 0 {
+            return Some(nd);
+        }
+        // ---- 4. layer 1, 8 hit rows at a time: each row's hit at the latest query occurrence of
+        //      its code, d = row + K - 1 + off - j. A row continuing the previous row's run
+        //      (row + 1, same diagonal) is no boundary; boundaries are left-packed as (list index,
+        //      diagonal, row), rows of repeated codes as (row, j). The exact hit total comes out of
+        //      the same pass ----
+        grow(&mut s.rb_idx, np + 16);
+        grow(&mut s.rb_d, np + 16);
+        grow(&mut s.rb_r, np + 16);
+        grow(&mut s.mrow, np + 16);
+        grow(&mut s.mj, np + 16);
+        let (mut nb, mut nm) = (0usize, 0usize);
+        let mut extra = vdupq_n_u32(0);
+        {
+            const WL: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+            const WH: [u16; 8] = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let (wl, wh) = (vld1q_u16(WL.as_ptr()), vld1q_u16(WH.as_ptr()));
+            let mut idx = vld1q_u16(IO.as_ptr());
+            let (k8, one) = (vdupq_n_u16(8), vdupq_n_u16(1));
+            let koff = vdupq_n_u16((off + K - 1) as u16);
+            let kpos = vdupq_n_u16(TAB_POS as u16);
+            let kmulti = vdupq_n_u16(TAB_MULTI as u16);
+            let vn = vdupq_n_u16(np as u16);
+            let (mut prev_r, mut prev_d) = (vdupq_n_u16(0), vdupq_n_u16(0xFFFF));
+            let tab = s.tab.as_ptr();
+            // Codes past `np` are stale but in range (< 1024); their lanes are masked.
+            let look4 = |c: *const u16| -> uint16x8_t {
+                let x = (c as *const u64).read_unaligned();
+                let e = |sh: u32| u64::from(*tab.add(((x >> sh) & 1023) as usize));
+                let a = e(0) | e(16) << 32;
+                let b = e(32) | e(48) << 32;
+                vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(a), vcreate_u64(b)))
+            };
+            let mut k0 = 0usize;
+            while k0 < np {
+                let r = vld1q_u16(s.hrow.as_ptr().add(k0));
+                let e0 = look4(s.hcode.as_ptr().add(k0));
+                let e1 = look4(s.hcode.as_ptr().add(k0 + 4));
+                let (lo, occ) = (vuzp1q_u16(e0, e1), vuzp2q_u16(e0, e1));
+                let j = vandq_u16(lo, kpos);
+                let d = vsubq_u16(vaddq_u16(r, koff), j);
+                let rp = vextq_u16::<7>(prev_r, r);
+                let dp = vextq_u16::<7>(prev_d, d);
+                (prev_r, prev_d) = (r, d);
+                let valid = vcltq_u16(idx, vn);
+                let cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one)), vceqq_u16(d, dp));
+                let bd = vbicq_u16(valid, cont);
+                let mu = vandq_u16(vtstq_u16(lo, kmulti), valid);
+                extra = vpadalq_u16(extra, vandq_u16(vsubq_u16(occ, one), valid));
+                let m = u32::from(vaddvq_u16(vorrq_u16(vandq_u16(bd, wl), vandq_u16(mu, wh))));
+                let (mb, mm) = (m & 0xFF, m >> 8);
+                pack(&mut s.rb_idx, nb, idx, mb);
+                pack(&mut s.rb_d, nb, d, mb);
+                nb = pack(&mut s.rb_r, nb, r, mb);
+                pack(&mut s.mrow, nm, r, mm);
+                nm = pack(&mut s.mj, nm, j, mm);
+                idx = vaddq_u16(idx, k8);
+                k0 += 8;
+            }
+        }
+        let nhits = np + vaddvq_u32(extra) as usize;
+        if nhits > max_hits {
+            return None;
+        }
+        // Early fail: no interval can beat `base + a * nhits - c` (see the scalar counter).
+        if p.base() + p.a * nhits as i32 - p.c < p.minsc {
+            return Some(nd);
+        }
+        // ---- 5. layer 1's runs, last to first: rows descend, so the last store to `minrow[d]`
+        //      is the diagonal's earliest row. Then the repeated codes' other occurrences ----
+        s.rb_idx[nb] = np as u16;
+        {
+            let (cnt, minrow, occ) = (&mut s.cnt[..], &mut s.minrow[..], &mut s.occ_bits[..]);
+            for x in (0..nb).rev() {
+                let d = s.rb_d[x] as usize;
+                cnt[d] += s.rb_idx[x + 1] - s.rb_idx[x];
+                minrow[d] = s.rb_r[x];
+                occ[d / 64] |= 1 << (d % 64);
+            }
+        }
+        // ---- Layers >= 2: layer L holds each row whose code occurs at least L times, with its
+        //      L-th latest occurrence. Within a layer, rows still ascend, so runs collapse as in
+        //      layer 1; `minrow` takes the min. The next layer (rows whose chain continues) is
+        //      packed in the same pass ----
+        let nxt = s.nxt.as_ptr();
+        // `nxt` of four query positions (past the list's end the lanes are stale, masked to stay
+        // in `nxt`, whose QCAP entries cover every query position).
+        let nxt4 = |j: *const u16| -> u64 {
+            let x = (j as *const u64).read_unaligned();
+            let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
+            e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
+        };
+        for x in 0..nm {
+            s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+        }
+        let mut n = nm;
+        grow(&mut s.hrow, n + 16);
+        grow(&mut s.hcode, n + 16);
+        let (mut rows, mut js) = (std::mem::take(&mut s.mrow), std::mem::take(&mut s.mj));
+        let (mut rows2, mut js2) = (std::mem::take(&mut s.hrow), std::mem::take(&mut s.hcode));
+        {
+            const WL: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+            const WH: [u16; 8] = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let (wl, wh) = (vld1q_u16(WL.as_ptr()), vld1q_u16(WH.as_ptr()));
+            let (k8, one) = (vdupq_n_u16(8), vdupq_n_u16(1));
+            let koff = vdupq_n_u16((off + K - 1) as u16);
+            while n > 0 {
+                let vn = vdupq_n_u16(n as u16);
+                let mut idx = vld1q_u16(IO.as_ptr());
+                let (mut prev_r, mut prev_d) = (vdupq_n_u16(0), vdupq_n_u16(0xFFFF));
+                let (mut nb, mut n2) = (0usize, 0usize);
+                let mut k0 = 0usize;
+                while k0 < n {
+                    let r = vld1q_u16(rows.as_ptr().add(k0));
+                    let j = vld1q_u16(js.as_ptr().add(k0));
+                    let jn = vreinterpretq_s16_u64(vcombine_u64(
+                        vcreate_u64(nxt4(js.as_ptr().add(k0))),
+                        vcreate_u64(nxt4(js.as_ptr().add(k0 + 4))),
+                    ));
+                    let d = vsubq_u16(vaddq_u16(r, koff), j);
+                    let rp = vextq_u16::<7>(prev_r, r);
+                    let dp = vextq_u16::<7>(prev_d, d);
+                    (prev_r, prev_d) = (r, d);
+                    let valid = vcltq_u16(idx, vn);
+                    let cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one)), vceqq_u16(d, dp));
+                    let keep = vandq_u16(vcgezq_s16(jn), valid);
+                    let m = u32::from(vaddvq_u16(vorrq_u16(
+                        vandq_u16(vbicq_u16(valid, cont), wl),
+                        vandq_u16(keep, wh),
+                    )));
+                    let (mb, mk) = (m & 0xFF, m >> 8);
+                    pack(&mut s.rb_idx, nb, idx, mb);
+                    pack(&mut s.rb_d, nb, d, mb);
+                    nb = pack(&mut s.rb_r, nb, r, mb);
+                    pack(&mut rows2, n2, r, mk);
+                    n2 = pack(&mut js2, n2, vreinterpretq_u16_s16(jn), mk);
+                    idx = vaddq_u16(idx, k8);
+                    k0 += 8;
+                }
+                s.rb_idx[nb] = n as u16;
+                let (cnt, minrow, occ) = (&mut s.cnt[..], &mut s.minrow[..], &mut s.occ_bits[..]);
+                for x in 0..nb {
+                    let (d, row) = (s.rb_d[x] as usize, s.rb_r[x]);
+                    let c = cnt[d];
+                    minrow[d] = if c == 0 { row } else { minrow[d].min(row) };
+                    cnt[d] = c + s.rb_idx[x + 1] - s.rb_idx[x];
+                    occ[d / 64] |= 1 << (d % 64);
+                }
+                n = n2;
+                std::mem::swap(&mut rows, &mut rows2);
+                std::mem::swap(&mut js, &mut js2);
+            }
+        }
+        (s.mrow, s.mj, s.hrow, s.hcode) = (rows, js, rows2, js2);
+        Some(nd)
+    }
 }
 
 /// The decision from the per-diagonal counts, walking only the diagonals that hold a hit.
@@ -435,96 +798,61 @@ fn count_hits_from(
 ///   between them reaches `minsc`, and the bound across a gap is convex, so its minimum is at an
 ///   end or next to a breakpoint ([`gap_min`]).
 fn sparse_decision(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decision {
-    let (base, c, minsc) = (p.base(), p.c, p.minsc);
-    s.occ.clear();
-    for (w, &bits) in s.occ_bits.iter().enumerate() {
-        let mut bits = bits;
-        while bits != 0 {
-            s.occ.push((w * 64) as u32 + bits.trailing_zeros());
-            bits &= bits - 1;
-        }
-    }
-    let n = s.occ.len();
+    // With `P[d]` the sum of the weights `a cnt - c` through `d` (`P[-1] = 0`), the Kadane sum ending
+    // at `d` is `f = P[d] - M[d-1]`, `M` the running minimum of `P` from `-1`, the one starting at `d`
+    // is `b = X[d] - P[d-1]`, `X` the suffix maximum, and the interval bound is `base + X[d] - M[d-1]`.
+    // Between two occupied diagonals `P` only falls, so `M[d-1]` is the minimum of the `Q = P[d-1]`
+    // of the occupied diagonals up to `d`, and `X[d]` the maximum of their `P` from `d` on.
+    let (base, a, c, minsc) = (p.base(), p.a, p.c, p.minsc);
+    let n: usize = s.occ_bits.iter().map(|w| w.count_ones() as usize).sum();
     if n == 0 {
         // Only hit-free intervals, worth at most `base - c = (K-1)a < minsc`.
         return Decision::Fail;
     }
-    debug_assert!((*s.occ.last().unwrap() as usize) < nd);
-    // ---- Forward Kadane over the occupied diagonals. After `g` empty diagonals a positive sum
-    //      `x` has decayed to `max(x - g c, 0)` before it is carried ----
-    s.fo.clear();
-    s.fo.reserve(n);
-    let mut best = i32::MIN;
-    let (mut prev_d, mut prev_f) = (0u32, 0i32);
-    for (idx, &d) in s.occ.iter().enumerate() {
-        let carry = if idx == 0 {
-            0
-        } else {
-            let gap = (d - prev_d - 1) as i32;
-            (prev_f.max(0) - gap * c).max(0)
-        };
-        let f = p.weight(s.cnt[d as usize]) + carry;
-        s.fo.push(f);
-        best = best.max(f);
-        (prev_d, prev_f) = (d, f);
+    if s.fw.len() < n {
+        s.fw.resize(n, [0; 4]);
+        s.hot.resize(n, [0; 4]);
     }
+    let (mut pp, mut m, mut best, mut prev, mut k) = (0i32, 0i32, i32::MIN, -1i32, 0usize);
+    for (w, &bits) in s.occ_bits.iter().enumerate() {
+        let mut bits = bits;
+        while bits != 0 {
+            let d = (w * 64) as i32 + bits.trailing_zeros() as i32;
+            bits &= bits - 1;
+            let hit = a * s.cnt[d as usize] as i32;
+            pp += hit - c * (d - prev);
+            let q = pp - hit + c;
+            m = m.min(q);
+            best = best.max(pp - m);
+            s.fw[k] = [d, pp, m, q];
+            (prev, k) = (d, k + 1);
+        }
+    }
+    debug_assert!((prev as usize) < nd);
     if base + best < minsc {
         return Decision::Fail;
     }
-    // ---- Backward Kadane, the mirror image ----
-    s.bo.clear();
-    s.bo.resize(n, 0);
-    let (mut next_d, mut next_b) = (0u32, 0i32);
-    for idx in (0..n).rev() {
-        let d = s.occ[idx];
-        let carry = if idx == n - 1 {
-            0
-        } else {
-            let gap = (next_d - d - 1) as i32;
-            (next_b.max(0) - gap * c).max(0)
-        };
-        let b = p.weight(s.cnt[d as usize]) + carry;
-        s.bo[idx] = b;
-        (next_d, next_b) = (d, b);
+    // Backward: keep the diagonals whose bound reaches `minsc` (store always, advance on a pass).
+    let (mut x, mut nh) = (i32::MIN, 0usize);
+    for k in (0..n).rev() {
+        let [_, pk, mk, _] = s.fw[k];
+        x = x.max(pk);
+        s.fw[k][3] = x;
+        let bnd = base + x - mk;
+        s.hot[nh] = [k as i32, x, bnd, 0];
+        nh += (bnd >= minsc) as usize;
     }
-
-    // ---- Components, as in the dense scan: runs of diagonals whose bound reaches `minsc` ----
+    (s.n_occ, s.n_hot) = (n, nh);
+    let off = (nd - len1 - 1) as i32;
+    let mut c19 = std::mem::take(&mut s.c19);
+    components(s, p, minsc, off, nd, false, &mut c19);
+    s.c19 = c19;
     let (mut lo, mut hi) = (len1 as i64, -1i64);
-    // The open component: its best bound, earliest hit row and last hit diagonal.
-    let mut open: Option<(i32, i64, i64)> = None;
-    let close = |comp: (i32, i64, i64), lo: &mut i64, hi: &mut i64| {
-        let (ub, i0, dmax) = comp;
-        *lo = (*lo).min(i0);
-        // The last hit diagonal `dmax - off` reaches row `(dmax - off) + (off - 1)` at the last pad
-        // column (`off` is the padded query length), then `tail` more rows through a deletion.
-        *hi = (*hi).max(dmax - 1 + p.tail(ub) as i64);
-    };
-    for idx in 0..n {
-        let d = s.occ[idx];
-        let bnd = base + s.fo[idx] + s.bo[idx] - p.weight(s.cnt[d as usize]);
-        if bnd < minsc {
-            if let Some(comp) = open.take() {
-                close(comp, &mut lo, &mut hi);
-            }
-            continue;
-        }
-        let (row, dd) = (s.minrow[d as usize] as i64, d as i64);
-        open = match open {
-            Some((ub, i0, _))
-                if gap_min(p, s.fo[idx - 1], s.bo[idx], d - s.occ[idx - 1] - 1) >= minsc =>
-            {
-                Some((ub.max(bnd), i0.min(row), dd))
-            }
-            prev => {
-                if let Some(comp) = prev {
-                    close(comp, &mut lo, &mut hi);
-                }
-                Some((bnd, row, dd))
-            }
-        };
-    }
-    if let Some(comp) = open {
-        close(comp, &mut lo, &mut hi);
+    for c in &s.c19 {
+        lo = lo.min(c.i0 as i64);
+        // The last hit diagonal `dmaxhit` reaches row `dmaxhit + off - 1` at the last pad column
+        // (`off` is the padded query length), then `tail` more rows through a deletion.
+        hi = hi.max(c.dmaxhit as i64 + off as i64 - 1 + p.tail(c.ub) as i64);
     }
     if hi < 0 {
         return Decision::Fail;
@@ -533,6 +861,215 @@ fn sparse_decision(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decis
         hb: lo.max(0) as usize,
         he: hi.min(len1 as i64 - 1) as usize,
     }
+}
+
+/// A diagonal component at some threshold `tau`: the diagonals `dlo..=dhi` (`d = i - j`, unshifted)
+/// whose interval bound reaches `tau`, its best bound, the earliest start row of its hits and its
+/// last diagonal holding a hit. `kf..=kl` are its occupied diagonals' indices in `Scratch::fw`;
+/// `dlo`/`dhi` cover the empty diagonals at its ends only after [`extend`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Comp {
+    pub ub: i32,
+    pub i0: i32,
+    pub dlo: i32,
+    pub dhi: i32,
+    pub dmaxhit: i32,
+    kf: usize,
+    kl: usize,
+}
+
+/// The components at `tau >= minsc`, from the lists [`sparse_decision`] left in `s`: runs of
+/// occupied diagonals whose bound reaches `tau`, joined across a gap whose bounds all reach `tau`.
+/// On a gap `(d1, d2)` every bound is at least `base + X[d2] - M[d1]` (`X` and `M` only fall),
+/// which settles most gaps without [`gap_min`].
+///
+/// Why this equals the dense scan's components:
+/// * a component's best bound is reached on an occupied diagonal: the best interval through an
+///   empty diagonal holds an occupied one (an all-empty interval is worth `base - c * len`, below
+///   any valid `minsc`), and that interval lies inside the component, so the occupied diagonal's
+///   bound is at least as high;
+/// * a component without a hit contributes nothing (the dense scan skips it too);
+/// * two consecutive occupied diagonals share a component exactly when every empty diagonal
+///   between them reaches `tau`, and the bound across a gap is convex, so its minimum is at an
+///   end or next to a breakpoint ([`gap_min`]).
+fn components(
+    s: &Scratch,
+    p: &Params,
+    tau: i32,
+    off: i32,
+    nd: usize,
+    ext: bool,
+    out: &mut Vec<Comp>,
+) {
+    let (base, a, c) = (p.base(), p.a, p.c);
+    out.clear();
+    let mut open: Option<Comp> = None;
+    let (mut pk, mut pd, mut pm, mut pf) = (-2i32, 0i32, 0i32, 0i32);
+    for &[k, x, bnd, _] in s.hot[..s.n_hot].iter().rev() {
+        if bnd < tau {
+            continue;
+        }
+        let [d, pk_, mk, _] = s.fw[k as usize];
+        let row = i32::from(s.minrow[d as usize]);
+        let qk = pk_ - a * i32::from(s.cnt[d as usize]) + c;
+        open = match open {
+            Some(cur)
+                if k == pk + 1
+                    && (base + x - pm >= tau
+                        || gap_min(p, pf, x - qk, (d - pd - 1) as u32) >= tau) =>
+            {
+                Some(Comp {
+                    ub: cur.ub.max(bnd),
+                    i0: cur.i0.min(row),
+                    dhi: d - off,
+                    dmaxhit: d - off,
+                    kl: k as usize,
+                    ..cur
+                })
+            }
+            prev => {
+                if let Some(cur) = prev {
+                    out.push(cur);
+                }
+                Some(Comp {
+                    ub: bnd,
+                    i0: row,
+                    dlo: d - off,
+                    dhi: d - off,
+                    dmaxhit: d - off,
+                    kf: k as usize,
+                    kl: k as usize,
+                })
+            }
+        };
+        (pk, pd, pm, pf) = (k, d, mk.min(pk_), pk_ - mk);
+    }
+    if let Some(cur) = open {
+        out.push(cur);
+    }
+    if ext {
+        for cm in out.iter_mut() {
+            extend(s, p, tau, nd, cm);
+        }
+    }
+}
+
+/// Widen `cm` to the empty diagonals at its two ends whose bound reaches `tau`: on the gap next to
+/// an end the bound is convex ([`gap_min`]), so those diagonals are the longest run from the end
+/// on which it stays `>= tau`, found by bisection on the monotone side of the minimum.
+fn extend(s: &Scratch, p: &Params, tau: i32, nd: usize, cm: &mut Comp) {
+    let (a, c) = (p.a, p.c);
+    // The gap between occupied indices `kl` (`-1`: before the first) and `kr` (`n`: past the last):
+    // its length and the clamped Kadane sums on either side.
+    let gap = |kl: i32, kr: usize| -> (i32, i32, i32) {
+        let (dl, pl) = if kl < 0 {
+            (-1, 0)
+        } else {
+            let [d, pp, m, _] = s.fw[kl as usize];
+            (d, (pp - m).max(0))
+        };
+        let (dr, qr) = if kr >= s.n_occ {
+            (nd as i32, 0)
+        } else {
+            let [d, pp, _, x] = s.fw[kr];
+            (d, (x - (pp - a * i32::from(s.cnt[d as usize]) + c)).max(0))
+        };
+        (dr - dl - 1, pl, qr)
+    };
+    let at = |pl: i32, qr: i32, g: i32, j: i32| {
+        p.base() - c + (pl - (j - 1) * c).max(0) + (qr - (g - j) * c).max(0)
+    };
+    let argmin = |pl: i32, qr: i32, g: i32| {
+        let (k1, k2) = (1 + pl / c, g - qr / c);
+        [1, g, k1, k1 + 1, k2, k2 - 1]
+            .into_iter()
+            .map(|j| j.clamp(1, g))
+            .min_by_key(|&j| at(pl, qr, g, j))
+            .unwrap()
+    };
+    // Right of `kl`: the longest prefix `1..=j` of the gap with bound `>= tau`.
+    let (g, pl, qr) = gap(cm.kl as i32, cm.kl + 1);
+    if g > 0 && at(pl, qr, g, 1) >= tau {
+        let jm = argmin(pl, qr, g);
+        let mut j = if at(pl, qr, g, jm) >= tau { g } else { 1 };
+        if j < g {
+            // Bisection on `[1, jm)`, nonincreasing: `at(j) >= tau`, `at(jm) < tau`.
+            let mut hi = jm;
+            while hi - j > 1 {
+                let mid = (j + hi) / 2;
+                if at(pl, qr, g, mid) >= tau {
+                    j = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+        }
+        cm.dhi += j;
+    }
+    // Left of `kf`: the longest suffix `j..=g` with bound `>= tau`.
+    let (g, pl, qr) = gap(cm.kf as i32 - 1, cm.kf);
+    if g > 0 && at(pl, qr, g, g) >= tau {
+        let jm = argmin(pl, qr, g);
+        let mut j = if at(pl, qr, g, jm) >= tau { 1 } else { g };
+        if j > 1 {
+            // Bisection on `(jm, g]`, nondecreasing: `at(jm) < tau`, `at(j) >= tau`.
+            let mut lo = jm;
+            while j - lo > 1 {
+                let mid = (lo + j) / 2;
+                if at(pl, qr, g, mid) >= tau {
+                    j = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+        }
+        cm.dlo -= g - j + 1;
+    }
+}
+
+/// [`decide`], and on a `Hull` the components the banded kernel runs: `c19` at `minsc` and, when
+/// the band threshold `T1 = max(minsc, ub2 / 2)` (`ub2` the second-best component bound) exceeds
+/// `minsc`, `ct` at `T1`. Returns `T1`, or 0 when the decision is not a hull.
+pub(crate) fn decide_bands(
+    t: &[u8],
+    q: &[u8],
+    p: &Params,
+    max_hits: usize,
+    c19: &mut Vec<Comp>,
+    ct: &mut Vec<Comp>,
+) -> (Decision, i32) {
+    let (len1, len2, k) = (t.len(), q.len(), p.k);
+    if len1 < k || len2 < k || len1 > WCAP || len2 > QCAP {
+        return (Decision::Full, 0);
+    }
+    SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
+        let Some(nd) = count_hits(s, t, q, p, max_hits) else {
+            return (Decision::Full, 0);
+        };
+        let dec = sparse_decision(s, p, len1, nd);
+        if !matches!(dec, Decision::Hull { .. }) {
+            return (dec, 0);
+        }
+        let off = (nd - len1 - 1) as i32;
+        let (mut ub1, mut ub2) = (0, 0);
+        for c in &s.c19 {
+            if c.ub > ub1 {
+                (ub2, ub1) = (ub1, c.ub);
+            } else if c.ub > ub2 {
+                ub2 = c.ub;
+            }
+        }
+        let t1 = p.minsc.max(ub2 / 2);
+        std::mem::swap(&mut s.c19, c19);
+        for cm in c19.iter_mut() {
+            extend(s, p, p.minsc, nd, cm);
+        }
+        if t1 > p.minsc {
+            components(s, p, t1, off, nd, true, ct);
+        }
+        (dec, t1)
+    })
 }
 
 /// The smallest interval bound on the `gap` empty diagonals between two occupied ones, the left
@@ -562,11 +1099,11 @@ fn gap_min(p: &Params, f_left: i32, b_right: i32, gap: u32) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bwa_extend::ksw_align2;
 
-    fn scmat(a: i8, b: i8) -> Vec<i8> {
+    pub(crate) fn scmat(a: i8, b: i8) -> Vec<i8> {
         let mut m = vec![0i8; 25];
         for i in 0..5 {
             for j in 0..5 {
@@ -682,12 +1219,22 @@ mod tests {
             }
         }
         assert!(hulls > 2000 && fails > 2000, "hulls {hulls}, fails {fails}");
+        // And every real job of a dump, when one is given.
+        if let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") {
+            let p = &params[0];
+            for (n, (t, q)) in load_dump(&path).iter().enumerate() {
+                if let Some(nd) = count_hits(&mut s, t, q, p, usize::MAX) {
+                    let want = dense_decision(&s, p, t.len(), nd);
+                    assert_eq!(sparse_decision(&mut s, p, t.len(), nd), want, "job {n}");
+                }
+            }
+        }
     }
 
     /// Real rescue jobs dumped by `BWA4_RESCUE_DUMP` (u32 tlen, u32 qlen, target, query), for
     /// offline timing: `BWA4_PRUNE_BENCH=jobs.bin cargo test --release -p bwa-mem4-neon
     /// prune_bench -- --ignored --nocapture`.
-    pub(super) fn load_dump(path: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub(crate) fn load_dump(path: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
         let raw = std::fs::read(path).unwrap();
         let (mut out, mut at) = (Vec::new(), 0);
         while at + 8 <= raw.len() {
@@ -776,9 +1323,83 @@ mod tests {
                 let (cnt, minrow) = naive_counts(t, q, k);
                 assert_eq!(&s.cnt[..nd], &cnt[..], "job {n}, k {k}: cnt");
                 let got: Vec<i32> = (0..nd)
-                    .map(|d| if s.cnt[d] > 0 { s.minrow[d] } else { 0 })
+                    .map(|d| {
+                        if s.cnt[d] > 0 {
+                            i32::from(s.minrow[d])
+                        } else {
+                            0
+                        }
+                    })
                     .collect();
                 assert_eq!(got, minrow, "job {n}, k {k}: minrow");
+                for d in 0..nd {
+                    let bit = s.occ_bits[d / 64] >> (d % 64) & 1;
+                    assert_eq!(bit == 1, s.cnt[d] > 0, "job {n}, k {k}: occ bit {d}");
+                }
+            }
+        }
+    }
+
+    /// The NEON counter against the scalar one: same verdict, same `cnt`, same `minrow` wherever
+    /// `cnt != 0`, same `occ_bits`, on generated jobs (many repeats, poly-A, tiny lengths) and on
+    /// the real dump when `BWA4_PRUNE_BENCH` names one.
+    #[test]
+    fn neon_counts_equal_scalar_counts() {
+        let mut state = 0x5eed_1234_abcd_0001u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mut jobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for _ in 0..4000 {
+            let qlen = 5 + next() % 200;
+            let tlen = 5 + next() % 1500;
+            let alpha = [4, 4, 2, 1, 3][next() % 5];
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % alpha) as u8).collect();
+            let q: Vec<u8> = (0..qlen).map(|_| (next() % alpha) as u8).collect();
+            for _ in 0..next() % 4 {
+                let l = (5 + next() % 80).min(qlen).min(tlen);
+                let (qs, at) = (next() % (qlen - l + 1), next() % (tlen - l + 1));
+                t[at..at + l].copy_from_slice(&q[qs..qs + l]);
+            }
+            if next() % 20 == 0 {
+                let at = next() % tlen;
+                t[at] = 4;
+            }
+            jobs.push((t, q));
+        }
+        if let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") {
+            jobs.extend(load_dump(&path));
+        }
+        let (mut a, mut b) = (Scratch::new(), Scratch::new());
+        for minsc in [1, 19] {
+            let p = Params {
+                minsc,
+                ..Params::from(1, 4, 6, 1, 6, 1, 19).unwrap()
+            };
+            for mh in [400usize, usize::MAX] {
+                for (n, (t, q)) in jobs.iter().enumerate() {
+                    if t.len() < 5 || q.len() < 5 || t.len() > WCAP || q.len() > QCAP {
+                        continue;
+                    }
+                    let x = count_hits(&mut a, t, q, &p, mh);
+                    let y = count_hits_scalar(&mut b, t, q, &p, mh);
+                    assert_eq!(x, y, "job {n} minsc {minsc} mh {mh}: verdict");
+                    let Some(nd) = x else { continue };
+                    let nw = nd.div_ceil(64);
+                    assert_eq!(a.occ_bits[..nw], b.occ_bits[..nw], "job {n}: occ_bits");
+                    if a.occ_bits.iter().all(|&w| w == 0) {
+                        continue;
+                    }
+                    assert_eq!(a.cnt[..nd], b.cnt[..nd], "job {n}: cnt");
+                    for d in 0..nd {
+                        if a.cnt[d] != 0 {
+                            assert_eq!(a.minrow[d], b.minrow[d], "job {n}: minrow {d}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -817,63 +1438,36 @@ mod tests {
     }
 
     /// The diagonal components at threshold `tau` from the counts `count_hits` left in `s`:
-    /// `(ub, first row, first diagonal slot, last diagonal slot, tail rows)`. Same walk as
-    /// [`sparse_decision`], with `tau` in place of `minsc`.
-    fn components_at(s: &Scratch, p: &Params, tau: i32) -> Vec<(i32, i64, i64, i64, i64)> {
-        let (base, mut out) = (p.base(), Vec::new());
-        let n = s.occ.len();
+    /// `(ub, first row, first hit slot, last hit slot, tail rows)`, from the dense bound.
+    fn components_at(
+        s: &Scratch,
+        p: &Params,
+        nd: usize,
+        tau: i32,
+    ) -> Vec<(i32, i64, i64, i64, i64)> {
+        let tail =
+            |ub: i32| ((ub - tau - p.o_del + (p.k as i32 - 1) * p.a).max(0) / p.e_del) as i64;
+        let (bnd, mut out) = (dense_bound(s, p, nd), Vec::new());
         let mut open: Option<(i32, i64, i64, i64)> = None;
-        let tail = |ub: i32| {
-            let x = ub - tau - p.o_del + (p.k as i32 - 1) * p.a;
-            if x <= 0 {
-                0
-            } else {
-                (x / p.e_del) as i64
-            }
-        };
-        let gap_min_tau = |fl: i32, br: i32, gap: u32| {
-            if gap == 0 {
-                return i32::MAX;
-            }
-            let (c, g) = (p.c, gap as i32);
-            let (pl, qr) = (fl.max(0), br.max(0));
-            let at = |k: i32| {
-                let k = k.clamp(1, g);
-                base - c + (pl - (k - 1) * c).max(0) + (qr - (g - k) * c).max(0)
-            };
-            let (k1, k2) = (1 + pl / c, g - qr / c);
-            [1, g, k1, k1 + 1, k2, k2 - 1]
-                .into_iter()
-                .map(at)
-                .min()
-                .unwrap()
-        };
-        for idx in 0..n {
-            let d = s.occ[idx];
-            let bnd = base + s.fo[idx] + s.bo[idx] - p.weight(s.cnt[d as usize]);
-            if bnd < tau {
+        for d in 0..=nd {
+            if d == nd || bnd[d] < tau {
                 if let Some((ub, i0, lo, hi)) = open.take() {
-                    out.push((ub, i0, lo, hi, tail(ub)));
+                    if lo >= 0 {
+                        out.push((ub, i0, lo, hi, tail(ub)));
+                    }
                 }
                 continue;
             }
-            let (row, dd) = (s.minrow[d as usize] as i64, d as i64);
-            open = match open {
-                Some((ub, i0, lo, _))
-                    if gap_min_tau(s.fo[idx - 1], s.bo[idx], d - s.occ[idx - 1] - 1) >= tau =>
-                {
-                    Some((ub.max(bnd), i0.min(row), lo, dd))
+            let (mut ub, mut i0, mut lo, mut hi) = open.unwrap_or((bnd[d], i64::MAX, -1, -1));
+            ub = ub.max(bnd[d]);
+            if s.cnt[d] != 0 {
+                i0 = i0.min(s.minrow[d] as i64);
+                hi = d as i64;
+                if lo < 0 {
+                    lo = d as i64;
                 }
-                prev => {
-                    if let Some((ub, i0, lo, hi)) = prev {
-                        out.push((ub, i0, lo, hi, tail(ub)));
-                    }
-                    Some((bnd, row, dd, dd))
-                }
-            };
-        }
-        if let Some((ub, i0, lo, hi)) = open {
-            out.push((ub, i0, lo, hi, tail(ub)));
+            }
+            open = Some((ub, i0, lo, hi));
         }
         out
     }
@@ -1211,8 +1805,7 @@ mod tests {
             c_now += hull;
             // Rebuild the counts and Kadane sums (decide's scratch is thread-local, not `s`).
             let nd = count_hits(&mut s, t, q, &p, usize::MAX).unwrap();
-            let _ = sparse_decision(&mut s, &p, t.len(), nd);
-            let c0 = components_at(&s, &p, p.minsc);
+            let c0 = components_at(&s, &p, nd, p.minsc);
             let mut ubs: Vec<i32> = c0.iter().map(|c| c.0).collect();
             ubs.sort_unstable_by(|a, b| b.cmp(a));
             let ub2 = ubs.get(1).copied().unwrap_or(0);
@@ -1223,7 +1816,7 @@ mod tests {
             let band_cells = |cs: &[(i32, i64, i64, i64, i64)]| -> u64 {
                 cs.iter().map(|c| (c.3 - c.2 + 1 + c.4) as u64 * ql).sum()
             };
-            let b1 = band_cells(&components_at(&s, &p, t1));
+            let b1 = band_cells(&components_at(&s, &p, nd, t1));
             let b0 = band_cells(&c0);
             // Round 1 is final iff T1 == minsc, or S >= T1 and (score2 >= T1 or the hull lies in
             // the zone around te); otherwise round 2 adds the components at minsc.
@@ -1350,45 +1943,6 @@ mod tests {
                     pc(c_full + c_hull_kept)
                 );
             }
-        }
-        // Shape of the hits: per job, rows, rows with a primary hit, runs, repeated-occurrence hits.
-        {
-            let k = 5;
-            let (mut rows, mut prim, mut runs, mut multi, mut nhits) =
-                (0u64, 0u64, 0u64, 0u64, 0u64);
-            let mut s = Scratch::new();
-            for (t, q) in &jobs {
-                if t.iter().chain(q.iter()).any(|&b| b > 3) {
-                    continue;
-                }
-                s.load_query(q, k);
-                s.ensure_chains();
-                let off = q.len().div_ceil(16) * 16;
-                let mut last: Option<(usize, usize)> = None;
-                for i in k - 1..t.len() {
-                    rows += 1;
-                    let code = t[i + 1 - k..=i]
-                        .iter()
-                        .fold(0usize, |c, &b| (c << 2) | b as usize);
-                    let j = s.head(code);
-                    if j < 0 {
-                        continue;
-                    }
-                    prim += 1;
-                    nhits += s.count(code) as u64;
-                    multi += s.count(code) as u64 - 1;
-                    let d = i + off - j as usize;
-                    if last != Some((d, i - 1)) {
-                        runs += 1;
-                    }
-                    last = Some((d, i));
-                }
-            }
-            let n = jobs.len() as f64;
-            eprintln!(
-                "BENCH shape/job: rows {:.0}, primary rows {:.0}, runs {:.0}, repeat hits {:.0}, hits {:.0}",
-                rows as f64 / n, prim as f64 / n, runs as f64 / n, multi as f64 / n, nhits as f64 / n
-            );
         }
         // The query-table rebuild alone, in the dump's order (as production sees it).
         {

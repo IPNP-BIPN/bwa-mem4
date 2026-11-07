@@ -198,6 +198,17 @@ pub mod rescue_split {
     pub static T_SORT1: AtomicU64 = AtomicU64::new(0);
     pub static T_SCAN: AtomicU64 = AtomicU64::new(0);
     pub static T_SORT3: AtomicU64 = AtomicU64::new(0);
+    /// Inside `collect`: the skip scan over the mate's regions (and the rows it walked), and the
+    /// window fetch + reverse complement. Inside `apply`: the hit insertions (and their count).
+    pub static COLLECT_SKIP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COLLECT_SKIP_ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static COLLECT_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static COLLECT_FETCH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_INSERT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static VIEW_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static VIEW_BUILDS: AtomicU64 = AtomicU64::new(0);
+    pub static VIEW_BUILD_ROWS: AtomicU64 = AtomicU64::new(0);
 
     /// Whether the probe records. Read once and cached.
     ///
@@ -236,6 +247,21 @@ pub mod rescue_split {
             APPLY_DEDUP_NS.load(Relaxed) as f64 / 1e9,
             APPLY_DEDUP_CALLS.load(Relaxed),
             APPLY_DEDUP_ROWS.load(Relaxed),
+        );
+        eprintln!(
+            "[rescue-split] collect: skip scan {:.3}s over {} calls / {} rows, fetch+rc {:.3}s; apply: inserts {:.3}s over {} hits",
+            COLLECT_SKIP_NS.load(Relaxed) as f64 / 1e9,
+            COLLECT_CALLS.load(Relaxed),
+            COLLECT_SKIP_ROWS.load(Relaxed),
+            COLLECT_FETCH_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_INSERT_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_HITS.load(Relaxed),
+        );
+        eprintln!(
+            "[rescue-split] view builds {} over {} rows in {:.3}s",
+            VIEW_BUILDS.load(Relaxed),
+            VIEW_BUILD_ROWS.load(Relaxed),
+            VIEW_BUILD_NS.load(Relaxed) as f64 / 1e9,
         );
         eprintln!(
             "[dedup-internals] sort_re {:.3}s, scan {:.3}s, sort_score {:.3}s CPU (all callers)",

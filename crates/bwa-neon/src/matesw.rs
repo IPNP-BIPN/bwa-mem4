@@ -131,17 +131,17 @@ pub struct KswJob<'a> {
 ///   `i32::MAX` on the forward pass means "never stop early"; on the reverse pass it is the forward
 ///   score, because the reverse walk only needs to find where that same score began.
 #[derive(Clone, Copy)]
-struct FwdJob<'a> {
+pub(crate) struct FwdJob<'a> {
     /// DP columns: 2-bit base codes, `<= 4`. On the forward pass this is [`KswJob::query`] verbatim;
     /// on the reverse pass it is the owned reversed prefix `query[..=qe]`, so it is at most as long.
-    query: &'a [u8],
+    pub(crate) query: &'a [u8],
     /// DP rows: 2-bit base codes, `<= 4`. Forward pass: [`KswJob::target`]. Reverse pass: the owned
     /// reversed prefix `target[..=te]`.
-    target: &'a [u8],
+    pub(crate) target: &'a [u8],
     /// 2nd-best candidate cutoff, in score units. See the doc above for how each pass sets it.
-    minsc: i32,
+    pub(crate) minsc: i32,
     /// Early-stop score, in score units. See the doc above for how each pass sets it.
-    endsc: i32,
+    pub(crate) endsc: i32,
 }
 
 /// `BWA4_MATESW_TIME=1`: cells, jobs and wall for the rescue kernel, so its throughput can be
@@ -215,6 +215,12 @@ pub mod cells {
     /// a hull, jobs run in full, and the target rows of the hull jobs before and after the cut.
     pub static PRUNE_FAIL: AtomicU64 = AtomicU64::new(0);
     pub static PRUNE_HULL: AtomicU64 = AtomicU64::new(0);
+    pub static PRUNE_BAND: AtomicU64 = AtomicU64::new(0);
+    /// The banded path: kernel time, the rest of `Batch::run`, cell vectors computed, round-2 parents.
+    pub static BAND_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BAND_OTHER_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BAND_CELLS: AtomicU64 = AtomicU64::new(0);
+    pub static BAND_R2: AtomicU64 = AtomicU64::new(0);
     pub static PRUNE_FULL: AtomicU64 = AtomicU64::new(0);
     pub static HULL_ROWS_IN: AtomicU64 = AtomicU64::new(0);
     pub static HULL_ROWS_KEPT: AtomicU64 = AtomicU64::new(0);
@@ -394,13 +400,23 @@ pub mod cells {
                 HULL_ROWS_IN.load(Ordering::Relaxed),
                 HULL_ROWS_KEPT.load(Ordering::Relaxed),
             );
+            let band = PRUNE_BAND.load(Ordering::Relaxed);
             eprintln!(
-                "[matesw] prune: {fail} proven failing, {hull} narrowed (rows kept {:.1}%), {full} full, \
-                 of {} filtered, in {:.2}s CPU ({:.2} us/job)",
+                "[matesw] bands: kernel {:.2}s for {} cells ({:.2} Gcell/s), other {:.2}s, round 2 {}",
+                BAND_KERNEL_NS.load(Ordering::Relaxed) as f64 / 1e9,
+                BAND_CELLS.load(Ordering::Relaxed),
+                BAND_CELLS.load(Ordering::Relaxed) as f64 / BAND_KERNEL_NS.load(Ordering::Relaxed).max(1) as f64,
+                BAND_OTHER_NS.load(Ordering::Relaxed) as f64 / 1e9,
+                BAND_R2.load(Ordering::Relaxed),
+            );
+            eprintln!(
+                "[matesw] prune: {fail} proven failing, {hull} narrowed (rows kept {:.1}%), {band} banded, \
+                 {full} full, of {} filtered, in {:.2}s CPU ({:.2} us/job)",
                 100.0 * rkept as f64 / rin.max(1) as f64,
-                fail + hull + full,
+                fail + hull + full + band,
                 PRUNE_NS.load(Ordering::Relaxed) as f64 / 1e9,
-                PRUNE_NS.load(Ordering::Relaxed) as f64 / 1e3 / (fail + hull + full).max(1) as f64
+                PRUNE_NS.load(Ordering::Relaxed) as f64 / 1e3
+                    / (fail + hull + full + band).max(1) as f64
             );
         }
     }
@@ -525,6 +541,12 @@ pub fn batched_mate_rescue(
     )
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+thread_local! {
+    /// The banded-rescue state, reused across kernel calls.
+    static BAND: std::cell::RefCell<crate::rescue_band::Batch> = Default::default();
+}
+
 /// The body of both entry points; `prune` is the pruning bound, `None` for the exact-everywhere path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn batched_align(
@@ -615,9 +637,46 @@ pub(crate) fn batched_align(
     // The pass-specific stop conditions: collect `score2` candidates at `minsc`, and never stop
     // early (`endsc = i32::MAX`) because the forward pass does not yet know what score to aim for.
     let mut fwd_jobs: Vec<FwdJob> = Vec::with_capacity(jobs.len());
+    // Banded rescue (`rescue_band`): a pruned job whose bands are cheaper than its hull leaves
+    // `fwd_jobs` and is run after them, under the u8 kernel's own conditions.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let band_ok = prune.is_some()
+        && !matches!(forced_rescue_tier(), RescueTier::Scalar)
+        && crate::rescue_band::kernel_available()
+        && mat_is_standard(m, mat)
+        && u8_table_has_headroom(mat);
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let mut band = BAND.with(|c| c.take());
     for (i, j) in jobs.iter().enumerate() {
         let t_decide = probing.then(std::time::Instant::now);
-        let decision = prune.map(|p| rescue_prune::decide(j.target, j.query, &p, prune_max_hits()));
+        let decision = match prune {
+            None => None,
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            Some(p)
+                if band_ok
+                    && j.query.len().min(j.target.len()) as i32 * max_sc < U8_SCORE_LIMIT
+                    && j.query.len() < U8_SCORE_LIMIT as usize =>
+            {
+                let quanta = ksw_padded_qlen(j.query.len(), max_sc);
+                match band.plan(i, j.target, j.query, &p, prune_max_hits(), quanta) {
+                    Some(d) => Some(d),
+                    None => {
+                        if let Some(t0) = t_decide {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            cells::PRUNE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+                            cells::PRUNE_BAND.fetch_add(1, Relaxed);
+                        }
+                        continue;
+                    }
+                }
+            }
+            Some(p) => Some(rescue_prune::decide(
+                j.target,
+                j.query,
+                &p,
+                prune_max_hits(),
+            )),
+        };
         if let Some(t0) = t_decide {
             use std::sync::atomic::Ordering::Relaxed;
             cells::PRUNE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
@@ -714,6 +773,18 @@ pub(crate) fn batched_align(
             score2,
             te2: shift(te2),
         };
+    }
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        if band_ok {
+            // SAFETY: NEON, the standard table and the u8 ceiling were checked when planning.
+            unsafe {
+                band.run(
+                    jobs, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, &mut out,
+                );
+            }
+        }
+        band.clear();
     }
 
     // ---- Pass 2 (KSW_XSTART): reversed prefixes, to recover where each alignment BEGINS. ----
@@ -821,7 +892,42 @@ pub(crate) fn batched_align(
             endsc: out[i].score,
         })
         .collect();
-    let rev_results = fwd_local_sw_batch(&rev_jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc);
+    // The reverse pass: banded around the diagonal where the band kernel runs (every qualifying
+    // job is under the u8 ceiling, as its forward pass was), else the forward kernel on the whole
+    // reversed prefixes.
+    #[allow(unused_mut)]
+    let mut rev_results: Vec<(i32, i32, i32, i32, i32)> = Vec::new();
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let mut banded_rev = false;
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if band_ok && !rev_jobs.is_empty() {
+        let rj: Vec<(&[u8], &[u8], i32)> = rev_jobs
+            .iter()
+            .map(|j| (j.query, j.target, j.endsc))
+            .collect();
+        let mut r3 = vec![(0i32, -1i32, -1i32); rj.len()];
+        // SAFETY: as for `band.run`.
+        unsafe {
+            band.run_reverse(&rj, mat, o_del, e_del, o_ins, e_ins, max_sc, &mut r3);
+        }
+        rev_results = r3
+            .into_iter()
+            .map(|(s, te, qe)| (s, te, qe, -1, -1))
+            .collect();
+        banded_rev = true;
+    }
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        band.clear();
+        BAND.with(|c| c.replace(band));
+        if !banded_rev {
+            rev_results = fwd_local_sw_batch(&rev_jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc);
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        rev_results = fwd_local_sw_batch(&rev_jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc);
+    }
     for (k, &i) in rev_of_job.iter().enumerate() {
         // `rscore` should equal the forward score; `rte`/`rqe` are end offsets *in the reversed*
         // coordinates, i.e. how many bases back from `te`/`qe` the alignment started. The two
@@ -883,16 +989,17 @@ fn prune_params(
 
 /// The hit gate of [`rescue_prune::decide`]: a window sharing more K-mer hits than this with its
 /// mate runs in full, because enumerating them would cost more than the rows the bound could save.
-/// 400 is the best of {300, 400, 600, 1000} on real GIAB reads, where a 1.4 kb window shares ~200
-/// random 5-mer hits with its mate (fg-labs/bwa-mem3 also lands on 400). Changes speed only, never
-/// output. `BWA4_RESCUE_PRUNE_MAX_HITS` overrides it.
+/// 1000 is the best of {400, 1000, 2000} on real GIAB reads with the banded kernel (2M HG002 pairs,
+/// M4: 90.6 s of mate-rescue CPU at 1000, 117.6 at 400, 93.7 at 2000; a 1.4 kb window shares ~600
+/// 5-mer hits with its mate). Changes speed only, never output. `BWA4_RESCUE_PRUNE_MAX_HITS`
+/// overrides it.
 fn prune_max_hits() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("BWA4_RESCUE_PRUNE_MAX_HITS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(400)
+            .unwrap_or(1000)
     })
 }
 
@@ -1226,7 +1333,7 @@ fn forced_rescue_tier() -> RescueTier {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fwd_local_sw_batch(
+pub(crate) fn fwd_local_sw_batch(
     jobs: &[FwdJob],
     m: usize,
     mat: &[i8],
@@ -2138,17 +2245,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
     let bias = if USQADD { 0 } else { mispen };
     let mut tbl = [0u8; 16];
     if USQADD {
-        tbl[0] = mtch; // match: +a
-        for e in tbl.iter_mut().take(4).skip(1) {
-            *e = mispen.wrapping_neg(); // mismatch: -b
-        }
-        for e in tbl.iter_mut().take(8).skip(4) {
-            *e = 0xff; // query N (code 4) against a real base: bwa scores -1
-        }
-        tbl[8] = 0xff; // both N: N_TARGET XOR 4
-        for e in tbl.iter_mut().take(16).skip(12) {
-            *e = 0xff; // target N against a real base: N_TARGET XOR 0-3
-        }
+        tbl = u8_score_table(mat);
     } else {
         tbl[0] = bias + mtch; // match: +a
                               // tbl[1..=3] = bias - b = 0 (mismatch), already zero
@@ -2806,6 +2903,25 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
         );
     }
     out
+}
+
+/// The u8 kernels' signed substitution table, indexed by `target XOR query` (see the score-table
+/// note in [`fwd_local_sw_neon_u8_impl`]): match `+a`, mismatch `-b`, any N `-1`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn u8_score_table(mat: &[i8]) -> [u8; 16] {
+    let mut tbl = [0u8; 16];
+    tbl[0] = mat[0] as u8; // match: +a
+    for e in tbl.iter_mut().take(4).skip(1) {
+        *e = mat[1] as u8; // mismatch: -b
+    }
+    for e in tbl.iter_mut().take(8).skip(4) {
+        *e = 0xff; // query N (code 4) against a real base: bwa scores -1
+    }
+    tbl[8] = 0xff; // both N: N_TARGET XOR 4
+    for e in tbl.iter_mut().take(16).skip(12) {
+        *e = 0xff; // target N against a real base: N_TARGET XOR 0-3
+    }
+    tbl
 }
 
 /// Pick the monomorphised NEON u8 body and run it. The two const parameters of

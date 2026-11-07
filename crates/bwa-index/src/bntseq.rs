@@ -127,7 +127,14 @@ pub struct BntSeq {
     pub n_holes: i32,
     /// Ambiguous runs in ascending, non-overlapping `offset` order.
     pub ambs: Vec<Amb>,
+    /// Per `1 << RID_BUCKET_SHIFT` forward positions, the contig holding the whole bucket, or -1
+    /// when a contig boundary lies in it (then [`Self::pos2rid`] falls back to its binary search).
+    /// Empty until [`Self::load`] builds it; every lookup tolerates that.
+    pub rid_bucket: Vec<i32>,
 }
+
+/// `log2` of a [`BntSeq::rid_bucket`] span: 64 kb, ~47k entries on GRCh38.
+const RID_BUCKET_SHIFT: u32 = 16;
 
 impl Contig {
     /// The FASTA comment as the C holds it after reading `.ann`, which is what `-V` prints: empty for
@@ -167,7 +174,26 @@ impl BntSeq {
         if let Ok(alt) = std::fs::read_to_string(&alt_path) {
             bns.apply_alt(&alt);
         }
+        bns.build_rid_buckets();
         Ok(bns)
+    }
+
+    /// Fill [`Self::rid_bucket`] from the contigs: a bucket whose first and last positions lie in
+    /// one contig (the pac is their concatenation, so then every position between does) names it.
+    pub fn build_rid_buckets(&mut self) {
+        let n = ((self.l_pac + (1 << RID_BUCKET_SHIFT) - 1) >> RID_BUCKET_SHIFT) as usize;
+        self.rid_bucket = (0..n)
+            .map(|b| {
+                let start = (b as i64) << RID_BUCKET_SHIFT;
+                let last = (start + (1 << RID_BUCKET_SHIFT) - 1).min(self.l_pac - 1);
+                let rid = self.pos2rid_search(start);
+                if self.in_contig(rid, last) {
+                    rid
+                } else {
+                    -1
+                }
+            })
+            .collect();
     }
 
     /// Mark every contig named in a `.alt` file as ALT. Port of the `.alt` block of `bns_restore`
@@ -352,6 +378,16 @@ impl BntSeq {
         if pos_f >= self.l_pac {
             return -1;
         }
+        if let Some(&rid) = self.rid_bucket.get((pos_f >> RID_BUCKET_SHIFT) as usize) {
+            if rid >= 0 {
+                return rid;
+            }
+        }
+        self.pos2rid_search(pos_f)
+    }
+
+    /// [`Self::pos2rid`]'s binary search over the contig offsets (`bns_pos2rid`, `bntseq.cpp`).
+    fn pos2rid_search(&self, pos_f: i64) -> i32 {
         // Bracket over CONTIG INDICES (not positions): the answer is known to lie in `[left, right)`
         // at the top of every iteration, because contig offsets ascend and `pos_f < l_pac`.
         // `mid` is deliberately declared out here: it survives the loop and IS the return value,
@@ -565,6 +601,7 @@ fn parse_ann(text: &[u8]) -> Result<BntSeq> {
         contigs,
         n_holes: 0,
         ambs: Vec::new(),
+        rid_bucket: Vec::new(),
     })
 }
 
@@ -708,6 +745,7 @@ mod tests {
             contigs,
             n_holes: 0,
             ambs: Vec::new(),
+            rid_bucket: Vec::new(),
         };
         for rb in 0..2 * bns.l_pac {
             for re in rb..=2 * bns.l_pac {
@@ -729,6 +767,59 @@ mod tests {
                 };
                 assert_eq!(bns.intv2rid(rb, re), expected, "[{rb}, {re})");
             }
+        }
+    }
+
+    #[test]
+    fn rid_buckets_agree_with_the_search() {
+        // Contigs shorter and longer than a bucket, boundaries inside and on bucket edges.
+        let lens = [70_000, 100, 1 << 16, 200_000, 7, 3 << 16];
+        let mut offset = 0;
+        let contigs = lens
+            .iter()
+            .map(|&len| {
+                let contig = Contig {
+                    gi: 0,
+                    name: String::new(),
+                    anno: Vec::new(),
+                    offset,
+                    len,
+                    n_ambs: 0,
+                    is_alt: false,
+                };
+                offset += i64::from(len);
+                contig
+            })
+            .collect();
+        let mut bns = BntSeq {
+            l_pac: offset,
+            n_seqs: lens.len() as i32,
+            seed: 0,
+            contigs,
+            n_holes: 0,
+            ambs: Vec::new(),
+            rid_bucket: Vec::new(),
+        };
+        bns.build_rid_buckets();
+        assert!(bns.rid_bucket.iter().any(|&r| r >= 0));
+        assert!(bns.rid_bucket.iter().any(|&r| r < 0));
+        let mut probes: Vec<i64> = (0..bns.l_pac).step_by(997).collect();
+        for c in &bns.contigs {
+            probes.extend([
+                c.offset - 1,
+                c.offset,
+                c.offset + 1,
+                c.offset + i64::from(c.len) - 1,
+            ]);
+        }
+        probes.extend([bns.l_pac - 1, bns.l_pac, bns.l_pac + 5]);
+        for pos in probes.into_iter().filter(|&p| p >= 0) {
+            let expected = if pos >= bns.l_pac {
+                -1
+            } else {
+                bns.pos2rid_search(pos)
+            };
+            assert_eq!(bns.pos2rid(pos), expected, "{pos}");
         }
     }
 }

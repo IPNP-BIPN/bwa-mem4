@@ -526,6 +526,12 @@ enum LsPhase {
     Start,
     /// One forward-extension iteration: append `codes[j]` on the right.
     Fwd,
+    /// The first forward iterations of a walk, read from the seed jump table (see the arm).
+    FwdTable,
+    /// A unique forward match: LF-walking its row to a sampled SA row, then comparing the
+    /// rest of the read with the text (see the `Fwd` arm).
+    S1Lf,
+    S1Cmp,
     /// Forward-to-backward handover: push the final candidate and reverse to longest-first. Costs no
     /// FM operation, but is its own phase so the state machine stays a faithful line-by-line mirror.
     BwdInit,
@@ -576,10 +582,23 @@ struct LsSlot {
     /// Candidate buffer. Allocated once at `max_len + 2` (the batch's longest read) and reused across
     /// every walk this slot runs, which is the point of `reset_to`: the invariant from
     /// [`smems_from_pos`] holds for any read in the batch.
+    /// The unique match's SA walk: current row and LF steps taken; then its text position.
+    lf_row: i64,
+    lf_off: i64,
+    tpos: i64,
+    /// Forward steps the seed jump table serves for this walk (`read[x .. x + jdp)` is ACGT and
+    /// `jdp <= fm.seed_jump_depth()`), and those bases' 2-bit code; 0 once taken.
+    jdp: usize,
+    jcode: u32,
     prev: Vec<Smem>,
     /// SMEMs emitted by the current walk, moved out when the slot reaches `Done`.
     out: Vec<Smem>,
 }
+
+/// A forward walk at a unique match hands off to the text compare only with at least this many
+/// read bases left: resolving the match's text position costs an LF walk to a sampled SA row
+/// (about 4 steps at 1 sample in 8 rows) and a pac read.
+const S1_MIN_REST: usize = 16;
 
 impl LsSlot {
     /// Create a slot ready to walk read `ridx` from position `x`.
@@ -604,6 +623,11 @@ impl LsSlot {
             num_prev: 0,
             j: 0,
             jj: -1,
+            lf_row: 0,
+            lf_off: 0,
+            tpos: 0,
+            jdp: 0,
+            jcode: 0,
             next_x: 0,
             prev: vec![Smem::default(); max_len + 2],
             out: Vec::new(),
@@ -658,218 +682,354 @@ impl LsSlot {
         let min_intv = self.min_intv;
         // Length of this read in bases; the exclusive upper bound of every READ offset below.
         let readlength = codes.len();
-        match self.phase {
-            LsPhase::Start => {
-                if self.x >= readlength {
-                    self.phase = LsPhase::Done;
-                    return;
-                }
-                self.next_x = self.x + 1;
-                // 2-bit code of the read base at READ offset `x`; `>= 4` means `N`.
-                let a = codes[self.x];
-                if a >= AMBIGUOUS_BASE {
-                    // No SMEM at an ambiguous base; advance one position (smems_from_pos returns x+1).
-                    // A round-2 re-seed handles exactly one position, so it stops here regardless.
-                    self.x = self.next_x;
-                    if self.single_pos || self.x >= readlength {
+        // Phases that touch no index memory run on at once; the others return after issuing
+        // their prefetches, so the other slots' loads overlap this one's.
+        loop {
+            match self.phase {
+                LsPhase::Start => {
+                    if self.x >= readlength {
                         self.phase = LsPhase::Done;
+                        return;
                     }
-                    return;
-                }
-                let a = a as usize;
-                // The single-base interval for `codes[x]`: `k` is the first BWT ROW starting with
-                // that base, `l` the first row of its complement (the RC-side interval, which makes
-                // the later k/l swap valid), `s` the number of times the base occurs in the 2L text.
-                self.smem = Smem {
-                    rid: 0,
-                    m: self.x as u32,
-                    n: self.x as u32,
-                    k: counts[a],
-                    l: counts[MAX_BASE - a],
-                    s: counts[a + 1] - counts[a],
-                };
-                self.num_prev = 0;
-                self.j = self.x + 1;
-                self.phase = LsPhase::Fwd;
-                #[cfg(feature = "seed-stats")]
-                if stats_on {
-                    seed_stats::STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            LsPhase::Fwd => {
-                if self.j >= readlength {
-                    self.phase = LsPhase::BwdInit;
-                    return;
-                }
-                // Base code at the READ offset being appended on the right.
-                let aj = codes[self.j];
-                self.next_x = self.j + 1;
-                if aj >= AMBIGUOUS_BASE {
-                    self.phase = LsPhase::BwdInit;
-                    return;
-                }
-                // Forward extension = backward extension on the reverse complement: swap k/l to
-                // reinterpret the interval as the RC one, prepend the complement base `3 - aj`,
-                // swap back. See the module docs.
-                // `rc_view`: the same interval reinterpreted as that of the pattern's reverse
-                // complement (k and l are BWT ROWS; swapping them swaps which strand's rows lead).
-                let mut rc_view = self.smem;
-                std::mem::swap(&mut rc_view.k, &mut rc_view.l);
-                // `rc_extended`: interval of `complement(aj)` prepended to the RC pattern, which is
-                // the RC of `pattern + aj`.
-                #[cfg(feature = "seed-stats")]
-                if stats_on {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    seed_stats::FWD_STEPS.fetch_add(1, Relaxed);
-                    // `j - x` is how many bases have been appended since this start, so the first
-                    // ten steps of a start are the ones a depth-10 prefix table could serve.
-                    if self.j - self.x < 10 {
-                        seed_stats::FWD_FIRST10.fetch_add(1, Relaxed);
+                    self.next_x = self.x + 1;
+                    // 2-bit code of the read base at READ offset `x`; `>= 4` means `N`.
+                    let a = codes[self.x];
+                    if a >= AMBIGUOUS_BASE {
+                        // No SMEM at an ambiguous base; advance one position (smems_from_pos returns x+1).
+                        // A round-2 re-seed handles exactly one position, so it stops here regardless.
+                        self.x = self.next_x;
+                        if self.single_pos || self.x >= readlength {
+                            self.phase = LsPhase::Done;
+                        }
+                        return;
+                    }
+                    let a = a as usize;
+                    // The single-base interval for `codes[x]`: `k` is the first BWT ROW starting with
+                    // that base, `l` the first row of its complement (the RC-side interval, which makes
+                    // the later k/l swap valid), `s` the number of times the base occurs in the 2L text.
+                    self.smem = Smem {
+                        rid: 0,
+                        m: self.x as u32,
+                        n: self.x as u32,
+                        k: counts[a],
+                        l: counts[MAX_BASE - a],
+                        s: counts[a + 1] - counts[a],
+                    };
+                    self.num_prev = 0;
+                    self.j = self.x + 1;
+                    self.phase = LsPhase::Fwd;
+                    #[cfg(feature = "seed-stats")]
+                    if stats_on {
+                        seed_stats::STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // The first forward steps from the table (see `FwdTable`): as many as the
+                    // table is deep and the read stays ACGT. Their lines are prefetched now and
+                    // read on the next visit, so the other slots' loads overlap these.
+                    let lim = fm.seed_jump_depth().min(readlength - self.x);
+                    let mut jdp = 1;
+                    let mut code = a as u32;
+                    while jdp < lim && codes[self.x + jdp] < AMBIGUOUS_BASE {
+                        code = code << 2 | u32::from(codes[self.x + jdp]);
+                        jdp += 1;
+                    }
+                    if jdp >= 2 {
+                        self.jdp = jdp;
+                        self.jcode = code;
+                        for d in 2..=jdp {
+                            fm.prefetch_seed_jump(d, code >> (2 * (jdp - d)));
+                        }
+                        self.phase = LsPhase::FwdTable;
+                        return;
                     }
                 }
-                let rc_extended = fm.backward_ext(rc_view, MAX_BASE - aj as usize);
-                // `new_smem`: swapped back, so it is the forward interval of the read substring
-                // `codes[x ..= j]`, one base longer on the RIGHT than `self.smem`.
-                let mut new_smem = rc_extended;
-                std::mem::swap(&mut new_smem.k, &mut new_smem.l);
-                new_smem.n = self.j as u32;
+                LsPhase::FwdTable => {
+                    // The forward steps to depths `2..=jdp`, each with the bookkeeping of a `Fwd`
+                    // step and the interval read from the table instead of the FM index (the
+                    // table holds what that step would compute; fg-labs/bwa-mem3's
+                    // `ls_advance_forward_table`). Every base is ACGT and inside the read, so only
+                    // the `s < min_intv` exit and the unique-match hand-off can end the run early.
+                    let (jdp, code) = (self.jdp, self.jcode);
+                    self.jdp = 0;
+                    for d in 2..=jdp {
+                        let e = fm.seed_jump(d, code >> (2 * (jdp - d)));
+                        let j = self.x + d - 1;
+                        self.next_x = j + 1;
+                        let new_smem = Smem {
+                            rid: 0,
+                            m: self.x as u32,
+                            n: j as u32,
+                            k: e.k,
+                            l: e.l,
+                            s: e.s,
+                        };
+                        self.prev[self.num_prev] = self.smem;
+                        if new_smem.s != self.smem.s {
+                            self.num_prev += 1;
+                        }
+                        if new_smem.s < min_intv {
+                            self.next_x = j;
+                            self.phase = LsPhase::BwdInit;
+                            return;
+                        }
+                        self.smem = new_smem;
+                        self.j = j + 1;
+                        if new_smem.s == 1 && readlength - self.j >= S1_MIN_REST {
+                            self.lf_row = new_smem.k;
+                            self.lf_off = 0;
+                            self.phase = LsPhase::S1Lf;
+                            fm.prefetch_sa_row(new_smem.k);
+                            return;
+                        }
+                    }
+                    self.phase = LsPhase::Fwd;
+                    fm.prefetch_occ(self.smem.l, self.smem.l + self.smem.s);
+                    return;
+                }
+                LsPhase::Fwd => {
+                    if self.j >= readlength {
+                        self.phase = LsPhase::BwdInit;
+                        return;
+                    }
+                    // Base code at the READ offset being appended on the right.
+                    let aj = codes[self.j];
+                    self.next_x = self.j + 1;
+                    if aj >= AMBIGUOUS_BASE {
+                        self.phase = LsPhase::BwdInit;
+                        return;
+                    }
+                    // Forward extension = backward extension on the reverse complement: swap k/l to
+                    // reinterpret the interval as the RC one, prepend the complement base `3 - aj`,
+                    // swap back. See the module docs.
+                    // `rc_view`: the same interval reinterpreted as that of the pattern's reverse
+                    // complement (k and l are BWT ROWS; swapping them swaps which strand's rows lead).
+                    let mut rc_view = self.smem;
+                    std::mem::swap(&mut rc_view.k, &mut rc_view.l);
+                    // `rc_extended`: interval of `complement(aj)` prepended to the RC pattern, which is
+                    // the RC of `pattern + aj`.
+                    #[cfg(feature = "seed-stats")]
+                    if stats_on {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        seed_stats::FWD_STEPS.fetch_add(1, Relaxed);
+                        // `j - x` is how many bases have been appended since this start, so the first
+                        // ten steps of a start are the ones a depth-10 prefix table could serve.
+                        if self.j - self.x < 10 {
+                            seed_stats::FWD_FIRST10.fetch_add(1, Relaxed);
+                        }
+                    }
+                    let rc_extended = fm.backward_ext(rc_view, MAX_BASE - aj as usize);
+                    // `new_smem`: swapped back, so it is the forward interval of the read substring
+                    // `codes[x ..= j]`, one base longer on the RIGHT than `self.smem`.
+                    let mut new_smem = rc_extended;
+                    std::mem::swap(&mut new_smem.k, &mut new_smem.l);
+                    new_smem.n = self.j as u32;
 
-                self.prev[self.num_prev] = self.smem;
-                if new_smem.s != self.smem.s {
-                    self.num_prev += 1;
-                }
-                if new_smem.s < min_intv {
-                    self.next_x = self.j;
-                    self.phase = LsPhase::BwdInit;
-                    return;
-                }
-                self.smem = new_smem;
-                // Next forward step swaps k/l, so its backward_ext reads the blocks at `new_smem.l`.
-                fm.prefetch_occ(new_smem.l, new_smem.l + new_smem.s);
-                self.j += 1;
-            }
-            LsPhase::BwdInit => {
-                if self.smem.s >= min_intv {
                     self.prev[self.num_prev] = self.smem;
-                    self.num_prev += 1;
-                }
-                self.prev[..self.num_prev].reverse();
-                self.jj = self.x as i64 - 1;
-                self.phase = LsPhase::Bwd;
-                // The next step extends these, and this step was the last chance to warn the cache:
-                // without it the first backward round only prefetches right before its own loads.
-                // From fg-labs/bwa-mem3 PR #600. A hint, so it cannot change a result.
-                for c in self.prev[..self.num_prev.min(pf_ahead)].iter() {
-                    fm.prefetch_occ(c.k, c.k + c.s);
-                }
-            }
-            LsPhase::Bwd => {
-                if self.jj < 0 {
-                    self.phase = LsPhase::PosDone;
+                    if new_smem.s != self.smem.s {
+                        self.num_prev += 1;
+                    }
+                    if new_smem.s < min_intv {
+                        self.next_x = self.j;
+                        self.phase = LsPhase::BwdInit;
+                        return;
+                    }
+                    self.smem = new_smem;
+                    self.j += 1;
+                    // A unique match (`s == 1`, so `min_intv <= 1`) keeps its row `k` on every further
+                    // forward step: the one suffix it names is either extended or dropped. So instead
+                    // of stepping the rest of the read a base at a time, resolve that suffix's text
+                    // position from `k` and compare the read with the text (fg-labs/bwa-mem3).
+                    if new_smem.s == 1 && readlength - self.j >= S1_MIN_REST {
+                        self.lf_row = new_smem.k;
+                        self.lf_off = 0;
+                        self.phase = LsPhase::S1Lf;
+                        fm.prefetch_sa_row(new_smem.k);
+                        return;
+                    }
+                    // Next forward step swaps k/l, so its backward_ext reads the blocks at `new_smem.l`.
+                    fm.prefetch_occ(new_smem.l, new_smem.l + new_smem.s);
                     return;
                 }
-                // Base code at the READ offset being prepended on the left this round.
-                let a = codes[self.jj as usize];
-                if a > 3 {
-                    self.phase = LsPhase::PosDone;
-                    return;
+                LsPhase::S1Lf => match fm.sa_step(self.lf_row, self.lf_off) {
+                    Err(next) => {
+                        self.lf_row = next;
+                        self.lf_off += 1;
+                        fm.prefetch_sa_row(next);
+                        return;
+                    }
+                    Ok(v) => {
+                        // `v = SA[k]`, where `read[m..=n]` starts in the text; read base `j` faces
+                        // text base `v + (j - m)`.
+                        self.tpos = v + (self.j as i64 - i64::from(self.smem.m));
+                        // Keep the resolved position for the SA lookup of this match and of its
+                        // backward extensions (`sa_tag`); `l` is dead from here on.
+                        self.smem.l = bwa_index::fmindex::sa_tag(v - i64::from(self.smem.m));
+                        self.phase = LsPhase::S1Cmp;
+                        let tend = 2 * fm.l_pac();
+                        if self.tpos < tend {
+                            fm.prefetch_pac(
+                                self.tpos,
+                                (self.tpos + (readlength - self.j) as i64).min(tend),
+                            );
+                        }
+                        return;
+                    }
+                },
+                LsPhase::S1Cmp => {
+                    // The exit the base-at-a-time walk would take at the first base that ends it: the
+                    // read's end, a non-ACGT read base (`next_x = j + 1`), or a base the text does not
+                    // continue with, the text's end included (`next_x = j`). Every exit keeps the
+                    // match (`s = 1 >= min_intv`) with `n = j - 1`, which `BwdInit` records.
+                    let tend = 2 * fm.l_pac();
+                    let (mut j, mut t) = (self.j, self.tpos);
+                    while j < readlength && t < tend && codes[j] == fm.base(t) {
+                        j += 1;
+                        t += 1;
+                    }
+                    self.next_x = if j >= readlength {
+                        readlength
+                    } else if codes[j] >= AMBIGUOUS_BASE {
+                        j + 1
+                    } else {
+                        j
+                    };
+                    self.smem.n = (j - 1) as u32;
+                    self.phase = LsPhase::BwdInit;
                 }
-                let a = a as usize;
-                // Survivors kept so far this round; also the write cursor for the in-place compaction
-                // of `prev`.
-                let mut num_curr = 0usize;
-                // Occurrence count of the last survivor kept this round. `-1` is impossible for a
-                // real count, so the first survivor always passes the `!=` test.
-                let mut curr_s = -1i64;
+                LsPhase::BwdInit => {
+                    if self.smem.s >= min_intv {
+                        self.prev[self.num_prev] = self.smem;
+                        self.num_prev += 1;
+                    }
+                    self.prev[..self.num_prev].reverse();
+                    self.jj = self.x as i64 - 1;
+                    self.phase = LsPhase::Bwd;
+                    // The next step extends these, and this step was the last chance to warn the cache:
+                    // without it the first backward round only prefetches right before its own loads.
+                    // From fg-labs/bwa-mem3 PR #600. A hint, so it cannot change a result.
+                    for c in self.prev[..self.num_prev.min(pf_ahead)].iter() {
+                        fm.prefetch_occ(c.k, c.k + c.s);
+                    }
+                }
+                LsPhase::Bwd => {
+                    if self.jj < 0 {
+                        self.phase = LsPhase::PosDone;
+                        return;
+                    }
+                    // Base code at the READ offset being prepended on the left this round.
+                    let a = codes[self.jj as usize];
+                    if a > 3 {
+                        self.phase = LsPhase::PosDone;
+                        return;
+                    }
+                    let a = a as usize;
+                    if self.num_prev == 1 {
+                        // The common case (a unique match): one candidate, so the two loops below
+                        // and their dedup collapse to one step. Same decisions in the same order.
+                        #[cfg(feature = "seed-stats")]
+                        if stats_on {
+                            seed_stats::BWD_STEPS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let candidate = self.prev[0];
+                        let mut new_smem = fm.backward_ext_konly(candidate, a);
+                        new_smem.m = self.jj as u32;
+                        self.jj -= 1;
+                        if new_smem.s < min_intv {
+                            if (i64::from(candidate.n) - i64::from(candidate.m) + 1)
+                                >= i64::from(min_seed_len)
+                            {
+                                self.out.push(candidate);
+                            }
+                            self.num_prev = 0;
+                            self.phase = LsPhase::PosDone;
+                        } else {
+                            self.prev[0] = new_smem;
+                            fm.prefetch_occ(new_smem.k, new_smem.k + new_smem.s);
+                        }
+                        return;
+                    }
+                    // Survivors kept so far this round; also the write cursor for the in-place compaction
+                    // of `prev`.
+                    let mut num_curr = 0usize;
+                    // Occurrence count of the last survivor kept this round. `-1` is impossible for a
+                    // real count, so the first survivor always passes the `!=` test.
+                    let mut curr_s = -1i64;
 
-                // Read cursor over the live candidates. Invariant at the top of each iteration:
-                // `prev[..num_curr]` holds this round's survivors (already left-extended by `a`) and
-                // `prev[p..num_prev]` still holds last round's candidates, longest first. The write
-                // cursor never overtakes the read cursor, so no candidate is clobbered before use.
-                // Every live candidate is about to be extended by the same base, and each
-                // extension is an independent pair of checkpoint loads. Issuing all the prefetches
-                // BEFORE the first extension turns a serial chain of dependent DRAM misses into
-                // overlapping ones; the loop below then mostly hits cache. Costs a few prefetch
-                // instructions on the rounds that break early, which is why it is capped rather
-                // than run over the whole array.
-                //
-                // Prefetching cannot change a result: it moves lines into cache and nothing else.
-                for c in self.prev[..self.num_prev.min(pf_ahead)].iter() {
-                    fm.prefetch_occ(c.k, c.k + c.s);
-                }
-                let mut p = 0usize;
-                while p < self.num_prev {
-                    let candidate = self.prev[p];
-                    // Interval of `a` prepended to the candidate: same read substring one base longer
-                    // on the LEFT. Plain backward extension, no k/l swap.
-                    #[cfg(feature = "seed-stats")]
-                    if stats_on {
-                        seed_stats::BWD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Read cursor over the live candidates. Invariant at the top of each iteration:
+                    // `prev[..num_curr]` holds this round's survivors (already left-extended by `a`) and
+                    // `prev[p..num_prev]` still holds last round's candidates, longest first. The write
+                    // cursor never overtakes the read cursor, so no candidate is clobbered before use.
+                    // Every live candidate is about to be extended by the same base, and each
+                    // extension is an independent pair of checkpoint loads. Issuing all the prefetches
+                    // BEFORE the first extension turns a serial chain of dependent DRAM misses into
+                    // overlapping ones; the loop below then mostly hits cache. Costs a few prefetch
+                    // instructions on the rounds that break early, which is why it is capped rather
+                    // than run over the whole array.
+                    //
+                    // Prefetching cannot change a result: it moves lines into cache and nothing else.
+                    for c in self.prev[..self.num_prev.min(pf_ahead)].iter() {
+                        fm.prefetch_occ(c.k, c.k + c.s);
                     }
-                    let mut new_smem = fm.backward_ext(candidate, a);
-                    new_smem.m = self.jj as u32;
-                    if new_smem.s < min_intv
-                        && (i64::from(candidate.n) - i64::from(candidate.m) + 1)
+                    // bwa's two loops as one pass: `open` is true until the first candidate that is
+                    // either emitted (its extension dies while it is long enough) or kept; after
+                    // that, shorter candidates survive only with a new occurrence count and are
+                    // never emitted this round.
+                    let mut open = true;
+                    for p in 0..self.num_prev {
+                        let candidate = self.prev[p];
+                        #[cfg(feature = "seed-stats")]
+                        if stats_on {
+                            seed_stats::BWD_STEPS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let mut new_smem = fm.backward_ext_konly(candidate, a);
+                        new_smem.m = self.jj as u32;
+                        if new_smem.s >= min_intv {
+                            if new_smem.s != curr_s {
+                                curr_s = new_smem.s;
+                                self.prev[num_curr] = new_smem;
+                                num_curr += 1;
+                                fm.prefetch_occ(new_smem.k, new_smem.k + new_smem.s);
+                                open = false;
+                            }
+                        } else if open
+                            && (i64::from(candidate.n) - i64::from(candidate.m) + 1)
+                                >= i64::from(min_seed_len)
+                        {
+                            self.out.push(candidate);
+                            open = false;
+                        }
+                    }
+                    self.num_prev = num_curr;
+                    self.jj -= 1;
+                    if num_curr == 0 {
+                        self.phase = LsPhase::PosDone;
+                    }
+                    return;
+                }
+                LsPhase::PosDone => {
+                    if self.num_prev != 0 {
+                        // Candidates are kept longest-first, so `prev[0]` is the longest survivor. The
+                        // backward phase ended at the read start or at an `N` rather than because a
+                        // candidate died, so this one is left-maximal by boundary: emit it if long enough.
+                        let longest = self.prev[0];
+                        if (i64::from(longest.n) - i64::from(longest.m) + 1)
                             >= i64::from(min_seed_len)
-                    {
-                        self.out.push(candidate);
-                        break;
+                        {
+                            self.out.push(longest);
+                        }
                     }
-                    if new_smem.s >= min_intv && new_smem.s != curr_s {
-                        curr_s = new_smem.s;
-                        self.prev[num_curr] = new_smem;
-                        num_curr += 1;
-                        fm.prefetch_occ(new_smem.k, new_smem.k + new_smem.s);
-                        break;
-                    }
-                    p += 1;
+                    self.x = self.next_x;
+                    // Round-2 re-seeds a single position (matching one `smems_from_pos` call); round 1
+                    // sweeps the whole read.
+                    self.phase = if self.single_pos || self.x >= readlength {
+                        LsPhase::Done
+                    } else {
+                        LsPhase::Start
+                    };
                 }
-                p += 1;
-                // Second loop over the remaining, strictly shorter candidates. They can no longer be
-                // emitted this round; they survive only if they add a distinct occurrence count.
-                while p < self.num_prev {
-                    let candidate = self.prev[p];
-                    #[cfg(feature = "seed-stats")]
-                    if stats_on {
-                        seed_stats::BWD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    let mut new_smem = fm.backward_ext(candidate, a);
-                    new_smem.m = self.jj as u32;
-                    if new_smem.s >= min_intv && new_smem.s != curr_s {
-                        curr_s = new_smem.s;
-                        self.prev[num_curr] = new_smem;
-                        num_curr += 1;
-                        fm.prefetch_occ(new_smem.k, new_smem.k + new_smem.s);
-                    }
-                    p += 1;
-                }
-                self.num_prev = num_curr;
-                self.jj -= 1;
-                if num_curr == 0 {
-                    self.phase = LsPhase::PosDone;
-                }
+                LsPhase::Done => return,
             }
-            LsPhase::PosDone => {
-                if self.num_prev != 0 {
-                    // Candidates are kept longest-first, so `prev[0]` is the longest survivor. The
-                    // backward phase ended at the read start or at an `N` rather than because a
-                    // candidate died, so this one is left-maximal by boundary: emit it if long enough.
-                    let longest = self.prev[0];
-                    if (i64::from(longest.n) - i64::from(longest.m) + 1) >= i64::from(min_seed_len)
-                    {
-                        self.out.push(longest);
-                    }
-                }
-                self.x = self.next_x;
-                // Round-2 re-seeds a single position (matching one `smems_from_pos` call); round 1
-                // sweeps the whole read.
-                self.phase = if self.single_pos || self.x >= readlength {
-                    LsPhase::Done
-                } else {
-                    LsPhase::Start
-                };
-            }
-            LsPhase::Done => {}
         }
     }
 }
@@ -1065,7 +1225,7 @@ fn smems_from_pos(
             if stats_on {
                 seed_stats::BWD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            let mut new_smem = fm.backward_ext(candidate, a);
+            let mut new_smem = fm.backward_ext_konly(candidate, a);
             new_smem.m = jj as u32;
             // (a) This candidate cannot survive base `a` on the left, so it is left-maximal, and
             // being the longest live candidate it is also right-maximal: an SMEM. Emit it and stop
@@ -1102,7 +1262,7 @@ fn smems_from_pos(
             if stats_on {
                 seed_stats::BWD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            let mut new_smem = fm.backward_ext(candidate, a);
+            let mut new_smem = fm.backward_ext_konly(candidate, a);
             new_smem.m = jj as u32;
             if new_smem.s >= min_intv && new_smem.s != curr_s {
                 curr_s = new_smem.s;
@@ -1216,6 +1376,8 @@ fn bwt_seed_strategy(
 /// call advances exactly one phase iteration, so different reads' FM operations interleave.
 #[derive(PartialEq, Eq)]
 enum BwtPhase {
+    /// Read the planned seed jump entry (see the `Start` arm) and resume `Fwd` past it.
+    Jump,
     /// Set up the single-base interval at `x` (or skip an `N` and move to the next position).
     Start,
     /// One forward-extension iteration: append `codes[j]` on the right, and emit plus end the
@@ -1244,6 +1406,9 @@ struct BwtSeedSlot {
     smem: Smem,
     /// Which phase the next `step` call executes. `Done` tells the driver to harvest and refill.
     phase: BwtPhase,
+    /// The planned seed jump (see `Jump`): its length and the 2-bit code of `read[x .. x + jd)`.
+    jd: usize,
+    jcode: u32,
     /// SMEMs emitted by the current walk, moved out when the slot reaches `Done`.
     out: Vec<Smem>,
 }
@@ -1259,6 +1424,8 @@ impl BwtSeedSlot {
             j: 0,
             smem: Smem::default(),
             phase: BwtPhase::Start,
+            jd: 0,
+            jcode: 0,
             out: Vec::new(),
         }
     }
@@ -1331,6 +1498,39 @@ impl BwtSeedSlot {
                 };
                 self.j = self.x + 1;
                 self.phase = BwtPhase::Fwd;
+                // Nothing below can end a walk before it is `min_seed_len` long, so its first
+                // `jd` bases come from the seed jump table in one entry when they are all ACGT
+                // (the fork's `bsd_plan_jump`); the entry is prefetched here and read by `Jump`.
+                let jd = fm.seed_jump_depth().min(min_seed_len.max(1) as usize - 1);
+                if jd >= 2
+                    && self.x + jd <= readlength
+                    && codes[self.x + 1..self.x + jd]
+                        .iter()
+                        .all(|&b| b < AMBIGUOUS_BASE)
+                {
+                    self.jd = jd;
+                    self.jcode = codes[self.x..self.x + jd]
+                        .iter()
+                        .fold(0u32, |c, &b| c << 2 | u32::from(b));
+                    fm.prefetch_seed_jump(jd, self.jcode);
+                    self.phase = BwtPhase::Jump;
+                }
+            }
+            BwtPhase::Jump => {
+                // The walk's state after its first `jd - 1` forward steps, `next_x` included.
+                let e = fm.seed_jump(self.jd, self.jcode);
+                self.smem = Smem {
+                    rid: 0,
+                    m: self.x as u32,
+                    n: (self.x + self.jd - 1) as u32,
+                    k: e.k,
+                    l: e.l,
+                    s: e.s,
+                };
+                self.j = self.x + self.jd;
+                self.next_x = self.j;
+                self.phase = BwtPhase::Fwd;
+                fm.prefetch_occ(self.smem.l, self.smem.l + self.smem.s);
             }
             BwtPhase::Fwd => {
                 if self.j >= readlength {
@@ -1780,6 +1980,126 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// Seeding on a real index and real reads, for timing variants of the lockstep walk:
+    /// `BWA4_SEED_BENCH_INDEX=<prefix> BWA4_SEED_BENCH_FQ=<fastq> [BWA4_SEED_BENCH_N=200000]
+    /// cargo test --release -p bwa-mem4-seed smem_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn smem_bench() {
+        let (Ok(idx), Ok(fq)) = (
+            std::env::var("BWA4_SEED_BENCH_INDEX"),
+            std::env::var("BWA4_SEED_BENCH_FQ"),
+        ) else {
+            return;
+        };
+        let n: usize = std::env::var("BWA4_SEED_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let fm = FmIndex::load(Path::new(&idx)).unwrap();
+        let text = std::fs::read_to_string(&fq).unwrap();
+        let reads: Vec<Vec<u8>> = text
+            .lines()
+            .skip(1)
+            .step_by(4)
+            .take(n)
+            .map(|l| {
+                l.bytes()
+                    .map(|b| match b {
+                        b'A' | b'a' => 0,
+                        b'C' | b'c' => 1,
+                        b'G' | b'g' => 2,
+                        b'T' | b't' => 3,
+                        _ => 4,
+                    })
+                    .collect()
+            })
+            .collect();
+        let opt = MemOpt::default();
+        let mut total = 0usize;
+        let (mut t1, mut t2, mut t3) = (0u128, 0u128, 0u128);
+        let t0 = std::time::Instant::now();
+        for chunk in reads.chunks(512) {
+            let refs: Vec<&[u8]> = chunk.iter().map(|r| r.as_slice()).collect();
+            #[cfg(feature = "seed-stats")]
+            let snap = || {
+                use std::sync::atomic::Ordering::Relaxed;
+                (
+                    seed_stats::STARTS.load(Relaxed),
+                    seed_stats::FWD_STEPS.load(Relaxed),
+                    seed_stats::BWD_STEPS.load(Relaxed),
+                )
+            };
+            #[cfg(feature = "seed-stats")]
+            let s0 = snap();
+            let a = std::time::Instant::now();
+            let mut per_read = collect_smems_batched(&fm, &refs, opt.min_seed_len, 1);
+            t1 += a.elapsed().as_nanos();
+            #[cfg(feature = "seed-stats")]
+            let s1 = snap();
+            let a = std::time::Instant::now();
+            smem_round_2_batched(&fm, &refs, &opt, &mut per_read);
+            t2 += a.elapsed().as_nanos();
+            #[cfg(feature = "seed-stats")]
+            {
+                let s2 = snap();
+                use std::sync::atomic::Ordering::Relaxed;
+                R1.fetch_add(s1.0 - s0.0, Relaxed);
+                R1F.fetch_add(s1.1 - s0.1, Relaxed);
+                R1B.fetch_add(s1.2 - s0.2, Relaxed);
+                R2.fetch_add(s2.0 - s1.0, Relaxed);
+                R2F.fetch_add(s2.1 - s1.1, Relaxed);
+                R2B.fetch_add(s2.2 - s1.2, Relaxed);
+            }
+            let a = std::time::Instant::now();
+            if opt.max_mem_intv > 0 {
+                bwt_seed_strategy_batched(
+                    &fm,
+                    &refs,
+                    opt.max_mem_intv,
+                    opt.min_seed_len + 1,
+                    &mut per_read,
+                );
+            }
+            t3 += a.elapsed().as_nanos();
+            total += per_read.iter().map(|v| v.len()).sum::<usize>();
+        }
+        let ns = t0.elapsed().as_nanos() as f64;
+        let n = reads.len() as f64;
+        eprintln!(
+            "SEED bench: {} reads, {total} smems, {:.0} ns/read (round 1 {:.0}, round 2 {:.0}, round 3 {:.0}), {:.2} s",
+            reads.len(),
+            ns / n,
+            t1 as f64 / n,
+            t2 as f64 / n,
+            t3 as f64 / n,
+            ns / 1e9
+        );
+        #[cfg(feature = "seed-stats")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            seed_stats::dump();
+            let n = reads.len() as f64;
+            eprintln!(
+                "per read: round 1 starts {:.2} fwd {:.1} bwd {:.1}; round 2 starts {:.2} fwd {:.1} bwd {:.1}",
+                R1.load(Relaxed) as f64 / n, R1F.load(Relaxed) as f64 / n, R1B.load(Relaxed) as f64 / n,
+                R2.load(Relaxed) as f64 / n, R2F.load(Relaxed) as f64 / n, R2B.load(Relaxed) as f64 / n
+            );
+        }
+    }
+    #[cfg(feature = "seed-stats")]
+    static R1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(feature = "seed-stats")]
+    static R1F: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(feature = "seed-stats")]
+    static R1B: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(feature = "seed-stats")]
+    static R2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(feature = "seed-stats")]
+    static R2F: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(feature = "seed-stats")]
+    static R2B: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     /// Load the small checked-in test index (`testdata/tiny/tiny.fa` plus its `.bwt`/`.sa` siblings).
     /// Small enough to be cache-resident, so these tests exercise correctness, never latency.
     fn tiny() -> FmIndex {
@@ -1849,6 +2169,11 @@ mod tests {
     ///
     /// # Returns
     /// The brute-force occurrence count, which must equal the FM interval's `s`.
+    /// An SMEM without its `l`, which the production walks do not maintain (see `backward_ext_konly`).
+    fn sans_l(s: &Smem) -> (u32, u32, u32, i64, i64) {
+        (s.rid, s.m, s.n, s.k, s.s)
+    }
+
     fn naive_occ(reference: &[u8], pat: &[u8]) -> i64 {
         reference.windows(pat.len()).filter(|w| *w == pat).count() as i64
     }
@@ -1935,9 +2260,11 @@ mod tests {
             let batched = collect_smems_batched(&fm, &refs, msl, mi);
             for (r, read) in reads.iter().enumerate() {
                 let per_read = collect_smems(&fm, read, msl, mi);
+                // `l` is not compared: the batched walk leaves it stale past a unique match (the
+                // text compare) and after every backward step, and nothing reads it after seeding.
                 assert_eq!(
-                    batched[r],
-                    per_read,
+                    batched[r].iter().map(sans_l).collect::<Vec<_>>(),
+                    per_read.iter().map(sans_l).collect::<Vec<_>>(),
                     "batched != per-read at read {r} (len {}, msl={msl}, mi={mi})",
                     read.len()
                 );
@@ -1995,8 +2322,8 @@ mod tests {
         for (r, read) in reads.iter().enumerate() {
             let per_read = mem_collect_smem(&fm, read, &opt);
             assert_eq!(
-                batched[r],
-                per_read,
+                batched[r].iter().map(sans_l).collect::<Vec<_>>(),
+                per_read.iter().map(sans_l).collect::<Vec<_>>(),
                 "batched full != per-read at read {r} (len {})",
                 read.len()
             );

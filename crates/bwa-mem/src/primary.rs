@@ -800,7 +800,7 @@ pub(crate) fn insert_into_settled(
 
 /// Whether two regions are indistinguishable to everything after the dedup. `n_comp` is left out
 /// because the pass resets it on both.
-fn same_but_n_comp(x: &MemAlnReg, y: &MemAlnReg) -> bool {
+pub(crate) fn same_but_n_comp(x: &MemAlnReg, y: &MemAlnReg) -> bool {
     x.rb == y.rb
         && x.re == y.re
         && x.qb == y.qb

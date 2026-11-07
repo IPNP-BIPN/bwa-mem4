@@ -75,6 +75,7 @@ use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
 use crate::primary::{
     hash_64, insert_into_settled, mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch,
+    same_but_n_comp,
 };
 use crate::MemAlnReg;
 
@@ -268,6 +269,44 @@ pub(crate) fn bns_fetch_seq(
     // which holds here by construction.
     let seq: Vec<u8> = fm.bases(rb, re);
     (rb, re, rid, seq)
+}
+
+/// [`bns_fetch_seq`] appending the window to `out` instead of allocating it.
+pub(crate) fn bns_fetch_seq_into(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    rb: i64,
+    mid: i64,
+    re: i64,
+    out: &mut Vec<u8>,
+) -> (i64, i64, i32) {
+    let (mut rb, mut re) = if re < rb { (re, rb) } else { (rb, re) };
+    let (fwd_mid, is_rev) = bns.depos(mid);
+    let rid = bns.pos2rid(fwd_mid);
+    let (mut far_beg, mut far_end) = if rid >= 0 {
+        let contig = &bns.contigs[rid as usize];
+        (contig.offset, contig.offset + i64::from(contig.len))
+    } else {
+        (0, bns.l_pac << 1)
+    };
+    if is_rev {
+        let old_far_beg = far_beg;
+        far_beg = (bns.l_pac << 1) - far_end;
+        far_end = (bns.l_pac << 1) - old_far_beg;
+    }
+    rb = rb.max(far_beg);
+    re = re.min(far_end);
+    WINDOW.with(|w| {
+        let w = &mut *w.borrow_mut();
+        fm.bases_into(rb, re, w);
+        out.extend_from_slice(w);
+    });
+    (rb, re, rid)
+}
+
+thread_local! {
+    /// Scratch for one reference window, reused across [`bns_fetch_seq_into`] calls.
+    static WINDOW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Smith-Waterman mate rescue: given an anchor region `a` for one read, try to align the mate `ms`
@@ -541,10 +580,10 @@ fn mem_matesw(
 /// mate `query` in this orientation vs the `target` window, plus the coordinates needed to place the
 /// hit ([`matesw_apply`]).
 struct Orient {
-    /// The mate in this orientation: `ms` as sequenced, or its reverse complement when `is_rev`.
-    query: Vec<u8>,
-    /// The fetched reference window, already clamped to the anchor's contig by `bns_fetch_seq`.
-    target: Vec<u8>,
+    /// The fetched reference window, already clamped to the anchor's contig by `bns_fetch_seq`:
+    /// its `(offset, length)` in the round's arena. The mate in this orientation is `ms` as
+    /// sequenced, or the call's `rc` when `is_rev`.
+    target: (u32, u32),
     /// The window's start in the doubled coordinate space *after* clamping. Every ksw target
     /// coordinate is relative to this, so it must travel with the job.
     rb: i64,
@@ -556,6 +595,15 @@ struct Orient {
 /// One anchor's mate rescue, split into the SW-independent `collect` (which orientations to run) and
 /// the SW-dependent `apply` (insert the hits). Mirrors [`mem_matesw`] exactly but lets the SW of many
 /// anchors, across the whole pair batch, run through one vectorized [`batched_mate_rescue`].
+/// What [`matesw_collect`] reads of an anchor region: its position, contig and ALT flag. The
+/// anchors of a whole pair batch sit in one flat vector, which the rescue rounds index.
+#[derive(Clone, Copy)]
+pub(crate) struct Anchor {
+    rb: i64,
+    rid: i32,
+    is_alt: bool,
+}
+
 struct RescueCall {
     /// `skip[r] != 0` means orientation `r` runs no SW. `matesw_apply` re-walks this so its
     /// per-orientation dedup fires on exactly the same iterations as the C's loop.
@@ -564,6 +612,10 @@ struct RescueCall {
     /// or landed on the wrong contig. `skip[r] == 0` with `per_r[r] == None` is the C's "window
     /// rejected": no SW, and `n` is not incremented.
     per_r: [Option<Orient>; 4],
+    /// The mate's reverse complement in the round's arena, `(offset, length)`, built once per call
+    /// when a reverse orientation runs (length 0 when none did). The windows live there too: one
+    /// arena per round instead of two allocations per call.
+    rc: (u32, u32),
     /// Mate length in bases, needed to flip query coordinates for the reverse orientations.
     l_ms: i64,
     /// The anchor's `rid` and `is_alt`, copied into every region this call produces. Captured at
@@ -595,14 +647,182 @@ struct RescueCall {
 /// `min_seed_len` (the minimum usable window width), `pes` the per-orientation insert windows, `a`
 /// the anchor region of the other read, `ms` this read's nt4 sequence, `ma` this read's current
 /// regions (used solely for the `skip` test).
+/// Fewer regions than this and the per-anchor scans stay linear: a view costs an allocation and a
+/// sort, and a short list is walked faster than it is indexed.
+const VIEW_MIN: usize = 16;
+
+/// A rescue target's regions indexed for the two per-anchor scans, the skip test of
+/// [`matesw_collect`] (any region at a proper-pair distance of the anchor) and the settled insert
+/// of [`matesw_apply`] (any region overlapping the hit). Both are range queries on `rb`, so the
+/// linear scans (1.4G rows per 2M pairs: repetitive mates carry a hundred regions and fifty
+/// anchors) become binary searches.
+#[derive(Default)]
+pub(crate) struct RegionView {
+    /// `(rb, re, qb, qe)` of every region, ascending by `rb`. Meaningful only while `built`.
+    by_rb: Vec<(i64, i64, i32, i32)>,
+    /// Longest `re - rb` in `by_rb`: how far left of a hit an overlapping region's `rb` can lie.
+    max_len: i64,
+    built: bool,
+    /// Every region has `rid >= 0` and `re > rb`: what lets the insert scan visit only the regions
+    /// overlapping the hit, since [`insert_into_settled`] declines on any other kind.
+    clean: bool,
+    /// Whether the list is what `mem_sort_dedup_patch` left (see [`insert_into_settled`]).
+    pub(crate) settled: bool,
+}
+
+impl RegionView {
+    /// Index `ma` unless it is short; returns whether the view is usable for it.
+    fn ensure(&mut self, ma: &[MemAlnReg]) -> bool {
+        if ma.len() < VIEW_MIN {
+            return false;
+        }
+        if !self.built {
+            let t_build = crate::rescue_split::start();
+            if t_build.is_some() {
+                crate::rescue_split::VIEW_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::rescue_split::VIEW_BUILD_ROWS
+                    .fetch_add(ma.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.by_rb.clear();
+            self.by_rb
+                .extend(ma.iter().map(|q| (q.rb, q.re, q.qb, q.qe)));
+            self.by_rb.sort_unstable_by_key(|q| q.0);
+            self.max_len = ma.iter().map(|q| q.re - q.rb).max().unwrap_or(0);
+            self.clean = ma.iter().all(|q| q.rid >= 0 && q.re > q.rb);
+            self.built = true;
+            crate::rescue_split::stop(&crate::rescue_split::VIEW_BUILD_NS, t_build);
+        }
+        true
+    }
+
+    /// Whether some region's `rb` lies in `[lo, hi]` (none when `lo > hi`).
+    fn any_rb_in(&self, lo: i64, hi: i64) -> bool {
+        let i = self.by_rb.partition_point(|q| q.0 < lo);
+        i < self.by_rb.len() && self.by_rb[i].0 <= hi
+    }
+
+    /// Mirror an insertion into `ma`.
+    fn push(&mut self, q: &MemAlnReg) {
+        if self.built {
+            let at = self.by_rb.partition_point(|x| x.0 < q.rb);
+            self.by_rb.insert(at, (q.rb, q.re, q.qb, q.qe));
+            self.max_len = self.max_len.max(q.re - q.rb);
+        }
+    }
+}
+
+/// The skip scan of [`mem_matesw`] on the view: orientation `r` is already paired when some region
+/// of the mate is at distance `[low, high]` of the anchor in that orientation. The linear loop's
+/// `mem_infer_dir` test, inverted: the `p2` range that gives `r` with a distance in range, mapped
+/// back to an `rb` range on the strand `r` names. `skip[r]` is only ever set, never cleared.
+fn skip_from_view(
+    view: &RegionView,
+    l_pac: i64,
+    a_rb: i64,
+    pes: &[PeStat; 4],
+    skip: &mut [i32; 4],
+) {
+    let a_rev = a_rb >= l_pac;
+    for r in 0..4 {
+        if skip[r] != 0 {
+            continue;
+        }
+        let (lo, hi) = (i64::from(pes[r].low), i64::from(pes[r].high));
+        // `mem_infer_dir`: `r = opposite_strands ^ (if p2 > b1 { 0 } else { 3 })`.
+        let opposite = r == 1 || r == 2;
+        let (p_lo, p_hi) = if r == 0 || r == 1 {
+            (a_rb + lo.max(1), a_rb + hi)
+        } else {
+            (a_rb - hi, a_rb - lo.max(0))
+        };
+        // `p2` is `rb` on the anchor's strand and `2 * l_pac - 1 - rb` on the other.
+        let (rb_lo, rb_hi) = if opposite {
+            ((l_pac << 1) - 1 - p_hi, (l_pac << 1) - 1 - p_lo)
+        } else {
+            (p_lo, p_hi)
+        };
+        let (s_lo, s_hi) = if a_rev != opposite {
+            (l_pac, (l_pac << 1) - 1)
+        } else {
+            (0, l_pac - 1)
+        };
+        if view.any_rb_in(rb_lo.max(s_lo), rb_hi.min(s_hi)) {
+            skip[r] = 1;
+        }
+    }
+}
+
+/// [`insert_into_settled`] through a built, clean view: its overlap test needs `or_ > 0` when
+/// `0 <= mask_level_redun`, so only the regions overlapping `b` in reference coordinates can pass
+/// it or decline the insert, and the scan visits those alone. Same answer, same `ma` afterwards.
+fn insert_settled_view(
+    opt: &MemOpt,
+    ma: &mut Vec<MemAlnReg>,
+    view: &mut RegionView,
+    mut b: MemAlnReg,
+) -> Result<(), MemAlnReg> {
+    let mask_level_redun = opt.mask_level_redun;
+    if ma.is_empty() || b.rid < 0 || b.qe <= b.qb || b.re <= b.rb {
+        return Err(b);
+    }
+    let mut identical = false;
+    let start = view.by_rb.partition_point(|q| q.0 <= b.rb - view.max_len);
+    for &(rb, re, qb, qe) in &view.by_rb[start..] {
+        if rb >= b.re {
+            break;
+        }
+        if re <= b.rb {
+            continue;
+        }
+        let or_ = if re <= b.re { re - b.rb } else { b.re - rb };
+        let oq = if re <= b.re {
+            if qb < b.qb {
+                qe - b.qb
+            } else {
+                b.qe - qb
+            }
+        } else if b.qb < qb {
+            b.qe - qb
+        } else {
+            qe - b.qb
+        };
+        let mr = (re - rb).min(b.re - b.rb);
+        let mq = (qe - qb).min(b.qe - b.qb);
+        if or_ as f32 > mask_level_redun * mr as f32 && oq as f32 > mask_level_redun * mq as f32 {
+            // The identity test needs the whole region; every `ma` entry with these coordinates
+            // passed the overlap test above the same way.
+            let same = ma
+                .iter()
+                .filter(|q| q.rb == rb && q.re == re && q.qb == qb && q.qe == qe)
+                .all(|q| same_but_n_comp(q, &b));
+            if !same {
+                return Err(b);
+            }
+            identical = true;
+        }
+    }
+    if !identical {
+        b.n_comp = 1;
+        let at = ma.partition_point(|r| {
+            (-i64::from(r.score), r.rb, r.qb) < (-i64::from(b.score), b.rb, b.qb)
+        });
+        view.push(&b);
+        ma.insert(at, b);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn matesw_collect(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
     pes: &[PeStat; 4],
-    a: &MemAlnReg,
+    a: &Anchor,
     ms: &[u8],
     ma: &[MemAlnReg],
+    view: &mut RegionView,
+    arena: &mut Vec<u8>,
 ) -> Option<RescueCall> {
     // `l_pac`: packed reference length (doubled space is [0, 2*l_pac)). `l_ms`: mate length in
     // bases, stored into the returned call because `matesw_apply` needs it to flip query
@@ -613,34 +833,39 @@ fn matesw_collect(
     for (r, skip_r) in skip.iter_mut().enumerate() {
         *skip_r = i32::from(pes[r].failed);
     }
-    for existing in ma.iter() {
-        let (r, dist) = mem_infer_dir(l_pac, a.rb, existing.rb);
-        if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
-            skip[r] = 1;
+    let t_skip = crate::rescue_split::start();
+    if view.ensure(ma) {
+        skip_from_view(view, l_pac, a.rb, pes, &mut skip);
+    } else {
+        for existing in ma.iter() {
+            let (r, dist) = mem_infer_dir(l_pac, a.rb, existing.rb);
+            if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
+                skip[r] = 1;
+            }
         }
     }
+    if t_skip.is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::rescue_split::COLLECT_CALLS.fetch_add(1, Relaxed);
+        crate::rescue_split::COLLECT_SKIP_ROWS.fetch_add(ma.len() as u64, Relaxed);
+    }
+    crate::rescue_split::stop(&crate::rescue_split::COLLECT_SKIP_NS, t_skip);
     if skip.iter().sum::<i32>() == 4 {
         return None;
     }
+    let t_fetch = crate::rescue_split::start();
     // `per_r[r]`: the SW job for orientation `r`, left `None` when `r` is skipped or its window was
     // rejected. Every binding inside the loop below (`is_rev`, `is_larger`, `seq`, `lo`/`hi`,
     // `rb0`/`re0`, `rb`/`re`/`rid`/`refseq`) has the same meaning as in [`mem_matesw`], which
     // carries the explanations; this copy stops at building the job instead of calling ksw.
     let mut per_r: [Option<Orient>; 4] = [None, None, None, None];
+    let mut rc = (0u32, 0u32);
     for r in 0..4 {
         if skip[r] != 0 {
             continue;
         }
         let is_rev = (r >> 1) != (r & 1);
         let is_larger = (r >> 1) == 0;
-        let seq: Vec<u8> = if is_rev {
-            ms.iter()
-                .rev()
-                .map(|&b| if b < 4 { 3 - b } else { 4 })
-                .collect()
-        } else {
-            ms.to_vec()
-        };
         let (lo, hi) = (i64::from(pes[r].low), i64::from(pes[r].high));
         let (rb0, re0) = if !is_rev {
             let rb = if is_larger { a.rb + lo } else { a.rb - hi };
@@ -654,7 +879,8 @@ fn matesw_collect(
         let rb0 = rb0.max(0);
         let re0 = re0.min(l_pac << 1);
         if rb0 < re0 {
-            let (rb, re, rid, refseq) = bns_fetch_seq(fm, bns, rb0, (rb0 + re0) >> 1, re0);
+            let off = arena.len();
+            let (rb, re, rid) = bns_fetch_seq_into(fm, bns, rb0, (rb0 + re0) >> 1, re0, arena);
             if dump_pestat() {
                 eprintln!(
                     "[MSW_R] anchor={} r={r} rb={rb} re={re} rid={rid} a_rid={}",
@@ -662,18 +888,26 @@ fn matesw_collect(
                 );
             }
             if a.rid == rid && re - rb >= i64::from(opt.min_seed_len) {
+                let wlen = (arena.len() - off) as u32;
+                if is_rev && rc.1 == 0 {
+                    rc = (arena.len() as u32, ms.len() as u32);
+                    arena.extend(ms.iter().rev().map(|&b| if b < 4 { 3 - b } else { 4 }));
+                }
                 per_r[r] = Some(Orient {
-                    query: seq,
-                    target: refseq,
+                    target: (off as u32, wlen),
                     rb,
                     is_rev,
                 });
+            } else {
+                arena.truncate(off);
             }
         }
     }
+    crate::rescue_split::stop(&crate::rescue_split::COLLECT_FETCH_NS, t_fetch);
     Some(RescueCall {
         skip,
         per_r,
+        rc,
         l_ms,
         rid: a.rid,
         is_alt: a.is_alt,
@@ -687,14 +921,22 @@ fn matesw_collect(
 /// the entire contract between the two halves: there is no index stored in the job, so if either
 /// side changed its traversal the results would be silently mismatched to the wrong orientation.
 ///
-/// PARAMETERS: `call` is one anchor's collected rescue, borrowed for as long as the iterator lives
-/// (the jobs hold slices into its `Orient`s, they copy nothing).
+/// PARAMETERS: `call` is one anchor's collected rescue and `ms` the mate it was collected for,
+/// borrowed for as long as the iterator lives (the jobs hold slices, they copy nothing).
 ///
 /// RETURNS between 0 and 4 jobs, one per `Some` entry in `call.per_r`, ascending in orientation.
-fn rescue_jobs(call: &RescueCall) -> impl Iterator<Item = KswJob<'_>> {
-    call.per_r.iter().flatten().map(|o| KswJob {
-        query: &o.query,
-        target: &o.target,
+fn rescue_jobs<'a>(
+    call: &'a RescueCall,
+    ms: &'a [u8],
+    arena: &'a [u8],
+) -> impl Iterator<Item = KswJob<'a>> {
+    call.per_r.iter().flatten().map(move |o| KswJob {
+        query: if o.is_rev {
+            &arena[call.rc.0 as usize..(call.rc.0 + call.rc.1) as usize]
+        } else {
+            ms
+        },
+        target: &arena[o.target.0 as usize..(o.target.0 + o.target.1) as usize],
     })
 }
 
@@ -724,7 +966,7 @@ fn matesw_apply(
     call: &RescueCall,
     alns: &[KswAlignResult],
     ma: &mut Vec<MemAlnReg>,
-    ma_settled: &mut bool,
+    view: &mut RegionView,
 ) {
     let l_pac = bns.l_pac;
     let l_ms = call.l_ms;
@@ -756,7 +998,7 @@ fn matesw_apply(
     // settled comes from the single-end dedup, which ran WITH the query and so may have patched two
     // regions into one that now contains a third; the first null-query pass drops that third, so it
     // must run even when no hit was inserted (1 read in 173M of HG002 30x lost an XA hit to this).
-    let mut dirty = !*ma_settled;
+    let mut dirty = !view.settled;
     for r in 0..4 {
         if call.skip[r] != 0 {
             continue;
@@ -766,6 +1008,11 @@ fn matesw_apply(
             let aln = alns[ai];
             ai += 1;
             if aln.score >= opt.min_seed_len && aln.qb >= 0 {
+                let t_ins = crate::rescue_split::start();
+                if t_ins.is_some() {
+                    crate::rescue_split::APPLY_HITS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 // `rb`: doubled-space start of the window `aln`'s target offsets are relative to.
                 // `is_rev`: whether the query was reverse complemented, so both axes must be
                 // mirrored below. Every binding that follows mirrors [`mem_matesw`] exactly.
@@ -815,10 +1062,19 @@ fn matesw_apply(
                     n_comp: 0,
                 };
                 // A settled list can often take the hit without the full pass. See the function.
-                let b = if *ma_settled {
-                    match insert_into_settled(opt, ma, b) {
+                let b = if view.settled {
+                    let r = if view.ensure(ma)
+                        && view.clean
+                        && (0.0..1.0).contains(&opt.mask_level_redun)
+                    {
+                        insert_settled_view(opt, ma, view, b)
+                    } else {
+                        insert_into_settled(opt, ma, b)
+                    };
+                    match r {
                         Ok(()) => {
                             n += 1;
+                            crate::rescue_split::stop(&crate::rescue_split::APPLY_INSERT_NS, t_ins);
                             continue;
                         }
                         Err(b) => b,
@@ -832,6 +1088,7 @@ fn matesw_apply(
                 }
                 ma.insert(ins, b);
                 dirty = true;
+                crate::rescue_split::stop(&crate::rescue_split::APPLY_INSERT_NS, t_ins);
             }
             n += 1;
         }
@@ -844,7 +1101,8 @@ fn matesw_apply(
             }
             let taken = std::mem::take(ma);
             // Below two regions the pass returns its input as it found it, so that proves nothing.
-            *ma_settled = taken.len() >= 2;
+            view.settled = taken.len() >= 2;
+            view.built = false;
             *ma = mem_sort_dedup_patch(fm, opt, &[], taken);
             crate::rescue_split::stop(&crate::rescue_split::APPLY_DEDUP_NS, t_dd);
             dirty = false;
@@ -1172,42 +1430,53 @@ pub fn batch_mate_rescue(
     // regions inserted by rescue must NOT themselves become anchors, and in bwa they cannot, because
     // the C snapshots `b[i]` before its own anchor loop too.
     // `max_rounds`: the longest anchor list seen, i.e. how many rounds the loop below needs.
-    let mut anchors: Vec<[Vec<MemAlnReg>; 2]> = Vec::with_capacity(pairs.len());
+    let mut anchors: Vec<Anchor> = Vec::new();
+    let mut spans: Vec<[(u32, u32); 2]> = Vec::with_capacity(pairs.len());
     let mut max_rounds = 0usize;
     for p in pairs.iter() {
         // Each side is snapshotted on its own: bwa gates only on MEM_F_NO_RESCUE, never on both
         // reads having regions. A read with no regions simply contributes no anchors -- but it is
         // still the *rescue target* of the other read's anchors, which is exactly how an unmapped
         // mate gets rescued. Requiring both sides non-empty leaves it unmapped.
-        let near_best = |regs: &[MemAlnReg]| -> Vec<MemAlnReg> {
+        let mut near_best = |regs: &[MemAlnReg]| -> (u32, u32) {
+            let start = anchors.len() as u32;
             let Some(best) = regs.first().map(|r| r.score) else {
-                return Vec::new();
+                return (start, 0);
             };
             // bwa builds `b[i]` from the *whole* region vector and only then caps the anchor loop
             // at `max_matesw`; taking `anchor_cap` during the filter is the same set because the
             // vector is
             // already sorted score-descending, so the near-best regions are a prefix.
-            regs.iter()
-                .filter(|r| r.score >= best - pen)
-                .take(anchor_cap)
-                .cloned()
-                .collect()
+            anchors.extend(
+                regs.iter()
+                    .filter(|r| r.score >= best - pen)
+                    .take(anchor_cap)
+                    .map(|r| Anchor {
+                        rb: r.rb,
+                        rid: r.rid,
+                        is_alt: r.is_alt,
+                    }),
+            );
+            (start, anchors.len() as u32 - start)
         };
-        // `b0`/`b1`: this pair's read-1 and read-2 anchors (bwa's `b[0]`/`b[1]`). Cloned, not
-        // borrowed, because the arrays they came from are about to be mutated by rescue.
+        // `b0`/`b1`: this pair's read-1 and read-2 anchors (bwa's `b[0]`/`b[1]`), as `(start,
+        // len)` in `anchors`. Copied, not borrowed, because the arrays they came from are about
+        // to be mutated by rescue.
         let b0 = near_best(p.a0);
         let b1 = near_best(p.a1);
-        max_rounds = max_rounds.max(b0.len()).max(b1.len());
-        anchors.push([b0, b1]);
+        max_rounds = max_rounds.max(b0.1 as usize).max(b1.1 as usize);
+        spans.push([b0, b1]);
     }
 
-    anchor_spread::record(&anchors);
+    anchor_spread::record(&anchors, &spans);
+    // The round's reference windows and reverse complements, back to back.
+    let mut arena: Vec<u8> = Vec::new();
 
     // Round k processes the k-th anchor of every (pair, direction) that still has one. Pairs with
     // fewer anchors simply drop out of later rounds; the loop count is the deepest anchor list.
     rescue_rounds::record_chunk(max_rounds);
     // Whether each pair's `[a1, a0]` is settled in the sense of `matesw_apply`, indexed by `dir`.
-    let mut settled = vec![[false; 2]; pairs.len()];
+    let mut views: Vec<[RegionView; 2]> = (0..pairs.len()).map(|_| Default::default()).collect();
     for round in 0..max_rounds {
         // Collect this round's rescue calls across all pairs and both directions.
         // `calls`: every rescue this round will perform, tagged with the pair index and direction it
@@ -1215,21 +1484,31 @@ pub fn batch_mate_rescue(
         // apply loop below walks, so inserts land in the same sequence as the per-pair path.
         let t_collect = crate::rescue_split::start();
         let mut calls: Vec<(usize, usize, RescueCall)> = Vec::new(); // (pair, dir, call)
+        arena.clear();
         for (pi, p) in pairs.iter().enumerate() {
             for dir in 0..2 {
-                let anchor_list = &anchors[pi][dir];
-                if round >= anchor_list.len() {
+                let (start, len) = spans[pi][dir];
+                if round >= len as usize {
                     continue;
                 }
+                let anchor = anchors[start as usize + round];
                 // dir 0 is bwa's `i = 0`: read-1 anchors, mate `s[!i]` = read 2, target `a[!i]` = a1.
                 let (ms, target): (&[u8], &Vec<MemAlnReg>) = if dir == 0 {
                     (p.seq1, p.a1)
                 } else {
                     (p.seq0, p.a0)
                 };
-                if let Some(call) =
-                    matesw_collect(fm, bns, opt, pes, &anchor_list[round], ms, target)
-                {
+                if let Some(call) = matesw_collect(
+                    fm,
+                    bns,
+                    opt,
+                    pes,
+                    &anchor,
+                    ms,
+                    target,
+                    &mut views[pi][dir],
+                    &mut arena,
+                ) {
                     calls.push((pi, dir, call));
                 }
             }
@@ -1243,9 +1522,14 @@ pub fn batch_mate_rescue(
         // The two vectors are index-parallel with `calls`.
         let mut jobs: Vec<KswJob> = Vec::new();
         let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (_, _, call) in &calls {
+        for (pi, dir, call) in &calls {
             let start = jobs.len();
-            jobs.extend(rescue_jobs(call));
+            let ms = if *dir == 0 {
+                pairs[*pi].seq1
+            } else {
+                pairs[*pi].seq0
+            };
+            jobs.extend(rescue_jobs(call, ms, &arena));
             spans.push((start, jobs.len() - start));
         }
         // No `lanes` argument here, unlike the scalar [`mem_matesw`] call, which passes 16 or 8 from
@@ -1266,7 +1550,7 @@ pub fn batch_mate_rescue(
             let mut win: Vec<(i32, i64, i64)> = Vec::with_capacity(jobs.len());
             for (_, _, call) in &calls {
                 for o in call.per_r.iter().flatten() {
-                    win.push((call.rid, o.rb, o.rb + o.target.len() as i64));
+                    win.push((call.rid, o.rb, o.rb + i64::from(o.target.1)));
                 }
             }
             rescue_rounds::record_windows(&mut win);
@@ -1304,7 +1588,7 @@ pub fn batch_mate_rescue(
                 call,
                 &alns[start..start + count],
                 target,
-                &mut settled[*pi][*dir],
+                &mut views[*pi][*dir],
             );
         }
         crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
@@ -2977,7 +3261,7 @@ mod id_shift_tests {
 /// `UNION` is the width of their union per (pair, direction). `SPAN / UNION` is the ceiling of the
 /// idea; anything near 1.0 means the anchors are scattered and there is nothing to share.
 pub mod anchor_spread {
-    use crate::MemAlnReg;
+    use super::Anchor;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::OnceLock;
     /// Summed per-anchor window widths, in bases.
@@ -2999,13 +3283,14 @@ pub mod anchor_spread {
     ///
     /// The window width is approximated by a constant 1400 bases, the measured mean; the exact width
     /// depends on `pes[r].high - pes[r].low + l_ms` and does not change the shape of the answer.
-    pub fn record(anchors: &[[Vec<MemAlnReg>; 2]]) {
+    pub(crate) fn record(anchors: &[Anchor], spans: &[[(u32, u32); 2]]) {
         if !enabled() {
             return;
         }
         const W: i64 = 1400;
-        for per_pair in anchors {
-            for list in per_pair {
+        for per_pair in spans {
+            for &(start, len) in per_pair {
+                let list = &anchors[start as usize..(start + len) as usize];
                 if list.len() < 2 {
                     continue;
                 }
@@ -3057,6 +3342,136 @@ pub mod anchor_spread {
 }
 
 #[cfg(test)]
+mod region_view_tests {
+    use super::*;
+
+    fn xorshift() -> impl FnMut(u64) -> u64 {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        }
+    }
+
+    /// Regions on both strands of a 100 kb reference, short and long, clustered so that overlaps
+    /// and proper-pair distances are the common case.
+    fn region(next: &mut dyn FnMut(u64) -> u64) -> MemAlnReg {
+        let l_pac = 100_000i64;
+        let rb = next(2) as i64 * l_pac + next(60) as i64 * 5 + next(3) as i64 * 400;
+        let len = 20 + next(6) as i64 * 30;
+        let qb = next(4) as i32 * 10;
+        let qlen = (len as i32 + next(3) as i32 * 2).min(148 - qb);
+        MemAlnReg {
+            rb,
+            re: rb + len,
+            qb,
+            qe: qb + qlen,
+            rid: 0,
+            score: 30 + next(5) as i32 * 5,
+            truesc: 0,
+            sub: 0,
+            csub: next(3) as i32,
+            sub_n: 0,
+            seedcov: next(2) as i32,
+            seedlen0: 0,
+            secondary: -1,
+            secondary_all: 0,
+            w: 0,
+            frac_rep: 0.0,
+            is_alt: false,
+            alt_sc: 0,
+            hash: 0,
+            n_comp: 0,
+        }
+    }
+
+    #[test]
+    fn skip_from_view_equals_the_linear_scan() {
+        let l_pac = 100_000i64;
+        let mut next = xorshift();
+        let mut pes = [PeStat::default(); 4];
+        for _ in 0..300 {
+            for p in pes.iter_mut() {
+                p.low = next(3) as i32 * 200 - 100;
+                p.high = p.low + next(4) as i32 * 300;
+                p.failed = next(5) == 0;
+            }
+            let n = VIEW_MIN + next(100) as usize;
+            let ma: Vec<MemAlnReg> = (0..n).map(|_| region(&mut next)).collect();
+            let mut view = RegionView::default();
+            assert!(view.ensure(&ma));
+            for _ in 0..8 {
+                let a_rb = region(&mut next).rb;
+                let mut want = [0i32; 4];
+                for (r, s) in want.iter_mut().enumerate() {
+                    *s = i32::from(pes[r].failed);
+                }
+                let mut got = want;
+                for existing in &ma {
+                    let (r, dist) = mem_infer_dir(l_pac, a_rb, existing.rb);
+                    if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
+                        want[r] = 1;
+                    }
+                }
+                skip_from_view(&view, l_pac, a_rb, &pes, &mut got);
+                assert_eq!(got, want, "anchor {a_rb} pes {pes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn insert_settled_view_equals_insert_into_settled() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let fm = FmIndex::load(std::path::Path::new(prefix)).unwrap();
+        let opt = MemOpt::default();
+        let mut next = xorshift();
+        let same = |x: &[MemAlnReg], y: &[MemAlnReg]| format!("{x:?}") == format!("{y:?}");
+        let (mut taken, mut declined) = (0u32, 0u32);
+        for _ in 0..400 {
+            let n = VIEW_MIN + next(100) as usize;
+            let pool: Vec<MemAlnReg> = (0..n).map(|_| region(&mut next)).collect();
+            let settled = mem_sort_dedup_patch(&fm, &opt, &[], pool);
+            if settled.len() < VIEW_MIN {
+                continue;
+            }
+            let mut fast = settled.clone();
+            let mut full = settled.clone();
+            let mut view = RegionView::default();
+            // Several inserts in a row: the view must follow its own pushes.
+            for _ in 0..6 {
+                let mut b = region(&mut next);
+                if next(2) == 0 {
+                    b = full[next(full.len() as u64) as usize].clone();
+                    b.n_comp = 0;
+                    match next(4) {
+                        0 => b.csub += 1,
+                        1 => b.re += 1,
+                        2 => b.score += 1,
+                        _ => {}
+                    }
+                }
+                assert!(view.ensure(&fast) && view.clean);
+                let want = insert_into_settled(&opt, &mut full, b.clone());
+                let got = insert_settled_view(&opt, &mut fast, &mut view, b.clone());
+                assert_eq!(got.is_ok(), want.is_ok(), "b {b:?}");
+                assert!(same(&fast, &full), "b {b:?}\nfast {fast:?}\nfull {full:?}");
+                if got.is_ok() {
+                    taken += 1;
+                } else {
+                    declined += 1;
+                }
+            }
+        }
+        assert!(
+            taken > 100 && declined > 100,
+            "taken {taken} declined {declined}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod matesw_apply_tests {
     use super::*;
 
@@ -3102,8 +3517,7 @@ mod matesw_apply_tests {
             skip: [0, 1, 1, 1],
             per_r: [
                 Some(Orient {
-                    query: vec![0; 20],
-                    target: vec![0; 40],
+                    target: (0, 40),
                     rb: 0,
                     is_rev: false,
                 }),
@@ -3111,6 +3525,7 @@ mod matesw_apply_tests {
                 None,
                 None,
             ],
+            rc: (0, 0),
             l_ms: 20,
             rid: 0,
             is_alt: false,
@@ -3124,8 +3539,8 @@ mod matesw_apply_tests {
             score2: -1,
             te2: -1,
         };
-        let (mut ma, mut settled) = (ma0, false);
-        matesw_apply(&fm, &bns, &opt, &call, &[miss], &mut ma, &mut settled);
+        let (mut ma, mut view) = (ma0, RegionView::default());
+        matesw_apply(&fm, &bns, &opt, &call, &[miss], &mut ma, &mut view);
         assert_eq!(format!("{ma:?}"), format!("{want:?}"));
     }
 }
