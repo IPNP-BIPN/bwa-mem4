@@ -2676,6 +2676,49 @@ macro_rules! define_sw_kernel {
                             // the buffers' column count, and `last_live >= beg >= 0` is tested first.
                             *nxt = live & next_bits;
                             let (hp, ep) = (eh_h.as_mut_ptr(), eh_e.as_mut_ptr());
+                            if cfg!(target_arch = "x86_64") {
+                                // The x86 kernels pick the trackers' answers in vector lanes and
+                                // scan only the lanes whose tracker points at or past `end`.
+                                let mut am = active_bits;
+                                while am != 0 {
+                                    let l = am.trailing_zeros() as usize;
+                                    am &= am - 1;
+                                    // SAFETY: see above.
+                                    unsafe {
+                                        *hp.add(end[l] as usize * LANES + l) = h1_out[l];
+                                        *ep.add(end[l] as usize * LANES + l) = 0;
+                                    }
+                                }
+                                // SAFETY: as for `prologue16`; the outputs are u8 (`rowvec`).
+                                let mut sc = unsafe {
+                                    super::$rowmod::tighten::<LANES>(
+                                        live,
+                                        first_out.as_ptr() as *const u8,
+                                        last_out.as_ptr() as *const u8,
+                                        seen_out.as_ptr() as *const u8,
+                                        h1_out.as_ptr() as *const u8,
+                                        qlen32.as_ptr(),
+                                        beg.as_mut_ptr(),
+                                        end.as_mut_ptr(),
+                                    )
+                                };
+                                while sc != 0 {
+                                    let l = sc.trailing_zeros() as usize;
+                                    sc &= sc - 1;
+                                    let mut last_live = end[l] - 1;
+                                    // SAFETY: see above.
+                                    while last_live >= beg[l]
+                                        && unsafe {
+                                            *hp.add(last_live as usize * LANES + l) == 0
+                                                && *ep.add(last_live as usize * LANES + l) == 0
+                                        }
+                                    {
+                                        last_live -= 1;
+                                    }
+                                    end[l] = (last_live + 2).min(qlen[l] as i32);
+                                }
+                                continue;
+                            }
                             let mut am = active_bits;
                             while am != 0 {
                                 let l = am.trailing_zeros() as usize;
@@ -2954,6 +2997,53 @@ mod x86_row {
         _mm_cvtsi128_si32(_mm_max_epi32(x, _mm_shuffle_epi32::<0b10_11_00_01>(x)))
     }
 
+    /// The row epilogue's band tightening for the `live` lanes, from the column loop's trackers
+    /// (`first`, `last`, `seen`, and the row's `h1`): writes `beg`, and `end` for every lane the
+    /// trackers answer. Returns the lanes whose last live column needs the scan (their tracker
+    /// points at or past `end`): `beg` written, `end` left for the caller's scan.
+    ///
+    /// # Safety
+    /// AVX2; every pointer addresses `N` lanes; `N` is a multiple of 8.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn tighten<const N: usize>(
+        live: u64,
+        first: *const u8,
+        last: *const u8,
+        seen: *const u8,
+        h1: *const u8,
+        qlen: *const i32,
+        beg: *mut i32,
+        end: *mut i32,
+    ) -> u64 {
+        let lb = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+        let zero = _mm256_setzero_si256();
+        let (one, two) = (_mm256_set1_epi32(1), _mm256_set1_epi32(2));
+        let mut scan = 0u64;
+        for o in (0..N).step_by(8) {
+            let b8 = ((live >> o) & 0xff) as i32;
+            if b8 == 0 {
+                continue;
+            }
+            let m = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(b8), lb), lb);
+            let e = ld(end.add(o));
+            let sn = _mm256_cmpgt_epi32(widen8(seen.add(o)), zero);
+            let fl = sel(sn, _mm256_min_epi32(widen8(first.add(o)), e), e);
+            st(beg.add(o), sel(m, fl, ld(beg.add(o))));
+            let lst = widen8(last.add(o));
+            let hz = _mm256_cmpeq_epi32(widen8(h1.add(o)), zero);
+            let ll = sel(hz, sel(sn, lst, _mm256_sub_epi32(fl, one)), e);
+            let need = _mm256_andnot_si256(
+                _mm256_cmpgt_epi32(e, lst),
+                _mm256_and_si256(m, _mm256_and_si256(hz, sn)),
+            );
+            let ne = _mm256_min_epi32(_mm256_add_epi32(ll, two), ld(qlen.add(o)));
+            st(end.add(o), sel(_mm256_andnot_si256(need, m), ne, e));
+            scan |= bits8(need) << o;
+        }
+        scan
+    }
+
     /// As `neon_row::prologue`, over `N` lanes.
     ///
     /// # Safety
@@ -3200,6 +3290,69 @@ mod x86_row {
 
     #[cfg(test)]
     mod tests {
+        /// `tighten` against the scalar epilogue's tracker logic, on random lanes.
+        #[test]
+        fn tighten_matches_scalar() {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                eprintln!("skipping: no avx2");
+                return;
+            }
+            let mut x = 0x2545_f491_4f6c_dd1du64;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            const N: usize = 32;
+            for _ in 0..2000 {
+                let live = next() & next();
+                let qlen: [i32; N] = std::array::from_fn(|_| 1 + (next() % 200) as i32);
+                let end: [i32; N] = std::array::from_fn(|l| (next() % (qlen[l] as u64 + 1)) as i32);
+                let beg0: [i32; N] = std::array::from_fn(|_| (next() % 7) as i32);
+                let first: [u8; N] = std::array::from_fn(|_| (next() % 220) as u8);
+                let last: [u8; N] = std::array::from_fn(|_| (next() % 220) as u8);
+                let seen: [u8; N] = std::array::from_fn(|_| (next() % 2) as u8);
+                let h1: [u8; N] = std::array::from_fn(|_| (next() % 3) as u8);
+                let (mut beg, mut e) = (beg0, end);
+                let sc = unsafe {
+                    super::tighten::<N>(
+                        live,
+                        first.as_ptr(),
+                        last.as_ptr(),
+                        seen.as_ptr(),
+                        h1.as_ptr(),
+                        qlen.as_ptr(),
+                        beg.as_mut_ptr(),
+                        e.as_mut_ptr(),
+                    )
+                };
+                for l in 0..N {
+                    if live >> l & 1 == 0 {
+                        assert_eq!((beg[l], e[l], sc >> l & 1), (beg0[l], end[l], 0));
+                        continue;
+                    }
+                    let fl = if seen[l] != 0 {
+                        (first[l] as i32).min(end[l])
+                    } else {
+                        end[l]
+                    };
+                    assert_eq!(beg[l], fl);
+                    let ll = if h1[l] != 0 {
+                        end[l]
+                    } else if seen[l] == 0 {
+                        fl - 1
+                    } else if (last[l] as i32) < end[l] {
+                        last[l] as i32
+                    } else {
+                        assert_eq!((sc >> l & 1, e[l]), (1, end[l]));
+                        continue;
+                    };
+                    assert_eq!((sc >> l & 1, e[l]), (0, (ll + 2).min(qlen[l])));
+                }
+            }
+        }
+
         /// The SSE2 transpose against the plain per-byte scatter, 32 lanes over two blocks.
         #[test]
         fn fill_soa_matches_scatter() {
@@ -3252,6 +3405,21 @@ mod x86_row {
 #[cfg(target_arch = "aarch64")]
 mod neon_row {
     use std::arch::aarch64::*;
+
+    /// Never called: the band tightening is vectorised on x86 only.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn tighten<const N: usize>(
+        _: u64,
+        _: *const u8,
+        _: *const u8,
+        _: *const u8,
+        _: *const u8,
+        _: *const i32,
+        _: *mut i32,
+        _: *mut i32,
+    ) -> u64 {
+        unreachable!("tighten is x86-only")
+    }
 
     /// A 16-lane byte mask (0/1 or 0/0xff per lane) widened to four i32 lane masks.
     #[target_feature(enable = "neon")]
