@@ -1618,12 +1618,18 @@ impl FmIndex {
         }
         // The rest survive only with a new occurrence count, and none is emitted.
         while p < n {
-            let c = prev[p];
+            // Borrowed, not copied: only `k` and `s` feed the counts, and holding the whole
+            // candidate across them spilled it to the stack every iteration.
+            let (k, s) = self.konly_hoisted(cp, &prev[p], a, count_a, hx, lx);
             p += 1;
-            let (k, s) = self.konly_hoisted(cp, &c, a, count_a, hx, lx);
             if s >= min_intv && s != curr_s {
                 curr_s = s;
-                prev[kept] = Smem { k, s, m, ..c };
+                prev[kept] = Smem {
+                    k,
+                    s,
+                    m,
+                    ..prev[p - 1]
+                };
                 kept += 1;
                 self.prefetch_occ(k, k + s);
             }

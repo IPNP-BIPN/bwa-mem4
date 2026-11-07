@@ -562,6 +562,61 @@ fn global_cell(mm: i32, e: i32, s: i8, f: &mut i32, h1: &mut i32, g: &GlobalGaps
     (d, e)
 }
 
+/// `row[j] = mat_row[query[j]]`, 16 columns per table lookup where the CPU has one (fg-labs/
+/// bwa-mem3's `ksw_g2_query_profile`). A block holding a code past the row falls to the scalar loop,
+/// which indexes exactly as before.
+fn query_profile_row(row: &mut [i8], query: &[u8], mat_row: &[i8]) {
+    let mut j = 0;
+    if mat_row.len() <= 16 {
+        let mut tab = [0i8; 16];
+        tab[..mat_row.len()].copy_from_slice(mat_row);
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is mandatory on AArch64; every load and store is 16 bytes inside
+        // `query[j..]` / `row[j..]` with `j + 16 <= len`.
+        unsafe {
+            use std::arch::aarch64::*;
+            let t = vld1q_u8(tab.as_ptr().cast());
+            while j + 16 <= query.len() {
+                let idx = vld1q_u8(query.as_ptr().add(j));
+                if usize::from(vmaxvq_u8(idx)) >= mat_row.len() {
+                    break;
+                }
+                vst1q_u8(row.as_mut_ptr().add(j).cast(), vqtbl1q_u8(t, idx));
+                j += 16;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            // SAFETY: SSSE3 was just detected.
+            j = unsafe { query_profile_ssse3(row, query, &tab, mat_row.len()) };
+        }
+    }
+    for (r, &q) in row[j..].iter_mut().zip(&query[j..]) {
+        *r = mat_row[q as usize];
+    }
+}
+
+/// [`query_profile_row`]'s x86 blocks: `pshufb` over the 16-entry table. Returns where they stopped.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn query_profile_ssse3(row: &mut [i8], query: &[u8], tab: &[i8; 16], n: usize) -> usize {
+    use std::arch::x86_64::*;
+    let t = _mm_loadu_si128(tab.as_ptr().cast());
+    // Codes `0..n` are kept; `min(idx, n - 1) == idx` fails for any larger one, and for bytes with
+    // the top bit set, which `pshufb` would turn into 0.
+    let lim = _mm_set1_epi8((n - 1) as i8);
+    let mut j = 0;
+    while j + 16 <= query.len() {
+        let idx = _mm_loadu_si128(query.as_ptr().add(j).cast());
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(idx, lim), idx)) != 0xffff {
+            break;
+        }
+        _mm_storeu_si128(row.as_mut_ptr().add(j).cast(), _mm_shuffle_epi8(t, idx));
+        j += 16;
+    }
+    j
+}
+
 /// The interior rows `[i0, i1)` of [`ksw_global2`] at band `w = (N - 1) / 2`: each row is the full
 /// `N` cells `[i - w, i + w]` with `h1` and `f` starting at MINUS_INF, reads `eh[i-w ..= i+w]`, and
 /// writes back the same span plus `eh[i+w+1] = {h1, MINUS_INF}`. Row `i + 1` reads only what row
@@ -709,10 +764,14 @@ pub fn ksw_global2(
             eh_h: eh_h_buf,
             eh_e: eh_e_buf,
         } = &mut *scratch;
-        z_buf.clear();
-        z_buf.resize(n_col * tlen, 0u8);
-        qp_buf.clear();
-        qp_buf.resize(qlen * m, 0i8);
+        // Grown, never cleared: the forward pass writes every `z` cell the traceback reads and
+        // every `qp` entry (ksw.c mallocs both uninitialised), so zeroing them was pure cost.
+        if z_buf.len() < n_col * tlen {
+            z_buf.resize(n_col * tlen, 0u8);
+        }
+        if qp_buf.len() < qlen * m {
+            qp_buf.resize(qlen * m, 0i8);
+        }
         // Fixed-length reslices, and they are not cosmetic: `resize` leaves the vector length opaque to
         // LLVM, which reinstated a bounds check on every `eh_h[j]`/`eh_e[j]`/`z[..]` access in the
         // inner loop and cost 2.1 us per call on ARM (7.66 -> 10.75 s CPU over 1.46M calls) before
@@ -720,16 +779,9 @@ pub fn ksw_global2(
         // `vec![...]` used to provide.
         let z: &mut [u8] = &mut z_buf[..n_col * tlen];
         let qp: &mut [i8] = &mut qp_buf[..qlen * m];
-        // Flat cursor into `qp`: index of the next entry to write. Walks all `m * qlen` entries in
-        // order and ends at `qlen * m`.
-        let mut write_pos = 0;
-        for target_code in 0..m {
+        for (target_code, row) in qp.chunks_exact_mut(qlen).enumerate() {
             // The `mat` row for this target base: `mat_row[q]` scores it against query code `q`.
-            let mat_row = &mat[target_code * m..target_code * m + m];
-            for &query_base in query {
-                qp[write_pos] = mat_row[query_base as usize];
-                write_pos += 1;
-            }
+            query_profile_row(row, query, &mat[target_code * m..target_code * m + m]);
         }
 
         // Row -1. Unlike the local kernel there is no 0 sentinel: unreachable is MINUS_INF, and the
