@@ -1736,11 +1736,13 @@ fn run_side<B: SwBackend>(
         // Purely a throughput sort: a SIMD batch runs for as long as its longest lane, so grouping
         // similar lengths cuts wasted lanes. bwa-mem2 does the same with a histogram sort,
         // `sortPairsLenExt` (`bwamem.cpp:2446`, and again for the right side at `bwamem.cpp:2679`),
-        // which also keys on length. Unobservable in the output because each job's result depends
+        // which also keys on length. The key is the query length alone, as the fork's
+        // PAIR_SORT_LEN2 does: the column loop walks query positions, so lanes with equal qlen
+        // share their row ends (-7G instructions on 2M GIAB pairs vs max(qlen, tlen)). Unobservable in the output because each job's result depends
         // only on its own `(query, target, h0, w)`, which is the invariant this whole file rests on.
         // A counting sort, descending and stable: the same permutation the stable sort gave, in
         // O(n) (the merge sort was 2 s per 2M pairs; lengths are a few hundred at most).
-        let key = |k: usize| jobs[k].query.1.max(jobs[k].target.1) as usize;
+        let key = |k: usize| jobs[k].query.1 as usize;
         let kmax = active_idxs.iter().map(|&k| key(k)).max().unwrap_or(0);
         let mut start = vec![0usize; kmax + 2];
         for &k in &active_idxs {
