@@ -1869,6 +1869,9 @@ macro_rules! define_sw_kernel {
             band = $band:path, band_bias = $bbias:expr,
             band_width = $bwidth:expr, diag = |$dm:ident, $ds:ident, $db:ident| $diag:expr,
             sbt_bias = |$bb:ident| $sbias:expr,
+            sbt_tbl = $sbt_tbl:literal,
+            tbl_ld = |$tp:ident| $tblld:expr,
+            tbl = |$tt:ident, $tk:ident, $tq:ident| $tblx:expr,
             rowvec = $rowvec:literal
         ) => {
         /// # Safety
@@ -1952,6 +1955,19 @@ macro_rules! define_sw_kernel {
             let sbt_match_v = $dup((bias + i32::from(mat[0])) as $elem); // bias + a
             let sbt_mism_v = $dup((bias + i32::from(mat[1])) as $elem); // bias - |mm|
             let sbt_npen_v = $dup((bias + i32::from(mat[m - 1])) as $elem); // bias - |npen|
+            // The same three scores as a 16-entry table indexed by `t ^ q`, with a target N
+            // re-encoded as 12 per row: equal bases give 0 (match), unequal ACGT give 1..=3
+            // (mismatch), and any N gives >= 4 (12 ^ 0..=3 = 12..=15, 12 ^ 4 = 8, 4 ^ 0..=3 = 4..=7).
+            // One XOR and one byte shuffle (`tbl` / `pshufb`) replace the compare/blend chain.
+            // Byte lanes only (`sbt_tbl`); the i16 kernels keep the compare form.
+            let tab_v = {
+                let mut tab = [(bias + i32::from(mat[m - 1])) as $elem; 16];
+                tab[0] = (bias + i32::from(mat[0])) as $elem;
+                tab[1..4].fill((bias + i32::from(mat[1])) as $elem);
+                let $tp = tab.as_ptr() as *const u8;
+                $tblld
+            };
+            let twelve_v = $dup(12);
             // Only a kernel that keeps the bias needs non-negative lanes; USQADD's are signed.
             debug_assert!(
                 bias != full_bias
@@ -2277,6 +2293,7 @@ macro_rules! define_sw_kernel {
                         let mut last_v = zero_v;
                         let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
                         let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
+                        let t_key = $bsl(t_is_n, twelve_v, t_v); // `tab_v`'s row half of the index
 
                         // --- substitution pre-pass (vector, off the critical path) ---
                         // For every band column, compute the same `sbt_pos`/`sbt_neg` the DP body used to
@@ -2294,11 +2311,16 @@ macro_rules! define_sw_kernel {
                             for j in gbeg..gend {
                                 let col_base = j as usize * LANES;
                                 let q_v = $lds(qcode.as_ptr().add(col_base));
-                                let is_eq = $ceq(t_v, q_v);
-                                let is_n = $orru(t_is_n, $cge(q_v, amb_v));
                                 // One biased value per cell: N wins over the equality test, exactly as
                                 // the split form's `is_n` blend sat outermost on both halves.
-                                let sbt = $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v));
+                                let sbt = if $sbt_tbl {
+                                    let ($tt, $tk, $tq) = (tab_v, t_key, q_v);
+                                    $tblx
+                                } else {
+                                    let is_eq = $ceq(t_v, q_v);
+                                    let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                                    $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
+                                };
                                 $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
                             }
                         }
@@ -2358,9 +2380,14 @@ macro_rules! define_sw_kernel {
                                     // and half the stores the pre-pass form originally cost.
                                     let sbt = if INL_SBT {
                                         let q_v = $lds(qcode.as_ptr().add(col_base));
-                                        let is_eq = $ceq(t_v, q_v);
-                                        let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                                        $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
+                                        if $sbt_tbl {
+                                            let ($tt, $tk, $tq) = (tab_v, t_key, q_v);
+                                            $tblx
+                                        } else {
+                                            let is_eq = $ceq(t_v, q_v);
+                                            let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                                            $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
+                                        }
                                     } else {
                                         $lds(sbt_buf.as_ptr().add(col_base))
                                     };
@@ -3111,6 +3138,9 @@ mod neon {
         band_width = false,
         diag = |m, s, bias| vsubq_s16(vaddq_s16(m, s), bias),
         sbt_bias = |bias| bias,
+        sbt_tbl = false,
+        tbl_ld = |_p| vdupq_n_s16(0),
+        tbl = |_t, _k, _q| unreachable!(),
         rowvec = false
     );
 
@@ -3156,6 +3186,9 @@ mod neon {
         band_width = true,
         diag = |m, s, _bias| vsqaddq_u8(m, vreinterpretq_s8_u8(s)),
         sbt_bias = |_bias| 0,
+        sbt_tbl = true,
+        tbl_ld = |p| vld1q_u8(p),
+        tbl = |t, k, q| vqtbl1q_u8(t, veorq_u8(k, q)),
         rowvec = true
     );
 }
@@ -3326,6 +3359,9 @@ mod avx2 {
         band_width = false,
         diag = |m, s, bias| _mm256_sub_epi16(_mm256_add_epi16(m, s), bias),
         sbt_bias = |bias| bias,
+        sbt_tbl = false,
+        tbl_ld = |_p| _mm256_setzero_si256(),
+        tbl = |_t, _k, _q| unreachable!(),
         rowvec = false
     );
 
@@ -3353,6 +3389,9 @@ mod avx2 {
         band_width = false,
         diag = |m, s, bias| _mm256_subs_epu8(_mm256_adds_epu8(m, s), bias),
         sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tbl_ld = |p| _mm256_broadcastsi128_si256(_mm_loadu_si128(p as *const __m128i)),
+        tbl = |t, k, q| _mm256_shuffle_epi8(t, _mm256_xor_si256(k, q)),
         rowvec = false
     );
 }
@@ -3506,6 +3545,9 @@ mod sse41 {
         band_width = false,
         diag = |m, s, bias| _mm_sub_epi16(_mm_add_epi16(m, s), bias),
         sbt_bias = |bias| bias,
+        sbt_tbl = false,
+        tbl_ld = |_p| _mm_setzero_si128(),
+        tbl = |_t, _k, _q| unreachable!(),
         rowvec = false
     );
 
@@ -3533,6 +3575,9 @@ mod sse41 {
         band_width = false,
         diag = |m, s, bias| _mm_subs_epu8(_mm_adds_epu8(m, s), bias),
         sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tbl_ld = |p| _mm_loadu_si128(p as *const __m128i),
+        tbl = |t, k, q| _mm_shuffle_epi8(t, _mm_xor_si128(k, q)),
         rowvec = false
     );
 }
@@ -3688,6 +3733,9 @@ mod avx512 {
         band_width = false,
         diag = |m, s, bias| _mm512_sub_epi16(_mm512_add_epi16(m, s), bias),
         sbt_bias = |bias| bias,
+        sbt_tbl = false,
+        tbl_ld = |_p| _mm512_setzero_si512(),
+        tbl = |_t, _k, _q| unreachable!(),
         rowvec = false
     );
 
@@ -3715,6 +3763,9 @@ mod avx512 {
         band_width = false,
         diag = |m, s, bias| _mm512_subs_epu8(_mm512_adds_epu8(m, s), bias),
         sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tbl_ld = |p| _mm512_broadcast_i32x4(_mm_loadu_si128(p as *const __m128i)),
+        tbl = |t, k, q| _mm512_shuffle_epi8(t, _mm512_xor_si512(k, q)),
         rowvec = false
     );
 }
