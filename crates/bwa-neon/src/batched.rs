@@ -1872,7 +1872,8 @@ macro_rules! define_sw_kernel {
             sbt_tbl = $sbt_tbl:literal,
             tbl_ld = |$tp:ident| $tblld:expr,
             tbl = |$tt:ident, $tk:ident, $tq:ident| $tblx:expr,
-            rowvec = $rowvec:literal
+            rowvec = $rowvec:literal,
+            row = $rowmod:ident
         ) => {
         /// # Safety
         /// Requires the `$feat` target feature; all vector loads/stores use fixed-size
@@ -2110,10 +2111,10 @@ macro_rules! define_sw_kernel {
                     st.qcode.resize(soa_cols * LANES, 0 as $elem);
                     st.tcode.clear();
                     st.tcode.resize(soa_rows * LANES, 0 as $elem);
-                    if $rowvec {
-                        // SAFETY: `rowvec` is the NEON u8 kernel: LANES == 16, `$elem` is u8.
+                    if $rowvec && LANES == 16 && cfg!(target_arch = "aarch64") {
+                        // SAFETY: the NEON u8 kernel: LANES == 16, `$elem` is u8.
                         unsafe {
-                            super::neon_row::fill_soa16(
+                            super::$rowmod::fill_soa16(
                                 &jobs[chunk_start..chunk_start + nlane],
                                 soa_cols,
                                 soa_rows,
@@ -2192,12 +2193,12 @@ macro_rules! define_sw_kernel {
                         let mut active_lane = [0 as $umask; LANES];
                         let (gbeg, gend, fast_lo_raw, fast_hi_raw);
                         #[allow(unused_assignments)]
-                        let mut active_bits = 0u32;
+                        let mut active_bits = 0u64;
                         if $rowvec {
                             // SAFETY: `rowvec` is set only on the NEON u8 kernel, where LANES == 16,
                             // `$elem` and `$umask` are u8, `band_width` holds and `band_bias` is 0.
                             (gbeg, gend, fast_lo_raw, fast_hi_raw, active_bits) = unsafe {
-                                super::neon_row::prologue16(
+                                super::$rowmod::prologue::<LANES>(
                                     i,
                                     done.as_ptr(),
                                     tlen32.as_ptr(),
@@ -2213,6 +2214,7 @@ macro_rules! define_sw_kernel {
                                     beg_lane.as_mut_ptr() as *mut u8,
                                     end_lane.as_mut_ptr() as *mut u8,
                                     active_lane.as_mut_ptr() as *mut u8,
+                                    $bbias as u8,
                                 )
                             };
                         } else {
@@ -2531,7 +2533,7 @@ macro_rules! define_sw_kernel {
                         if $rowvec {
                             // SAFETY: as for `prologue16`.
                             let live = unsafe {
-                                super::neon_row::epilogue16(
+                                super::$rowmod::epilogue::<LANES>(
                                     i,
                                     active.as_ptr(),
                                     h1_out.as_ptr() as *const u8,
@@ -2565,7 +2567,7 @@ macro_rules! define_sw_kernel {
                                     *hp.add(end[l] as usize * LANES + l) = h1_out[l];
                                     *ep.add(end[l] as usize * LANES + l) = 0;
                                 }
-                                if live & (1 << l) == 0 {
+                                if live & (1u64 << l) == 0 {
                                     continue;
                                 }
                                 let dead = |j: i32| unsafe {
@@ -2772,52 +2774,219 @@ macro_rules! define_sw_kernel {
 /// The NEON u8 kernel's row prologue and epilogue in i32 vector lanes (`rowvec` in
 /// [`define_sw_kernel!`]): the same per-lane logic as the scalar arms, with every test folded into
 /// a select, over 16 lanes as four `int32x4_t`.
-/// The `rowvec` arm's functions where no kernel sets `rowvec` (every non-aarch64 target): never
-/// called, present so the macro's dead branch type-checks.
-#[cfg(not(target_arch = "aarch64"))]
-mod neon_row {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn prologue16(
-        _i: i32,
-        _done: *const bool,
-        _tlen: *const i32,
-        _qlen: *const i32,
-        _w: *const i32,
-        _h0: *const i32,
-        _beg: *mut i32,
-        _end: *mut i32,
-        _o_del: i32,
-        _e_del: i32,
-        _h1: *mut u8,
-        _active: *mut bool,
-        _beg_lane: *mut u8,
-        _end_lane: *mut u8,
-        _active_lane: *mut u8,
-    ) -> (i32, i32, i32, i32, u32) {
-        unreachable!("rowvec is set on the NEON u8 kernel only")
+/// The x86 u8 kernels' row prologue and epilogue in i32 vector lanes (`rowvec` in
+/// [`define_sw_kernel!`]), eight lanes per AVX2 register: the NEON `neon_row` logic over `N`
+/// lanes (32 for AVX2, 64 for AVX-512, which implies AVX2). Writes the lane vectors in the x86
+/// kernels' form: `beg`/`end` XOR-ed with `bias` (`band_bias`), `end` itself (no `band_width`).
+#[cfg(target_arch = "x86_64")]
+mod x86_row {
+    use std::arch::x86_64::*;
+
+    /// Eight bytes from `p` widened to i32.
+    #[target_feature(enable = "avx2")]
+    unsafe fn widen8(p: *const u8) -> __m256i {
+        _mm256_cvtepu8_epi32(_mm_loadl_epi64(p as *const __m128i))
     }
-    #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn epilogue16(
-        _i: i32,
-        _active: *const bool,
-        _h1_out: *const u8,
-        _rowmax_out: *const u8,
-        _mj_out: *const u8,
-        _end: *const i32,
-        _qlen: *const i32,
-        _zdrop: i32,
-        _e_del: i32,
-        _e_ins: i32,
-        _max: *mut i32,
-        _max_i: *mut i32,
-        _max_j: *mut i32,
-        _max_ie: *mut i32,
-        _gscore: *mut i32,
-        _max_off: *mut i32,
-        _done: *mut bool,
-    ) -> u32 {
-        unreachable!("rowvec is set on the NEON u8 kernel only")
+
+    /// Eight i32 in `0..256` narrowed to eight bytes stored at `p`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn narrow8(p: *mut u8, v: __m256i) {
+        let w = _mm256_packus_epi32(v, v);
+        let b = _mm256_packus_epi16(w, w);
+        let lo = _mm_cvtsi128_si32(_mm256_castsi256_si128(b)) as u32;
+        let hi = _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(b)) as u32;
+        (p as *mut u64).write_unaligned(u64::from(lo) | u64::from(hi) << 32);
     }
+
+    /// One bit per i32 lane of a mask.
+    #[target_feature(enable = "avx2")]
+    unsafe fn bits8(m: __m256i) -> u64 {
+        _mm256_movemask_ps(_mm256_castsi256_ps(m)) as u32 as u64
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn ld(p: *const i32) -> __m256i {
+        _mm256_loadu_si256(p as *const __m256i)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn st(p: *mut i32, v: __m256i) {
+        _mm256_storeu_si256(p as *mut __m256i, v)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn sel(m: __m256i, t: __m256i, f: __m256i) -> __m256i {
+        _mm256_blendv_epi8(f, t, m)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn hmin(v: __m256i) -> i32 {
+        let x = _mm_min_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        let x = _mm_min_epi32(x, _mm_shuffle_epi32::<0b01_00_11_10>(x));
+        _mm_cvtsi128_si32(_mm_min_epi32(x, _mm_shuffle_epi32::<0b10_11_00_01>(x)))
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn hmax(v: __m256i) -> i32 {
+        let x = _mm_max_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        let x = _mm_max_epi32(x, _mm_shuffle_epi32::<0b01_00_11_10>(x));
+        _mm_cvtsi128_si32(_mm_max_epi32(x, _mm_shuffle_epi32::<0b10_11_00_01>(x)))
+    }
+
+    /// As `neon_row::prologue`, over `N` lanes.
+    ///
+    /// # Safety
+    /// AVX2; every pointer addresses `N` lanes; `N` is a multiple of 8.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn prologue<const N: usize>(
+        i: i32,
+        done: *const bool,
+        tlen: *const i32,
+        qlen: *const i32,
+        w: *const i32,
+        h0: *const i32,
+        beg: *mut i32,
+        end: *mut i32,
+        o_del: i32,
+        e_del: i32,
+        h1: *mut u8,
+        active: *mut bool,
+        beg_lane: *mut u8,
+        end_lane: *mut u8,
+        active_lane: *mut u8,
+        bias: u8,
+    ) -> (i32, i32, i32, i32, u64) {
+        let iv = _mm256_set1_epi32(i);
+        let zero = _mm256_setzero_si256();
+        let (one, ff) = (_mm256_set1_epi32(1), _mm256_set1_epi32(0xff));
+        let biasv = _mm256_set1_epi32(i32::from(bias));
+        let pen = _mm256_set1_epi32(o_del + e_del * (i + 1));
+        let (vmax, vmin) = (_mm256_set1_epi32(i32::MAX), _mm256_set1_epi32(i32::MIN));
+        let (mut gb, mut ge, mut fl, mut fh) = (vmax, zero, vmin, vmax);
+        let mut abits = 0u64;
+        for o in (0..N).step_by(8) {
+            let a = _mm256_andnot_si256(
+                _mm256_cmpgt_epi32(widen8(done.add(o) as *const u8), zero),
+                _mm256_cmpgt_epi32(ld(tlen.add(o)), iv),
+            );
+            let wv = ld(w.add(o));
+            let (b0, e0) = (ld(beg.add(o)), ld(end.add(o)));
+            let b = _mm256_max_epi32(b0, _mm256_sub_epi32(iv, wv));
+            let e = _mm256_min_epi32(
+                _mm256_min_epi32(e0, _mm256_add_epi32(_mm256_add_epi32(iv, wv), one)),
+                ld(qlen.add(o)),
+            );
+            st(beg.add(o), sel(a, b, b0));
+            st(end.add(o), sel(a, e, e0));
+            let h = _mm256_max_epi32(_mm256_sub_epi32(ld(h0.add(o)), pen), zero);
+            let hq = _mm256_and_si256(_mm256_and_si256(_mm256_cmpeq_epi32(b, zero), h), a);
+            gb = _mm256_min_epi32(gb, sel(a, b, vmax));
+            ge = _mm256_max_epi32(ge, sel(a, e, zero));
+            fl = _mm256_max_epi32(fl, sel(a, b, vmin));
+            fh = _mm256_min_epi32(fh, sel(a, e, vmax));
+            narrow8(h1.add(o), hq);
+            let xb = _mm256_and_si256(_mm256_xor_si256(_mm256_and_si256(b, ff), biasv), a);
+            let xe = _mm256_and_si256(_mm256_xor_si256(_mm256_and_si256(e, ff), biasv), a);
+            narrow8(beg_lane.add(o), xb);
+            narrow8(end_lane.add(o), xe);
+            narrow8(active_lane.add(o), _mm256_and_si256(a, ff));
+            narrow8(active.add(o) as *mut u8, _mm256_and_si256(a, one));
+            abits |= bits8(a) << o;
+        }
+        (hmin(gb), hmax(ge), hmax(fl), hmin(fh), abits)
+    }
+
+    /// As `neon_row::epilogue`, over `N` lanes; returns one bit per lane still live.
+    ///
+    /// # Safety
+    /// AVX2; every pointer addresses `N` lanes; `N` is a multiple of 8.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn epilogue<const N: usize>(
+        i: i32,
+        active: *const bool,
+        h1_out: *const u8,
+        rowmax_out: *const u8,
+        mj_out: *const u8,
+        end: *const i32,
+        qlen: *const i32,
+        zdrop: i32,
+        e_del: i32,
+        e_ins: i32,
+        max: *mut i32,
+        max_i: *mut i32,
+        max_j: *mut i32,
+        max_ie: *mut i32,
+        gscore: *mut i32,
+        max_off: *mut i32,
+        done: *mut bool,
+    ) -> u64 {
+        let iv = _mm256_set1_epi32(i);
+        let zero = _mm256_setzero_si256();
+        let one = _mm256_set1_epi32(1);
+        let (ed, ei, zd) = (
+            _mm256_set1_epi32(e_del),
+            _mm256_set1_epi32(e_ins),
+            _mm256_set1_epi32(zdrop),
+        );
+        let zdrop_on = _mm256_set1_epi32(if zdrop > 0 { -1 } else { 0 });
+        let mut live_bits = 0u64;
+        for o in (0..N).step_by(8) {
+            let a = _mm256_cmpgt_epi32(widen8(active.add(o) as *const u8), zero);
+            let h1 = widen8(h1_out.add(o));
+            let rm = widen8(rowmax_out.add(o));
+            let mj = widen8(mj_out.add(o));
+            let (mx, mi, mjj) = (ld(max.add(o)), ld(max_i.add(o)), ld(max_j.add(o)));
+            let gs = ld(gscore.add(o));
+            let g_upd = _mm256_andnot_si256(
+                _mm256_cmpgt_epi32(gs, h1),
+                _mm256_and_si256(a, _mm256_cmpeq_epi32(ld(end.add(o)), ld(qlen.add(o)))),
+            );
+            st(max_ie.add(o), sel(g_upd, iv, ld(max_ie.add(o))));
+            st(gscore.add(o), sel(g_upd, h1, gs));
+            let improve = _mm256_and_si256(a, _mm256_cmpgt_epi32(rm, mx));
+            let off = _mm256_abs_epi32(_mm256_sub_epi32(mj, iv));
+            let (di, dj) = (_mm256_sub_epi32(iv, mi), _mm256_sub_epi32(mj, mjj));
+            let dd = sel(
+                _mm256_cmpgt_epi32(di, dj),
+                _mm256_mullo_epi32(_mm256_sub_epi32(di, dj), ed),
+                _mm256_mullo_epi32(_mm256_sub_epi32(dj, di), ei),
+            );
+            let drop = _mm256_sub_epi32(_mm256_sub_epi32(mx, rm), dd);
+            let dead = _mm256_and_si256(
+                a,
+                _mm256_or_si256(
+                    _mm256_cmpeq_epi32(rm, zero),
+                    _mm256_and_si256(
+                        _mm256_andnot_si256(improve, zdrop_on),
+                        _mm256_cmpgt_epi32(drop, zd),
+                    ),
+                ),
+            );
+            let mo = ld(max_off.add(o));
+            st(
+                max_off.add(o),
+                sel(
+                    _mm256_and_si256(improve, _mm256_cmpgt_epi32(off, mo)),
+                    off,
+                    mo,
+                ),
+            );
+            st(max.add(o), sel(improve, rm, mx));
+            st(max_i.add(o), sel(improve, iv, mi));
+            st(max_j.add(o), sel(improve, mj, mjj));
+            let d = _mm256_or_si256(
+                widen8(done.add(o) as *const u8),
+                _mm256_and_si256(dead, one),
+            );
+            narrow8(done.add(o) as *mut u8, d);
+            live_bits |= bits8(_mm256_andnot_si256(dead, a)) << o;
+        }
+        live_bits
+    }
+
+    /// Never called: the SoA fill is vectorised on NEON only.
     pub(super) unsafe fn fill_soa16(
         _jobs: &[bwa_extend::ExtendJob],
         _cols: usize,
@@ -2825,7 +2994,7 @@ mod neon_row {
         _qcode: *mut u8,
         _tcode: *mut u8,
     ) {
-        unreachable!("rowvec is set on the NEON u8 kernel only")
+        unreachable!("fill_soa16 is NEON-only")
     }
 }
 
@@ -2888,7 +3057,7 @@ mod neon_row {
     /// NEON; every pointer addresses 16 lanes.
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn prologue16(
+    pub(super) unsafe fn prologue<const N: usize>(
         i: i32,
         done: *const bool,
         tlen: *const i32,
@@ -2904,7 +3073,9 @@ mod neon_row {
         beg_lane: *mut u8,
         end_lane: *mut u8,
         active_lane: *mut u8,
-    ) -> (i32, i32, i32, i32, u32) {
+        _bias: u8,
+    ) -> (i32, i32, i32, i32, u64) {
+        debug_assert!(N == 16 && _bias == 0);
         let iv = vdupq_n_s32(i);
         let not_done = widen_mask(vceqzq_u8(vld1q_u8(done as *const u8)));
         let (mut gb, mut ge, mut fl, mut fh) = (i32::MAX, 0i32, i32::MIN, i32::MAX);
@@ -2954,7 +3125,7 @@ mod neon_row {
         ]);
         vst1q_u8(active_lane, a8);
         vst1q_u8(active as *mut u8, vandq_u8(a8, vdupq_n_u8(1)));
-        (gb, ge, fl, fh, bits(a8))
+        (gb, ge, fl, fh, u64::from(bits(a8)))
     }
 
     /// Fill the chunk's SoA buffers (`cols` query positions, `rows` target positions, both
@@ -3000,7 +3171,7 @@ mod neon_row {
     /// NEON; every pointer addresses 16 lanes.
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn epilogue16(
+    pub(super) unsafe fn epilogue<const N: usize>(
         i: i32,
         active: *const bool,
         h1_out: *const u8,
@@ -3018,7 +3189,8 @@ mod neon_row {
         gscore: *mut i32,
         max_off: *mut i32,
         done: *mut bool,
-    ) -> u32 {
+    ) -> u64 {
+        debug_assert!(N == 16);
         let iv = vdupq_n_s32(i);
         let zero = vdupq_n_s32(0);
         let act = widen_mask(vld1q_u8(active as *const u8));
@@ -3081,7 +3253,7 @@ mod neon_row {
         let d8 = vld1q_u8(done as *const u8);
         let a8 = vld1q_u8(active as *const u8);
         vst1q_u8(done as *mut u8, vorrq_u8(d8, vbicq_u8(a8, live8)));
-        bits(live8)
+        u64::from(bits(live8))
     }
 }
 
@@ -3141,7 +3313,8 @@ mod neon {
         sbt_tbl = false,
         tbl_ld = |_p| vdupq_n_s16(0),
         tbl = |_t, _k, _q| unreachable!(),
-        rowvec = false
+        rowvec = false,
+        row = neon_row
     );
 
     // 8-bit kernel: **unsigned** u8 [0,255] with saturating add/sub, so a local extension whose score
@@ -3189,7 +3362,8 @@ mod neon {
         sbt_tbl = true,
         tbl_ld = |p| vld1q_u8(p),
         tbl = |t, k, q| vqtbl1q_u8(t, veorq_u8(k, q)),
-        rowvec = true
+        rowvec = true,
+        row = neon_row
     );
 }
 
@@ -3362,7 +3536,8 @@ mod avx2 {
         sbt_tbl = false,
         tbl_ld = |_p| _mm256_setzero_si256(),
         tbl = |_t, _k, _q| unreachable!(),
-        rowvec = false
+        rowvec = false,
+        row = x86_row
     );
 
     define_sw_kernel!(
@@ -3392,7 +3567,8 @@ mod avx2 {
         sbt_tbl = true,
         tbl_ld = |p| _mm256_broadcastsi128_si256(_mm_loadu_si128(p as *const __m128i)),
         tbl = |t, k, q| _mm256_shuffle_epi8(t, _mm256_xor_si256(k, q)),
-        rowvec = false
+        rowvec = true,
+        row = x86_row
     );
 }
 
@@ -3548,7 +3724,8 @@ mod sse41 {
         sbt_tbl = false,
         tbl_ld = |_p| _mm_setzero_si128(),
         tbl = |_t, _k, _q| unreachable!(),
-        rowvec = false
+        rowvec = false,
+        row = x86_row
     );
 
     define_sw_kernel!(
@@ -3578,7 +3755,8 @@ mod sse41 {
         sbt_tbl = true,
         tbl_ld = |p| _mm_loadu_si128(p as *const __m128i),
         tbl = |t, k, q| _mm_shuffle_epi8(t, _mm_xor_si128(k, q)),
-        rowvec = false
+        rowvec = false,
+        row = x86_row
     );
 }
 
@@ -3736,7 +3914,8 @@ mod avx512 {
         sbt_tbl = false,
         tbl_ld = |_p| _mm512_setzero_si512(),
         tbl = |_t, _k, _q| unreachable!(),
-        rowvec = false
+        rowvec = false,
+        row = x86_row
     );
 
     define_sw_kernel!(
@@ -3766,7 +3945,8 @@ mod avx512 {
         sbt_tbl = true,
         tbl_ld = |p| _mm512_broadcast_i32x4(_mm_loadu_si128(p as *const __m128i)),
         tbl = |t, k, q| _mm512_shuffle_epi8(t, _mm512_xor_si512(k, q)),
-        rowvec = false
+        rowvec = true,
+        row = x86_row
     );
 }
 
