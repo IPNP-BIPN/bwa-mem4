@@ -1719,6 +1719,62 @@ fn tight_band_enabled() -> bool {
 pub(crate) static FULL_BAND_FOR_FIELD_GATES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Bit position of column `k` in [`block_mismatches`]' mask is `k << BLOCK_SHIFT`: NEON narrows a
+/// byte compare to four bits per column, the other targets to one.
+const BLOCK_SHIFT: u32 = if cfg!(target_arch = "aarch64") { 2 } else { 0 };
+
+/// The columns of a 16-column block where `q` and `t` differ, column `k` at bit `k << BLOCK_SHIFT`,
+/// or `None` if either holds an N (code >= 4). Both slices are exactly 16 long.
+#[inline]
+fn block_mismatches(q: &[u8], t: &[u8]) -> Option<u64> {
+    debug_assert!(q.len() == 16 && t.len() == 16);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; both loads read the 16 bytes asserted above.
+    unsafe {
+        use std::arch::aarch64::*;
+        let (a, b) = (vld1q_u8(q.as_ptr()), vld1q_u8(t.as_ptr()));
+        if vmaxvq_u8(vmaxq_u8(a, b)) >= 4 {
+            return None;
+        }
+        // Four bits per byte; the lowest of each four marks the column.
+        let nib = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+            vmvnq_u8(vceqq_u8(a, b)),
+        ))));
+        Some(nib & 0x1111_1111_1111_1111)
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of the x86_64 baseline; both loads read the 16 bytes asserted above.
+    unsafe {
+        use std::arch::x86_64::*;
+        let (a, b) = (
+            _mm_loadu_si128(q.as_ptr() as *const __m128i),
+            _mm_loadu_si128(t.as_ptr() as *const __m128i),
+        );
+        // A code >= 4 has a bit above the low two; `max_epu8` then a compare against 3 finds it.
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_max_epu8(_mm_max_epu8(a, b), _mm_set1_epi8(3)),
+            _mm_set1_epi8(3),
+        )) != 0xFFFF
+        {
+            return None;
+        }
+        Some(u64::from(
+            !(_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u32) & 0xFFFF,
+        ))
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let mut bits = 0u64;
+        for (k, (&x, &y)) in q.iter().zip(t).enumerate() {
+            if x >= 4 || y >= 4 {
+                return None;
+            }
+            bits |= u64::from(x != y) << k;
+        }
+        Some(bits)
+    }
+}
+
 /// The ungapped-score band bound for one job, or `i32::MAX` when no bound applies.
 ///
 /// The lemma (fork's `bwamem.cpp:4119`): an alignment at offset `B` from the seed diagonal carries
@@ -1782,17 +1838,51 @@ fn tight_band_bound(
     // and this walk's prefix maximum before death is exactly that.
     let mut h = h0;
     let mut s_best = h0;
-    for col in 0..min_len {
-        let (qc, tc) = (query[col], target[col]);
-        if qc >= 4 || tc >= 4 {
-            return i32::MAX;
+    // 16 columns at a time, one step per mismatch rather than per base (the fork's
+    // `ungapped_walk_mis`): with `a > 0` and `mm < 0` the score only rises along a run of matches,
+    // so the run's last column holds its best and only a mismatch can kill the walk. A block holding
+    // an N goes to the byte loop below, which returns or dies exactly where it did before.
+    let mut col = 0usize;
+    let dead = 'blocks: {
+        if a <= 0 || mm >= 0 {
+            break 'blocks false;
         }
-        h += if qc == tc { a } else { mm };
-        if h <= 0 {
-            break;
+        while col + 16 <= min_len {
+            let Some(mut ne) = block_mismatches(&query[col..col + 16], &target[col..col + 16])
+            else {
+                break 'blocks false;
+            };
+            let mut run_start = 0i32;
+            while ne != 0 {
+                let k = (ne.trailing_zeros() >> BLOCK_SHIFT) as i32;
+                h += (k - run_start) * a;
+                s_best = s_best.max(h);
+                h += mm;
+                if h <= 0 {
+                    break 'blocks true;
+                }
+                run_start = k + 1;
+                ne &= ne - 1;
+            }
+            h += (16 - run_start) * a;
+            s_best = s_best.max(h);
+            col += 16;
         }
-        if h > s_best {
-            s_best = h;
+        false
+    };
+    if !dead {
+        for col in col..min_len {
+            let (qc, tc) = (query[col], target[col]);
+            if qc >= 4 || tc >= 4 {
+                return i32::MAX;
+            }
+            h += if qc == tc { a } else { mm };
+            if h <= 0 {
+                break;
+            }
+            if h > s_best {
+                s_best = h;
+            }
         }
     }
     // The cost of sitting at offset `B` is ONE gap run of `B` columns at the cheapest rates,
@@ -2200,24 +2290,36 @@ macro_rules! define_sw_kernel {
                         }
                     }
                     // --- row -1: the leading-insertion run that seeds the first real row ---
+                    // Column `j >= 1` holds `max(h0 - oe_ins - (j-1)*e_ins, 0)` up to `qlen`: the
+                    // C's `eh[j] = eh[j-1] - e_ins while eh[j-1] > e_ins` run in closed form, one
+                    // vector per column instead of a store-to-load chain per lane.
                     let eh = &mut st.eh_h[..];
+                    let mut ramp = [0 as $elem; LANES];
+                    let mut qlen_e = [0 as $elem; LANES];
+                    let mut jmax = 0usize;
                     for l in 0..nlane {
                         eh[l] = st.h0[l] as $elem; // column 0
-                        if st.qlen[l] >= 1 {
-                            eh[LANES + l] = if st.h0[l] > oe_ins {
-                                (st.h0[l] - oe_ins) as $elem
+                        qlen_e[l] = st.qlen[l] as $elem;
+                        if st.h0[l] > oe_ins {
+                            ramp[l] = (st.h0[l] - oe_ins) as $elem;
+                            // Columns whose value is still positive: `j - 1 < (h0 - oe_ins) / e_ins`.
+                            let n = if e_ins > 0 {
+                                (st.h0[l] - oe_ins - 1) as usize / e_ins as usize + 1
                             } else {
-                                0
+                                st.qlen[l]
                             };
-                        }
-                        let mut j = 2usize;
-                        while j <= st.qlen[l] && i32::from(eh[(j - 1) * LANES + l]) > e_ins {
-                            eh[j * LANES + l] = eh[(j - 1) * LANES + l] - e_ins as $elem;
-                            j += 1;
+                            jmax = jmax.max(n.min(st.qlen[l]));
                         }
                         st.max[l] = st.h0[l];
                         st.end[l] = st.qlen[l] as i32;
                         st.done[l] = false;
+                    }
+                    let qlen_v = $lds(qlen_e.as_ptr());
+                    let mut ramp_v = $lds(ramp.as_ptr());
+                    for j in 1..=jmax {
+                        let keep = $cge(qlen_v, $dup(j as $elem));
+                        $sts(eh.as_mut_ptr().add(j * LANES), $bsl(keep, ramp_v, zero_v));
+                        ramp_v = $max($sub(ramp_v, e_ins_v), zero_v);
                     }
                 }
 
@@ -5744,6 +5846,72 @@ mod mismatch_scan_tests {
                 super::mismatch_scan(&q, &t, x, 128),
                 reference(&q, &t, x, 128),
                 "n={n} x={x}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tight_band_walk_tests {
+    /// The byte walk `tight_band_bound` had before the block walk, kept as the reference.
+    fn reference(q: &[u8], t: &[u8], h0: i32, a: i32, mm: i32, oe: (i32, i32), eb: i32) -> i32 {
+        let min_len = q.len().min(t.len());
+        if min_len == 0 || h0 <= 0 || oe.0 < 0 || oe.1 <= 0 {
+            return i32::MAX;
+        }
+        let (mut h, mut s_best) = (h0, h0);
+        for col in 0..min_len {
+            if q[col] >= 4 || t[col] >= 4 {
+                return i32::MAX;
+            }
+            h += if q[col] == t[col] { a } else { mm };
+            if h <= 0 {
+                break;
+            }
+            s_best = s_best.max(h);
+        }
+        let numer =
+            i64::from(h0) + (min_len as i64) * i64::from(a) - i64::from(s_best) - i64::from(oe.0)
+                + i64::from(eb.max(0));
+        if numer <= 0 {
+            return 2;
+        }
+        let d = i64::from(oe.1);
+        ((((numer + d - 1) / d).min(i64::from(i32::MAX - 1))) as i32).saturating_add(1)
+    }
+
+    #[test]
+    fn block_walk_equals_the_byte_walk() {
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |m: u64| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st % m
+        };
+        for _ in 0..200_000 {
+            let n = rnd(260) as usize;
+            let q: Vec<u8> = (0..n).map(|_| rnd(4) as u8).collect();
+            let mut t: Vec<u8> = q
+                .iter()
+                .map(|&c| if rnd(6) == 0 { rnd(4) as u8 } else { c })
+                .collect();
+            if rnd(10) == 0 && n > 0 {
+                let i = rnd(n as u64) as usize;
+                t[i] = 4;
+            }
+            t.truncate(n.saturating_sub(rnd(5) as usize));
+            let h0 = rnd(40) as i32;
+            let (a, mm) = if rnd(20) == 0 {
+                (0, -4)
+            } else {
+                (1 + rnd(2) as i32, -(rnd(6) as i32))
+            };
+            let args = (h0, a, mm, (6, 1), 5);
+            assert_eq!(
+                super::tight_band_bound(&q, &t, args.0, args.1, args.2, args.3, args.4),
+                reference(&q, &t, args.0, args.1, args.2, args.3, args.4),
+                "n={n} h0={h0} a={a} mm={mm}"
             );
         }
     }
