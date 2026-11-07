@@ -161,6 +161,20 @@ jobs:
           fi
           done
 
+          # The fork's extension kernel, every sampled instruction in address order, beside ours:
+          # the two column loops instruction by instruction.
+          # Mangled names: the fork's are C++ with spaces once demangled.
+          for side in "ours:_R[0-9A-Za-z_]*batched_extend_[a-z0-9]*_u8[0-9A-Za-z_]*" \
+                      "fork:_Z[0-9A-Za-z_]*smithWatermanBatchWrapper8Compact[0-9A-Za-z_]*"; do
+            bin=${side%%:*}; pat=${side#*:}
+            sym=$("$PERF" report -i "$bin.data" --stdio --no-children --no-demangle 2>/dev/null \
+              | grep -o "$pat" | head -1 || true)
+            [ -n "$sym" ] || continue
+            echo "===== $bin: sampled instructions of $sym, address order ====="
+            "$PERF" annotate -i "$bin.data" --stdio --no-source --no-demangle "$sym" 2>/dev/null \
+              | awk '$1 ~ /^[0-9]+\.[0-9]+$/ && $1 >= 0.05' | head -400 || true
+          done
+
       - name: Keep the recordings
         if: always()
         uses: actions/upload-artifact@v4
