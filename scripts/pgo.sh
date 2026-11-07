@@ -5,6 +5,8 @@
 # Requires cargo-pgo (`cargo install cargo-pgo`) and an llvm-profdata on PATH compatible with
 # rustc's LLVM. On this homebrew-rust host, homebrew LLVM provides it:
 #   export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+# Keep rustc's profile flags off the bundled C libraries; see the wrapper for why.
+export CC="$PWD/scripts/cc_no_profile.sh"
 # BOLT is intentionally skipped (needs an LLVM built with BOLT; not available here).
 set -euo pipefail
 cd "$(dirname "$0")/.."

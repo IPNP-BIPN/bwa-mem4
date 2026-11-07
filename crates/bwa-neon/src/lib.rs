@@ -126,6 +126,8 @@ pub mod batched;
 /// Mate rescue: the lane-parallel `ksw_align2` equivalent. Public because the paired-end code calls
 /// it directly (there is no `SwBackend` method for whole-read local alignment).
 pub mod matesw;
+/// Banded mate rescue (NEON and AVX2): the pruned jobs' bands in place of their hulls.
+mod rescue_band;
 /// Exact K-mer pruning of mate-rescue windows, consulted by [`matesw::batched_ksw_align2`].
 mod rescue_prune;
 

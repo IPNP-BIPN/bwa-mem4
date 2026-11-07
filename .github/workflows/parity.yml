@@ -217,9 +217,9 @@ jobs:
           KNOWN_X86_XS_DIVERGENCE: "1"
         run: |
           set -o pipefail
+          # Exits non-zero on any failed case; pipefail carries that through `tee`. (A grep for
+          # "0 failed" used to decide here, and it also matched "10 failed".)
           bash scripts/opt_parity.sh ./target/release/bwa-mem4 | tee /tmp/parity.log
-          # The script always exits 0 so the full report is printed; the pass/fail decision is here.
-          grep -q "0 failed" /tmp/parity.log
 
       # The long-read path's oracle is rammap, not bwa-mem2, so it cannot ride on the step above.
       # The binary is installed rather than skipped: `longread_parity.sh` exits 0 with a SKIP when

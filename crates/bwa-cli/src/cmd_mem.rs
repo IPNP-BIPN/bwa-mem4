@@ -2016,9 +2016,14 @@ fn forget_index(fm: bwa_index::FmIndex, bns: bwa_index::BntSeq) {
 /// `Ok(())` after the last SAM record has been written and the sink finalized. Errors: an
 /// unreadable index, an unreadable `-H` file, a malformed `-I`/`-O`/`-E`/`-L`/`-h` argument, or any
 /// I/O failure in the pipeline.
-pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
+pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Wall-clock origin for the end-of-run traffic dump only; not on any hot path.
     let t_run = std::time::Instant::now();
+    // `-p` reads mates interleaved from the first file; bwa ignores a second one, with this same
+    // warning (`fastmap.cpp`). Pairing it with the first file instead pairs unrelated records.
+    if args.smart_pairing && args.reads2.take().is_some() {
+        eprintln!("[W::main_mem] when '-p' is in use, the second query file is ignored.");
+    }
     // Options we parse for CLI compatibility but do not yet honour. Failing loudly is the point: an
     // aligner that accepts `-a` and silently emits only primaries hands back a result the user
     // believes is something it is not. Refuse rather than mislead.
@@ -2141,10 +2146,12 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Batch size in INPUT BASES, not reads. Default `chunk_size * -t` (10M per thread), mirroring
     // bwa's `aux.task_size`; `-K` overrides it. Load-bearing for paired-end reproducibility: the
     // insert-size model is re-estimated per batch, so the boundary this fixes is visible in the
-    // output. Clamped to >= 1 so a zero or negative `-K` cannot stall the reader.
+    // output. As in bwa (`fastmap.cpp`), `-K` counts only when > 0, and the default uses the thread
+    // count already clamped to >= 1: `-t 0` and `-K 0` used to give one-read batches here.
     let k_batch = args
         .k_batch
-        .unwrap_or(opt.chunk_size * i64::from(args.threads))
+        .filter(|&k| k > 0)
+        .unwrap_or(opt.chunk_size * i64::from(opt.n_threads))
         .max(1) as usize;
 
     // ================= Start reading before loading the index =================
@@ -2185,6 +2192,15 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Together they are several GB for a human genome (memory-mapped where possible).
     let fm = FmIndex::load(&args.index_prefix)?;
     let mut bns = BntSeq::load(&args.index_prefix)?;
+    // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
+    anyhow::ensure!(
+        fm.l_pac() == bns.l_pac,
+        "{}: the .ann describes a {}-base reference but the .bwt.2bit.64 a {}-base one \
+         (mixed index from two builds; rebuild it)",
+        args.index_prefix.display(),
+        bns.l_pac,
+        fm.l_pac()
+    );
     // `-j`: clear the ALT flags the loader just read from `<prefix>.alt`, so every contig counts as
     // primary assembly. Done here, after loading, exactly as `fastmap.cpp:907` does it.
     if args.ignore_alt {

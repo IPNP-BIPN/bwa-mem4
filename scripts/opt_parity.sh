@@ -530,4 +530,5 @@ check_bgzf
 echo ""
 echo "RESULT: $pass passed, $fail failed"
 [ $fail -gt 0 ] && printf 'FAILING: %s\n' "${failed_opts[*]}"
-exit 0
+# The full report above is always printed; the exit code is the verdict (CI relies on it).
+exit $((fail > 0))

@@ -142,22 +142,21 @@ use crate::sais::suffix_array_inplace;
 fn suffix_array_libsais(bref: &[u8]) -> Vec<i64> {
     let n = bref.len();
     let mut sa = vec![0i64; n + 1];
+    // Built straight into `sa[1..]`: an owned buffer is a SECOND 8n-byte array copied into this one,
+    // and that copy made the index build peak at 105 GB on GRCh38 against bwa-mem2's 79 GB.
+    let build = libsais::SuffixArrayConstruction::for_text(bref).in_borrowed_buffer(&mut sa[1..]);
     // The builder is typed by its threading choice, so the serial and parallel arms each finish the
     // chain themselves rather than sharing a half-built value.
     #[cfg(not(feature = "libsais-c-omp"))]
-    let build = libsais::SuffixArrayConstruction::for_text(bref)
-        .in_owned_buffer()
-        .single_threaded();
-    #[cfg(feature = "libsais-c-omp")]
-    let build = {
-        let build = libsais::SuffixArrayConstruction::for_text(bref).in_owned_buffer();
-        build.multi_threaded(libsais::ThreadCount::fixed(sa_threads() as u16))
-    };
-    let built: Vec<i64> = build
+    build
+        .single_threaded()
         .run()
-        .expect("libsais suffix-array construction")
-        .into_vec();
-    sa[1..].copy_from_slice(&built);
+        .expect("libsais suffix-array construction");
+    #[cfg(feature = "libsais-c-omp")]
+    build
+        .multi_threaded(libsais::ThreadCount::fixed(sa_threads() as u16))
+        .run()
+        .expect("libsais suffix-array construction");
     sa[0] = n as i64;
     sa
 }
@@ -444,6 +443,14 @@ pub fn build_index_with_prefix(fasta: &Path, prefix: &Path) -> Result<()> {
     // memory-heavy suffix-array stage.
     drop(contigs);
 
+    // A rebuild writes .pac/.ann/.amb long before the .bwt (the suffix array, the step that runs
+    // out of memory, sits between them). Drop the old .bwt first, so a build that dies there
+    // leaves no index rather than a new .pac beside an old .bwt that `mem` would happily load.
+    match std::fs::remove_file(sibling(prefix, "bwt.2bit.64")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+
     // 2. Write .pac (2-bit packed forward reference).
     write_pac(&sibling(prefix, "pac"), &forward)?;
 
@@ -557,8 +564,10 @@ fn read_fasta(path: &Path) -> Result<Vec<FastaContig>> {
                     cur.name
                 )));
             }
-            cur.seq
-                .extend(line.iter().filter(|b| !b.is_ascii_whitespace()));
+            // Kept byte for byte, spaces and tabs included: kseq only drops the newline and a
+            // trailing `\r` (stripped above), so bwa-mem2 indexes any other whitespace byte as an
+            // ambiguous base. Measured: `ACGT ACGT` is 9 bases there, and must be here too.
+            cur.seq.extend_from_slice(line);
         }
     }
     Ok(contigs)
@@ -1100,6 +1109,20 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whitespace inside a sequence line is a base for bwa-mem2 (kseq keeps it; `nt4` makes it
+    /// ambiguous); only the newline, one trailing `\r` and empty lines vanish. Measured against
+    /// `bwa-mem2 index`: all five files identical on each of these shapes.
+    #[test]
+    fn sequence_whitespace_is_kept_like_kseq() {
+        let dir = std::env::temp_dir().join(format!("bwa-fa-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fasta = dir.join("t.fa");
+        std::fs::write(&fasta, b">c\r\nAC GT\r\n\n   \n\tA \n").unwrap();
+        let c = read_fasta(&fasta).unwrap();
+        assert_eq!(c[0].seq, b"AC GT   \tA ".to_vec());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// An N-run must NOT be merged across a contig boundary: bwa-mem2's `add1` resets its
     /// `lasts` tracker to 0 at the start of every contig, so N at the end of one contig and N at

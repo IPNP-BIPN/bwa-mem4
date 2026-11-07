@@ -118,6 +118,7 @@ use bwa_core::MemOpt;
 use bwa_extend::{ExtendJob, SwBackend};
 use bwa_index::{BntSeq, FmIndex};
 use bwa_seed::{mem_collect_smem_batched, MemSeed};
+use std::cell::RefCell;
 
 /// A seed counts as "comparably long" to the candidate when it is at least this fraction of the
 /// candidate's length. The C spells the test `t->len < s->len * .95` (`bwamem.cpp:2969`), an
@@ -361,6 +362,9 @@ pub(crate) fn discard_contained(
     // a line per region where this is three to a line.
     let mut bounds: Vec<(i64, i64, i32, i32)> =
         regs.iter().map(|r| (r.rb, r.re, r.qb, r.qe)).collect();
+    let mut ix = KEPT_INDEX.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    ix.clear();
+    let mut index_ok = true;
     for idx in 0..n_slots {
         if purged[idx] {
             continue; // pre-skipped: never extended, and contributes no `lim`
@@ -374,90 +378,39 @@ pub(crate) fn discard_contained(
         // ---- step 1: has an earlier surviving region already covered this seed? ----
         // "test whether extension has been made before" (`bwamem.cpp:2929`): scan this read's regions
         // in slot order, stopping once `lim` non-purged ones have been examined without finding a
-        // container. Two exits matter and they mean opposite things:
-        //   - fall out with `n_rejected == lim`: no earlier region swallows this seed, so keep it.
-        //   - `break` with `n_rejected < lim`: region `prior` swallows it, so it is a purge candidate.
-        // `n_rejected` counts *rejected* regions (the C's `v`), so `n_rejected < lim` after the loop
-        // can only be reached via `break`.
-        // Loop state for the containment scan. Invariant at the top of each iteration: `scan_idx` is
-        // the next slot to examine, and `n_rejected` counts how many *non-purged* slots in
-        // `0..scan_idx` failed to contain the seed. The scan stops when `n_rejected` reaches `lim`
-        // (the C's budget of previously kept regions) or slots run out.
-        let mut n_rejected: i32 = 0;
-        let mut scan_idx = 0usize;
-        while scan_idx < n_slots && n_rejected < lim {
-            // `prior`'s bounds; `prior` is the C's `p`, an already-emitted region of this same read.
-            let (rb, re, qb, qe) = bounds[scan_idx];
-            if qb == -1 && qe == -1 {
-                scan_idx += 1;
-                continue; // already purged: not counted against `lim`
-            }
-            // The seed's [qbeg, qbeg+len) x [rbeg, rbeg+len) box must lie wholly inside `prior`
-            // on *both* axes (`bwamem.cpp:2941-2942`). Note the asymmetric widths: `qb/qe` are i32
-            // query offsets, `rb/re` i64 positions in the doubled pac, hence the `i64::from`.
-            if seed.rbeg < rb
-                || seed.rbeg + i64::from(seed.len) > re
-                || seed.qbeg < qb
-                || seed.qbeg + seed.len > qe
-            {
+        // container. Every slot before `idx` is decided, and the non-purged ones among them are
+        // exactly the `lim` kept ones, so when every kept region is live the scan examines
+        // precisely the kept set and its answer is order-free: "some kept region contains the
+        // seed". The index answers that from the regions whose reference span can hold the seed
+        // (fg-labs/bwa-mem3's Pass-3 kept-set index). A kept region that is not live (its bounds
+        // already `-1`) would let the scan run past `idx`, so from then on the read uses the scan.
+        let contained = if index_ok {
+            ix.contains(&seed, regs, l_query, opt)
+        } else {
+            // Loop state for the containment scan. Invariant at the top of each iteration:
+            // `scan_idx` is the next slot to examine, and `n_rejected` counts how many
+            // *non-purged* slots in `0..scan_idx` failed to contain the seed. The scan stops when
+            // `n_rejected` reaches `lim` (the C's budget of previously kept regions) or slots run
+            // out; `n_rejected < lim` after the loop means a container was found.
+            let mut n_rejected: i32 = 0;
+            let mut scan_idx = 0usize;
+            while scan_idx < n_slots && n_rejected < lim {
+                let b = bounds[scan_idx];
+                if b.2 == -1 && b.3 == -1 {
+                    scan_idx += 1;
+                    continue; // already purged: not counted against `lim`
+                }
+                if contains(&seed, &regs[scan_idx], b, l_query, opt) {
+                    break;
+                }
                 n_rejected += 1;
                 scan_idx += 1;
-                continue; // not fully contained
             }
-            let prior = &regs[scan_idx];
-            // `bwamem.cpp:2943`: `if (s->len - p->seedlen0 > .1 * l_query)`. `seedlen0` is the length
-            // of the seed that *founded* `prior`. If this seed is more than 10% of the read longer
-            // than that founder, it is materially better evidence and could pull out a better
-            // alignment, so `prior`'s existence is not a reason to drop it. In C the left-hand side
-            // is an int promoted to double; `f64::from` on the already-computed i32 difference
-            // reproduces that exactly, including the case where the difference is negative.
-            if f64::from(seed.len - prior.seedlen0) > SEEDLEN_SLACK_FRAC * f64::from(l_query) {
-                n_rejected += 1;
-                scan_idx += 1;
-                continue; // this seed may give a better alignment
-            }
-            // Ahead of the seed: is it "around" this hit, within the gap the band still allows?
-            // `qd`/`rd` are the query and reference distances from `prior`'s start to the seed's
-            // start (`bwamem.cpp:2945`). Both are non-negative here, since containment was just
-            // checked.
-            // `qd`: query bases between `prior`'s start and the seed's start. `rd`: the same gap
-            // measured on the reference. Both in bases, both non-negative here.
-            let qd = i64::from(seed.qbeg - prior.qb);
-            let rd = seed.rbeg - prior.rb;
-            // `cal_max_gap(opt, min(qd, rd))` is the longest indel an alignment of that length could
-            // afford before the gap penalty eats the match score: it solves
-            // `qlen*a - o = e*l` for l, takes the larger of the deletion and insertion answers, and
-            // clamps to `[1, 2*opt.w]` (`bwamem.cpp:66-76`). The `as i32` narrowing is safe because
-            // `min(qd, rd)` is bounded by the region's query span, which is a read length.
-            // `max_gap`: longest indel, in bases, an alignment of `min(qd, rd)` length could pay for.
-            let max_gap = i64::from(cal_max_gap(opt, qd.min(rd) as i32));
-            // Bounded by the band actually used for `prior`, since a shift wider than the band could
-            // not have been found by `prior`'s own DP anyway. `w` is therefore the diagonal slack, in
-            // bases, that the test just below allows between the seed and `prior`.
-            let w = max_gap.min(i64::from(prior.w));
-            // `|qd - rd| < w` written as two one-sided tests, exactly as the C does. This asks
-            // whether the seed sits on a diagonal reachable from `prior`'s start within the band: if
-            // so, `prior`'s alignment already explores this diagonal and the seed adds nothing.
-            if qd - rd < w && rd - qd < w {
-                break;
-            }
-            // Same test behind the seed: distances from the seed's end to `prior`'s end. These
-            // `qd`/`rd` shadow the previous pair, matching the C's reuse of the same locals.
-            let qd = i64::from(prior.qe - (seed.qbeg + seed.len));
-            let rd = prior.re - (seed.rbeg + i64::from(seed.len));
-            // Same two quantities as above, recomputed for the trailing gap: affordable indel length,
-            // then the diagonal slack after clamping to `prior`'s band.
-            let max_gap = i64::from(cal_max_gap(opt, qd.min(rd) as i32));
-            let w = max_gap.min(i64::from(prior.w));
-            if qd - rd < w && rd - qd < w {
-                break;
-            }
-            n_rejected += 1;
-            scan_idx += 1;
-        }
+            n_rejected < lim
+        };
 
         // ---- step 2: confirm no comparably long off-diagonal seed of this chain interferes ----
-        if n_rejected < lim {
+        if contained {
             // The seed is (almost) contained in an existing alignment. Confirm it cannot lead to a
             // different one: look for a comparably long, already-processed seed of the same chain
             // that overlaps it on a *different* diagonal. bwa scans `srt2[k+1..]` (higher scores,
@@ -529,7 +482,157 @@ pub(crate) fn discard_contained(
         // search. Growing it monotonically is what makes the pass O(n^2) worst case but also what
         // makes the result depend on slot order, hence the invariant stated in the doc comment.
         lim += 1;
+        if index_ok {
+            let b = bounds[idx];
+            if b.2 == -1 && b.3 == -1 {
+                index_ok = false;
+            } else {
+                ix.insert(idx, b);
+            }
+        }
     }
+    KEPT_INDEX.with(|c| *c.borrow_mut() = ix);
+}
+
+/// Whether region `prior` (bounds `b`: `rb, re, qb, qe`) contains `seed` closely enough that the
+/// seed's extension is redundant (`bwamem.cpp:2941-2960`): the seed's box lies inside the region
+/// on both axes, the seed is not materially longer than the region's founding seed, and on one
+/// side of the seed the region's start (or end) is within the band's reach of the seed's diagonal.
+fn contains(
+    seed: &MemSeed,
+    prior: &MemAlnReg,
+    b: (i64, i64, i32, i32),
+    l_query: i32,
+    opt: &MemOpt,
+) -> bool {
+    let (rb, re, qb, qe) = b;
+    // The seed's [qbeg, qbeg+len) x [rbeg, rbeg+len) box must lie wholly inside `prior` on *both*
+    // axes. Note the asymmetric widths: `qb/qe` are i32 query offsets, `rb/re` i64 positions in
+    // the doubled pac.
+    if seed.rbeg < rb
+        || seed.rbeg + i64::from(seed.len) > re
+        || seed.qbeg < qb
+        || seed.qbeg + seed.len > qe
+    {
+        return false;
+    }
+    // `bwamem.cpp:2943`: `if (s->len - p->seedlen0 > .1 * l_query)`. `seedlen0` is the length of
+    // the seed that *founded* `prior`. If this seed is more than 10% of the read longer than that
+    // founder, it is materially better evidence and could pull out a better alignment. In C the
+    // left-hand side is an int promoted to double; `f64::from` on the i32 difference reproduces
+    // that exactly, including a negative difference.
+    if f64::from(seed.len - prior.seedlen0) > SEEDLEN_SLACK_FRAC * f64::from(l_query) {
+        return false;
+    }
+    // Ahead of the seed: is it "around" this hit, within the gap the band still allows? `qd`/`rd`
+    // are the query and reference distances from `prior`'s start to the seed's start
+    // (`bwamem.cpp:2945`), both non-negative here. `cal_max_gap(opt, min(qd, rd))` is the longest
+    // indel an alignment of that length could afford, bounded by the band `prior` actually used;
+    // `|qd - rd| < w` as two one-sided tests, exactly as the C does.
+    let qd = i64::from(seed.qbeg - prior.qb);
+    let rd = seed.rbeg - prior.rb;
+    let w = i64::from(cal_max_gap(opt, qd.min(rd) as i32)).min(i64::from(prior.w));
+    if qd - rd < w && rd - qd < w {
+        return true;
+    }
+    // Same test behind the seed: distances from the seed's end to `prior`'s end.
+    let qd = i64::from(prior.qe - (seed.qbeg + seed.len));
+    let rd = prior.re - (seed.rbeg + i64::from(seed.len));
+    let w = i64::from(cal_max_gap(opt, qd.min(rd) as i32)).min(i64::from(prior.w));
+    qd - rd < w && rd - qd < w
+}
+
+/// The kept regions of one read, indexed by reference position for [`discard_contained`]: members
+/// are chained into hash buckets of `rb >> BUCKET_SHIFT`. A member containing the seed `[s, e)`
+/// has `rb <= s` and `re >= e`, and every member spans at most `maxspan`, so only the buckets
+/// covering `[e - maxspan, s]` can hold one; a range of many buckets (very long regions) is
+/// answered by scanning the members instead. Bucket collisions only add candidates, which the box
+/// test rejects. Per-thread, grow-only; `clear` resets only the heads a read touched.
+#[derive(Default)]
+struct KeptIndex {
+    recs: Vec<(i64, i64, i32, i32, u32, i32)>,
+    head: Vec<i32>,
+    maxspan: i64,
+}
+
+impl KeptIndex {
+    const HBITS: u32 = 12;
+    const BUCKET_SHIFT: u32 = 10;
+    const MAX_BUCKET_WALK: i64 = 32;
+
+    fn hslot(bucket: i64) -> usize {
+        ((bucket as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - Self::HBITS)) as usize
+    }
+
+    fn clear(&mut self) {
+        if self.head.is_empty() {
+            self.head = vec![-1; 1 << Self::HBITS];
+        }
+        for r in &self.recs {
+            self.head[Self::hslot(r.0 >> Self::BUCKET_SHIFT)] = -1;
+        }
+        self.recs.clear();
+        self.maxspan = 0;
+    }
+
+    fn insert(&mut self, slot: usize, b: (i64, i64, i32, i32)) {
+        let h = Self::hslot(b.0 >> Self::BUCKET_SHIFT);
+        self.maxspan = self.maxspan.max(b.1 - b.0);
+        let next = self.head[h];
+        self.head[h] = self.recs.len() as i32;
+        self.recs.push((b.0, b.1, b.2, b.3, slot as u32, next));
+    }
+
+    /// Whether some member [`contains`] `seed`.
+    fn contains(&self, seed: &MemSeed, regs: &[MemAlnReg], l_query: i32, opt: &MemOpt) -> bool {
+        if self.recs.is_empty() {
+            return false;
+        }
+        let (s, e) = (seed.rbeg, seed.rbeg + i64::from(seed.len));
+        let lo = e - self.maxspan;
+        if lo > s {
+            return false;
+        }
+        let hit = |r: &(i64, i64, i32, i32, u32, i32)| {
+            r.0 <= s
+                && r.1 >= e
+                && contains(
+                    seed,
+                    &regs[r.4 as usize],
+                    (r.0, r.1, r.2, r.3),
+                    l_query,
+                    opt,
+                )
+        };
+        let (b_lo, b_hi) = (lo >> Self::BUCKET_SHIFT, s >> Self::BUCKET_SHIFT);
+        if b_hi - b_lo >= Self::MAX_BUCKET_WALK {
+            return self.recs.iter().any(hit);
+        }
+        // Distinct buckets can share a head; walk each head once.
+        let mut seen = [0usize; Self::MAX_BUCKET_WALK as usize];
+        let mut n_seen = 0;
+        for b in b_lo..=b_hi {
+            let h = Self::hslot(b);
+            if seen[..n_seen].contains(&h) {
+                continue;
+            }
+            seen[n_seen] = h;
+            n_seen += 1;
+            let mut t = self.head[h];
+            while t >= 0 {
+                let r = &self.recs[t as usize];
+                if hit(r) {
+                    return true;
+                }
+                t = r.5;
+            }
+        }
+        false
+    }
+}
+
+thread_local! {
+    static KEPT_INDEX: std::cell::RefCell<KeptIndex> = RefCell::new(KeptIndex::default());
 }
 
 /// One pending one-sided extension, with a back-pointer to the region it fills.
@@ -1086,14 +1189,30 @@ fn align_reads_batched_inner<B: SwBackend>(
     // The output under construction: per read, one region slot per seed, in slot order (chains back
     // to back, seeds within a chain in descending-score order). Filled skeleton-first by the
     // collection pass, completed by `run_side`'s scatter, then compacted at the very end.
-    let mut regs: Vec<Vec<MemAlnReg>> = vec![Vec::new(); reads.len()];
+    // One slot per seed of the read, sized up front: four vectors grown by doubling per read
+    // were ~100M reallocations per 2M pairs.
+    let n_seeds = |r: usize| {
+        per_read_chains[r]
+            .iter()
+            .map(|c| c.seeds.len())
+            .sum::<usize>()
+    };
+    let mut regs: Vec<Vec<MemAlnReg>> = (0..reads.len())
+        .map(|r| Vec::with_capacity(n_seeds(r)))
+        .collect();
     // region -> owning chain index (for the final seedcov pass).
-    let mut reg_chain: Vec<Vec<usize>> = vec![Vec::new(); reads.len()];
+    let mut reg_chain: Vec<Vec<usize>> = (0..reads.len())
+        .map(|r| Vec::with_capacity(n_seeds(r)))
+        .collect();
     // Per-region (chain, order position, seed) for the discard pass.
-    let mut reg_meta: Vec<Vec<RegMeta>> = vec![Vec::new(); reads.len()];
+    let mut reg_meta: Vec<Vec<RegMeta>> = (0..reads.len())
+        .map(|r| Vec::with_capacity(n_seeds(r)))
+        .collect();
     // Seeds whose extension nh13's skip elided: they keep a slot (so the discard pass reproduces
     // bwa-mem2's scan order) but start purged.
-    let mut reg_preskip: Vec<Vec<bool>> = vec![Vec::new(); reads.len()];
+    let mut reg_preskip: Vec<Vec<bool>> = (0..reads.len())
+        .map(|r| Vec::with_capacity(n_seeds(r)))
+        .collect();
 
     // The two pending-extension queues, pooled across the WHOLE batch rather than per read: that is
     // what gives the SIMD kernel enough same-length work to fill its lanes. A seed contributes a left
@@ -1123,6 +1242,7 @@ fn align_reads_batched_inner<B: SwBackend>(
     // millions of short vectors, and returning an owned one each time made the allocator visible
     // next to the unpack itself.
     let mut rseq_buf: Vec<u8> = Vec::new();
+    let mut order: Vec<usize> = Vec::new();
     // Backing store for every job's query and target. Cleared once per chunk; the ranges in
     // `SideJob` index it. Holding it whole for the chunk is what the owned vectors were doing
     // anyway, and this way each read's bases and each chain's window are stored ONCE instead of
@@ -1135,7 +1255,10 @@ fn align_reads_batched_inner<B: SwBackend>(
         let fwd_off = arena.len() as u32;
         arena.extend_from_slice(codes);
         let rev_off = arena.len() as u32;
-        arena.extend(codes.iter().rev().copied());
+        // A copy then `reverse()`: both are word-at-a-time, where `extend(iter().rev())` is a byte
+        // loop, and the reversed windows below are 40 GB per 2M pairs.
+        arena.extend_from_slice(codes);
+        arena[rev_off as usize..].reverse();
         // This read's length in bases, and its surviving chains. `l_query` is the 3' limit every
         // right-side decision below compares against.
         let l_query = codes.len() as i32;
@@ -1216,7 +1339,8 @@ fn align_reads_batched_inner<B: SwBackend>(
             let rseq_off = arena.len() as u32;
             arena.extend_from_slice(rseq);
             let rrseq_off = arena.len() as u32;
-            arena.extend(rseq.iter().rev().copied());
+            arena.extend_from_slice(rseq);
+            arena[rrseq_off as usize..].reverse();
             let w_len = rseq.len() as u32;
 
             // Seeds in descending (score, index) order.
@@ -1232,10 +1356,15 @@ fn align_reads_batched_inner<B: SwBackend>(
             //     high half of a u64, so a (never observed in practice) negative score would sort as
             //     a huge positive one. Reproducing the reinterpretation rather than sign-extending is
             //     the conservative choice.
-            let mut order: Vec<usize> = (0..chain.seeds.len()).collect();
-            order.sort_by_key(|&i| {
-                std::cmp::Reverse((u64::from(chain.seeds[i].score as u32) << 32) | i as u64)
-            });
+            // One scratch list for every chain of the batch (109M chains per 2M pairs: a `Vec`
+            // each was a malloc each), sorted only when there is something to sort.
+            order.clear();
+            order.extend(0..chain.seeds.len());
+            if order.len() > 1 {
+                order.sort_by_key(|&i| {
+                    std::cmp::Reverse((u64::from(chain.seeds[i].score as u32) << 32) | i as u64)
+                });
+            }
 
             for (pos, &si) in order.iter().enumerate() {
                 if skip_contained && seed_ext_redundant(&chain.seeds, si) {
@@ -1596,7 +1725,24 @@ fn run_side<B: SwBackend>(
         // `sortPairsLenExt` (`bwamem.cpp:2446`, and again for the right side at `bwamem.cpp:2679`),
         // which also keys on length. Unobservable in the output because each job's result depends
         // only on its own `(query, target, h0, w)`, which is the invariant this whole file rests on.
-        active_idxs.sort_by_key(|&k| std::cmp::Reverse(jobs[k].query.1.max(jobs[k].target.1)));
+        // A counting sort, descending and stable: the same permutation the stable sort gave, in
+        // O(n) (the merge sort was 2 s per 2M pairs; lengths are a few hundred at most).
+        let key = |k: usize| jobs[k].query.1.max(jobs[k].target.1) as usize;
+        let kmax = active_idxs.iter().map(|&k| key(k)).max().unwrap_or(0);
+        let mut start = vec![0usize; kmax + 2];
+        for &k in &active_idxs {
+            start[kmax - key(k) + 1] += 1;
+        }
+        for b in 1..start.len() {
+            start[b] += start[b - 1];
+        }
+        let mut sorted = vec![0usize; active_idxs.len()];
+        for &k in &active_idxs {
+            let b = kmax - key(k);
+            sorted[start[b]] = k;
+            start[b] += 1;
+        }
+        active_idxs = sorted;
 
         // ---- step 2: run the batch at this round's band width ----
         // Band width for this round: `opt.w`, then `2*opt.w` (`bwamem.cpp:2474`).

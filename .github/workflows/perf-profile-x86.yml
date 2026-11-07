@@ -86,7 +86,7 @@ jobs:
               - bioconda
           create-args: >-
             bwa-mem2
-            bwa-mem3
+            bwa-mem3=0.16.0
             wgsim
             samtools
           init-shell: bash
@@ -125,12 +125,12 @@ jobs:
           r1="${SET}1.fq"; r2="${SET}2.fq"
           # Warm the page cache for both, so the first one recorded is not paying for the index read.
           ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
-          bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
+          bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
 
           for arm in ours fork; do
             case "$arm" in
               ours) cmd=(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
-              fork) cmd=(bwa-mem3   mem -t "$T" chr21.fa "$r1" "$r2") ;;
+              fork) cmd=(bwa-mem3   mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2") ;;
             esac
             echo "::group::perf record: $arm"
             "$PERF" record -F 499 -g --call-graph fp -o "$arm.data" -- "${cmd[@]}" > /dev/null 2>/dev/null || true

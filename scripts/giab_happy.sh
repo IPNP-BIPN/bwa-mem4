@@ -31,9 +31,8 @@
 #   MEM4=...         path to the bwa-mem4 binary (default target/release/bwa-mem4)
 #   ORACLE=bwa-mem2  the oracle to compare against, on PATH or as a path
 #
-# Needs on PATH: samtools, bcftools, and one of `rtg` (rtg-tools) or `hap.py`. The oracle
-# (`bwa-mem2`) is needed for the comparison arm; without it the script still scores our own calls
-# and says the oracle arm was skipped.
+# Needs on PATH: samtools, bcftools, one of `rtg` (rtg-tools) or `hap.py`, and the oracle
+# (`bwa-mem2`). Exits non-zero when the oracle is missing or when the BAM or VCF records differ.
 #
 #   micromamba install -c conda-forge -c bioconda samtools bcftools rtg-tools bwa-mem2
 set -euo pipefail
@@ -128,47 +127,44 @@ score() {
   fi
 }
 
+command -v "$ORACLE" > /dev/null || [ -x "$ORACLE" ] || { echo "oracle ($ORACLE) not found" >&2; exit 1; }
 align mem4 "$MEM4"
-if command -v "$ORACLE" > /dev/null || [ -x "$ORACLE" ]; then
-  align oracle "$ORACLE"
-  HAVE_ORACLE=1
-else
-  echo "== oracle ($ORACLE) not found: scoring our arm only =="
-  HAVE_ORACLE=0
-fi
+align oracle "$ORACLE"
+DIFFER=0
 
 # The identity check, before any scoring: if this passes, the rest of the script is a formality and
 # the table below is guaranteed to have two identical rows. If it FAILS, the table is the
 # interesting part, so the script continues rather than exiting.
-if [ "$HAVE_ORACLE" = 1 ]; then
-  echo "== record-level identity of the two BAMs =="
-  a=$(samtools view "$OUT/mem4.bam" | md5sum | cut -d' ' -f1)
-  b=$(samtools view "$OUT/oracle.bam" | md5sum | cut -d' ' -f1)
-  if [ "$a" = "$b" ]; then
-    echo "BAM records identical ($a)"
-  else
-    echo "BAM records DIFFER: mem4=$a oracle=$b"
-    echo "(the table below is then a real comparison, not a formality)"
-  fi
+echo "== record-level identity of the two BAMs =="
+a=$(samtools view "$OUT/mem4.bam" | md5sum | cut -d' ' -f1)
+b=$(samtools view "$OUT/oracle.bam" | md5sum | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then
+  echo "BAM records identical ($a)"
+else
+  echo "BAM records DIFFER: mem4=$a oracle=$b"
+  echo "(the table below is then a real comparison, not a formality)"
+  DIFFER=1
 fi
 
 call mem4
-[ "$HAVE_ORACLE" = 1 ] && call oracle
+call oracle
 
-if [ "$HAVE_ORACLE" = 1 ]; then
-  echo "== VCF identity =="
-  # Compares the CALLS, not the file: a gzip member's bytes depend on the compressor's state and
-  # every VCF carries the command line that produced it in its header.
-  va=$(bcftools view -H "$OUT/mem4.vcf.gz" | md5sum | cut -d' ' -f1)
-  vb=$(bcftools view -H "$OUT/oracle.vcf.gz" | md5sum | cut -d' ' -f1)
-  [ "$va" = "$vb" ] && echo "VCF records identical ($va)" || echo "VCF records DIFFER: mem4=$va oracle=$vb"
-fi
+echo "== VCF identity =="
+# Compares the CALLS, not the file: a gzip member's bytes depend on the compressor's state and
+# every VCF carries the command line that produced it in its header.
+va=$(bcftools view -H "$OUT/mem4.vcf.gz" | md5sum | cut -d' ' -f1)
+vb=$(bcftools view -H "$OUT/oracle.vcf.gz" | md5sum | cut -d' ' -f1)
+if [ "$va" = "$vb" ]; then echo "VCF records identical ($va)"; else echo "VCF records DIFFER: mem4=$va oracle=$vb"; DIFFER=1; fi
 
 score mem4
-[ "$HAVE_ORACLE" = 1 ] && score oracle
+score oracle
 
 echo
 echo "== what this table is =="
 echo "Precision and recall are bcftools' numbers on this data, not a statement about the best"
 echo "achievable pipeline. The load-bearing claim is that the two arms agree, which is what makes"
 echo "byte-identity mean something to a variant-calling user."
+
+# The scores above are printed either way; any record difference fails the gate.
+[ "$DIFFER" = 0 ] || { echo "GIAB GATE: FAIL (records differ)"; exit 1; }
+echo "GIAB GATE: PASS"
