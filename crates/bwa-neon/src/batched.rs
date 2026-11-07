@@ -1524,6 +1524,72 @@ fn default_result() -> ExtendResult {
     }
 }
 
+/// A buffer whose slice starts on a 64-byte boundary, so a vector at a multiple of its own width
+/// never splits a cache line: a `Vec<u8>` is only as aligned as the allocator makes it (16 bytes),
+/// which splits every AVX-512 access and one AVX2 access in four.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) struct ABuf<T> {
+    v: Vec<T>,
+    off: usize,
+    len: usize,
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl<T: Copy> ABuf<T> {
+    pub(crate) const fn new() -> Self {
+        ABuf {
+            v: Vec::new(),
+            off: 0,
+            len: 0,
+        }
+    }
+
+    /// `n` elements, all `x`.
+    pub(crate) fn reset(&mut self, n: usize, x: T) {
+        self.v.clear();
+        self.v.resize(n + 64 / std::mem::size_of::<T>(), x);
+        self.off = self.v.as_ptr().align_offset(64);
+        self.len = n;
+    }
+
+    /// At least `n` elements, the first `n` as they were where the buffer already had them.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn fit(&mut self, n: usize, x: T) {
+        if self.len < n {
+            let old = std::mem::take(&mut self.v);
+            let (off, len) = (self.off, self.len);
+            self.reset(n, x);
+            self[..len].copy_from_slice(&old[off..off + len]);
+        }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl<T: Copy> Default for ABuf<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl<T> std::ops::Deref for ABuf<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        // SAFETY: `reset` keeps `off + len <= v.len()`.
+        unsafe { std::slice::from_raw_parts(self.v.as_ptr().add(self.off), self.len) }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl<T> std::ops::DerefMut for ABuf<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as for `deref`.
+        unsafe { std::slice::from_raw_parts_mut(self.v.as_mut_ptr().add(self.off), self.len) }
+    }
+}
+
 /// Most vectors in one lane-compaction superblock (see `compact_plan`).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const COMPACT_MAX: usize = 16;
@@ -1989,10 +2055,10 @@ macro_rules! define_sw_kernel {
             // 2.05x with 8-vector superblocks.
             let kmax = super::compact_groups(LANES);
             struct Vs {
-                eh_h: Vec<$elem>,
-                eh_e: Vec<$elem>,
-                qcode: Vec<$elem>,
-                tcode: Vec<$elem>,
+                eh_h: super::ABuf<$elem>,
+                eh_e: super::ABuf<$elem>,
+                qcode: super::ABuf<$elem>,
+                tcode: super::ABuf<$elem>,
                 qlen: [usize; LANES],
                 tlen: [usize; LANES],
                 qlen32: [i32; LANES],
@@ -2017,10 +2083,10 @@ macro_rules! define_sw_kernel {
             }
             let mut vs: Vec<Vs> = (0..kmax)
                 .map(|_| Vs {
-                    eh_h: Vec::new(),
-                    eh_e: Vec::new(),
-                    qcode: Vec::new(),
-                    tcode: Vec::new(),
+                    eh_h: super::ABuf::new(),
+                    eh_e: super::ABuf::new(),
+                    qcode: super::ABuf::new(),
+                    tcode: super::ABuf::new(),
                     qlen: [0; LANES],
                     tlen: [0; LANES],
                     qlen32: [0; LANES],
@@ -2046,7 +2112,7 @@ macro_rules! define_sw_kernel {
             // base and the column's query base, never on the DP recurrence. Computing it in a
             // separate per-row loop and loading it in the DP body lifts ~7 vector ALU ops off the
             // serial H/E/F critical path. Refilled per vector and row, so one serves them all.
-            let mut sbt_buf: Vec<$elem> = Vec::new();
+            let mut sbt_buf: super::ABuf<$elem> = super::ABuf::new();
             let mut moves: Vec<(u8, u8, u8, u8)> = Vec::new();
 
             for sb_start in (0..jobs.len()).step_by(LANES * kmax) {
@@ -2064,8 +2130,7 @@ macro_rules! define_sw_kernel {
                 // Padding is code 0, masked out of every write by `band`.
                 let soa_cols = if $rowvec { stride.next_multiple_of(16) } else { stride };
                 let soa_rows = if $rowvec { (max_t + 1).next_multiple_of(16) } else { max_t + 1 };
-                sbt_buf.clear();
-                sbt_buf.resize(stride * LANES, 0 as $elem);
+                sbt_buf.reset(stride * LANES, 0 as $elem);
                 for (v, st) in vs[..nvec].iter_mut().enumerate() {
                     let chunk_start = sb_start + v * LANES;
                     let nlane = (sb_end - chunk_start).min(LANES);
@@ -2107,14 +2172,10 @@ macro_rules! define_sw_kernel {
                     }
                     st.qlen32 = std::array::from_fn(|l| st.qlen[l] as i32);
                     st.tlen32 = std::array::from_fn(|l| st.tlen[l] as i32);
-                    st.eh_h.clear();
-                    st.eh_h.resize(stride * LANES, 0 as $elem);
-                    st.eh_e.clear();
-                    st.eh_e.resize(stride * LANES, 0 as $elem);
-                    st.qcode.clear();
-                    st.qcode.resize(soa_cols * LANES, 0 as $elem);
-                    st.tcode.clear();
-                    st.tcode.resize(soa_rows * LANES, 0 as $elem);
+                    st.eh_h.reset(stride * LANES, 0 as $elem);
+                    st.eh_e.reset(stride * LANES, 0 as $elem);
+                    st.qcode.reset(soa_cols * LANES, 0 as $elem);
+                    st.tcode.reset(soa_rows * LANES, 0 as $elem);
                     if $rowvec {
                         // SAFETY: `rowvec` kernels are u8 (`$elem` is u8), and both SoA sizes are
                         // multiples of 16 under `rowvec`.
@@ -2128,28 +2189,30 @@ macro_rules! define_sw_kernel {
                             );
                         }
                     } else {
+                        let (qc, tc) = (&mut st.qcode[..], &mut st.tcode[..]);
                         for l in 0..nlane {
                             for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
-                                st.qcode[ju * LANES + l] = c as $elem;
+                                qc[ju * LANES + l] = c as $elem;
                             }
                             for (iu, &c) in jobs[chunk_start + l].target.iter().enumerate() {
-                                st.tcode[iu * LANES + l] = c as $elem;
+                                tc[iu * LANES + l] = c as $elem;
                             }
                         }
                     }
                     // --- row -1: the leading-insertion run that seeds the first real row ---
+                    let eh = &mut st.eh_h[..];
                     for l in 0..nlane {
-                        st.eh_h[l] = st.h0[l] as $elem; // column 0
+                        eh[l] = st.h0[l] as $elem; // column 0
                         if st.qlen[l] >= 1 {
-                            st.eh_h[LANES + l] = if st.h0[l] > oe_ins {
+                            eh[LANES + l] = if st.h0[l] > oe_ins {
                                 (st.h0[l] - oe_ins) as $elem
                             } else {
                                 0
                             };
                         }
                         let mut j = 2usize;
-                        while j <= st.qlen[l] && i32::from(st.eh_h[(j - 1) * LANES + l]) > e_ins {
-                            st.eh_h[j * LANES + l] = st.eh_h[(j - 1) * LANES + l] - e_ins as $elem;
+                        while j <= st.qlen[l] && i32::from(eh[(j - 1) * LANES + l]) > e_ins {
+                            eh[j * LANES + l] = eh[(j - 1) * LANES + l] - e_ins as $elem;
                             j += 1;
                         }
                         st.max[l] = st.h0[l];
@@ -2725,15 +2788,19 @@ macro_rules! define_sw_kernel {
                         // those below `beg` must carry over too), its query codes, and its target
                         // rows from `i + 1`. The rest of the slot is outside its band, masked.
                         let ql = src.qlen[sl];
+                        let (dh, sh) = (&mut dst.eh_h[..], &src.eh_h[..]);
+                        let (de, se) = (&mut dst.eh_e[..], &src.eh_e[..]);
                         for c in 0..=ql {
-                            dst.eh_h[c * LANES + dl] = src.eh_h[c * LANES + sl];
-                            dst.eh_e[c * LANES + dl] = src.eh_e[c * LANES + sl];
+                            dh[c * LANES + dl] = sh[c * LANES + sl];
+                            de[c * LANES + dl] = se[c * LANES + sl];
                         }
+                        let (dq, sq) = (&mut dst.qcode[..], &src.qcode[..]);
                         for c in 0..ql {
-                            dst.qcode[c * LANES + dl] = src.qcode[c * LANES + sl];
+                            dq[c * LANES + dl] = sq[c * LANES + sl];
                         }
+                        let (dt, stc) = (&mut dst.tcode[..], &src.tcode[..]);
                         for r in (i as usize + 1)..src.tlen[sl] {
-                            dst.tcode[r * LANES + dl] = src.tcode[r * LANES + sl];
+                            dt[r * LANES + dl] = stc[r * LANES + sl];
                         }
                         dst.qlen[dl] = src.qlen[sl];
                         dst.tlen[dl] = src.tlen[sl];

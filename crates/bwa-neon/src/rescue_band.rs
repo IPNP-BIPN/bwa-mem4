@@ -1264,7 +1264,7 @@ pub(crate) mod neon {
 /// excluded from the row bookkeeping, and feed only later rows of the same lane.
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use crate::batched::x86_row::t16;
+    use crate::batched::{x86_row::t16, ABuf};
     use std::arch::x86_64::*;
 
     pub(super) const L: usize = 32;
@@ -1289,11 +1289,11 @@ mod avx2 {
     #[derive(Default)]
     pub(super) struct Work {
         st: Vec<u8>,
-        a: Vec<u8>,
-        refv: Vec<u8>,
-        h: Vec<u8>,
-        e: Vec<u8>,
-        r: Vec<u8>,
+        a: ABuf<u8>,
+        refv: ABuf<u8>,
+        h: ABuf<u8>,
+        e: ABuf<u8>,
+        r: ABuf<u8>,
         rl: Vec<u8>,
         rstride: usize,
         pub gmax: [u8; L],
@@ -1332,11 +1332,11 @@ mod avx2 {
             let stride = npp.max(nrp);
             let hs = w + 7;
             fit(&mut self.st, 16 * stride);
-            fit(&mut self.a, npp * L);
-            fit(&mut self.refv, nrp * L);
-            fit(&mut self.h, 2 * hs * L);
-            fit(&mut self.e, (w + 9) * L);
-            fit(&mut self.r, nrp * L);
+            self.a.fit(npp * L, 0);
+            self.refv.fit(nrp * L, 0);
+            self.h.fit(2 * hs * L, 0);
+            self.e.fit((w + 9) * L, 0);
+            self.r.fit(nrp * L, 0);
             self.h[..2 * hs * L].fill(0);
             self.e[..(w + 9) * L].fill(0);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
@@ -1622,7 +1622,7 @@ mod avx2 {
 
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
-    use crate::batched::x86_row::t16;
+    use crate::batched::{x86_row::t16, ABuf};
     use std::arch::x86_64::*;
 
     pub(super) const L: usize = 64;
@@ -1635,11 +1635,11 @@ mod avx512 {
     /// As the NEON kernel's `Work`.
     pub(super) struct Work {
         st: Vec<u8>,
-        a: Vec<u8>,
-        refv: Vec<u8>,
-        h: Vec<u8>,
-        e: Vec<u8>,
-        r: Vec<u8>,
+        a: ABuf<u8>,
+        refv: ABuf<u8>,
+        h: ABuf<u8>,
+        e: ABuf<u8>,
+        r: ABuf<u8>,
         rl: Vec<u8>,
         rstride: usize,
         pub gmax: [u8; L],
@@ -1652,11 +1652,11 @@ mod avx512 {
         fn default() -> Self {
             Work {
                 st: Vec::new(),
-                a: Vec::new(),
-                refv: Vec::new(),
-                h: Vec::new(),
-                e: Vec::new(),
-                r: Vec::new(),
+                a: ABuf::new(),
+                refv: ABuf::new(),
+                h: ABuf::new(),
+                e: ABuf::new(),
+                r: ABuf::new(),
                 rl: Vec::new(),
                 rstride: 0,
                 gmax: [0; L],
@@ -1697,11 +1697,11 @@ mod avx512 {
             let stride = npp.max(nrp);
             let hs = w + 7;
             fit(&mut self.st, 16 * stride);
-            fit(&mut self.a, npp * L);
-            fit(&mut self.refv, nrp * L);
-            fit(&mut self.h, 2 * hs * L);
-            fit(&mut self.e, (w + 9) * L);
-            fit(&mut self.r, nrp * L);
+            self.a.fit(npp * L, 0);
+            self.refv.fit(nrp * L, 0);
+            self.h.fit(2 * hs * L, 0);
+            self.e.fit((w + 9) * L, 0);
+            self.r.fit(nrp * L, 0);
             self.h[..2 * hs * L].fill(0);
             self.e[..(w + 9) * L].fill(0);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
