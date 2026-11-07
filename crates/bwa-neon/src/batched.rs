@@ -862,7 +862,7 @@ fn simd_dispatch(
 ///
 /// The cost of finding them has to stay far below what they cost to compute. A byte-wise hash over
 /// ~230 bytes per job would eat a third of the job's own DP; instead this fingerprints the lengths,
-/// `h0` and up to 32 bytes from each end of each sequence, reading them as 64-bit words, and then
+/// `h0` and every byte of each sequence as 64-bit words in four independent chains, and then
 /// **verifies candidates by comparing the bytes**. The fingerprint may collide; the verification is
 /// what makes the result exact.
 ///
@@ -876,26 +876,30 @@ fn simd_dispatch(
 fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
     use std::collections::HashMap;
 
-    /// Fold up to `LIMIT` bytes from each end of `s` into `h`, eight at a time. Reading words
-    /// rather than bytes is what keeps this at a few percent of a job's DP instead of a third of it.
+    /// Fold every byte of `s` into `h`, 32 at a time in four independent multiply chains so the
+    /// latency of one does not serialise the rest. Covering only 32 bytes at each end let 121M of
+    /// 126M candidate pairs on 1M chr21 pairs collide (repeat windows share their ends), and the
+    /// byte comparisons that rejected them cost more than hashing everything.
     fn fold(h: &mut u64, s: &[u8]) {
-        const LIMIT: usize = 32;
-        let mut mix = |chunk: &[u8]| {
-            for w in chunk.chunks(8) {
-                let mut v = 0u64;
-                for (i, &b) in w.iter().enumerate() {
-                    v |= u64::from(b) << (8 * i);
-                }
-                *h ^= v;
-                *h = h.wrapping_mul(0x1000_0000_01b3);
+        const P: u64 = 0x1000_0000_01b3;
+        let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
+        let mut acc = [*h, h.rotate_left(16), h.rotate_left(32), h.rotate_left(48)];
+        let (blocks, rest) = s.as_chunks::<32>();
+        for blk in blocks {
+            for (i, a) in acc.iter_mut().enumerate() {
+                *a = (*a ^ word(&blk[8 * i..8 * i + 8])).wrapping_mul(P);
             }
-        };
-        if s.len() <= 2 * LIMIT {
-            mix(s);
-        } else {
-            mix(&s[..LIMIT]);
-            mix(&s[s.len() - LIMIT..]);
         }
+        let mut t =
+            acc[0] ^ acc[1].rotate_left(13) ^ acc[2].rotate_left(29) ^ acc[3].rotate_left(43);
+        for w in rest.chunks(8) {
+            let mut v = 0u64;
+            for (i, &b) in w.iter().enumerate() {
+                v |= u64::from(b) << (8 * i);
+            }
+            t = (t ^ v).wrapping_mul(P);
+        }
+        *h = (t ^ t >> 29).wrapping_mul(P);
     }
 
     /// The keys are already FNV hashes: used as they are, not hashed again with SipHash.
