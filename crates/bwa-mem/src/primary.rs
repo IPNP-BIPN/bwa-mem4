@@ -465,6 +465,14 @@ mod sort_scratch {
     thread_local! {
         pub static PERM_RE: RefCell<PermRe> = const { RefCell::new(Vec::new()) };
         pub static PERM_SCORE: RefCell<PermScore> = const { RefCell::new(Vec::new()) };
+        /// `mem_mark_primary_se`'s permutation: (score descending, ALT last, hash) and the index,
+        /// packed into one u128 off x86-64 (see [`super::sort_hlt`]).
+        #[cfg(target_arch = "x86_64")]
+        #[allow(clippy::type_complexity)]
+        pub static PERM_PRI: RefCell<Vec<((std::cmp::Reverse<i32>, bool, u64), u32)>> =
+            const { RefCell::new(Vec::new()) };
+        #[cfg(not(target_arch = "x86_64"))]
+        pub static PERM_PRI: RefCell<Vec<u128>> = const { RefCell::new(Vec::new()) };
         /// The gather target, which comes back holding the previous region buffer.
         pub static SPARE: RefCell<Vec<MemAlnReg>> = const { RefCell::new(Vec::new()) };
     }
@@ -943,6 +951,49 @@ pub fn stamp_is_alt(bns: &BntSeq, regs: &mut [MemAlnReg]) {
     }
 }
 
+/// bwa's order (`alnreg_hlt`): score descending, non-ALT first, then hash. The key is total:
+/// `hash_64` is a bijection (each step multiplies by an odd constant or xorshifts), so the hashes
+/// of `id + i` are distinct and every sort leaves the regions where bwa's introsort does.
+fn sort_hlt(a: &mut [MemAlnReg]) {
+    let key = |r: &MemAlnReg| (std::cmp::Reverse(r.score), r.is_alt, r.hash);
+    if a.len() <= 16 {
+        a.sort_unstable_by_key(key);
+    } else {
+        // Indirect, as in `mem_sort_dedup_patch`: a region is 96 bytes, a key and index 24.
+        sort_scratch::PERM_PRI.with_borrow_mut(|perm| {
+            sort_scratch::SPARE.with_borrow_mut(|spare| {
+                perm.clear();
+                // Off x86-64 the key and a 31-bit index are one u128 (`!score` biased to unsigned,
+                // ALT bit, hash, index), compared in two instructions instead of a tuple chain.
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    assert!(a.len() < 1 << 31);
+                    perm.extend(a.iter().enumerate().map(|(i, r)| {
+                        u128::from(!(r.score as u32 ^ 0x8000_0000)) << 96
+                            | u128::from(r.is_alt) << 95
+                            | u128::from(r.hash) << 31
+                            | i as u128
+                    }));
+                    perm.sort_unstable();
+                    spare.clear();
+                    spare.extend(
+                        perm.iter()
+                            .map(|&k| a[(k as u32 & 0x7fff_ffff) as usize].clone()),
+                    );
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    perm.extend(a.iter().enumerate().map(|(i, r)| (key(r), i as u32)));
+                    perm.sort_unstable();
+                    spare.clear();
+                    spare.extend(perm.iter().map(|&(_, i)| a[i as usize].clone()));
+                }
+                a.clone_from_slice(spare);
+            });
+        });
+    }
+}
+
 /// Mark primary/secondary regions and set `sub`/`sub_n`. Port of `mem_mark_primary_se`
 /// (`bwamem.cpp:1420`) for the primary-assembly (non-ALT) case.
 ///
@@ -1019,11 +1070,7 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     // are no ties left for introsort's instability to resolve differently. Contrast `alnreg_slt2`
     // in `mem_sort_dedup_patch` above, which keys on `re` alone and where instability genuinely
     // decides which alignment survives.
-    ks_introsort_by(a, |x, y| {
-        x.score > y.score
-            || (x.score == y.score
-                && (!x.is_alt && y.is_alt || (x.is_alt == y.is_alt && x.hash < y.hash)))
-    });
+    sort_hlt(a);
     mark_primary_core(opt, a);
     let n = a.len();
     // First-round bookkeeping (`bwamem.cpp:1433-1439`), done BEFORE any re-ranking:
@@ -1290,6 +1337,42 @@ pub fn mem_reorder_primary5(t: i32, regs: &mut [MemAlnReg]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `mem_mark_primary_se`'s unstable sort puts the regions where bwa's introsort does: with the
+    /// hashes of `id + i` distinct, the key is total. Few scores and ALT flags, so ties up to the
+    /// hash are the common case; lengths on both sides of the indirect threshold.
+    #[test]
+    fn mark_primary_sort_matches_introsort() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for round in 0..400u64 {
+            let n = 1 + next(80) as usize;
+            let mut a: Vec<MemAlnReg> = (0..n)
+                .map(|i| {
+                    let mut r = reg(20 + next(3) as i32, 0, 0, 0, 1);
+                    r.is_alt = next(4) == 0;
+                    r.rb = i as i64;
+                    r.hash = hash_64(round.wrapping_add(i as u64));
+                    r
+                })
+                .collect();
+            let mut b = a.clone();
+            sort_hlt(&mut a);
+            ks_introsort_by(&mut b, |x, y| {
+                x.score > y.score
+                    || (x.score == y.score
+                        && (!x.is_alt && y.is_alt || (x.is_alt == y.is_alt && x.hash < y.hash)))
+            });
+            let ia: Vec<i64> = a.iter().map(|r| r.rb).collect();
+            let ib: Vec<i64> = b.iter().map(|r| r.rb).collect();
+            assert_eq!(ia, ib, "round {round}, n {n}");
+        }
+    }
 
     /// The incremental insert against the pass it stands in for, on lists built to hit every case its
     /// proof names: tied `re`, tied scores, exact duplicates, near-duplicates differing in one field,

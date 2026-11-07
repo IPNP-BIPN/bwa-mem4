@@ -199,6 +199,20 @@ struct Scratch {
     n_hot: usize,
     /// The components at `minsc`.
     c19: Vec<Comp>,
+    /// The hit total of the last count, and [`dense`]'s buffers: per diagonal the segment-local
+    /// prefix sums and running minima (segment-major), the bounds (diagonal order), and the
+    /// bitsets of diagonals at threshold and of those holding a hit. `dense` says which scan
+    /// produced `c19`.
+    nhits: usize,
+    /// `occ_bits` not yet derived from `cnt` (see [`occ_ready`]): the NEON counter leaves it to
+    /// the sparse scan, its only reader.
+    occ_stale: bool,
+    dp: Vec<i16>,
+    dm: Vec<i16>,
+    bnd: Vec<i16>,
+    mw: Vec<u64>,
+    hw: Vec<u64>,
+    dense: bool,
 }
 
 /// [`Scratch::tab`]'s flag for a code the query holds more than once, and its position field.
@@ -234,6 +248,14 @@ impl Scratch {
             n_occ: 0,
             n_hot: 0,
             c19: Vec::new(),
+            nhits: 0,
+            occ_stale: false,
+            dp: Vec::new(),
+            dm: Vec::new(),
+            bnd: Vec::new(),
+            mw: Vec::new(),
+            hw: Vec::new(),
+            dense: false,
         }
     }
 
@@ -265,20 +287,30 @@ impl Scratch {
         for &b in &q[..k - 1] {
             code = (code << 2) | b as u32;
         }
-        for j in k - 1..q.len() {
-            code = ((code << 2) | q[j] as u32) & mask;
-            let v = self.tab[code as usize];
-            if k == 5 {
-                self.pres[(code >> 3) as usize] |= 1 << (code & 7);
+        // Branch-free and unchecked: a query is rebuilt for nearly every rescue job (a round holds
+        // about one job per mate), and whether a code repeats is data, not a predictable branch.
+        // `code <= mask < tab.len()`, `j < q.len() <= QCAP = nxt.len()`, and `touched` keeps
+        // QCAP capacity, more than the distinct codes of one query.
+        debug_assert!(q.len() <= self.nxt.len() && q.len() <= self.touched.capacity());
+        let (tab, nxt) = (self.tab.as_mut_ptr(), self.nxt.as_mut_ptr());
+        let touched = self.touched.as_mut_ptr();
+        let mut nt = 0usize;
+        // SAFETY: the bounds above.
+        unsafe {
+            for j in k - 1..q.len() {
+                code = ((code << 2) | u32::from(*q.get_unchecked(j))) & mask;
+                let v = *tab.add(code as usize);
+                if k == 5 {
+                    self.pres[(code >> 3) as usize] |= 1 << (code & 7);
+                }
+                let seen = v != 0;
+                *touched.add(nt) = code as u16;
+                nt += usize::from(!seen);
+                *nxt.add(j) = if seen { (v & TAB_POS) as i16 } else { -1 };
+                *tab.add(code as usize) =
+                    ((v >> 16) + 1) << 16 | if seen { TAB_MULTI } else { 0 } | j as u32;
             }
-            if v == 0 {
-                self.touched.push(code as u16);
-                self.nxt[j] = -1;
-                self.tab[code as usize] = 1 << 16 | j as u32;
-            } else {
-                self.nxt[j] = (v & TAB_POS) as i16;
-                self.tab[code as usize] = ((v >> 16) + 1) << 16 | TAB_MULTI | j as u32;
-            }
+            self.touched.set_len(nt);
         }
     }
 }
@@ -303,7 +335,7 @@ pub(crate) fn decide(t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Decisio
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
         match count_hits(s, t, q, p, max_hits) {
-            Some(nd) => sparse_decision(s, p, len1, nd),
+            Some(nd) => decide_counts(s, p, len1, nd),
             None => Decision::Full,
         }
     })
@@ -361,6 +393,7 @@ fn count_hits_scalar(
         _ => codes.extend(t.windows(8).map(code_of)),
     }
     let nhits = primary_hits(s, &codes, k, off, stride, trash);
+    s.nhits = nhits;
     s.occ_bits.clear();
     s.occ_bits.resize(nw, 0);
     s.cnt.clear();
@@ -513,8 +546,21 @@ mod neon {
         let sh = vld1q_u8(SHUF[m as usize].as_ptr());
         let x = vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(v), sh));
         vst1q_u16(out.as_mut_ptr().add(at), x);
-        at + m.count_ones() as usize
+        // A table, not `count_ones`: the cursor chains every pack on the previous, and a scalar
+        // popcount crosses to the vector unit and back (fg-labs/bwa-mem3's `pc[]`).
+        at + PC[m as usize] as usize
     }
+
+    /// `PC[m]`: the number of lanes set in `m`.
+    static PC: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut m = 0;
+        while m < 256 {
+            t[m] = (m as u32).count_ones() as u8;
+            m += 1;
+        }
+        t
+    };
 
     #[inline(always)]
     fn grow(v: &mut Vec<u16>, n: usize) {
@@ -535,16 +581,27 @@ mod neon {
         s.load_query(q, K);
         // ---- 1. N check while copying the window into a zero-padded buffer, so the 16-row code
         //      blocks never read past it ----
-        s.rbuf.clear();
-        s.rbuf.extend_from_slice(t);
-        s.rbuf.resize(len1 + 32, 0);
+        // One pass: copy 16 bytes, OR them in. `rbuf` keeps `len1 + 32` bytes, the last 32 zero.
+        if s.rbuf.len() < len1 + 32 {
+            s.rbuf.resize(len1 + 32, 0);
+        }
+        let rb = s.rbuf.as_mut_ptr();
         let mut ov = vdupq_n_u8(0);
         let mut i = 0;
         while i + 16 <= len1 {
-            ov = vorrq_u8(ov, vld1q_u8(s.rbuf.as_ptr().add(i)));
+            let x = vld1q_u8(t.as_ptr().add(i));
+            ov = vorrq_u8(ov, x);
+            vst1q_u8(rb.add(i), x);
             i += 16;
         }
-        let tail = t[i..].iter().fold(0u8, |a, &b| a | b);
+        let mut tail = 0u8;
+        while i < len1 {
+            tail |= t[i];
+            *rb.add(i) = t[i];
+            i += 1;
+        }
+        vst1q_u8(rb.add(len1), vdupq_n_u8(0));
+        vst1q_u8(rb.add(len1 + 16), vdupq_n_u8(0));
         if s.q_has_n || (vmaxvq_u8(ov) | tail) & !3 != 0 {
             return None;
         }
@@ -554,11 +611,7 @@ mod neon {
         let span = nw * 64;
         s.occ_bits.clear();
         s.occ_bits.resize(nw, 0);
-        s.cnt.clear();
-        s.cnt.resize(span, 0);
-        if s.minrow.len() < span {
-            s.minrow.resize(span, 0);
-        }
+        s.occ_stale = false;
         // ---- 3. hit rows, 16 at a time: 5-mer codes and a presence-bitmap lookup (two 64-byte
         //      TBLs), the rows with a hit and their codes left-packed ----
         let nrow = len1 + 1 - K;
@@ -623,6 +676,11 @@ mod neon {
         if np == 0 {
             return Some(nd);
         }
+        // Every hit row holds at least one hit, so the gate can already refuse: the densest jobs
+        // then skip layer 1, their most expensive part.
+        if np > max_hits {
+            return None;
+        }
         // ---- 4. layer 1, 8 hit rows at a time: each row's hit at the latest query occurrence of
         //      its code, d = row + K - 1 + off - j. A row continuing the previous row's run
         //      (row + 1, same diagonal) is no boundary; boundaries are left-packed as (list index,
@@ -684,6 +742,7 @@ mod neon {
             }
         }
         let nhits = np + vaddvq_u32(extra) as usize;
+        s.nhits = nhits;
         if nhits > max_hits {
             return None;
         }
@@ -691,16 +750,25 @@ mod neon {
         if p.base() + p.a * nhits as i32 - p.c < p.minsc {
             return Some(nd);
         }
+        // Zeroed only now: the returns above leave no diagonal occupied, and `cnt`/`minrow` are
+        // read only under an `occ_bits` bit.
+        s.cnt.clear();
+        s.cnt.resize(span, 0);
+        if s.minrow.len() < span {
+            s.minrow.resize(span, 0);
+        }
         // ---- 5. layer 1's runs, last to first: rows descend, so the last store to `minrow[d]`
         //      is the diagonal's earliest row. Then the repeated codes' other occurrences ----
         s.rb_idx[nb] = np as u16;
         {
-            let (cnt, minrow, occ) = (&mut s.cnt[..], &mut s.minrow[..], &mut s.occ_bits[..]);
+            // Unchecked: every `d` is a diagonal below `nd`, and `cnt` and `minrow` span the
+            // rounded-up `nd`; `rb_idx` holds `nb + 1` entries.
+            let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
+            let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
             for x in (0..nb).rev() {
-                let d = s.rb_d[x] as usize;
-                cnt[d] += s.rb_idx[x + 1] - s.rb_idx[x];
-                minrow[d] = s.rb_r[x];
-                occ[d / 64] |= 1 << (d % 64);
+                let d = *bd.add(x) as usize;
+                *cnt.add(d) += *bi.add(x + 1) - *bi.add(x);
+                *minrow.add(d) = *br.add(x);
             }
         }
         // ---- Layers >= 2: layer L holds each row whose code occurs at least L times, with its
@@ -764,13 +832,17 @@ mod neon {
                     k0 += 8;
                 }
                 s.rb_idx[nb] = n as u16;
-                let (cnt, minrow, occ) = (&mut s.cnt[..], &mut s.minrow[..], &mut s.occ_bits[..]);
+                // Unchecked as in layer 1.
+                let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
+                let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
                 for x in 0..nb {
-                    let (d, row) = (s.rb_d[x] as usize, s.rb_r[x]);
-                    let c = cnt[d];
-                    minrow[d] = if c == 0 { row } else { minrow[d].min(row) };
-                    cnt[d] = c + s.rb_idx[x + 1] - s.rb_idx[x];
-                    occ[d / 64] |= 1 << (d % 64);
+                    let (d, row) = (*bd.add(x) as usize, *br.add(x));
+                    let c = *cnt.add(d);
+                    // A stale `minrow` (c == 0) ORed to u16::MAX: one `min`, no branch. Written
+                    // as `if`, LLVM sank the load into a branch on `c`, mispredicted per run.
+                    let stale = u16::from(c == 0).wrapping_neg();
+                    *minrow.add(d) = (*minrow.add(d) | stale).min(row);
+                    *cnt.add(d) = c + *bi.add(x + 1) - *bi.add(x);
                 }
                 n = n2;
                 std::mem::swap(&mut rows, &mut rows2);
@@ -778,7 +850,298 @@ mod neon {
             }
         }
         (s.mrow, s.mj, s.hrow, s.hcode) = (rows, js, rows2, js2);
+        // `occ_bits` is derived from `cnt` only if the sparse scan runs (`occ_ready`).
+        s.occ_stale = true;
         Some(nd)
+    }
+
+    /// `occ_bits` from `cnt` in one pass, not per run: consecutive runs mostly land in one
+    /// 64-diagonal word, and a read-modify-write per run chains them through memory.
+    ///
+    /// # Safety
+    /// NEON; `cnt` spans `occ_bits.len() * 64` diagonals.
+    pub(super) unsafe fn occ_from_cnt(s: &mut Scratch) {
+        const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let bw = vld1q_u8(BW.as_ptr());
+        let c = s.cnt.as_ptr();
+        for (w, word) in s.occ_bits.iter_mut().enumerate() {
+            let mut bits = 0u64;
+            for g in 0..4 {
+                let p = c.add(w * 64 + g * 16);
+                let (a, b) = (vld1q_u16(p), vld1q_u16(p.add(8)));
+                let m = vcombine_u8(vmovn_u16(vtstq_u16(a, a)), vmovn_u16(vtstq_u16(b, b)));
+                let mut x = vandq_u8(m, bw);
+                x = vpaddq_u8(x, x);
+                x = vpaddq_u8(x, x);
+                x = vpaddq_u8(x, x);
+                bits |= u64::from(vgetq_lane_u16::<0>(vreinterpretq_u16_u8(x))) << (16 * g);
+            }
+            *word = bits;
+        }
+    }
+}
+
+/// The interval bounds and components as dense scans over every diagonal (fg-labs/bwa-mem3's
+/// `lean_neon_core` steps 6 and 7), for jobs whose sums fit in `i16`. With `P` the prefix sum of the
+/// weights `a cnt - c`, the bound is `base + max P[d..] - min(0, P[..d])` and the best Kadane sum is
+/// `max (P[d] - min(0, P[..d]))`, as in [`sparse_decision`]. The diagonals are split into 8 segments
+/// of `L` (a multiple of 8), one per lane, and an 8x8 transpose turns 8 consecutive diagonals of
+/// every segment into 8 vectors, so each scan step is one vertical operation; the segments are
+/// scanned from zero and combined through per-segment carries. A component at `tau` is then a run
+/// of diagonals whose bound reaches `tau` holding a hit: [`components`] after [`extend`], which the
+/// sparse path pins.
+#[cfg(target_arch = "aarch64")]
+mod dense {
+    use super::{Comp, Params, Scratch};
+    use std::arch::aarch64::*;
+
+    /// Transpose 8 vectors of 8 lanes.
+    #[inline(always)]
+    unsafe fn tr8(v: &mut [int16x8_t; 8]) {
+        let a: [int16x8_t; 8] = [
+            vtrn1q_s16(v[0], v[1]),
+            vtrn2q_s16(v[0], v[1]),
+            vtrn1q_s16(v[2], v[3]),
+            vtrn2q_s16(v[2], v[3]),
+            vtrn1q_s16(v[4], v[5]),
+            vtrn2q_s16(v[4], v[5]),
+            vtrn1q_s16(v[6], v[7]),
+            vtrn2q_s16(v[6], v[7]),
+        ];
+        let w = |x: int16x8_t| vreinterpretq_s32_s16(x);
+        let b = [
+            vtrn1q_s32(w(a[0]), w(a[2])),
+            vtrn1q_s32(w(a[1]), w(a[3])),
+            vtrn2q_s32(w(a[0]), w(a[2])),
+            vtrn2q_s32(w(a[1]), w(a[3])),
+            vtrn1q_s32(w(a[4]), w(a[6])),
+            vtrn1q_s32(w(a[5]), w(a[7])),
+            vtrn2q_s32(w(a[4]), w(a[6])),
+            vtrn2q_s32(w(a[5]), w(a[7])),
+        ];
+        let d = |x: int32x4_t| vreinterpretq_s64_s32(x);
+        let r = |x: int64x2_t| vreinterpretq_s16_s64(x);
+        for k in 0..4 {
+            v[k] = r(vtrn1q_s64(d(b[k]), d(b[k + 4])));
+            v[k + 4] = r(vtrn2q_s64(d(b[k]), d(b[k + 4])));
+        }
+    }
+
+    /// The bounds of every diagonal into `s.bnd`. `None` when a sum could leave `i16` (the caller
+    /// then scans sparsely), `Some(false)` when no interval reaches `minsc` (the job fails),
+    /// `Some(true)` otherwise.
+    ///
+    /// # Safety
+    /// NEON; `s.cnt` holds the count of `nd` diagonals, zero up to the next multiple of 64.
+    pub(super) unsafe fn bounds(s: &mut Scratch, p: &Params, nd: usize) -> Option<bool> {
+        let l = nd.div_ceil(64) * 8;
+        let nt = 8 * l;
+        // |P| stays under a hits + c (NT + L): every value below fits `i16` with room to spare.
+        if i64::from(p.a) * s.nhits as i64 + i64::from(p.c) * (nt + l) as i64 > 32000 {
+            return None;
+        }
+        debug_assert!(s.cnt.len() >= nt && s.minrow.len() >= nt);
+        for v in [&mut s.dp, &mut s.dm, &mut s.bnd] {
+            if v.len() < nt {
+                v.resize(nt, 0);
+            }
+        }
+        let (zero, big, small) = (vdupq_n_s16(0), vdupq_n_s16(i16::MAX), vdupq_n_s16(i16::MIN));
+        let (wa, wc) = (vdupq_n_s16(p.a as i16), vdupq_n_s16(p.c as i16));
+        let cnt = s.cnt.as_ptr() as *const i16;
+        let (dp, dm) = (s.dp.as_mut_ptr(), s.dm.as_mut_ptr());
+        // Per segment: P before it (`cp`), min(0, P before it) (`mb`), max P after it (`xa`).
+        let (cp, mb, xa);
+        {
+            let (mut pv, mut rm, mut mx, mut bestl) = (zero, big, small, small);
+            let mut t = 0;
+            while t < l {
+                let mut c: [int16x8_t; 8] = std::array::from_fn(|k| vld1q_s16(cnt.add(k * l + t)));
+                tr8(&mut c);
+                for (k, &ck) in c.iter().enumerate() {
+                    pv = vaddq_s16(pv, vsubq_s16(vmulq_s16(ck, wa), wc));
+                    vst1q_s16(dp.add((t + k) * 8), pv);
+                    // The segment's exclusive running minimum.
+                    vst1q_s16(dm.add((t + k) * 8), rm);
+                    bestl = vmaxq_s16(bestl, vqsubq_s16(pv, rm));
+                    rm = vminq_s16(rm, pv);
+                    mx = vmaxq_s16(mx, pv);
+                }
+                t += 8;
+            }
+            // Across lanes: exclusive prefix sum of the totals, exclusive prefix min (with 0) of
+            // the minima, exclusive suffix max of the maxima.
+            let mut x = pv;
+            x = vaddq_s16(x, vextq_s16::<7>(zero, x));
+            x = vaddq_s16(x, vextq_s16::<6>(zero, x));
+            x = vaddq_s16(x, vextq_s16::<4>(zero, x));
+            cp = vextq_s16::<7>(zero, x);
+            let mut g = vaddq_s16(cp, rm);
+            g = vminq_s16(g, vextq_s16::<7>(big, g));
+            g = vminq_s16(g, vextq_s16::<6>(big, g));
+            g = vminq_s16(g, vextq_s16::<4>(big, g));
+            mb = vminq_s16(vextq_s16::<7>(zero, g), zero);
+            let h = vaddq_s16(cp, mx);
+            let mut hs = vmaxq_s16(h, vextq_s16::<1>(h, small));
+            hs = vmaxq_s16(hs, vextq_s16::<2>(hs, small));
+            hs = vmaxq_s16(hs, vextq_s16::<4>(hs, small));
+            xa = vextq_s16::<1>(hs, small);
+            let best = vmaxq_s16(bestl, vsubq_s16(h, mb));
+            if p.base() + i32::from(vmaxvq_s16(best)) < p.minsc {
+                return Some(false);
+            }
+        }
+        // Backward, in each segment's own frame: bnd = base + max(sx, Xa - CP) - min(Mb - CP, TM).
+        let basev = vdupq_n_s16(p.base() as i16);
+        let ml = vsubq_s16(mb, cp);
+        let mut sx = vqsubq_s16(xa, cp);
+        let bnd = s.bnd.as_mut_ptr();
+        let mut t = l;
+        while t > 0 {
+            t -= 8;
+            let mut bd = [zero; 8];
+            for k in (0..8).rev() {
+                let o = (t + k) * 8;
+                sx = vmaxq_s16(sx, vld1q_s16(dp.add(o)));
+                bd[k] = vaddq_s16(basev, vsubq_s16(sx, vminq_s16(ml, vld1q_s16(dm.add(o)))));
+            }
+            tr8(&mut bd);
+            for (k, &b) in bd.iter().enumerate() {
+                vst1q_s16(bnd.add(k * l + t), b);
+            }
+        }
+        Some(true)
+    }
+
+    /// The components at `tau`, from the bounds [`bounds`] left: each run of diagonals whose bound
+    /// reaches `tau` and that holds a hit, with its best bound, earliest hit row and last hit
+    /// diagonal. `off` shifts the diagonals back to `d = i - j`.
+    ///
+    /// # Safety
+    /// NEON, after `bounds(s, _, nd)` returned `Some(true)`.
+    pub(super) unsafe fn components(
+        s: &mut Scratch,
+        tau: i32,
+        off: i32,
+        nd: usize,
+        out: &mut Vec<Comp>,
+    ) {
+        out.clear();
+        let nw = nd.div_ceil(64);
+        for v in [&mut s.mw, &mut s.hw] {
+            v.clear();
+            v.resize(nw, 0);
+        }
+        const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let bw = vld1q_u8(BW.as_ptr());
+        let tv = vdupq_n_s16(tau.clamp(-32768, 32767) as i16);
+        let (bnd, cnt) = (s.bnd.as_ptr(), s.cnt.as_ptr());
+        // 64 byte masks to 64 bits: weigh each byte by its bit, then three rounds of pairwise
+        // adds fold the four vectors into bytes 0..8 in diagonal order.
+        let bits64 = |g: [uint8x16_t; 4]| -> u64 {
+            let x01 = vpaddq_u8(vandq_u8(g[0], bw), vandq_u8(g[1], bw));
+            let x23 = vpaddq_u8(vandq_u8(g[2], bw), vandq_u8(g[3], bw));
+            let x = vpaddq_u8(x01, x23);
+            vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(x, x)))
+        };
+        for w in 0..nw {
+            let (mut ge, mut gh) = ([vdupq_n_u8(0); 4], [vdupq_n_u8(0); 4]);
+            for g in 0..4 {
+                let at = w * 64 + g * 16;
+                ge[g] = vcombine_u8(
+                    vmovn_u16(vcgeq_s16(vld1q_s16(bnd.add(at)), tv)),
+                    vmovn_u16(vcgeq_s16(vld1q_s16(bnd.add(at + 8)), tv)),
+                );
+                let (c0, c1) = (vld1q_u16(cnt.add(at)), vld1q_u16(cnt.add(at + 8)));
+                let hit = vcombine_u8(vmovn_u16(vtstq_u16(c0, c0)), vmovn_u16(vtstq_u16(c1, c1)));
+                gh[g] = vandq_u8(ge[g], hit);
+            }
+            s.mw[w] = bits64(ge);
+            s.hw[w] = bits64(gh);
+        }
+        if !nd.is_multiple_of(64) {
+            let keep = (1u64 << (nd % 64)) - 1;
+            s.mw[nw - 1] &= keep;
+            s.hw[nw - 1] &= keep;
+        }
+        // The first diagonal at or after `from` whose `bits ^ inv` bit is set, or `nd`.
+        let next = |bits: &[u64], from: usize, inv: u64| -> usize {
+            let mut w = from / 64;
+            if w >= nw {
+                return nd;
+            }
+            let mut x = (bits[w] ^ inv) & (!0u64 << (from % 64));
+            loop {
+                if x != 0 {
+                    return (w * 64 + x.trailing_zeros() as usize).min(nd);
+                }
+                w += 1;
+                if w >= nw {
+                    return nd;
+                }
+                x = bits[w] ^ inv;
+            }
+        };
+        const IO: [i16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let io = vld1q_s16(IO.as_ptr());
+        let minrow = s.minrow.as_ptr();
+        let mut d = next(&s.mw, 0, 0);
+        while d < nd {
+            let (a, b) = (d, next(&s.mw, d, !0));
+            // The last hit diagonal of [a, b).
+            let mut dmax = None;
+            let mut w = (b - 1) / 64;
+            loop {
+                let lo_mask = if w == a / 64 { !0u64 << (a % 64) } else { !0 };
+                let hi_mask = if w == (b - 1) / 64 {
+                    !0u64 >> (63 - (b - 1) % 64)
+                } else {
+                    !0
+                };
+                let x = s.hw[w] & lo_mask & hi_mask;
+                if x != 0 {
+                    dmax = Some(w * 64 + 63 - x.leading_zeros() as usize);
+                    break;
+                }
+                if w == a / 64 {
+                    break;
+                }
+                w -= 1;
+            }
+            if let Some(dmax) = dmax {
+                let (va, vb) = (vdupq_n_s16(a as i16), vdupq_n_s16(b as i16));
+                let (mut mx, mut mn) = (vdupq_n_s16(i16::MIN), vdupq_n_u16(u16::MAX));
+                let mut x = a & !7;
+                while x < b {
+                    let pos = vaddq_s16(io, vdupq_n_s16(x as i16));
+                    let inr = vandq_u16(vcgeq_s16(pos, va), vcltq_s16(pos, vb));
+                    let c = vld1q_u16(cnt.add(x));
+                    mx = vmaxq_s16(
+                        mx,
+                        vbslq_s16(inr, vld1q_s16(bnd.add(x)), vdupq_n_s16(i16::MIN)),
+                    );
+                    mn = vminq_u16(
+                        mn,
+                        vbslq_u16(
+                            vandq_u16(inr, vtstq_u16(c, c)),
+                            vld1q_u16(minrow.add(x)),
+                            vdupq_n_u16(u16::MAX),
+                        ),
+                    );
+                    x += 8;
+                }
+                out.push(Comp {
+                    ub: i32::from(vmaxvq_s16(mx)),
+                    i0: i32::from(vminvq_u16(mn)),
+                    dlo: a as i32 - off,
+                    dhi: b as i32 - 1 - off,
+                    dmaxhit: dmax as i32 - off,
+                    kf: 0,
+                    kl: 0,
+                });
+            }
+            d = next(&s.mw, b, 0);
+        }
     }
 }
 
@@ -798,6 +1161,7 @@ mod neon {
 ///   between them reaches `minsc`, and the bound across a gap is convex, so its minimum is at an
 ///   end or next to a breakpoint ([`gap_min`]).
 fn sparse_decision(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decision {
+    occ_ready(s);
     // With `P[d]` the sum of the weights `a cnt - c` through `d` (`P[-1] = 0`), the Kadane sum ending
     // at `d` is `f = P[d] - M[d-1]`, `M` the running minimum of `P` from `-1`, the one starting at `d`
     // is `b = X[d] - P[d-1]`, `X` the suffix maximum, and the interval bound is `base + X[d] - M[d-1]`.
@@ -847,8 +1211,56 @@ fn sparse_decision(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decis
     let mut c19 = std::mem::take(&mut s.c19);
     components(s, p, minsc, off, nd, false, &mut c19);
     s.c19 = c19;
+    hull_of(&s.c19, p, off, len1)
+}
+
+/// Derive `occ_bits` if the counter left it to its reader.
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+fn occ_ready(s: &mut Scratch) {
+    #[cfg(target_arch = "aarch64")]
+    if s.occ_stale {
+        s.occ_stale = false;
+        // SAFETY: NEON is part of the aarch64 baseline; the counter sized `cnt` to the words.
+        unsafe { neon::occ_from_cnt(s) };
+    }
+}
+
+/// The decision from the per-diagonal counts: [`dense`]'s scan where it applies, else
+/// [`sparse_decision`]. Both leave the components at `minsc` in `s.c19`; `s.dense` says which.
+fn decide_counts(s: &mut Scratch, p: &Params, len1: usize, nd: usize) -> Decision {
+    s.dense = false;
+    #[cfg(target_arch = "aarch64")]
+    // A stale `occ_bits` means the counter got past its early returns: some diagonal holds a hit.
+    if dense_enabled() && (s.occ_stale || s.occ_bits.iter().any(|&w| w != 0)) {
+        // SAFETY: NEON is part of the aarch64 baseline; the count just filled `s` for `nd`.
+        match unsafe { dense::bounds(s, p, nd) } {
+            Some(false) => return Decision::Fail,
+            Some(true) => {
+                let off = (nd - len1 - 1) as i32;
+                let mut c19 = std::mem::take(&mut s.c19);
+                // SAFETY: as above, after `bounds`.
+                unsafe { dense::components(s, p.minsc, off, nd, &mut c19) };
+                s.c19 = c19;
+                s.dense = true;
+                return hull_of(&s.c19, p, off, len1);
+            }
+            None => {}
+        }
+    }
+    sparse_decision(s, p, len1, nd)
+}
+
+/// `BWA4_PRUNE_DENSE=0` keeps the sparse scan everywhere (A/B handle).
+#[cfg(target_arch = "aarch64")]
+fn dense_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_PRUNE_DENSE").is_none_or(|v| v != "0"))
+}
+
+/// The hull of the components at `minsc`, or `Fail` when there is none.
+fn hull_of(c19: &[Comp], p: &Params, off: i32, len1: usize) -> Decision {
     let (mut lo, mut hi) = (len1 as i64, -1i64);
-    for c in &s.c19 {
+    for c in c19 {
         lo = lo.min(c.i0 as i64);
         // The last hit diagonal `dmaxhit` reaches row `dmaxhit + off - 1` at the last pad column
         // (`off` is the padded query length), then `tail` more rows through a deletion.
@@ -1047,7 +1459,7 @@ pub(crate) fn decide_bands(
         let Some(nd) = count_hits(s, t, q, p, max_hits) else {
             return (Decision::Full, 0);
         };
-        let dec = sparse_decision(s, p, len1, nd);
+        let dec = decide_counts(s, p, len1, nd);
         if !matches!(dec, Decision::Hull { .. }) {
             return (dec, 0);
         }
@@ -1062,6 +1474,15 @@ pub(crate) fn decide_bands(
         }
         let t1 = p.minsc.max(ub2 / 2);
         std::mem::swap(&mut s.c19, c19);
+        #[cfg(target_arch = "aarch64")]
+        if s.dense {
+            // The dense components are the threshold's whole runs: already extended.
+            if t1 > p.minsc {
+                // SAFETY: NEON is part of the aarch64 baseline; `bounds` filled `s` for `nd`.
+                unsafe { dense::components(s, t1, off, nd, ct) };
+            }
+            return (dec, t1);
+        }
         for cm in c19.iter_mut() {
             extend(s, p, p.minsc, nd, cm);
         }
@@ -1102,6 +1523,26 @@ fn gap_min(p: &Params, f_left: i32, b_right: i32, gap: u32) -> i32 {
 pub(crate) mod tests {
     use super::*;
     use bwa_extend::ksw_align2;
+
+    /// [`super::count_hits`] with `cnt` made dense: the counter leaves `cnt` stale where no
+    /// `occ_bits` bit is set (production reads it only under one), these tests read every slot.
+    fn count_hits(
+        s: &mut Scratch,
+        t: &[u8],
+        q: &[u8],
+        p: &Params,
+        max_hits: usize,
+    ) -> Option<usize> {
+        let nd = super::count_hits(s, t, q, p, max_hits)?;
+        occ_ready(s);
+        s.cnt.resize(s.cnt.len().max(nd), 0);
+        for d in 0..nd {
+            if s.occ_bits[d / 64] >> (d % 64) & 1 == 0 {
+                s.cnt[d] = 0;
+            }
+        }
+        Some(nd)
+    }
 
     pub(crate) fn scmat(a: i8, b: i8) -> Vec<i8> {
         let mut m = vec![0i8; 25];
@@ -1227,6 +1668,108 @@ pub(crate) mod tests {
                     let want = dense_decision(&s, p, t.len(), nd);
                     assert_eq!(sparse_decision(&mut s, p, t.len(), nd), want, "job {n}");
                 }
+            }
+        }
+    }
+
+    /// The dense scan gives the sparse scan's decision and components (at `minsc` after
+    /// [`extend`], and at the band threshold `T1`) on every job it takes.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn dense_scan_equals_sparse_scan() {
+        let mut state = 0x0bad_cafe_1234_5678u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let params: Vec<Params> = [
+            (1, 4, 6, 1, 6, 1, 19),
+            (1, 4, 6, 1, 6, 1, 7),
+            (1, 6, 6, 1, 6, 1, 19),
+            (1, 4, 8, 2, 8, 2, 30),
+            (2, 8, 12, 2, 12, 2, 38),
+            (1, 5, 5, 3, 7, 1, 12),
+        ]
+        .iter()
+        .filter_map(|&(a, b, o, e, oi, ei, m)| Params::from(a, b, o, e, oi, ei, m))
+        .collect();
+        let key = |c: &Comp| (c.ub, c.i0, c.dlo, c.dhi, c.dmaxhit);
+        let mut s = Scratch::new();
+        let check = |s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, what: &str| -> u32 {
+            let Some(nd) = count_hits(s, t, q, p, usize::MAX) else {
+                return 0;
+            };
+            if s.occ_bits.iter().all(|&w| w == 0) {
+                return 0;
+            }
+            let (len1, off) = (t.len(), (nd - t.len() - 1) as i32);
+            let want = sparse_decision(s, p, len1, nd);
+            let mut c19 = s.c19.clone();
+            // SAFETY: NEON is part of the aarch64 baseline.
+            let got = match unsafe { dense::bounds(s, p, nd) } {
+                None => return 0,
+                Some(false) => Decision::Fail,
+                Some(true) => {
+                    let mut d19 = Vec::new();
+                    unsafe { dense::components(s, p.minsc, off, nd, &mut d19) };
+                    let got = hull_of(&d19, p, off, len1);
+                    if let Decision::Hull { .. } = want {
+                        for cm in c19.iter_mut() {
+                            extend(s, p, p.minsc, nd, cm);
+                        }
+                        assert_eq!(
+                            c19.iter().map(key).collect::<Vec<_>>(),
+                            d19.iter().map(key).collect::<Vec<_>>(),
+                            "{what}: c19"
+                        );
+                        let (mut ub1, mut ub2) = (0, 0);
+                        for c in &c19 {
+                            if c.ub > ub1 {
+                                (ub2, ub1) = (ub1, c.ub);
+                            } else if c.ub > ub2 {
+                                ub2 = c.ub;
+                            }
+                        }
+                        let t1 = p.minsc.max(ub2 / 2);
+                        let (mut ct, mut dt) = (Vec::new(), Vec::new());
+                        components(s, p, t1, off, nd, true, &mut ct);
+                        unsafe { dense::components(s, t1, off, nd, &mut dt) };
+                        assert_eq!(
+                            ct.iter().map(key).collect::<Vec<_>>(),
+                            dt.iter().map(key).collect::<Vec<_>>(),
+                            "{what}: ct at {t1}"
+                        );
+                    }
+                    got
+                }
+            };
+            assert_eq!(got, want, "{what}");
+            1
+        };
+        let mut taken = 0;
+        for iter in 0..20000 {
+            let qlen = 10 + next() % 200;
+            let tlen = qlen + next() % 1500;
+            let alpha = [4, 4, 4, 2, 3][next() % 5];
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % alpha) as u8).collect();
+            let q: Vec<u8> = (0..qlen).map(|_| (next() % alpha) as u8).collect();
+            for _ in 0..next() % 4 {
+                let l = (5 + next() % 60).min(qlen);
+                let (qs, at) = (next() % (qlen - l + 1), next() % (tlen - l + 1));
+                t[at..at + l].copy_from_slice(&q[qs..qs + l]);
+                for _ in 0..next() % 3 {
+                    t[at + next() % l] = (next() % 4) as u8;
+                }
+            }
+            let p = &params[iter % params.len()];
+            taken += check(&mut s, &t, &q, p, &format!("iter {iter}"));
+        }
+        assert!(taken > 5000, "taken {taken}");
+        if let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") {
+            for (n, (t, q)) in load_dump(&path).iter().enumerate() {
+                check(&mut s, t, q, &params[0], &format!("job {n}"));
             }
         }
     }
@@ -1909,7 +2452,12 @@ pub(crate) mod tests {
         };
         let jobs = load_dump(&path);
         let p = Params::from(1, 4, 6, 1, 6, 1, 19).unwrap();
-        for mh in [0usize, 400, 1000, 100_000] {
+        // `BWA4_PRUNE_BENCH_MH=1000,1000`: only these gates (one profile per gate).
+        let mhs: Vec<usize> = std::env::var("BWA4_PRUNE_BENCH_MH")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_else(|| vec![0, 400, 1000, 100_000]);
+        for mh in mhs {
             for _rep in 0..2 {
                 let t0 = std::time::Instant::now();
                 let (mut fail, mut hull, mut full) = (0, 0, 0);
@@ -1944,6 +2492,9 @@ pub(crate) mod tests {
                 );
             }
         }
+        if std::env::var_os("BWA4_PRUNE_BENCH_MH").is_some() {
+            return;
+        }
         // The query-table rebuild alone, in the dump's order (as production sees it).
         {
             let mut s = Scratch::new();
@@ -1971,12 +2522,12 @@ pub(crate) mod tests {
         let t0 = std::time::Instant::now();
         let mut nds = Vec::with_capacity(jobs.len());
         for (t, q) in &jobs {
-            nds.push(count_hits(&mut s, t, q, &p, 100_000));
+            nds.push(super::count_hits(&mut s, t, q, &p, 100_000));
         }
         let count_ns = t0.elapsed().as_nanos() as f64 / jobs.len() as f64;
         let t0 = std::time::Instant::now();
         for ((t, q), _) in jobs.iter().zip(&nds) {
-            if let Some(nd) = count_hits(&mut s, t, q, &p, 100_000) {
+            if let Some(nd) = super::count_hits(&mut s, t, q, &p, 100_000) {
                 std::hint::black_box(sparse_decision(&mut s, &p, t.len(), nd));
             }
         }

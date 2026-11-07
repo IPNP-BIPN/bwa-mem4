@@ -633,6 +633,9 @@ impl KeptIndex {
 
 thread_local! {
     static KEPT_INDEX: std::cell::RefCell<KeptIndex> = RefCell::new(KeptIndex::default());
+    /// The collection pass's `arena`, kept between chunks: about 20 MB a chunk at -t8, which built
+    /// afresh each time was regrown by doubling (a memmove each) and page-faulted anew.
+    static ARENA: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
 /// One pending one-sided extension, with a back-pointer to the region it fills.
@@ -1200,19 +1203,25 @@ fn align_reads_batched_inner<B: SwBackend>(
     let mut regs: Vec<Vec<MemAlnReg>> = (0..reads.len())
         .map(|r| Vec::with_capacity(n_seeds(r)))
         .collect();
-    // region -> owning chain index (for the final seedcov pass).
-    let mut reg_chain: Vec<Vec<usize>> = (0..reads.len())
-        .map(|r| Vec::with_capacity(n_seeds(r)))
-        .collect();
-    // Per-region (chain, order position, seed) for the discard pass.
-    let mut reg_meta: Vec<Vec<RegMeta>> = (0..reads.len())
-        .map(|r| Vec::with_capacity(n_seeds(r)))
-        .collect();
-    // Seeds whose extension nh13's skip elided: they keep a slot (so the discard pass reproduces
-    // bwa-mem2's scan order) but start purged.
-    let mut reg_preskip: Vec<Vec<bool>> = (0..reads.len())
-        .map(|r| Vec::with_capacity(n_seeds(r)))
-        .collect();
+    // Per-region (chain, order position, seed) for the seedcov and discard passes, and whether the
+    // seed's extension was skipped (the slot starts purged): read `r`'s region `i` at
+    // `slot0[r] + i`, flat for the batch, since each read fills exactly its `n_seeds(r)` slots in
+    // step with `regs[r]` (a vector per read each was two more allocations per read).
+    let mut slot0: Vec<usize> = Vec::with_capacity(reads.len());
+    let mut n_slots = 0usize;
+    for r in 0..reads.len() {
+        slot0.push(n_slots);
+        n_slots += n_seeds(r);
+    }
+    let mut reg_meta = vec![
+        RegMeta {
+            chain: 0,
+            pos: 0,
+            seed: 0
+        };
+        n_slots
+    ];
+    let mut reg_preskip = vec![false; n_slots];
 
     // The two pending-extension queues, pooled across the WHOLE batch rather than per read: that is
     // what gives the SIMD kernel enough same-length work to fill its lanes. A seed contributes a left
@@ -1237,17 +1246,13 @@ fn align_reads_batched_inner<B: SwBackend>(
     let skip_contained = skip_contained_enabled();
 
     // ---- collection pass: one region skeleton + up to one left and one right job per seed ----
-    // Reused across every chain of every read in this chunk: `bases_into` clears it and refills it,
-    // so the only thing carried over is the allocation. One window per chain over a whole genome is
-    // millions of short vectors, and returning an owned one each time made the allocator visible
-    // next to the unpack itself.
-    let mut rseq_buf: Vec<u8> = Vec::new();
     let mut order: Vec<usize> = Vec::new();
     // Backing store for every job's query and target. Cleared once per chunk; the ranges in
     // `SideJob` index it. Holding it whole for the chunk is what the owned vectors were doing
     // anyway, and this way each read's bases and each chain's window are stored ONCE instead of
     // once per seed that slices them.
-    let mut arena: Vec<u8> = Vec::new();
+    let mut arena: Vec<u8> = ARENA.take();
+    arena.clear();
     for (r, codes) in reads.iter().enumerate() {
         // This read's bases in the arena, forward then reversed. Right-side jobs slice the forward
         // copy from `qe`; left-side jobs slice the LAST `qbeg` bytes of the reversed copy, which is
@@ -1269,9 +1274,10 @@ fn align_reads_batched_inner<B: SwBackend>(
         // close enough for a hint. From fg-labs/bwa-mem3 PR #625.
         if let Some(next) = per_read_chains.get(r + 1) {
             let next_len = i64::from(reads[r + 1].len() as u32);
-            for seed in next.iter().take(4).filter_map(|c| c.seeds.first()) {
+            let pad = i64::from(opt.w);
+            for seed in next.iter().take(16).filter_map(|c| c.seeds.first()) {
                 let rb = seed.rbeg - i64::from(seed.qbeg);
-                fm.prefetch_pac(rb, rb + next_len);
+                fm.prefetch_pac(rb - pad, rb + next_len + pad);
             }
         }
         for (ci, chain) in chains.iter().enumerate() {
@@ -1320,28 +1326,33 @@ fn align_reads_batched_inner<B: SwBackend>(
             // end into the next contig's sequence (visible on the circular MT genome). The rebinding
             // shadows the mutable pair above with the final immutable window bounds.
             let (rmax0, rmax1, _rid) = bns.fetch_bounds(rmax0, rmax1, chain.seeds[0].rbeg);
-            // Materialise the window's bases once per chain, so both sides of every seed slice out of
-            // it. `fm.base` unpacks the 2-bit pac; the C gets the same bytes from `bns_fetch_seq_v2`
-            // (`bwamem.cpp:2175-2181`). Indices into `rseq` are therefore `position - rmax0`.
-            // `bases` unpacks the whole window in one vectorised pass; the per-base `base(p)` this
-            // replaced was 18.1 s of CPU on a 500k-pair `-t16` run, roughly a quarter of the align
-            // stage, because it redid the index arithmetic, the strand test and the shift for every
-            // single base of every chain's window.
-            // Not wrapped in the `align_split` probe any more. It was, and that is how the
-            // per-base unpack was found, but the wrapper costs a cached-flag load and a closure on
-            // a path that runs once per CHAIN; once the number it was measuring had been fixed, the
-            // probe was the only thing left on the path. The coarser counters (seeding, side,
-            // chain filter) stay: they wrap per-batch and per-read work, where the check is free.
-            fm.bases_into(rmax0, rmax1, &mut rseq_buf);
-            let rseq = &rseq_buf[..];
-            // Same pair for the chain's window: forward for right-side targets, reversed for
-            // left-side ones.
-            let rseq_off = arena.len() as u32;
-            arena.extend_from_slice(rseq);
+            // The window `rseq` (the C's `bns_fetch_seq_v2`, `bwamem.cpp:2175-2181`) is never
+            // materialised: only the two pieces the jobs read are unpacked, straight into the arena.
+            let w_len = (rmax1 - rmax0) as u32;
+            let (mut rmin, mut lmax) = (w_len, 0u32);
+            for seed in &chain.seeds {
+                if seed.qbeg > 0 {
+                    lmax = lmax.max((seed.rbeg - rmax0) as u32);
+                }
+                if seed.qbeg + seed.len != l_query {
+                    rmin = rmin.min((seed.rbeg + i64::from(seed.len) - rmax0) as u32);
+                }
+            }
+            // `rseq_off + re` is where `rseq[re]` sits, for every `re >= rmin`.
+            let rseq_off = (arena.len() as u32).wrapping_sub(rmin);
+            fm.bases_append(rmax0 + i64::from(rmin), rmax1, &mut arena);
+            // `rrseq_off + lmax - rlen` is where the reversed `rseq[..rlen]` starts. Reversed
+            // without complement is the other strand's mirror range complemented back (base `p`
+            // of the doubled text is the complement of base `2L - 1 - p`).
             let rrseq_off = arena.len() as u32;
-            arena.extend_from_slice(rseq);
-            arena[rrseq_off as usize..].reverse();
-            let w_len = rseq.len() as u32;
+            fm.bases_append(
+                (l_pac << 1) - rmax0 - i64::from(lmax),
+                (l_pac << 1) - rmax0,
+                &mut arena,
+            );
+            for b in &mut arena[rrseq_off as usize..] {
+                *b ^= 3;
+            }
 
             // Seeds in descending (score, index) order.
             //
@@ -1370,13 +1381,13 @@ fn align_reads_batched_inner<B: SwBackend>(
                 if skip_contained && seed_ext_redundant(&chain.seeds, si) {
                     // Keep the slot, skip the DP: the discard pass would purge this seed anyway
                     // (its container is a longer same-diagonal seed, extended earlier).
-                    reg_chain[r].push(ci);
-                    reg_meta[r].push(RegMeta {
+                    let k = slot0[r] + regs[r].len();
+                    reg_meta[k] = RegMeta {
                         chain: ci as u32,
                         pos: pos as u32,
                         seed: si as u32,
-                    });
-                    reg_preskip[r].push(true);
+                    };
+                    reg_preskip[k] = true;
                     // A placeholder region, born purged. Bounds are `-1` (the discard pass's
                     // tombstone) rather than `H0_SENTINEL`, so the seedcov pass skips it, the
                     // discard pass's `qb == -1 && qe == -1` check skips it, and the final
@@ -1452,7 +1463,7 @@ fn align_reads_batched_inner<B: SwBackend>(
                     // extension may consume. Non-negative because `rmax0 <= seed.rbeg` by
                     // construction of the window above.
                     let rlen = (seed.rbeg - rmax0) as u32;
-                    let target = (rrseq_off + w_len - rlen, rlen);
+                    let target = (rrseq_off + lmax - rlen, rlen);
                     // Provisional bounds at the seed's left edge; `run_side` walks them further left
                     // by subtracting the DP's `qle` (query length consumed) / `tle` (target length
                     // consumed).
@@ -1493,7 +1504,7 @@ fn align_reads_batched_inner<B: SwBackend>(
                     // the C's `len2 = l_query - qe` and `len1 = rmax[1] - rmax[0] - re`.
                     let re = seed.rbeg + i64::from(seed.len) - rmax0;
                     let query = (fwd_off + qe as u32, codes.len() as u32 - qe as u32);
-                    let target = (rseq_off + re as u32, w_len - re as u32);
+                    let target = (rseq_off.wrapping_add(re as u32), w_len - re as u32);
                     reg.qe = qe;
                     // Back to an absolute reference position for the region's bound.
                     reg.re = rmax0 + re;
@@ -1515,13 +1526,13 @@ fn align_reads_batched_inner<B: SwBackend>(
 
                 // Push metadata and region together, in lockstep, so the four per-read vectors stay
                 // index-aligned. `discard_contained` relies on that alignment.
-                reg_chain[r].push(ci);
-                reg_meta[r].push(RegMeta {
+                let k = slot0[r] + regs[r].len();
+                reg_meta[k] = RegMeta {
                     chain: ci as u32,
                     pos: pos as u32,
                     seed: si as u32,
-                });
-                reg_preskip[r].push(false);
+                };
+                reg_preskip[k] = false;
                 regs[r].push(reg);
             }
         }
@@ -1576,6 +1587,7 @@ fn align_reads_batched_inner<B: SwBackend>(
             false,
         )
     });
+    ARENA.set(arena);
 
     // ---- seedcov, per region, from final bounds (mirrors mem_chain2aln's tail) ----
     // `seedcov` is the number of query bases covered by seeds that fall entirely inside the finished
@@ -1590,7 +1602,7 @@ fn align_reads_batched_inner<B: SwBackend>(
     for r in 0..reads.len() {
         for (idx, reg) in regs[r].iter_mut().enumerate() {
             if reg.rb != H0_SENTINEL && reg.qb != H0_SENTINEL as i32 && reg.qb != -1 {
-                let chain = &per_read_chains[r][reg_chain[r][idx]];
+                let chain = &per_read_chains[r][reg_meta[slot0[r] + idx].chain as usize];
                 reg.seedcov = 0;
                 // Every seed of the *owning chain*, not just the one that founded this region: a
                 // wide extension can swallow several of its chain's seeds.
@@ -1611,13 +1623,14 @@ fn align_reads_batched_inner<B: SwBackend>(
     if purge {
         for r in 0..reads.len() {
             let l_query = reads[r].len() as i32;
+            let n = regs[r].len();
             discard_contained(
                 opt,
                 l_query,
                 &per_read_chains[r],
                 &mut regs[r],
-                &reg_meta[r],
-                &reg_preskip[r],
+                &reg_meta[slot0[r]..slot0[r] + n],
+                &reg_preskip[slot0[r]..slot0[r] + n],
             );
         }
     }

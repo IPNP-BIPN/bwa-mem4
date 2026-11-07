@@ -14,8 +14,8 @@
 #     "11.76x binning win" that was a loop warming the cache.
 #   - the genome index only. region.fa's 2 Mbp BWT is cache-resident and hides seeding, which is
 #     ~78% of the real profile.
-#   - our arm should be the PGO binary (scripts/pgo.sh). A cargo build --release is ~15% slower and
-#     is not what we ship, so timing it would flatter the fork by 15%.
+#   - our arm is a plain cargo build --release, which is what we ship. PGO stopped paying on Apple
+#     Silicon in 2026-11 (docs/perf-levers.md): it now costs PE time.
 #   - nothing under 3% is a gain. Host noise is ~2.4%.
 set -uo pipefail
 cd "$(dirname "$0")/.."

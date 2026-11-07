@@ -296,17 +296,8 @@ pub(crate) fn bns_fetch_seq_into(
     }
     rb = rb.max(far_beg);
     re = re.min(far_end);
-    WINDOW.with(|w| {
-        let w = &mut *w.borrow_mut();
-        fm.bases_into(rb, re, w);
-        out.extend_from_slice(w);
-    });
+    fm.bases_append(rb, re, out);
     (rb, re, rid)
-}
-
-thread_local! {
-    /// Scratch for one reference window, reused across [`bns_fetch_seq_into`] calls.
-    static WINDOW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Smith-Waterman mate rescue: given an anchor region `a` for one read, try to align the mate `ms`
@@ -658,8 +649,12 @@ const VIEW_MIN: usize = 16;
 /// anchors) become binary searches.
 #[derive(Default)]
 pub(crate) struct RegionView {
-    /// `(rb, re, qb, qe)` of every region, ascending by `rb`. Meaningful only while `built`.
+    /// `(rb, re, qb, qe)` of every region, ascending by `rb` up to `sorted`, then the few pushed
+    /// since, unordered. Meaningful only while `built`.
     by_rb: Vec<(i64, i64, i32, i32)>,
+    /// Scratch for [`RegionView::ensure`]'s sort, kept for its capacity.
+    keys: Vec<u64>,
+    sorted: usize,
     /// Longest `re - rb` in `by_rb`: how far left of a hit an overlapping region's `rb` can lie.
     max_len: i64,
     built: bool,
@@ -668,6 +663,9 @@ pub(crate) struct RegionView {
     clean: bool,
     /// Whether the list is what `mem_sort_dedup_patch` left (see [`insert_into_settled`]).
     pub(crate) settled: bool,
+    /// Hits [`insert_settled_view`] appended past the list's sorted prefix, put in place by
+    /// [`settle_order`] before anything that reads the order.
+    pending: usize,
 }
 
 impl RegionView {
@@ -684,9 +682,27 @@ impl RegionView {
                     .fetch_add(ma.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             self.by_rb.clear();
-            self.by_rb
-                .extend(ma.iter().map(|q| (q.rb, q.re, q.qb, q.qe)));
-            self.by_rb.sort_unstable_by_key(|q| q.0);
+            // Sorted as packed `rb << 24 | index` words: a primitive sort, not a keyed tuple one.
+            if ma.len() < 1 << 24 && ma.iter().all(|q| (0..1 << 40).contains(&q.rb)) {
+                let mut keys = std::mem::take(&mut self.keys);
+                keys.clear();
+                keys.extend(
+                    ma.iter()
+                        .enumerate()
+                        .map(|(i, q)| (q.rb as u64) << 24 | i as u64),
+                );
+                keys.sort_unstable();
+                self.by_rb.extend(keys.iter().map(|&k| {
+                    let q = &ma[(k & 0xff_ffff) as usize];
+                    (q.rb, q.re, q.qb, q.qe)
+                }));
+                self.keys = keys;
+            } else {
+                self.by_rb
+                    .extend(ma.iter().map(|q| (q.rb, q.re, q.qb, q.qe)));
+                self.by_rb.sort_unstable_by_key(|q| q.0);
+            }
+            self.sorted = self.by_rb.len();
             self.max_len = ma.iter().map(|q| q.re - q.rb).max().unwrap_or(0);
             self.clean = ma.iter().all(|q| q.rid >= 0 && q.re > q.rb);
             self.built = true;
@@ -697,15 +713,21 @@ impl RegionView {
 
     /// Whether some region's `rb` lies in `[lo, hi]` (none when `lo > hi`).
     fn any_rb_in(&self, lo: i64, hi: i64) -> bool {
-        let i = self.by_rb.partition_point(|q| q.0 < lo);
-        i < self.by_rb.len() && self.by_rb[i].0 <= hi
+        let (head, tail) = self.by_rb.split_at(self.sorted);
+        let i = head.partition_point(|q| q.0 < lo);
+        (i < head.len() && head[i].0 <= hi) || tail.iter().any(|q| (lo..=hi).contains(&q.0))
     }
 
     /// Mirror an insertion into `ma`.
     fn push(&mut self, q: &MemAlnReg) {
         if self.built {
-            let at = self.by_rb.partition_point(|x| x.0 < q.rb);
-            self.by_rb.insert(at, (q.rb, q.re, q.qb, q.qe));
+            // Appended, and sorted in once more than 16 wait: a sorted insert per hit was a memmove.
+            self.by_rb.push((q.rb, q.re, q.qb, q.qe));
+            if self.by_rb.len() - self.sorted > 16 {
+                // Stable: a sorted run plus a short tail is merged in near-linear time.
+                self.by_rb.sort_by_key(|q| q.0);
+                self.sorted = self.by_rb.len();
+            }
             self.max_len = self.max_len.max(q.re - q.rb);
         }
     }
@@ -766,12 +788,11 @@ fn insert_settled_view(
         return Err(b);
     }
     let mut identical = false;
-    let start = view.by_rb.partition_point(|q| q.0 <= b.rb - view.max_len);
-    for &(rb, re, qb, qe) in &view.by_rb[start..] {
-        if rb >= b.re {
-            break;
-        }
-        if re <= b.rb {
+    let (head, tail) = view.by_rb.split_at(view.sorted);
+    let start = head.partition_point(|q| q.0 <= b.rb - view.max_len);
+    let near = head[start..].iter().take_while(|q| q.0 < b.re);
+    for &(rb, re, qb, qe) in near.chain(tail) {
+        if rb >= b.re || re <= b.rb {
             continue;
         }
         let or_ = if re <= b.re { re - b.rb } else { b.re - rb };
@@ -803,13 +824,63 @@ fn insert_settled_view(
     }
     if !identical {
         b.n_comp = 1;
-        let at = ma.partition_point(|r| {
-            (-i64::from(r.score), r.rb, r.qb) < (-i64::from(b.score), b.rb, b.qb)
-        });
         view.push(&b);
-        ma.insert(at, b);
+        // Appended, not inserted: a rescued hit lands near the front of a long score-descending
+        // list, and shifting ~100 96-byte regions per hit was 2 s of memmove per 2M pairs. Until
+        // `settle_order`, only order-blind readers see the list (the skip scan, this function).
+        ma.push(b);
+        view.pending += 1;
     }
     Ok(())
+}
+
+/// Put the `*pending` hits appended past `ma`'s sorted prefix where [`insert_into_settled`]'s
+/// `partition_point` insert would have put them one by one: by `(score desc, rb, qb)`, each before
+/// the regions with its key, so among equal keys the later hit first. One backward merge.
+fn settle_order(ma: &mut Vec<MemAlnReg>, pending: &mut usize) {
+    if *pending == 0 {
+        return;
+    }
+    let key = |r: &MemAlnReg| (-i64::from(r.score), r.rb, r.qb);
+    let mut a = ma.len() - *pending;
+    *pending = 0;
+    let mut tail = ma.split_off(a);
+    // Stable on the reversed hits: equal keys come out later hit first.
+    tail.reverse();
+    tail.sort_by_key(key);
+    ma.extend_from_slice(&tail);
+    let mut k = ma.len();
+    for t in tail.into_iter().rev() {
+        while a > 0 && key(&ma[a - 1]) >= key(&t) {
+            k -= 1;
+            a -= 1;
+            ma[k] = ma[a].clone();
+        }
+        k -= 1;
+        ma[k] = t;
+    }
+}
+
+/// Prefetch the reference windows [`matesw_collect`] would fetch for anchor `a`, in each
+/// orientation the insert-size model has not failed. A hint: the contig clamp is left out.
+fn prefetch_windows(fm: &FmIndex, l_pac: i64, pes: &[PeStat; 4], a: &Anchor, ms: &[u8]) {
+    let l_ms = ms.len() as i64;
+    for (r, pe) in pes.iter().enumerate() {
+        if pe.failed {
+            continue;
+        }
+        let is_rev = (r >> 1) != (r & 1);
+        let is_larger = (r >> 1) == 0;
+        let (lo, hi) = (i64::from(pe.low), i64::from(pe.high));
+        let rb = if is_larger { a.rb + lo } else { a.rb - hi };
+        let re = if is_larger { a.rb + hi } else { a.rb - lo };
+        let (rb, re) = if is_rev {
+            (rb - l_ms, re)
+        } else {
+            (rb, re + l_ms)
+        };
+        fm.prefetch_pac(rb.max(0), re.min(l_pac << 1));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1069,6 +1140,7 @@ fn matesw_apply(
                     {
                         insert_settled_view(opt, ma, view, b)
                     } else {
+                        settle_order(ma, &mut view.pending);
                         insert_into_settled(opt, ma, b)
                     };
                     match r {
@@ -1082,6 +1154,7 @@ fn matesw_apply(
                 } else {
                     b
                 };
+                settle_order(ma, &mut view.pending);
                 let mut ins = 0;
                 while ins < ma.len() && ma[ins].score >= b.score {
                     ins += 1;
@@ -1099,6 +1172,7 @@ fn matesw_apply(
                 crate::rescue_split::APPLY_DEDUP_CALLS.fetch_add(1, Relaxed);
                 crate::rescue_split::APPLY_DEDUP_ROWS.fetch_add(ma.len() as u64, Relaxed);
             }
+            settle_order(ma, &mut view.pending);
             let taken = std::mem::take(ma);
             // Below two regions the pass returns its input as it found it, so that proves nothing.
             view.settled = taken.len() >= 2;
@@ -1477,15 +1551,44 @@ pub fn batch_mate_rescue(
     rescue_rounds::record_chunk(max_rounds);
     // Whether each pair's `[a1, a0]` is settled in the sense of `matesw_apply`, indexed by `dir`.
     let mut views: Vec<[RegionView; 2]> = (0..pairs.len()).map(|_| Default::default()).collect();
+    // Results of earlier rounds, found through `head` by (pair, dir, window length, mate orientation,
+    // window content hash) and chained through `Seen::next` when two share a key. Two anchors of one pair in identical repeat
+    // copies fetch byte-identical windows at different positions, one round apart; the job is then
+    // the same bytes (the query is that direction's mate), so the same window-relative result.
+    // Rounds run apart to keep bwa's insertion order, which is why the repeat is not adjacent as it
+    // would be in a flattened batch. A hash match is only a candidate: the earlier window is
+    // fetched again and compared byte for byte.
+    // One probe per job, not a walk over every earlier round of the slot.
+    let mut head: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<PassHash>> =
+        Default::default();
+    let mut seen: Vec<Seen> = Vec::new();
+    let mut refetch: Vec<u8> = Vec::new();
+    // (pair, dir, call); kept across rounds for its capacity.
+    let mut calls: Vec<(usize, usize, RescueCall)> = Vec::new();
+    // Pairs with an anchor left in this round or a later one, ascending: the rounds run to the
+    // deepest pair's anchor count, and most pairs are done long before.
+    let mut active: Vec<u32> = (0..pairs.len() as u32).collect();
     for round in 0..max_rounds {
+        active.retain(|&pi| spans[pi as usize].iter().any(|sp| sp.1 as usize > round));
         // Collect this round's rescue calls across all pairs and both directions.
         // `calls`: every rescue this round will perform, tagged with the pair index and direction it
         // must be applied back to. Order is (pair ascending, then dir), which is also the order the
         // apply loop below walks, so inserts land in the same sequence as the per-pair path.
         let t_collect = crate::rescue_split::start();
-        let mut calls: Vec<(usize, usize, RescueCall)> = Vec::new(); // (pair, dir, call)
+        calls.clear();
         arena.clear();
-        for (pi, p) in pairs.iter().enumerate() {
+        for (ai, &pi) in active.iter().enumerate() {
+            let (pi, p) = (pi as usize, &pairs[pi as usize]);
+            // The windows of the active pair two ahead are random DRAM misses: hint them now.
+            if let Some(&qi) = active.get(ai + 2) {
+                let (q, sp) = (&pairs[qi as usize], &spans[qi as usize]);
+                for (dir, ms) in [(0, q.seq1), (1, q.seq0)] {
+                    let (start, len) = sp[dir];
+                    if round < len as usize {
+                        prefetch_windows(fm, bns.l_pac, pes, &anchors[start as usize + round], ms);
+                    }
+                }
+            }
             for dir in 0..2 {
                 let (start, len) = spans[pi][dir];
                 if round >= len as usize {
@@ -1520,17 +1623,66 @@ pub fn batch_mate_rescue(
         // `jobs`: every orientation's SW, from every call, in one flat batch.
         // `spans[idx]`: `(start, count)` of call `idx`'s jobs within `jobs`, hence within `alns`.
         // The two vectors are index-parallel with `calls`.
-        let mut jobs: Vec<KswJob> = Vec::new();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
+        // Sized once: grown push by push, this was a realloc chain every round.
+        let n_orient: usize = calls
+            .iter()
+            .map(|c| c.2.per_r.iter().flatten().count())
+            .sum();
+        let mut jobs: Vec<KswJob> = Vec::with_capacity(n_orient);
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(calls.len());
+        // Per orientation of every call, in apply order: its kernel job (`Ok`) or an earlier
+        // round's result (`Err`); `keys[k]` is kernel job `k`'s list, length, orientation, hash and
+        // window start.
+        let mut src: Vec<Result<usize, KswAlignResult>> = Vec::with_capacity(n_orient);
+        let mut keys: Vec<(usize, u32, bool, u64, i64)> = Vec::with_capacity(n_orient);
         for (pi, dir, call) in &calls {
-            let start = jobs.len();
+            let start = src.len();
             let ms = if *dir == 0 {
                 pairs[*pi].seq1
             } else {
                 pairs[*pi].seq0
             };
-            jobs.extend(rescue_jobs(call, ms, &arena));
-            spans.push((start, jobs.len() - start));
+            for (job, o) in rescue_jobs(call, ms, &arena).zip(call.per_r.iter().flatten()) {
+                let slot = 2 * *pi + *dir;
+                let (len, h) = (o.target.1, window_hash(job.target));
+                let mut e = *head
+                    .get(&seen_key(slot, len, o.is_rev, h))
+                    .unwrap_or(&u32::MAX);
+                let mut hit = None;
+                while e != u32::MAX {
+                    let c = &seen[e as usize];
+                    if c.slot == slot as u32
+                        && c.len == len
+                        && c.is_rev == o.is_rev
+                        && c.hash == h
+                        && (c.rb == o.rb || {
+                            refetch.clear();
+                            bns_fetch_seq_into(
+                                fm,
+                                bns,
+                                c.rb,
+                                c.rb,
+                                c.rb + i64::from(len),
+                                &mut refetch,
+                            );
+                            refetch == job.target
+                        })
+                    {
+                        hit = Some(c.result);
+                        break;
+                    }
+                    e = c.next;
+                }
+                match hit {
+                    Some(r) => src.push(Err(r)),
+                    None => {
+                        src.push(Ok(jobs.len()));
+                        jobs.push(job);
+                        keys.push((slot, len, o.is_rev, h, o.rb));
+                    }
+                }
+            }
+            spans.push((start, src.len() - start));
         }
         // No `lanes` argument here, unlike the scalar [`mem_matesw`] call, which passes 16 or 8 from
         // bwa's `l_ms * a < 250` KSW_XBYTE test. `batched_mate_rescue` instead bins jobs by length
@@ -1571,6 +1723,28 @@ pub fn batch_mate_rescue(
         );
         crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
         let t_apply = crate::rescue_split::start();
+        for (&(slot, len, is_rev, hash, rb), r) in keys.iter().zip(&alns) {
+            let at = head
+                .entry(seen_key(slot, len, is_rev, hash))
+                .or_insert(u32::MAX);
+            seen.push(Seen {
+                next: *at,
+                slot: slot as u32,
+                len,
+                is_rev,
+                hash,
+                rb,
+                result: *r,
+            });
+            *at = (seen.len() - 1) as u32;
+        }
+        let alns: Vec<KswAlignResult> = src
+            .iter()
+            .map(|s| match *s {
+                Ok(k) => alns[k],
+                Err(r) => r,
+            })
+            .collect();
         for (idx, (pi, dir, call)) in calls.iter().enumerate() {
             let (start, count) = spans[idx];
             // `target`: the region vector this call's hits are inserted into, i.e. the MATE's array
@@ -1593,6 +1767,65 @@ pub fn batch_mate_rescue(
         }
         crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
     }
+    for (p, v) in pairs.iter_mut().zip(&mut views) {
+        settle_order(p.a1, &mut v[0].pending);
+        settle_order(p.a0, &mut v[1].pending);
+    }
+}
+
+/// One earlier-round rescue job of [`batch_mate_rescue`]'s repeat lists: its window's length,
+/// mate orientation, [`window_hash`] and start, its result, and the list's next entry.
+#[derive(Clone, Copy)]
+struct Seen {
+    next: u32,
+    slot: u32,
+    len: u32,
+    is_rev: bool,
+    hash: u64,
+    rb: i64,
+    result: KswAlignResult,
+}
+
+/// [`Seen`]'s lookup key: the slot, length and orientation mixed into the window hash.
+fn seen_key(slot: usize, len: u32, is_rev: bool, h: u64) -> u64 {
+    const M: u64 = 0x9E37_79B9_7F4A_7C15;
+    (h ^ (slot as u64) << 33 ^ u64::from(len) << 1 ^ u64::from(is_rev)).wrapping_mul(M)
+}
+
+/// A hasher that passes an already mixed `u64` key through.
+#[derive(Default)]
+struct PassHash(u64);
+impl std::hash::Hasher for PassHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0 ^ u64::from(x)).wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+/// A 64-bit hash of a rescue window's bytes, four independent multiply lanes over 8-byte words.
+/// Only selects candidates for [`batch_mate_rescue`]'s repeat lookup, which then compares bytes.
+fn window_hash(b: &[u8]) -> u64 {
+    const M: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = [b.len() as u64, 1, 2, 3];
+    let (words, rest) = b.as_chunks::<32>();
+    for w in words {
+        for (l, x) in h.iter_mut().zip(w.as_chunks::<8>().0) {
+            *l = (*l ^ u64::from_le_bytes(*x))
+                .wrapping_mul(M)
+                .rotate_left(31);
+        }
+    }
+    for (i, &x) in rest.iter().enumerate() {
+        h[i & 3] = (h[i & 3] ^ u64::from(x)).wrapping_mul(M).rotate_left(31);
+    }
+    (h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48)).wrapping_mul(M)
 }
 
 /// bwa's `id << 8`, reproduced with its C integer width.
@@ -1933,7 +2166,7 @@ fn mem_pair(
     // fields are recovered later by masking (`y & 1` = read, `y >> 1 & 1` = strand,
     // `y << 32 >> 34` = region index).
     // ---- step 1: flatten both reads' regions into one position-sortable list ----
-    let mut v: Vec<(u64, u64)> = Vec::new();
+    let mut v: Vec<(u64, u64)> = Vec::with_capacity(a[0].len() + a[1].len());
     for (r, regs) in a.iter().enumerate() {
         for (i, reg) in regs.iter().enumerate() {
             // Fold the doubled coordinate back onto the forward strand so both strands' placements
@@ -3456,7 +3689,10 @@ mod region_view_tests {
                 let want = insert_into_settled(&opt, &mut full, b.clone());
                 let got = insert_settled_view(&opt, &mut fast, &mut view, b.clone());
                 assert_eq!(got.is_ok(), want.is_ok(), "b {b:?}");
-                assert!(same(&fast, &full), "b {b:?}\nfast {fast:?}\nfull {full:?}");
+                // `fast` keeps its hits pending across the inserts, as a rescue round does.
+                let (mut chk, mut pending) = (fast.clone(), view.pending);
+                settle_order(&mut chk, &mut pending);
+                assert!(same(&chk, &full), "b {b:?}\nfast {chk:?}\nfull {full:?}");
                 if got.is_ok() {
                     taken += 1;
                 } else {

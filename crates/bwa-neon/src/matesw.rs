@@ -216,6 +216,8 @@ pub mod cells {
     pub static PRUNE_FAIL: AtomicU64 = AtomicU64::new(0);
     pub static PRUNE_HULL: AtomicU64 = AtomicU64::new(0);
     pub static PRUNE_BAND: AtomicU64 = AtomicU64::new(0);
+    /// Jobs answered from an earlier job of the batch with the same mate and the same kept rows.
+    pub static PRUNE_REUSED: AtomicU64 = AtomicU64::new(0);
     /// The banded path: kernel time, the rest of `Batch::run`, cell vectors computed, round-2 parents.
     pub static BAND_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
     pub static BAND_OTHER_NS: AtomicU64 = AtomicU64::new(0);
@@ -402,6 +404,10 @@ pub mod cells {
             );
             let band = PRUNE_BAND.load(Ordering::Relaxed);
             eprintln!(
+                "[matesw] reused: {} jobs answered from an identical kept window",
+                PRUNE_REUSED.load(Ordering::Relaxed)
+            );
+            eprintln!(
                 "[matesw] bands: kernel {:.2}s for {} cells ({:.2} Gcell/s), other {:.2}s, round 2 {}",
                 BAND_KERNEL_NS.load(Ordering::Relaxed) as f64 / 1e9,
                 BAND_CELLS.load(Ordering::Relaxed),
@@ -541,6 +547,20 @@ pub fn batched_mate_rescue(
     )
 }
 
+/// A grouping key for a query's bytes: equal queries get equal keys. Collisions only cost a
+/// cache miss in the filter, never a wrong result (`load_query` compares the bytes).
+fn query_key(q: &[u8]) -> u64 {
+    let mut h = q.len() as u64;
+    for c in q.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        h = (h ^ u64::from_le_bytes(w))
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(29);
+    }
+    h
+}
+
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 thread_local! {
     /// The banded-rescue state, reused across kernel calls.
@@ -647,7 +667,57 @@ pub(crate) fn batched_align(
         && u8_table_has_headroom(mat);
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let mut band = BAND.with(|c| c.take());
-    for (i, j) in jobs.iter().enumerate() {
+    // The filter caches its K-mer table per query (`Scratch::load_query`), and a batch holds ~17
+    // jobs per distinct mate query, scattered by the caller's (pair, anchor) order: visit the jobs
+    // grouped by query content so the table is built once per query. Free to reorder: every
+    // per-job result below (`run_of`, `hb_of`, the band plan) is keyed by the job's own index.
+    let mut ord: Vec<(u64, u32)> = (0..jobs.len() as u32)
+        .map(|i| {
+            (
+                if prune.is_some() {
+                    query_key(jobs[i as usize].query)
+                } else {
+                    0
+                },
+                i,
+            )
+        })
+        .collect();
+    if prune.is_some() {
+        ord.sort_unstable();
+    }
+    // ---- Repeats: a job whose kept rows (hull or whole window) and mate equal an earlier job's
+    //      has that job's forward result, rows shifted: a pruned job's forward pass is exactly the
+    //      DP of its kept rows (on either kernel), a function of those bytes, the mate and `minsc`.
+    //      Two anchors near one mate locus produce them: different windows, one hull. Only the
+    //      forward pass is shared; the reverse pass still runs on the job's own window. The
+    //      candidates are the earlier jobs of the current query group (`ord` groups by query).
+    //      `alias`: (job, source job, row shift). ----
+    let mut alias: Vec<(u32, u32, i32)> = Vec::new();
+    let mut group: Vec<(u32, u32, u32)> = Vec::new(); // (job, first kept row, kept rows)
+    let mut group_q: &[u8] = &[];
+    let kept = |d: &rescue_prune::Decision, len1: usize| match *d {
+        rescue_prune::Decision::Hull { hb, he } => Some((hb, he + 1 - hb)),
+        rescue_prune::Decision::Full => Some((0, len1)),
+        rescue_prune::Decision::Fail => None,
+    };
+    // The source among `group` for job `j` with kept rows `(hb, n)`, if any.
+    let find = |group: &[(u32, u32, u32)], j: &KswJob, hb: usize, n: usize| {
+        group
+            .iter()
+            .find(|&&(s, shb, sn)| {
+                sn as usize == n
+                    && jobs[s as usize].target[shb as usize..shb as usize + n]
+                        == j.target[hb..hb + n]
+            })
+            .map(|&(s, shb, _)| (s, hb as i32 - shb as i32))
+    };
+    for &(_, i) in &ord {
+        let (i, j) = (i as usize, &jobs[i as usize]);
+        if prune.is_some() && group_q != j.query {
+            group.clear();
+            group_q = j.query;
+        }
         let t_decide = probing.then(std::time::Instant::now);
         let decision = match prune {
             None => None,
@@ -658,7 +728,15 @@ pub(crate) fn batched_align(
                     && j.query.len() < U8_SCORE_LIMIT as usize =>
             {
                 let quanta = ksw_padded_qlen(j.query.len(), max_sc);
-                match band.plan(i, j.target, j.query, &p, prune_max_hits(), quanta) {
+                let (d, t1) = band.decide(j.target, j.query, &p, prune_max_hits());
+                if let Some((hb, n)) = kept(&d, j.target.len()) {
+                    if let Some((src, sh)) = find(&group, j, hb, n) {
+                        alias.push((i as u32, src, sh));
+                        continue;
+                    }
+                    group.push((i as u32, hb as u32, n as u32));
+                }
+                match band.commit(i, j.target, j.query, d, t1, &p, quanta) {
                     Some(d) => Some(d),
                     None => {
                         if let Some(t0) = t_decide {
@@ -670,12 +748,17 @@ pub(crate) fn batched_align(
                     }
                 }
             }
-            Some(p) => Some(rescue_prune::decide(
-                j.target,
-                j.query,
-                &p,
-                prune_max_hits(),
-            )),
+            Some(p) => {
+                let d = rescue_prune::decide(j.target, j.query, &p, prune_max_hits());
+                if let Some((hb, n)) = kept(&d, j.target.len()) {
+                    if let Some((src, sh)) = find(&group, j, hb, n) {
+                        alias.push((i as u32, src, sh));
+                        continue;
+                    }
+                    group.push((i as u32, hb as u32, n as u32));
+                }
+                Some(d)
+            }
         };
         if let Some(t0) = t_decide {
             use std::sync::atomic::Ordering::Relaxed;
@@ -785,6 +868,18 @@ pub(crate) fn batched_align(
             }
         }
         band.clear();
+    }
+    for &(i, src, sh) in &alias {
+        let shift = |row: i32| if row >= 0 { row + sh } else { row };
+        let r = out[src as usize];
+        out[i as usize] = KswAlignResult {
+            te: shift(r.te),
+            te2: shift(r.te2),
+            ..r
+        };
+    }
+    if probing {
+        cells::PRUNE_REUSED.fetch_add(alias.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ---- Pass 2 (KSW_XSTART): reversed prefixes, to recover where each alignment BEGINS. ----

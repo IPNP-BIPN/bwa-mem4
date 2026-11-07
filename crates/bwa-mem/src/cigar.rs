@@ -419,8 +419,25 @@ pub(crate) fn gen_cigar2(
         // Invariant: at the top of iteration `i`, `diagonal_score` is the summed substitution score
         // of columns `0..i`. There is no gap term because this path has no gaps by construction.
         let mut diagonal_score = 0;
-        for i in 0..l_query as usize {
-            diagonal_score += i32::from(opt.mat[rseq[i] as usize * 5 + query[i] as usize]);
+        let n = l_query as usize;
+        if (0..4).all(|b| opt.mat[b * 6] == opt.mat[0]) {
+            // Every equal pair scores `mat[0]` (`rseq` holds pac codes 0-3 only), so a run of
+            // equal bases is one multiply; only the mismatches read the matrix.
+            let mut i = 0;
+            loop {
+                let k = common_prefix(&rseq[i..n], &query[i..n]);
+                diagonal_score += k as i32 * i32::from(opt.mat[0]);
+                i += k;
+                if i >= n {
+                    break;
+                }
+                diagonal_score += i32::from(opt.mat[rseq[i] as usize * 5 + query[i] as usize]);
+                i += 1;
+            }
+        } else {
+            for i in 0..n {
+                diagonal_score += i32::from(opt.mat[rseq[i] as usize * 5 + query[i] as usize]);
+            }
         }
         // `(len << 4) | 0`: op 0 is M, so the `| 0` is elided.
         (diagonal_score, vec![(l_query as u32) << 4])
@@ -537,15 +554,23 @@ pub(crate) fn gen_cigar2(
             // M covers both matches and mismatches, so we have to compare base by base. Note the
             // comparison is on nt4 codes, so an N in the query (code 4) never equals a reference
             // base and always scores as a mismatch in NM.
-            for i in 0..len {
-                if query[query_pos + i] != rseq[ref_pos + i] {
-                    crate::emit::push_int_str(&mut md, i64::from(match_run));
-                    md.push(base_char(rseq[ref_pos + i]));
-                    n_mm += 1;
-                    match_run = 0;
-                } else {
-                    match_run += 1;
+            let (q, r) = (
+                &query[query_pos..query_pos + len],
+                &rseq[ref_pos..ref_pos + len],
+            );
+            let mut i = 0;
+            loop {
+                let k = common_prefix(&q[i..], &r[i..]);
+                match_run += k as i32;
+                i += k;
+                if i >= len {
+                    break;
                 }
+                crate::emit::push_int_str(&mut md, i64::from(match_run));
+                md.push(base_char(r[i]));
+                n_mm += 1;
+                match_run = 0;
+                i += 1;
             }
             query_pos += len;
             ref_pos += len;
@@ -579,6 +604,25 @@ pub(crate) fn gen_cigar2(
     SCRATCH_QUERY.with(|c| *c.borrow_mut() = std::mem::take(&mut query));
     SCRATCH_RSEQ.with(|c| *c.borrow_mut() = std::mem::take(&mut rseq));
     Some((score, cigar, n_mm + n_gap, md))
+}
+
+/// The length of the common prefix of `a` and `b`, at most the shorter length; eight bytes per
+/// compare.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let w = |s: &[u8]| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        let x = w(a) ^ w(b);
+        if x != 0 {
+            return i + (x.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
 }
 
 thread_local! {
@@ -1066,5 +1110,24 @@ pub mod global_fp {
             "[global-fp] the lemma licenses X <= {}",
             THRESHOLD.load(Relaxed)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `common_prefix` stops at the first difference wherever it falls in an 8-byte word, and at
+    /// the shorter length.
+    #[test]
+    fn common_prefix_equals_bytewise() {
+        let a: Vec<u8> = (0..40u8).map(|i| i % 4).collect();
+        for n in 0..a.len() {
+            for at in 0..=n {
+                let mut b = a[..n].to_vec();
+                if at < n {
+                    b[at] ^= 1;
+                }
+                assert_eq!(super::common_prefix(&a, &b), at);
+            }
+        }
     }
 }

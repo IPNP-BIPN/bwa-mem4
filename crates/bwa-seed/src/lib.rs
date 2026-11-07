@@ -270,12 +270,16 @@ fn probe_lockstep_width(fm: &FmIndex) -> usize {
     let times = fm.probe_concurrency(&CANDIDATES, ACCESSES);
     let best = times.iter().cloned().fold(f64::MAX, f64::min);
     // Smallest width within 5% of the best: on a flat top, fewer slots means less scratch memory and
-    // less bookkeeping for the same latency hiding.
+    // less bookkeeping for the same latency hiding. Halved, because a slot step prefetches two
+    // blocks (`k` and `k + s`), so a slot holds two of the chase's lines in flight: on an M4 the
+    // chase picks 64 (sometimes 32) and the walk is 2% slower in cycles at 64 than at 16 or 32 (2M
+    // GIAB reads, -t8). The fork's tuned widths sit at the same half: 16 on M4 (chase knee ~28) and
+    // 32 on Zen 5 (~58).
     let width = CANDIDATES
         .iter()
         .zip(&times)
         .find(|(_, &ns)| ns <= best * 1.05)
-        .map(|(k, _)| *k)
+        .map(|(k, _)| (*k / 2).max(CANDIDATES[0]))
         .unwrap_or(DEFAULT_LOCKSTEP_WIDTH);
 
     if std::env::var_os("BWA4_LOCKSTEP_PROBE").is_some() {
@@ -392,6 +396,18 @@ pub fn collect_smems_batched(
     min_seed_len: i32,
     min_intv: i64,
 ) -> Vec<Vec<Smem>> {
+    collect_smems_batched_bsd(fm, reads, min_seed_len, min_intv, None).0
+}
+
+/// [`collect_smems_batched`], also recording each read's round-3 first walk when `bsd` is
+/// `Some((max_intv, min_len))` (round 3's arguments): see [`FirstWalk`].
+fn collect_smems_batched_bsd(
+    fm: &FmIndex,
+    reads: &[&[u8]],
+    min_seed_len: i32,
+    min_intv: i64,
+    bsd: Option<(i64, i32)>,
+) -> (Vec<Vec<Smem>>, Vec<FirstWalk>) {
     // Lockstep width: independent walks kept in flight so each slot's prefetch has a full cycle to
     // land before the block is used. 16 measured ~2.8% faster than 8 on a genome-scale index (M4 Max,
     // SE); 24 ties it and 32 regresses, so 16 is the knee. Shared by all three batched seeding rounds.
@@ -404,9 +420,12 @@ pub fn collect_smems_batched(
     // Per-read result slots, pre-sized so a finished walk can be moved straight into `output[ridx]`
     // regardless of the order in which reads complete.
     let mut output: Vec<Vec<Smem>> = (0..reads.len()).map(|_| Vec::new()).collect();
+    let mut walks = vec![FirstWalk::NONE; if bsd.is_some() { reads.len() } else { 0 }];
     if reads.is_empty() {
-        return output;
+        return (output, walks);
     }
+    // Armed only on round 1's x = 0 walk at min_intv 1, which round 3's first walk is a prefix of.
+    let bsd = bsd.filter(|&(mi, ml)| min_intv == 1 && mi >= 1 && ml >= 1);
     // Longest read in the batch, in bases. Sizes every slot's `prev` buffer once (`max_len + 2`) so
     // a slot recycled onto any other read in the batch still satisfies the capacity invariant of
     // `smems_from_pos`.
@@ -419,7 +438,9 @@ pub fn collect_smems_batched(
     let mut next_read = 0usize;
     for _ in 0..lockstep_slots {
         if next_read < reads.len() {
-            slots.push(Some(LsSlot::new(next_read, 0, min_intv, false, max_len)));
+            let mut slot = LsSlot::new(next_read, 0, min_intv, false, max_len);
+            slot.bsd_cfg = bsd;
+            slots.push(Some(slot));
             next_read += 1;
         } else {
             slots.push(None);
@@ -437,9 +458,6 @@ pub fn collect_smems_batched(
     // `next_read..` have not been started. Progress is guaranteed because every `step` either
     // advances a cursor or moves the phase forward.
     let mut live = slots.iter().filter(|s| s.is_some()).count();
-    // Hoisted out of the round loop: `step` runs on the order of 1e9 times per 500k pairs, and a
-    // `OnceLock` read there is an acquire load per step.
-    let pf_ahead = prefetch_ahead();
     while live > 0 {
         // Rust: `.iter_mut()` walks the slot table yielding an exclusive borrow of each entry, so
         // each in-flight read can be advanced in place. `.as_mut()` on the `Option` turns "maybe a
@@ -449,14 +467,19 @@ pub fn collect_smems_batched(
             let Some(slot) = slot_opt.as_mut() else {
                 continue;
             };
-            slot.step(fm, reads[slot.ridx], min_seed_len, &counts, pf_ahead);
+            slot.step(fm, reads[slot.ridx], min_seed_len, &counts);
             if slot.phase == LsPhase::Done {
                 // Rust: this is the move-out problem and its sanctioned solution. `slot.out` is a
                 // vector owned by a struct that is still in use, so it cannot simply be handed over.
                 // `take` swaps it for an empty vector and returns the original, transferring the
                 // seeds to the output with no copy while leaving `slot` in a valid state, ready to
                 // be reset onto the next read.
-                output[slot.ridx] = std::mem::take(&mut slot.out);
+                // Sized like the walk just done, so the next read's pushes rarely regrow it.
+                let cap = slot.out.len();
+                output[slot.ridx] = std::mem::replace(&mut slot.out, Vec::with_capacity(cap));
+                if bsd.is_some() {
+                    walks[slot.ridx] = slot.bsd;
+                }
                 if next_read < reads.len() {
                     slot.reset_to(next_read, 0, min_intv, false);
                     next_read += 1;
@@ -467,7 +490,34 @@ pub fn collect_smems_batched(
             }
         }
     }
-    output
+    (output, walks)
+}
+
+/// Round 3's first walk on a read (from x = 0), recorded by round 1's x = 0 forward walk (the
+/// fork's `BsdFirstWalk`). Both step every base from read base 0 with the same forward extension,
+/// so round 3's walk is a prefix of round 1's (min_intv 1, which goes on while s >= 1). Round 1
+/// notes the step where round 3 would stop (`s < max_intv` at length `>= min_len`), or where it
+/// would end when round 1 stops first, and round 3 emits that seed and starts at `x` instead.
+#[derive(Clone, Copy)]
+struct FirstWalk {
+    /// The walk's last interval, emitted as its seed (m = 0, n) when s > 0. After a unique match's
+    /// text compare `l` holds that match's `sa_tag` (m = 0, so it is `SA[k]`), not a row.
+    k: i64,
+    l: i64,
+    s: i64,
+    n: u32,
+    /// Where round 3 goes on; < 0: not recorded.
+    x: i32,
+}
+
+impl FirstWalk {
+    const NONE: FirstWalk = FirstWalk {
+        k: 0,
+        l: 0,
+        s: 0,
+        n: 0,
+        x: -1,
+    };
 }
 
 /// `BWA4_SEED_STATS=1`: how the seeding FM traffic is distributed, so a proposed cache can be sized
@@ -532,9 +582,6 @@ enum LsPhase {
     /// rest of the read with the text (see the `Fwd` arm).
     S1Lf,
     S1Cmp,
-    /// Forward-to-backward handover: push the final candidate and reverse to longest-first. Costs no
-    /// FM operation, but is its own phase so the state machine stays a faithful line-by-line mirror.
-    BwdInit,
     /// One backward-search outer iteration: prepend `codes[jj]` to every live candidate.
     Bwd,
     /// Emit the boundary SMEM and advance `x` to `next_x`.
@@ -545,7 +592,7 @@ enum LsPhase {
 
 /// One read's round-1 SMEM walk as a resumable state machine (see [`collect_smems_batched`]). Mirrors
 /// [`smems_from_pos`] step by step: `Start` seeds the single-base interval at `x`, `Fwd` runs one
-/// forward-extension iteration, `BwdInit` does the fwd->bwd housekeeping (append + reverse), `Bwd`
+/// forward-extension iteration, `bwd_init` does the fwd->bwd housekeeping (append + reverse), `Bwd`
 /// runs one backward-search outer iteration, `PosDone` emits the final SMEM and advances `x`.
 struct LsSlot {
     /// Index of the read this slot is currently walking, within the caller's `reads` slice. The
@@ -565,10 +612,10 @@ struct LsSlot {
     phase: LsPhase,
     /// The interval currently being extended in the forward phase (`smems_from_pos`'s `smem`).
     /// `k`/`l` are BWT ROW numbers (`0 ..= ref_seq_len`), `s` an occurrence count, `m`/`n` inclusive
-    /// READ offsets. Live only between `Start` and `BwdInit`; the backward phase works out of `prev`.
+    /// READ offsets. Live only between `Start` and `bwd_init`; the backward phase works out of `prev`.
     smem: Smem,
     /// Number of live candidates in `prev`, i.e. the valid prefix is `prev[..num_prev]`. Same
-    /// variable as the C's `numPrev`. Grows during `Fwd`/`BwdInit`, only shrinks during `Bwd`.
+    /// variable as the C's `numPrev`. Grows during `Fwd`/`bwd_init`, only shrinks during `Bwd`.
     num_prev: usize,
     /// Forward-phase cursor: the READ offset being appended on the right (never a reference position).
     /// Runs `x + 1 ..= codes.len()`.
@@ -590,6 +637,13 @@ struct LsSlot {
     /// `jdp <= fm.seed_jump_depth()`), and those bases' 2-bit code; 0 once taken.
     jdp: usize,
     jcode: u32,
+    /// Round 3's `(max_intv, min_len)` when this driver records [`FirstWalk`]s, else `None`.
+    bsd_cfg: Option<(i64, i32)>,
+    /// The forward step at which round 3's walk may stop (`min_len - 1`) while a record is
+    /// pending, `usize::MAX` otherwise; `bsd_intv` is round 3's `max_intv`.
+    bsd_j: usize,
+    bsd_intv: i64,
+    bsd: FirstWalk,
     prev: Vec<Smem>,
     /// SMEMs emitted by the current walk, moved out when the slot reaches `Done`.
     out: Vec<Smem>,
@@ -628,6 +682,10 @@ impl LsSlot {
             tpos: 0,
             jdp: 0,
             jcode: 0,
+            bsd_cfg: None,
+            bsd_j: usize::MAX,
+            bsd_intv: 0,
+            bsd: FirstWalk::NONE,
             next_x: 0,
             prev: vec![Smem::default(); max_len + 2],
             out: Vec::new(),
@@ -649,6 +707,41 @@ impl LsSlot {
         self.phase = LsPhase::Start;
         self.num_prev = 0;
         self.out.clear();
+        self.bsd_j = usize::MAX;
+        self.bsd = FirstWalk::NONE;
+    }
+
+    /// Forward step `j` reached `e` (`read[0..=j]`), with `j >= bsd_j`: round 3 stops here when
+    /// `e.s < max_intv`, emitting `e` when `e.s > 0`, and goes on at `j + 1`.
+    #[inline]
+    fn bsd_note(&mut self, j: usize, e: &Smem) {
+        if e.s < self.bsd_intv {
+            self.bsd = FirstWalk {
+                k: e.k,
+                l: e.l,
+                s: e.s,
+                n: j as u32,
+                x: (j + 1) as i32,
+            };
+            self.bsd_j = usize::MAX;
+        }
+    }
+
+    /// Round 1's walk stopped before round 3's at read base `p`: the read's end, an `N`, or a
+    /// base the interval does not extend with (s = 0 from step `p` on). Round 3 then steps with
+    /// s = 0, ending at the first `N` (x = p + 1), at the first step `>= bsd_j` (no seed,
+    /// x = p + 1), or at the read's end.
+    #[cold]
+    fn bsd_resolve(&mut self, codes: &[u8], mut p: usize) {
+        let rl = codes.len();
+        while p < rl && codes[p] < AMBIGUOUS_BASE && p < self.bsd_j {
+            p += 1;
+        }
+        self.bsd = FirstWalk {
+            x: if p < rl { p + 1 } else { rl } as i32,
+            ..FirstWalk::NONE
+        };
+        self.bsd_j = usize::MAX;
     }
 
     /// Advance this walk by exactly one phase iteration (at most one FM extension of one candidate
@@ -661,17 +754,26 @@ impl LsSlot {
     /// - `min_seed_len`: emission length floor in bases (same value for the whole batch).
     /// - `counts`: the index's C array, hoisted by the driver. `counts[b]` is the first BWT ROW whose
     ///   suffix starts with base `b`; `counts[4]` is the total row count.
-    /// `pf_ahead` is [`prefetch_ahead`], passed in rather than read here: this function is the
-    /// aligner's hottest loop body, and reading a `OnceLock` per step is an acquire load the
-    /// compiler is not free to hoist out of the driver's round loop across the call.
-    fn step(
-        &mut self,
-        fm: &FmIndex,
-        codes: &[u8],
-        min_seed_len: i32,
-        counts: &[i64; 5],
-        pf_ahead: usize,
-    ) {
+    /// End of the forward walk (the fork's `ls_prepare_backward`): push the last interval, put the
+    /// candidates longest-first and enter `Bwd`. Returns whether the first backward round reads
+    /// the index, in which case the caller yields so the hints issued here land first.
+    #[inline(always)]
+    fn bwd_init(&mut self, fm: &FmIndex, min_intv: i64) -> bool {
+        if self.smem.s >= min_intv {
+            self.prev[self.num_prev] = self.smem;
+            self.num_prev += 1;
+            // The forward steps hinted every other candidate's blocks when they pushed it; this
+            // last one is hinted only now (a hint cannot change a result).
+            fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
+        }
+        self.prev[..self.num_prev].reverse();
+        self.jj = self.x as i64 - 1;
+        self.phase = LsPhase::Bwd;
+        self.jj >= 0 && self.num_prev != 0
+    }
+
+    #[inline(always)]
+    fn step(&mut self, fm: &FmIndex, codes: &[u8], min_seed_len: i32, counts: &[i64; 5]) {
         // Read once per call rather than per extension, and compiled out entirely unless the
         // `seed-stats` feature is on: this sits on a path that runs 1.7 billion times per 500k
         // pairs, where even a predictable branch is measurable (it cost about 3% of CPU when it
@@ -718,6 +820,10 @@ impl LsSlot {
                     self.num_prev = 0;
                     self.j = self.x + 1;
                     self.phase = LsPhase::Fwd;
+                    if let (0, false, Some((mi, ml))) = (self.x, self.single_pos, self.bsd_cfg) {
+                        self.bsd_j = ml as usize - 1;
+                        self.bsd_intv = mi;
+                    }
                     #[cfg(feature = "seed-stats")]
                     if stats_on {
                         seed_stats::STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -765,11 +871,21 @@ impl LsSlot {
                         self.prev[self.num_prev] = self.smem;
                         if new_smem.s != self.smem.s {
                             self.num_prev += 1;
+                            // The first backward round reads this candidate's blocks: hinted now, visits ahead.
+                            fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
                         }
                         if new_smem.s < min_intv {
+                            if self.bsd_j != usize::MAX {
+                                self.bsd_resolve(codes, j);
+                            }
                             self.next_x = j;
-                            self.phase = LsPhase::BwdInit;
-                            return;
+                            if self.bwd_init(fm, min_intv) {
+                                return;
+                            }
+                            continue;
+                        }
+                        if j >= self.bsd_j {
+                            self.bsd_note(j, &new_smem);
                         }
                         self.smem = new_smem;
                         self.j = j + 1;
@@ -787,25 +903,29 @@ impl LsSlot {
                 }
                 LsPhase::Fwd => {
                     if self.j >= readlength {
-                        self.phase = LsPhase::BwdInit;
-                        return;
+                        if self.bsd_j != usize::MAX {
+                            self.bsd_resolve(codes, self.j);
+                        }
+                        if self.bwd_init(fm, min_intv) {
+                            return;
+                        }
+                        continue;
                     }
                     // Base code at the READ offset being appended on the right.
                     let aj = codes[self.j];
                     self.next_x = self.j + 1;
                     if aj >= AMBIGUOUS_BASE {
-                        self.phase = LsPhase::BwdInit;
-                        return;
+                        if self.bsd_j != usize::MAX {
+                            self.bsd_resolve(codes, self.j);
+                        }
+                        if self.bwd_init(fm, min_intv) {
+                            return;
+                        }
+                        continue;
                     }
-                    // Forward extension = backward extension on the reverse complement: swap k/l to
-                    // reinterpret the interval as the RC one, prepend the complement base `3 - aj`,
-                    // swap back. See the module docs.
-                    // `rc_view`: the same interval reinterpreted as that of the pattern's reverse
-                    // complement (k and l are BWT ROWS; swapping them swaps which strand's rows lead).
-                    let mut rc_view = self.smem;
-                    std::mem::swap(&mut rc_view.k, &mut rc_view.l);
-                    // `rc_extended`: interval of `complement(aj)` prepended to the RC pattern, which is
-                    // the RC of `pattern + aj`.
+                    // Forward extension = backward extension on the reverse complement (swap k/l,
+                    // prepend the complement base `3 - aj`, swap back; see the module docs), as
+                    // `forward_ext` computes it.
                     #[cfg(feature = "seed-stats")]
                     if stats_on {
                         use std::sync::atomic::Ordering::Relaxed;
@@ -816,21 +936,29 @@ impl LsSlot {
                             seed_stats::FWD_FIRST10.fetch_add(1, Relaxed);
                         }
                     }
-                    let rc_extended = fm.backward_ext(rc_view, MAX_BASE - aj as usize);
-                    // `new_smem`: swapped back, so it is the forward interval of the read substring
-                    // `codes[x ..= j]`, one base longer on the RIGHT than `self.smem`.
-                    let mut new_smem = rc_extended;
-                    std::mem::swap(&mut new_smem.k, &mut new_smem.l);
+                    // `new_smem`: the forward interval of the read substring `codes[x ..= j]`, one
+                    // base longer on the RIGHT than `self.smem`.
+                    let mut new_smem = fm.forward_ext(self.smem, aj as usize);
                     new_smem.n = self.j as u32;
 
                     self.prev[self.num_prev] = self.smem;
                     if new_smem.s != self.smem.s {
                         self.num_prev += 1;
+                        // The first backward round reads this candidate's blocks: hinted now, visits ahead.
+                        fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
                     }
                     if new_smem.s < min_intv {
+                        if self.bsd_j != usize::MAX {
+                            self.bsd_resolve(codes, self.j);
+                        }
                         self.next_x = self.j;
-                        self.phase = LsPhase::BwdInit;
-                        return;
+                        if self.bwd_init(fm, min_intv) {
+                            return;
+                        }
+                        continue;
+                    }
+                    if self.j >= self.bsd_j {
+                        self.bsd_note(self.j, &new_smem);
                     }
                     self.smem = new_smem;
                     self.j += 1;
@@ -878,13 +1006,8 @@ impl LsSlot {
                     // The exit the base-at-a-time walk would take at the first base that ends it: the
                     // read's end, a non-ACGT read base (`next_x = j + 1`), or a base the text does not
                     // continue with, the text's end included (`next_x = j`). Every exit keeps the
-                    // match (`s = 1 >= min_intv`) with `n = j - 1`, which `BwdInit` records.
-                    let tend = 2 * fm.l_pac();
-                    let (mut j, mut t) = (self.j, self.tpos);
-                    while j < readlength && t < tend && codes[j] == fm.base(t) {
-                        j += 1;
-                        t += 1;
-                    }
+                    // match (`s = 1 >= min_intv`) with `n = j - 1`, which `bwd_init` records.
+                    let j = fm.text_match(codes, self.j, self.tpos);
                     self.next_x = if j >= readlength {
                         readlength
                     } else if codes[j] >= AMBIGUOUS_BASE {
@@ -892,22 +1015,24 @@ impl LsSlot {
                     } else {
                         j
                     };
-                    self.smem.n = (j - 1) as u32;
-                    self.phase = LsPhase::BwdInit;
-                }
-                LsPhase::BwdInit => {
-                    if self.smem.s >= min_intv {
-                        self.prev[self.num_prev] = self.smem;
-                        self.num_prev += 1;
+                    // A pending round-3 walk had s = 1 on read bases `self.j .. j` and stops on the
+                    // first of them at `bsd_j` when 1 < max_intv (no earlier step reached `bsd_j`,
+                    // or `bsd_note` would have recorded it); otherwise it goes on from base `j`.
+                    if self.bsd_j != usize::MAX {
+                        if self.bsd_intv > 1 && self.bsd_j < j {
+                            let n = self.bsd_j;
+                            let e = Smem {
+                                n: n as u32,
+                                ..self.smem
+                            };
+                            self.bsd_note(n, &e);
+                        } else {
+                            self.bsd_resolve(codes, j);
+                        }
                     }
-                    self.prev[..self.num_prev].reverse();
-                    self.jj = self.x as i64 - 1;
-                    self.phase = LsPhase::Bwd;
-                    // The next step extends these, and this step was the last chance to warn the cache:
-                    // without it the first backward round only prefetches right before its own loads.
-                    // From fg-labs/bwa-mem3 PR #600. A hint, so it cannot change a result.
-                    for c in self.prev[..self.num_prev.min(pf_ahead)].iter() {
-                        fm.prefetch_occ(c.k, c.k + c.s);
+                    self.smem.n = (j - 1) as u32;
+                    if self.bwd_init(fm, min_intv) {
+                        return;
                     }
                 }
                 LsPhase::Bwd => {
@@ -921,84 +1046,20 @@ impl LsSlot {
                         self.phase = LsPhase::PosDone;
                         return;
                     }
-                    let a = a as usize;
-                    if self.num_prev == 1 {
-                        // The common case (a unique match): one candidate, so the two loops below
-                        // and their dedup collapse to one step. Same decisions in the same order.
-                        #[cfg(feature = "seed-stats")]
-                        if stats_on {
-                            seed_stats::BWD_STEPS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        let candidate = self.prev[0];
-                        let mut new_smem = fm.backward_ext_konly(candidate, a);
-                        new_smem.m = self.jj as u32;
-                        self.jj -= 1;
-                        if new_smem.s < min_intv {
-                            if (i64::from(candidate.n) - i64::from(candidate.m) + 1)
-                                >= i64::from(min_seed_len)
-                            {
-                                self.out.push(candidate);
-                            }
-                            self.num_prev = 0;
-                            self.phase = LsPhase::PosDone;
-                        } else {
-                            self.prev[0] = new_smem;
-                            fm.prefetch_occ(new_smem.k, new_smem.k + new_smem.s);
-                        }
-                        return;
+                    #[cfg(feature = "seed-stats")]
+                    if stats_on {
+                        seed_stats::BWD_STEPS
+                            .fetch_add(self.num_prev as u64, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // Survivors kept so far this round; also the write cursor for the in-place compaction
-                    // of `prev`.
-                    let mut num_curr = 0usize;
-                    // Occurrence count of the last survivor kept this round. `-1` is impossible for a
-                    // real count, so the first survivor always passes the `!=` test.
-                    let mut curr_s = -1i64;
-
-                    // Read cursor over the live candidates. Invariant at the top of each iteration:
-                    // `prev[..num_curr]` holds this round's survivors (already left-extended by `a`) and
-                    // `prev[p..num_prev]` still holds last round's candidates, longest first. The write
-                    // cursor never overtakes the read cursor, so no candidate is clobbered before use.
-                    // Every live candidate is about to be extended by the same base, and each
-                    // extension is an independent pair of checkpoint loads. Issuing all the prefetches
-                    // BEFORE the first extension turns a serial chain of dependent DRAM misses into
-                    // overlapping ones; the loop below then mostly hits cache. Costs a few prefetch
-                    // instructions on the rounds that break early, which is why it is capped rather
-                    // than run over the whole array.
-                    //
-                    // Prefetching cannot change a result: it moves lines into cache and nothing else.
-                    for c in self.prev[..self.num_prev.min(pf_ahead)].iter() {
-                        fm.prefetch_occ(c.k, c.k + c.s);
-                    }
-                    // bwa's two loops as one pass: `open` is true until the first candidate that is
-                    // either emitted (its extension dies while it is long enough) or kept; after
-                    // that, shorter candidates survive only with a new occurrence count and are
-                    // never emitted this round.
-                    let mut open = true;
-                    for p in 0..self.num_prev {
-                        let candidate = self.prev[p];
-                        #[cfg(feature = "seed-stats")]
-                        if stats_on {
-                            seed_stats::BWD_STEPS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        let mut new_smem = fm.backward_ext_konly(candidate, a);
-                        new_smem.m = self.jj as u32;
-                        if new_smem.s >= min_intv {
-                            if new_smem.s != curr_s {
-                                curr_s = new_smem.s;
-                                self.prev[num_curr] = new_smem;
-                                num_curr += 1;
-                                fm.prefetch_occ(new_smem.k, new_smem.k + new_smem.s);
-                                open = false;
-                            }
-                        } else if open
-                            && (i64::from(candidate.n) - i64::from(candidate.m) + 1)
-                                >= i64::from(min_seed_len)
-                        {
-                            self.out.push(candidate);
-                            open = false;
-                        }
+                    let (num_curr, emit) = fm.backward_round(
+                        &mut self.prev[..self.num_prev],
+                        a as usize,
+                        self.jj as u32,
+                        min_intv,
+                        i64::from(min_seed_len),
+                    );
+                    if let Some(c) = emit {
+                        self.out.push(c);
                     }
                     self.num_prev = num_curr;
                     self.jj -= 1;
@@ -1439,6 +1500,23 @@ impl BwtSeedSlot {
         self.out.clear();
     }
 
+    /// Take round 1's record of this read's first walk: emit its seed and go on where it ended.
+    fn take_first_walk(&mut self, walks: &[FirstWalk]) {
+        if let Some(r) = walks.get(self.ridx).filter(|r| r.x > 0) {
+            if r.s > 0 {
+                self.out.push(Smem {
+                    rid: 0,
+                    m: 0,
+                    n: r.n,
+                    k: r.k,
+                    l: r.l,
+                    s: r.s,
+                });
+            }
+            self.x = r.x as usize;
+        }
+    }
+
     /// End the current position: advance `x` to `next_x` and return to `Start` (or finish).
     ///
     /// # Parameters
@@ -1475,7 +1553,9 @@ impl BwtSeedSlot {
         let readlength = codes.len();
         match self.phase {
             BwtPhase::Start => {
-                if self.x >= readlength {
+                // A walk emits only at a step `min_seed_len` long, which must end inside the read,
+                // so no walk from here on emits (the fork's `bwtseed_x_end`).
+                if self.x + (min_seed_len.max(1) as usize) > readlength {
                     self.phase = BwtPhase::Done;
                     return;
                 }
@@ -1544,14 +1624,8 @@ impl BwtSeedSlot {
                     self.end_pos(readlength);
                     return;
                 }
-                // Forward extension via the reverse-complement view (swap the two BWT ROW fields,
-                // prepend the complement base, swap back).
-                let mut rc_view = self.smem;
-                std::mem::swap(&mut rc_view.k, &mut rc_view.l);
-                let rc_extended = fm.backward_ext(rc_view, MAX_BASE - aj as usize);
                 // Interval of `codes[x ..= j]`, one base longer on the RIGHT than before.
-                let mut new_smem = rc_extended;
-                std::mem::swap(&mut new_smem.k, &mut new_smem.l);
+                let mut new_smem = fm.forward_ext(self.smem, aj as usize);
                 new_smem.n = self.j as u32;
                 self.smem = new_smem;
                 if self.smem.s < max_intv
@@ -1589,6 +1663,7 @@ fn bwt_seed_strategy_batched(
     reads: &[&[u8]],
     max_intv: i64,
     min_seed_len: i32,
+    walks: &[FirstWalk],
     out: &mut [Vec<Smem>],
 ) {
     let lockstep_slots = lockstep_width(fm);
@@ -1603,7 +1678,9 @@ fn bwt_seed_strategy_batched(
     let mut next_read = 0usize;
     for _ in 0..lockstep_slots {
         if next_read < reads.len() {
-            slots.push(Some(BwtSeedSlot::new(next_read)));
+            let mut slot = BwtSeedSlot::new(next_read);
+            slot.take_first_walk(walks);
+            slots.push(Some(slot));
             next_read += 1;
         } else {
             slots.push(None);
@@ -1622,6 +1699,7 @@ fn bwt_seed_strategy_batched(
                 out[slot.ridx].append(&mut slot.out);
                 if next_read < reads.len() {
                     slot.reset(next_read);
+                    slot.take_first_walk(walks);
                     next_read += 1;
                 } else {
                     *slot_opt = None;
@@ -1670,7 +1748,9 @@ pub fn mem_collect_smem(fm: &FmIndex, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
 pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> Vec<Vec<Smem>> {
     // Round 1 in lockstep, `min_intv = 1` (accept any pattern that occurs at all). This vector is
     // then grown in place by rounds 2 and 3.
-    let mut per_read = collect_smems_batched(fm, reads, opt.min_seed_len, 1);
+    // Round 1 also records round 3's first walk on each read, which round 3 then skips.
+    let r3 = (opt.max_mem_intv > 0).then_some((opt.max_mem_intv, opt.min_seed_len + 1));
+    let (mut per_read, walks) = collect_smems_batched_bsd(fm, reads, opt.min_seed_len, 1, r3);
     // Rounds 2 and 3 both run in lockstep across the batch so their data-dependent `cp_occ` loads
     // overlap — the same latency-hiding trick as round 1. Order per read is preserved (round 1,
     // then round 2, then round 3), so this is identical to the per-read path.
@@ -1688,6 +1768,7 @@ pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> 
             reads,
             opt.max_mem_intv,
             opt.min_seed_len + 1,
+            &walks,
             &mut per_read,
         );
     }
@@ -1730,6 +1811,7 @@ pub fn mem_collect_smem_hybrid(
             reads,
             opt.max_mem_intv,
             opt.min_seed_len + 1,
+            &[],
             &mut per_read,
         );
     }
@@ -1887,17 +1969,15 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
     // job named by its `job_id`, jobs `next_job..` are unstarted, and `results[..]` holds output only
     // for jobs already completed. A slot retires only when both are exhausted.
     let mut live = slots.iter().filter(|s| s.is_some()).count();
-    // Hoisted out of the round loop: `step` runs on the order of 1e9 times per 500k pairs, and a
-    // `OnceLock` read there is an acquire load per step.
-    let pf_ahead = prefetch_ahead();
     while live > 0 {
         for slot_opt in slots.iter_mut() {
             let Some((job_id, slot)) = slot_opt.as_mut() else {
                 continue;
             };
-            slot.step(fm, reads[slot.ridx], opt.min_seed_len, &counts, pf_ahead);
+            slot.step(fm, reads[slot.ridx], opt.min_seed_len, &counts);
             if slot.phase == LsPhase::Done {
-                results[*job_id] = std::mem::take(&mut slot.out);
+                let cap = slot.out.len();
+                results[*job_id] = std::mem::replace(&mut slot.out, Vec::with_capacity(cap));
                 if next_job < jobs.len() {
                     let j = &jobs[next_job];
                     *job_id = next_job;
@@ -2016,6 +2096,12 @@ mod tests {
             })
             .collect();
         let opt = MemOpt::default();
+        // `BWA4_SEED_BENCH_ROUNDS=1` or `2` stops after that round, so a hardware counter over the
+        // whole process (`/usr/bin/time -l`) can be split by round.
+        let rounds: u32 = std::env::var("BWA4_SEED_BENCH_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
         let mut total = 0usize;
         let (mut t1, mut t2, mut t3) = (0u128, 0u128, 0u128);
         let t0 = std::time::Instant::now();
@@ -2037,6 +2123,10 @@ mod tests {
             t1 += a.elapsed().as_nanos();
             #[cfg(feature = "seed-stats")]
             let s1 = snap();
+            if rounds < 2 {
+                total += per_read.iter().map(|v| v.len()).sum::<usize>();
+                continue;
+            }
             let a = std::time::Instant::now();
             smem_round_2_batched(&fm, &refs, &opt, &mut per_read);
             t2 += a.elapsed().as_nanos();
@@ -2052,12 +2142,13 @@ mod tests {
                 R2B.fetch_add(s2.2 - s1.2, Relaxed);
             }
             let a = std::time::Instant::now();
-            if opt.max_mem_intv > 0 {
+            if opt.max_mem_intv > 0 && rounds >= 3 {
                 bwt_seed_strategy_batched(
                     &fm,
                     &refs,
                     opt.max_mem_intv,
                     opt.min_seed_len + 1,
+                    &[],
                     &mut per_read,
                 );
             }
@@ -2290,10 +2381,10 @@ mod tests {
         // Length of the whole 2L text in bases (`2 * l_pac`).
         let reflen = 2 * fm.l_pac(); // 2L, without materializing the reference
         let mut reads: Vec<Vec<u8>> = Vec::new();
-        for _ in 0..80 {
-            // Read flavour: 0 = random (shallow SMEMs), 1..=4 = exact reference slice, and 3/4 also
-            // get two point mutations.
-            let kind = next() % 5;
+        for _ in 0..240 {
+            // Read flavour: 0 = random (shallow SMEMs), 1..=5 = exact reference slice, 3/4 also
+            // get two point mutations, 5 an `N` in its first 30 bases (round 3's first walk).
+            let kind = next() % 6;
             // Read length in bases, 40..=189: long enough that SMEMs can exceed `split_len` (28) and
             // so actually trigger round-2 re-seeding.
             let len = 40 + (next() % 150) as usize;
@@ -2306,27 +2397,36 @@ mod tests {
                 }
             };
             // Mutate a couple of bases in some slices (splits SMEMs, varied reseed geometry).
-            if kind >= 3 && r.len() > 4 {
+            if (3..=4).contains(&kind) && r.len() > 4 {
                 for _ in 0..2 {
                     let p = (next() as usize) % r.len();
                     r[p] = (next() % 4) as u8;
                 }
+            }
+            if kind == 5 {
+                r[(next() % 30) as usize] = 4;
             }
             reads.push(r);
         }
         // Borrowed view of the batch, in the `&[&[u8]]` shape the batched entry points take.
         let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
 
-        let opt = MemOpt::default();
-        let batched = mem_collect_smem_batched(&fm, &refs, &opt);
-        for (r, read) in reads.iter().enumerate() {
-            let per_read = mem_collect_smem(&fm, read, &opt);
-            assert_eq!(
-                batched[r].iter().map(sans_l).collect::<Vec<_>>(),
-                per_read.iter().map(sans_l).collect::<Vec<_>>(),
-                "batched full != per-read at read {r} (len {})",
-                read.len()
-            );
+        // Round 3's first walk comes from round 1's record: vary where it stops (`max_mem_intv`,
+        // 1 makes a unique match go on) and how long it must be (`-k`).
+        for (max_intv, k) in [(20, 19), (1, 19), (2, 12), (500, 25), (0, 19)] {
+            let mut opt = MemOpt::default();
+            opt.max_mem_intv = max_intv;
+            opt.min_seed_len = k;
+            let batched = mem_collect_smem_batched(&fm, &refs, &opt);
+            for (r, read) in reads.iter().enumerate() {
+                let per_read = mem_collect_smem(&fm, read, &opt);
+                assert_eq!(
+                    batched[r].iter().map(sans_l).collect::<Vec<_>>(),
+                    per_read.iter().map(sans_l).collect::<Vec<_>>(),
+                    "batched full != per-read at read {r} (len {}, max_intv {max_intv}, k {k})",
+                    read.len()
+                );
+            }
         }
     }
 

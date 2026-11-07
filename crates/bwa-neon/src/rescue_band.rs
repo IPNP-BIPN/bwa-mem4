@@ -23,7 +23,6 @@
 use crate::matesw::KswJob;
 use crate::rescue_prune::{self, Comp, Decision, Params};
 use bwa_extend::KswAlignResult;
-use bwa_extend::SuboptimalTracker;
 
 #[cfg(target_arch = "x86_64")]
 use avx2 as kernel;
@@ -160,6 +159,7 @@ impl Batch {
 
     /// The prune decision of job `idx` (window `t`, mate `q`, padded to `quanta` columns), or
     /// `None` when the job is banded: this batch then owns it and [`Self::run`] writes its result.
+    #[cfg(test)]
     pub(crate) fn plan(
         &mut self,
         idx: usize,
@@ -169,7 +169,34 @@ impl Batch {
         max_hits: usize,
         quanta: usize,
     ) -> Option<Decision> {
-        let (dec, t1) = rescue_prune::decide_bands(t, q, p, max_hits, &mut self.c19, &mut self.ct);
+        let (dec, t1) = self.decide(t, q, p, max_hits);
+        self.commit(idx, t, q, dec, t1, p, quanta)
+    }
+
+    /// The prune decision of window `t` against mate `q` and its round-1 threshold, leaving the
+    /// components in this batch for [`Self::commit`].
+    pub(crate) fn decide(
+        &mut self,
+        t: &[u8],
+        q: &[u8],
+        p: &Params,
+        max_hits: usize,
+    ) -> (Decision, i32) {
+        rescue_prune::decide_bands(t, q, p, max_hits, &mut self.c19, &mut self.ct)
+    }
+
+    /// [`Self::plan`] after [`Self::decide`] gave `(dec, t1)` for the same `t` and `q`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit(
+        &mut self,
+        idx: usize,
+        t: &[u8],
+        q: &[u8],
+        dec: Decision,
+        t1: i32,
+        p: &Params,
+        quanta: usize,
+    ) -> Option<Decision> {
         let (len1, quanta) = (t.len() as i32, quanta as i32);
         if !enabled() || q.len().div_ceil(16) * 16 != quanta as usize {
             return Some(dec);
@@ -582,36 +609,156 @@ impl Batch {
     }
 }
 
-/// `(score2, te2)` from the row maxima `rows` of target rows `row0..`, by the kernels' tracker.
-/// Only rows reaching `minsc` are pushed (the tracker ignores the others), found 16 at a time.
-fn score2(rows: &[u8], row0: i32, s: i32, te: i32, minsc: i32, max_sc: i32) -> (i32, i32) {
-    let mut tr = SuboptimalTracker::new();
-    let ms = minsc.min(255) as u8;
-    let mut r = 0;
-    while r < rows.len() {
-        let n = 16.min(rows.len() - r);
-        let chunk = &rows[r..r + n];
-        // One vector max per full chunk: the scalar `any` is an early-exit loop over 8 GB of
-        // row maxima per 2M pairs, almost all of it below `minsc`.
-        #[cfg(target_arch = "aarch64")]
-        let hot = if n == 16 {
-            // SAFETY: `chunk` is 16 bytes; an unaligned load of them.
-            unsafe {
-                std::arch::aarch64::vmaxvq_u8(std::arch::aarch64::vld1q_u8(chunk.as_ptr())) >= ms
+/// The kernels' suboptimal tracker (`SuboptimalTracker::push_row`) streamed: `cs`/`cr` the open
+/// candidate (`cr == i32::MIN` when none), `s2`/`te2` the best closed one outside `[low, high]`.
+/// Its candidates are evaluated as each one closes instead of being stored: `s` and `te` are known
+/// up front, so `finish`'s exclusion test runs on the fly, in the same row order, keeping the
+/// first strict maximum as it does.
+struct Tracker {
+    s2: i32,
+    te2: i32,
+    cs: i32,
+    cr: i32,
+    low: i32,
+    high: i32,
+}
+
+impl Tracker {
+    #[inline(always)]
+    fn close(&mut self) {
+        if self.cr != i32::MIN && (self.cr < self.low || self.cr > self.high) && self.cs > self.s2 {
+            (self.s2, self.te2) = (self.cs, self.cr);
+        }
+    }
+
+    /// One row reaching `minsc`: it raises the candidate it directly follows (the candidate's row
+    /// is that of its last raise), else closes it and opens its own.
+    #[inline(always)]
+    fn push(&mut self, row: i32, v: i32) {
+        if self.cr != i32::MIN && self.cr + 1 == row {
+            if self.cs < v {
+                (self.cs, self.cr) = (v, row);
             }
         } else {
-            chunk.iter().any(|&v| v >= ms)
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        let hot = chunk.iter().any(|&v| v >= ms);
-        if hot {
-            for (x, &v) in chunk.iter().enumerate() {
-                tr.push_row(row0 + (r + x) as i32, i32::from(v), minsc);
+            self.close();
+            (self.cs, self.cr) = (v, row);
+        }
+    }
+
+    /// Push the rows `rows[from..to]` (target rows `row0 + x`) that reach `minsc`, skipping those
+    /// not above `s2`, the best kept so far. Such a row can never be kept (a candidate's score is
+    /// a row's), nor stop a better candidate from being: one row after it ends that candidate's
+    /// growth whatever its score, and skipping it only delays the candidate's close, which `s2`
+    /// does not change in between (every row that could change it is still pushed). The first row
+    /// above `s2` leaves the same state either way, opening or raising to `(v, row)`.
+    fn scan(&mut self, rows: &[u8], row0: i32, minsc: i32, from: usize, to: usize) {
+        #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+        let mut r = from;
+        // Rows are `u8`, so the vector test needs `minsc` in `1..=255`; any other `minsc` takes
+        // the row loop below for every row.
+        #[cfg(target_arch = "aarch64")]
+        if (1..=255).contains(&minsc) {
+            use std::arch::aarch64::*;
+            // SAFETY: NEON is part of the aarch64 baseline; each load reads 16 bytes inside `rows`
+            // (`r + 16 <= to <= rows.len()`).
+            unsafe {
+                while r + 16 <= to {
+                    // The bar a row must reach: `minsc`, or above `s2` once one is kept. Past 255
+                    // no `u8` row can.
+                    let bar = minsc.max(self.s2 + 1);
+                    if bar > 255 {
+                        return;
+                    }
+                    let a = vld1q_u8(rows.as_ptr().add(r));
+                    // One vector max per chunk: almost every row maximum is below the bar.
+                    if vmaxvq_u8(a) >= bar as u8 {
+                        // Four bits per row, set where the row reaches the bar.
+                        let mut nib = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                            vreinterpretq_u16_u8(vcgeq_u8(a, vdupq_n_u8(bar as u8))),
+                        ))) & 0x1111_1111_1111_1111;
+                        while nib != 0 {
+                            let x = r + nib.trailing_zeros() as usize / 4;
+                            self.push(row0 + x as i32, i32::from(rows[x]));
+                            nib &= nib - 1;
+                        }
+                    }
+                    r += 16;
+                }
             }
         }
-        r += n;
+        for (x, &v) in rows.iter().enumerate().take(to).skip(r) {
+            if i32::from(v) >= minsc && i32::from(v) > self.s2 {
+                self.push(row0 + x as i32, i32::from(v));
+            }
+        }
     }
-    tr.finish(s, te, max_sc)
+}
+
+/// `(score2, te2)` from the row maxima `rows` of target rows `row0..`, by the kernels' tracker.
+///
+/// The rows inside the exclusion zone `[low, high]` (around `te`, where the rows reaching `minsc`
+/// crowd) are mostly skipped: a candidate whose row is in the zone is never kept, so once the open
+/// candidate's row is in the zone the only thing the zone's remaining rows decide is whether the
+/// candidate open at its last row `h` was raised there (then `(rows[h], h)`, which the next row may
+/// continue). That follows `u_i = p_i && !(u_(i-1) && v_(i-1) >= v_i)` (`p_i`: row `i` reaches
+/// `minsc`): `u_i = p_i` where the previous row is not pushed or is lower, and `u` alternates along
+/// a run of pushed, non-increasing rows. So `u_h` comes from walking that run back from `h`.
+fn score2(rows: &[u8], row0: i32, s: i32, te: i32, minsc: i32, max_sc: i32) -> (i32, i32) {
+    let half = (s + max_sc - 1) / max_sc;
+    let (low, high) = (te - half, te + half);
+    let mut t = Tracker {
+        s2: -1,
+        te2: -1,
+        cs: 0,
+        cr: i32::MIN,
+        low,
+        high,
+    };
+    let n = rows.len();
+    // The zone's rows `[b0, b1)`, as indices into `rows`.
+    let idx = |row: i64| (row - i64::from(row0)).clamp(0, n as i64) as usize;
+    let (b0, b1) = if high - low >= 2 {
+        (idx(i64::from(low)), idx(i64::from(high) + 1))
+    } else {
+        (n, n)
+    };
+    t.scan(rows, row0, minsc, 0, b0);
+    // Row by row until the open candidate's row enters the zone (at most two pushed rows).
+    let mut x = b0;
+    while x < b1 && !(low..=high).contains(&t.cr) {
+        if i32::from(rows[x]) >= minsc {
+            t.push(row0 + x as i32, i32::from(rows[x]));
+        }
+        x += 1;
+    }
+    if x < b1 {
+        // The candidate was raised at row `x - 1`, so `u` is true there; walk back from the last
+        // zone row `h` along pushed, non-increasing rows, stopping at `x - 1` at the latest.
+        let (h, known) = (b1 - 1, x - 1);
+        let p = |i: usize| i32::from(rows[i]) >= minsc;
+        let raised = p(h) && {
+            let mut j = h;
+            while j > known && p(j - 1) && rows[j - 1] >= rows[j] {
+                j -= 1;
+            }
+            // `u_j` is true (`j == known`, or the run starts at `j` with `p_j`); it alternates.
+            (h - j) % 2 == 0
+        };
+        // Not raised at `h`: any zone row other than `h` stands for the candidate, which the next
+        // row cannot continue and which, being in the zone, is never kept.
+        (t.cs, t.cr) = if raised {
+            (i32::from(rows[h]), row0 + h as i32)
+        } else {
+            (t.cs, low)
+        };
+    }
+    t.scan(rows, row0, minsc, b1, n);
+    t.close();
+    if s > 0 {
+        (t.s2, t.te2)
+    } else {
+        (-1, -1)
+    }
 }
 
 fn write(p: &Parent, o: &mut KswAlignResult) {
@@ -660,6 +807,9 @@ pub(crate) mod neon {
         a: Vec<u8>,
         refv: Vec<u8>,
         h: Vec<u8>,
+        /// H of rows `r`, `r + 1`, `r + 2` of a four-row step (row `r + 3` is in `h`), kept for
+        /// the `qe` scan.
+        hr: Vec<u8>,
         e: Vec<u8>,
         r: Vec<u8>,
         rl: Vec<u8>,
@@ -768,8 +918,22 @@ pub(crate) mod neon {
         ///
         /// # Safety
         /// NEON available.
-        #[target_feature(enable = "neon")]
         pub(super) unsafe fn run(
+            &mut self,
+            lanes: &[Lane],
+            w: usize,
+            tbl: &[u8; 16],
+            gaps: [u8; 4],
+        ) {
+            if gaps[0] == gaps[2] {
+                self.run_impl::<true>(lanes, w, tbl, gaps)
+            } else {
+                self.run_impl::<false>(lanes, w, tbl, gaps)
+            }
+        }
+
+        #[target_feature(enable = "neon")]
+        unsafe fn run_impl<const SHARE: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -790,8 +954,10 @@ pub(crate) mod neon {
             // masked cells read and write there (see the row loop).
             let hs = w + 7;
             fit(&mut self.h, 2 * hs * L);
+            fit(&mut self.hr, 3 * hs * L);
             fit(&mut self.e, (w + 9) * L);
             fit(&mut self.r, nrp * L);
+            // `hr` needs no clearing: the qe scan reads only slots its four-row step wrote.
             self.h[..2 * hs * L].fill(0);
             self.e[..(w + 9) * L].fill(0);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
@@ -820,14 +986,18 @@ pub(crate) mod neon {
             transpose_to(st, stride, npp, self.a.as_mut_ptr());
             for l in 0..L {
                 let row = std::slice::from_raw_parts_mut(st.add(l * stride), nrp);
-                row.fill(RPAD);
-                if let Some(lane) = lanes.get(l) {
+                let Some(lane) = lanes.get(l) else {
+                    row.fill(RPAD);
+                    continue;
+                };
+                {
                     row[..lane.t.len()].copy_from_slice(lane.t);
+                    row[lane.t.len()..].fill(RPAD);
                     // A target N scores -1 against everything through the table's slots 8 and
                     // 12-15 once it is re-encoded as 12 (`N_TARGET`); as 4 it would read the
                     // match slot against a query N. A pruned job holds none; a reverse-pass job
-                    // may.
-                    if lane.t.iter().any(|&b| b > 3) {
+                    // may. An OR fold, not `any`: it vectorises, and `b > 3` is `b & !3 != 0`.
+                    if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
                         for b in row[..lane.t.len()].iter_mut() {
                             if *b == 4 {
                                 *b = 12;
@@ -864,20 +1034,46 @@ pub(crate) mod neon {
                 self.h.as_mut_ptr().add(3 * L),
                 self.h.as_mut_ptr().add((hs + 3) * L),
             );
+            let hr0 = self.hr.as_mut_ptr().add(3 * L);
+            let (hr1, hr2) = (hr0.add(hs * L), hr0.add(2 * hs * L));
             let li = L as isize;
             let mut gmax = zero;
             let mut te = [-1i32; L];
-            let mut qe = [0u8; L];
+            let mut qev = zero;
             let wm1 = w as i32 - 1;
+            // `qe` is not tracked per cell. A lane's (te, qe) is that of its last improving row, so
+            // `qe` is read off H only where a run of consecutive improving rows ends (`pend`: the
+            // lanes that improved on the previous row, `prev`: that row's H), a few times per lane:
+            // the largest k in the row's computed range whose H equals gmax. That is the cell the
+            // per-cell tracking picked (the first, in k-descending order, reaching the live row
+            // max): cells above a lane's range are j < 0 and hold 0 < gmax, and its dead
+            // (j >= quanta) cells all lie below its live ones, so the largest match is live.
+            let mut pend = zero;
+            let mut prev: (*const u8, i32) = (std::ptr::null(), -1);
+            let qe_scan =
+                |buf: *const u8, row: i32, msk: uint8x16_t, gmax: uint8x16_t, qev: uint8x16_t| {
+                    let (kl, kh) = (0.max(row + ominq), wm1.min(row + omax));
+                    let mut jv = vaddq_u8(vdupq_n_u8((row - kl) as u8), ov);
+                    let mut best = zero;
+                    for k in kl..=kh {
+                        let eq = vceqq_u8(vld1q_u8(buf.add(k as usize * L)), gmax);
+                        best = vbslq_u8(eq, jv, best);
+                        jv = vsubq_u8(jv, one);
+                    }
+                    vbslq_u8(msk, best, qev)
+                };
 
             // One cell: `d` the diagonal H, `ein` the E carry, `f` the row's F carry (updated),
             // `top` the validity mask of a cell past `w - 1` (`None`: valid), `LIVE` whether a lane
             // can be on a dead `j >= quanta` cell here. Returns `(H, E for the row below)`.
             macro_rules! cell {
-                ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $jcol:ident,
-                 $jv:expr, $top:expr, $live:expr) => {{
+                ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
+                 $live:expr) => {{
                     let sc = vqtbl1q_u8(tblv, veorq_u8($q, $rref));
-                    let h0 = vmaxq_u8(vsqaddq_u8($d, vreinterpretq_s8_u8(sc)), $ein);
+                    let mut h0 = vmaxq_u8(vsqaddq_u8($d, vreinterpretq_s8_u8(sc)), $ein);
+                    if let Some(m) = $top {
+                        h0 = vandq_u8(h0, m);
+                    }
                     let mut h = vmaxq_u8(h0, $f);
                     if let Some(m) = $top {
                         h = vandq_u8(h, m);
@@ -887,32 +1083,43 @@ pub(crate) mod neon {
                     } else {
                         h
                     };
-                    $jcol = vbslq_u8(vcgtq_u8(hl, $rmax), $jv, $jcol);
                     $rmax = vmaxq_u8($rmax, hl);
-                    let eout = vmaxq_u8(vqsubq_u8(h, oe_del), vqsubq_u8($ein, e_del));
-                    $f = vmaxq_u8(vqsubq_u8(h, oe_ins), vqsubq_u8($f, e_ins));
+                    // Both gaps open from G = max(diagonal, E), not H (fg-labs/bwa-mem3's FScan
+                    // cell): E then no longer waits on F, which takes F's max off the row-to-row
+                    // E chain of the skewed step. It only drops paths with an in-row gap run
+                    // directly followed by a vertical one; each such optimal path has a twin with
+                    // the two runs swapped, same score, which F admits, and which the band holds
+                    // wherever the band must be exact (rescue_prune's containment for round 1,
+                    // the [-Imax, Dmax] diagonal range for the reverse pass): gmax, te, the qe
+                    // cells and the row maxima are unchanged. In a whole-window band every H is.
+                    // `SHARE`: one open for both gaps when `oe_del == oe_ins` (bwa's default).
+                    let t = vqsubq_u8(h0, oe_del);
+                    let eout = vmaxq_u8(t, vqsubq_u8($ein, e_del));
+                    let ti = if SHARE { t } else { vqsubq_u8(h0, oe_ins) };
+                    $f = vmaxq_u8(ti, vqsubq_u8($f, e_ins));
                     (h, eout)
                 }};
             }
-            // Row bookkeeping: publish the row max, update the lanes' best.
+            // Row bookkeeping: publish the row max, update the lanes' best, close the runs of
+            // improving rows that ended on the previous row. `$buf` holds this row's H.
             macro_rules! finish_row {
-                ($row:expr, $rmax:expr, $jcol:expr, $rref:expr) => {{
+                ($row:expr, $rmax:expr, $rref:expr, $buf:expr) => {{
                     vst1q_u8(rout.add($row * L), $rmax);
                     let imp = vandq_u8(vcgtq_u8($rmax, gmax), vcltq_u8($rref, rpadv));
-                    gmax = vbslq_u8(imp, $rmax, gmax);
-                    let m = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
-                        vreinterpretq_u16_u8(imp),
-                    )));
-                    if m != 0 {
-                        let mut jc = [0u8; L];
-                        vst1q_u8(jc.as_mut_ptr(), $jcol);
-                        for l in 0..L {
-                            if m >> (4 * l) & 1 != 0 {
-                                te[l] = $row as i32;
-                                qe[l] = jc[l];
-                            }
-                        }
+                    let flush = vbicq_u8(pend, imp);
+                    if vmaxvq_u8(flush) != 0 {
+                        qev = qe_scan(prev.0, prev.1, flush, gmax, qev);
                     }
+                    gmax = vbslq_u8(imp, $rmax, gmax);
+                    let mut m = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                        vreinterpretq_u16_u8(imp),
+                    ))) & 0x1111_1111_1111_1111;
+                    while m != 0 {
+                        te[m.trailing_zeros() as usize / 4] = $row as i32;
+                        m &= m - 1;
+                    }
+                    pend = imp;
+                    prev = ($buf as *const u8, $row as i32);
                 }};
             }
 
@@ -923,7 +1130,6 @@ pub(crate) mod neon {
                 let klo = 0.max(ri + ominq);
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
-                let mut jv = vaddq_u8(vdupq_n_u8((ri - khi) as u8), ov);
                 if r + 3 < nr {
                     // Four rows per step, skewed: `(r, k)`, `(r+1, k+1)`, `(r+2, k+2)`, `(r+3, k+3)`
                     // share the query position `p = r + c - k`; each row's diagonal and E carry come
@@ -939,7 +1145,6 @@ pub(crate) mod neon {
                     let (mut f0, mut f1, mut f2, mut f3) = (zero, zero, zero, zero);
                     let (mut d1, mut d2, mut d3) = (zero, zero, zero);
                     let (mut rmax0, mut rmax1, mut rmax2, mut rmax3) = (zero, zero, zero, zero);
-                    let (mut jcol0, mut jcol1, mut jcol2, mut jcol3) = (zero, zero, zero, zero);
                     macro_rules! step4 {
                         ($mask:expr, $live:expr) => {{
                             let ko = k as isize;
@@ -957,18 +1162,16 @@ pub(crate) mod neon {
                             let q = vld1q_u8(a.offset((r as isize + w as isize - 1 - ko) * li));
                             let e0 = vld1q_u8(e.offset(ko * li));
                             let d0 = vld1q_u8(hp.offset(ko * li));
-                            let (h0, e1) =
-                                cell!(d0, e0, f0, q, rref0, rmax0, jcol0, jv, valid(0), $live);
-                            let (h1, e2) =
-                                cell!(d1, e1, f1, q, rref1, rmax1, jcol1, jv, valid(1), $live);
-                            let (h2, e3) =
-                                cell!(d2, e2, f2, q, rref2, rmax2, jcol2, jv, valid(2), $live);
-                            let (h3, e4) =
-                                cell!(d3, e3, f3, q, rref3, rmax3, jcol3, jv, valid(3), $live);
+                            let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), $live);
+                            let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), $live);
+                            let (h2, e3) = cell!(d2, e2, f2, q, rref2, rmax2, valid(2), $live);
+                            let (h3, e4) = cell!(d3, e3, f3, q, rref3, rmax3, valid(3), $live);
+                            vst1q_u8(hr0.offset(ko * li), h0);
+                            vst1q_u8(hr1.offset((ko + 1) * li), h1);
+                            vst1q_u8(hr2.offset((ko + 2) * li), h2);
                             vst1q_u8(hc.offset((ko + 3) * li), h3);
                             vst1q_u8(e.offset((ko + 4) * li), e4);
                             (d1, d2, d3) = (h0, h1, h2);
-                            jv = vaddq_u8(jv, one);
                             k -= 1;
                         }};
                     }
@@ -986,10 +1189,10 @@ pub(crate) mod neon {
                     while k >= kend {
                         step4!(true, true);
                     }
-                    finish_row!(r, rmax0, jcol0, rref0);
-                    finish_row!(r + 1, rmax1, jcol1, rref1);
-                    finish_row!(r + 2, rmax2, jcol2, rref2);
-                    finish_row!(r + 3, rmax3, jcol3, rref3);
+                    finish_row!(r, rmax0, rref0, hr0);
+                    finish_row!(r + 1, rmax1, rref1, hr1);
+                    finish_row!(r + 2, rmax2, rref2, hr2);
+                    finish_row!(r + 3, rmax3, rref3, hc);
                     r += 4;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
@@ -997,17 +1200,16 @@ pub(crate) mod neon {
                 } else {
                     self.cells += (khi - klo + 1).max(0) as u64;
                     let rref = vld1q_u8(self.refv.as_ptr().add(r * L));
-                    let (mut f, mut rmax, mut jcol) = (zero, zero, zero);
+                    let (mut f, mut rmax) = (zero, zero);
                     macro_rules! step1 {
                         ($live:expr) => {{
                             let ko = k as isize;
                             let q = vld1q_u8(a.offset((r as isize + w as isize - 1 - ko) * li));
                             let e0 = vld1q_u8(e.offset(ko * li));
                             let d0 = vld1q_u8(hp.offset(ko * li));
-                            let (h, e1) = cell!(d0, e0, f, q, rref, rmax, jcol, jv, None, $live);
+                            let (h, e1) = cell!(d0, e0, f, q, rref, rmax, None, $live);
                             vst1q_u8(hc.offset(ko * li), h);
                             vst1q_u8(e.offset((ko + 1) * li), e1);
-                            jv = vaddq_u8(jv, one);
                             k -= 1;
                         }};
                     }
@@ -1017,7 +1219,7 @@ pub(crate) mod neon {
                     while k >= klo {
                         step1!(true);
                     }
-                    finish_row!(r, rmax, jcol, rref);
+                    finish_row!(r, rmax, rref, hc);
                     r += 1;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
@@ -1025,9 +1227,12 @@ pub(crate) mod neon {
                 }
                 std::mem::swap(&mut hc, &mut hp);
             }
+            if vmaxvq_u8(pend) != 0 {
+                qev = qe_scan(prev.0, prev.1, pend, gmax, qev);
+            }
             vst1q_u8(self.gmax.as_mut_ptr(), gmax);
             self.te = te;
-            self.qe = qe;
+            vst1q_u8(self.qe.as_mut_ptr(), qev);
             // Row maxima back to lane-major, zero past `nr`.
             self.rstride = nrp;
             fit(&mut self.rl, nrp * L);
@@ -1362,6 +1567,56 @@ mod tests {
     use crate::matesw::{batched_align, KswJob};
     use crate::rescue_prune::tests::{load_dump, scmat};
     use bwa_extend::ksw_align2;
+
+    /// The streamed `score2` equals `SuboptimalTracker` on random row maxima: plateaus, gaps,
+    /// values around `minsc`, rows offset by `row0`.
+    #[test]
+    fn score2_equals_tracker() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as usize
+        };
+        for _ in 0..20000 {
+            let n = next() % 300;
+            // Half the rounds walk in small steps, for plateaus and slopes (the tracker's
+            // alternating case), the rest jump.
+            let walk = next() % 2 == 0;
+            let mut cur = 30i32;
+            let rows: Vec<u8> = (0..n)
+                .map(|_| {
+                    if walk {
+                        cur = (cur + (next() % 5) as i32 - 2).clamp(0, 60);
+                        return cur as u8;
+                    }
+                    match next() % 4 {
+                        0 => 0,
+                        1 => (15 + next() % 10) as u8,
+                        _ => (next() % 60) as u8,
+                    }
+                })
+                .collect();
+            let minsc = match next() % 8 {
+                0 => 300,
+                1 => (next() % 3) as i32 - 1,
+                _ => 1 + (next() % 60) as i32,
+            };
+            let (row0, max_sc) = ((next() % 50) as i32, 1 + (next() % 2) as i32);
+            let s = i32::from(rows.iter().copied().max().unwrap_or(0));
+            let te = row0 + if n > 0 { (next() % n) as i32 } else { -1 };
+            let mut tr = bwa_extend::SuboptimalTracker::new();
+            for (i, &v) in rows.iter().enumerate() {
+                tr.push_row(row0 + i as i32, i32::from(v), minsc);
+            }
+            assert_eq!(
+                score2(&rows, row0, s, te, minsc, max_sc),
+                tr.finish(s, te, max_sc),
+                "rows {rows:?} row0 {row0} te {te} minsc {minsc}"
+            );
+        }
+    }
 
     /// The batched path (which bands every eligible pruned job) against `ksw_align2` on the full
     /// window: every consumed result (`score >= minsc`) must be identical, on generated jobs with

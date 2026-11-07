@@ -550,6 +550,67 @@ fn cell_bound(job: &ExtendJob, max_sc: i32) -> i32 {
     job.h0 + (job.query.len().min(job.target.len()) as i32) * max_sc.max(0)
 }
 
+/// [`ungapped_hit`]'s diagonal walk: the mismatch columns as bits and their count, or `None` on an
+/// N, on more than `x_threshold` mismatches, or on a mismatch at column `>= cap` (cap <= 128). All
+/// three exits decline, so testing them 16 columns at a time cannot change which jobs decline.
+#[inline]
+fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u128, i32)> {
+    // Whole 16-column blocks then lie wholly below or wholly at or past `cap`.
+    debug_assert!(cap <= 128 && cap.is_multiple_of(16));
+    let n = q.len();
+    let (mut bits, mut total) = (0u128, 0i32);
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+    let mut col = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; every load reads 16 bytes below `n` of slices
+    // `n` long.
+    unsafe {
+        use std::arch::aarch64::*;
+        while col + 16 <= n {
+            let (a, b) = (vld1q_u8(q.as_ptr().add(col)), vld1q_u8(t.as_ptr().add(col)));
+            if vmaxvq_u8(vmaxq_u8(a, b)) >= 4 {
+                return None;
+            }
+            let ne = vmvnq_u8(vceqq_u8(a, b));
+            // Four bits per byte, then one per byte.
+            let nib = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                vreinterpretq_u16_u8(ne),
+            )));
+            if nib != 0 {
+                if col + 16 > cap {
+                    return None;
+                }
+                let mut m = 0u128;
+                let mut x = nib & 0x1111_1111_1111_1111;
+                while x != 0 {
+                    m |= 1u128 << (col + x.trailing_zeros() as usize / 4);
+                    x &= x - 1;
+                }
+                total += m.count_ones() as i32;
+                if total > x_threshold {
+                    return None;
+                }
+                bits |= m;
+            }
+            col += 16;
+        }
+    }
+    for col in col..n {
+        let (query_base, target_base) = (q[col], t[col]);
+        if query_base >= 4 || target_base >= 4 {
+            return None;
+        }
+        if query_base != target_base {
+            total += 1;
+            if total > x_threshold || col >= cap {
+                return None;
+            }
+            bits |= 1u128 << col;
+        }
+    }
+    Some((bits, total))
+}
+
 /// Ungapped diagonal fast path (nh13's `ungapped_analyze`, FP_STATUS_HIT; `bwamem.cpp`): when a
 /// seed extension stays on the diagonal with few enough mismatches, the ungapped alignment is
 /// *provably* optimal and the banded Smith-Waterman is skipped.
@@ -624,25 +685,12 @@ fn ungapped_hit(
     // `mismatch_bits` bit `c` is set iff diagonal position `c` is a mismatch (so only positions
     // `< 128` are representable); `total_mis` counts them, including any beyond the bitmap, and is
     // what gets tested against `x_threshold`.
-    let mut mismatch_bits: u128 = 0;
-    let mut total_mis = 0i32;
-    for col in 0..diag_len {
-        // SAFETY of indexing: target.len() >= diag_len checked above.
-        let (query_base, target_base) = (job.query[col], job.target[col]);
-        if query_base >= 4 || target_base >= 4 {
-            return None;
-        }
-        if query_base != target_base {
-            total_mis += 1;
-            if total_mis > x_threshold {
-                return None; // a gapped alignment could win: let the kernel decide
-            }
-            if col >= MISMATCH_BITMAP_BITS {
-                return None; // past the mismatch bitmap
-            }
-            mismatch_bits |= 1u128 << col;
-        }
-    }
+    let (mismatch_bits, total_mis) = mismatch_scan(
+        &job.query[..diag_len],
+        &job.target[..diag_len],
+        x_threshold,
+        MISMATCH_BITMAP_BITS,
+    )?;
     if total_mis == 0 {
         // A mismatch-free walk only ever climbs, so its last cell is also its best: local and
         // query-exhausting alignments coincide and both consume all `diag_len` bases.
@@ -826,7 +874,6 @@ fn simd_dispatch(
 /// of its representative in `unique`. `map[i] == i'` means `out[i]` must be `results[i']`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
-    use std::collections::hash_map::Entry;
     use std::collections::HashMap;
 
     /// Fold up to `LIMIT` bytes from each end of `s` into `h`, eight at a time. Reading words
@@ -851,7 +898,28 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
         }
     }
 
-    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(jobs.len());
+    /// The keys are already FNV hashes: used as they are, not hashed again with SipHash.
+    #[derive(Default)]
+    struct Pass(u64);
+    impl std::hash::Hasher for Pass {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, b: &[u8]) {
+            for &x in b {
+                self.0 = (self.0 ^ u64::from(x)).wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+        fn write_u64(&mut self, x: u64) {
+            self.0 = x;
+        }
+    }
+    // Fingerprint -> the latest distinct job with it; `older[i]`: the previous distinct job with
+    // job `i`'s fingerprint (`u32::MAX`: none). Distinct jobs never compare equal, so at most one
+    // on a chain matches and the walk order does not matter.
+    let mut heads: HashMap<u64, u32, std::hash::BuildHasherDefault<Pass>> =
+        HashMap::with_capacity_and_hasher(jobs.len(), Default::default());
+    let mut older: Vec<u32> = Vec::with_capacity(jobs.len());
     let mut unique: Vec<ExtendJob<'a>> = Vec::with_capacity(jobs.len());
     let mut map: Vec<u32> = Vec::with_capacity(jobs.len());
 
@@ -864,34 +932,25 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
         fold(&mut h, job.query);
         fold(&mut h, job.target);
 
-        let slot = match buckets.entry(h) {
-            Entry::Occupied(e) => {
-                // Same fingerprint: could be the same job or a collision, so compare the bytes.
-                // Only jobs that reach here pay for a comparison, and they are the minority.
-                let mut found = None;
-                for &cand in e.get() {
-                    let u = &unique[cand as usize];
-                    if u.h0 == job.h0 && u.query == job.query && u.target == job.target {
-                        found = Some(cand);
-                        break;
-                    }
-                }
-                match found {
-                    Some(cand) => cand,
-                    None => {
-                        let idx = unique.len() as u32;
-                        unique.push(*job);
-                        e.into_mut().push(idx);
-                        idx
-                    }
-                }
+        let head = heads.entry(h).or_insert(u32::MAX);
+        // Same fingerprint: could be the same job or a collision, so compare the bytes. Only jobs
+        // that reach here pay for a comparison, and they are the minority.
+        let mut cand = *head;
+        while cand != u32::MAX {
+            let u = &unique[cand as usize];
+            if u.h0 == job.h0 && u.query == job.query && u.target == job.target {
+                break;
             }
-            Entry::Vacant(e) => {
-                let idx = unique.len() as u32;
-                unique.push(*job);
-                e.insert(vec![idx]);
-                idx
-            }
+            cand = older[cand as usize];
+        }
+        let slot = if cand != u32::MAX {
+            cand
+        } else {
+            let idx = unique.len() as u32;
+            unique.push(*job);
+            older.push(*head);
+            *head = idx;
+            idx
         };
         map.push(slot);
     }
@@ -4815,5 +4874,96 @@ mod avx512_verify {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mismatch_scan_tests {
+    /// The byte loop `mismatch_scan` replaced, kept as its reference.
+    fn reference(q: &[u8], t: &[u8], x: i32, cap: usize) -> Option<(u128, i32)> {
+        let (mut bits, mut total) = (0u128, 0i32);
+        for col in 0..q.len() {
+            if q[col] >= 4 || t[col] >= 4 {
+                return None;
+            }
+            if q[col] != t[col] {
+                total += 1;
+                if total > x || col >= cap {
+                    return None;
+                }
+                bits |= 1u128 << col;
+            }
+        }
+        Some((bits, total))
+    }
+
+    #[test]
+    fn mismatch_scan_equals_the_byte_loop() {
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |m: u64| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st % m
+        };
+        for _ in 0..200_000 {
+            let n = rnd(200) as usize;
+            let q: Vec<u8> = (0..n).map(|_| rnd(4) as u8).collect();
+            let mut t = q.clone();
+            for _ in 0..rnd(8) {
+                if n > 0 {
+                    let i = rnd(n as u64) as usize;
+                    t[i] = if rnd(40) == 0 { 4 } else { rnd(4) as u8 };
+                }
+            }
+            let x = rnd(10) as i32 - 1;
+            assert_eq!(
+                super::mismatch_scan(&q, &t, x, 128),
+                reference(&q, &t, x, 128),
+                "n={n} x={x}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod dedup_jobs_tests {
+    use bwa_extend::ExtendJob;
+
+    /// Every job maps to a distinct job with the same `h0`, query and target, and the distinct
+    /// jobs come in first-appearance order.
+    #[test]
+    fn dedup_maps_each_job_to_its_equal() {
+        // Short sequences over a small alphabet, so contents repeat, including across `h0`.
+        let seqs: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| (0..(i % 7 + 1)).map(|j| ((i * 3 + j) % 3) as u8).collect())
+            .collect();
+        let jobs: Vec<ExtendJob> = (0..400u32)
+            .map(|i| ExtendJob {
+                query: &seqs[(i * 7 % 40) as usize],
+                target: &seqs[(i * 13 % 40) as usize],
+                h0: (i % 3) as i32,
+            })
+            .collect();
+        let (unique, map) = super::dedup_jobs(&jobs);
+        let same = |a: &ExtendJob, b: &ExtendJob| {
+            a.h0 == b.h0 && a.query == b.query && a.target == b.target
+        };
+        for (j, &u) in jobs.iter().zip(&map) {
+            assert!(same(j, &unique[u as usize]));
+        }
+        for (x, a) in unique.iter().enumerate() {
+            assert!(unique[x + 1..].iter().all(|b| !same(a, b)));
+            assert_eq!(
+                map.iter()
+                    .position(|&u| u as usize == x)
+                    .map(|i| same(&jobs[i], a)),
+                Some(true)
+            );
+        }
+        let first: Vec<usize> = (0..unique.len())
+            .map(|x| map.iter().position(|&u| u as usize == x).unwrap())
+            .collect();
+        assert!(first.windows(2).all(|w| w[0] < w[1]));
     }
 }

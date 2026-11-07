@@ -192,6 +192,18 @@ const fn rows_before(y: i64) -> u64 {
     !(u64::MAX >> y)
 }
 
+/// [`rows_before`] for every `y` in `0..64`, for loading the mask straight into a vector register.
+#[cfg(target_arch = "aarch64")]
+static ROWS_BEFORE: [u64; 64] = {
+    let mut t = [0u64; 64];
+    let mut y = 0;
+    while y < 64 {
+        t[y] = rows_before(y as i64);
+        y += 1;
+    }
+    t
+};
+
 /// Loaded FM-index plus the binary reference for O(1) base access.
 pub struct FmIndex {
     /// `reference_seq_len` = 2L + 1, i.e. the number of BWT rows: `2 * l_pac` reference positions
@@ -302,6 +314,12 @@ pub(crate) fn unpack_pac_base(pac: &[u8], l_pac: i64, pos: i64) -> u8 {
 /// - `out`: destination, filled with exactly `len` bases, one per byte, codes 0..=3.
 #[inline]
 fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: neon detected; `out` has `len + 16` bytes of room, as every caller reserves.
+        unsafe { unpack_fwd_neon(pac, start, len, out) };
+        return;
+    }
     // Bases before the first whole packed byte, done one at a time so the block loop below can
     // assume `pos % 4 == 0`.
     let mut pos = start;
@@ -309,39 +327,6 @@ fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     while pos < end && (pos & 3) != 0 {
         out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
         pos += 1;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            use std::arch::aarch64::*;
-            // SAFETY: neon detected. Every load reads 4 bytes at `pos >> 2` with
-            // `pos + 16 <= end <= l_pac`, so the byte index is inside the payload; every store
-            // writes 16 bytes into capacity reserved by the caller's `with_capacity`.
-            unsafe {
-                // Spread byte `k` of the four loaded bytes across lanes `4k..4k+4`.
-                let spread = vld1q_u8([0u8, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3].as_ptr());
-                // Right shifts, as the negative left shifts `vshlq_u8` wants: within a byte the
-                // most significant pair is base 0, so the four bases need `>>6, >>4, >>2, >>0`.
-                let shifts = vld1q_s8(
-                    [-6i8, -4, -2, 0, -6, -4, -2, 0, -6, -4, -2, 0, -6, -4, -2, 0].as_ptr(),
-                );
-                let three = vdupq_n_u8(3);
-                while pos + 16 <= end {
-                    // The four packed bytes holding these sixteen bases, broadcast so the table
-                    // lookup can pick any of them into any lane.
-                    let word =
-                        (pac.as_ptr().add((pos >> 2) as usize) as *const u32).read_unaligned();
-                    let v = vreinterpretq_u8_u32(vdupq_n_u32(word));
-                    let v = vqtbl1q_u8(v, spread);
-                    let v = vandq_u8(vshlq_u8(v, shifts), three);
-                    let n = out.len();
-                    vst1q_u8(out.as_mut_ptr().add(n), v);
-                    out.set_len(n + 16);
-                    pos += 16;
-                }
-            }
-        }
     }
 
     // The same sixteen-bases-per-iteration unpack on x86. It was missing, and the cost of missing
@@ -435,51 +420,196 @@ pub(crate) fn unpack_pac_range(pac: &[u8], l_pac: i64, rb: i64, re: i64) -> Vec<
 /// complemented (`^ 3`), walking the source from its end so the output comes out in order. The
 /// head and tail that do not fill a word go base by base. Appends to `out`, which must have room
 /// for `len + 16` bytes.
+/// `SPREAD[o]`: for sixteen bases starting `o` bases into a packed byte, the byte each lane reads
+/// (`IDX`) and the right shift that brings its base down (`SH`, negative as `vshlq_u8` wants;
+/// within a byte the most significant pair is base 0).
+#[cfg(target_arch = "aarch64")]
+const SPREAD: ([[u8; 16]; 4], [[i8; 16]; 4]) = {
+    let (mut idx, mut sh) = ([[0u8; 16]; 4], [[0i8; 16]; 4]);
+    let mut o = 0;
+    while o < 4 {
+        let mut i = 0;
+        while i < 16 {
+            idx[o][i] = ((o + i) >> 2) as u8;
+            sh[o][i] = -(6 - 2 * ((o + i) & 3) as i8);
+            i += 1;
+        }
+        o += 1;
+    }
+    (idx, sh)
+};
+
+/// Forward bases `[p, p + 16)` at any alignment: the five packed bytes holding them come from one
+/// 8-byte load, spread and shifted by the tables of `p % 4`.
+///
+/// # Safety
+/// NEON present, `p >= 0` and `(p >> 2) + 8 <= pac.len()`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn unpack16(
+    pac: &[u8],
+    p: i64,
+    idx: std::arch::aarch64::uint8x16_t,
+    sh: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::uint8x16_t {
+    use std::arch::aarch64::*;
+    let w = (pac.as_ptr().add((p >> 2) as usize) as *const u64).read_unaligned();
+    let v = vqtbl1q_u8(vreinterpretq_u8_u64(vdupq_n_u64(w)), idx);
+    vandq_u8(vshlq_u8(v, sh), vdupq_n_u8(3))
+}
+
+/// Bases `[p, p + 64)` of the forward strand, `p % 4 == 0`, written to `dst`, or with `rc` their
+/// reverse complement: their 16 packed bytes in one load, each byte's four 2-bit fields split by
+/// shifts and interleaved by one `st4` (fg-labs/bwa-mem3's `bns_block`). For `rc` the bytes are
+/// reversed and inverted first: `!b` complements all four bases, and `b`'s low field is then the
+/// first one out.
+///
+/// # Safety
+/// NEON present, `p >= 0`, `(p >> 2) + 16 <= pac.len()`, and `dst` valid for 64 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn unpack64(pac: &[u8], p: i64, rc: bool, dst: *mut u8) {
+    use std::arch::aarch64::*;
+    let q = vld1q_u8(pac.as_ptr().add((p >> 2) as usize));
+    let m = vdupq_n_u8(3);
+    if rc {
+        let r = vmvnq_u8(vrev64q_u8(q));
+        let q = vextq_u8(r, r, 8);
+        let f = uint8x16x4_t(
+            vandq_u8(q, m),
+            vandq_u8(vshrq_n_u8::<2>(q), m),
+            vandq_u8(vshrq_n_u8::<4>(q), m),
+            vshrq_n_u8::<6>(q),
+        );
+        vst4q_u8(dst, f);
+    } else {
+        let f = uint8x16x4_t(
+            vshrq_n_u8::<6>(q),
+            vandq_u8(vshrq_n_u8::<4>(q), m),
+            vandq_u8(vshrq_n_u8::<2>(q), m),
+            vandq_u8(q, m),
+        );
+        vst4q_u8(dst, f);
+    }
+}
+
+/// Windows at least this long go to byte alignment base by base and then 64 bases per
+/// [`unpack64`]; the rest of a window, and any shorter one, 16 at a time.
+#[cfg(target_arch = "aarch64")]
+const UNPACK64_MIN: usize = 67;
+
+/// [`unpack_pac_fwd`] on NEON: 64 bases per step from a byte boundary ([`unpack64`]), then sixteen
+/// per step from any alignment, the last step stored whole and trimmed, so no base goes one at a
+/// time except the (at most three) before the boundary and within 8 bytes of the end of `pac`.
+///
+/// # Safety
+/// NEON present; `out` has room for `len + 16` bytes past its length.
+#[cfg(target_arch = "aarch64")]
+unsafe fn unpack_fwd_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    use std::arch::aarch64::*;
+    let end = start + len as i64;
+    let mut pos = start;
+    if len >= UNPACK64_MIN {
+        while pos & 3 != 0 {
+            out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
+            pos += 1;
+        }
+        // `pos + 64 <= end <= l_pac`, so the 16 bytes from `pos >> 2` are inside `pac`.
+        while pos + 64 <= end {
+            let n = out.len();
+            unpack64(pac, pos, false, out.as_mut_ptr().add(n));
+            out.set_len(n + 64);
+            pos += 64;
+        }
+    }
+    let o = (pos & 3) as usize;
+    let (idx, sh) = (
+        vld1q_u8(SPREAD.0[o].as_ptr()),
+        vld1q_s8(SPREAD.1[o].as_ptr()),
+    );
+    while pos < end && ((pos >> 2) as usize) + 8 <= pac.len() {
+        let v = unpack16(pac, pos, idx, sh);
+        let n = out.len();
+        vst1q_u8(out.as_mut_ptr().add(n), v);
+        out.set_len(n + (end - pos).min(16) as usize);
+        pos += 16;
+    }
+    while pos < end {
+        out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
+        pos += 1;
+    }
+}
+
+/// [`unpack_pac_fwd`] of `[start, start + len)` reversed and complemented, in one NEON pass: the
+/// sixteen source bases ending where the output has got to, reversed (`rev64` + a half swap) and
+/// complemented (`^ 3`), walking the source from its end. The last step is stored whole and
+/// trimmed; a step whose source word would leave `pac` or start before 0 goes base by base.
+/// Appends to `out`, which must have room for `len + 16` bytes.
 #[cfg(target_arch = "aarch64")]
 fn unpack_pac_rc_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     use std::arch::aarch64::*;
-    // Exclusive source end: output base `o` is the complement of source base `end - 1 - o`.
-    let end = start + len as i64;
     let scalar = |p: i64| 3 - ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3);
-    let mut o = 0usize;
-    while o < len && (end - o as i64) & 3 != 0 {
-        out.push(scalar(end - 1 - o as i64));
-        o += 1;
-    }
-    // SAFETY: NEON is present (checked by the caller); every word read lies inside `pac` because
-    // `[start, end)` does and the word covers `[s_end - 16, s_end)` with `s_end <= end`; the
-    // stores stay inside `out`'s reserved capacity (`len + 16` past its length on entry).
-    unsafe {
-        let spread = vld1q_u8([0u8, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3].as_ptr());
-        let shifts =
-            vld1q_s8([-6i8, -4, -2, 0, -6, -4, -2, 0, -6, -4, -2, 0, -6, -4, -2, 0].as_ptr());
-        let three = vdupq_n_u8(3);
-        while o + 16 <= len {
-            let s_end = end - o as i64;
-            let word =
-                (pac.as_ptr().add(((s_end - 16) >> 2) as usize) as *const u32).read_unaligned();
-            let v = vqtbl1q_u8(vreinterpretq_u8_u32(vdupq_n_u32(word)), spread);
-            let v = vandq_u8(vshlq_u8(v, shifts), three);
-            let r = vrev64q_u8(v);
-            let r = veorq_u8(vextq_u8(r, r, 8), three);
+    // Exclusive source end: output base `o` is the complement of source base `end - 1 - o`. A long
+    // window first takes its top bases down to a byte boundary, then 64 per step ([`unpack64`]);
+    // what is left below goes on as a shorter window.
+    let mut end = start + len as i64;
+    if len >= UNPACK64_MIN {
+        while end & 3 != 0 {
+            out.push(scalar(end - 1));
+            end -= 1;
+        }
+        while end - 64 >= start {
             let n = out.len();
-            vst1q_u8(out.as_mut_ptr().add(n), r);
-            out.set_len(n + 16);
-            o += 16;
+            // SAFETY: NEON is present (checked by the caller); `end <= l_pac`, so the 16 bytes
+            // from `(end - 64) >> 2` are inside `pac`, and the store stays inside the `len + 16`
+            // bytes reserved past the length.
+            unsafe { unpack64(pac, end - 64, true, out.as_mut_ptr().add(n)) };
+            unsafe { out.set_len(n + 64) };
+            end -= 64;
         }
     }
-    while o < len {
-        out.push(scalar(end - 1 - o as i64));
-        o += 1;
+    let len = (end - start) as usize;
+    // SAFETY: NEON is present (checked by the caller); `unpack16` is called only where its bounds
+    // hold, and the stores stay inside `out`'s reserved capacity (`len + 16` past its length).
+    unsafe {
+        let off = ((end - 16) & 3) as usize;
+        let (idx, sh) = (
+            vld1q_u8(SPREAD.0[off].as_ptr()),
+            vld1q_s8(SPREAD.1[off].as_ptr()),
+        );
+        let three = vdupq_n_u8(3);
+        let mut o = 0usize;
+        while o < len {
+            let k = (len - o).min(16);
+            let s0 = end - o as i64 - 16;
+            if s0 >= 0 && ((s0 >> 2) as usize) + 8 <= pac.len() {
+                let r = vrev64q_u8(unpack16(pac, s0, idx, sh));
+                let r = veorq_u8(vextq_u8(r, r, 8), three);
+                let n = out.len();
+                vst1q_u8(out.as_mut_ptr().add(n), r);
+                out.set_len(n + k);
+            } else {
+                for i in 0..k {
+                    out.push(scalar(end - 1 - (o + i) as i64));
+                }
+            }
+            o += 16;
+        }
     }
 }
 
 pub(crate) fn unpack_pac_range_into(pac: &[u8], l_pac: i64, rb: i64, re: i64, out: &mut Vec<u8>) {
-    let len = (re - rb).max(0) as usize;
     out.clear();
+    unpack_pac_range_append(pac, l_pac, rb, re, out);
+}
+
+/// [`unpack_pac_range_into`] appending to `out` instead of replacing its contents.
+pub(crate) fn unpack_pac_range_append(pac: &[u8], l_pac: i64, rb: i64, re: i64, out: &mut Vec<u8>) {
+    let len = (re - rb).max(0) as usize;
     if len == 0 {
         return;
     }
+    let len0 = out.len();
     out.reserve(len + 16);
     if re <= l_pac {
         unpack_pac_fwd(pac, rb, len, out);
@@ -494,12 +624,12 @@ pub(crate) fn unpack_pac_range_into(pac: &[u8], l_pac: i64, rb: i64, re: i64, ou
         #[cfg(target_arch = "aarch64")]
         if std::arch::is_aarch64_feature_detected!("neon") {
             unpack_pac_rc_neon(pac, 2 * l_pac - re, len, out);
-            debug_assert_eq!(out.len(), len);
+            debug_assert_eq!(out.len(), len0 + len);
             return;
         }
         unpack_pac_fwd(pac, 2 * l_pac - re, len, out);
-        out.reverse();
-        for b in out.iter_mut() {
+        out[len0..].reverse();
+        for b in out[len0..].iter_mut() {
             // Complement in bwa's A=0 C=1 G=2 T=3 order, where complementary codes sum to 3.
             *b ^= 3;
         }
@@ -508,7 +638,7 @@ pub(crate) fn unpack_pac_range_into(pac: &[u8], l_pac: i64, rb: i64, re: i64, ou
             out.push(unpack_pac_base(pac, l_pac, p));
         }
     }
-    debug_assert_eq!(out.len(), len);
+    debug_assert_eq!(out.len(), len0 + len);
 }
 
 /// Build the path `<prefix>.<ext>`, the naming convention every index file follows.
@@ -1376,6 +1506,179 @@ impl FmIndex {
         }
     }
 
+    /// [`occ_in`](Self::occ_in) for [`backward_round`](Self::backward_round), with `a`'s plane masks
+    /// (`hx`, `lx`, each all ones where `a` has that bit clear) computed once by the caller.
+    #[inline(always)]
+    fn occ_hoisted(&self, cp: &[CpOcc], pp: i64, a: usize, hx: u64, lx: u64) -> i64 {
+        debug_assert!(((pp >> CP_SHIFT) as usize) < cp.len());
+        // SAFETY: `pp` is a row of a live interval, at most `ref_seq_len`, and the blocks cover
+        // every row up to and including it (`get_occ` indexes the same block checked).
+        let b = unsafe { cp.get_unchecked((pp >> CP_SHIFT) as usize) };
+        // AArch64 has no scalar popcount: computed in GPRs, the count crosses to the vector unit
+        // and back on the `k` chain. Planes and mask go straight into vector registers instead (a
+        // mask table, as fg-labs/bwa-mem3's `occ_popcount64`), leaving one move out.
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is mandatory on AArch64; the loads read `b`'s planes and one table entry
+        // (`pp & CP_MASK < 64`).
+        let rows = unsafe {
+            use std::arch::aarch64::*;
+            let x = vand_u64(
+                vand_u64(
+                    veor_u64(vld1_u64(&b.hi), vcreate_u64(hx)),
+                    veor_u64(vld1_u64(&b.lo), vcreate_u64(lx)),
+                ),
+                vld1_u64(ROWS_BEFORE.as_ptr().add((pp & CP_MASK) as usize)),
+            );
+            u32::from(vaddv_u8(vcnt_u8(vreinterpret_u8_u64(x))))
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let rows = ((b.hi ^ hx) & (b.lo ^ lx) & rows_before(pp & CP_MASK)).count_ones();
+        let mut o = i64::from(b.cp_count[a]) + i64::from(rows);
+        if self.wide {
+            o += self.count_base[(pp >> self.count_span_shift) as usize][a];
+        }
+        if pp >> CP_SHIFT == self.sentinel_block {
+            o -= self.sentinel_before(pp, a);
+        }
+        o
+    }
+
+    /// [`backward_ext_konly`](Self::backward_ext_konly)'s new `k` and `s` for
+    /// [`backward_round`](Self::backward_round), on the caller's hoisted values.
+    #[inline(always)]
+    fn konly_hoisted(
+        &self,
+        cp: &[CpOcc],
+        c: &Smem,
+        a: usize,
+        count_a: i64,
+        hx: u64,
+        lx: u64,
+    ) -> (i64, i64) {
+        if c.s == 1 {
+            // SAFETY: as in `occ_hoisted`.
+            let b = unsafe { cp.get_unchecked((c.k >> CP_SHIFT) as usize) };
+            let hit = c.k != self.sentinel_index && Self::base_at(b, c.k) == a;
+            (
+                count_a + self.occ_hoisted(cp, c.k, a, hx, lx),
+                i64::from(hit),
+            )
+        } else {
+            let o = self.occ_hoisted(cp, c.k, a, hx, lx);
+            (count_a + o, self.occ_hoisted(cp, c.k + c.s, a, hx, lx) - o)
+        }
+    }
+
+    /// One outer iteration of the SMEM search's backward phase (bwa's two loops in
+    /// `getSMEMsOnePosOneThread`): every live candidate `prev[..]`, longest first, is extended on
+    /// the left by base `a` at read offset `m`. Survivors with a new occurrence count are compacted
+    /// to the front of `prev` and their next blocks prefetched; the first candidate that dies while
+    /// at least `min_seed_len` long, if it comes before any survivor, is returned for emission.
+    ///
+    /// The same decisions as calling [`backward_ext_konly`](Self::backward_ext_konly) per
+    /// candidate, with `a`'s plane masks, `count[a]` and the block array hoisted out of the loop and
+    /// the block loads unchecked, which the slot's state machine could not keep in registers.
+    ///
+    /// # Returns
+    /// The number of survivors, and the candidate to emit.
+    #[inline]
+    pub fn backward_round(
+        &self,
+        prev: &mut [Smem],
+        a: usize,
+        m: u32,
+        min_intv: i64,
+        min_seed_len: i64,
+    ) -> (usize, Option<Smem>) {
+        let hx = ((a as u64 >> 1) & 1).wrapping_sub(1);
+        let lx = (a as u64 & 1).wrapping_sub(1);
+        let count_a = self.count[a];
+        let cp = &self.cp_occ[..];
+        let n = prev.len();
+        let mut kept = 0usize;
+        let mut emit = None;
+        let mut p = 0usize;
+        // Until the first candidate that is kept or emitted.
+        let mut curr_s = -1i64;
+        while p < n {
+            let c = prev[p];
+            p += 1;
+            let (k, s) = self.konly_hoisted(cp, &c, a, count_a, hx, lx);
+            if s >= min_intv {
+                curr_s = s;
+                prev[0] = Smem { k, s, m, ..c };
+                kept = 1;
+                self.prefetch_occ(k, k + s);
+                break;
+            }
+            if i64::from(c.n) - i64::from(c.m) + 1 >= min_seed_len {
+                emit = Some(c);
+                break;
+            }
+        }
+        // The rest survive only with a new occurrence count, and none is emitted.
+        while p < n {
+            let c = prev[p];
+            p += 1;
+            let (k, s) = self.konly_hoisted(cp, &c, a, count_a, hx, lx);
+            if s >= min_intv && s != curr_s {
+                curr_s = s;
+                prev[kept] = Smem { k, s, m, ..c };
+                kept += 1;
+                self.prefetch_occ(k, k + s);
+            }
+        }
+        (kept, emit)
+    }
+
+    /// The forward extension of `smem` by base `aj` (`0..4`): the interval of the pattern with `aj`
+    /// appended on the right, `n` unchanged. The same result as swapping `k`/`l`, calling
+    /// [`backward_ext`](Self::backward_ext) with the complement `3 - aj` and swapping back.
+    ///
+    /// On AArch64 for a genome that is not `wide`, only what the swapped-back result reads is
+    /// computed: base `c`'s count and size, and the summed sizes of the bases above it (the `l`
+    /// recurrence), as three vector reductions of the two blocks' counts. `backward_ext` builds all
+    /// four `k`, `s` and `l` and picks one lane through the stack, three times the instructions on
+    /// round 3's walks, which are compute-bound.
+    #[inline(always)]
+    pub fn forward_ext(&self, smem: Smem, aj: usize) -> Smem {
+        let c = 3 - aj;
+        #[cfg(target_arch = "aarch64")]
+        if !self.wide {
+            use std::arch::aarch64::*;
+            let sp = smem.l;
+            let ep = smem.l + smem.s;
+            let o_sp = self.occ4_narrow(&self.cp_occ[(sp >> CP_SHIFT) as usize], sp);
+            let o_ep = self.occ4_narrow(&self.cp_occ[(ep >> CP_SHIFT) as usize], ep);
+            // SAFETY: NEON is mandatory on AArch64; the loads read four-element local arrays.
+            let (kc, sc, sgt) = unsafe {
+                let (vsp, vep) = (vld1q_u32(o_sp.as_ptr()), vld1q_u32(o_ep.as_ptr()));
+                let d = vsubq_u32(vep, vsp);
+                let lane = vld1q_u32([0u32, 1, 2, 3].as_ptr());
+                let cv = vdupq_n_u32(c as u32);
+                let (eq, gt) = (vceqq_u32(lane, cv), vcgtq_u32(lane, cv));
+                (
+                    vaddvq_u32(vandq_u32(vsp, eq)),
+                    vaddvq_u32(vandq_u32(d, eq)),
+                    vaddlvq_u32(vandq_u32(d, gt)),
+                )
+            };
+            // As in `backward_ext`: the sentinel row inside `[sp, ep)` shifts the `l` side by one.
+            let so = i64::from((sp <= self.sentinel_index) & (ep > self.sentinel_index));
+            return Smem {
+                k: smem.k + so + sgt as i64,
+                l: self.count[c] + i64::from(kc),
+                s: i64::from(sc),
+                ..smem
+            };
+        }
+        let mut rc = smem;
+        std::mem::swap(&mut rc.k, &mut rc.l);
+        let mut e = self.backward_ext(rc, c);
+        std::mem::swap(&mut e.k, &mut e.l);
+        e
+    }
+
     #[inline(always)]
     pub fn backward_ext(&self, smem: Smem, a: usize) -> Smem {
         // Load the sp/ep checkpoint blocks once (all 4 bases share them), rather than re-deriving
@@ -1753,6 +2056,76 @@ impl FmIndex {
         unpack_pac_base(&self.pac, self.l_pac(), pos)
     }
 
+    /// The first read offset at or after `j` where `q` stops matching the text from `t`: `q[j..]`
+    /// against text positions `t..` (2L space), ending at the end of `q`, at the end of the text, or
+    /// at the first base that differs (a read code of 4 differs from every text base). The same
+    /// result as stepping [`base`](Self::base) one position at a time, sixteen bases per compare
+    /// on NEON (fg-labs/bwa-mem3's `ls_text_match`, eight at a time).
+    pub fn text_match(&self, q: &[u8], mut j: usize, mut t: i64) -> usize {
+        let l_pac = self.l_pac();
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is mandatory on AArch64. Each `unpack16` reads pac bytes `[p >> 2, +8)`,
+        // checked against `pac.len()`; each read load is `q[j..j + 16]`, checked against `q.len()`.
+        unsafe {
+            use std::arch::aarch64::*;
+            // Index of the first lane set in `ne` (0xFF lanes), 16 when none is.
+            let first = |ne: uint8x16_t| -> usize {
+                let m = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                    vreinterpretq_u16_u8(ne),
+                )));
+                (m.trailing_zeros() / 4) as usize
+            };
+            let pac = &self.pac[..];
+            if t < l_pac {
+                let o = (t & 3) as usize;
+                let (idx, sh) = (
+                    vld1q_u8(SPREAD.0[o].as_ptr()),
+                    vld1q_s8(SPREAD.1[o].as_ptr()),
+                );
+                while j + 16 <= q.len() && t + 16 <= l_pac && ((t >> 2) as usize) + 8 <= pac.len() {
+                    let ne = vmvnq_u8(vceqq_u8(
+                        unpack16(pac, t, idx, sh),
+                        vld1q_u8(q.as_ptr().add(j)),
+                    ));
+                    let k = first(ne);
+                    if k < 16 {
+                        return j + k;
+                    }
+                    j += 16;
+                    t += 16;
+                }
+            } else {
+                // Text `t..t + 16` is forward `[2L - t - 16, 2L - t)` reversed and complemented.
+                let s0 = 2 * l_pac - t - 16;
+                let o = (s0 & 3) as usize;
+                let (idx, sh) = (
+                    vld1q_u8(SPREAD.0[o].as_ptr()),
+                    vld1q_s8(SPREAD.1[o].as_ptr()),
+                );
+                let three = vdupq_n_u8(3);
+                while j + 16 <= q.len()
+                    && 2 * l_pac - t - 16 >= 0
+                    && (((2 * l_pac - t - 16) >> 2) as usize) + 8 <= pac.len()
+                {
+                    let r = vrev64q_u8(unpack16(pac, 2 * l_pac - t - 16, idx, sh));
+                    let x = veorq_u8(vextq_u8(r, r, 8), three);
+                    let ne = vmvnq_u8(vceqq_u8(x, vld1q_u8(q.as_ptr().add(j))));
+                    let k = first(ne);
+                    if k < 16 {
+                        return j + k;
+                    }
+                    j += 16;
+                    t += 16;
+                }
+            }
+        }
+        while j < q.len() && t < 2 * l_pac && q[j] == self.base(t) {
+            j += 1;
+            t += 1;
+        }
+        j
+    }
+
     /// [`base`](Self::base) over a whole range, vectorised. See [`unpack_pac_range`].
     ///
     /// # Parameters
@@ -1777,6 +2150,11 @@ impl FmIndex {
     /// - `out`: destination, cleared then filled with `re - rb` bytes. Its capacity is kept.
     pub fn bases_into(&self, rb: i64, re: i64, out: &mut Vec<u8>) {
         unpack_pac_range_into(&self.pac, self.l_pac(), rb, re, out);
+    }
+
+    /// [`bases_into`](Self::bases_into) appending to `out` instead of replacing its contents.
+    pub fn bases_append(&self, rb: i64, re: i64, out: &mut Vec<u8>) {
+        unpack_pac_range_append(&self.pac, self.l_pac(), rb, re, out);
     }
 
     /// Prefetch the `.pac` lines of the window `[rb, re)` that [`bases_into`] will unpack. `rb` and
@@ -1859,20 +2237,26 @@ mod tests {
     /// the doubled coordinate space and at every alignment of the range against the 4-base packing.
     #[test]
     fn unpack_range_matches_per_base() {
-        // A synthetic `.pac`: 4 bases per byte, so 64 forward bases, plus a trailer byte the real
+        // A synthetic `.pac`: 4 bases per byte, so 256 forward bases, plus a trailer byte the real
         // format carries and this code must never index.
-        let l_pac: i64 = 64;
-        let pac: Vec<u8> = (0..17u8)
+        let l_pac: i64 = 256;
+        let pac: Vec<u8> = (0..65u8)
             .map(|i| i.wrapping_mul(37).wrapping_add(11))
             .collect();
         for rb in 0..(2 * l_pac) {
-            for len in [0i64, 1, 3, 4, 5, 15, 16, 17, 33, 64] {
+            for len in [
+                0i64, 1, 3, 4, 5, 15, 16, 17, 31, 33, 47, 64, 66, 67, 70, 100, 131, 135, 200, 256,
+            ] {
                 let re = (rb + len).min(2 * l_pac);
                 let want: Vec<u8> = (rb..re)
                     .map(|p| super::unpack_pac_base(&pac, l_pac, p))
                     .collect();
                 let got = super::unpack_pac_range(&pac, l_pac, rb, re);
                 assert_eq!(got, want, "range [{rb}, {re}) of 2L = {}", 2 * l_pac);
+                // Appending after a prefix keeps the prefix and adds the same bases.
+                let mut app = vec![9u8; 5];
+                super::unpack_pac_range_append(&pac, l_pac, rb, re, &mut app);
+                assert_eq!((&app[..5], &app[5..]), (&[9u8; 5][..], &want[..]));
             }
         }
     }
@@ -1932,6 +2316,45 @@ mod tests {
 
     /// The k-only backward step agrees with the full one on `k` and `s` for every base, on
     /// intervals of every size, including the sentinel's block and the whole-BWT interval.
+    /// `forward_ext` against the swap / `backward_ext` / swap it stands for, on random intervals
+    /// (both `k` and `l` random, so every `l`-side block and the sentinel's are reached).
+    #[test]
+    fn forward_ext_equals_swapped_backward() {
+        let fm = tiny();
+        let n = fm.counts()[4];
+        let mut state = 0x1f83_d9ab_fb41_bd6bu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        let mut intervals: Vec<(i64, i64, i64)> =
+            vec![(0, 0, n), (5, fm.sentinel_index.max(1) - 1, 3)];
+        for _ in 0..20000 {
+            let l = next() % n;
+            let s = 1 + next() % (n - l).min(1 + next() % 5000);
+            intervals.push((next() % n, l, s));
+        }
+        for (k, l, s) in intervals {
+            let smem = Smem {
+                k,
+                l,
+                s,
+                m: 3,
+                n: 9,
+                ..Default::default()
+            };
+            for aj in 0..4 {
+                let mut rc = smem;
+                std::mem::swap(&mut rc.k, &mut rc.l);
+                let mut want = fm.backward_ext(rc, 3 - aj);
+                std::mem::swap(&mut want.k, &mut want.l);
+                assert_eq!(fm.forward_ext(smem, aj), want, "k {k} l {l} s {s} aj {aj}");
+            }
+        }
+    }
+
     #[test]
     fn konly_backward_step_equals_full() {
         let fm = tiny();
@@ -2120,6 +2543,51 @@ mod tests {
 
     /// The fused reverse-complement unpack agrees with the base-by-base one on every range shape:
     /// any alignment at both ends, shorter than a word, and the whole strand.
+    /// `text_match` stops where the base-by-base compare stops, on both halves of the text, at
+    /// the text's end and at a read `N`.
+    #[test]
+    fn text_match_equals_base_by_base() {
+        let fm = tiny();
+        let tend = 2 * fm.l_pac();
+        let mut rng = 12345u64;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as i64
+        };
+        for _ in 0..4000 {
+            let t = next() % tend;
+            let len = (next() % 200) as usize;
+            let j0 = if len > 0 { (next() as usize) % len } else { 0 };
+            // `q[j0..]` follows the text from `t` (zeros past its end), with at most one change.
+            let mut q: Vec<u8> = (0..len as i64)
+                .map(|i| {
+                    let p = t + i - j0 as i64;
+                    if (0..tend).contains(&p) {
+                        fm.base(p)
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            if len > j0 && next() % 2 == 0 {
+                let at = j0 + (next() as usize) % (len - j0);
+                q[at] = if next() % 4 == 0 {
+                    4
+                } else {
+                    (q[at] + 1 + (next() % 3) as u8) & 3
+                };
+            }
+            let (mut j, mut tt) = (j0, t);
+            while j < q.len() && tt < tend && q[j] == fm.base(tt) {
+                j += 1;
+                tt += 1;
+            }
+            assert_eq!(fm.text_match(&q, j0, t), j, "t={t} len={len} j0={j0}");
+        }
+    }
+
     #[test]
     fn rc_unpack_equals_base_by_base() {
         let fm = tiny();

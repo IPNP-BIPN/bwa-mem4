@@ -118,10 +118,9 @@ pub fn push_int_str(out: &mut String, value: i64) {
         i -= 1;
         buf[i] = b'-';
     }
-    // SAFETY-free: the buffer holds ASCII digits and an optional '-', so it is valid UTF-8 by
-    // construction and `from_utf8` cannot fail. `expect` rather than `unwrap_unchecked`: this is
-    // once per number, not per byte, and a panic here would be a bug worth seeing.
-    out.push_str(std::str::from_utf8(&buf[i..]).expect("decimal digits are ASCII"));
+    // SAFETY: the buffer holds ASCII digits and an optional '-', so the string stays UTF-8. The
+    // checked `from_utf8` cost 0.5G cycles per 2M pairs.
+    unsafe { out.as_mut_vec() }.extend_from_slice(&buf[i..]);
 }
 
 /// Build a 256-entry table mapping an nt4 code to its SAM character, so the encoders below need no

@@ -145,11 +145,11 @@ jobs:
           - os: macos-14
             target_id: macos-arm64
             deployment_target: "11.0"
-            # The one platform where PGO pays, and it pays a lot: +12.4% on an M4, +6.1% SE / +8.5%
-            # PE at genome scale (docs/perf-levers.md). What it buys is branch layout on the branchy
-            # driver, seeding and SAM paths, and how much that is worth is a property of the core's
-            # branch predictor, not of this code.
-            pgo: true
+            # PGO used to pay here (+6.1% SE / +8.5% PE, docs/perf-levers.md), but the hand-placed
+            # inlining since has taken that gain, and the tiny training set now mislays the rescue
+            # path: on an M4, 2M GIAB pairs -t8, this exact recipe costs +3.7% PE cycles (656G vs
+            # 632G) for -1.3% SE (178G vs 180G). Trained on 50k real GIAB pairs it still loses both.
+            pgo: false
           - os: macos-15-intel
             target_id: macos-x86_64
             deployment_target: "10.12"
@@ -199,8 +199,8 @@ jobs:
       #   | AMD EPYC 7763 (Zen 3)       |104.22/104.27/104.27|107.36/108.15/108.24| -3.3% |
       #
       # The Zen 3 row uses THIS recipe, tiny-fixture training included, so it is not a proxy. So the
-      # step is now gated on `matrix.pgo`: Apple Silicon builds profile-guided, everything else
-      # builds plain, and the artefacts that no longer use it become reproducible from a clean tree
+      # step is now gated on `matrix.pgo`. Apple Silicon built profile-guided until 2026-11, when it
+      # stopped paying there too (see the macos-14 row); every target builds plain now, and the artefacts that no longer use it become reproducible from a clean tree
       # again. What PGO buys here is branch layout on the branchy driver, seeding and SAM paths, and
       # how much that is worth is a property of the core's branch predictor rather than of the code.
       #

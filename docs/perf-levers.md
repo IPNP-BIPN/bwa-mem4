@@ -22,7 +22,14 @@ every binary pre-warmed, interleaved x4):
 | PGO, region-trained | **1.061x** (1.070/1.060/1.054/1.059) | — |
 | PGO, genome-trained | **1.061x** (1.063/1.060/1.057/1.062) | **1.085x** (1.080/1.091/1.083) |
 
-**PGO is worth ~+6.1% SE / +8.5% PE at genome scale**, and byte-identical: 500k SE + 1M PE records
+> **Superseded (2026-11-07): PGO no longer pays on Apple Silicon either.** M4 Max, 2M GIAB pairs,
+> `-t8 -K 100000000`, three interleaved reps, cycles from `/usr/bin/time -l`: the release recipe
+> (tiny training set) is 656G vs 632G plain in PE (+3.7%) and 178.1G vs 180.4G in SE (-1.3%);
+> trained on 50k real GIAB pairs it is 639G PE and 182.8G SE, worse in both. The hand-placed
+> `#[inline(always)]` and code layout work since this table was measured took what PGO used to buy.
+> The release workflow builds macOS arm64 without PGO since. The history below is kept as measured.
+
+**PGO was worth ~+6.1% SE / +8.5% PE at genome scale**, and byte-identical: 500k SE + 1M PE records
 `cmp`-clean against the non-PGO binary (only `@PG CL:` differs, which records the invocation path).
 
 > ### ⚠️ On Apple Silicon. Off it, PGO LOSES.

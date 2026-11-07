@@ -473,7 +473,19 @@ pub fn sa_positions_for_read(
     // occurrence at `q_T + m_T`, hence at `q_T + m_U` (fg-labs/bwa-mem3's `s1_tag_contained`).
     // The list is sorted by `(m, n)`, so a container has `m_T <= m_U`: either earlier, or in the
     // same-`m` run after `U` (then `n_T >= n_U`). `resolved[i]` is `q + m` for each such SMEM.
-    let mut resolved: Vec<i64> = vec![i64::MIN; smems.len()];
+    // Per-thread scratch, reused across reads: three allocations per read added up to ~10% of the
+    // whole run's malloc count.
+    thread_local! {
+        static SCRATCH: std::cell::Cell<SaScratch> = const { std::cell::Cell::new(SaScratch::new()) };
+    }
+    let mut scratch = SCRATCH.take();
+    let SaScratch {
+        resolved,
+        runs,
+        pieces,
+    } = &mut scratch;
+    resolved.clear();
+    resolved.resize(smems.len(), i64::MIN);
     {
         let (mut best_n, mut best_q) = (-1i64, 0i64);
         let mut run = 0usize;
@@ -499,14 +511,7 @@ pub fn sa_positions_for_read(
         }
     }
     let first_row = positions.len();
-    /// An unstrided run of rows pushed for one SMEM: rows `k .. k + count` at `positions[start..]`.
-    struct Run {
-        k: i64,
-        count: i64,
-        start: usize,
-    }
-    let mut runs: Vec<Run> = Vec::new();
-    let mut pieces: Vec<(i64, i64, usize)> = Vec::new();
+    runs.clear();
     let mut counts: Vec<i64> = Vec::with_capacity(smems.len());
     // The last SMEM whose rows were actually enumerated for walking, and where its run starts. A
     // duplicate does not replace it, so a run of identical SMEMs all point at the first.
@@ -562,16 +567,18 @@ pub fn sa_positions_for_read(
         // runs sample their rows, so only the exact-repeat case above covers them.
         if step == 1 && count > 0 && resolved[i] == i64::MIN {
             pieces.clear();
-            for r in &runs {
+            for r in runs.iter() {
                 let (lo, hi) = (p.k.max(r.k), (p.k + count).min(r.k + r.count));
                 if lo < hi {
                     pieces.push((lo, hi, r.start + (lo - r.k) as usize));
                 }
             }
             if !pieces.is_empty() {
-                pieces.sort_unstable();
+                // By `lo` alone: any order of equal-`lo` pieces gives valid repeats, and a repeat
+                // only says where to copy a row from, never what the row holds.
+                pieces.sort_unstable_by_key(|q| q.0);
                 let mut cur = p.k;
-                for &(lo, hi, src) in &pieces {
+                for &(lo, hi, src) in pieces.iter() {
                     let lo2 = lo.max(cur);
                     if lo2 < hi {
                         repeats.push(RepeatedRun {
@@ -603,7 +610,38 @@ pub fn sa_positions_for_read(
         let dups = rows.windows(2).filter(|w| w[0] == w[1]).count();
         chain_time::SA_DUP_ROWS.fetch_add(dups as u64, std::sync::atomic::Ordering::Relaxed);
     }
+    SCRATCH.set(scratch);
     counts
+}
+
+/// An unstrided run of rows pushed for one SMEM: rows `k .. k + count` at `positions[start..]`.
+struct Run {
+    k: i64,
+    count: i64,
+    start: usize,
+}
+
+/// `sa_positions_for_read`'s per-read working vectors, kept per thread between reads.
+struct SaScratch {
+    resolved: Vec<i64>,
+    runs: Vec<Run>,
+    pieces: Vec<(i64, i64, usize)>,
+}
+
+impl SaScratch {
+    const fn new() -> Self {
+        Self {
+            resolved: Vec::new(),
+            runs: Vec::new(),
+            pieces: Vec::new(),
+        }
+    }
+}
+
+impl Default for SaScratch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// `BWA4_SMEM_DUP=1`: are there exact duplicate SMEMs to compact away, and how many?
@@ -809,8 +847,10 @@ pub fn build_chains_from_smems(
 /// Bits of a flat key holding the chain index; the position takes the rest (`< 2^43`).
 const FLAT_CI_BITS: u32 = 20;
 /// More open chains than this on the flat index: the kbtree takes the read (bounds the sorted
-/// key inserts).
-const FLAT_CAP: usize = 512;
+/// key inserts). The fork's 512 sent enough repeat reads to a replay on the kbtree to cost more
+/// than the longer memmoves: 2M GIAB pairs -t8, 512 -> 630G cycles, 1024 -> 624G, 2048 -> 624G,
+/// 4096 -> 625G; 64 and 192 were worse.
+const FLAT_CAP: usize = 2048;
 
 /// Chain the resolved seeds of one read: each seed joins the chain with the largest `pos <= rbeg`
 /// when [`test_and_merge`] accepts it, else opens a chain. Returns the chains in creation order
@@ -1336,7 +1376,23 @@ pub fn ks_introsort_by_key<T: Clone, K: Copy>(
     // billion, and halving the index width halves what each swap moves.
     perm.clear();
     perm.extend(a.iter().enumerate().map(|(i, e)| (key(e), i as u32)));
-    ks_introsort_by(perm, |x, y| lt(&x.0, &y.0));
+    // Distinct keys have exactly one sorted order, so any sort that leaves no two neighbours tied
+    // has produced bwa's permutation. 97% of these sorts are tie-free (2M GIAB pairs); the rest
+    // are rebuilt and take the exact introsort.
+    perm.sort_unstable_by(|x, y| {
+        if lt(&x.0, &y.0) {
+            std::cmp::Ordering::Less
+        } else if lt(&y.0, &x.0) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    if perm.windows(2).any(|w| !lt(&w[0].0, &w[1].0)) {
+        perm.clear();
+        perm.extend(a.iter().enumerate().map(|(i, e)| (key(e), i as u32)));
+        ks_introsort_by(perm, |x, y| lt(&x.0, &y.0));
+    }
     // The single gather. Reading `a` out of order is cheap here: the whole array is a few kilobytes
     // and has just been walked twice, so it is resident.
     spare.clear();
@@ -1657,7 +1713,7 @@ mod tests {
             (state >> 33) as u32
         };
         for &n in &[0usize, 1, 2, 3, 15, 16, 17, 33, 64, 105, 200, 1000] {
-            for &modulus in &[3u32, 8, 1000] {
+            for &modulus in &[3u32, 8, 1000, u32::MAX] {
                 // `.1` is the payload: distinct, never compared, and therefore the only thing that
                 // can reveal a difference in how ties were ordered.
                 let orig: Vec<(u32, u32)> = (0..n).map(|i| (next() % modulus, i as u32)).collect();
