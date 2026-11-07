@@ -2904,20 +2904,31 @@ macro_rules! define_sw_kernel {
                         // Only what the lane can still read: columns `0..=qlen` of H/E (`end <= qlen`;
                         // those below `beg` must carry over too), its query codes, and its target
                         // rows from `i + 1`. The rest of the slot is outside its band, masked.
-                        let ql = src.qlen[sl];
-                        let (dh, sh) = (&mut dst.eh_h[..], &src.eh_h[..]);
-                        let (de, se) = (&mut dst.eh_e[..], &src.eh_e[..]);
-                        for c in 0..=ql {
-                            dh[c * LANES + dl] = sh[c * LANES + sl];
-                            de[c * LANES + dl] = se[c * LANES + sl];
-                        }
-                        let (dq, sq) = (&mut dst.qcode[..], &src.qcode[..]);
-                        for c in 0..ql {
-                            dq[c * LANES + dl] = sq[c * LANES + sl];
-                        }
-                        let (dt, stc) = (&mut dst.tcode[..], &src.tcode[..]);
-                        for r in (i as usize + 1)..src.tlen[sl] {
-                            dt[r * LANES + dl] = stc[r * LANES + sl];
+                        let (ql, tl) = (src.qlen[sl], src.tlen[sl]);
+                        // Unchecked: every vector's buffers hold `stride` (> qlen) H/E columns,
+                        // `soa_cols` (>= stride) query and `soa_rows` (> tlen) target columns.
+                        assert!(
+                            ql < stride && dst.eh_h.len() == stride * LANES && src.eh_h.len() == stride * LANES
+                                && dst.eh_e.len() == stride * LANES && src.eh_e.len() == stride * LANES
+                                && dst.qcode.len() >= ql * LANES && src.qcode.len() >= ql * LANES
+                                && dst.tcode.len() >= tl * LANES && src.tcode.len() >= tl * LANES
+                        );
+                        // SAFETY: the lengths just asserted bound every index below.
+                        unsafe {
+                            let (dh, sh) = (dst.eh_h.as_mut_ptr().add(dl), src.eh_h.as_ptr().add(sl));
+                            let (de, se) = (dst.eh_e.as_mut_ptr().add(dl), src.eh_e.as_ptr().add(sl));
+                            for c in 0..=ql {
+                                *dh.add(c * LANES) = *sh.add(c * LANES);
+                                *de.add(c * LANES) = *se.add(c * LANES);
+                            }
+                            let (dq, sq) = (dst.qcode.as_mut_ptr().add(dl), src.qcode.as_ptr().add(sl));
+                            for c in 0..ql {
+                                *dq.add(c * LANES) = *sq.add(c * LANES);
+                            }
+                            let (dt, stc) = (dst.tcode.as_mut_ptr().add(dl), src.tcode.as_ptr().add(sl));
+                            for r in (i as usize + 1)..tl {
+                                *dt.add(r * LANES) = *stc.add(r * LANES);
+                            }
                         }
                         dst.qlen[dl] = src.qlen[sl];
                         dst.tlen[dl] = src.tlen[sl];
