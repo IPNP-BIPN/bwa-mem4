@@ -24,11 +24,11 @@ use crate::matesw::KswJob;
 use crate::rescue_prune::{self, Comp, Decision, Params};
 use bwa_extend::KswAlignResult;
 
-#[cfg(target_arch = "x86_64")]
-use avx2 as kernel;
 /// The band kernel of this architecture: NEON (16 lanes) or AVX2 (32 lanes), the same `Work`.
 #[cfg(target_arch = "aarch64")]
 use neon as kernel;
+#[cfg(target_arch = "x86_64")]
+use x86 as kernel;
 
 /// Whether this machine runs the band kernel.
 pub(crate) fn kernel_available() -> bool {
@@ -352,7 +352,10 @@ impl Batch {
             use crate::matesw::cells::*;
             use std::sync::atomic::Ordering::Relaxed;
             BAND_R2.fetch_add(self.r2.len() as u64, Relaxed);
-            BAND_CELLS.fetch_add((self.work.cells - cells0) * kernel::L as u64, Relaxed);
+            BAND_CELLS.fetch_add(
+                (self.work.cells - cells0) * self.work.lanes() as u64,
+                Relaxed,
+            );
             BAND_KERNEL_NS.fetch_add(self.work.kernel_ns, Relaxed);
             BAND_OTHER_NS.fetch_add(
                 t0.elapsed().as_nanos() as u64 - self.work.kernel_ns,
@@ -384,7 +387,10 @@ impl Batch {
         if let Some(t0) = t_all {
             use crate::matesw::cells::*;
             use std::sync::atomic::Ordering::Relaxed;
-            BAND_CELLS.fetch_add((self.work.cells - cells0) * kernel::L as u64, Relaxed);
+            BAND_CELLS.fetch_add(
+                (self.work.cells - cells0) * self.work.lanes() as u64,
+                Relaxed,
+            );
             BAND_KERNEL_NS.fetch_add(self.work.kernel_ns, Relaxed);
             BAND_OTHER_NS.fetch_add(
                 t0.elapsed().as_nanos() as u64 - self.work.kernel_ns,
@@ -441,9 +447,10 @@ impl Batch {
         self.order.extend(0..n as u32);
         self.order
             .sort_unstable_by_key(|&i| self.jobs[i as usize].key);
-        for g in (0..n).step_by(kernel::L) {
-            let nl = kernel::L.min(n - g);
-            let mut lanes: [kernel::Lane; kernel::L] = Default::default();
+        let gl = self.work.lanes();
+        for g in (0..n).step_by(gl) {
+            let nl = gl.min(n - g);
+            let mut lanes = [kernel::Lane::default(); kernel::L];
             let (mut wmax, mut omax) = (1, i32::MIN);
             for l in 0..nl {
                 let j = &self.jobs[self.order[g + l] as usize];
@@ -557,9 +564,10 @@ impl Batch {
         self.order.extend(0..n as u32);
         self.order
             .sort_unstable_by_key(|&i| self.jobs[i as usize].key);
-        for g in (0..n).step_by(kernel::L) {
-            let nl = kernel::L.min(n - g);
-            let mut lanes: [kernel::Lane; kernel::L] = Default::default();
+        let gl = self.work.lanes();
+        for g in (0..n).step_by(gl) {
+            let nl = gl.min(n - g);
+            let mut lanes = [kernel::Lane::default(); kernel::L];
             let (mut wmax, mut omax) = (1, i32::MIN);
             for l in 0..nl {
                 let j = &self.jobs[self.order[g + l] as usize];
@@ -910,6 +918,10 @@ pub(crate) mod neon {
 
     impl Work {
         /// Lane `l`'s row maxima for its `nrows` rows, after [`Self::run`].
+        pub(super) fn lanes(&self) -> usize {
+            L
+        }
+
         pub(super) fn lane_rows(&self, l: usize, nrows: usize) -> &[u8] {
             &self.rl[l * self.rstride..l * self.rstride + nrows]
         }
@@ -1286,7 +1298,6 @@ mod avx2 {
         pub te: [i32; L],
         pub qe: [u8; L],
         pub cells: u64,
-        pub kernel_ns: u64,
     }
 
     fn fit(v: &mut Vec<u8>, n: usize) {
@@ -1561,6 +1572,397 @@ mod avx2 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use std::arch::x86_64::*;
+
+    pub(super) const L: usize = 64;
+    const DEAD: u8 = 0xC0;
+    const QPAD: u8 = 0x80;
+    const RPAD: u8 = 0x80;
+
+    pub(super) use super::avx2::Lane;
+
+    /// As the NEON kernel's `Work`.
+    pub(super) struct Work {
+        a: Vec<u8>,
+        refv: Vec<u8>,
+        h: Vec<u8>,
+        e: Vec<u8>,
+        r: Vec<u8>,
+        rl: Vec<u8>,
+        rstride: usize,
+        pub gmax: [u8; L],
+        pub te: [i32; L],
+        pub qe: [u8; L],
+        pub cells: u64,
+    }
+
+    impl Default for Work {
+        fn default() -> Self {
+            Work {
+                a: Vec::new(),
+                refv: Vec::new(),
+                h: Vec::new(),
+                e: Vec::new(),
+                r: Vec::new(),
+                rl: Vec::new(),
+                rstride: 0,
+                gmax: [0; L],
+                te: [0; L],
+                qe: [0; L],
+                cells: 0,
+            }
+        }
+    }
+
+    fn fit(v: &mut Vec<u8>, n: usize) {
+        if v.len() < n {
+            v.resize(n, 0);
+        }
+    }
+
+    impl Work {
+        pub(super) fn lane_rows(&self, l: usize, nrows: usize) -> &[u8] {
+            &self.rl[l * self.rstride..l * self.rstride + nrows]
+        }
+
+        /// Run one group of `lanes` (at most `L`) at width `w`; `tbl` is the signed score table.
+        ///
+        /// # Safety
+        /// AVX-512BW available.
+        #[target_feature(enable = "avx512bw")]
+        pub(super) unsafe fn run(
+            &mut self,
+            lanes: &[Lane],
+            w: usize,
+            tbl: &[u8; 16],
+            gaps: [u8; 4],
+        ) {
+            let nr = lanes.iter().map(|l| l.t.len()).max().unwrap_or(0);
+            let np = nr + w - 1;
+            let c = w as i32 - 1;
+            let nrp = nr.next_multiple_of(16);
+            let hs = w + 7;
+            fit(&mut self.a, (np + 4) * L);
+            fit(&mut self.refv, nr * L);
+            fit(&mut self.h, 2 * hs * L);
+            fit(&mut self.e, (w + 9) * L);
+            fit(&mut self.r, nrp * L);
+            self.a[..(np + 4) * L].fill(DEAD);
+            self.refv[..nr * L].fill(RPAD);
+            self.h[..2 * hs * L].fill(0);
+            self.e[..(w + 9) * L].fill(0);
+            let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
+            let mut ob = [0u8; L];
+            for (l, lane) in lanes.iter().enumerate() {
+                let pq0 = c - lane.o;
+                let len2 = lane.q.len() as i32;
+                for p in pq0.max(0)..(pq0 + len2).min(np as i32) {
+                    self.a[p as usize * L + l] = lane.q[(p - pq0) as usize];
+                }
+                for p in (pq0 + len2).max(0)..(pq0 + lane.quanta).min(np as i32) {
+                    self.a[p as usize * L + l] = QPAD;
+                }
+                for (r, &b) in lane.t.iter().enumerate() {
+                    // Target N re-encoded as 12 (see the NEON kernel).
+                    self.refv[r * L + l] = if b == 4 { 12 } else { b };
+                }
+                ob[l] = lane.o as u8;
+                omax = omax.max(lane.o);
+                ominq = ominq.min(lane.o - lane.quanta + 1);
+                omaskq = omaskq.max(lane.o - lane.quanta + 1);
+            }
+            // The biased table, replicated per 128-bit half: `score + bias`, bias the mismatch
+            // penalty, so every entry is a non-negative magnitude. Slots 9-11 are unreachable.
+            let bias = tbl[1].wrapping_neg();
+            let mut tblb = [0u8; 64];
+            for i in 0..64 {
+                tblb[i] = tbl[i % 16].wrapping_add(bias);
+            }
+            let tblv = _mm512_loadu_si512(tblb.as_ptr() as *const _);
+            let biasv = _mm512_set1_epi8(bias as i8);
+            let zero = _mm512_setzero_si512();
+            let one = _mm512_set1_epi8(1);
+            let eight = _mm512_set1_epi8(8);
+            let deadv = _mm512_set1_epi8(DEAD as i8);
+            let (oe_del, e_del, oe_ins, e_ins) = (
+                _mm512_set1_epi8(gaps[0] as i8),
+                _mm512_set1_epi8(gaps[1] as i8),
+                _mm512_set1_epi8(gaps[2] as i8),
+                _mm512_set1_epi8(gaps[3] as i8),
+            );
+            let ov = _mm512_loadu_si512(ob.as_ptr() as *const _);
+            let mut tb = [0u8; L];
+            for (l, lane) in lanes.iter().enumerate() {
+                tb[l] = lane.target;
+            }
+            let early = tb.iter().any(|&t| t > 0);
+            let tgt = _mm512_loadu_si512(tb.as_ptr() as *const _);
+            let a = self.a.as_ptr();
+            let e = self.e.as_mut_ptr().add(3 * L);
+            let rout = self.r.as_mut_ptr();
+            let (mut hc, mut hp) = (
+                self.h.as_mut_ptr().add(3 * L),
+                self.h.as_mut_ptr().add((hs + 3) * L),
+            );
+            let li = L as isize;
+            let mut gmax = zero;
+            let mut te = [-1i32; L];
+            let mut qe = [0u8; L];
+            let wm1 = w as i32 - 1;
+
+            macro_rules! ld {
+                ($p:expr) => {
+                    _mm512_loadu_si512($p as *const _)
+                };
+            }
+            macro_rules! st {
+                ($p:expr, $v:expr) => {
+                    _mm512_storeu_si512($p as *mut _, $v)
+                };
+            }
+            // One cell, as the NEON kernel's: `bi` is the bias on this column (0 off real bases).
+            macro_rules! cell {
+                ($d:expr, $ein:expr, $f:ident, $q:expr, $bi:expr, $rref:expr, $rmax:ident,
+                 $jcol:ident, $jv:expr, $top:expr, $live:expr) => {{
+                    let sc = _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref));
+                    let h0 = _mm512_max_epu8(_mm512_subs_epu8(_mm512_adds_epu8($d, sc), $bi), $ein);
+                    let mut h = _mm512_max_epu8(h0, $f);
+                    if let Some(m) = $top {
+                        h = _mm512_and_si512(h, m);
+                    }
+                    let hl = if $live {
+                        _mm512_maskz_mov_epi8(_mm512_cmplt_epu8_mask($q, deadv), h)
+                    } else {
+                        h
+                    };
+                    let rn = _mm512_max_epu8($rmax, hl);
+                    $jcol = _mm512_mask_blend_epi8(_mm512_cmpeq_epi8_mask(rn, $rmax), $jv, $jcol);
+                    $rmax = rn;
+                    let eout =
+                        _mm512_max_epu8(_mm512_subs_epu8(h, oe_del), _mm512_subs_epu8($ein, e_del));
+                    $f = _mm512_max_epu8(_mm512_subs_epu8(h, oe_ins), _mm512_subs_epu8($f, e_ins));
+                    (h, eout)
+                }};
+            }
+            macro_rules! finish_row {
+                ($row:expr, $rmax:expr, $jcol:expr, $rref:expr) => {{
+                    st!(rout.add($row * L), $rmax);
+                    let imp =
+                        _mm512_cmpgt_epu8_mask($rmax, gmax) & _mm512_cmpge_epi8_mask($rref, zero);
+                    gmax = _mm512_mask_blend_epi8(imp, gmax, $rmax);
+                    let m = imp;
+                    if m != 0 {
+                        let mut jc = [0u8; L];
+                        st!(jc.as_mut_ptr(), $jcol);
+                        for l in 0..L {
+                            if m >> l & 1 != 0 {
+                                te[l] = $row as i32;
+                                qe[l] = jc[l];
+                            }
+                        }
+                    }
+                }};
+            }
+
+            let mut r = 0usize;
+            while r < nr {
+                let ri = r as i32;
+                let khi = wm1.min(ri + omax);
+                let klo = 0.max(ri + ominq);
+                let kun = klo.max(ri + omaskq);
+                let mut k = khi;
+                let mut jv = _mm512_add_epi8(_mm512_set1_epi8((ri - khi) as i8), ov);
+                if r + 1 < nr {
+                    self.cells += 2 * (khi - klo + 1).max(0) as u64;
+                    let rref0 = ld!(self.refv.as_ptr().add(r * L));
+                    let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
+                    let (mut f0, mut f1, mut d1) = (zero, zero, zero);
+                    let (mut rmax0, mut rmax1, mut jcol0, mut jcol1) = (zero, zero, zero, zero);
+                    macro_rules! step2 {
+                        ($mask:expr, $live:expr) => {{
+                            let ko = k as isize;
+                            let valid = |i: i32| -> Option<__m512i> {
+                                if $mask {
+                                    Some(_mm512_set1_epi8(if (0..=wm1).contains(&(k + i)) {
+                                        -1
+                                    } else {
+                                        0
+                                    }))
+                                } else {
+                                    None
+                                }
+                            };
+                            let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                            // The bias applies on real query columns (codes `< 8`, unsigned):
+                            // a pad or nonexistent code must carry the diagonal unbiased.
+                            let bi = _mm512_maskz_mov_epi8(_mm512_cmplt_epu8_mask(q, eight), biasv);
+                            let e0 = ld!(e.offset(ko * li));
+                            let d0 = ld!(hp.offset(ko * li));
+                            let (h0, e1) =
+                                cell!(d0, e0, f0, q, bi, rref0, rmax0, jcol0, jv, valid(0), $live);
+                            let (h1, e2) =
+                                cell!(d1, e1, f1, q, bi, rref1, rmax1, jcol1, jv, valid(1), $live);
+                            st!(hc.offset((ko + 1) * li), h1);
+                            st!(e.offset((ko + 2) * li), e2);
+                            d1 = h0;
+                            jv = _mm512_add_epi8(jv, one);
+                            k -= 1;
+                        }};
+                    }
+                    while k >= klo && k > wm1 - 1 {
+                        step2!(true, true);
+                    }
+                    while k >= kun {
+                        step2!(false, false);
+                    }
+                    while k >= klo {
+                        step2!(false, true);
+                    }
+                    let kend = (ri + ominq).max(-1);
+                    while k >= kend {
+                        step2!(true, true);
+                    }
+                    finish_row!(r, rmax0, jcol0, rref0);
+                    finish_row!(r + 1, rmax1, jcol1, rref1);
+                    r += 2;
+                    if early && _mm512_cmpge_epu8_mask(gmax, tgt) == u64::MAX {
+                        break;
+                    }
+                } else {
+                    self.cells += (khi - klo + 1).max(0) as u64;
+                    let rref = ld!(self.refv.as_ptr().add(r * L));
+                    let (mut f, mut rmax, mut jcol) = (zero, zero, zero);
+                    macro_rules! step1 {
+                        ($live:expr) => {{
+                            let ko = k as isize;
+                            let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                            // The bias applies on real query columns (codes `< 8`, unsigned):
+                            // a pad or nonexistent code must carry the diagonal unbiased.
+                            let bi = _mm512_maskz_mov_epi8(_mm512_cmplt_epu8_mask(q, eight), biasv);
+                            let e0 = ld!(e.offset(ko * li));
+                            let d0 = ld!(hp.offset(ko * li));
+                            let (h, e1) =
+                                cell!(d0, e0, f, q, bi, rref, rmax, jcol, jv, None, $live);
+                            st!(hc.offset(ko * li), h);
+                            st!(e.offset((ko + 1) * li), e1);
+                            jv = _mm512_add_epi8(jv, one);
+                            k -= 1;
+                        }};
+                    }
+                    while k >= kun {
+                        step1!(false);
+                    }
+                    while k >= klo {
+                        step1!(true);
+                    }
+                    finish_row!(r, rmax, jcol, rref);
+                    r += 1;
+                    if early && _mm512_cmpge_epu8_mask(gmax, tgt) == u64::MAX {
+                        break;
+                    }
+                }
+                std::mem::swap(&mut hc, &mut hp);
+            }
+            st!(self.gmax.as_mut_ptr(), gmax);
+            self.te = te;
+            self.qe = qe;
+            // Row maxima to lane-major, zero past `nr`.
+            self.rstride = nrp;
+            fit(&mut self.rl, nrp * L);
+            for l in 0..L {
+                let row = &mut self.rl[l * nrp..(l + 1) * nrp];
+                for (x, v) in row.iter_mut().enumerate() {
+                    *v = if x < nr { self.r[x * L + l] } else { 0 };
+                }
+            }
+        }
+    }
+}
+
+/// The x86 band kernel: AVX-512BW (64 lanes) where available and not capped by
+/// `BWA4_RESCUE_TIER`, else AVX2 (32 lanes). Same outputs either way; the group size is the only
+/// thing that differs, read through [`Work::lanes`].
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::{avx2, avx512};
+    pub(super) use avx2::Lane;
+
+    /// The widest group either kernel takes.
+    pub(super) const L: usize = avx512::L;
+
+    pub(super) struct Work {
+        w2: avx2::Work,
+        w5: avx512::Work,
+        wide: bool,
+        pub gmax: [u8; L],
+        pub te: [i32; L],
+        pub qe: [u8; L],
+        pub cells: u64,
+        pub kernel_ns: u64,
+    }
+
+    impl Default for Work {
+        fn default() -> Self {
+            Work {
+                w2: Default::default(),
+                w5: Default::default(),
+                wide: crate::matesw::rescue_avx512_ok(),
+                gmax: [0; L],
+                te: [0; L],
+                qe: [0; L],
+                cells: 0,
+                kernel_ns: 0,
+            }
+        }
+    }
+
+    impl Work {
+        /// Lanes per group of the kernel this machine runs.
+        pub(super) fn lanes(&self) -> usize {
+            if self.wide {
+                avx512::L
+            } else {
+                avx2::L
+            }
+        }
+
+        pub(super) fn lane_rows(&self, l: usize, nrows: usize) -> &[u8] {
+            if self.wide {
+                self.w5.lane_rows(l, nrows)
+            } else {
+                self.w2.lane_rows(l, nrows)
+            }
+        }
+
+        /// # Safety
+        /// AVX2 available (AVX-512BW too when `wide`, which `rescue_avx512_ok` checked).
+        pub(super) unsafe fn run(
+            &mut self,
+            lanes: &[Lane],
+            w: usize,
+            tbl: &[u8; 16],
+            gaps: [u8; 4],
+        ) {
+            let n = lanes.len();
+            if self.wide {
+                self.w5.run(lanes, w, tbl, gaps);
+                self.gmax[..n].copy_from_slice(&self.w5.gmax[..n]);
+                self.te[..n].copy_from_slice(&self.w5.te[..n]);
+                self.qe[..n].copy_from_slice(&self.w5.qe[..n]);
+                self.cells = self.w5.cells;
+            } else {
+                self.w2.run(lanes, w, tbl, gaps);
+                self.gmax[..n].copy_from_slice(&self.w2.gmax[..n]);
+                self.te[..n].copy_from_slice(&self.w2.te[..n]);
+                self.qe[..n].copy_from_slice(&self.w2.qe[..n]);
+                self.cells = self.w2.cells;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1712,6 +2114,88 @@ mod tests {
             banded > checked / 20,
             "too few banded jobs: {banded} of {checked}"
         );
+    }
+
+    /// The 64-lane AVX-512 band kernel against two 32-lane AVX2 groups on the same lanes: every
+    /// lane's best score, its end, and its row maxima must match. Runs only where `avx512bw` is
+    /// detected (the `avx512-check` workflow runs it under Intel SDE).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_band_kernel_matches_avx2() {
+        if !std::arch::is_x86_feature_detected!("avx512bw") {
+            eprintln!("skipping avx512: avx512bw not detected");
+            return;
+        }
+        let mut state = 0x51d2_88a3_04c7_e6b9u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let tbl = crate::matesw::u8_score_table(&scmat(1, 4));
+        let gaps = [7u8, 1, 7, 1];
+        let (mut w2, mut w5) = (avx2::Work::default(), avx512::Work::default());
+        for round in 0..300 {
+            let w = 1 + next() % 48;
+            let seqs: Vec<(Vec<u8>, Vec<u8>, i32)> = (0..64)
+                .map(|_| {
+                    let qlen = 20 + next() % 180;
+                    let tlen = 1 + next() % 300;
+                    let q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
+                    let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+                    // Plant a stretch of the query so lanes score above zero.
+                    let l = (next() % qlen).min(tlen);
+                    let at = next() % (tlen - l + 1);
+                    t[at..at + l].copy_from_slice(&q[..l]);
+                    let o = (next() % qlen) as i32;
+                    (q, t, o)
+                })
+                .collect();
+            let lanes: Vec<avx2::Lane> = seqs
+                .iter()
+                .map(|(q, t, o)| avx2::Lane {
+                    q,
+                    t,
+                    quanta: q.len().div_ceil(16) as i32 * 16,
+                    o: *o,
+                    w: w as i32,
+                    target: 0,
+                })
+                .collect();
+            let n5 = 33 + next() % 32;
+            unsafe { w5.run(&lanes[..n5], w, &tbl, gaps) };
+            for half in 0..2 {
+                let (lo, hi) = (half * 32, (half * 32 + 32).min(n5));
+                if lo >= hi {
+                    continue;
+                }
+                unsafe { w2.run(&lanes[lo..hi], w, &tbl, gaps) };
+                for l in lo..hi {
+                    let k = l - lo;
+                    let msg = format!("round {round} lane {l} w {w}");
+                    assert_eq!(w5.gmax[l], w2.gmax[k], "gmax {msg}");
+                    if w2.gmax[k] > 0 {
+                        assert_eq!((w5.te[l], w5.qe[l]), (w2.te[k], w2.qe[k]), "end {msg}");
+                    }
+                    let nr = lanes[l].t.len();
+                    assert_eq!(w5.lane_rows(l, nr), w2.lane_rows(k, nr), "rows {msg}");
+                }
+            }
+        }
+    }
+
+    /// [`bands_reproduce_ksw_align2`] again, named for the `avx512-check` filter: under SDE the x86
+    /// kernel resolves to AVX-512, so this is the end-to-end check of the 64-lane groups.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_bands_reproduce_ksw_align2() {
+        if !std::arch::is_x86_feature_detected!("avx512bw") {
+            eprintln!("skipping avx512: avx512bw not detected");
+            return;
+        }
+        assert!(Batch::default().work.lanes() == 64);
+        bands_reproduce_ksw_align2();
     }
 
     /// Planning statistics on a dump at gate 1000: why parents are declined, and the cells the
@@ -1902,7 +2386,7 @@ mod tests {
             sink += r.iter().map(|o| o.0 as i64).sum::<i64>();
         }
         std::hint::black_box(sink);
-        let cells = b.work.cells * kernel::L as u64;
+        let cells = b.work.cells * b.work.lanes() as u64;
         eprintln!(
             "BAND bench: {nband} banded ({nhull} hull-only): plan {:.0} ns/job; bands {:.2} s for {cells} cells ({:.2} Gcell/s) vs their hulls {:.2} s for {hull_cells} cells ({:.2} Gcell/s)",
             t_plan as f64 / jobs.len() as f64,

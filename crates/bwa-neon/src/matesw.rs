@@ -1427,6 +1427,14 @@ fn forced_rescue_tier() -> RescueTier {
     })
 }
 
+/// Whether the rescue kernels may take their AVX-512BW form: the CPU has it and
+/// `BWA4_RESCUE_TIER` does not cap the tier below it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn rescue_avx512_ok() -> bool {
+    matches!(forced_rescue_tier(), RescueTier::Auto | RescueTier::Avx512)
+        && std::arch::is_x86_feature_detected!("avx512bw")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fwd_local_sw_batch(
     jobs: &[FwdJob],
