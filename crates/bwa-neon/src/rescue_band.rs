@@ -1264,6 +1264,7 @@ pub(crate) mod neon {
 /// excluded from the row bookkeeping, and feed only later rows of the same lane.
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
+    use crate::batched::x86_row::t16;
     use std::arch::x86_64::*;
 
     pub(super) const L: usize = 32;
@@ -1287,6 +1288,7 @@ mod avx2 {
     /// As the NEON kernel's `Work`.
     #[derive(Default)]
     pub(super) struct Work {
+        st: Vec<u8>,
         a: Vec<u8>,
         refv: Vec<u8>,
         h: Vec<u8>,
@@ -1326,36 +1328,77 @@ mod avx2 {
             let nr = lanes.iter().map(|l| l.t.len()).max().unwrap_or(0);
             let np = nr + w - 1;
             let c = w as i32 - 1;
-            let nrp = nr.next_multiple_of(16);
+            let (npp, nrp) = ((np + 4).next_multiple_of(16), nr.next_multiple_of(16));
+            let stride = npp.max(nrp);
             let hs = w + 7;
-            fit(&mut self.a, (np + 4) * L);
-            fit(&mut self.refv, nr * L);
+            fit(&mut self.st, 16 * stride);
+            fit(&mut self.a, npp * L);
+            fit(&mut self.refv, nrp * L);
             fit(&mut self.h, 2 * hs * L);
             fit(&mut self.e, (w + 9) * L);
             fit(&mut self.r, nrp * L);
-            self.a[..(np + 4) * L].fill(DEAD);
-            self.refv[..nr * L].fill(RPAD);
             self.h[..2 * hs * L].fill(0);
             self.e[..(w + 9) * L].fill(0);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
-            for (l, lane) in lanes.iter().enumerate() {
-                let pq0 = c - lane.o;
-                let len2 = lane.q.len() as i32;
-                for p in pq0.max(0)..(pq0 + len2).min(np as i32) {
-                    self.a[p as usize * L + l] = lane.q[(p - pq0) as usize];
+            // The SoA buffers through a lane-major staging area, 16 lanes at a time, and 16x16
+            // transposes (as the NEON kernel): the query in band layout, then the reference rows.
+            let st = self.st.as_mut_ptr();
+            for blk in 0..L / 16 {
+                for i in 0..16 {
+                    let row = std::slice::from_raw_parts_mut(st.add(i * stride), npp);
+                    row.fill(DEAD);
+                    let l = blk * 16 + i;
+                    let Some(lane) = lanes.get(l) else { continue };
+                    let pq0 = c - lane.o;
+                    let len2 = lane.q.len() as i32;
+                    let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
+                    if p0 < p1 {
+                        row[p0 as usize..p1 as usize]
+                            .copy_from_slice(&lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize]);
+                    }
+                    let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
+                    if p0 < p1 {
+                        row[p0 as usize..p1 as usize].fill(QPAD);
+                    }
+                    ob[l] = lane.o as u8;
+                    omax = omax.max(lane.o);
+                    ominq = ominq.min(lane.o - lane.quanta + 1);
+                    omaskq = omaskq.max(lane.o - lane.quanta + 1);
                 }
-                for p in (pq0 + len2).max(0)..(pq0 + lane.quanta).min(np as i32) {
-                    self.a[p as usize * L + l] = QPAD;
+                for b in (0..npp).step_by(16) {
+                    t16(
+                        st.add(b),
+                        stride,
+                        self.a.as_mut_ptr().add(b * L + blk * 16),
+                        L,
+                    );
                 }
-                for (r, &b) in lane.t.iter().enumerate() {
+                for i in 0..16 {
+                    let row = std::slice::from_raw_parts_mut(st.add(i * stride), nrp);
+                    let Some(lane) = lanes.get(blk * 16 + i) else {
+                        row.fill(RPAD);
+                        continue;
+                    };
+                    row[..lane.t.len()].copy_from_slice(lane.t);
+                    row[lane.t.len()..].fill(RPAD);
                     // Target N re-encoded as 12 (see the NEON kernel).
-                    self.refv[r * L + l] = if b == 4 { 12 } else { b };
+                    if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
+                        for b in row[..lane.t.len()].iter_mut() {
+                            if *b == 4 {
+                                *b = 12;
+                            }
+                        }
+                    }
                 }
-                ob[l] = lane.o as u8;
-                omax = omax.max(lane.o);
-                ominq = ominq.min(lane.o - lane.quanta + 1);
-                omaskq = omaskq.max(lane.o - lane.quanta + 1);
+                for b in (0..nrp).step_by(16) {
+                    t16(
+                        st.add(b),
+                        stride,
+                        self.refv.as_mut_ptr().add(b * L + blk * 16),
+                        L,
+                    );
+                }
             }
             // The biased table, replicated per 128-bit half: `score + bias`, bias the mismatch
             // penalty, so every entry is a non-negative magnitude. Slots 9-11 are unreachable.
@@ -1562,10 +1605,15 @@ mod avx2 {
             // Row maxima to lane-major, zero past `nr`.
             self.rstride = nrp;
             fit(&mut self.rl, nrp * L);
-            for l in 0..L {
-                let row = &mut self.rl[l * nrp..(l + 1) * nrp];
-                for (x, v) in row.iter_mut().enumerate() {
-                    *v = if x < nr { self.r[x * L + l] } else { 0 };
+            self.r[nr * L..nrp * L].fill(0);
+            for blk in 0..L / 16 {
+                for b in (0..nrp).step_by(16) {
+                    t16(
+                        self.r.as_ptr().add(b * L + blk * 16),
+                        L,
+                        self.rl.as_mut_ptr().add(blk * 16 * nrp + b),
+                        nrp,
+                    );
                 }
             }
         }
@@ -1574,6 +1622,7 @@ mod avx2 {
 
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
+    use crate::batched::x86_row::t16;
     use std::arch::x86_64::*;
 
     pub(super) const L: usize = 64;
@@ -1585,6 +1634,7 @@ mod avx512 {
 
     /// As the NEON kernel's `Work`.
     pub(super) struct Work {
+        st: Vec<u8>,
         a: Vec<u8>,
         refv: Vec<u8>,
         h: Vec<u8>,
@@ -1601,6 +1651,7 @@ mod avx512 {
     impl Default for Work {
         fn default() -> Self {
             Work {
+                st: Vec::new(),
                 a: Vec::new(),
                 refv: Vec::new(),
                 h: Vec::new(),
@@ -1642,36 +1693,77 @@ mod avx512 {
             let nr = lanes.iter().map(|l| l.t.len()).max().unwrap_or(0);
             let np = nr + w - 1;
             let c = w as i32 - 1;
-            let nrp = nr.next_multiple_of(16);
+            let (npp, nrp) = ((np + 4).next_multiple_of(16), nr.next_multiple_of(16));
+            let stride = npp.max(nrp);
             let hs = w + 7;
-            fit(&mut self.a, (np + 4) * L);
-            fit(&mut self.refv, nr * L);
+            fit(&mut self.st, 16 * stride);
+            fit(&mut self.a, npp * L);
+            fit(&mut self.refv, nrp * L);
             fit(&mut self.h, 2 * hs * L);
             fit(&mut self.e, (w + 9) * L);
             fit(&mut self.r, nrp * L);
-            self.a[..(np + 4) * L].fill(DEAD);
-            self.refv[..nr * L].fill(RPAD);
             self.h[..2 * hs * L].fill(0);
             self.e[..(w + 9) * L].fill(0);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
-            for (l, lane) in lanes.iter().enumerate() {
-                let pq0 = c - lane.o;
-                let len2 = lane.q.len() as i32;
-                for p in pq0.max(0)..(pq0 + len2).min(np as i32) {
-                    self.a[p as usize * L + l] = lane.q[(p - pq0) as usize];
+            // The SoA buffers through a lane-major staging area, 16 lanes at a time, and 16x16
+            // transposes (as the NEON kernel): the query in band layout, then the reference rows.
+            let st = self.st.as_mut_ptr();
+            for blk in 0..L / 16 {
+                for i in 0..16 {
+                    let row = std::slice::from_raw_parts_mut(st.add(i * stride), npp);
+                    row.fill(DEAD);
+                    let l = blk * 16 + i;
+                    let Some(lane) = lanes.get(l) else { continue };
+                    let pq0 = c - lane.o;
+                    let len2 = lane.q.len() as i32;
+                    let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
+                    if p0 < p1 {
+                        row[p0 as usize..p1 as usize]
+                            .copy_from_slice(&lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize]);
+                    }
+                    let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
+                    if p0 < p1 {
+                        row[p0 as usize..p1 as usize].fill(QPAD);
+                    }
+                    ob[l] = lane.o as u8;
+                    omax = omax.max(lane.o);
+                    ominq = ominq.min(lane.o - lane.quanta + 1);
+                    omaskq = omaskq.max(lane.o - lane.quanta + 1);
                 }
-                for p in (pq0 + len2).max(0)..(pq0 + lane.quanta).min(np as i32) {
-                    self.a[p as usize * L + l] = QPAD;
+                for b in (0..npp).step_by(16) {
+                    t16(
+                        st.add(b),
+                        stride,
+                        self.a.as_mut_ptr().add(b * L + blk * 16),
+                        L,
+                    );
                 }
-                for (r, &b) in lane.t.iter().enumerate() {
+                for i in 0..16 {
+                    let row = std::slice::from_raw_parts_mut(st.add(i * stride), nrp);
+                    let Some(lane) = lanes.get(blk * 16 + i) else {
+                        row.fill(RPAD);
+                        continue;
+                    };
+                    row[..lane.t.len()].copy_from_slice(lane.t);
+                    row[lane.t.len()..].fill(RPAD);
                     // Target N re-encoded as 12 (see the NEON kernel).
-                    self.refv[r * L + l] = if b == 4 { 12 } else { b };
+                    if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
+                        for b in row[..lane.t.len()].iter_mut() {
+                            if *b == 4 {
+                                *b = 12;
+                            }
+                        }
+                    }
                 }
-                ob[l] = lane.o as u8;
-                omax = omax.max(lane.o);
-                ominq = ominq.min(lane.o - lane.quanta + 1);
-                omaskq = omaskq.max(lane.o - lane.quanta + 1);
+                for b in (0..nrp).step_by(16) {
+                    t16(
+                        st.add(b),
+                        stride,
+                        self.refv.as_mut_ptr().add(b * L + blk * 16),
+                        L,
+                    );
+                }
             }
             // The biased table, replicated per 128-bit half: `score + bias`, bias the mismatch
             // penalty, so every entry is a non-negative magnitude. Slots 9-11 are unreachable.
@@ -1871,10 +1963,15 @@ mod avx512 {
             // Row maxima to lane-major, zero past `nr`.
             self.rstride = nrp;
             fit(&mut self.rl, nrp * L);
-            for l in 0..L {
-                let row = &mut self.rl[l * nrp..(l + 1) * nrp];
-                for (x, v) in row.iter_mut().enumerate() {
-                    *v = if x < nr { self.r[x * L + l] } else { 0 };
+            self.r[nr * L..nrp * L].fill(0);
+            for blk in 0..L / 16 {
+                for b in (0..nrp).step_by(16) {
+                    t16(
+                        self.r.as_ptr().add(b * L + blk * 16),
+                        L,
+                        self.rl.as_mut_ptr().add(blk * 16 * nrp + b),
+                        nrp,
+                    );
                 }
             }
         }

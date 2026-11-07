@@ -2786,7 +2786,7 @@ macro_rules! define_sw_kernel {
 /// lanes (32 for AVX2, 64 for AVX-512, which implies AVX2). Writes the lane vectors in the x86
 /// kernels' form: `beg`/`end` XOR-ed with `bias` (`band_bias`), `end` itself (no `band_width`).
 #[cfg(target_arch = "x86_64")]
-mod x86_row {
+pub(crate) mod x86_row {
     use std::arch::x86_64::*;
 
     /// Eight bytes from `p` widened to i32.
@@ -3042,23 +3042,16 @@ mod x86_row {
         live_bits
     }
 
-    /// Where the SSE2 unpack network below leaves column `c`: vector `BITREV[c]`.
+    /// Where the unpack network of [`t16`] leaves row `c`: vector `BITREV[c]`.
     const BITREV: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
 
-    /// `n` positions (a multiple of 16) of 16 lane-major rows of `stride` bytes at `src`, stored
-    /// position-major into lanes `off..off + 16` of `N`-lane vectors at `dst`. Four rounds of
-    /// unpacks pair rows `2k`/`2k + 1` at widths 1, 2, 4, 8 bytes: a 16x16 byte transpose whose
-    /// columns come out in bit-reversed order.
+    /// 16x16 byte block transpose: byte `c` of row `l` (the 16 bytes at `src + l * ss`) goes to
+    /// byte `l` of row `c` (at `dst + c * ds`). Four rounds of unpacks pair rows `2k`/`2k + 1` at
+    /// widths 1, 2, 4, 8 bytes; the rows come out in bit-reversed order. SSE2, the x86-64 baseline.
     ///
     /// # Safety
-    /// `src` holds `16 * stride` bytes with `n <= stride`; `dst` holds `n * N` bytes.
-    unsafe fn transpose_to<const N: usize>(
-        src: *const u8,
-        stride: usize,
-        n: usize,
-        dst: *mut u8,
-        off: usize,
-    ) {
+    /// `src` holds 16 rows of 16 bytes at stride `ss`, `dst` 16 at stride `ds`.
+    pub(crate) unsafe fn t16(src: *const u8, ss: usize, dst: *mut u8, ds: usize) {
         macro_rules! round {
             ($v:ident, $lo:ident, $hi:ident) => {{
                 let mut o = [_mm_setzero_si128(); 16];
@@ -3069,20 +3062,33 @@ mod x86_row {
                 o
             }};
         }
-        let mut b = 0;
-        while b < n {
-            let mut v = [_mm_setzero_si128(); 16];
-            for (l, x) in v.iter_mut().enumerate() {
-                *x = _mm_loadu_si128(src.add(l * stride + b) as *const __m128i);
-            }
-            let v = round!(v, _mm_unpacklo_epi8, _mm_unpackhi_epi8);
-            let v = round!(v, _mm_unpacklo_epi16, _mm_unpackhi_epi16);
-            let v = round!(v, _mm_unpacklo_epi32, _mm_unpackhi_epi32);
-            let v = round!(v, _mm_unpacklo_epi64, _mm_unpackhi_epi64);
-            for (c, &r) in BITREV.iter().enumerate() {
-                _mm_storeu_si128(dst.add((b + c) * N + off) as *mut __m128i, v[r]);
-            }
-            b += 16;
+        let mut v = [_mm_setzero_si128(); 16];
+        for (l, x) in v.iter_mut().enumerate() {
+            *x = _mm_loadu_si128(src.add(l * ss) as *const __m128i);
+        }
+        let v = round!(v, _mm_unpacklo_epi8, _mm_unpackhi_epi8);
+        let v = round!(v, _mm_unpacklo_epi16, _mm_unpackhi_epi16);
+        let v = round!(v, _mm_unpacklo_epi32, _mm_unpackhi_epi32);
+        let v = round!(v, _mm_unpacklo_epi64, _mm_unpackhi_epi64);
+        for (c, &r) in BITREV.iter().enumerate() {
+            _mm_storeu_si128(dst.add(c * ds) as *mut __m128i, v[r]);
+        }
+    }
+
+    /// `n` positions (a multiple of 16) of 16 lane-major rows of `stride` bytes at `src`, stored
+    /// position-major into lanes `off..off + 16` of `N`-lane vectors at `dst`.
+    ///
+    /// # Safety
+    /// `src` holds `16 * stride` bytes with `n <= stride`; `dst` holds `n * N` bytes.
+    unsafe fn transpose_to<const N: usize>(
+        src: *const u8,
+        stride: usize,
+        n: usize,
+        dst: *mut u8,
+        off: usize,
+    ) {
+        for b in (0..n).step_by(16) {
+            t16(src.add(b), stride, dst.add(b * N + off), N);
         }
     }
 
