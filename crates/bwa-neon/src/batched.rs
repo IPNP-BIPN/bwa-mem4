@@ -2835,14 +2835,18 @@ macro_rules! define_sw_kernel {
                                 max_off: dst.max_off[dl],
                             };
                         }
-                        for c in 0..stride {
+                        // Only what the lane can still read: columns `0..=qlen` of H/E (`end <= qlen`;
+                        // those below `beg` must carry over too), its query codes, and its target
+                        // rows from `i + 1`. The rest of the slot is outside its band, masked.
+                        let ql = src.qlen[sl];
+                        for c in 0..=ql {
                             dst.eh_h[c * LANES + dl] = src.eh_h[c * LANES + sl];
                             dst.eh_e[c * LANES + dl] = src.eh_e[c * LANES + sl];
                         }
-                        for c in 0..soa_cols {
+                        for c in 0..ql {
                             dst.qcode[c * LANES + dl] = src.qcode[c * LANES + sl];
                         }
-                        for r in (i as usize + 1)..soa_rows {
+                        for r in (i as usize + 1)..src.tlen[sl] {
                             dst.tcode[r * LANES + dl] = src.tcode[r * LANES + sl];
                         }
                         dst.qlen[dl] = src.qlen[sl];
@@ -2891,9 +2895,6 @@ macro_rules! define_sw_kernel {
     };
 }
 
-/// The NEON u8 kernel's row prologue and epilogue in i32 vector lanes (`rowvec` in
-/// [`define_sw_kernel!`]): the same per-lane logic as the scalar arms, with every test folded into
-/// a select, over 16 lanes as four `int32x4_t`.
 /// The x86 u8 kernels' row prologue and epilogue in i32 vector lanes (`rowvec` in
 /// [`define_sw_kernel!`]), eight lanes per AVX2 register: the NEON `neon_row` logic over `N`
 /// lanes (32 for AVX2, 64 for AVX-512, which implies AVX2). Writes the lane vectors in the x86
@@ -3245,6 +3246,9 @@ mod x86_row {
     }
 }
 
+/// The NEON u8 kernel's row prologue and epilogue in i32 vector lanes (`rowvec` in
+/// [`define_sw_kernel!`]): the same per-lane logic as the scalar arms, with every test folded into
+/// a select, over 16 lanes as four `int32x4_t`.
 #[cfg(target_arch = "aarch64")]
 mod neon_row {
     use std::arch::aarch64::*;
