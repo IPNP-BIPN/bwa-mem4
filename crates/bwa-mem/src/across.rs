@@ -852,7 +852,7 @@ pub fn align_reads_batched<B: SwBackend>(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
-    reads: &[Vec<u8>],
+    reads: &[impl AsRef<[u8]>],
     backend: &B,
 ) -> Vec<Vec<MemAlnReg>> {
     // Whole-function timer for the split probe; `None` and free when the probe is off.
@@ -878,7 +878,7 @@ fn align_reads_batched_inner<B: SwBackend>(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
-    reads: &[Vec<u8>],
+    reads: &[impl AsRef<[u8]>],
     backend: &B,
 ) -> Vec<Vec<MemAlnReg>> {
     // Length of the forward strand in bases. Every reference coordinate below lives in `0..2*l_pac`,
@@ -890,7 +890,9 @@ fn align_reads_batched_inner<B: SwBackend>(
     // chain each read. Result-identical to per-read `build_chains` (batched seeding is verified equal
     // to per-read `collect_smems`).
     // Borrowed view of `reads`, the shape the batched seeder wants. No copy of the bases.
-    let refs: Vec<&[u8]> = reads.iter().map(|c| c.as_slice()).collect();
+    let refs: Vec<&[u8]> = reads.iter().map(|c| c.as_ref()).collect();
+    // From here on, `reads` is that view: one type whatever the caller holds the bases in.
+    let reads: &[&[u8]] = &refs;
     // One vector of round-1 SMEMs per read, parallel to `reads`. At this point each SMEM carries an
     // SA *interval* (`k`, `s`), not yet resolved reference positions.
     // The four `alloc_probe::enter` scopes in this function split `BWA4_STAGE_ALLOC`'s `align` row

@@ -2427,7 +2427,7 @@ fn batched_regs(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
-    codes: &[Vec<u8>],
+    codes: &[impl AsRef<[u8]> + Sync],
     leave_undeduped: bool,
 ) -> Vec<Vec<MemAlnReg>> {
     // One chunk per worker, so every thread gets a slice big enough to fill the SIMD lanes.
@@ -2461,7 +2461,8 @@ fn batched_regs(
                     // survivors' lists are given back too.
                     if !leave_undeduped {
                         for (r, codes) in regs.iter_mut().zip(chunk) {
-                            let mut kept = mem_sort_dedup_patch(fm, opt, codes, std::mem::take(r));
+                            let mut kept =
+                                mem_sort_dedup_patch(fm, opt, codes.as_ref(), std::mem::take(r));
                             // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
                             // the dedup and before any primary marking reads it.
                             bwa_mem::stamp_is_alt(bns, &mut kept);
@@ -3014,29 +3015,27 @@ fn run_pe(
     // path; primary marking and pairing happen later, per bwa-mem2.
     // `batch` is one `-K` worth of read PAIRS in input order; `base_pair` is the global id of its
     // first pair. Returns the batch's complete SAM text.
-    let process = |batch: Vec<(Record, Record)>, base_pair: u64| -> Vec<Vec<u8>> {
-        // ---- Both mates of every pair, interleaved as c1,c2,c1,c2,... so the batched extension
-        //      sees one flat list of reads ----
-        // Length is `2 * batch.len()`; index `2i` is pair `i`'s mate 1 and `2i+1` its mate 2.
-        //
-        // Run on the pool, as bwa-mem2 does (it encodes inside `mem_kernel1_core`, under `kt_for`).
-        // Indexed by the FLAT read index `i`, so `i >> 1` is the pair and `i & 1` the mate: an
-        // indexed `par_iter` over a range preserves order exactly, and `dna::nt4` is a pure table
-        // lookup, so each entry depends only on its own read. Byte-identical to the serial form.
-        let all_codes: Vec<Vec<u8>> = stage_time::measure(Stage::Encode, || {
+    let process = |mut batch: Vec<(Record, Record)>, base_pair: u64| -> Vec<Vec<u8>> {
+        // ---- nt4 in place, as bwa does (`mem_kernel1_core`, under `kt_for`) ----
+        // Nothing downstream reads the ASCII bases of a pair, and a second, separately allocated
+        // copy of every base held for the whole batch cost ~85 MB per 80M-base batch.
+        stage_time::measure(Stage::Encode, || {
             stage_time::barrier::region(Stage::Encode, || {
-                (0..2 * batch.len())
-                    .into_par_iter()
-                    .map(|i| {
-                        stage_time::barrier::worker(|| {
-                            let (rec1, rec2) = &batch[i >> 1];
-                            let seq = if i & 1 == 0 { rec1.seq() } else { rec2.seq() };
-                            seq.iter().map(|&base| dna::nt4(base)).collect()
-                        })
+                batch.par_iter_mut().for_each(|(rec1, rec2)| {
+                    stage_time::barrier::worker(|| {
+                        for base in rec1.seq_mut().iter_mut().chain(rec2.seq_mut()) {
+                            *base = dna::nt4(*base);
+                        }
                     })
-                    .collect()
+                })
             })
         });
+        // Both mates of every pair, interleaved c1,c2,c1,c2,... so the batched extension sees one
+        // flat list of reads: index `2i` is pair `i`'s mate 1 and `2i+1` its mate 2.
+        let all_codes: Vec<&[u8]> = batch
+            .iter()
+            .flat_map(|(rec1, rec2)| [rec1.seq(), rec2.seq()])
+            .collect();
         // Both mates, so the bytes-per-base column counts the same bases the aligner processed.
         // One sum per batch, and only when `BWA4_STAGE_ALLOC` is armed.
         if crate::stage_alloc::enabled() {
@@ -3046,28 +3045,16 @@ fn run_pe(
         let regs_all = stage_time::measure(Stage::Align, || {
             batched_regs(fm, bns, opt, &all_codes, false)
         });
+        drop(all_codes);
 
-        // ---- De-interleave: pair up each mate's owned codes + regions by sequential moves (no
-        //      content copy), so the parallel prep can consume them instead of cloning
-        //      `all_codes[2i]`/`regs_all[2i]` per pair ----
-        // Owning cursors over the two interleaved lists. Invariant: both have yielded the same
-        // number of items at every point, so the four `next()` calls below always take mate 1's
-        // codes, mate 2's codes, mate 1's regions and mate 2's regions of the SAME pair. Each
-        // `unwrap` is sound because both lists hold exactly `2 * batch.len()` items.
-        // Re-paired, one entry per input pair, in pair order: ((codes1, codes2), (regs1, regs2)).
-        #[allow(clippy::type_complexity)]
-        let paired: Vec<((Vec<u8>, Vec<u8>), (Vec<MemAlnReg>, Vec<MemAlnReg>))> =
+        // ---- De-interleave each mate's regions by sequential moves (no content copy) ----
+        // Invariant: the two `next()` calls take mate 1's and mate 2's regions of the SAME pair;
+        // each `unwrap` is sound because the list holds exactly `2 * batch.len()` items.
+        let paired: Vec<(Vec<MemAlnReg>, Vec<MemAlnReg>)> =
             stage_time::measure(Stage::Deinterleave, || {
-                let mut code_iter = all_codes.into_iter();
                 let mut regs_iter = regs_all.into_iter();
                 (0..batch.len())
-                    .map(|_| {
-                        let codes1 = code_iter.next().unwrap();
-                        let codes2 = code_iter.next().unwrap();
-                        let regs1 = regs_iter.next().unwrap();
-                        let regs2 = regs_iter.next().unwrap();
-                        ((codes1, codes2), (regs1, regs2))
-                    })
+                    .map(|_| (regs_iter.next().unwrap(), regs_iter.next().unwrap()))
                     .collect()
             });
 
@@ -3076,18 +3063,12 @@ fn run_pe(
         // because mate rescue writes new regions into it and `mem_sam_pe` then rewrites them again.
         let mut prepared: Vec<PrepPair> = stage_time::measure(Stage::DedupPrep, || {
             stage_time::barrier::region(Stage::DedupPrep, || {
-                // `into_par_iter`, not `par_iter`: `batch` is dead after this stage, so the six
-                // per-pair fields below are MOVED out of the records instead of cloned. At 1M pairs
-                // that is six million allocations and about 376 MB of copying removed from a
-                // parallel stage. Indexed either way, so the order is unchanged and so is the
-                // output.
+                // `into_par_iter`: `batch` is dead after this stage, so the records are MOVED.
                 batch
                     .into_par_iter()
                     .zip(paired.into_par_iter())
-                    .map(|((rec1, rec2), ((codes1, codes2), (regs1, regs2)))| {
+                    .map(|((rec1, rec2), (regs1, regs2))| {
                         stage_time::barrier::worker(|| PrepPair {
-                            codes1,
-                            codes2,
                             regs1,
                             regs2,
                             rec1,
@@ -3143,8 +3124,8 @@ fn run_pe(
                 let mut rescue_jobs: Vec<PairRescueData> = prepared
                     .iter_mut()
                     .map(|pair| PairRescueData {
-                        seq0: pair.codes1.as_slice(),
-                        seq1: pair.codes2.as_slice(),
+                        seq0: pair.rec1.seq(),
+                        seq1: pair.rec2.seq(),
                         a0: &mut pair.regs1,
                         a1: &mut pair.regs2,
                     })
@@ -3177,7 +3158,7 @@ fn run_pe(
                             // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
                             // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
                             let names = [pair.rec1.name(), pair.rec2.name()];
-                            let seqs = [pair.codes1.as_slice(), pair.codes2.as_slice()];
+                            let seqs = [pair.rec1.seq(), pair.rec2.seq()];
                             let quals = [pair.rec1.qual(), pair.rec2.qual()];
                             let comments = [pair.rec1.comment(), pair.rec2.comment()];
                             // This pair's SAM text.
@@ -3322,11 +3303,8 @@ fn rescue_pairs_override() -> Option<usize> {
     })
 }
 
-/// One read pair prepared for the pairing/output stage: nt4 codes, dedup'd regions, names, quals.
+/// One read pair prepared for the pairing/output stage: dedup'd regions and the two records.
 struct PrepPair {
-    /// nt4-coded bases of mate 1 and mate 2 (A=0, C=1, G=2, T=3, else 4).
-    codes1: Vec<u8>,
-    codes2: Vec<u8>,
     /// Each mate's deduplicated candidate alignments, still unpaired at this point. Mutated twice
     /// more: mate rescue may append to them, then `mem_sam_pe` marks primaries and pairs them.
     regs1: Vec<MemAlnReg>,
@@ -3336,13 +3314,11 @@ struct PrepPair {
     /// This used to be six owned fields (`name1/2`, `qual1/2`, `comment1/2`) cloned out of the
     /// records, which is six allocations per pair. Since `Record` became one buffer plus offsets
     /// the whole record is 32 bytes and moving it is strictly cheaper than copying any one of its
-    /// parts. `seq` rides along unused here (the stage works on `codes`), which costs nothing: the
-    /// bytes were going to be freed at the end of the batch either way.
+    /// parts. `seq()` holds nt4 codes (A=0, C=1, G=2, T=3, else 4), recoded in place at encode.
     ///
     /// `name()` is the QNAME: bwa emits the SAME name on both records of a pair, so any `/1`, `/2`
     /// suffix has already been stripped by the reader. `qual()` is the per-base ASCII quality, or
-    /// `None` for FASTA input (SAM column 11 becomes `*`), always as long as the corresponding
-    /// `codes`. `comment()` is the `-C` trailer.
+    /// `None` for FASTA input (SAM column 11 becomes `*`), always as long as `seq()`. `comment()` is the `-C` trailer.
     rec1: Record,
     rec2: Record,
 }

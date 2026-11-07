@@ -132,6 +132,14 @@ impl Record {
         &self.buf[start..start + self.seq_len as usize]
     }
 
+    /// [`Record::seq`], writable: lets a caller recode the bases in place (bwa's nt4 pass) instead
+    /// of holding a second copy for the whole batch.
+    #[inline]
+    pub fn seq_mut(&mut self) -> &mut [u8] {
+        let start = self.name_len as usize;
+        &mut self.buf[start..start + self.seq_len as usize]
+    }
+
     /// FASTQ line 4: Phred+33 quality, one byte per base, or `None` for FASTA input.
     #[inline]
     #[must_use]

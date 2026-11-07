@@ -548,6 +548,7 @@ fn mem_matesw(
                     while ins < ma.len() && ma[ins].score >= b.score {
                         ins += 1;
                     }
+                    grow_one(ma);
                     ma.insert(ins, b);
                 }
                 n += 1;
@@ -828,6 +829,7 @@ fn insert_settled_view(
         // Appended, not inserted: a rescued hit lands near the front of a long score-descending
         // list, and shifting ~100 96-byte regions per hit was 2 s of memmove per 2M pairs. Until
         // `settle_order`, only order-blind readers see the list (the skip scan, this function).
+        grow_one(ma);
         ma.push(b);
         view.pending += 1;
     }
@@ -1159,6 +1161,7 @@ fn matesw_apply(
                 while ins < ma.len() && ma[ins].score >= b.score {
                     ins += 1;
                 }
+                grow_one(ma);
                 ma.insert(ins, b);
                 dirty = true;
                 crate::rescue_split::stop(&crate::rescue_split::APPLY_INSERT_NS, t_ins);
@@ -1784,6 +1787,16 @@ struct Seen {
     hash: u64,
     rb: i64,
     result: KswAlignResult,
+}
+
+/// Room for one more region, growing by an eighth rather than doubling. A batch holds every read's
+/// regions until SAM emit, and doubling on the rescued hit left a few-region list half empty: 0.15
+/// GB of chr21's 2.2 GB peak. An eighth keeps repeat-heavy lists (hundreds of regions, many rescued
+/// hits each) amortized.
+fn grow_one(ma: &mut Vec<MemAlnReg>) {
+    if ma.len() == ma.capacity() {
+        ma.reserve_exact(1 + ma.len() / 8);
+    }
 }
 
 /// [`Seen`]'s lookup key: the slot, length and orientation mixed into the window hash.
