@@ -1050,7 +1050,9 @@ pub(crate) mod neon {
             let (hr1, hr2) = (hr0.add(hs * L), hr0.add(2 * hs * L));
             let li = L as isize;
             let mut gmax = zero;
-            let mut te = [-1i32; L];
+            // `te` as its low and high bytes per lane, written with the row on every improving
+            // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
+            let (mut te_lo, mut te_hi) = (zero, zero);
             let mut qev = zero;
             let wm1 = w as i32 - 1;
             // `qe` is not tracked per cell. A lane's (te, qe) is that of its last improving row, so
@@ -1123,12 +1125,9 @@ pub(crate) mod neon {
                         qev = qe_scan(prev.0, prev.1, flush, gmax, qev);
                     }
                     gmax = vbslq_u8(imp, $rmax, gmax);
-                    let mut m = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
-                        vreinterpretq_u16_u8(imp),
-                    ))) & 0x1111_1111_1111_1111;
-                    while m != 0 {
-                        te[m.trailing_zeros() as usize / 4] = $row as i32;
-                        m &= m - 1;
+                    te_lo = vbslq_u8(imp, vdupq_n_u8($row as u8), te_lo);
+                    if $row >= 256 {
+                        te_hi = vbslq_u8(imp, vdupq_n_u8(($row >> 8) as u8), te_hi);
                     }
                     pend = imp;
                     prev = ($buf as *const u8, $row as i32);
@@ -1243,7 +1242,16 @@ pub(crate) mod neon {
                 qev = qe_scan(prev.0, prev.1, pend, gmax, qev);
             }
             vst1q_u8(self.gmax.as_mut_ptr(), gmax);
-            self.te = te;
+            let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
+            vst1q_u8(lo.as_mut_ptr(), te_lo);
+            vst1q_u8(hi.as_mut_ptr(), te_hi);
+            self.te = std::array::from_fn(|l| {
+                if self.gmax[l] > 0 {
+                    i32::from(lo[l]) | i32::from(hi[l]) << 8
+                } else {
+                    -1
+                }
+            });
             vst1q_u8(self.qe.as_mut_ptr(), qev);
             // Row maxima back to lane-major, zero past `nr`.
             self.rstride = nrp;
@@ -1437,8 +1445,8 @@ mod avx2 {
             );
             let li = L as isize;
             let mut gmax = zero;
-            let mut te = [-1i32; L];
-            let mut qe = [0u8; L];
+            // Last improving row as two bytes and its column, blended per lane like gmax.
+            let (mut te_lo, mut te_hi, mut qev) = (zero, zero, zero);
             let wm1 = w as i32 - 1;
 
             macro_rules! cge {
@@ -1486,17 +1494,11 @@ mod avx2 {
                     let cgt = _mm256_xor_si256(cge!(gmax, $rmax), ones);
                     let imp = _mm256_andnot_si256(_mm256_cmpgt_epi8(zero, $rref), cgt);
                     gmax = _mm256_blendv_epi8(gmax, $rmax, imp);
-                    let m = _mm256_movemask_epi8(imp) as u32;
-                    if m != 0 {
-                        let mut jc = [0u8; L];
-                        st!(jc.as_mut_ptr(), $jcol);
-                        for l in 0..L {
-                            if m >> l & 1 != 0 {
-                                te[l] = $row as i32;
-                                qe[l] = jc[l];
-                            }
-                        }
+                    te_lo = _mm256_blendv_epi8(te_lo, _mm256_set1_epi8($row as i8), imp);
+                    if $row >= 256 {
+                        te_hi = _mm256_blendv_epi8(te_hi, _mm256_set1_epi8(($row >> 8) as i8), imp);
                     }
+                    qev = _mm256_blendv_epi8(qev, $jcol, imp);
                 }};
             }
 
@@ -1600,8 +1602,17 @@ mod avx2 {
                 std::mem::swap(&mut hc, &mut hp);
             }
             st!(self.gmax.as_mut_ptr(), gmax);
-            self.te = te;
-            self.qe = qe;
+            let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
+            st!(lo.as_mut_ptr(), te_lo);
+            st!(hi.as_mut_ptr(), te_hi);
+            st!(self.qe.as_mut_ptr(), qev);
+            self.te = std::array::from_fn(|l| {
+                if self.gmax[l] > 0 {
+                    i32::from(lo[l]) | i32::from(hi[l]) << 8
+                } else {
+                    -1
+                }
+            });
             // Row maxima to lane-major, zero past `nr`.
             self.rstride = nrp;
             fit(&mut self.rl, nrp * L);
@@ -1800,8 +1811,8 @@ mod avx512 {
             );
             let li = L as isize;
             let mut gmax = zero;
-            let mut te = [-1i32; L];
-            let mut qe = [0u8; L];
+            // Last improving row as two bytes and its column, blended per lane like gmax.
+            let (mut te_lo, mut te_hi, mut qev) = (zero, zero, zero);
             let wm1 = w as i32 - 1;
 
             macro_rules! ld {
@@ -1844,17 +1855,12 @@ mod avx512 {
                     let imp =
                         _mm512_cmpgt_epu8_mask($rmax, gmax) & _mm512_cmpge_epi8_mask($rref, zero);
                     gmax = _mm512_mask_blend_epi8(imp, gmax, $rmax);
-                    let m = imp;
-                    if m != 0 {
-                        let mut jc = [0u8; L];
-                        st!(jc.as_mut_ptr(), $jcol);
-                        for l in 0..L {
-                            if m >> l & 1 != 0 {
-                                te[l] = $row as i32;
-                                qe[l] = jc[l];
-                            }
-                        }
+                    te_lo = _mm512_mask_blend_epi8(imp, te_lo, _mm512_set1_epi8($row as i8));
+                    if $row >= 256 {
+                        te_hi =
+                            _mm512_mask_blend_epi8(imp, te_hi, _mm512_set1_epi8(($row >> 8) as i8));
                     }
+                    qev = _mm512_mask_blend_epi8(imp, qev, $jcol);
                 }};
             }
 
@@ -1958,8 +1964,17 @@ mod avx512 {
                 std::mem::swap(&mut hc, &mut hp);
             }
             st!(self.gmax.as_mut_ptr(), gmax);
-            self.te = te;
-            self.qe = qe;
+            let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
+            st!(lo.as_mut_ptr(), te_lo);
+            st!(hi.as_mut_ptr(), te_hi);
+            st!(self.qe.as_mut_ptr(), qev);
+            self.te = std::array::from_fn(|l| {
+                if self.gmax[l] > 0 {
+                    i32::from(lo[l]) | i32::from(hi[l]) << 8
+                } else {
+                    -1
+                }
+            });
             // Row maxima to lane-major, zero past `nr`.
             self.rstride = nrp;
             fit(&mut self.rl, nrp * L);
