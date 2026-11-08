@@ -1688,16 +1688,17 @@ impl FmIndex {
                 (c as u64 & 1).wrapping_sub(1),
             );
             let cp = &self.cp_occ[..];
+            // Branch-free plane select (`c` is a random base, a `match` mispredicts): `hi` for
+            // c <= 1, `lo` for c == 0, `hi & lo` for c == 2, nothing for c == 3.
+            let mask = |on: bool| 0u64.wrapping_sub(u64::from(on));
+            let (mh, ml, mhl) = (mask(c <= 1), mask(c == 0), mask(c == 2));
             let gt = |row: i64| {
                 let b = &cp[(row >> CP_SHIFT) as usize];
-                let plane = match c {
-                    0 => b.hi | b.lo,
-                    1 => b.hi,
-                    2 => b.hi & b.lo,
-                    _ => 0,
-                };
+                let plane = (b.hi & mh) | (b.lo & ml) | (b.hi & b.lo & mhl);
                 // In i64: three counts of a human genome overflow u32.
-                let before: i64 = b.cp_count[c + 1..].iter().map(|&x| i64::from(x)).sum();
+                let before: i64 = (0..4)
+                    .map(|x| i64::from(b.cp_count[x]) & 0i64.wrapping_sub(i64::from(x > c)))
+                    .sum();
                 before + i64::from((plane & rows_before(row & CP_MASK)).count_ones())
             };
             let (sp, ep) = (smem.l, smem.l + smem.s);
