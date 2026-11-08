@@ -1683,19 +1683,6 @@ fn band_fast_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_EXTEND_BANDFAST").is_none_or(|v| v != "0"))
 }
 
-/// `BWA4_BAND_QUANT`: 1 rounds each lane's band up to the fork's rung ceilings, 2 widens every lane
-/// to its chunk's widest band (never past the lane's own full band). Experiment knob.
-fn band_quant() -> u8 {
-    use std::sync::OnceLock;
-    static V: OnceLock<u8> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("BWA4_BAND_QUANT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
-
 /// Whether the extension kernels fold the substitution pre-pass into the column loop (issue #48B).
 /// `BWA4_EXTEND_SBT=0` keeps the separate pre-pass and its `sbt_buf` round trip. Read once, cached.
 ///
@@ -2282,21 +2269,9 @@ macro_rules! define_sw_kernel {
                             );
                             wl = wl.min(bound);
                         }
-                        if super::band_quant() == 1 {
-                            let full = clamp_band(w0, st.qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del);
-                            let q = [4, 8, 12, 16, 20, 24, 28, 30].into_iter().find(|&c| c >= wl).unwrap_or(full);
-                            wl = q.min(full).max(wl);
-                        }
                         // Exact: a band past every index (all `< 256` when `$trk` is i16) is as
                         // good as unbounded.
                         st.w[l] = wl.min(i32::from(<$trk>::MAX) / 2) as $trk;
-                    }
-                    if super::band_quant() == 2 {
-                        let mx = st.w[..nlane].iter().copied().max().unwrap_or(0);
-                        for l in 0..nlane {
-                            let full = clamp_band(w0, st.qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del);
-                            st.w[l] = (i32::from(mx).min(full).max(i32::from(st.w[l]))).min(i32::from(<$trk>::MAX) / 2) as $trk;
-                        }
                     }
                     st.qlen32 = std::array::from_fn(|l| st.qlen[l] as $trk);
                     st.tlen32 = std::array::from_fn(|l| st.tlen[l] as $trk);
