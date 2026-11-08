@@ -31,6 +31,10 @@ on:
         description: "Runner image"
         default: "ubuntu-22.04"
         required: false
+      extra_rustflags:
+        description: "Appended to our profile build's RUSTFLAGS (codegen experiments, e.g. -C target-cpu=neoverse-n2)"
+        default: ""
+        required: false
       knob_sweep:
         description: "Also sweep the three memory-level-parallelism knobs that have no x86 measurement"
         default: "false"
@@ -117,7 +121,7 @@ jobs:
           # code runs; both change what the profile can say about it.
           # The x86 artefact tier; aarch64 (runner=ubuntu-24.04-arm) builds at its baseline, NEON.
           tier=""; [ "$(uname -m)" = x86_64 ] && tier="-C target-cpu=x86-64-v3"
-          RUSTFLAGS="$tier -C force-frame-pointers=yes -C debuginfo=1" \
+          RUSTFLAGS="$tier -C force-frame-pointers=yes -C debuginfo=1 ${{ github.event.inputs.extra_rustflags }}" \
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf
           cp target-perf/release/bwa-mem4 ./mem4-v3
 
