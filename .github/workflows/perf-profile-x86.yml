@@ -121,7 +121,10 @@ jobs:
           # code runs; both change what the profile can say about it.
           # The x86 artefact tier; aarch64 (runner=ubuntu-24.04-arm) builds at its baseline, NEON.
           tier=""; [ "$(uname -m)" = x86_64 ] && tier="-C target-cpu=x86-64-v3"
-          RUSTFLAGS="$tier -C force-frame-pointers=yes -C debuginfo=1 ${{ github.event.inputs.extra_rustflags }}" \
+          # Line tables through the profile, not RUSTFLAGS: with `debug` unset in [profile.release],
+          # Cargo strips debuginfo after linking, so `-C debuginfo=1` alone left perf no lines.
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+          RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }}" \
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf
           cp target-perf/release/bwa-mem4 ./mem4-v3
 
