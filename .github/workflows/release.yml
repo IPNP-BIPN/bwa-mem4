@@ -142,7 +142,8 @@ jobs:
           # user below it. Same lesson as `-C target-cpu=native`: build for the audience, not for
           # the machine. Measured on the v3.0.0 artifacts (deleted in the rename): arm64 minos 11.0, x86_64 minos 10.12.
           # The newest macOS is worth TESTING on, which is ci.yml's job, not this one's.
-          - os: macos-14
+          # macos-15, not macos-14: GitHub retired the macos-14 image ("not supported", the job never starts).
+          - os: macos-15
             target_id: macos-arm64
             deployment_target: "11.0"
             # The one platform where PGO pays, and it pays a lot: +12.4% on an M4, +6.1% SE / +8.5%

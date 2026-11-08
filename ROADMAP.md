@@ -3,7 +3,7 @@
 Une phase = une branche. Commits frequents ; PR vers `dev`, `dev` promu sur `main` a la release.
 Cible d'acceptation : index et SAM **octet-identiques** au binaire `bwa-mem2` 2.3 patche (oracle).
 
-**Version courante : 4.4.0.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
+**Version courante : 4.4.1.** Les phases 0 a 10 sont terminees. Ce document reste le journal des
 mesures : chaque phase garde son resultat, y compris les negatifs, pour ne pas re-instruire deux fois
 la meme idee.
 
@@ -39,6 +39,7 @@ rapprochees.
 | 4.3.1 | 2026-08-14 | couche mecanique Rust sur les 10 crates (preparee le 2026-08-04, publiee ici) ; lecteur hors du chemin critique et entree FIFO reparee, lecture parallele des deux fichiers de mates, une allocation par read au lieu de trois, tri par longueur du lot de rescue, backend C libsais par defaut (+ OpenMP en option), PGO reparee sur macos-14 |
 | 4.3.2 | 2026-08-14 | cible bibliotheque : les implementations de commandes sont appelables sans sous-processus, et `MemArgs` derive `Default` pour etre constructible par un embarqueur |
 | 4.3.3 | 2026-08-15 | le crate est enfin dependable : xz de needletail, sortie BAM/CRAM et mimalloc passent en features, donc la cible bibliotheque se compile sans toolchain C, sans conflit de lien lzma et sans allocateur global impose (#62, #63, #64) |
+| 4.4.1 | 2026-11-08 | correctif : apres le rescue des mates, le dedoublonnage de bwa tourne meme sans hit, sinon un hit XA en trop pouvait rester (#100) ; sortie identique a bwa-mem2 sur HG002 30x PE complet ; release macos-arm64 construite sur macos-15 |
 | 4.4.0 | 2026-11-02 | la bande resserree devient le defaut, jobs DP dedupliques, marches SA evitees, ecriture SAM sans allocation, second lot en vol seulement si la RAM est la ; noyaux AVX-512BW d'extension et table de score par XOR au rescue, dispatch a l'execution, verifies sous Intel SDE ; position x86 mesuree par machine (#20, #25, #27, #33, #44, #46, #48) ; index compact en memoire (checkpoints de 32 octets) et rescue incremental, rattrapage de bwa-mem3 v0.15, `-V` ecrit enfin `XR:Z`, l'indexeur accepte un commentaire FASTA non UTF-8 |
 
 ## Jalons ouverts (GitHub Projects nº3)
