@@ -167,14 +167,14 @@ jobs:
             # Instructions per symbol (sampled on the instructions event): where the extra work is.
             if "$PERF" record -e instructions -F 499 -o "$arm.ins" -- "${cmd[@]}" > /dev/null 2>/dev/null; then
               echo "===== $arm: top symbols by instructions ====="
-              "$PERF" report -i "$arm.ins" --stdio --no-children --show-nr-samples --percent-limit 0.4 2>/dev/null \
-                | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -32 || true
+              "$PERF" report -i "$arm.ins" --stdio --no-children --show-nr-samples --percent-limit 0.05 2>/dev/null \
+                | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -122 || true
             fi
             echo
             echo "===== $arm: top symbols by self time ====="
             # Sample counts too: percentages alone cannot compare the two binaries' CPU time.
-            "$PERF" report -i "$arm.data" --stdio --no-children --show-nr-samples --percent-limit 0.4 2>/dev/null \
-              | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -32 || echo "(perf report produced nothing)"
+            "$PERF" report -i "$arm.data" --stdio --no-children --show-nr-samples --percent-limit 0.05 2>/dev/null \
+              | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -122 || echo "(perf report produced nothing)"
           done
 
           # Where inside our u8 extension and rescue band kernels and the SMEM walk the time goes: per-line
