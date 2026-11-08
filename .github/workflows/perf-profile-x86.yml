@@ -138,6 +138,11 @@ jobs:
             echo "::group::perf record: $arm"
             "$PERF" record -F 499 -g --call-graph fp -o "$arm.data" -- "${cmd[@]}" > /dev/null 2>/dev/null || true
             echo "::endgroup::"
+            # Whole-run counters (where the host exposes a PMU): IPC, mispredicts and L1 misses
+            # separate "more work" from "slower work" for the same instruction stream.
+            echo "===== $arm: perf stat ====="
+            "$PERF" stat -x, -e cycles,instructions,branch-misses,L1-dcache-load-misses -- "${cmd[@]}" \
+              2>&1 > /dev/null | grep -E '^[0-9<]' || true
             echo
             echo "===== $arm: top symbols by self time ====="
             # Sample counts too: percentages alone cannot compare the two binaries' CPU time.
