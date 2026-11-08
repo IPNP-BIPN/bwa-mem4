@@ -186,7 +186,9 @@ jobs:
                      'bwa_neon::rescue_prune::count_hits' \
                      'bwa_neon::rescue_prune::Scratch::load_query' \
                      'bwa_neon::batched::dispatch_bins' \
-                     'bwa_mem4_mem::across::run_side'; do
+                     'bwa_mem4_mem::across::run_side' \
+                     'bwa_mem4_mem::across::align_reads_batched' \
+                     'bwa_mem4_mem::pe::batch_mate_rescue'; do
           sym=$("$PERF" report -i ours.data --stdio --no-children 2>/dev/null \
             | grep -o "$pat" | head -1 || true)
           if [ -n "$sym" ]; then
