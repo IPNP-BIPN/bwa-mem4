@@ -104,16 +104,6 @@ fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_BAND").is_none_or(|v| v != "0"))
 }
 
-/// `BWA4_RB_ROWS=2`: the NEON band kernel steps two skewed rows at a time instead of four. Four
-/// keep more independent cells in flight; two waste fewer masked cells at the band's edges (a step
-/// of `n` rows masks up to `n - 1` cells at the top and bottom of every block), which narrow bands
-/// feel.
-#[cfg(target_arch = "aarch64")]
-fn rows2() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BWA4_RB_ROWS").is_ok_and(|v| v == "2"))
-}
-
 /// The band of component `c` at threshold `tau`, or `None` when it leaves the hull or holds no
 /// cell (the parent then keeps the hull path).
 fn to_band(
@@ -1168,7 +1158,6 @@ pub(crate) mod neon {
                 }};
             }
 
-            let two = super::rows2();
             let mut r = 0usize;
             while r < nr {
                 let ri = r as i32;
@@ -1176,7 +1165,7 @@ pub(crate) mod neon {
                 let klo = 0.max(ri + ominq);
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
-                if !two && r + 3 < nr {
+                if r + 3 < nr {
                     // Four rows per step, skewed: `(r, k)`, `(r+1, k+1)`, `(r+2, k+2)`, `(r+3, k+3)`
                     // share the query position `p = r + c - k`; each row's diagonal and E carry come
                     // from the row above's previous step and this step, in registers. Cells past
@@ -1240,58 +1229,6 @@ pub(crate) mod neon {
                     finish_row!(r + 2, rmax2, rref2, hr2);
                     finish_row!(r + 3, rmax3, rref3, hc);
                     r += 4;
-                    if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
-                        break;
-                    }
-                } else if two && r + 1 < nr {
-                    // The same skewed step on two rows: `(r, k)` and `(r + 1, k + 1)`.
-                    self.cells += 2 * (khi - klo + 1).max(0) as u64;
-                    let rref0 = vld1q_u8(self.refv.as_ptr().add(r * L));
-                    let rref1 = vld1q_u8(self.refv.as_ptr().add((r + 1) * L));
-                    let (mut f0, mut f1, mut d1) = (zero, zero, zero);
-                    let (mut rmax0, mut rmax1) = (zero, zero);
-                    macro_rules! step2 {
-                        ($mask:expr, $live:expr) => {{
-                            let ko = k as isize;
-                            let valid = |i: i32| -> Option<uint8x16_t> {
-                                if $mask {
-                                    Some(vdupq_n_u8(if (0..=wm1).contains(&(k + i)) {
-                                        0xff
-                                    } else {
-                                        0
-                                    }))
-                                } else {
-                                    None
-                                }
-                            };
-                            let q = vld1q_u8(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            let e0 = vld1q_u8(e.offset(ko * li));
-                            let d0 = vld1q_u8(hp.offset(ko * li));
-                            let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), $live);
-                            let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), $live);
-                            vst1q_u8(hr0.offset(ko * li), h0);
-                            vst1q_u8(hc.offset((ko + 1) * li), h1);
-                            vst1q_u8(e.offset((ko + 2) * li), e2);
-                            d1 = h0;
-                            k -= 1;
-                        }};
-                    }
-                    while k >= klo && k > wm1 - 1 {
-                        step2!(true, true);
-                    }
-                    while k >= kun {
-                        step2!(false, false);
-                    }
-                    while k >= klo {
-                        step2!(false, true);
-                    }
-                    let kend = (ri + ominq).max(-1);
-                    while k >= kend {
-                        step2!(true, true);
-                    }
-                    finish_row!(r, rmax0, rref0, hr0);
-                    finish_row!(r + 1, rmax1, rref1, hc);
-                    r += 2;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
                     }

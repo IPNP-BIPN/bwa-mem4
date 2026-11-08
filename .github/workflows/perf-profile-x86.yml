@@ -315,8 +315,13 @@ jobs:
           # The extension tier too: the start-up calibration times a synthetic batch with no z-drop
           # deaths, while real batches waste more lanes the wider the vector (BWA4_LANE_TRACE model:
           # 3.0x executed/useful cells at 16 lanes, 3.9x at 32, 6.05x at 64).
-          # BWA4_RB_ROWS=2: the NEON band kernel on two skewed rows per step instead of four.
-          for arm in "BWA4_RB_ROWS=2"; do
+          # BWA4_COMPACT_K=1: without same-row lane compaction; 2 and 4: fewer vectors in flight
+          # (a smaller L1 working set, Neoverse-N2 has 64 KB).
+          for arm in "BWA4_COMPACT_K=1" "BWA4_COMPACT_K=2" "BWA4_COMPACT_K=4" "BWA4_BAND_SPLIT=0" "BWA4_BAND_SPLIT=-4" "BWA4_BAND_SPLIT=-16" \
+                     "BWA4_EXTEND_TIER=avx512" "BWA4_EXTEND_TIER=avx2" "BWA4_EXTEND_TIER=sse41" \
+                     "BWA4_LOCKSTEP_N=16" "BWA4_LOCKSTEP_N=32" "BWA4_LOCKSTEP_N=64" \
+                     "BWA4_SA_WINDOW=32" "BWA4_SA_WINDOW=64" "BWA4_SA_WINDOW=256" \
+                     "BWA4_SEED_PREFETCH=0" "BWA4_SEED_PREFETCH=16" "BWA4_SEED_PREFETCH=32"; do
             t=$(timed "$arm")
             md5=$(grep -v '^@PG' out.sam | md5sum | cut -d' ' -f1)
             c=$(timed BWA4_NOOP=1)
