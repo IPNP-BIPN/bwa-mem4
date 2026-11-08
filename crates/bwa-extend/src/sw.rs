@@ -496,7 +496,7 @@ pub fn ksw_extend2(
 /// penalties from it repeatedly, and starting a quarter of the way up from the bottom leaves ample
 /// headroom so those subtractions cannot wrap. Reproduce the constant exactly, since an unreachable
 /// cell's exact value can leak into a tie-break.
-const MINUS_INF: i32 = -0x4000_0000;
+pub(crate) const MINUS_INF: i32 = -0x4000_0000;
 
 /// Append `(op, len)` to a CIGAR (op-merged), mirroring bwa's `push_cigar` (`ksw.cpp:546-556`).
 /// Ops follow the BAM encoding used throughout bwa: 0=M, 1=I, 2=D, packed as `len << 4 | op`.
@@ -513,7 +513,7 @@ const MINUS_INF: i32 = -0x4000_0000;
 ///   Must fit in 4 bits.
 /// * `len`: run length in bases, `>= 1`. Normally `1` (the traceback emits a single base per step);
 ///   the two leading-gap flushes at the end of the traceback pass a longer run.
-fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
+pub(crate) fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
     if let Some(last) = cigar.last_mut() {
         if (*last & 0xf) == op {
             *last += len << 4;
@@ -701,8 +701,31 @@ fn global_mid_rows<const N: usize>(
 /// packed run-length encoding, one `len << 4 | op` word per run with `op` in `{0=M, 1=I, 2=D}`, in
 /// left-to-right order. Its `M`+`I` lengths sum to `query.len()` and its `M`+`D` lengths sum to
 /// `target.len()`.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 pub fn ksw_global2(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w: i32,
+) -> (i32, Vec<u32>) {
+    // The NEON wavefront kernel where it is proven byte-identical and wide enough to pay.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(r) =
+        crate::global_wave::try_wave16(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
+    {
+        return r;
+    }
+    ksw_global2_scalar(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
+}
+
+/// [`ksw_global2`] on the scalar row-major kernel, every shape.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub(crate) fn ksw_global2_scalar(
     query: &[u8],
     target: &[u8],
     m: usize,

@@ -1,0 +1,406 @@
+//! Anti-diagonal (wavefront) NEON `ksw_global2` in int16 lanes: fg-labs/bwa-mem3's `ksw_g2_wave16`
+//! (`ksw_global2_wave.h`, with its LEMMA 1-10 proof of byte-identity to the scalar `ksw_global2`).
+//!
+//! Cells on one anti-diagonal `s = i + j` depend only on diagonals `s - 1` and `s - 2`, so eight rows
+//! of a diagonal go in one vector. H/E/F live in rings indexed by row (`+1` store offset), the
+//! direction bytes in diagonal-major order, and the traceback walks them exactly as the scalar walks
+//! its row-major bytes. Entered only where [`safe`] proves every value fits int16 and the band meets
+//! the kernel's floor `w >= |tlen - qlen| + 3`.
+
+use std::arch::aarch64::*;
+
+/// Int16 "minus infinity": its own decrement cannot wrap and no feasible score reaches it ([`safe`]).
+const VMINF: i16 = -30000;
+/// Bytes of padding on both sides of the query and target copies (the vector loads overhang by 7).
+const PAD: usize = 64;
+
+/// Narrowest band routed here (the fork's NEON crossover, `KSW_WAVE16_WMIN`). `BWA4_WAVE_WMIN`
+/// overrides it; a huge value keeps every call on the scalar kernel.
+fn wmin() -> usize {
+    use std::sync::OnceLock;
+    static W: OnceLock<usize> = OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("BWA4_WAVE_WMIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5)
+            .max(3)
+    })
+}
+
+/// The fork's `ksw_g2_wave16_safe`: every H/E/F the int16 kernel can produce stays clear of
+/// [`VMINF`] and of int16 overflow, and the index math fits int16.
+#[allow(clippy::too_many_arguments)]
+fn safe(
+    qlen: usize,
+    tlen: usize,
+    w: usize,
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    mat: &[i8],
+) -> bool {
+    let (mut a, mut b) = (0i64, 0i64);
+    for &v in &mat[..25] {
+        a = a.max(i64::from(v));
+        b = b.max(-i64::from(v));
+    }
+    let (o_max, e_max) = (i64::from(o_del.max(o_ins)), i64::from(e_del.max(e_ins)));
+    let (q, t, w) = (qlen as i64, tlen as i64, w as i64);
+    let l = q.min(t);
+    let slack = 64;
+    let h_upper = q * a + a;
+    let h_lower = -(l * b) - (o_max + e_max * (2 * w + 2)) - b;
+    q < 32000
+        && t < 32000
+        && t + w <= 32000
+        && h_upper <= 32767 - slack
+        && h_lower >= i64::from(VMINF) + o_max + e_max + slack
+        && i64::from(VMINF) - (o_max + e_max) > -32768 + slack
+}
+
+#[derive(Default)]
+struct Scratch {
+    tpad: Vec<u8>,
+    qpad: Vec<u8>,
+    hb: Vec<i16>,
+    eb: Vec<i16>,
+    fb: Vec<i16>,
+    z: Vec<u8>,
+    zoff: Vec<usize>,
+    zis: Vec<usize>,
+    stride: usize,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// [`super::sw::ksw_global2`]'s result from the wavefront kernel, or `None` when the call is
+/// outside what the kernel is proven for (or below the width crossover).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_wave16(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w: i32,
+) -> Option<(i32, Vec<u32>)> {
+    let (qlen, tlen) = (query.len(), target.len());
+    if m != 5 || mat.len() < 25 || qlen == 0 || tlen == 0 || w < 0 {
+        return None;
+    }
+    let w = w as usize;
+    if w < wmin()
+        || w < qlen.abs_diff(tlen) + 3
+        || !safe(qlen, tlen, w, o_del, e_del, o_ins, e_ins, mat)
+    {
+        return None;
+    }
+    Some(SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        wave16(&mut s, query, target, mat, o_del, e_del, o_ins, e_ins, w)
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wave16(
+    sc: &mut Scratch,
+    query: &[u8],
+    target: &[u8],
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w: usize,
+) -> (i32, Vec<u32>) {
+    let (qlen, tlen) = (query.len(), target.len());
+    let maxlen = qlen.max(tlen);
+    if sc.stride < maxlen + 1 + 32 {
+        // Grown, never cleared between calls: no in-band cell reads a value this call did not write
+        // (stale ring lanes are masked by `evalid`/`freset`, LEMMA 7).
+        sc.stride = maxlen + 1 + 32;
+        sc.hb = vec![VMINF; 3 * sc.stride];
+        sc.eb = vec![VMINF; 2 * sc.stride];
+        sc.fb = vec![VMINF; 2 * sc.stride];
+        sc.tpad = vec![0; maxlen + 2 * PAD];
+        sc.qpad = vec![0; maxlen + 2 * PAD];
+    }
+    let sdim = tlen + qlen - 1;
+    let zneed = qlen.min(2 * w + 1) * (tlen + qlen) + 64;
+    if sc.z.len() < zneed {
+        sc.z.resize(zneed, 0);
+    }
+    if sc.zoff.len() < sdim {
+        sc.zoff.resize(sdim, 0);
+        sc.zis.resize(sdim, 0);
+    }
+    sc.tpad[PAD..PAD + tlen].copy_from_slice(target);
+    sc.qpad[PAD..PAD + qlen].copy_from_slice(query);
+    let stride = sc.stride;
+    let (oe_del, oe_ins) = (o_del + e_del, o_ins + e_ins);
+    let mut score = if qlen <= w {
+        -(o_ins + e_ins * qlen as i32)
+    } else {
+        super::sw::MINUS_INF
+    };
+    let mut tab = [0u8; 32];
+    for (d, &v) in tab.iter_mut().zip(&mat[..25]) {
+        *d = v as u8;
+    }
+    let (w16, q16) = (w as i16, qlen as i16);
+    let mut roff = 0usize;
+    // SAFETY: NEON is mandatory on AArch64. Every pointer below stays inside its buffer: ring rows are
+    // `stride >= maxlen + 33` long and lanes reach at most row `tlen + 8`; the query/target copies
+    // have `PAD` bytes on both sides of the at most 7-byte overhang; `z` holds `zneed` bytes, the
+    // in-band cell count plus 64 for the last chunk's overhang.
+    unsafe {
+        let table = uint8x16x2_t(vld1q_u8(tab.as_ptr()), vld1q_u8(tab.as_ptr().add(16)));
+        let m8 = vdup_n_u8(5);
+        let vminf = vdupq_n_s16(VMINF);
+        let laneid = vld1q_s16([0i16, 1, 2, 3, 4, 5, 6, 7].as_ptr());
+        let (hb, eb, fb) = (sc.hb.as_mut_ptr(), sc.eb.as_mut_ptr(), sc.fb.as_mut_ptr());
+        let (tp, qp, z) = (
+            sc.tpad.as_ptr().add(PAD),
+            sc.qpad.as_ptr().add(PAD),
+            sc.z.as_mut_ptr(),
+        );
+        let (mut hc, mut hd2, mut efc) = (0usize, 1usize, 0usize);
+        for s in 0..sdim {
+            let (hcur, hdiag2) = (hb.add(hc * stride), hb.add(hd2 * stride));
+            let (ecur, ep1) = (eb.add(efc * stride), eb.add((efc ^ 1) * stride));
+            let (fcur, fp1) = (fb.add(efc * stride), fb.add((efc ^ 1) * stride));
+            let si = s as isize;
+            let i_lo = (si - (qlen as isize - 1))
+                .max((si - w as isize + 1) >> 1)
+                .max(0) as usize;
+            let i_hi = (s.min((s + w) >> 1)).min(tlen - 1);
+            sc.zoff[s] = roff;
+            sc.zis[s] = i_lo;
+            let zbase = roff;
+            if i_hi >= i_lo {
+                roff += i_hi - i_lo + 1;
+            }
+            let mut i0 = i_lo;
+            while i0 <= i_hi {
+                let (hdiag, e, f);
+                if i0 > i_lo && i0 + 7 < i_hi {
+                    hdiag = vld1q_s16(hdiag2.add(i0));
+                    e = vld1q_s16(ep1.add(i0));
+                    f = vld1q_s16(fp1.add(i0 + 1));
+                } else if i0 > 0 && s - i0 > 7 {
+                    // Band-edge chunk (LEMMA 8b): no lane on row 0 or column 0; only the lane on the
+                    // band's lower edge loses E and the one on its upper edge loses F.
+                    hdiag = vld1q_s16(hdiag2.add(i0));
+                    let (mut ev, mut fv) = (vld1q_s16(ep1.add(i0)), vld1q_s16(fp1.add(i0 + 1)));
+                    if (s + w) & 1 == 0 {
+                        let el = (((s as isize - w as isize) / 2) - i0 as isize) as i16;
+                        let fl = (((s + w) / 2) as isize - i0 as isize) as i16;
+                        ev = vbslq_s16(vceqq_s16(laneid, vdupq_n_s16(el)), vminf, ev);
+                        fv = vbslq_s16(vceqq_s16(laneid, vdupq_n_s16(fl)), vminf, fv);
+                    }
+                    e = ev;
+                    f = fv;
+                } else {
+                    let iv = vaddq_s16(vdupq_n_s16(i0 as i16), laneid);
+                    let jv = vsubq_s16(vdupq_n_s16((s - i0) as i16), laneid);
+                    let beg = vmaxq_s16(vdupq_n_s16(0), vsubq_s16(iv, vdupq_n_s16(w16)));
+                    let mut hd = vld1q_s16(hdiag2.add(i0));
+                    let i0m = vceqq_s16(iv, vdupq_n_s16(0));
+                    let j0m = vceqq_s16(jv, vdupq_n_s16(0));
+                    let hi0 = vbslq_s16(
+                        j0m,
+                        vdupq_n_s16(0),
+                        vsubq_s16(
+                            vdupq_n_s16(-o_ins as i16),
+                            vmulq_s16(vdupq_n_s16(e_ins as i16), jv),
+                        ),
+                    );
+                    let hj0 = vsubq_s16(
+                        vdupq_n_s16(-o_del as i16),
+                        vmulq_s16(vdupq_n_s16(e_del as i16), iv),
+                    );
+                    hd = vbslq_s16(j0m, hj0, hd);
+                    hd = vbslq_s16(i0m, hi0, hd);
+                    hdiag = hd;
+                    let begm1 = vmaxq_s16(vdupq_n_s16(0), vsubq_s16(iv, vdupq_n_s16(w16 + 1)));
+                    let endm1 = vminq_s16(vdupq_n_s16(q16), vaddq_s16(iv, vdupq_n_s16(w16)));
+                    let evalid = vandq_u16(
+                        vcgeq_s16(iv, vdupq_n_s16(1)),
+                        vandq_u16(vcgeq_s16(jv, begm1), vcltq_s16(jv, endm1)),
+                    );
+                    e = vbslq_s16(evalid, vld1q_s16(ep1.add(i0)), vminf);
+                    f = vbslq_s16(vceqq_s16(jv, beg), vminf, vld1q_s16(fp1.add(i0 + 1)));
+                }
+                // Score index t*5 + q per byte lane; lane l reads query column s - i0 - l.
+                let tb = vld1_u8(tp.add(i0));
+                let qb = vld1_u8(qp.offset(s as isize - i0 as isize - 7));
+                let idx = vmla_u8(vrev64_u8(qb), tb, m8);
+                let sv = vmovl_s8(vreinterpret_s8_u8(vqtbl2_u8(table, idx)));
+                let mm = vaddq_s16(hdiag, sv);
+                let h_me = vmaxq_s16(mm, e);
+                let h = vmaxq_s16(h_me, f);
+                let t1 = vsubq_s16(mm, vdupq_n_s16(oe_del as i16));
+                let em = vsubq_s16(e, vdupq_n_s16(e_del as i16));
+                let t2 = vsubq_s16(mm, vdupq_n_s16(oe_ins as i16));
+                let fm = vsubq_s16(f, vdupq_n_s16(e_ins as i16));
+                vst1q_s16(hcur.add(i0 + 1), h);
+                vst1q_s16(ecur.add(i0 + 1), vmaxq_s16(em, t1));
+                vst1q_s16(fcur.add(i0 + 1), vmaxq_s16(fm, t2));
+                let mut d = vbslq_s16(vcgeq_s16(mm, e), vdupq_n_s16(0), vdupq_n_s16(1));
+                d = vbslq_s16(vcgeq_s16(h_me, f), d, vdupq_n_s16(2));
+                d = vorrq_s16(
+                    d,
+                    vbslq_s16(vcgtq_s16(em, t1), vdupq_n_s16(1 << 2), vdupq_n_s16(0)),
+                );
+                d = vorrq_s16(
+                    d,
+                    vbslq_s16(vcgtq_s16(fm, t2), vdupq_n_s16(2 << 4), vdupq_n_s16(0)),
+                );
+                vst1_u8(
+                    z.add(zbase + (i0 - i_lo)),
+                    vmovn_u16(vreinterpretq_u16_s16(d)),
+                );
+                i0 += 8;
+            }
+            // The terminal column (LEMMA 9): in band on this diagonal iff its row is `i_lo`.
+            if s + 1 == i_lo + qlen && i_lo <= i_hi {
+                score = i32::from(*hcur.add(i_lo + 1));
+            }
+            hc = if hc == 2 { 0 } else { hc + 1 };
+            hd2 = if hd2 == 2 { 0 } else { hd2 + 1 };
+            efc ^= 1;
+        }
+    }
+    // Traceback (LEMMA 10): the scalar's walk over the same bytes, diagonal-major.
+    let mut cigar: Vec<u32> = Vec::new();
+    let mut i = tlen as i64 - 1;
+    let mut k = (tlen as i64 + w as i64).min(qlen as i64) - 1;
+    let mut which = 0u8;
+    while i >= 0 && k >= 0 {
+        let s = (i + k) as usize;
+        let d = sc.z[sc.zoff[s] + (i as usize - sc.zis[s])];
+        which = (d >> (which << 1)) & 3;
+        match which {
+            0 => {
+                super::sw::push_cigar(&mut cigar, 0, 1);
+                i -= 1;
+                k -= 1;
+            }
+            1 => {
+                super::sw::push_cigar(&mut cigar, 2, 1);
+                i -= 1;
+            }
+            _ => {
+                super::sw::push_cigar(&mut cigar, 1, 1);
+                k -= 1;
+            }
+        }
+    }
+    if i >= 0 {
+        super::sw::push_cigar(&mut cigar, 2, (i + 1) as u32);
+    }
+    if k >= 0 {
+        super::sw::push_cigar(&mut cigar, 1, (k + 1) as u32);
+    }
+    cigar.reverse();
+    (score, cigar)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The wavefront kernel against the scalar `ksw_global2` on random inputs at every width it
+    /// may be given (`w >= |tlen - qlen| + 3`), including tie-heavy scoring.
+    #[test]
+    fn wave16_matches_scalar() {
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st % n
+        };
+        let mut checked = 0;
+        for case in 0..30000 {
+            let qlen = 1 + rnd(if case % 5 == 0 { 400 } else { 160 }) as usize;
+            let dl = rnd(12) as i64 - 6;
+            let tlen = (qlen as i64 + dl).max(1) as usize;
+            let query: Vec<u8> = (0..qlen)
+                .map(|_| if rnd(40) == 0 { 4 } else { rnd(4) as u8 })
+                .collect();
+            // Mostly a mutated copy, so real alignments with indels dominate, as in production.
+            let mut target: Vec<u8> = Vec::with_capacity(tlen);
+            let mut j = 0;
+            while target.len() < tlen {
+                let r = rnd(100);
+                if j < qlen && r < 85 {
+                    target.push(query[j]);
+                    j += 1;
+                } else if r < 92 {
+                    target.push(rnd(5) as u8);
+                    j += 1;
+                } else if r < 96 {
+                    j += 1 + rnd(3) as usize;
+                } else {
+                    target.push(rnd(4) as u8);
+                }
+            }
+            let (a, b) = if case % 3 == 0 {
+                (1i8, 1i8)
+            } else {
+                (1 + rnd(3) as i8, 1 + rnd(5) as i8)
+            };
+            let mut mat = [0i8; 25];
+            for x in 0..5 {
+                for y in 0..5 {
+                    mat[x * 5 + y] = if x == 4 || y == 4 {
+                        -1
+                    } else if x == y {
+                        a
+                    } else {
+                        -b
+                    };
+                }
+            }
+            let (o_del, e_del, o_ins, e_ins) = if case % 4 == 0 {
+                (
+                    1 + rnd(8) as i32,
+                    1 + rnd(3) as i32,
+                    1 + rnd(8) as i32,
+                    1 + rnd(3) as i32,
+                )
+            } else {
+                (6, 1, 6, 1)
+            };
+            let w = (qlen.abs_diff(tlen) + 3 + rnd(40) as usize) as i32;
+            if !super::safe(qlen, tlen, w as usize, o_del, e_del, o_ins, e_ins, &mat) {
+                continue;
+            }
+            let wave = super::SCRATCH.with(|s| {
+                super::wave16(
+                    &mut s.borrow_mut(),
+                    &query,
+                    &target,
+                    &mat,
+                    o_del,
+                    e_del,
+                    o_ins,
+                    e_ins,
+                    w as usize,
+                )
+            });
+            let scalar = crate::sw::ksw_global2_scalar(
+                &query, &target, 5, &mat, o_del, e_del, o_ins, e_ins, w,
+            );
+            assert_eq!(wave, scalar, "case {case}: qlen {qlen} tlen {tlen} w {w}");
+            checked += 1;
+        }
+        assert!(checked > 20000, "only {checked} cases reached the kernel");
+    }
+}
