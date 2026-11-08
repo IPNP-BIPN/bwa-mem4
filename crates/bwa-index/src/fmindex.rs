@@ -1509,7 +1509,14 @@ impl FmIndex {
     /// [`occ_in`](Self::occ_in) for [`backward_round`](Self::backward_round), with `a`'s plane masks
     /// (`hx`, `lx`, each all ones where `a` has that bit clear) computed once by the caller.
     #[inline(always)]
-    fn occ_hoisted(&self, cp: &[CpOcc], pp: i64, a: usize, hx: u64, lx: u64) -> i64 {
+    fn occ_hoisted<const WIDE: bool, const A0: bool>(
+        &self,
+        cp: &[CpOcc],
+        pp: i64,
+        a: usize,
+        hx: u64,
+        lx: u64,
+    ) -> i64 {
         debug_assert!(((pp >> CP_SHIFT) as usize) < cp.len());
         // SAFETY: `pp` is a row of a live interval, at most `ref_seq_len`, and the blocks cover
         // every row up to and including it (`get_occ` indexes the same block checked).
@@ -1534,10 +1541,11 @@ impl FmIndex {
         #[cfg(not(target_arch = "aarch64"))]
         let rows = ((b.hi ^ hx) & (b.lo ^ lx) & rows_before(pp & CP_MASK)).count_ones();
         let mut o = i64::from(b.cp_count[a]) + i64::from(rows);
-        if self.wide {
+        if WIDE {
             o += self.count_base[(pp >> self.count_span_shift) as usize][a];
         }
-        if pp >> CP_SHIFT == self.sentinel_block {
+        // The sentinel row is stored as an `A`, so only base 0 needs the correction (`A0`).
+        if A0 && pp >> CP_SHIFT == self.sentinel_block {
             o -= self.sentinel_before(pp, a);
         }
         o
@@ -1546,7 +1554,7 @@ impl FmIndex {
     /// [`backward_ext_konly`](Self::backward_ext_konly)'s new `k` and `s` for
     /// [`backward_round`](Self::backward_round), on the caller's hoisted values.
     #[inline(always)]
-    fn konly_hoisted(
+    fn konly_hoisted<const WIDE: bool, const A0: bool>(
         &self,
         cp: &[CpOcc],
         c: &Smem,
@@ -1558,14 +1566,17 @@ impl FmIndex {
         if c.s == 1 {
             // SAFETY: as in `occ_hoisted`.
             let b = unsafe { cp.get_unchecked((c.k >> CP_SHIFT) as usize) };
-            let hit = c.k != self.sentinel_index && Self::base_at(b, c.k) == a;
+            let hit = (!A0 || c.k != self.sentinel_index) && Self::base_at(b, c.k) == a;
             (
-                count_a + self.occ_hoisted(cp, c.k, a, hx, lx),
+                count_a + self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx),
                 i64::from(hit),
             )
         } else {
-            let o = self.occ_hoisted(cp, c.k, a, hx, lx);
-            (count_a + o, self.occ_hoisted(cp, c.k + c.s, a, hx, lx) - o)
+            let o = self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx);
+            (
+                count_a + o,
+                self.occ_hoisted::<WIDE, A0>(cp, c.k + c.s, a, hx, lx) - o,
+            )
         }
     }
 
@@ -1590,6 +1601,25 @@ impl FmIndex {
         min_intv: i64,
         min_seed_len: i64,
     ) -> (usize, Option<Smem>) {
+        // One copy per index kind, so the per-occurrence `wide` test leaves the loop. (Splitting on
+        // `a == 0` too drops the sentinel test, -7G instructions, but the random-base dispatch costs
+        // the cycles back.)
+        if self.wide {
+            self.backward_round_impl::<true, true>(prev, a, m, min_intv, min_seed_len)
+        } else {
+            self.backward_round_impl::<false, true>(prev, a, m, min_intv, min_seed_len)
+        }
+    }
+
+    #[inline]
+    fn backward_round_impl<const WIDE: bool, const A0: bool>(
+        &self,
+        prev: &mut [Smem],
+        a: usize,
+        m: u32,
+        min_intv: i64,
+        min_seed_len: i64,
+    ) -> (usize, Option<Smem>) {
         let hx = ((a as u64 >> 1) & 1).wrapping_sub(1);
         let lx = (a as u64 & 1).wrapping_sub(1);
         let count_a = self.count[a];
@@ -1603,7 +1633,7 @@ impl FmIndex {
         while p < n {
             let c = prev[p];
             p += 1;
-            let (k, s) = self.konly_hoisted(cp, &c, a, count_a, hx, lx);
+            let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &c, a, count_a, hx, lx);
             if s >= min_intv {
                 curr_s = s;
                 prev[0] = Smem { k, s, m, ..c };
@@ -1620,7 +1650,7 @@ impl FmIndex {
         while p < n {
             // Borrowed, not copied: only `k` and `s` feed the counts, and holding the whole
             // candidate across them spilled it to the stack every iteration.
-            let (k, s) = self.konly_hoisted(cp, &prev[p], a, count_a, hx, lx);
+            let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &prev[p], a, count_a, hx, lx);
             p += 1;
             if s >= min_intv && s != curr_s {
                 curr_s = s;
@@ -1702,8 +1732,8 @@ impl FmIndex {
                 before + i64::from((plane & rows_before(row & CP_MASK)).count_ones())
             };
             let (sp, ep) = (smem.l, smem.l + smem.s);
-            let kc = self.occ_hoisted(cp, sp, c, hx, lx);
-            let sc = self.occ_hoisted(cp, ep, c, hx, lx) - kc;
+            let kc = self.occ_hoisted::<false, true>(cp, sp, c, hx, lx);
+            let sc = self.occ_hoisted::<false, true>(cp, ep, c, hx, lx) - kc;
             let so = i64::from((sp <= self.sentinel_index) & (ep > self.sentinel_index));
             return Smem {
                 k: smem.k + so + gt(ep) - gt(sp),
