@@ -1114,12 +1114,11 @@ fn dispatch_bins(
     // Homogeneous fast path: whole batch in one bin -> run the kernel on `jobs` with no gather/scatter.
     // `n` is the batch size, so `x_idx.len() == n` means bin `x` took every job.
     let n = jobs.len();
-    // `BWA4_BAND_SPLIT=T`: u8 jobs whose band (full clamp, then the ungapped-score bound) is below
-    // `T` ride before the wider ones, each group keeping the caller's (length) order, so a vector
-    // does not pay a wide lane's column range for its narrow ones. Experiment knob.
+    // Band order of the u8 batch (see `band_split`); the bands go to the kernel through `BAND_HINT`.
     let split = band_split();
-    if split > 0 && u8_idx.len() > 1 {
-        let narrow = |k: usize| {
+    let mut u8_band: Vec<i32> = Vec::new();
+    if split != 0 && u8_idx.len() > 1 {
+        let band = |k: usize| {
             let job = &jobs[k];
             let mut wl = clamp_band(
                 w0,
@@ -1142,11 +1141,16 @@ fn dispatch_bins(
                     end_bonus,
                 ));
             }
-            wl < split
+            wl
         };
-        let (a, b): (Vec<usize>, Vec<usize>) = u8_idx.iter().partition(|&&k| narrow(k));
-        u8_idx = a;
-        u8_idx.extend(b);
+        let mut keyed: Vec<(i32, usize)> = u8_idx.iter().map(|&k| (band(k), k)).collect();
+        if split > 0 {
+            keyed.sort_by_key(|&(w, _)| w >= split);
+        } else {
+            keyed.sort_by_key(|&(w, _)| (w / -split).min(8));
+        }
+        u8_idx = keyed.iter().map(|&(_, k)| k).collect();
+        u8_band = keyed.iter().map(|&(w, _)| w).collect();
     }
     // The three single-bin fast paths. Each has to go through `expand`, because with the dedup
     // above `jobs` is the DISTINCT batch and the caller is owed one result per ORIGINAL job. Missing
@@ -1184,10 +1188,14 @@ fn dispatch_bins(
             out[k] = bin_results[bin_slot];
         }
     };
+    if !u8_band.is_empty() {
+        BAND_HINT.with(|h| *h.borrow_mut() = u8_band);
+    }
     run_bin(&u8_idx, &|bin| unsafe {
         // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
         run_u8!(bin)
     });
+    BAND_HINT.with(|h| h.borrow_mut().clear());
     run_bin(&i16_idx, &|bin| unsafe {
         // SAFETY: neon available; MAX_SEQ_LEN16 bounds keep all values inside i16.
         run_i16!(bin)
@@ -1717,7 +1725,19 @@ fn band_fast_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_EXTEND_BANDFAST").is_none_or(|v| v != "0"))
 }
 
-/// `BWA4_BAND_SPLIT`: band below which u8 jobs are batched apart (0 = off). Experiment knob.
+thread_local! {
+    /// Per-job bands `dispatch_bins` computed to order a u8 batch, handed to the kernel it calls next
+    /// so the ungapped-score walk runs once per job. Taken (emptied) by the kernel.
+    static BAND_HINT: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How `dispatch_bins` orders the u8 batch by band before chunking it into vectors, so a vector does
+/// not pay its widest lane's column range for narrow ones (fg-labs/bwa-mem3 batches narrow bands
+/// apart, `bsw_tb_probe_rung` / `compact_min_w`). Negative `-c` (default -8): stable sort by band
+/// class `w / c` (capped at 8, i.e. one class for every band of `8c` and wider), keeping the
+/// caller's length order inside a class. Positive `T`: two groups, `w < T` first. `0`: caller order.
+/// `BWA4_BAND_SPLIT` overrides it. The kernel reuses the computed bands (`BAND_HINT`).
+/// M4 chr21 -8: 244 -> 228-231G cycles, 1.045T -> 0.968T instructions; GIAB PE -6 to -8G, SE -1.7G.
 fn band_split() -> i32 {
     use std::sync::OnceLock;
     static V: OnceLock<i32> = OnceLock::new();
@@ -1725,7 +1745,7 @@ fn band_split() -> i32 {
         std::env::var("BWA4_BAND_SPLIT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+            .unwrap_or(-8)
     })
 }
 
@@ -2200,6 +2220,9 @@ macro_rules! define_sw_kernel {
             // Measured on GIAB lanes (BWA4_LANE_TRACE): 16 lanes compute 3.0x the useful cells,
             // 2.05x with 8-vector superblocks.
             let kmax = super::compact_groups(LANES);
+            // Each job's band as `dispatch_bins` already computed it to order the batch, if it did.
+            let band_hint = super::BAND_HINT.with(|h| std::mem::take(&mut *h.borrow_mut()));
+            let band_hint = (band_hint.len() == jobs.len()).then_some(band_hint);
             struct Vs {
                 eh_h: super::ABuf<$elem>,
                 eh_e: super::ABuf<$elem>,
@@ -2301,9 +2324,12 @@ macro_rules! define_sw_kernel {
                         st.qlen[l] = job.query.len();
                         st.tlen[l] = job.target.len();
                         st.h0[l] = job.h0 as $trk;
-                        let mut wl = clamp_band(w0, st.qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del);
+                        let mut wl = match &band_hint {
+                            Some(h) => h[chunk_start + l],
+                            None => clamp_band(w0, st.qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del),
+                        };
                         // `BWA4_TIGHT_BAND`: clamp this lane's band by the ungapped-score bound.
-                        if tight_band_enabled() {
+                        if band_hint.is_none() && tight_band_enabled() {
                             let bound = tight_band_bound(
                                 job.query,
                                 job.target,
