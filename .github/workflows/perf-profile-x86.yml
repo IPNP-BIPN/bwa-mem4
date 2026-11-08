@@ -180,8 +180,13 @@ jobs:
               | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -122 || echo "(perf report produced nothing)"
             # Who calls into libc (memmove/memset): the leaf has no frame, so chains start one up.
             echo "===== $arm: libc callers ====="
-            "$PERF" report -i "$arm.data" --stdio --no-children --dsos libc.so.6 -g callee,0.05 --percent-limit 0.2 2>/dev/null \
-              | grep -vE "^$|^#" | head -300 || true
+            # DWARF unwinding: libc's string routines keep no frame pointer, but their .eh_frame
+            # gets the unwinder past them to the Rust caller.
+            if [ "$arm" = ours ]; then
+              "$PERF" record -F 99 --call-graph dwarf,8192 -o libc.data -- "${cmd[@]}" > /dev/null 2>/dev/null || true
+              "$PERF" report -i libc.data --stdio --no-children --dsos libc.so.6 -g caller,0.05,callee,function,percent --max-stack 6 --percent-limit 0.1 2>/dev/null \
+                | grep -vE "^$|^#" | head -300 || true
+            fi
           done
 
           # Where inside our u8 extension and rescue band kernels and the SMEM walk the time goes: per-line

@@ -1229,8 +1229,9 @@ fn align_reads_batched_inner<B: SwBackend>(
     // what gives the SIMD kernel enough same-length work to fill its lanes. A seed contributes a left
     // job only if it has query bases before it, and a right job only if it has query bases after it,
     // so neither queue is one-per-seed. Both are consumed (and drained via `active`) by `run_side`.
-    let mut left_jobs: Vec<SideJob> = Vec::new();
-    let mut right_jobs: Vec<SideJob> = Vec::new();
+    // At most one of each per slot: reserved once, growing push by push was a realloc copy chain.
+    let mut left_jobs: Vec<SideJob> = Vec::with_capacity(n_slots);
+    let mut right_jobs: Vec<SideJob> = Vec::with_capacity(n_slots);
 
     // Skip banded-SW for same-diagonal contained seeds (nh13 --skip-contained-ext). The discard pass
     // below needs one slot per seed to reproduce bwa-mem2's scan order, so a skipped seed would shift
