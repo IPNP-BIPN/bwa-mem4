@@ -180,8 +180,8 @@ jobs:
               | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -122 || echo "(perf report produced nothing)"
             # Who calls into libc (memmove/memset): the leaf has no frame, so chains start one up.
             echo "===== $arm: libc callers ====="
-            "$PERF" report -i "$arm.data" --stdio --no-children --dsos libc.so.6 -G --percent-limit 0.3 2>/dev/null \
-              | grep -vE '^$|^#' | head -150 || true
+            "$PERF" report -i "$arm.data" --stdio --no-children --dsos libc.so.6 -g callee,0.05 --percent-limit 0.2 2>/dev/null \
+              | grep -vE "^$|^#" | head -300 || true
           done
 
           # Where inside our u8 extension and rescue band kernels and the SMEM walk the time goes: per-line
