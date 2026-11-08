@@ -221,7 +221,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: perf-data
-          path: work/*.data
+          # The binary too: perf on the runner resolves no source lines, addr2line here does.
+          path: |
+            work/*.data
+            mem4-v3
           if-no-files-found: warn
 
   # THREE KNOBS THAT HAVE NEVER BEEN MEASURED ON x86, and the profile says they are where the money
