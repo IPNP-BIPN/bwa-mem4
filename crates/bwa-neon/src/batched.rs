@@ -559,7 +559,7 @@ fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u1
     debug_assert!(cap <= 128 && cap.is_multiple_of(16));
     let n = q.len();
     let (mut bits, mut total) = (0u128, 0i32);
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(unused_mut))]
     let mut col = 0usize;
     #[cfg(target_arch = "aarch64")]
     // SAFETY: NEON is part of the aarch64 baseline; every load reads 16 bytes below `n` of slices
@@ -591,6 +591,34 @@ fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u1
                     return None;
                 }
                 bits |= m;
+            }
+            col += 16;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of the x86_64 baseline; every load reads 16 bytes below `n` of slices
+    // `n` long.
+    unsafe {
+        use std::arch::x86_64::*;
+        let three = _mm_set1_epi8(3);
+        while col + 16 <= n {
+            let a = _mm_loadu_si128(q.as_ptr().add(col).cast());
+            let b = _mm_loadu_si128(t.as_ptr().add(col).cast());
+            // A code >= 4 has a bit above the low two: `max(a, b, 3) != 3` finds it.
+            let hi = _mm_max_epu8(_mm_max_epu8(a, b), three);
+            if _mm_movemask_epi8(_mm_cmpeq_epi8(hi, three)) != 0xFFFF {
+                return None;
+            }
+            let ne = !(_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u32) & 0xFFFF;
+            if ne != 0 {
+                if col + 16 > cap {
+                    return None;
+                }
+                total += ne.count_ones() as i32;
+                if total > x_threshold {
+                    return None;
+                }
+                bits |= u128::from(ne) << col;
             }
             col += 16;
         }
@@ -848,6 +876,21 @@ fn simd_dispatch(
     out
 }
 
+/// Hint the line holding `p` into L1. No effect on any result.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    // SAFETY: a prefetch never faults, whatever the address.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
 /// Compute each DISTINCT extension job once and copy the answer to its repeats.
 ///
 /// A DP job is a pure function of `(query, target, h0)`: same bytes in, same `ExtendResult` out,
@@ -874,7 +917,6 @@ fn simd_dispatch(
 /// of its representative in `unique`. `map[i] == i'` means `out[i]` must be `results[i']`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
-    use std::collections::HashMap;
 
     /// Fold every byte of `s` into `h`, 32 at a time in four independent multiply chains so the
     /// latency of one does not serialise the rest. Covering only 32 bytes at each end let 121M of
@@ -907,44 +949,52 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
         *h = (t ^ t >> 29).wrapping_mul(P);
     }
 
-    /// The keys are already FNV hashes: used as they are, not hashed again with SipHash.
-    #[derive(Default)]
-    struct Pass(u64);
-    impl std::hash::Hasher for Pass {
-        fn finish(&self) -> u64 {
-            self.0
-        }
-        fn write(&mut self, b: &[u8]) {
-            for &x in b {
-                self.0 = (self.0 ^ u64::from(x)).wrapping_mul(0x1000_0000_01b3);
-            }
-        }
-        fn write_u64(&mut self, x: u64) {
-            self.0 = x;
-        }
-    }
-    // Fingerprint -> the latest distinct job with it; `older[i]`: the previous distinct job with
-    // job `i`'s fingerprint (`u32::MAX`: none). Distinct jobs never compare equal, so at most one
-    // on a chain matches and the walk order does not matter.
-    let mut heads: HashMap<u64, u32, std::hash::BuildHasherDefault<Pass>> =
-        HashMap::with_capacity_and_hasher(jobs.len(), Default::default());
+    // Fingerprints first, in a streaming pass, so the table probes below can be prefetched ahead.
+    let fps: Vec<u64> = jobs
+        .iter()
+        .map(|job| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            h ^= (job.query.len() as u64) << 32 | job.target.len() as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+            h ^= job.h0 as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+            fold(&mut h, job.query);
+            fold(&mut h, job.target);
+            h
+        })
+        .collect();
+    // Open addressing, linear probe, at most half full. A slot is `(fingerprint, latest distinct
+    // job with it + 1)`, 0 meaning empty; `older[i]`: the previous distinct job with job `i`'s
+    // fingerprint (`u32::MAX`: none). Distinct jobs never compare equal, so at most one on a chain
+    // matches and the walk order does not matter. A std `HashMap` here missed cache on every probe
+    // with nothing to hide it behind (a fifth of `dispatch_bins` on x86).
+    let cap = (jobs.len() * 2).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut table: Vec<(u64, u32)> = vec![(0, 0); cap];
+    let slot_of = |h: u64| (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
     let mut older: Vec<u32> = Vec::with_capacity(jobs.len());
     let mut unique: Vec<ExtendJob<'a>> = Vec::with_capacity(jobs.len());
     let mut map: Vec<u32> = Vec::with_capacity(jobs.len());
+    const AHEAD: usize = 16;
 
-    for job in jobs {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        h ^= (job.query.len() as u64) << 32 | job.target.len() as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-        h ^= job.h0 as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-        fold(&mut h, job.query);
-        fold(&mut h, job.target);
-
-        let head = heads.entry(h).or_insert(u32::MAX);
+    for (i, job) in jobs.iter().enumerate() {
+        if let Some(&f) = fps.get(i + AHEAD) {
+            prefetch(table.as_ptr().wrapping_add(slot_of(f)));
+        }
+        let h = fps[i];
+        let mut at = slot_of(h);
+        while table[at].1 != 0 && table[at].0 != h {
+            at = (at + 1) & mask;
+        }
+        let head = if table[at].1 == 0 {
+            table[at].0 = h;
+            u32::MAX
+        } else {
+            table[at].1 - 1
+        };
         // Same fingerprint: could be the same job or a collision, so compare the bytes. Only jobs
         // that reach here pay for a comparison, and they are the minority.
-        let mut cand = *head;
+        let mut cand = head;
         while cand != u32::MAX {
             let u = &unique[cand as usize];
             if u.h0 == job.h0 && u.query == job.query && u.target == job.target {
@@ -957,8 +1007,8 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
         } else {
             let idx = unique.len() as u32;
             unique.push(*job);
-            older.push(*head);
-            *head = idx;
+            older.push(head);
+            table[at].1 = idx + 1;
             idx
         };
         map.push(slot);
