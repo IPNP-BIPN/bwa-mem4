@@ -79,11 +79,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + bwa-mem3 + wgsim (bioconda)
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
@@ -214,11 +231,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + bwa-mem3 + samtools (bioconda)
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
@@ -316,11 +350,28 @@ jobs:
           toolchain: "1.96.1"
           components: llvm-tools-preview
 
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + wgsim (bioconda)
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
@@ -409,11 +460,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + wgsim (bioconda)
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
@@ -558,11 +626,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + wgsim (bioconda)
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
