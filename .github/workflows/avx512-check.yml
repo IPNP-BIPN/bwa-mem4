@@ -103,7 +103,7 @@ jobs:
 
       - name: Fetch Intel SDE
         run: |
-          curl -fsSL -o sde.tar.xz "$SDE_URL"
+          curl -fsSL --retry 8 --retry-all-errors --retry-delay 15 -o sde.tar.xz "$SDE_URL"
           echo "$SDE_SHA256  sde.tar.xz" | sha256sum -c -
           tar xf sde.tar.xz
           "./$SDE_DIR/sde64" -version | head -3

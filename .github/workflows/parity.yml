@@ -122,7 +122,7 @@ jobs:
         run: |
           set -euo pipefail
           V="${BWA_MEM2_VERSION}"
-          curl -fsSL -o bwa-mem2.tar.bz2 \
+          curl -fsSL --retry 8 --retry-all-errors --retry-delay 15 -o bwa-mem2.tar.bz2 \
             "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${V}/bwa-mem2-${V}_x64-linux.tar.bz2"
           echo "${BWA_MEM2_SHA256}  bwa-mem2.tar.bz2" | sha256sum -c -
           tar xjf bwa-mem2.tar.bz2
