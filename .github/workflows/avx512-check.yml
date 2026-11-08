@@ -101,9 +101,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Cached, and a cold cache retries for up to ~10 minutes (the CDN returns 504s).
+      - uses: actions/cache@v4
+        with:
+          path: sde.tar.xz
+          key: sde-${{ env.SDE_SHA256 }}
+
       - name: Fetch Intel SDE
         run: |
-          curl -fsSL --retry 8 --retry-all-errors --retry-delay 15 -o sde.tar.xz "$SDE_URL"
+          for i in 1 2 3 4 5 6; do
+            [ -s sde.tar.xz ] && break
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 15 -o sde.tar.xz "$SDE_URL" \
+              || { rm -f sde.tar.xz; sleep $((30 * i)); }
+          done
           echo "$SDE_SHA256  sde.tar.xz" | sha256sum -c -
           tar xf sde.tar.xz
           "./$SDE_DIR/sde64" -version | head -3

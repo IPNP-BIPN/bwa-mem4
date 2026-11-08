@@ -118,12 +118,23 @@ jobs:
           samtools --version | head -1
           bgzip --version | head -1
 
+      # The release CDN returns 504s for minutes at a time: the pinned tarball is cached, and a
+      # cold cache retries for up to ~10 minutes.
+      - uses: actions/cache@v4
+        with:
+          path: bwa-mem2.tar.bz2
+          key: bwa-mem2-${{ env.BWA_MEM2_VERSION }}-${{ env.BWA_MEM2_SHA256 }}
+
       - name: Fetch bwa-mem2 ${{ env.BWA_MEM2_VERSION }} (the oracle)
         run: |
           set -euo pipefail
           V="${BWA_MEM2_VERSION}"
-          curl -fsSL --retry 8 --retry-all-errors --retry-delay 15 -o bwa-mem2.tar.bz2 \
-            "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${V}/bwa-mem2-${V}_x64-linux.tar.bz2"
+          for i in 1 2 3 4 5 6; do
+            [ -s bwa-mem2.tar.bz2 ] && break
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 15 -o bwa-mem2.tar.bz2 \
+              "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${V}/bwa-mem2-${V}_x64-linux.tar.bz2" \
+              || { rm -f bwa-mem2.tar.bz2; sleep $((30 * i)); }
+          done
           echo "${BWA_MEM2_SHA256}  bwa-mem2.tar.bz2" | sha256sum -c -
           tar xjf bwa-mem2.tar.bz2
           echo "$PWD/bwa-mem2-${V}_x64-linux" >> "$GITHUB_PATH"
