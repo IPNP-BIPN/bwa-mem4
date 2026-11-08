@@ -142,7 +142,8 @@ jobs:
           # user below it. Same lesson as `-C target-cpu=native`: build for the audience, not for
           # the machine. Measured on the v3.0.0 artifacts (deleted in the rename): arm64 minos 11.0, x86_64 minos 10.12.
           # The newest macOS is worth TESTING on, which is ci.yml's job, not this one's.
-          - os: macos-14
+          # macos-15, not macos-14: GitHub retired the macos-14 image ("not supported", the job never starts).
+          - os: macos-15
             target_id: macos-arm64
             deployment_target: "11.0"
             # PGO used to pay here (+6.1% SE / +8.5% PE, docs/perf-levers.md), but the hand-placed
@@ -200,7 +201,7 @@ jobs:
       #
       # The Zen 3 row uses THIS recipe, tiny-fixture training included, so it is not a proxy. So the
       # step is now gated on `matrix.pgo`. Apple Silicon built profile-guided until 2026-11, when it
-      # stopped paying there too (see the macos-14 row); every target builds plain now, and the artefacts that no longer use it become reproducible from a clean tree
+      # stopped paying there too (see the macos-arm64 row); every target builds plain now, and the artefacts that no longer use it become reproducible from a clean tree
       # again. What PGO buys here is branch layout on the branchy driver, seeding and SAM paths, and
       # how much that is worth is a property of the core's branch predictor rather than of the code.
       #
