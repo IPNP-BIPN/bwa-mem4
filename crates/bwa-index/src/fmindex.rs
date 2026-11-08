@@ -598,6 +598,58 @@ fn unpack_pac_rc_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     }
 }
 
+/// [`unpack_pac_fwd`] of `[start, start + len)` reversed and complemented in one SSSE3 pass, as
+/// [`unpack_pac_rc_neon`] does on aarch64: the source is walked from its end, 16 bases (4 packed
+/// bytes) per step, each step unpacked, reversed by `pshufb` and complemented by `^ 3`. Before, x86
+/// unpacked forward, then reversed, then complemented: three passes over every reverse-strand
+/// window. Appends to `out`, which must have room for `len + 16` bytes.
+///
+/// # Safety
+/// SSSE3.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn unpack_pac_rc_ssse3(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    use std::arch::x86_64::*;
+    let scalar = |p: i64| 3 - ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3);
+    // Output base `o` is the complement of source base `end - 1 - o`.
+    let mut end = start + len as i64;
+    // Top bases down to a byte boundary, so every vector step reads whole packed bytes.
+    while end > start && end & 3 != 0 {
+        out.push(scalar(end - 1));
+        end -= 1;
+    }
+    let spread = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    let rev = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    let three = _mm_set1_epi8(3);
+    // Within a packed byte the most significant pair is base 0, hence shifts 6, 4, 2, 0 by lane.
+    let m0 = _mm_setr_epi8(-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0);
+    let m1 = _mm_setr_epi8(0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0);
+    let m2 = _mm_setr_epi8(0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0);
+    let m3 = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
+    while end - 16 >= start {
+        // `end <= l_pac` and `end - 16 >= 0`, so the 4 bytes at `(end - 16) >> 2` are inside `pac`.
+        let word = (pac.as_ptr().add(((end - 16) >> 2) as usize) as *const u32).read_unaligned();
+        let v = _mm_shuffle_epi8(_mm_set1_epi32(word as i32), spread);
+        let s6 = _mm_and_si128(_mm_srli_epi16(v, 6), m0);
+        let s4 = _mm_and_si128(_mm_srli_epi16(v, 4), m1);
+        let s2 = _mm_and_si128(_mm_srli_epi16(v, 2), m2);
+        let s0 = _mm_and_si128(v, m3);
+        let fwd = _mm_and_si128(
+            _mm_or_si128(_mm_or_si128(s6, s4), _mm_or_si128(s2, s0)),
+            three,
+        );
+        let r = _mm_xor_si128(_mm_shuffle_epi8(fwd, rev), three);
+        let n = out.len();
+        _mm_storeu_si128(out.as_mut_ptr().add(n) as *mut __m128i, r);
+        out.set_len(n + 16);
+        end -= 16;
+    }
+    while end > start {
+        out.push(scalar(end - 1));
+        end -= 1;
+    }
+}
+
 pub(crate) fn unpack_pac_range_into(pac: &[u8], l_pac: i64, rb: i64, re: i64, out: &mut Vec<u8>) {
     out.clear();
     unpack_pac_range_append(pac, l_pac, rb, re, out);
@@ -624,6 +676,13 @@ pub(crate) fn unpack_pac_range_append(pac: &[u8], l_pac: i64, rb: i64, re: i64, 
         #[cfg(target_arch = "aarch64")]
         if std::arch::is_aarch64_feature_detected!("neon") {
             unpack_pac_rc_neon(pac, 2 * l_pac - re, len, out);
+            debug_assert_eq!(out.len(), len0 + len);
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("ssse3") {
+            // SAFETY: ssse3 detected; `out` has `len + 16` bytes of room (reserved above).
+            unsafe { unpack_pac_rc_ssse3(pac, 2 * l_pac - re, len, out) };
             debug_assert_eq!(out.len(), len0 + len);
             return;
         }
