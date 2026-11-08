@@ -402,27 +402,68 @@ pub struct MemAlnReg {
 /// C-QUIRK: the C evaluates `qlen * opt->a - opt->o_del` in `int` and only then casts to `double`;
 /// we promote to `f64` before multiplying. The two agree for every `qlen` an int can hold without
 /// the product overflowing (`qlen < 2^31 / a`), which no read approaches, so this is a widening
-/// that cannot change output. The division and the truncating cast are kept in `f64`/`as i32`
-/// exactly as the C does, because doing it in integers would round differently.
+/// that cannot change output. The division and truncating cast are done in integers where that is
+/// provably the same value (see [`gap_len`]) and in `f64`/`as i32` exactly as the C does elsewhere.
 #[must_use]
 pub(crate) fn cal_max_gap(opt: &MemOpt, qlen: i32) -> i32 {
-    // `opt.a` is the per-base match score, the reward this extension could earn per query base.
-    let match_score = f64::from(opt.a);
     // Longest DELETION (bases missing from the read) whose affine penalty is still repaid by the
-    // `qlen * a` this extension could earn. May be negative before the `.max(1)` floor below when
-    // `qlen` is small enough that even opening a gap costs more than the whole extension is worth.
-    let max_deletion_len = ((f64::from(qlen) * match_score - f64::from(opt.o_del))
-        / f64::from(opt.e_del)
-        + 1.0) as i32;
-    // Same quantity for an INSERTION (extra bases in the read), which may use different open/extend
-    // penalties, hence the separate computation rather than reusing the deletion answer.
-    let max_insertion_len = ((f64::from(qlen) * match_score - f64::from(opt.o_ins))
-        / f64::from(opt.e_ins)
-        + 1.0) as i32;
+    // `qlen * a` this extension could earn, then the same for an INSERTION, which may use different
+    // open/extend penalties. Either may be negative before the `.max(1)` floor below.
+    let max_deletion_len = gap_len(qlen, opt.a, opt.o_del, opt.e_del);
+    let max_insertion_len = gap_len(qlen, opt.a, opt.o_ins, opt.e_ins);
     // Whichever gap kind can stretch furthest decides the window; floored at 1 so a window is never
     // empty even when neither gap kind pays for itself.
     let max_gap = max_deletion_len.max(max_insertion_len).max(1);
     max_gap.min(opt.w << 1)
+}
+
+/// `(int)((double)(qlen * a - o) / e + 1.)`, the C's expression, without the double division in the
+/// common case. For `e > 0` and `|N| < 2^52` (`N = qlen * a - o`), `N / e` is never within a
+/// rounding step of a nonzero integer (the gap is at least `1 / e`), so truncating `N / e + 1`
+/// equals the integer `(N + e) / e`, which Rust rounds toward zero as the cast does. Everything
+/// else (a zero or negative `e`, huge products) takes the C's double path. Per seed this was four
+/// dependent `divsd` in `align_reads_batched`'s window loop, the hottest spot of that function on x86.
+#[inline]
+fn gap_len(qlen: i32, a: i32, o: i32, e: i32) -> i32 {
+    let n = i64::from(qlen) * i64::from(a) - i64::from(o);
+    if e == 1 && n.abs() < 1 << 52 {
+        return (n + 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    }
+    if e > 1 && n.abs() < 1 << 52 {
+        let e = i64::from(e);
+        return ((n + e) / e).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    }
+    ((f64::from(qlen) * f64::from(a) - f64::from(o)) / f64::from(e) + 1.0) as i32
+}
+
+#[cfg(test)]
+mod gap_len_tests {
+    /// The integer form against the C's double expression over every small input and a spread of
+    /// large ones, including negative numerators and saturating results.
+    #[test]
+    fn gap_len_equals_the_double_expression() {
+        let c = |q: i32, a: i32, o: i32, e: i32| {
+            ((f64::from(q) * f64::from(a) - f64::from(o)) / f64::from(e) + 1.0) as i32
+        };
+        for q in -300..2000 {
+            for a in 0..6 {
+                for o in [-3, 0, 1, 5, 6, 11, 40, 1000] {
+                    for e in -2..9 {
+                        assert_eq!(super::gap_len(q, a, o, e), c(q, a, o, e), "{q} {a} {o} {e}");
+                    }
+                }
+            }
+        }
+        for &q in &[i32::MAX, i32::MIN, 1 << 30, -(1 << 30), 123_456_789] {
+            for &a in &[1, 7, i32::MAX, -5] {
+                for &o in &[0, 6, i32::MAX, i32::MIN] {
+                    for &e in &[1, 2, 3, 1000, i32::MAX] {
+                        assert_eq!(super::gap_len(q, a, o, e), c(q, a, o, e), "{q} {a} {o} {e}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// What one accepted call to `ksw_extend2` reports back, plus the band that produced it.

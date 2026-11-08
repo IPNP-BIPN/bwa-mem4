@@ -682,30 +682,41 @@ impl RegionView {
                 crate::rescue_split::VIEW_BUILD_ROWS
                     .fetch_add(ma.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
+            // One pass over the 96-byte regions for everything the view needs; the sort then works
+            // on the 24-byte tuples alone. Three passes (keys, max length, cleanliness) plus a
+            // gather back through `ma` in sorted order were most of `batch_mate_rescue` on x86.
+            let (mut max_len, mut clean, mut packable) = (0i64, true, ma.len() < 1 << 24);
+            let tuples: Vec<(i64, i64, i32, i32)> = ma
+                .iter()
+                .map(|q| {
+                    max_len = max_len.max(q.re - q.rb);
+                    clean &= q.rid >= 0 && q.re > q.rb;
+                    packable &= (0..1 << 40).contains(&q.rb);
+                    (q.rb, q.re, q.qb, q.qe)
+                })
+                .collect();
             self.by_rb.clear();
             // Sorted as packed `rb << 24 | index` words: a primitive sort, not a keyed tuple one.
-            if ma.len() < 1 << 24 && ma.iter().all(|q| (0..1 << 40).contains(&q.rb)) {
+            if packable {
                 let mut keys = std::mem::take(&mut self.keys);
                 keys.clear();
                 keys.extend(
-                    ma.iter()
+                    tuples
+                        .iter()
                         .enumerate()
-                        .map(|(i, q)| (q.rb as u64) << 24 | i as u64),
+                        .map(|(i, q)| (q.0 as u64) << 24 | i as u64),
                 );
                 keys.sort_unstable();
-                self.by_rb.extend(keys.iter().map(|&k| {
-                    let q = &ma[(k & 0xff_ffff) as usize];
-                    (q.rb, q.re, q.qb, q.qe)
-                }));
+                self.by_rb
+                    .extend(keys.iter().map(|&k| tuples[(k & 0xff_ffff) as usize]));
                 self.keys = keys;
             } else {
-                self.by_rb
-                    .extend(ma.iter().map(|q| (q.rb, q.re, q.qb, q.qe)));
+                self.by_rb.extend_from_slice(&tuples);
                 self.by_rb.sort_unstable_by_key(|q| q.0);
             }
             self.sorted = self.by_rb.len();
-            self.max_len = ma.iter().map(|q| q.re - q.rb).max().unwrap_or(0);
-            self.clean = ma.iter().all(|q| q.rid >= 0 && q.re > q.rb);
+            self.max_len = max_len;
+            self.clean = clean;
             self.built = true;
             crate::rescue_split::stop(&crate::rescue_split::VIEW_BUILD_NS, t_build);
         }
