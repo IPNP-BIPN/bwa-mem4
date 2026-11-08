@@ -559,7 +559,10 @@ fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u1
     debug_assert!(cap <= 128 && cap.is_multiple_of(16));
     let n = q.len();
     let (mut bits, mut total) = (0u128, 0i32);
-    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(unused_mut))]
+    #[cfg_attr(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        allow(unused_mut)
+    )]
     let mut col = 0usize;
     #[cfg(target_arch = "aarch64")]
     // SAFETY: NEON is part of the aarch64 baseline; every load reads 16 bytes below `n` of slices
@@ -917,7 +920,6 @@ fn prefetch<T>(p: *const T) {
 /// of its representative in `unique`. `map[i] == i'` means `out[i]` must be `results[i']`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
-
     /// Fold every byte of `s` into `h`, 32 at a time in four independent multiply chains so the
     /// latency of one does not serialise the rest. Covering only 32 bytes at each end let 121M of
     /// 126M candidate pairs on 1M chr21 pairs collide (repeat windows share their ends), and the
