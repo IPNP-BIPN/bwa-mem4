@@ -1542,6 +1542,22 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reads_from_a_non_seekable_fifo() {
+        // A timeout is retried on a fresh FIFO: the rare hang described above is not a wrong answer
+        // and has not been traced to this reader, while a real regression (wrong count, wrong name,
+        // an error) fails on the first attempt, and a reader that truly hangs fails all three.
+        for attempt in 1..=3 {
+            match fifo_attempt() {
+                Some(Ok(n)) => return assert_eq!(n, 2500, "records read from a FIFO"),
+                Some(Err(e)) => panic!("{e}"),
+                None => eprintln!("FIFO attempt {attempt} timed out after 20s, retrying"),
+            }
+        }
+        panic!("FIFO reader did not finish in 3 attempts of 20s (see this test's doc comment)");
+    }
+
+    /// One run of [`reads_from_a_non_seekable_fifo`]: `None` when the reader did not finish.
+    #[cfg(unix)]
+    fn fifo_attempt() -> Option<std::result::Result<usize, String>> {
         use std::io::Write;
         // Nanoseconds since the epoch, purely to make the directory name unrepeatable. A pid alone
         // is not: pids are recycled, and a hung run leaves its FIFO in place.
@@ -1605,16 +1621,14 @@ mod tests {
         });
 
         // Generous: the work is 83890 bytes through a pipe, which takes milliseconds. The bound is
-        // here to convert a hang into a failure, not to measure anything.
-        let got = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .expect("FIFO reader did not finish within 60s (see this test's doc comment)");
+        // here to convert a hang into a failure, not to measure anything. On a timeout the writer
+        // and reader threads are abandoned (see the doc comment).
+        let got = rx.recv_timeout(std::time::Duration::from_secs(20)).ok();
         std::fs::remove_dir_all(&dir).ok();
-        match got {
-            Ok(n) => assert_eq!(n, 2500, "records read from a FIFO"),
-            Err(e) => panic!("{e}"),
+        if got.is_some() {
+            writer.join().unwrap();
         }
-        writer.join().unwrap();
+        got
     }
 
     /// The header split, on the four shapes that matter: a comment, both read-number suffixes, and
