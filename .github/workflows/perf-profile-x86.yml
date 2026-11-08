@@ -279,7 +279,7 @@ jobs:
           # 3.0x executed/useful cells at 16 lanes, 3.9x at 32, 6.05x at 64).
           # BWA4_COMPACT_K=1: without same-row lane compaction; 2 and 4: fewer vectors in flight
           # (a smaller L1 working set, Neoverse-N2 has 64 KB).
-          for arm in "BWA4_COMPACT_K=1" "BWA4_COMPACT_K=2" "BWA4_COMPACT_K=4" "BWA4_EXTEND_SBT=0" "BWA4_EXTEND_BANDFAST=0" \
+          for arm in "BWA4_COMPACT_K=1" "BWA4_COMPACT_K=2" "BWA4_COMPACT_K=4" "BWA4_BAND_SPLIT=24" "BWA4_BAND_SPLIT=31" "BWA4_BAND_SPLIT=40" \
                      "BWA4_EXTEND_TIER=avx512" "BWA4_EXTEND_TIER=avx2" "BWA4_EXTEND_TIER=sse41" \
                      "BWA4_LOCKSTEP_N=16" "BWA4_LOCKSTEP_N=32" "BWA4_LOCKSTEP_N=64" \
                      "BWA4_SA_WINDOW=32" "BWA4_SA_WINDOW=64" "BWA4_SA_WINDOW=256" \

@@ -1114,11 +1114,45 @@ fn dispatch_bins(
     // Homogeneous fast path: whole batch in one bin -> run the kernel on `jobs` with no gather/scatter.
     // `n` is the batch size, so `x_idx.len() == n` means bin `x` took every job.
     let n = jobs.len();
+    // `BWA4_BAND_SPLIT=T`: u8 jobs whose band (full clamp, then the ungapped-score bound) is below
+    // `T` ride before the wider ones, each group keeping the caller's (length) order, so a vector
+    // does not pay a wide lane's column range for its narrow ones. Experiment knob.
+    let split = band_split();
+    if split > 0 && u8_idx.len() > 1 {
+        let narrow = |k: usize| {
+            let job = &jobs[k];
+            let mut wl = clamp_band(
+                w0,
+                job.query.len(),
+                max_sc,
+                end_bonus,
+                o_ins,
+                e_ins,
+                o_del,
+                e_del,
+            );
+            if tight_band_enabled() {
+                wl = wl.min(tight_band_bound(
+                    job.query,
+                    job.target,
+                    job.h0,
+                    i32::from(mat[0]),
+                    i32::from(mat[1]),
+                    (o_del.min(o_ins), e_del.min(e_ins)),
+                    end_bonus,
+                ));
+            }
+            wl < split
+        };
+        let (a, b): (Vec<usize>, Vec<usize>) = u8_idx.iter().partition(|&&k| narrow(k));
+        u8_idx = a;
+        u8_idx.extend(b);
+    }
     // The three single-bin fast paths. Each has to go through `expand`, because with the dedup
     // above `jobs` is the DISTINCT batch and the caller is owed one result per ORIGINAL job. Missing
     // that on these paths is what the paired-end overlap test caught: they are the common case, so
     // the bug was not subtle, only invisible until something indexed past the end.
-    if u8_idx.len() == n {
+    if u8_idx.len() == n && split == 0 {
         // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
         return expand(unsafe { run_u8!(jobs) }, dup_map);
     }
@@ -1681,6 +1715,18 @@ fn band_fast_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BWA4_EXTEND_BANDFAST").is_none_or(|v| v != "0"))
+}
+
+/// `BWA4_BAND_SPLIT`: band below which u8 jobs are batched apart (0 = off). Experiment knob.
+fn band_split() -> i32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<i32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BWA4_BAND_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Whether the extension kernels fold the substitution pre-pass into the column loop (issue #48B).
