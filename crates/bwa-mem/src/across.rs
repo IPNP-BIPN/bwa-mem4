@@ -48,7 +48,7 @@
 //! # Reading order
 //!
 //! 1. [`align_reads_batched`] is the entry point and the spine: seed and chain the batch, collect
-//!    region slots and one-sided DP jobs, run left then right, then `seedcov`, then the discard pass.
+//!    region slots and one-sided DP jobs, run left then right, then the discard pass, then `seedcov`.
 //! 2. [`SideJob`] is the unit of work the collection pass emits.
 //! 3. [`run_side`] consumes those jobs: band-doubling rounds, acceptance test, scatter into regions.
 //! 4. [`discard_contained`] is the post-extension purge; [`RegMeta`] is the back-pointer state it
@@ -819,7 +819,7 @@ pub mod align_split {
 /// The five phases below run strictly in order, and the order is forced by data dependencies rather
 /// than taste: seed+chain all reads, collect one region slot and up to two extension jobs per seed,
 /// run every left extension, run every right extension (needs the left scores as `h0`), then
-/// `seedcov` and the discard pass (both need final bounds for the whole read).
+/// the discard pass and `seedcov` (both need final bounds for the whole read).
 ///
 /// # Parameters
 ///
@@ -1592,6 +1592,22 @@ fn align_reads_batched_inner<B: SwBackend>(
     });
     ARENA.set(arena);
 
+    // ---- bwa-mem2's discard pass, after every extension has landed ----
+    if purge {
+        for r in 0..reads.len() {
+            let l_query = reads[r].len() as i32;
+            let n = regs[r].len();
+            discard_contained(
+                opt,
+                l_query,
+                &per_read_chains[r],
+                &mut regs[r],
+                &reg_meta[slot0[r]..slot0[r] + n],
+                &reg_preskip[slot0[r]..slot0[r] + n],
+            );
+        }
+    }
+
     // ---- seedcov, per region, from final bounds (mirrors mem_chain2aln's tail) ----
     // `seedcov` is the number of query bases covered by seeds that fall entirely inside the finished
     // region. It feeds MAPQ and the `mem_sort_dedup_patch` redundancy test, so it must be exact.
@@ -1600,8 +1616,9 @@ fn align_reads_batched_inner<B: SwBackend>(
     // `2506-2516` in the left scatter, `2723-2732` in the right scatter), each guarded by all four
     // bounds being off `H0_`. Only the last execution survives, and by then the bounds are final, so
     // hoisting it to one pass here reaches the same values with a third of the work. The guard is the
-    // same one: skip regions whose extension never landed, and skip `-1` (a pre-skipped slot; the
-    // discard pass has not run yet, so `-1` here can only come from `reg_preskip`).
+    // same one: skip regions whose extension never landed, and skip `-1` (a pre-skipped or purged slot).
+    // Run after the discard pass, which never reads `seedcov`: a purged region is dropped below, so
+    // counting its seeds was wasted work, and most of a chain's seed regions are purged.
     for r in 0..reads.len() {
         for (idx, reg) in regs[r].iter_mut().enumerate() {
             if reg.rb != H0_SENTINEL && reg.qb != H0_SENTINEL as i32 && reg.qb != -1 {
@@ -1619,22 +1636,6 @@ fn align_reads_batched_inner<B: SwBackend>(
                     }
                 }
             }
-        }
-    }
-
-    // ---- bwa-mem2's discard pass, after every extension has landed ----
-    if purge {
-        for r in 0..reads.len() {
-            let l_query = reads[r].len() as i32;
-            let n = regs[r].len();
-            discard_contained(
-                opt,
-                l_query,
-                &per_read_chains[r],
-                &mut regs[r],
-                &reg_meta[slot0[r]..slot0[r] + n],
-                &reg_preskip[slot0[r]..slot0[r] + n],
-            );
         }
     }
 
