@@ -2751,32 +2751,16 @@ macro_rules! define_sw_kernel {
                             // stride`, the buffers' column count, and `last_live >= beg` is tested first.
                             *nxt = live & next_bits;
                             let (hp, ep) = (eh_h.as_mut_ptr(), eh_e.as_mut_ptr());
-                            // `eh[end] = {h1, 0}`: only a lane live into row `i + 1` reads it (a
-                            // lane moved in brings its own columns). Sixteen lanes store all of them,
-                            // branch-free (every `end` is in `0..=qlen`); wider vectors, where most
-                            // lanes have finished (6x executed per useful cell at 64), only `nxt`'s.
-                            if LANES > 16 {
-                                let mut b = *nxt;
-                                while b != 0 {
-                                    let l = b.trailing_zeros() as usize;
-                                    b &= b - 1;
-                                    let o = end[l] as usize * LANES + l;
-                                    // SAFETY: see above.
-                                    unsafe {
-                                        *hp.add(o) = h1_out[l];
-                                        *ep.add(o) = 0;
-                                    }
-                                }
-                            } else {
-                                let off: [u32; LANES] = std::array::from_fn(|l| {
-                                    end[l] as u32 * LANES as u32 + l as u32
-                                });
-                                for l in 0..LANES {
-                                    // SAFETY: see above.
-                                    unsafe {
-                                        *hp.add(off[l] as usize) = h1_out[l];
-                                        *ep.add(off[l] as usize) = 0;
-                                    }
+                            // `eh[end] = {h1, 0}` for every lane, branch-free: an inactive lane's
+                            // slot is never read again (a lane moved in brings its own columns), and
+                            // its `end` is in `0..=qlen` all the same.
+                            let off: [u32; LANES] =
+                                std::array::from_fn(|l| end[l] as u32 * LANES as u32 + l as u32);
+                            for l in 0..LANES {
+                                // SAFETY: see above.
+                                unsafe {
+                                    *hp.add(off[l] as usize) = h1_out[l];
+                                    *ep.add(off[l] as usize) = 0;
                                 }
                             }
                             // SAFETY: as for `prologue16`; the outputs are u8 (`rowvec`).
