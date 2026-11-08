@@ -1,4 +1,4 @@
-//! Anti-diagonal (wavefront) NEON `ksw_global2` in int16 lanes: fg-labs/bwa-mem3's `ksw_g2_wave16`
+//! Anti-diagonal (wavefront) `ksw_global2` in int16 lanes, NEON or SSE4.1: fg-labs/bwa-mem3's `ksw_g2_wave16`
 //! (`ksw_global2_wave.h`, with its LEMMA 1-10 proof of byte-identity to the scalar `ksw_global2`).
 //!
 //! Cells on one anti-diagonal `s = i + j` depend only on diagonals `s - 1` and `s - 2`, so eight rows
@@ -6,8 +6,107 @@
 //! direction bytes in diagonal-major order, and the traceback walks them exactly as the scalar walks
 //! its row-major bytes. Entered only where [`safe`] proves every value fits int16 and the band meets
 //! the kernel's floor `w >= |tlen - qlen| + 3`.
+//!
+//! One kernel body for both ISAs: on x86_64 the NEON intrinsics it uses are the SSE4.1 shims of
+//! [`sse`] (same 8 x int16 lanes, same names), and the score lookup and the direction-byte store,
+//! the two steps without a one-instruction twin, are [`score8`] and [`store_dirs`].
 
+#[cfg(target_arch = "x86_64")]
+use sse::*;
+#[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+
+/// The 5 x 5 score table as two 16-byte halves.
+#[cfg(target_arch = "aarch64")]
+type Table = uint8x16x2_t;
+#[cfg(target_arch = "aarch64")]
+unsafe fn load_table(tab: &[u8; 32]) -> Table {
+    uint8x16x2_t(vld1q_u8(tab.as_ptr()), vld1q_u8(tab.as_ptr().add(16)))
+}
+
+/// Lane `l`'s score `mat[t[l] * 5 + q[7 - l]]`, sign-extended: `tp` and `qp` point at 8 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn score8(table: &Table, tp: *const u8, qp: *const u8) -> int16x8_t {
+    let idx = vmla_u8(vrev64_u8(vld1_u8(qp)), vld1_u8(tp), vdup_n_u8(5));
+    vmovl_s8(vreinterpret_s8_u8(vqtbl2_u8(*table, idx)))
+}
+
+/// The eight direction bytes of `d` (each lane `< 64`) at `p`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_dirs(p: *mut u8, d: int16x8_t) {
+    vst1_u8(p, vmovn_u16(vreinterpretq_u16_s16(d)));
+}
+
+/// SSE4.1 under the NEON names the kernel uses; masks are all-ones / all-zeros int16 lanes.
+#[cfg(target_arch = "x86_64")]
+mod sse {
+    pub(super) use std::arch::x86_64::*;
+    type V = __m128i;
+    macro_rules! shim {
+        ($($name:ident($($a:ident: $t:ty),*) -> $r:ty $body:block)*) => {$(
+            #[inline]
+            #[target_feature(enable = "sse4.1")]
+            pub(super) unsafe fn $name($($a: $t),*) -> $r $body
+        )*};
+    }
+    shim! {
+        vdupq_n_s16(x: i16) -> V { _mm_set1_epi16(x) }
+        vld1q_s16(p: *const i16) -> V { _mm_loadu_si128(p.cast()) }
+        vst1q_s16(p: *mut i16, v: V) -> () { _mm_storeu_si128(p.cast(), v) }
+        vaddq_s16(a: V, b: V) -> V { _mm_add_epi16(a, b) }
+        vsubq_s16(a: V, b: V) -> V { _mm_sub_epi16(a, b) }
+        vmulq_s16(a: V, b: V) -> V { _mm_mullo_epi16(a, b) }
+        vmaxq_s16(a: V, b: V) -> V { _mm_max_epi16(a, b) }
+        vminq_s16(a: V, b: V) -> V { _mm_min_epi16(a, b) }
+        vceqq_s16(a: V, b: V) -> V { _mm_cmpeq_epi16(a, b) }
+        vcgtq_s16(a: V, b: V) -> V { _mm_cmpgt_epi16(a, b) }
+        vcltq_s16(a: V, b: V) -> V { _mm_cmpgt_epi16(b, a) }
+        vcgeq_s16(a: V, b: V) -> V { _mm_cmpeq_epi16(_mm_max_epi16(a, b), a) }
+        vbslq_s16(m: V, a: V, b: V) -> V { _mm_blendv_epi8(b, a, m) }
+        vandq_u16(a: V, b: V) -> V { _mm_and_si128(a, b) }
+        vorrq_s16(a: V, b: V) -> V { _mm_or_si128(a, b) }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+type Table = (__m128i, __m128i);
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn load_table(tab: &[u8; 32]) -> Table {
+    (
+        _mm_loadu_si128(tab.as_ptr().cast()),
+        _mm_loadu_si128(tab.as_ptr().add(16).cast()),
+    )
+}
+
+/// As the NEON one: indices `t * 5 + q < 25` look up both halves with `pshufb`, which reads the
+/// low four bits, and the half is picked by `idx > 15`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse4.1")]
+unsafe fn score8(table: &Table, tp: *const u8, qp: *const u8) -> __m128i {
+    let rev = _mm_setr_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -1, -1, -1, -1, -1, -1, -1);
+    let q = _mm_shuffle_epi8(_mm_loadl_epi64(qp.cast()), rev);
+    let t = _mm_cvtepu8_epi16(_mm_loadl_epi64(tp.cast()));
+    let i16x = _mm_add_epi16(_mm_mullo_epi16(t, _mm_set1_epi16(5)), _mm_cvtepu8_epi16(q));
+    let idx = _mm_packus_epi16(i16x, i16x);
+    let hi = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));
+    let s = _mm_blendv_epi8(
+        _mm_shuffle_epi8(table.0, idx),
+        _mm_shuffle_epi8(table.1, idx),
+        hi,
+    );
+    _mm_cvtepi8_epi16(s)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse4.1")]
+unsafe fn store_dirs(p: *mut u8, d: __m128i) {
+    _mm_storel_epi64(p.cast(), _mm_packus_epi16(d, d));
+}
 
 /// Int16 "minus infinity": its own decrement cannot wrap and no feasible score reaches it ([`safe`]).
 const VMINF: i16 = -30000;
@@ -96,6 +195,10 @@ pub(crate) fn try_wave16(
         return None;
     }
     let w = w as usize;
+    #[cfg(target_arch = "x86_64")]
+    if !std::arch::is_x86_feature_detected!("sse4.1") {
+        return None;
+    }
     if w < wmin()
         || w < qlen.abs_diff(tlen) + 3
         || !safe(qlen, tlen, w, o_del, e_del, o_ins, e_ins, mat)
@@ -104,12 +207,16 @@ pub(crate) fn try_wave16(
     }
     Some(SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
-        wave16(&mut s, query, target, mat, o_del, e_del, o_ins, e_ins, w)
+        // SAFETY: NEON is the AArch64 baseline; SSE4.1 was detected above on x86_64.
+        unsafe { wave16(&mut s, query, target, mat, o_del, e_del, o_ins, e_ins, w) }
     }))
 }
 
+/// # Safety
+/// On x86_64 the CPU must have SSE4.1.
 #[allow(clippy::too_many_arguments)]
-fn wave16(
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "sse4.1"))]
+unsafe fn wave16(
     sc: &mut Scratch,
     query: &[u8],
     target: &[u8],
@@ -156,13 +263,12 @@ fn wave16(
     }
     let (w16, q16) = (w as i16, qlen as i16);
     let mut roff = 0usize;
-    // SAFETY: NEON is mandatory on AArch64. Every pointer below stays inside its buffer: ring rows are
+    // SAFETY: the ISA is the caller's contract (see above). Every pointer below stays inside its buffer: ring rows are
     // `stride >= maxlen + 33` long and lanes reach at most row `tlen + 8`; the query/target copies
     // have `PAD` bytes on both sides of the at most 7-byte overhang; `z` holds `zneed` bytes, the
     // in-band cell count plus 64 for the last chunk's overhang.
     unsafe {
-        let table = uint8x16x2_t(vld1q_u8(tab.as_ptr()), vld1q_u8(tab.as_ptr().add(16)));
-        let m8 = vdup_n_u8(5);
+        let table = load_table(&tab);
         let vminf = vdupq_n_s16(VMINF);
         let laneid = vld1q_s16([0i16, 1, 2, 3, 4, 5, 6, 7].as_ptr());
         let (hb, eb, fb) = (sc.hb.as_mut_ptr(), sc.eb.as_mut_ptr(), sc.fb.as_mut_ptr());
@@ -239,10 +345,7 @@ fn wave16(
                     f = vbslq_s16(vceqq_s16(jv, beg), vminf, vld1q_s16(fp1.add(i0 + 1)));
                 }
                 // Score index t*5 + q per byte lane; lane l reads query column s - i0 - l.
-                let tb = vld1_u8(tp.add(i0));
-                let qb = vld1_u8(qp.offset(s as isize - i0 as isize - 7));
-                let idx = vmla_u8(vrev64_u8(qb), tb, m8);
-                let sv = vmovl_s8(vreinterpret_s8_u8(vqtbl2_u8(table, idx)));
+                let sv = score8(&table, tp.add(i0), qp.offset(s as isize - i0 as isize - 7));
                 let mm = vaddq_s16(hdiag, sv);
                 let h_me = vmaxq_s16(mm, e);
                 let h = vmaxq_s16(h_me, f);
@@ -263,10 +366,7 @@ fn wave16(
                     d,
                     vbslq_s16(vcgtq_s16(fm, t2), vdupq_n_s16(2 << 4), vdupq_n_s16(0)),
                 );
-                vst1_u8(
-                    z.add(zbase + (i0 - i_lo)),
-                    vmovn_u16(vreinterpretq_u16_s16(d)),
-                );
+                store_dirs(z.add(zbase + (i0 - i_lo)), d);
                 i0 += 8;
             }
             // The terminal column (LEMMA 9): in band on this diagonal iff its row is `i_lo`.
@@ -311,6 +411,14 @@ fn wave16(
     }
     cigar.reverse();
     (score, cigar)
+}
+
+#[cfg(test)]
+fn isa_ok() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return std::arch::is_x86_feature_detected!("sse4.1");
+    #[cfg(not(target_arch = "x86_64"))]
+    true
 }
 
 #[cfg(test)]
@@ -382,7 +490,11 @@ mod tests {
             if !super::safe(qlen, tlen, w as usize, o_del, e_del, o_ins, e_ins, &mat) {
                 continue;
             }
-            let wave = super::SCRATCH.with(|s| {
+            if !super::isa_ok() {
+                return;
+            }
+            // SAFETY: `isa_ok` checked the ISA.
+            let wave = super::SCRATCH.with(|s| unsafe {
                 super::wave16(
                     &mut s.borrow_mut(),
                     &query,

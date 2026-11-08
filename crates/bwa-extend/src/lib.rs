@@ -53,7 +53,7 @@
 //! generic parameter, not at run time through a pointer, because seed extension is the hot inner
 //! loop and an indirect call per alignment would be measurable.
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod global_wave;
 pub mod sw;
 

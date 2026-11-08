@@ -713,8 +713,9 @@ pub fn ksw_global2(
     e_ins: i32,
     w: i32,
 ) -> (i32, Vec<u32>) {
-    // The NEON wavefront kernel where it is proven byte-identical and wide enough to pay.
-    #[cfg(target_arch = "aarch64")]
+    // The wavefront kernel (NEON, or SSE4.1 on x86_64) where it is proven byte-identical and
+    // wide enough to pay.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     if let Some(r) =
         crate::global_wave::try_wave16(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
     {
