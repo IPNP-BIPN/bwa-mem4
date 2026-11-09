@@ -1051,16 +1051,14 @@ impl LsSlot {
                         seed_stats::BWD_STEPS
                             .fetch_add(self.num_prev as u64, std::sync::atomic::Ordering::Relaxed);
                     }
-                    let (num_curr, emit) = fm.backward_round(
+                    let num_curr = fm.backward_round(
                         &mut self.prev[..self.num_prev],
                         a as usize,
                         self.jj as u32,
                         min_intv,
                         i64::from(min_seed_len),
+                        &mut self.out,
                     );
-                    if let Some(c) = emit {
-                        self.out.push(c);
-                    }
                     self.num_prev = num_curr;
                     self.jj -= 1;
                     if num_curr == 0 {

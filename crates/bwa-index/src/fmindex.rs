@@ -1681,14 +1681,18 @@ impl FmIndex {
     /// `getSMEMsOnePosOneThread`): every live candidate `prev[..]`, longest first, is extended on
     /// the left by base `a` at read offset `m`. Survivors with a new occurrence count are compacted
     /// to the front of `prev` and their next blocks prefetched; the first candidate that dies while
-    /// at least `min_seed_len` long, if it comes before any survivor, is returned for emission.
+    /// at least `min_seed_len` long, if it comes before any survivor, is pushed onto `out`.
     ///
     /// The same decisions as calling [`backward_ext_konly`](Self::backward_ext_konly) per
     /// candidate, with `a`'s plane masks, `count[a]` and the block array hoisted out of the loop and
     /// the block loads unchecked, which the slot's state machine could not keep in registers.
     ///
+    /// The emitted candidate goes to `out` rather than into the return value: a returned
+    /// `(usize, Option<Smem>)` comes back through memory, stored in words and reloaded by the caller
+    /// as one 32-byte vector, a failed store forward on every round on x86.
+    ///
     /// # Returns
-    /// The number of survivors, and the candidate to emit.
+    /// The number of survivors.
     #[inline]
     pub fn backward_round(
         &self,
@@ -1697,14 +1701,15 @@ impl FmIndex {
         m: u32,
         min_intv: i64,
         min_seed_len: i64,
-    ) -> (usize, Option<Smem>) {
+        out: &mut Vec<Smem>,
+    ) -> usize {
         // One copy per index kind, so the per-occurrence `wide` test leaves the loop. (Splitting on
         // `a == 0` too drops the sentinel test, -7G instructions, but the random-base dispatch costs
         // the cycles back.)
         if self.wide {
-            self.backward_round_impl::<true, true>(prev, a, m, min_intv, min_seed_len)
+            self.backward_round_impl::<true, true>(prev, a, m, min_intv, min_seed_len, out)
         } else {
-            self.backward_round_impl::<false, true>(prev, a, m, min_intv, min_seed_len)
+            self.backward_round_impl::<false, true>(prev, a, m, min_intv, min_seed_len, out)
         }
     }
 
@@ -1716,14 +1721,14 @@ impl FmIndex {
         m: u32,
         min_intv: i64,
         min_seed_len: i64,
-    ) -> (usize, Option<Smem>) {
+        out: &mut Vec<Smem>,
+    ) -> usize {
         let hx = ((a as u64 >> 1) & 1).wrapping_sub(1);
         let lx = (a as u64 & 1).wrapping_sub(1);
         let count_a = self.count[a];
         let cp = &self.cp_occ[..];
         let n = prev.len();
         let mut kept = 0usize;
-        let mut emit = None;
         let mut p = 0usize;
         // Until the first candidate that is kept or emitted.
         let mut curr_s = -1i64;
@@ -1739,7 +1744,7 @@ impl FmIndex {
                 break;
             }
             if i64::from(c.n) - i64::from(c.m) + 1 >= min_seed_len {
-                emit = Some(c);
+                out.push(c);
                 break;
             }
         }
@@ -1761,7 +1766,7 @@ impl FmIndex {
                 self.prefetch_occ(k, k + s);
             }
         }
-        (kept, emit)
+        kept
     }
 
     /// The forward extension of `smem` by base `aj` (`0..4`): the interval of the pattern with `aj`
