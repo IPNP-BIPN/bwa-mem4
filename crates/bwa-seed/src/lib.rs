@@ -1944,11 +1944,13 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
     // Longest read in the batch, in bases; sizes each slot's `prev` buffer so a slot can be recycled
     // onto a job belonging to any other read.
     let max_len = reads.iter().map(|r| r.len()).max().unwrap_or(0);
-    // Each job's output, filled as it completes; appended in job order at the end.
-    let mut results: Vec<Vec<Smem>> = (0..jobs.len()).map(|_| Vec::new()).collect();
+    // Every job's output in completion order, and where each job's lies in it: appended per read in
+    // job order at the end. One buffer, where a vector per job was an allocation and a free per job.
+    let mut done: Vec<Smem> = Vec::new();
+    let mut range: Vec<(u32, u32)> = vec![(0, 0); jobs.len()];
 
-    // Slots pair a job id (index into `jobs`/`results`) with the walk state, because jobs complete
-    // out of order and the result must go back to the right `results` entry.
+    // Slots pair a job id (index into `jobs`/`range`) with the walk state, because jobs complete
+    // out of order and the result must go back to the right `range` entry.
     let mut slots: Vec<Option<(usize, LsSlot)>> = Vec::with_capacity(lockstep_slots);
     // Index of the next job not yet handed to a slot.
     let mut next_job = 0usize;
@@ -1966,7 +1968,7 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
     }
 
     // Number of `Some` slots. Invariant at the top of each pass: every live slot is mid-walk on the
-    // job named by its `job_id`, jobs `next_job..` are unstarted, and `results[..]` holds output only
+    // job named by its `job_id`, jobs `next_job..` are unstarted, and `range[..]` names output only
     // for jobs already completed. A slot retires only when both are exhausted.
     let mut live = slots.iter().filter(|s| s.is_some()).count();
     while live > 0 {
@@ -1976,8 +1978,9 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
             };
             slot.step(fm, reads[slot.ridx], opt.min_seed_len, &counts);
             if slot.phase == LsPhase::Done {
-                let cap = slot.out.len();
-                results[*job_id] = std::mem::replace(&mut slot.out, Vec::with_capacity(cap));
+                range[*job_id] = (done.len() as u32, slot.out.len() as u32);
+                // Moves the SMEMs and keeps the slot's capacity for its next job.
+                done.append(&mut slot.out);
                 if next_job < jobs.len() {
                     let j = &jobs[next_job];
                     *job_id = next_job;
@@ -1991,9 +1994,17 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
         }
     }
 
-    // Append each job's SMEMs to its read, in job order (= per-read round-1-index order).
-    for (job, res) in jobs.iter().zip(results) {
-        per_read[job.ridx].extend(res);
+    // Append each job's SMEMs to its read, in job order (= per-read round-1-index order), each
+    // read's vector grown once.
+    let mut add = vec![0usize; per_read.len()];
+    for (job, &(_, n)) in jobs.iter().zip(&range) {
+        add[job.ridx] += n as usize;
+    }
+    for (v, &n) in per_read.iter_mut().zip(&add) {
+        v.reserve(n);
+    }
+    for (job, &(at, n)) in jobs.iter().zip(&range) {
+        per_read[job.ridx].extend_from_slice(&done[at as usize..][..n as usize]);
     }
 }
 
