@@ -583,17 +583,18 @@ fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u1
                 if col + 16 > cap {
                     return None;
                 }
-                let mut m = 0u128;
+                // Bit 4k (byte k) to bit k, branch-free: a loop over the set bits mispredicted its
+                // exit on every block with a mismatch (~1% of an M4 run).
                 let mut x = nib & 0x1111_1111_1111_1111;
-                while x != 0 {
-                    m |= 1u128 << (col + x.trailing_zeros() as usize / 4);
-                    x &= x - 1;
-                }
-                total += m.count_ones() as i32;
+                x = (x | x >> 3) & 0x0303_0303_0303_0303;
+                x = (x | x >> 6) & 0x000F_000F_000F_000F;
+                x = (x | x >> 12) & 0x0000_00FF_0000_00FF;
+                x = (x | x >> 24) & 0xFFFF;
+                total += x.count_ones() as i32;
                 if total > x_threshold {
                     return None;
                 }
-                bits |= m;
+                bits |= u128::from(x) << col;
             }
             col += 16;
         }
@@ -741,32 +742,40 @@ fn ungapped_hit(
     // 1..=x_threshold mismatches: the walk is cheap but no longer closed-form. `running` is the
     // score at the current column, `best_score`/`best_end` the best cell seen and where it was
     // (these are ksw_extend2's `max`/`max_i`, tracked along the single diagonal).
+    // Walked mismatch to mismatch, not column by column (a mispredict per mismatch): with `a > 0` a
+    // match run only climbs, so it can raise the best only at its last column, and with `b > 0` a
+    // mismatch only falls, so only there can z-drop fire or the diagonal die. Other matrices
+    // decline to the DP.
+    if a <= 0 || b <= 0 {
+        return None;
+    }
     let (mut running, mut best_score, mut best_end) = (job.h0, job.h0, 0i32);
-    for col in 0..diag_len {
-        if running == 0 {
-            continue; // local SW: once the diagonal dies it stays dead (no e/f restart)
-        }
-        if mismatch_bits >> col & 1 == 0 {
-            running += a;
+    let (mut pos, mut rest) = (0i32, mismatch_bits);
+    loop {
+        // Columns `pos..end` match; `end` is the next mismatch, or the end of the walk.
+        let end = if rest == 0 {
+            diag_len as i32
         } else {
-            running -= b;
-            if running < 0 {
-                running = 0;
-            }
-        }
+            rest.trailing_zeros() as i32
+        };
+        running += (end - pos) * a;
         if running > best_score {
             best_score = running;
-            best_end = col as i32 + 1;
-        } else if zdrop > 0 && best_score - running > zdrop {
-            return None; // ksw would break the row loop here; this walk does not model that
+            best_end = end;
         }
-    }
-    if running == 0 {
-        // The diagonal died. `gscore`/`gtle` then depend on cells this walk does not model (ksw
-        // breaks the row loop at `m == 0`, leaving max_ie on the last live row), so decline the HIT
-        // rather than report a field we cannot prove. nh13 returns gtle = N here and relies on the
-        // caller ignoring it when gscore <= 0; we would rather not ship a struct that lies.
-        return None;
+        if rest == 0 {
+            break;
+        }
+        rest &= rest - 1;
+        running -= b;
+        // A dead diagonal (`running <= 0`): `gscore`/`gtle` then depend on cells this walk does
+        // not model (ksw breaks the row loop at `m == 0`, leaving max_ie on the last live row), so
+        // decline rather than report a field we cannot prove. A z-drop: ksw would break the row
+        // loop here, which this walk does not model either.
+        if running <= 0 || zdrop > 0 && best_score - running > zdrop {
+            return None;
+        }
+        pos = end + 1;
     }
     Some(ExtendResult {
         score: best_score,
@@ -6155,6 +6164,95 @@ mod mismatch_scan_tests {
                 super::mismatch_scan(&q, &t, x, 128),
                 reference(&q, &t, x, 128),
                 "n={n} x={x}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod ungapped_walk_tests {
+    use bwa_extend::{ExtendJob, ExtendResult};
+
+    /// The column-by-column walk `ungapped_hit` replaced, kept as its reference.
+    fn reference(job: &ExtendJob, a: i32, b: i32, x: i32, zdrop: i32) -> Option<ExtendResult> {
+        let n = job.query.len();
+        if n == 0 || job.h0 <= 0 || job.target.len() < n || x < 0 {
+            return None;
+        }
+        let (bits, total) = super::mismatch_scan(&job.query[..n], &job.target[..n], x, 128)?;
+        if total == 0 {
+            let score = job.h0 + n as i32 * a;
+            let n = n as i32;
+            return Some(ExtendResult {
+                score,
+                qle: n,
+                tle: n,
+                gtle: n,
+                gscore: score,
+                max_off: 0,
+            });
+        }
+        if n > 128 {
+            return None;
+        }
+        let (mut running, mut best, mut best_end) = (job.h0, job.h0, 0i32);
+        for col in 0..n {
+            if running == 0 {
+                continue;
+            }
+            if bits >> col & 1 == 0 {
+                running += a;
+            } else {
+                running = (running - b).max(0);
+            }
+            if running > best {
+                best = running;
+                best_end = col as i32 + 1;
+            } else if zdrop > 0 && best - running > zdrop {
+                return None;
+            }
+        }
+        (running != 0).then_some(ExtendResult {
+            score: best,
+            qle: best_end,
+            tle: best_end,
+            gtle: n as i32,
+            gscore: running,
+            max_off: 0,
+        })
+    }
+
+    #[test]
+    fn ungapped_walk_equals_the_column_loop() {
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |m: u64| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st % m
+        };
+        for _ in 0..200_000 {
+            let n = rnd(160) as usize;
+            let q: Vec<u8> = (0..n).map(|_| rnd(4) as u8).collect();
+            let mut t = q.clone();
+            for _ in 0..rnd(6) {
+                if n > 0 {
+                    let i = rnd(n as u64) as usize;
+                    t[i] = rnd(4) as u8;
+                }
+            }
+            t.extend((0..rnd(3)).map(|_| rnd(4) as u8));
+            let job = ExtendJob {
+                query: &q,
+                target: &t,
+                h0: rnd(30) as i32,
+            };
+            let (a, b) = (1 + rnd(2) as i32, 1 + rnd(5) as i32);
+            let (x, zdrop) = (rnd(6) as i32, rnd(12) as i32);
+            assert_eq!(
+                super::ungapped_hit(&job, a, b, x, zdrop),
+                reference(&job, a, b, x, zdrop),
+                "n={n} a={a} b={b} x={x} zdrop={zdrop}"
             );
         }
     }
