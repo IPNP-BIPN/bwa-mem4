@@ -1677,15 +1677,63 @@ fn default_result() -> ExtendResult {
     }
 }
 
+/// Bytes of slack a staging area needs past its last row: [`stage_row`]'s zero stores may run up to
+/// 15 bytes past `at + len`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const STAGE_SLACK: usize = 16;
+
 /// One lane-major staging row of `fill_soa`: `seq` (none for a lane past the jobs) then zeros, up
-/// to `len`, each byte written once.
+/// to `len`, in 16-byte moves: as `copy_from_slice` + `fill` this was two libc calls per lane and
+/// sequence, ~150 bytes each. The zeros may spill up to 15 bytes past `at + len`, into the next
+/// row (staged after this one) or the area's [`STAGE_SLACK`].
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn stage_row(st: &mut [u8], at: usize, len: usize, seq: Option<&[u8]>) {
-    let row = &mut st[at..at + len];
+    type V = [u8; 16];
     let seq = seq.unwrap_or(&[]);
-    row[..seq.len()].copy_from_slice(seq);
-    row[seq.len()..].fill(0);
+    let n = seq.len();
+    assert!(n <= len && at + len + STAGE_SLACK <= st.len());
+    // SAFETY: reads stay inside `seq`; writes stay below `at + len + 15`, in bounds by the assert.
+    unsafe {
+        let (d, s) = (st.as_mut_ptr().add(at), seq.as_ptr());
+        let mut i = 0;
+        while i + 16 <= n {
+            d.add(i)
+                .cast::<V>()
+                .write_unaligned(s.add(i).cast::<V>().read_unaligned());
+            i += 16;
+        }
+        if i < n {
+            if n >= 16 {
+                // The last 16 bytes, overlapping ones already copied.
+                d.add(n - 16)
+                    .cast::<V>()
+                    .write_unaligned(s.add(n - 16).cast::<V>().read_unaligned());
+            } else if n >= 8 {
+                d.cast::<u64>()
+                    .write_unaligned(s.cast::<u64>().read_unaligned());
+                d.add(n - 8)
+                    .cast::<u64>()
+                    .write_unaligned(s.add(n - 8).cast::<u64>().read_unaligned());
+            } else if n >= 4 {
+                d.cast::<u32>()
+                    .write_unaligned(s.cast::<u32>().read_unaligned());
+                d.add(n - 4)
+                    .cast::<u32>()
+                    .write_unaligned(s.add(n - 4).cast::<u32>().read_unaligned());
+            } else {
+                // 1 to 3 bytes: first, middle and last cover them (a loop here became a memcpy).
+                for k in [0, n / 2, n - 1] {
+                    *d.add(k) = *s.add(k);
+                }
+            }
+        }
+        let mut z = n;
+        while z < len {
+            d.add(z).cast::<V>().write_unaligned([0; 16]);
+            z += 16;
+        }
+    }
 }
 
 /// A buffer whose slice starts on a 64-byte boundary, so a vector at a multiple of its own width
@@ -3525,8 +3573,8 @@ pub(crate) mod x86_row {
         let stride = cols.max(rows);
         STAGE.with(|st| {
             let st = &mut *st.borrow_mut();
-            if st.len() < 16 * stride {
-                st.resize(16 * stride, 0);
+            if st.len() < 16 * stride + super::STAGE_SLACK {
+                st.resize(16 * stride + super::STAGE_SLACK, 0);
             }
             for blk in 0..N / 16 {
                 let js = jobs.get(blk * 16..).unwrap_or(&[]);
@@ -3592,6 +3640,30 @@ pub(crate) mod x86_row {
             }
             assert_eq!(q, q0);
             assert_eq!(t, t0);
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod stage_row_tests {
+    /// Every sequence length up to 40 against `copy_from_slice` + `fill`, rows staged in order
+    /// with no gap between them, so a row's spilled zeros must be overwritten by the next.
+    #[test]
+    fn stage_row_matches_copy_and_fill() {
+        let len = 48;
+        for n in 0..=40usize {
+            let seq: Vec<u8> = (0..n).map(|k| (k % 5) as u8 + 1).collect();
+            let mut st = vec![0xAAu8; 3 * len + super::STAGE_SLACK];
+            let mut want = st.clone();
+            for row in 0..3 {
+                let s = (row != 1).then_some(&seq[..]);
+                super::stage_row(&mut st, row * len, len, s);
+                let w = &mut want[row * len..(row + 1) * len];
+                let s = s.unwrap_or(&[]);
+                w[..s.len()].copy_from_slice(s);
+                w[s.len()..].fill(0);
+            }
+            assert_eq!(st[..3 * len], want[..3 * len], "n = {n}");
         }
     }
 }
@@ -3993,8 +4065,8 @@ mod neon_row {
         let stride = cols.max(rows);
         STAGE.with(|st| {
             let st = &mut *st.borrow_mut();
-            if st.len() < 16 * stride {
-                st.resize(16 * stride, 0);
+            if st.len() < 16 * stride + super::STAGE_SLACK {
+                st.resize(16 * stride + super::STAGE_SLACK, 0);
             }
             for l in 0..16 {
                 super::stage_row(st, l * stride, cols, jobs.get(l).map(|j| j.query));
