@@ -179,8 +179,8 @@ fn chn_end(c: &MemChain) -> i32 {
 ///   `opt.max_chain_gap` (bases, default 10000) are read here. Supplied by the CLI/`MemOpt::default`.
 /// - `l_pac`: forward-strand reference length in bases, from `BntSeq::l_pac`. It is the boundary of
 ///   the 2L space: a reference position `< l_pac` is forward strand, `>= l_pac` is reverse.
-/// - `c`: the one candidate chain, mutated in place (a seed is pushed onto `c.seeds` on acceptance).
-///   Its `seeds` is non-empty and ascending in `qbeg`; `c.pos` is NOT updated by this function.
+/// - `c`: the one candidate chain's [`Ends`]; on acceptance its last seed becomes `p` (the caller
+///   then pushes `p` onto the chain's `seeds`, which are non-empty and ascending in `qbeg`).
 /// - `p`: the seed being offered. `p.qbeg` is a 0-based READ offset, `p.rbeg` a REFERENCE position in
 ///   2L space, `p.len` a length in bases. Precondition from the caller's sweep: `p.qbeg` is >= the
 ///   `qbeg` of every seed already in `c` (SMEMs are visited in ascending `m`).
@@ -188,50 +188,100 @@ fn chn_end(c: &MemChain) -> i32 {
 ///   has already dropped negative rids (boundary-straddling seeds).
 ///
 /// # Returns
-/// `true` if the caller must NOT start a new chain for `p` (either appended, or already contained and
-/// therefore discarded); `false` if the chain refuses it.
+/// [`Merge::Appended`] or [`Merge::Contained`] if the caller must NOT start a new chain for `p`
+/// (appended, or already contained and therefore discarded); [`Merge::Refused`] otherwise.
 ///
 /// `l_pac`: forward-strand length in bases, from `BntSeq::l_pac`.
-fn test_and_merge(opt: &MemOpt, l_pac: i64, c: &mut MemChain, p: &MemSeed, seed_rid: i32) -> bool {
+fn test_and_merge(opt: &MemOpt, l_pac: i64, c: &mut Ends, p: &MemSeed, seed_rid: i32) -> Merge {
     // The chain's current frontier: the seed appended most recently, hence the largest `qbeg`.
-    let last = *c.seeds.last().unwrap();
+    let last = c.last;
     // End of that frontier seed, exclusive. `qend` is a READ offset, `rend` a 2L-space REFERENCE
     // position. They are the upper bounds of the chain's span used by the containment test below.
     let qend = last.qbeg + last.len;
     let rend = last.rbeg + i64::from(last.len);
 
-    if seed_rid != c.rid {
-        return false;
-    }
-    if p.qbeg >= c.seeds[0].qbeg
-        && p.qbeg + p.len <= qend
-        && p.rbeg >= c.seeds[0].rbeg
-        && p.rbeg + i64::from(p.len) <= rend
-    {
-        return true; // contained
-    }
-    if (last.rbeg < l_pac || c.seeds[0].rbeg < l_pac) && p.rbeg >= l_pac {
-        return false; // different strand
-    }
+    // Every test is evaluated (`&`, not `&&`) and only the verdict branches: each short-circuit
+    // was a data-dependent branch, and their mispredicts were the chain sweep's hottest samples.
+    // The order of the C's tests survives in how they combine: another contig refuses first, then
+    // containment wins over the strand and distance tests.
+    let same_rid = seed_rid == c.rid;
+    let contained = (p.qbeg >= c.qbeg0)
+        & (p.qbeg + p.len <= qend)
+        & (p.rbeg >= c.rbeg0)
+        & (p.rbeg + i64::from(p.len) <= rend);
+    let other_strand = ((last.rbeg < l_pac) | (c.rbeg0 < l_pac)) & (p.rbeg >= l_pac);
     // `x` = QUERY gap in bases from the frontier seed's start to the new seed's start. Non-negative
     // by construction (seeds arrive in ascending `qbeg`), which is why only `y` is sign-tested.
-    // `y` = REFERENCE gap in bases between the same two starts, both in 2L space, so the subtraction
-    // is well defined only because the strand test above already rejected a forward/reverse mix.
+    // `y` = REFERENCE gap in bases between the same two starts, both in 2L space, meaningful only
+    // on one strand, which `other_strand` vetoes.
     // `x - y` is the DIAGONAL drift between the two seeds (a third coordinate space: reference minus
     // query). Zero means perfectly collinear; non-zero means an indel of that many bases. `opt.w`
     // caps |drift|, and `max_chain_gap` caps each gap measured beyond the frontier seed's end.
     let x = i64::from(p.qbeg - last.qbeg);
     let y = p.rbeg - last.rbeg;
-    if y >= 0
-        && x - y <= i64::from(opt.w)
-        && y - x <= i64::from(opt.w)
-        && x - i64::from(last.len) < i64::from(opt.max_chain_gap)
-        && y - i64::from(last.len) < i64::from(opt.max_chain_gap)
-    {
-        c.seeds.push(*p);
-        return true;
+    let (w, gap) = (i64::from(opt.w), i64::from(opt.max_chain_gap));
+    let near = (y >= 0)
+        & (x - y <= w)
+        & (y - x <= w)
+        & (x - i64::from(last.len) < gap)
+        & (y - i64::from(last.len) < gap);
+    match u8::from(same_rid) * (u8::from(contained) | u8::from(near & !other_strand) << 1) {
+        0 => Merge::Refused,
+        1 | 3 => Merge::Contained,
+        _ => {
+            c.last = Last {
+                rbeg: p.rbeg,
+                qbeg: p.qbeg,
+                len: p.len,
+            };
+            Merge::Appended
+        }
     }
-    false
+}
+
+/// [`test_and_merge`]'s verdict on one seed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Merge {
+    /// Not this chain's: the caller may open a new one.
+    Refused,
+    /// Already inside the chain's span: dropped.
+    Contained,
+    /// Extends the chain: the caller pushes it onto the chain's seeds.
+    Appended,
+}
+
+/// The fields of a chain's last seed [`test_and_merge`] reads.
+#[derive(Clone, Copy)]
+struct Last {
+    rbeg: i64,
+    qbeg: i32,
+    len: i32,
+}
+
+/// What [`test_and_merge`] reads of a chain, 32 bytes beside the chains: its contig and first and
+/// last seeds. Reading the chain and then its seeds on the heap was two cache misses per offered
+/// seed on repeat reads (the chain sweep's hottest lines).
+#[derive(Clone, Copy)]
+struct Ends {
+    rbeg0: i64,
+    last: Last,
+    rid: i32,
+    qbeg0: i32,
+}
+
+impl Ends {
+    fn new(rid: i32, s: &MemSeed) -> Self {
+        Ends {
+            rbeg0: s.rbeg,
+            last: Last {
+                rbeg: s.rbeg,
+                qbeg: s.qbeg,
+                len: s.len,
+            },
+            rid,
+            qbeg0: s.qbeg,
+        }
+    }
 }
 
 /// Chain weight = min of non-overlapping query and reference coverage, in bases. Port of
@@ -879,6 +929,9 @@ fn chain_seeds(
     let mut chains: Vec<MemChain> = Vec::new();
     let mut tree = crate::kbtree::KbTree::new();
     let mut keys: Vec<u64> = Vec::new();
+    // `ends[i]` is `chains[i]`'s; the allocation is the thread's, kept between reads.
+    let mut ends = ENDS.take();
+    ends.clear();
     let ci_mask = (1u64 << FLAT_CI_BITS) - 1;
     let mut pos_cursor = 0usize;
     for (smem_index, smem) in smems.iter().enumerate() {
@@ -905,8 +958,13 @@ fn chain_seeds(
                 (tree.lower(rbeg), 0)
             };
             if let Some(chain_index) = lower {
-                if test_and_merge(opt, l_pac, &mut chains[chain_index], &seed, rid) {
-                    continue;
+                match test_and_merge(opt, l_pac, &mut ends[chain_index], &seed, rid) {
+                    Merge::Appended => {
+                        chains[chain_index].seeds.push(seed);
+                        continue;
+                    }
+                    Merge::Contained => continue,
+                    Merge::Refused => {}
                 }
             }
             if flat
@@ -914,6 +972,7 @@ fn chain_seeds(
                     || chains.len() >= FLAT_CAP
                     || !(0..1i64 << (63 - FLAT_CI_BITS)).contains(&rbeg))
             {
+                ENDS.set(ends);
                 return None;
             }
             // Slot the new chain will occupy in `chains`, and the payload stored in the index.
@@ -932,6 +991,7 @@ fn chain_seeds(
                 seeds: vec![seed],
             };
             chains.push(chain);
+            ends.push(Ends::new(rid, &seed));
             if flat {
                 keys.insert(rank, (rbeg as u64) << FLAT_CI_BITS | idx as u64);
             } else {
@@ -944,12 +1004,18 @@ fn chain_seeds(
             }
         }
     }
+    ENDS.set(ends);
     let order = if flat {
         keys.iter().map(|&k| (k & ci_mask) as usize).collect()
     } else {
         tree.in_order()
     };
     Some((chains, order))
+}
+
+thread_local! {
+    /// [`chain_seeds`]'s [`Ends`], kept for the allocation.
+    static ENDS: std::cell::Cell<Vec<Ends>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
 /// The chain merge, given SMEMs already sorted by [`sa_positions_for_read`] and their occurrence
