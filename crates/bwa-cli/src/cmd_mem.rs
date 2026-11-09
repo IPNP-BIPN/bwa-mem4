@@ -2309,8 +2309,6 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_neon::batched::bin_split::dump();
         bwa_mem::across::align_split::dump();
         bwa_mem::seed_stats_dump();
-        bwa_mem::pe::rescue_rounds::dump();
-        bwa_mem::pe::rescue_rounds::dump_clusters();
         bwa_mem::primary::dedup_shape::dump();
         bwa_mem::pe::anchor_spread::dump();
         bwa_chain::chain_time::dump();

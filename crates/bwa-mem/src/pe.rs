@@ -571,6 +571,7 @@ fn mem_matesw(
 /// One insert-consistent orientation's mate-rescue local-SW job (built by [`matesw_collect`]): the
 /// mate `query` in this orientation vs the `target` window, plus the coordinates needed to place the
 /// hit ([`matesw_apply`]).
+#[derive(Clone, Copy)]
 struct Orient {
     /// The fetched reference window, already clamped to the anchor's contig by `bns_fetch_seq`:
     /// its `(offset, length)` in the round's arena. The mate in this orientation is `ms` as
@@ -596,6 +597,7 @@ pub(crate) struct Anchor {
     is_alt: bool,
 }
 
+#[derive(Clone, Copy)]
 struct RescueCall {
     /// `skip[r] != 0` means orientation `r` runs no SW. `matesw_apply` re-walks this so its
     /// per-orientation dedup fires on exactly the same iterations as the C's loop.
@@ -896,6 +898,39 @@ fn prefetch_windows(fm: &FmIndex, l_pac: i64, pes: &[PeStat; 4], a: &Anchor, ms:
     }
 }
 
+/// The orientations `r` that need no rescue for an anchor at `a_rb`: `pes[r]` failed, or some
+/// region of `ma` already sits at a proper-pair distance of the anchor in that orientation.
+fn skip_set(
+    view: &mut RegionView,
+    ma: &[MemAlnReg],
+    l_pac: i64,
+    a_rb: i64,
+    pes: &[PeStat; 4],
+) -> [i32; 4] {
+    let mut skip = [0i32; 4];
+    for (r, skip_r) in skip.iter_mut().enumerate() {
+        *skip_r = i32::from(pes[r].failed);
+    }
+    let t_skip = crate::rescue_split::start();
+    if view.ensure(ma) {
+        skip_from_view(view, l_pac, a_rb, pes, &mut skip);
+    } else {
+        for existing in ma.iter() {
+            let (r, dist) = mem_infer_dir(l_pac, a_rb, existing.rb);
+            if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
+                skip[r] = 1;
+            }
+        }
+    }
+    if t_skip.is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::rescue_split::COLLECT_CALLS.fetch_add(1, Relaxed);
+        crate::rescue_split::COLLECT_SKIP_ROWS.fetch_add(ma.len() as u64, Relaxed);
+    }
+    crate::rescue_split::stop(&crate::rescue_split::COLLECT_SKIP_NS, t_skip);
+    skip
+}
+
 #[allow(clippy::too_many_arguments)]
 fn matesw_collect(
     fm: &FmIndex,
@@ -913,27 +948,7 @@ fn matesw_collect(
     // coordinates. `skip[r] != 0`: orientation `r` needs no rescue (failed, or already paired).
     let l_pac = bns.l_pac;
     let l_ms = ms.len() as i64;
-    let mut skip = [0i32; 4];
-    for (r, skip_r) in skip.iter_mut().enumerate() {
-        *skip_r = i32::from(pes[r].failed);
-    }
-    let t_skip = crate::rescue_split::start();
-    if view.ensure(ma) {
-        skip_from_view(view, l_pac, a.rb, pes, &mut skip);
-    } else {
-        for existing in ma.iter() {
-            let (r, dist) = mem_infer_dir(l_pac, a.rb, existing.rb);
-            if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
-                skip[r] = 1;
-            }
-        }
-    }
-    if t_skip.is_some() {
-        use std::sync::atomic::Ordering::Relaxed;
-        crate::rescue_split::COLLECT_CALLS.fetch_add(1, Relaxed);
-        crate::rescue_split::COLLECT_SKIP_ROWS.fetch_add(ma.len() as u64, Relaxed);
-    }
-    crate::rescue_split::stop(&crate::rescue_split::COLLECT_SKIP_NS, t_skip);
+    let skip = skip_set(view, ma, l_pac, a.rb, pes);
     if skip.iter().sum::<i32>() == 4 {
         return None;
     }
@@ -1211,279 +1226,27 @@ pub struct PairRescueData<'a> {
     pub a1: &'a mut Vec<MemAlnReg>,
 }
 
-/// `BWA4_RESCUE_ROUNDS=1` probe: is the per-ROUND batching starving the rescue kernel's SIMD lanes?
-///
-/// [`batch_mate_rescue`] issues ONE [`batched_mate_rescue`] call per round, and a round only holds the
-/// pairs whose anchor list is still that deep. Round 0 batches every pair; round 20 batches only the
-/// few with 20+ anchors. `fg-labs/bwa-mem3` instead flattens every (pair, anchor) into a single array
-/// and calls its kernel once (`mem_sam_pe_batch_pre`, `bwamem_pair.cpp:733-745`), which cannot empty
-/// out that way -- and which it can afford because it is not byte-identical to bwa-mem2, whereas our
-/// rounds exist precisely to reproduce the C's insertion order.
-///
-/// Whether that costs us anything depends on a number nobody has measured: the DISTRIBUTION of jobs
-/// per kernel call. A round carrying 4 jobs wastes 12 of a NEON u8 kernel's 16 lanes; a round carrying
-/// 400 wastes nothing. This records that histogram, and the round index each call came from, so the
-/// waste can be computed rather than assumed.
-///
-/// It also explains why this never showed up before: on wgsim, anchor lists are shallow, so there are
-/// one or two rounds and the flattening would buy nothing. `docs/perf-levers.md` has the measurement
-/// of how badly that read set understates this stage.
-///
-/// Counters are relaxed atomics on a per-KERNEL-CALL path (not per job, not per read), so the probe
-/// costs one fetch-add per SW batch. Still gated: `enabled()` is checked before any of them is touched.
-pub mod rescue_rounds {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-
-    /// Upper edges of the jobs-per-call histogram buckets. Chosen around the kernel's lane counts:
-    /// NEON runs 16 lanes at u8 and 8 at i16, AVX-512 runs 64 and 32, so a call under 16 jobs is
-    /// leaving lanes idle on every ISA we ship, and one under 64 is leaving them idle on AVX-512.
-    pub const EDGES: [u64; 8] = [3, 7, 15, 31, 63, 127, 511, u64::MAX];
-    /// Number of kernel calls whose job count fell in each bucket.
-    pub static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-    /// Number of JOBS in the calls of each bucket, so the histogram can be weighted by work rather
-    /// than by call count (a thousand 2-job calls matter less than one 100k-job call).
-    pub static JOBS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-    /// Jobs issued from round 0 only, i.e. the part that flattening could not improve.
-    pub static ROUND0_JOBS: AtomicU64 = AtomicU64::new(0);
-    /// Sum of `max_rounds` over every chunk, and the chunk count, giving the mean round depth.
-    pub static ROUNDS_SUM: AtomicU64 = AtomicU64::new(0);
-    /// Largest `max_rounds` seen, i.e. how deep the deepest anchor list in any chunk went.
-    pub static ROUNDS_MAX: AtomicU64 = AtomicU64::new(0);
-    /// Chunks processed, the denominator for `ROUNDS_SUM`.
-    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
-
-    /// Whether `BWA4_RESCUE_ROUNDS` is set. Read once and cached, like every other probe here.
-    pub fn enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_ROUNDS").is_some())
-    }
-
-    /// Record one kernel call carrying `n_jobs` jobs, issued from round `round`.
-    pub fn record_call(round: usize, n_jobs: usize) {
-        if !enabled() {
-            return;
-        }
-        let n = n_jobs as u64;
-        // First bucket whose upper edge the count fits under; the last edge is `u64::MAX`, so this
-        // always finds one.
-        let b = EDGES
-            .iter()
-            .position(|&e| n <= e)
-            .unwrap_or(EDGES.len() - 1);
-        CALLS[b].fetch_add(1, Ordering::Relaxed);
-        JOBS[b].fetch_add(n, Ordering::Relaxed);
-        if round == 0 {
-            ROUND0_JOBS.fetch_add(n, Ordering::Relaxed);
-        }
-    }
-
-    /// Rescue windows seen, and rows the kernel actually walked for them.
-    pub static WIN_COUNT: AtomicU64 = AtomicU64::new(0);
-    pub static WIN_ROWS: AtomicU64 = AtomicU64::new(0);
-    /// Rows a window-sharing kernel would walk instead: per overlap cluster, `W + A * T_BOUND`.
-    pub static SHARED_ROWS: AtomicU64 = AtomicU64::new(0);
-    /// Overlap clusters, and the histogram of their size `A` (windows per cluster).
-    pub static CLUSTERS: AtomicU64 = AtomicU64::new(0);
-    pub static CLUSTER_A: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-    /// Windows lying in a cluster of each size, so the histogram can be weighted by work.
-    pub static CLUSTER_A_WIN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-    pub static CLUSTER_A_MAX: AtomicU64 = AtomicU64::new(0);
-    /// The same two totals restricted to clusters of `A >= 2`, i.e. the only ones a shared DP could
-    /// help. Singletons are left on today's path in that accounting.
-    pub static WIN_ROWS_MULTI: AtomicU64 = AtomicU64::new(0);
-    pub static SHARED_ROWS_MULTI: AtomicU64 = AtomicU64::new(0);
-
-    /// Upper edges of the cluster-size histogram: 1, 2-3, 4-7, 8-15, 16-31, 32+.
-    pub const A_EDGES: [u64; 6] = [1, 3, 7, 15, 31, u64::MAX];
-
-    /// The alignment-span bound of issue #50: an alignment reaching `minsc` cannot span more than
-    /// this many target rows under bwa's defaults. Used here only to price the counterfactual, never
-    /// to truncate anything.
-    pub const T_BOUND: u64 = 271;
-
-    /// Whether `BWA4_RESCUE_CLUSTER` is set. Read once and cached.
-    pub fn cluster_enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_CLUSTER").is_some())
-    }
-
-    /// Record one kernel call's rescue windows as `(rid, begin, end)` on the reference, and price
-    /// the window-sharing counterfactual of issue #50B against them.
-    ///
-    /// Windows are clustered by overlap on the same contig: sorted by `(rid, begin)`, a window joins
-    /// the running cluster when it starts at or before the cluster's current end. For a cluster of
-    /// `A` windows spanning `W` reference bases, today's kernel walks the sum of the windows' own
-    /// lengths, while a shared-DP kernel would walk `W + A * T_BOUND` rows. The ratio of the two
-    /// totals is the ceiling on what #50B could win, before any implementation cost.
-    pub fn record_windows(win: &mut Vec<(i32, i64, i64)>) {
-        if !cluster_enabled() || win.is_empty() {
-            return;
-        }
-        win.sort_unstable();
-        WIN_COUNT.fetch_add(win.len() as u64, Ordering::Relaxed);
-        WIN_ROWS.fetch_add(
-            win.iter().map(|&(_, b, e)| (e - b).max(0) as u64).sum(),
-            Ordering::Relaxed,
-        );
-        let (mut c_rid, mut c_beg, mut c_end, mut c_a) = (win[0].0, win[0].1, win[0].2, 0u64);
-        let mut c_rows = 0u64;
-        let flush = |rid: i32, beg: i64, end: i64, a: u64, rows: u64| {
-            let _ = rid;
-            CLUSTERS.fetch_add(1, Ordering::Relaxed);
-            let shared = (end - beg).max(0) as u64 + a * T_BOUND;
-            SHARED_ROWS.fetch_add(shared, Ordering::Relaxed);
-            if a >= 2 {
-                WIN_ROWS_MULTI.fetch_add(rows, Ordering::Relaxed);
-                SHARED_ROWS_MULTI.fetch_add(shared, Ordering::Relaxed);
-            }
-            let b = A_EDGES.iter().position(|&e| a <= e).unwrap_or(5);
-            CLUSTER_A[b].fetch_add(1, Ordering::Relaxed);
-            CLUSTER_A_WIN[b].fetch_add(a, Ordering::Relaxed);
-            CLUSTER_A_MAX.fetch_max(a, Ordering::Relaxed);
-        };
-        for &(rid, beg, end) in win.iter() {
-            if rid == c_rid && beg <= c_end {
-                c_end = c_end.max(end);
-                c_a += 1;
-                c_rows += (end - beg).max(0) as u64;
-            } else {
-                flush(c_rid, c_beg, c_end, c_a, c_rows);
-                c_rid = rid;
-                c_beg = beg;
-                c_end = end;
-                c_a = 1;
-                c_rows = (end - beg).max(0) as u64;
-            }
-        }
-        flush(c_rid, c_beg, c_end, c_a, c_rows);
-    }
-
-    /// Print the clustering result, once, after the workers have joined. No-op unless enabled.
-    pub fn dump_clusters() {
-        if !cluster_enabled() {
-            return;
-        }
-        let (w, rows, shared, cl) = (
-            WIN_COUNT.load(Ordering::Relaxed),
-            WIN_ROWS.load(Ordering::Relaxed),
-            SHARED_ROWS.load(Ordering::Relaxed),
-            CLUSTERS.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "[rescue-cluster] {w} windows in {cl} overlap clusters, mean A = {:.2}, largest A = {}",
-            w as f64 / cl.max(1) as f64,
-            CLUSTER_A_MAX.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "[rescue-cluster] rows walked {rows}, shared-DP counterfactual {shared} \
-             (W + A*{T_BOUND} per cluster) -> {:.2}x",
-            rows as f64 / shared.max(1) as f64
-        );
-        let (rm, sm) = (
-            WIN_ROWS_MULTI.load(Ordering::Relaxed),
-            SHARED_ROWS_MULTI.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "[rescue-cluster] restricted to A >= 2 clusters: rows {rm} ({:.1}% of all), shared {sm} \
-             -> whole-kernel rows {:.4}x",
-            100.0 * rm as f64 / rows.max(1) as f64,
-            rows as f64 / (rows - rm + sm).max(1) as f64
-        );
-        eprintln!(
-            "[rescue-cluster] {:>10}  {:>10}  {:>12}  {:>7}",
-            "A", "clusters", "windows", "%_win"
-        );
-        let mut lo = 1u64;
-        for b in 0..A_EDGES.len() {
-            let (c, j) = (
-                CLUSTER_A[b].load(Ordering::Relaxed),
-                CLUSTER_A_WIN[b].load(Ordering::Relaxed),
-            );
-            let label = if A_EDGES[b] == u64::MAX {
-                format!("{lo}+")
-            } else if A_EDGES[b] == lo {
-                format!("{lo}")
-            } else {
-                format!("{lo}-{}", A_EDGES[b])
-            };
-            if c != 0 {
-                eprintln!(
-                    "[rescue-cluster] {label:>10}  {c:>10}  {j:>12}  {:>6.1}%",
-                    100.0 * j as f64 / w.max(1) as f64
-                );
-            }
-            lo = A_EDGES[b].saturating_add(1);
-        }
-    }
-
-    /// Record one chunk's round depth.
-    pub fn record_chunk(max_rounds: usize) {
-        if !enabled() {
-            return;
-        }
-        CHUNKS.fetch_add(1, Ordering::Relaxed);
-        ROUNDS_SUM.fetch_add(max_rounds as u64, Ordering::Relaxed);
-        ROUNDS_MAX.fetch_max(max_rounds as u64, Ordering::Relaxed);
-    }
-
-    /// Print the histogram to stderr once, after the worker threads have joined. No-op unless enabled.
-    pub fn dump() {
-        if !enabled() {
-            return;
-        }
-        let total_jobs: u64 = JOBS.iter().map(|j| j.load(Ordering::Relaxed)).sum();
-        let total_calls: u64 = CALLS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        let chunks = CHUNKS.load(Ordering::Relaxed).max(1);
-        eprintln!(
-            "[rescue-rounds] {total_calls} kernel calls, {total_jobs} jobs, {chunks} chunks, \
-             mean max_rounds {:.1}, deepest {}",
-            ROUNDS_SUM.load(Ordering::Relaxed) as f64 / chunks as f64,
-            ROUNDS_MAX.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "[rescue-rounds] round 0 carries {} of {} jobs ({:.1}%); the rest is what flattening could refill",
-            ROUND0_JOBS.load(Ordering::Relaxed),
-            total_jobs,
-            100.0 * ROUND0_JOBS.load(Ordering::Relaxed) as f64 / total_jobs.max(1) as f64,
-        );
-        eprintln!(
-            "[rescue-rounds] {:>12}  {:>10}  {:>12}  {:>7}",
-            "jobs/call", "calls", "jobs", "%_jobs"
-        );
-        // Running label for each bucket, e.g. "8-15".
-        let mut lo = 1u64;
-        for b in 0..EDGES.len() {
-            let (c, j) = (
-                CALLS[b].load(Ordering::Relaxed),
-                JOBS[b].load(Ordering::Relaxed),
-            );
-            let label = if EDGES[b] == u64::MAX {
-                format!("{lo}+")
-            } else {
-                format!("{lo}-{}", EDGES[b])
-            };
-            if c != 0 {
-                eprintln!(
-                    "[rescue-rounds] {label:>12}  {c:>10}  {j:>12}  {:>6.1}%",
-                    100.0 * j as f64 / total_jobs.max(1) as f64
-                );
-            }
-            lo = EDGES[b].saturating_add(1);
-        }
-    }
-}
-
 /// Batched mate rescue across a whole pair batch: identical to running [`mem_matesw`] inside each
-/// pair's `mem_sam_pe`, but every anchor's insert-window SW (across all pairs) runs in one vectorized
-/// [`batched_mate_rescue`], filling the SIMD lanes that a single pair's <=4 orientations cannot.
+/// pair's `mem_sam_pe`, but the insert-window SWs of many pairs' anchors run in one vectorized
+/// [`batched_mate_rescue`] call, filling the SIMD lanes that a single pair's <=4 orientations cannot.
 ///
-/// bwa-mem2's rescue snapshots each read's near-best regions as anchors (before any rescue), then, per
-/// anchor, SW-rescues the mate in each missing orientation. Anchors of one read against one mate are
-/// applied in order (later anchors' `skip` sees earlier inserts), so this proceeds in **rounds**: round
-/// `k` collects the `k`-th anchor of every (pair, direction), batches their SW, then applies, keeping
-/// the per-array insertion order byte-identical to the per-pair path. The two directions target
-/// disjoint arrays (`a1` vs `a0`), and different pairs are independent, so a round batches freely.
+/// bwa-mem2's rescue snapshots each read's near-best regions as anchors (before any rescue), then,
+/// per anchor in order, SW-rescues the mate in each orientation that `skip` (a mate region already
+/// at a proper-pair distance) leaves open. Later anchors' `skip` sees earlier anchors' inserts. This
+/// runs bwa-mem2's own batched shape (`mem_sam_pe_batch_pre` / `_post`), per block of pairs:
+/// 1. collect: every anchor of every pair in the block, `skip` read from the mate's list as it was
+///    before any rescue;
+/// 2. one kernel call for the whole block, identical windows of one (pair, direction) computed once;
+/// 3. apply, anchor by anchor in bwa's order: `skip` is read again from the CURRENT list, and the
+///    orientations it now closes drop their result. Skip sets only grow with inserts, so a job is
+///    never missing; when a dedup removed a region and reopened an orientation, the anchor is
+///    collected and computed again on the spot, which is exactly the per-pair path.
+///
+/// Blocks hold whole pairs and about [`RESCUE_BLOCK_ANCHORS`] anchors: the one-call batch is what
+/// lets the K-mer filter reuse a mate's table across its anchors and the band kernel group jobs of
+/// like width, and the bound keeps the windows' arena small. The two directions target disjoint
+/// arrays (`a1` vs `a0`) and different pairs are independent, so only the per-(pair, direction)
+/// anchor order matters, and it is kept.
 ///
 /// PARAMETERS: `fm`/`bns` are the reference. `opt` supplies `max_matesw` (`-m`, the anchor cap),
 /// `pen_unpaired` (`-U`, doubling as the anchor score window) and the ksw scoring parameters. `pes`
@@ -1511,30 +1274,23 @@ pub fn batch_mate_rescue(
     let pen = opt.pen_unpaired;
 
     // Snapshot near-best anchors per (pair, direction), before any rescue. dir 0: read-1 anchors that
-    // rescue read 2 (`a1`); dir 1: read-2 anchors that rescue read 1 (`a0`).
-    //
-    // `anchors[pi][dir]`: pair `pi`'s anchor list for that direction, score-descending, at most
-    // `anchor_cap` long. Frozen here and never updated, which is what makes the rounds well defined:
-    // regions inserted by rescue must NOT themselves become anchors, and in bwa they cannot, because
-    // the C snapshots `b[i]` before its own anchor loop too.
-    // `max_rounds`: the longest anchor list seen, i.e. how many rounds the loop below needs.
+    // rescue read 2 (`a1`); dir 1: read-2 anchors that rescue read 1 (`a0`). `spans[pi][dir]` is
+    // that list's `(start, len)` in `anchors`, score-descending, at most `anchor_cap` long. Frozen
+    // here: regions inserted by rescue must NOT themselves become anchors, and in bwa they cannot,
+    // because the C snapshots `b[i]` before its own anchor loop too.
     let mut anchors: Vec<Anchor> = Vec::new();
     let mut spans: Vec<[(u32, u32); 2]> = Vec::with_capacity(pairs.len());
-    let mut max_rounds = 0usize;
     for p in pairs.iter() {
         // Each side is snapshotted on its own: bwa gates only on MEM_F_NO_RESCUE, never on both
-        // reads having regions. A read with no regions simply contributes no anchors -- but it is
-        // still the *rescue target* of the other read's anchors, which is exactly how an unmapped
-        // mate gets rescued. Requiring both sides non-empty leaves it unmapped.
+        // reads having regions. A read with no regions contributes no anchors but is still the
+        // rescue target of the other read's anchors, which is how an unmapped mate gets rescued.
         let mut near_best = |regs: &[MemAlnReg]| -> (u32, u32) {
             let start = anchors.len() as u32;
             let Some(best) = regs.first().map(|r| r.score) else {
                 return (start, 0);
             };
-            // bwa builds `b[i]` from the *whole* region vector and only then caps the anchor loop
-            // at `max_matesw`; taking `anchor_cap` during the filter is the same set because the
-            // vector is
-            // already sorted score-descending, so the near-best regions are a prefix.
+            // The vector is sorted score-descending, so the near-best regions are a prefix and
+            // capping during the filter keeps the same set as bwa's cap on the anchor loop.
             anchors.extend(
                 regs.iter()
                     .filter(|r| r.score >= best - pen)
@@ -1547,239 +1303,213 @@ pub fn batch_mate_rescue(
             );
             (start, anchors.len() as u32 - start)
         };
-        // `b0`/`b1`: this pair's read-1 and read-2 anchors (bwa's `b[0]`/`b[1]`), as `(start,
-        // len)` in `anchors`. Copied, not borrowed, because the arrays they came from are about
-        // to be mutated by rescue.
         let b0 = near_best(p.a0);
         let b1 = near_best(p.a1);
-        max_rounds = max_rounds.max(b0.1 as usize).max(b1.1 as usize);
         spans.push([b0, b1]);
     }
-
     anchor_spread::record(&anchors, &spans);
-    // The round's reference windows and reverse complements, back to back.
-    let mut arena: Vec<u8> = Vec::new();
 
-    // Round k processes the k-th anchor of every (pair, direction) that still has one. Pairs with
-    // fewer anchors simply drop out of later rounds; the loop count is the deepest anchor list.
-    rescue_rounds::record_chunk(max_rounds);
-    // Whether each pair's `[a1, a0]` is settled in the sense of `matesw_apply`, indexed by `dir`.
     let mut views: Vec<[RegionView; 2]> = (0..pairs.len()).map(|_| Default::default()).collect();
-    // Results of earlier rounds, found through `head` by (pair, dir, window length, mate orientation,
-    // window content hash) and chained through `Seen::next` when two share a key. Two anchors of one pair in identical repeat
-    // copies fetch byte-identical windows at different positions, one round apart; the job is then
-    // the same bytes (the query is that direction's mate), so the same window-relative result.
-    // Rounds run apart to keep bwa's insertion order, which is why the repeat is not adjacent as it
-    // would be in a flattened batch. A hash match is only a candidate: the earlier window is
-    // fetched again and compared byte for byte.
-    // One probe per job, not a walk over every earlier round of the slot.
+    // The block's windows and reverse-complemented mates, back to back.
+    let mut arena: Vec<u8> = Vec::new();
+    // The block's anchors in apply order, `(pair, dir, anchor index)`, and what collect made of each.
+    let mut todo: Vec<(u32, u8, u32)> = Vec::new();
+    let mut calls: Vec<Option<RescueCall>> = Vec::new();
+    // Per anchor, `(start, count)` in `job_of`; per collected orientation, its kernel job.
+    let mut call_jobs: Vec<(u32, u32)> = Vec::new();
+    let mut job_of: Vec<u32> = Vec::new();
+    let mut kept: Vec<KswAlignResult> = Vec::with_capacity(4);
+    // Identical windows of one (pair, direction): two anchors in identical repeat copies fetch the
+    // same bytes, and the query is that direction's mate, so the job is the same. Found through
+    // `head` by (pair, dir, length, orientation, window hash), chained through `Seen::next`; a hash
+    // match is only a candidate, confirmed byte for byte against the earlier window in the arena.
     let mut head: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<PassHash>> =
         Default::default();
     let mut seen: Vec<Seen> = Vec::new();
-    let mut refetch: Vec<u8> = Vec::new();
-    // (pair, dir, call); kept across rounds for its capacity.
-    let mut calls: Vec<(usize, usize, RescueCall)> = Vec::new();
-    // Pairs with an anchor left in this round or a later one, ascending: the rounds run to the
-    // deepest pair's anchor count, and most pairs are done long before.
-    let mut active: Vec<u32> = (0..pairs.len() as u32).collect();
-    for round in 0..max_rounds {
-        active.retain(|&pi| spans[pi as usize].iter().any(|sp| sp.1 as usize > round));
-        // Collect this round's rescue calls across all pairs and both directions.
-        // `calls`: every rescue this round will perform, tagged with the pair index and direction it
-        // must be applied back to. Order is (pair ascending, then dir), which is also the order the
-        // apply loop below walks, so inserts land in the same sequence as the per-pair path.
-        let t_collect = crate::rescue_split::start();
-        calls.clear();
-        arena.clear();
-        for (ai, &pi) in active.iter().enumerate() {
-            let (pi, p) = (pi as usize, &pairs[pi as usize]);
-            // The windows of the active pair two ahead are random DRAM misses: hint them now.
-            if let Some(&qi) = active.get(ai + 2) {
-                let (q, sp) = (&pairs[qi as usize], &spans[qi as usize]);
-                for (dir, ms) in [(0, q.seq1), (1, q.seq0)] {
-                    let (start, len) = sp[dir];
-                    if round < len as usize {
-                        prefetch_windows(fm, bns.l_pac, pes, &anchors[start as usize + round], ms);
-                    }
-                }
-            }
+    // dir 0 is bwa's `i = 0`: read-1 anchors, mate `s[!i]` = read 2.
+    fn mate<'a>(p: &PairRescueData<'a>, dir: usize) -> &'a [u8] {
+        if dir == 0 {
+            p.seq1
+        } else {
+            p.seq0
+        }
+    }
+
+    let block = rescue_block_anchors();
+    let mut p0 = 0usize;
+    while p0 < pairs.len() {
+        // Whole pairs, until the block holds `block` anchors.
+        todo.clear();
+        let mut p1 = p0;
+        while p1 < pairs.len() && todo.len() < block {
             for dir in 0..2 {
-                let (start, len) = spans[pi][dir];
-                if round >= len as usize {
-                    continue;
-                }
-                let anchor = anchors[start as usize + round];
-                // dir 0 is bwa's `i = 0`: read-1 anchors, mate `s[!i]` = read 2, target `a[!i]` = a1.
-                let (ms, target): (&[u8], &Vec<MemAlnReg>) = if dir == 0 {
-                    (p.seq1, p.a1)
-                } else {
-                    (p.seq0, p.a0)
-                };
-                if let Some(call) = matesw_collect(
+                todo.extend((0..spans[p1][dir].1).map(|k| (p1 as u32, dir as u8, k)));
+            }
+            p1 += 1;
+        }
+        let anchor_of = |&(pi, dir, k): &(u32, u8, u32)| -> &Anchor {
+            &anchors[(spans[pi as usize][dir as usize].0 + k) as usize]
+        };
+
+        // ---- 1. collect, against each mate list as it was before any rescue ----
+        let t_collect = crate::rescue_split::start();
+        arena.clear();
+        calls.clear();
+        for (t, at) in todo.iter().enumerate() {
+            // The windows two anchors ahead are random DRAM misses: hint them now.
+            if let Some(ahead) = todo.get(t + 2) {
+                let q = &pairs[ahead.0 as usize];
+                prefetch_windows(
                     fm,
-                    bns,
-                    opt,
+                    bns.l_pac,
                     pes,
-                    &anchor,
-                    ms,
-                    target,
-                    &mut views[pi][dir],
-                    &mut arena,
-                ) {
-                    calls.push((pi, dir, call));
-                }
+                    anchor_of(ahead),
+                    mate(q, ahead.1 as usize),
+                );
             }
-        }
-        if calls.is_empty() {
-            continue;
-        }
-        // Flatten every call's orientation jobs into one batch (spans map each call to its slice).
-        // `jobs`: every orientation's SW, from every call, in one flat batch.
-        // `spans[idx]`: `(start, count)` of call `idx`'s jobs within `jobs`, hence within `alns`.
-        // The two vectors are index-parallel with `calls`.
-        // Sized once: grown push by push, this was a realloc chain every round.
-        let n_orient: usize = calls
-            .iter()
-            .map(|c| c.2.per_r.iter().flatten().count())
-            .sum();
-        let mut jobs: Vec<KswJob> = Vec::with_capacity(n_orient);
-        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(calls.len());
-        // Per orientation of every call, in apply order: its kernel job (`Ok`) or an earlier
-        // round's result (`Err`); `keys[k]` is kernel job `k`'s list, length, orientation, hash and
-        // window start.
-        let mut src: Vec<Result<usize, KswAlignResult>> = Vec::with_capacity(n_orient);
-        let mut keys: Vec<(usize, u32, bool, u64, i64)> = Vec::with_capacity(n_orient);
-        for (pi, dir, call) in &calls {
-            let start = src.len();
-            let ms = if *dir == 0 {
-                pairs[*pi].seq1
-            } else {
-                pairs[*pi].seq0
-            };
-            for (job, o) in rescue_jobs(call, ms, &arena).zip(call.per_r.iter().flatten()) {
-                let slot = 2 * *pi + *dir;
-                let (len, h) = (o.target.1, window_hash(job.target));
-                let mut e = *head
-                    .get(&seen_key(slot, len, o.is_rev, h))
-                    .unwrap_or(&u32::MAX);
-                let mut hit = None;
-                while e != u32::MAX {
-                    let c = &seen[e as usize];
-                    if c.slot == slot as u32
-                        && c.len == len
-                        && c.is_rev == o.is_rev
-                        && c.hash == h
-                        && (c.rb == o.rb || {
-                            refetch.clear();
-                            bns_fetch_seq_into(
-                                fm,
-                                bns,
-                                c.rb,
-                                c.rb,
-                                c.rb + i64::from(len),
-                                &mut refetch,
-                            );
-                            refetch == job.target
-                        })
-                    {
-                        hit = Some(c.result);
-                        break;
-                    }
-                    e = c.next;
-                }
-                match hit {
-                    Some(r) => src.push(Err(r)),
-                    None => {
-                        src.push(Ok(jobs.len()));
-                        jobs.push(job);
-                        keys.push((slot, len, o.is_rev, h, o.rb));
-                    }
-                }
-            }
-            spans.push((start, src.len() - start));
-        }
-        // No `lanes` argument here, unlike the scalar [`mem_matesw`] call, which passes 16 or 8 from
-        // bwa's `l_ms * a < 250` KSW_XBYTE test. `batched_mate_rescue` instead bins jobs by length
-        // internally and its u8 kernel uses *unsigned* saturating lanes, so it covers scores in
-        // [128, 255] that bwa-mem2 would have routed to int16 (see the `define_sw_kernel!` u8
-        // instantiation in `bwa-neon/src/batched.rs`). The batched kernels are documented there as
-        // exact, i.e. width does not change the reported score, which is what makes dropping the
-        // explicit `lanes` safe. UNVERIFIED: that exactness is asserted by `bwa-neon`'s own docs and
-        // tests; it has not been re-derived here.
-        // The number this probe exists for: how many jobs this round's single kernel call carries.
-        rescue_rounds::record_call(round, jobs.len());
-        // Issue #50B asks whether the rescue windows of one kernel call overlap enough for a shared
-        // DP to be worth writing. That is a property of the data, so it gets measured before
-        // anything is implemented. Reference coordinates come from the `Orient`s, not from the jobs,
-        // which carry only slices.
-        if rescue_rounds::cluster_enabled() {
-            let mut win: Vec<(i32, i64, i64)> = Vec::with_capacity(jobs.len());
-            for (_, _, call) in &calls {
-                for o in call.per_r.iter().flatten() {
-                    win.push((call.rid, o.rb, o.rb + i64::from(o.target.1)));
-                }
-            }
-            rescue_rounds::record_windows(&mut win);
-        }
-        crate::rescue_split::stop(&crate::rescue_split::COLLECT_NS, t_collect);
-        let t_kernel = crate::rescue_split::start();
-        // `alns`: one result per job, index-aligned with `jobs`.
-        let alns = batched_mate_rescue(
-            &jobs,
-            5,
-            &opt.mat,
-            opt.o_del,
-            opt.e_del,
-            opt.o_ins,
-            opt.e_ins,
-            opt.min_seed_len * opt.a,
-            opt.a,
-        );
-        crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
-        let t_apply = crate::rescue_split::start();
-        for (&(slot, len, is_rev, hash, rb), r) in keys.iter().zip(&alns) {
-            let at = head
-                .entry(seen_key(slot, len, is_rev, hash))
-                .or_insert(u32::MAX);
-            seen.push(Seen {
-                next: *at,
-                slot: slot as u32,
-                len,
-                is_rev,
-                hash,
-                rb,
-                result: *r,
-            });
-            *at = (seen.len() - 1) as u32;
-        }
-        let alns: Vec<KswAlignResult> = src
-            .iter()
-            .map(|s| match *s {
-                Ok(k) => alns[k],
-                Err(r) => r,
-            })
-            .collect();
-        for (idx, (pi, dir, call)) in calls.iter().enumerate() {
-            let (start, count) = spans[idx];
-            // `target`: the region vector this call's hits are inserted into, i.e. the MATE's array
-            // (dir 0 rescued read 2, so it writes `a1`). Re-borrowed per call because the two
-            // directions of one pair touch different arrays.
-            let target = if *dir == 0 {
-                &mut *pairs[*pi].a1
-            } else {
-                &mut *pairs[*pi].a0
-            };
-            matesw_apply(
+            let (pi, dir) = (at.0 as usize, at.1 as usize);
+            let p = &pairs[pi];
+            let target: &[MemAlnReg] = if dir == 0 { p.a1 } else { p.a0 };
+            calls.push(matesw_collect(
                 fm,
                 bns,
                 opt,
-                call,
-                &alns[start..start + count],
+                pes,
+                anchor_of(at),
+                mate(p, dir),
                 target,
-                &mut views[*pi][*dir],
-            );
+                &mut views[pi][dir],
+                &mut arena,
+            ));
+        }
+        // Every collected orientation's job, identical windows of one (pair, dir) merged.
+        let mut jobs: Vec<KswJob> = Vec::new();
+        call_jobs.clear();
+        job_of.clear();
+        head.clear();
+        seen.clear();
+        for (at, call) in todo.iter().zip(&calls) {
+            let start = job_of.len() as u32;
+            if let Some(call) = call {
+                let slot = 2 * at.0 as usize + at.1 as usize;
+                let ms = mate(&pairs[at.0 as usize], at.1 as usize);
+                for (job, o) in rescue_jobs(call, ms, &arena).zip(call.per_r.iter().flatten()) {
+                    let (len, h) = (o.target.1, window_hash(job.target));
+                    let key = seen_key(slot, len, o.is_rev, h);
+                    let first = head.get(&key).copied().unwrap_or(u32::MAX);
+                    let mut e = first;
+                    let mut hit = None;
+                    while e != u32::MAX {
+                        let c = &seen[e as usize];
+                        if c.slot == slot as u32
+                            && c.len == len
+                            && c.is_rev == o.is_rev
+                            && c.hash == h
+                            && (c.rb == o.rb
+                                || arena[c.off as usize..(c.off + len) as usize] == *job.target)
+                        {
+                            hit = Some(c.job);
+                            break;
+                        }
+                        e = c.next;
+                    }
+                    job_of.push(hit.unwrap_or_else(|| {
+                        seen.push(Seen {
+                            next: first,
+                            slot: slot as u32,
+                            len,
+                            is_rev: o.is_rev,
+                            hash: h,
+                            rb: o.rb,
+                            off: o.target.0,
+                            job: jobs.len() as u32,
+                        });
+                        head.insert(key, (seen.len() - 1) as u32);
+                        jobs.push(job);
+                        (jobs.len() - 1) as u32
+                    }));
+                }
+            }
+            call_jobs.push((start, job_of.len() as u32 - start));
+        }
+        crate::rescue_split::stop(&crate::rescue_split::COLLECT_NS, t_collect);
+
+        // ---- 2. one kernel call for the block ----
+        // No `lanes` argument, unlike the scalar [`mem_matesw`] call: `batched_mate_rescue` bins jobs
+        // by length and its u8 kernel uses unsigned saturating lanes, documented exact in
+        // `bwa-neon/src/batched.rs`, so width never changes the reported score.
+        let t_kernel = crate::rescue_split::start();
+        let alns = if jobs.is_empty() {
+            Vec::new()
+        } else {
+            batched_mate_rescue(
+                &jobs,
+                5,
+                &opt.mat,
+                opt.o_del,
+                opt.e_del,
+                opt.o_ins,
+                opt.e_ins,
+                opt.min_seed_len * opt.a,
+                opt.a,
+            )
+        };
+        drop(jobs);
+        crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
+
+        // ---- 3. apply in bwa's order, `skip` re-read from the current lists ----
+        let t_apply = crate::rescue_split::start();
+        for (t, at) in todo.iter().enumerate() {
+            let (pi, dir) = (at.0 as usize, at.1 as usize);
+            let a = *anchor_of(at);
+            let p = &mut pairs[pi];
+            let ms = mate(p, dir);
+            let target = if dir == 0 { &mut *p.a1 } else { &mut *p.a0 };
+            let view = &mut views[pi][dir];
+            let skip = skip_set(view, target, bns.l_pac, a.rb, pes);
+            let was = calls[t].as_ref().map_or([1; 4], |c| c.skip);
+            if (0..4).any(|r| skip[r] == 0 && was[r] != 0) {
+                // A dedup removed the region that closed an orientation: the per-pair path, here.
+                let mut own = Vec::new();
+                if let Some(call) =
+                    matesw_collect(fm, bns, opt, pes, &a, ms, target, view, &mut own)
+                {
+                    let jobs: Vec<KswJob> = rescue_jobs(&call, ms, &own).collect();
+                    let alns = batched_mate_rescue(
+                        &jobs,
+                        5,
+                        &opt.mat,
+                        opt.o_del,
+                        opt.e_del,
+                        opt.o_ins,
+                        opt.e_ins,
+                        opt.min_seed_len * opt.a,
+                        opt.a,
+                    );
+                    matesw_apply(fm, bns, opt, &call, &alns, target, view);
+                }
+                continue;
+            }
+            let Some(call) = &calls[t] else {
+                continue; // all four closed then and now
+            };
+            // This anchor's results in orientation order, without the ones `skip` has since closed.
+            let (start, _) = call_jobs[t];
+            kept.clear();
+            let mut ai = start as usize;
+            for r in 0..4 {
+                if call.per_r[r].is_some() {
+                    if skip[r] == 0 {
+                        kept.push(alns[job_of[ai] as usize]);
+                    }
+                    ai += 1;
+                }
+            }
+            let call = RescueCall { skip, ..*call };
+            matesw_apply(fm, bns, opt, &call, &kept, target, view);
         }
         crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
+        p0 = p1;
     }
     for (p, v) in pairs.iter_mut().zip(&mut views) {
         settle_order(p.a1, &mut v[0].pending);
@@ -1787,8 +1517,24 @@ pub fn batch_mate_rescue(
     }
 }
 
-/// One earlier-round rescue job of [`batch_mate_rescue`]'s repeat lists: its window's length,
-/// mate orientation, [`window_hash`] and start, its result, and the list's next entry.
+/// Anchors per [`batch_mate_rescue`] block; `BWA4_RESCUE_BLOCK` overrides it for measurement.
+fn rescue_block_anchors() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BWA4_RESCUE_BLOCK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(RESCUE_BLOCK_ANCHORS)
+    })
+}
+
+/// See [`batch_mate_rescue`].
+const RESCUE_BLOCK_ANCHORS: usize = 4096;
+
+/// One collected rescue job of a [`batch_mate_rescue`] block, for the identical-window lookup: its
+/// window's length, mate orientation, [`window_hash`], start and arena offset, its kernel job, and
+/// the list's next entry.
 #[derive(Clone, Copy)]
 struct Seen {
     next: u32,
@@ -1797,7 +1543,8 @@ struct Seen {
     is_rev: bool,
     hash: u64,
     rb: i64,
-    result: KswAlignResult,
+    off: u32,
+    job: u32,
 }
 
 /// Room for one more region, growing by an eighth rather than doubling. A batch holds every read's

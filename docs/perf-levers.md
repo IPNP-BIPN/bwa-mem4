@@ -447,7 +447,22 @@ kernels, `#[inline(always)]` on `backward_ext`, the statistics branches compiled
 paths, and the `OnceLock` reads hoisted out of the loops. See ROADMAP.md, section of that date. Like everything else in this section, the wgsim figure understated the lever that
 matters, because it understates the stage that dominates.
 
-### Tested and dead: flattening the rescue rounds (the fork's shape)
+### Revived and shipped: flattening the rescue rounds (the fork's shape)
+
+**2026-11-09: built, and it wins.** The verdict below judged flattening by lane fill alone, before
+the K-mer filter and the band kernel existed. Both gain from a big call: the filter's query table
+is cached per mate, and a pair's fifty anchors share one mate, so a round (one anchor per pair)
+rebuilt it for nearly every job; the band kernel groups jobs of like width and depth more tightly.
+`batch_mate_rescue` now runs bwa-mem2's own pre/post shape per block of ~4096 anchors: collect every
+anchor against the mate list as it was before rescue, one kernel call, then apply in bwa's order
+with `skip` re-read from the current list. Measured waste: 0.01% of jobs on chr21, 1.0% on GIAB,
+and no orientation ever reopened (handled exactly anyway, by re-running that anchor). M4 GIAB PE
+2M pairs: 557-567G -> 537-538G cycles, 2.196T -> 2.136T instructions, RSS -150 MB; chr21 -3.4%
+cycles; md5 unchanged. An earlier attempt that speculated rounds AHEAD while keeping them (double
+collect) lost on GIAB; the win needed the rounds gone. `BWA4_RESCUE_ROUNDS` went with them.
+
+The original analysis, kept for the record:
+
 
 `batch_mate_rescue` issues one `batched_ksw_align2` call per ROUND, and a round only holds the pairs
 whose anchor list is still that deep, so later rounds look like they must be running near-empty SIMD
