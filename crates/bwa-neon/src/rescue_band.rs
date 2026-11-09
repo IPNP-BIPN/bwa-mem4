@@ -1001,18 +1001,20 @@ pub(crate) mod neon {
             let st = self.st.as_mut_ptr();
             for l in 0..L {
                 let row = std::slice::from_raw_parts_mut(st.add(l * stride), npp);
-                row.fill(DEAD);
+                crate::batched::fill_fast(row, DEAD);
                 let Some(lane) = lanes.get(l) else { continue };
                 let pq0 = c - lane.o; // `p` where `j = 0`
                 let len2 = lane.q.len() as i32;
                 let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
                 if p0 < p1 {
-                    row[p0 as usize..p1 as usize]
-                        .copy_from_slice(&lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize]);
+                    crate::batched::copy_fast(
+                        &mut row[p0 as usize..p1 as usize],
+                        &lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize],
+                    );
                 }
                 let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
                 if p0 < p1 {
-                    row[p0 as usize..p1 as usize].fill(QPAD);
+                    crate::batched::fill_fast(&mut row[p0 as usize..p1 as usize], QPAD);
                 }
                 ob[l] = lane.o as u8;
                 omax = omax.max(lane.o);
@@ -1023,12 +1025,12 @@ pub(crate) mod neon {
             for l in 0..L {
                 let row = std::slice::from_raw_parts_mut(st.add(l * stride), nrp);
                 let Some(lane) = lanes.get(l) else {
-                    row.fill(RPAD);
+                    crate::batched::fill_fast(row, RPAD);
                     continue;
                 };
                 {
-                    row[..lane.t.len()].copy_from_slice(lane.t);
-                    row[lane.t.len()..].fill(RPAD);
+                    crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
+                    crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
                     // A target N scores -1 against everything through the table's slots 8 and
                     // 12-15 once it is re-encoded as 12 (`N_TARGET`); as 4 it would read the
                     // match slot against a query N. A pruned job holds none; a reverse-pass job
@@ -1379,19 +1381,21 @@ mod avx2 {
             for blk in 0..L / 16 {
                 for i in 0..16 {
                     let row = std::slice::from_raw_parts_mut(st.add(i * stride), npp);
-                    row.fill(DEAD);
+                    crate::batched::fill_fast(row, DEAD);
                     let l = blk * 16 + i;
                     let Some(lane) = lanes.get(l) else { continue };
                     let pq0 = c - lane.o;
                     let len2 = lane.q.len() as i32;
                     let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
                     if p0 < p1 {
-                        row[p0 as usize..p1 as usize]
-                            .copy_from_slice(&lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize]);
+                        crate::batched::copy_fast(
+                            &mut row[p0 as usize..p1 as usize],
+                            &lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize],
+                        );
                     }
                     let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
                     if p0 < p1 {
-                        row[p0 as usize..p1 as usize].fill(QPAD);
+                        crate::batched::fill_fast(&mut row[p0 as usize..p1 as usize], QPAD);
                     }
                     ob[l] = lane.o as u8;
                     omax = omax.max(lane.o);
@@ -1409,11 +1413,11 @@ mod avx2 {
                 for i in 0..16 {
                     let row = std::slice::from_raw_parts_mut(st.add(i * stride), nrp);
                     let Some(lane) = lanes.get(blk * 16 + i) else {
-                        row.fill(RPAD);
+                        crate::batched::fill_fast(row, RPAD);
                         continue;
                     };
-                    row[..lane.t.len()].copy_from_slice(lane.t);
-                    row[lane.t.len()..].fill(RPAD);
+                    crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
+                    crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
                     // Target N re-encoded as 12 (see the NEON kernel).
                     if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
                         for b in row[..lane.t.len()].iter_mut() {
@@ -1747,19 +1751,21 @@ mod avx512 {
             for blk in 0..L / 16 {
                 for i in 0..16 {
                     let row = std::slice::from_raw_parts_mut(st.add(i * stride), npp);
-                    row.fill(DEAD);
+                    crate::batched::fill_fast(row, DEAD);
                     let l = blk * 16 + i;
                     let Some(lane) = lanes.get(l) else { continue };
                     let pq0 = c - lane.o;
                     let len2 = lane.q.len() as i32;
                     let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
                     if p0 < p1 {
-                        row[p0 as usize..p1 as usize]
-                            .copy_from_slice(&lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize]);
+                        crate::batched::copy_fast(
+                            &mut row[p0 as usize..p1 as usize],
+                            &lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize],
+                        );
                     }
                     let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
                     if p0 < p1 {
-                        row[p0 as usize..p1 as usize].fill(QPAD);
+                        crate::batched::fill_fast(&mut row[p0 as usize..p1 as usize], QPAD);
                     }
                     ob[l] = lane.o as u8;
                     omax = omax.max(lane.o);
@@ -1777,11 +1783,11 @@ mod avx512 {
                 for i in 0..16 {
                     let row = std::slice::from_raw_parts_mut(st.add(i * stride), nrp);
                     let Some(lane) = lanes.get(blk * 16 + i) else {
-                        row.fill(RPAD);
+                        crate::batched::fill_fast(row, RPAD);
                         continue;
                     };
-                    row[..lane.t.len()].copy_from_slice(lane.t);
-                    row[lane.t.len()..].fill(RPAD);
+                    crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
+                    crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
                     // Target N re-encoded as 12 (see the NEON kernel).
                     if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
                         for b in row[..lane.t.len()].iter_mut() {
