@@ -1204,14 +1204,30 @@ fn dispatch_bins(
             }
             wl
         };
-        let mut keyed: Vec<(i32, usize)> = u8_idx.iter().map(|&k| (band(k), k)).collect();
-        if split > 0 {
-            keyed.sort_by_key(|&(w, _)| w >= split);
-        } else {
-            keyed.sort_by_key(|&(w, _)| (w / -split).min(8));
+        // At most 9 classes: a stable counting sort, the stable sort's permutation in O(n).
+        let class = |w: i32| {
+            if split > 0 {
+                usize::from(w >= split)
+            } else {
+                (w / -split).clamp(0, 8) as usize
+            }
+        };
+        let bands: Vec<i32> = u8_idx.iter().map(|&k| band(k)).collect();
+        let mut start = [0usize; 10];
+        for &w in &bands {
+            start[class(w) + 1] += 1;
         }
-        u8_idx = keyed.iter().map(|&(_, k)| k).collect();
-        u8_band = keyed.iter().map(|&(w, _)| w).collect();
+        for c in 1..start.len() {
+            start[c] += start[c - 1];
+        }
+        let (mut idx, mut wb) = (vec![0usize; bands.len()], vec![0i32; bands.len()]);
+        for (&k, &w) in u8_idx.iter().zip(&bands) {
+            let c = class(w);
+            (idx[start[c]], wb[start[c]]) = (k, w);
+            start[c] += 1;
+        }
+        u8_idx = idx;
+        u8_band = wb;
     }
     // The three single-bin fast paths. Each has to go through `expand`, because with the dedup
     // above `jobs` is the DISTINCT batch and the caller is owed one result per ORIGINAL job. Missing

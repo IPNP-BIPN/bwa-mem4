@@ -123,7 +123,9 @@ jobs:
           tier=""; [ "$(uname -m)" = x86_64 ] && tier="-C target-cpu=x86-64-v3"
           # Line tables through the profile, not RUSTFLAGS: with `debug` unset in [profile.release],
           # Cargo strips debuginfo after linking, so `-C debuginfo=1` alone left perf no lines.
-          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+          # CFLAGS: mimalloc is C, built by `cc` without frame pointers, which cut every chain
+          # through the allocator.
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CFLAGS="-O3 -fno-omit-frame-pointer" \
           RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }}" \
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf
           cp target-perf/release/bwa-mem4 ./mem4-v3
@@ -182,6 +184,14 @@ jobs:
             echo "===== $arm: libc callers ====="
             "$PERF" report -i "$arm.data" --stdio --no-children --dsos libc.so.6 -g callee,0.05 --percent-limit 0.2 2>/dev/null \
               | grep -vE "^$|^#" | head -300 || true
+            # Who allocates and who sorts (ours: x86 spends ~3x the M4's share in both).
+            if [ "$arm" = ours ]; then
+              for f in mi_ sort; do
+                echo "===== ours: callers of *$f* ====="
+                "$PERF" report -i "$arm.data" --stdio --no-children --symbol-filter="$f" --max-stack 8 \
+                  -g callee,0.05 --percent-limit 0.1 2>/dev/null | grep -vE "^$|^#" | head -400 || true
+              done
+            fi
           done
 
           # Where inside our u8 extension and rescue band kernels and the SMEM walk the time goes: per-line
