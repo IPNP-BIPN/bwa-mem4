@@ -861,6 +861,7 @@ fn simd_dispatch(
     // Indices of the jobs the fast path declined, i.e. the ones that still need the real DP.
     let mut needs_dp: Vec<usize> = Vec::new();
     for (k, job) in jobs.iter().enumerate() {
+        prefetch_job(jobs, k + 4);
         match ungapped_hit(job, a, b, x_threshold, zdrop) {
             Some(result) => out[k] = result,
             None => needs_dp.push(k),
@@ -927,6 +928,21 @@ fn prefetch<T>(p: *const T) {
 /// # Returns
 /// `(unique, map)`: the distinct jobs in first-appearance order, and for each input job the index
 /// of its representative in `unique`. `map[i] == i'` means `out[i]` must be `results[i']`.
+/// Hint the first two lines of job `k`'s query and target, if there is a job `k`. A batch is a
+/// whole chunk's jobs in length order, megabytes of bases read at random, so every pass over it
+/// (ungapped scan, dedup fingerprints, band bounds) waited on its first load of each job: a third
+/// of `run_side` on x86.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_job(jobs: &[ExtendJob], k: usize) {
+    if let Some(n) = jobs.get(k) {
+        for p in [n.query.as_ptr(), n.target.as_ptr()] {
+            prefetch(p);
+            prefetch(p.wrapping_add(64));
+        }
+    }
+}
+
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
     /// Fold every byte of `s` into `h`, 32 at a time in four independent multiply chains so the
@@ -963,7 +979,9 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
     // Fingerprints first, in a streaming pass, so the table probes below can be prefetched ahead.
     let fps: Vec<u64> = jobs
         .iter()
-        .map(|job| {
+        .enumerate()
+        .map(|(i, job)| {
+            prefetch_job(jobs, i + 4);
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
             h ^= (job.query.len() as u64) << 32 | job.target.len() as u64;
             h = h.wrapping_mul(0x1000_0000_01b3);
@@ -1212,7 +1230,14 @@ fn dispatch_bins(
                 (w / -split).clamp(0, 8) as usize
             }
         };
-        let bands: Vec<i32> = u8_idx.iter().map(|&k| band(k)).collect();
+        let bands: Vec<i32> = (0..u8_idx.len())
+            .map(|i| {
+                if let Some(&n) = u8_idx.get(i + 4) {
+                    prefetch_job(jobs, n);
+                }
+                band(u8_idx[i])
+            })
+            .collect();
         let mut start = [0usize; 10];
         for &w in &bands {
             start[class(w) + 1] += 1;
