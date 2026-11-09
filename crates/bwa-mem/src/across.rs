@@ -1362,18 +1362,9 @@ fn align_reads_batched_inner<B: SwBackend>(
             // `rseq_off + re` is where `rseq[re]` sits, for every `re >= rmin`.
             let rseq_off = (arena.len() as u32).wrapping_sub(rmin);
             fm.bases_append(rmax0 + i64::from(rmin), rmax1, &mut arena);
-            // `rrseq_off + lmax - rlen` is where the reversed `rseq[..rlen]` starts. Reversed
-            // without complement is the other strand's mirror range complemented back (base `p`
-            // of the doubled text is the complement of base `2L - 1 - p`).
+            // `rrseq_off + lmax - rlen` is where the reversed `rseq[..rlen]` starts.
             let rrseq_off = arena.len() as u32;
-            fm.bases_append(
-                (l_pac << 1) - rmax0 - i64::from(lmax),
-                (l_pac << 1) - rmax0,
-                &mut arena,
-            );
-            for b in &mut arena[rrseq_off as usize..] {
-                *b ^= 3;
-            }
+            fm.bases_append_rev(rmax0, rmax0 + i64::from(lmax), &mut arena);
 
             // Seeds in descending (score, index) order.
             //
@@ -1818,7 +1809,18 @@ fn run_side<B: SwBackend>(
         // ---- step 3: acceptance test, then scatter or requeue each job ----
         // Counted for issue #54 trap 5; see `align_split::record_round`.
         let mut requeued_this_round = 0usize;
+        // Scattered in job order, not lane order: jobs and regions were laid out read by read, so
+        // walking them in that order streams both instead of missing on each (each job writes only
+        // its own region, so the order is unobservable). Only `results` is read out of order.
+        let mut lane_of = vec![u32::MAX; jobs.len()];
         for (lane, &job_idx) in active_idxs.iter().enumerate() {
+            lane_of[job_idx] = lane as u32;
+        }
+        for (job_idx, &lane) in lane_of.iter().enumerate() {
+            if lane == u32::MAX {
+                continue;
+            }
+            let lane = lane as usize;
             // `res`: this lane's DP outcome (`score`, `qle`/`tle`, `gscore`/`gtle`, `max_off`; see
             // the module glossary). `prev`: the score this job reached in the previous round, or its
             // seed value for round 0 (-1 for a left job, the left extension's score for a right one).

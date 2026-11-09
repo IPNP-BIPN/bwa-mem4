@@ -312,12 +312,13 @@ pub(crate) fn unpack_pac_base(pac: &[u8], l_pac: i64, pos: i64) -> u8 {
 /// - `pac`: the whole mapped `.pac`, including its trailer bytes, which are never indexed here.
 /// - `start`: first FORWARD-strand position to unpack; `start + len` must not exceed `l_pac`.
 /// - `out`: destination, filled with exactly `len` bases, one per byte, codes 0..=3.
+/// - `XOR`: 0, or 3 to complement every base on the way out.
 #[inline]
-fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+fn unpack_pac_fwd<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: neon detected; `out` has `len + 16` bytes of room, as every caller reserves.
-        unsafe { unpack_fwd_neon(pac, start, len, out) };
+        unsafe { unpack_fwd_neon::<XOR>(pac, start, len, out) };
         return;
     }
     // Bases before the first whole packed byte, done one at a time so the block loop below can
@@ -325,7 +326,7 @@ fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     let mut pos = start;
     let end = start + len as i64;
     while pos < end && (pos & 3) != 0 {
-        out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
+        out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
         pos += 1;
     }
 
@@ -365,9 +366,12 @@ fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
                     let s4 = _mm_and_si128(_mm_srli_epi16(v, 4), m1);
                     let s2 = _mm_and_si128(_mm_srli_epi16(v, 2), m2);
                     let s0 = _mm_and_si128(v, m3);
-                    let out_v = _mm_and_si128(
-                        _mm_or_si128(_mm_or_si128(s6, s4), _mm_or_si128(s2, s0)),
-                        three,
+                    let out_v = _mm_xor_si128(
+                        _mm_and_si128(
+                            _mm_or_si128(_mm_or_si128(s6, s4), _mm_or_si128(s2, s0)),
+                            three,
+                        ),
+                        _mm_set1_epi8(XOR as i8),
                     );
                     let n = out.len();
                     _mm_storeu_si128(out.as_mut_ptr().add(n) as *mut __m128i, out_v);
@@ -380,7 +384,7 @@ fn unpack_pac_fwd(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
 
     // Tail, and the whole range on a build with neither vector path.
     while pos < end {
-        out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
+        out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
         pos += 1;
     }
 }
@@ -458,22 +462,25 @@ unsafe fn unpack16(
     vandq_u8(vshlq_u8(v, sh), vdupq_n_u8(3))
 }
 
-/// Bases `[p, p + 64)` of the forward strand, `p % 4 == 0`, written to `dst`, or with `rc` their
-/// reverse complement: their 16 packed bytes in one load, each byte's four 2-bit fields split by
-/// shifts and interleaved by one `st4` (fg-labs/bwa-mem3's `bns_block`). For `rc` the bytes are
-/// reversed and inverted first: `!b` complements all four bases, and `b`'s low field is then the
-/// first one out.
+/// Bases `[p, p + 64)` of the forward strand, `p % 4 == 0`, written to `dst`, or with `rev` in
+/// reverse order: their 16 packed bytes in one load, each byte's four 2-bit fields split by
+/// shifts and interleaved by one `st4` (fg-labs/bwa-mem3's `bns_block`). For `rev` the bytes are
+/// reversed first, and `b`'s low field is then the first one out. `xor` 3 complements every base
+/// (`!b` on the packed byte complements all four), 0 leaves them.
 ///
 /// # Safety
 /// NEON present, `p >= 0`, `(p >> 2) + 16 <= pac.len()`, and `dst` valid for 64 bytes.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn unpack64(pac: &[u8], p: i64, rc: bool, dst: *mut u8) {
+unsafe fn unpack64(pac: &[u8], p: i64, rev: bool, xor: u8, dst: *mut u8) {
     use std::arch::aarch64::*;
-    let q = vld1q_u8(pac.as_ptr().add((p >> 2) as usize));
+    let q = veorq_u8(
+        vld1q_u8(pac.as_ptr().add((p >> 2) as usize)),
+        vdupq_n_u8(xor.wrapping_mul(0x55)),
+    );
     let m = vdupq_n_u8(3);
-    if rc {
-        let r = vmvnq_u8(vrev64q_u8(q));
+    if rev {
+        let r = vrev64q_u8(q);
         let q = vextq_u8(r, r, 8);
         let f = uint8x16x4_t(
             vandq_u8(q, m),
@@ -505,19 +512,19 @@ const UNPACK64_MIN: usize = 67;
 /// # Safety
 /// NEON present; `out` has room for `len + 16` bytes past its length.
 #[cfg(target_arch = "aarch64")]
-unsafe fn unpack_fwd_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+unsafe fn unpack_fwd_neon<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     use std::arch::aarch64::*;
     let end = start + len as i64;
     let mut pos = start;
     if len >= UNPACK64_MIN {
         while pos & 3 != 0 {
-            out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
+            out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
             pos += 1;
         }
         // `pos + 64 <= end <= l_pac`, so the 16 bytes from `pos >> 2` are inside `pac`.
         while pos + 64 <= end {
             let n = out.len();
-            unpack64(pac, pos, false, out.as_mut_ptr().add(n));
+            unpack64(pac, pos, false, XOR, out.as_mut_ptr().add(n));
             out.set_len(n + 64);
             pos += 64;
         }
@@ -528,28 +535,28 @@ unsafe fn unpack_fwd_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>)
         vld1q_s8(SPREAD.1[o].as_ptr()),
     );
     while pos < end && ((pos >> 2) as usize) + 8 <= pac.len() {
-        let v = unpack16(pac, pos, idx, sh);
+        let v = veorq_u8(unpack16(pac, pos, idx, sh), vdupq_n_u8(XOR));
         let n = out.len();
         vst1q_u8(out.as_mut_ptr().add(n), v);
         out.set_len(n + (end - pos).min(16) as usize);
         pos += 16;
     }
     while pos < end {
-        out.push((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3);
+        out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
         pos += 1;
     }
 }
 
-/// [`unpack_pac_fwd`] of `[start, start + len)` reversed and complemented, in one NEON pass: the
-/// sixteen source bases ending where the output has got to, reversed (`rev64` + a half swap) and
-/// complemented (`^ 3`), walking the source from its end. The last step is stored whole and
+/// [`unpack_pac_fwd`] of `[start, start + len)` reversed, and complemented when `XOR` is 3, in one
+/// NEON pass: the sixteen source bases ending where the output has got to, reversed (`rev64` + a
+/// half swap) and `^ XOR`, walking the source from its end. The last step is stored whole and
 /// trimmed; a step whose source word would leave `pac` or start before 0 goes base by base.
 /// Appends to `out`, which must have room for `len + 16` bytes.
 #[cfg(target_arch = "aarch64")]
-fn unpack_pac_rc_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+fn unpack_pac_rev_neon<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     use std::arch::aarch64::*;
-    let scalar = |p: i64| 3 - ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3);
-    // Exclusive source end: output base `o` is the complement of source base `end - 1 - o`. A long
+    let scalar = |p: i64| ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3) ^ XOR;
+    // Exclusive source end: output base `o` is source base `end - 1 - o`, `^ XOR`. A long
     // window first takes its top bases down to a byte boundary, then 64 per step ([`unpack64`]);
     // what is left below goes on as a shorter window.
     let mut end = start + len as i64;
@@ -563,7 +570,7 @@ fn unpack_pac_rc_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
             // SAFETY: NEON is present (checked by the caller); `end <= l_pac`, so the 16 bytes
             // from `(end - 64) >> 2` are inside `pac`, and the store stays inside the `len + 16`
             // bytes reserved past the length.
-            unsafe { unpack64(pac, end - 64, true, out.as_mut_ptr().add(n)) };
+            unsafe { unpack64(pac, end - 64, true, XOR, out.as_mut_ptr().add(n)) };
             unsafe { out.set_len(n + 64) };
             end -= 64;
         }
@@ -577,14 +584,14 @@ fn unpack_pac_rc_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
             vld1q_u8(SPREAD.0[off].as_ptr()),
             vld1q_s8(SPREAD.1[off].as_ptr()),
         );
-        let three = vdupq_n_u8(3);
+        let xor = vdupq_n_u8(XOR);
         let mut o = 0usize;
         while o < len {
             let k = (len - o).min(16);
             let s0 = end - o as i64 - 16;
             if s0 >= 0 && ((s0 >> 2) as usize) + 8 <= pac.len() {
                 let r = vrev64q_u8(unpack16(pac, s0, idx, sh));
-                let r = veorq_u8(vextq_u8(r, r, 8), three);
+                let r = veorq_u8(vextq_u8(r, r, 8), xor);
                 let n = out.len();
                 vst1q_u8(out.as_mut_ptr().add(n), r);
                 out.set_len(n + k);
@@ -598,9 +605,9 @@ fn unpack_pac_rc_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// [`unpack_pac_fwd`] of `[start, start + len)` reversed and complemented in one SSSE3 pass, as
-/// [`unpack_pac_rc_neon`] does on aarch64: the source is walked from its end, 16 bases (4 packed
-/// bytes) per step, each step unpacked, reversed by `pshufb` and complemented by `^ 3`. Before, x86
+/// [`unpack_pac_fwd`] of `[start, start + len)` reversed, and complemented when `XOR` is 3, in one
+/// SSSE3 pass, as [`unpack_pac_rev_neon`] does on aarch64: the source is walked from its end, 16
+/// bases (4 packed bytes) per step, each step unpacked, reversed by `pshufb` and `^ XOR`. Before, x86
 /// unpacked forward, then reversed, then complemented: three passes over every reverse-strand
 /// window. Appends to `out`, which must have room for `len + 16` bytes.
 ///
@@ -608,10 +615,15 @@ fn unpack_pac_rc_neon(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
 /// SSSE3.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn unpack_pac_rc_ssse3(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+unsafe fn unpack_pac_rev_ssse3<const XOR: u8>(
+    pac: &[u8],
+    start: i64,
+    len: usize,
+    out: &mut Vec<u8>,
+) {
     use std::arch::x86_64::*;
-    let scalar = |p: i64| 3 - ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3);
-    // Output base `o` is the complement of source base `end - 1 - o`.
+    let scalar = |p: i64| ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3) ^ XOR;
+    // Output base `o` is source base `end - 1 - o`, `^ XOR`.
     let mut end = start + len as i64;
     // Top bases down to a byte boundary, so every vector step reads whole packed bytes.
     while end > start && end & 3 != 0 {
@@ -638,7 +650,7 @@ unsafe fn unpack_pac_rc_ssse3(pac: &[u8], start: i64, len: usize, out: &mut Vec<
             _mm_or_si128(_mm_or_si128(s6, s4), _mm_or_si128(s2, s0)),
             three,
         );
-        let r = _mm_xor_si128(_mm_shuffle_epi8(fwd, rev), three);
+        let r = _mm_xor_si128(_mm_shuffle_epi8(fwd, rev), _mm_set1_epi8(XOR as i8));
         let n = out.len();
         _mm_storeu_si128(out.as_mut_ptr().add(n) as *mut __m128i, r);
         out.set_len(n + 16);
@@ -664,40 +676,66 @@ pub(crate) fn unpack_pac_range_append(pac: &[u8], l_pac: i64, rb: i64, re: i64, 
     let len0 = out.len();
     out.reserve(len + 16);
     if re <= l_pac {
-        unpack_pac_fwd(pac, rb, len, out);
+        unpack_pac_fwd::<0>(pac, rb, len, out);
     } else if rb >= l_pac {
-        // Reverse-complement half: same packed bytes, read forward then flipped end for end.
-        //
-        // Two separate passes, `reverse()` then a complement loop, and that is deliberate: fusing
-        // them into one two-cursor swap loop was tried and measured 31.4 s of CPU against 11.1 s
-        // for the pair, on a 500k-pair `-t16` run. `reverse()` is a vectorised memory reversal and
-        // the `^= 3` loop auto-vectorises; a hand-fused loop is neither, and two vector passes beat
-        // one scalar pass by a wide margin here.
-        #[cfg(target_arch = "aarch64")]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            unpack_pac_rc_neon(pac, 2 * l_pac - re, len, out);
-            debug_assert_eq!(out.len(), len0 + len);
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
-        if std::is_x86_feature_detected!("ssse3") {
-            // SAFETY: ssse3 detected; `out` has `len + 16` bytes of room (reserved above).
-            unsafe { unpack_pac_rc_ssse3(pac, 2 * l_pac - re, len, out) };
-            debug_assert_eq!(out.len(), len0 + len);
-            return;
-        }
-        unpack_pac_fwd(pac, 2 * l_pac - re, len, out);
-        out[len0..].reverse();
-        for b in out[len0..].iter_mut() {
-            // Complement in bwa's A=0 C=1 G=2 T=3 order, where complementary codes sum to 3.
-            *b ^= 3;
-        }
+        // Reverse-complement half: same packed bytes, read backwards, complemented
+        // (complementary codes sum to 3 in bwa's A=0 C=1 G=2 T=3 order).
+        unpack_pac_rev::<3>(pac, 2 * l_pac - re, len, out);
     } else {
         for p in rb..re {
             out.push(unpack_pac_base(pac, l_pac, p));
         }
     }
     debug_assert_eq!(out.len(), len0 + len);
+}
+
+/// [`unpack_pac_range_append`] of `[rb, re)` in reverse order (base `re - 1` first), not
+/// complemented: the reversed reference the left extensions read, unpacked in one pass where an
+/// unpack of the mirror range plus a `^ 3` pass took two.
+pub(crate) fn unpack_pac_range_append_rev(
+    pac: &[u8],
+    l_pac: i64,
+    rb: i64,
+    re: i64,
+    out: &mut Vec<u8>,
+) {
+    let len = (re - rb).max(0) as usize;
+    if len == 0 {
+        return;
+    }
+    let len0 = out.len();
+    out.reserve(len + 16);
+    if re <= l_pac {
+        unpack_pac_rev::<0>(pac, rb, len, out);
+    } else if rb >= l_pac {
+        // Base `p` here is the complement of forward base `2L - 1 - p`: reversed, that is the
+        // forward range `[2L - re, 2L - rb)` in order, complemented.
+        unpack_pac_fwd::<3>(pac, 2 * l_pac - re, len, out);
+    } else {
+        for p in (rb..re).rev() {
+            out.push(unpack_pac_base(pac, l_pac, p));
+        }
+    }
+    debug_assert_eq!(out.len(), len0 + len);
+}
+
+/// Forward bases `[start, start + len)` appended last first, `^ XOR` (3: complemented). `out` must
+/// have room for `len + 16` bytes past its length.
+fn unpack_pac_rev<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        unpack_pac_rev_neon::<XOR>(pac, start, len, out);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("ssse3") {
+        // SAFETY: ssse3 detected; the caller reserved `len + 16` bytes.
+        unsafe { unpack_pac_rev_ssse3::<XOR>(pac, start, len, out) };
+        return;
+    }
+    let len0 = out.len();
+    unpack_pac_fwd::<XOR>(pac, start, len, out);
+    out[len0..].reverse();
 }
 
 /// Build the path `<prefix>.<ext>`, the naming convention every index file follows.
@@ -2286,6 +2324,12 @@ impl FmIndex {
         unpack_pac_range_append(&self.pac, self.l_pac(), rb, re, out);
     }
 
+    /// [`bases_append`](Self::bases_append) of `[rb, re)` in reverse order (base `re - 1` first),
+    /// not complemented.
+    pub fn bases_append_rev(&self, rb: i64, re: i64, out: &mut Vec<u8>) {
+        unpack_pac_range_append_rev(&self.pac, self.l_pac(), rb, re, out);
+    }
+
     /// Prefetch the `.pac` lines of the window `[rb, re)` that [`bases_into`] will unpack. `rb` and
     /// `re` are 2L-space positions on one strand; out-of-range values waste a fetch at worst, because
     /// a prefetch never faults. Only the first and last line are hinted, which covers all of a
@@ -2386,6 +2430,15 @@ mod tests {
                 let mut app = vec![9u8; 5];
                 super::unpack_pac_range_append(&pac, l_pac, rb, re, &mut app);
                 assert_eq!((&app[..5], &app[5..]), (&[9u8; 5][..], &want[..]));
+                // And the reversed form, not complemented, base `re - 1` first.
+                let mut rev = vec![9u8; 5];
+                super::unpack_pac_range_append_rev(&pac, l_pac, rb, re, &mut rev);
+                let want_rev: Vec<u8> = want.iter().rev().copied().collect();
+                assert_eq!(
+                    (&rev[..5], &rev[5..]),
+                    (&[9u8; 5][..], &want_rev[..]),
+                    "reversed [{rb}, {re})"
+                );
             }
         }
     }
