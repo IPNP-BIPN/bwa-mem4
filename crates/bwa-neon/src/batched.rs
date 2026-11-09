@@ -1652,6 +1652,17 @@ fn default_result() -> ExtendResult {
     }
 }
 
+/// One lane-major staging row of `fill_soa`: `seq` (none for a lane past the jobs) then zeros, up
+/// to `len`, each byte written once.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+fn stage_row(st: &mut [u8], at: usize, len: usize, seq: Option<&[u8]>) {
+    let row = &mut st[at..at + len];
+    let seq = seq.unwrap_or(&[]);
+    row[..seq.len()].copy_from_slice(seq);
+    row[seq.len()..].fill(0);
+}
+
 /// A buffer whose slice starts on a 64-byte boundary, so a vector at a multiple of its own width
 /// never splits a cache line: a `Vec<u8>` is only as aligned as the allocator makes it (16 bytes),
 /// which splits every AVX-512 access and one AVX2 access in four.
@@ -1681,7 +1692,6 @@ impl<T: Copy> ABuf<T> {
     }
 
     /// At least `n` elements, the first `n` as they were where the buffer already had them.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn fit(&mut self, n: usize, x: T) {
         if self.len < n {
             let old = std::mem::take(&mut self.v);
@@ -2426,8 +2436,14 @@ macro_rules! define_sw_kernel {
                     st.tlen32 = std::array::from_fn(|l| st.tlen[l] as $trk);
                     st.eh_h.reset(stride * LANES, 0 as $elem);
                     st.eh_e.reset(stride * LANES, 0 as $elem);
-                    st.qcode.reset(soa_cols * LANES, 0 as $elem);
-                    st.tcode.reset(soa_rows * LANES, 0 as $elem);
+                    if $rowvec {
+                        // `fill_soa` writes every lane of both.
+                        st.qcode.fit(soa_cols * LANES, 0 as $elem);
+                        st.tcode.fit(soa_rows * LANES, 0 as $elem);
+                    } else {
+                        st.qcode.reset(soa_cols * LANES, 0 as $elem);
+                        st.tcode.reset(soa_rows * LANES, 0 as $elem);
+                    }
                     if $rowvec {
                         // SAFETY: `rowvec` kernels are u8 (`$elem` is u8), and both SoA sizes are
                         // multiples of 16 under `rowvec`.
@@ -3468,8 +3484,8 @@ pub(crate) mod x86_row {
 
     /// Fill a chunk's SoA buffers (`cols` query positions, `rows` target positions, both multiples
     /// of 16, `N` lanes each) from the jobs, 16 lanes at a time: each sequence is copied into a
-    /// lane-major staging row, zero past its end, then transposed 16 positions at a time. Lanes
-    /// past `jobs` are left as they are (the caller's zeros).
+    /// lane-major staging row, zero past its end, then transposed 16 positions at a time. Every
+    /// lane is written, lanes past `jobs` with zeros, so the buffers need no clearing first.
     ///
     /// # Safety
     /// `qcode` holds `cols * N` bytes and `tcode` `rows * N`; every sequence fits; `N` is a
@@ -3484,20 +3500,18 @@ pub(crate) mod x86_row {
         let stride = cols.max(rows);
         STAGE.with(|st| {
             let st = &mut *st.borrow_mut();
-            st.clear();
-            st.resize(16 * stride, 0);
-            for (blk, js) in jobs.chunks(16).enumerate() {
-                for (l, j) in js.iter().enumerate() {
-                    st[l * stride..(l + 1) * stride].fill(0);
-                    st[l * stride..l * stride + j.query.len()].copy_from_slice(j.query);
-                }
-                if js.len() < 16 {
-                    st[js.len() * stride..].fill(0);
+            if st.len() < 16 * stride {
+                st.resize(16 * stride, 0);
+            }
+            for blk in 0..N / 16 {
+                let js = jobs.get(blk * 16..).unwrap_or(&[]);
+                let js = &js[..js.len().min(16)];
+                for l in 0..16 {
+                    super::stage_row(st, l * stride, cols, js.get(l).map(|j| j.query));
                 }
                 transpose_to::<N>(st.as_ptr(), stride, cols, qcode, blk * 16);
-                for (l, j) in js.iter().enumerate() {
-                    st[l * stride..(l + 1) * stride].fill(0);
-                    st[l * stride..l * stride + j.target.len()].copy_from_slice(j.target);
+                for l in 0..16 {
+                    super::stage_row(st, l * stride, rows, js.get(l).map(|j| j.target));
                 }
                 transpose_to::<N>(st.as_ptr(), stride, rows, tcode, blk * 16);
             }
@@ -3954,15 +3968,15 @@ mod neon_row {
         let stride = cols.max(rows);
         STAGE.with(|st| {
             let st = &mut *st.borrow_mut();
-            st.clear();
-            st.resize(16 * stride, 0);
-            for (l, j) in jobs.iter().enumerate() {
-                st[l * stride..l * stride + j.query.len()].copy_from_slice(j.query);
+            if st.len() < 16 * stride {
+                st.resize(16 * stride, 0);
+            }
+            for l in 0..16 {
+                super::stage_row(st, l * stride, cols, jobs.get(l).map(|j| j.query));
             }
             crate::rescue_band::neon::transpose_to(st.as_ptr(), stride, cols, qcode);
-            st.fill(0);
-            for (l, j) in jobs.iter().enumerate() {
-                st[l * stride..l * stride + j.target.len()].copy_from_slice(j.target);
+            for l in 0..16 {
+                super::stage_row(st, l * stride, rows, jobs.get(l).map(|j| j.target));
             }
             crate::rescue_band::neon::transpose_to(st.as_ptr(), stride, rows, tcode);
         });
