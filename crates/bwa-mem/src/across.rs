@@ -356,14 +356,20 @@ pub(crate) fn discard_contained(
     // out purged: their slot exists to preserve scan order, but they were never extended.
     // Invariant: `purged[i]` is true exactly when slot `i` is pre-skipped or has been tombstoned by
     // an earlier iteration of this pass. Read back in step 2, where a purged seed may not vouch.
-    let mut purged: Vec<bool> = preskip.to_vec();
+    let mut ix = KEPT_INDEX.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    ix.clear();
+    // Both scratch vectors live in the thread's `KeptIndex` between reads: two allocations per read.
+    let (mut purged, mut bounds) = (
+        std::mem::take(&mut ix.purged),
+        std::mem::take(&mut ix.bounds),
+    );
+    purged.clear();
+    purged.extend_from_slice(preskip);
     // The four bounds the containment scan tests, apart from the rest of each region. Nearly every
     // comparison ends at them, and over a repeat's hundreds of regions a walk over 96-byte records is
     // a line per region where this is three to a line.
-    let mut bounds: Vec<(i64, i64, i32, i32)> =
-        regs.iter().map(|r| (r.rb, r.re, r.qb, r.qe)).collect();
-    let mut ix = KEPT_INDEX.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    ix.clear();
+    bounds.clear();
+    bounds.extend(regs.iter().map(|r| (r.rb, r.re, r.qb, r.qe)));
     let mut index_ok = true;
     for idx in 0..n_slots {
         if purged[idx] {
@@ -491,6 +497,7 @@ pub(crate) fn discard_contained(
             }
         }
     }
+    (ix.purged, ix.bounds) = (purged, bounds);
     KEPT_INDEX.with(|c| *c.borrow_mut() = ix);
 }
 
@@ -553,6 +560,9 @@ struct KeptIndex {
     recs: Vec<(i64, i64, i32, i32, u32, i32)>,
     head: Vec<i32>,
     maxspan: i64,
+    /// [`discard_contained`]'s per-read scratch, kept here for its capacity.
+    purged: Vec<bool>,
+    bounds: Vec<(i64, i64, i32, i32)>,
 }
 
 impl KeptIndex {
