@@ -307,6 +307,11 @@ impl Ends {
 /// # Returns
 /// The weight in bases, in `0 ..= (1 << 30) - 1`.
 pub fn mem_chain_weight(c: &MemChain) -> i32 {
+    seeds_weight(&c.seeds)
+}
+
+/// [`mem_chain_weight`] of a chain whose seeds are `seeds`.
+fn seeds_weight(seeds: &[MemSeed]) -> i32 {
     // ---- Pass 1: non-overlapping coverage on the QUERY (read) side ---------------------------
     // `w` accumulates covered read bases; `covered_to` is the largest exclusive READ offset already
     // counted. Invariant at the top of each iteration: `w` = size of the union of the query spans of
@@ -314,7 +319,7 @@ pub fn mem_chain_weight(c: &MemChain) -> i32 {
     // number only because the spans arrive left to right).
     let mut w = 0i64;
     let mut covered_to = 0i64;
-    for seed in &c.seeds {
+    for seed in seeds {
         // `beg` is a READ offset here, `len` the seed length in bases.
         let (beg, len) = (i64::from(seed.qbeg), i64::from(seed.len));
         if beg >= covered_to {
@@ -334,7 +339,7 @@ pub fn mem_chain_weight(c: &MemChain) -> i32 {
     // takes the `beg >= covered_to` branch and contributes its full length.
     w = 0;
     covered_to = 0;
-    for seed in &c.seeds {
+    for seed in seeds {
         // `beg` is a 2L-space REFERENCE position here (contrast pass 1, where it was a read offset).
         let (beg, len) = (seed.rbeg, i64::from(seed.len));
         if beg >= covered_to {
@@ -903,8 +908,10 @@ const FLAT_CI_BITS: u32 = 20;
 const FLAT_CAP: usize = 2048;
 
 /// Chain the resolved seeds of one read: each seed joins the chain with the largest `pos <= rbeg`
-/// when [`test_and_merge`] accepts it, else opens a chain. Returns the chains in creation order
-/// and the emission order (ascending `pos`), a permutation of their indices.
+/// when [`test_and_merge`] accepts it, else opens a chain. Leaves the chains in `chains` (cleared
+/// first; the caller's, so its allocation outlives the read) in creation order WITHOUT their seeds,
+/// which it leaves in [`POOL`] as `(chain, seed)` in arrival order with each chain's count, and
+/// returns the emission order (ascending `pos`), a permutation of the chains' indices.
 ///
 /// `flat` runs the probe on a sorted array of packed `(pos, chain index)` keys with a binary
 /// search instead of the kbtree (fg-labs/bwa-mem3's flat chaining index): byte-identical while the
@@ -915,6 +922,7 @@ const FLAT_CAP: usize = 2048;
 /// whose `pos` equals its predecessor's declines (`None`, before anything the caller sees is
 /// decided), as do more than [`FLAT_CAP`] chains or a position the key cannot hold; the caller
 /// then replays the read on the tree.
+#[allow(clippy::too_many_arguments)]
 fn chain_seeds(
     bns: &BntSeq,
     opt: &MemOpt,
@@ -923,12 +931,22 @@ fn chain_seeds(
     counts: &[i64],
     rbegs: &[i64],
     flat: bool,
-) -> Option<(Vec<MemChain>, Vec<usize>)> {
+    chains: &mut Vec<MemChain>,
+) -> Option<Vec<usize>> {
     let l_pac = bns.l_pac;
     // Chains in CREATION order; the indices stay valid because nothing is removed.
-    let mut chains: Vec<MemChain> = Vec::new();
+    chains.clear();
     let mut tree = crate::kbtree::KbTree::new();
-    let mut keys: Vec<u64> = Vec::new();
+    // The flat index, the thread's allocation like `ends`: a fresh one per read regrew by
+    // doubling, a realloc and a copy each time.
+    let mut keys = KEYS.take();
+    keys.clear();
+    // Every accepted seed as `(chain, seed)` in arrival order, and each chain's seed count: the
+    // chains' vectors are allocated once at their final size at the end, where pushing into each
+    // as seeds arrived grew it by reallocation (a copy each time).
+    let (mut pool, mut n_seeds) = POOL.take();
+    pool.clear();
+    n_seeds.clear();
     // `ends[i]` is `chains[i]`'s; the allocation is the thread's, kept between reads.
     let mut ends = ENDS.take();
     ends.clear();
@@ -960,7 +978,8 @@ fn chain_seeds(
             if let Some(chain_index) = lower {
                 match test_and_merge(opt, l_pac, &mut ends[chain_index], &seed, rid) {
                     Merge::Appended => {
-                        chains[chain_index].seeds.push(seed);
+                        pool.push((chain_index as u32, seed));
+                        n_seeds[chain_index] += 1;
                         continue;
                     }
                     Merge::Contained => continue,
@@ -973,6 +992,8 @@ fn chain_seeds(
                     || !(0..1i64 << (63 - FLAT_CI_BITS)).contains(&rbeg))
             {
                 ENDS.set(ends);
+                KEYS.set(keys);
+                POOL.set((pool, n_seeds));
                 return None;
             }
             // Slot the new chain will occupy in `chains`, and the payload stored in the index.
@@ -988,10 +1009,12 @@ fn chain_seeds(
                 is_alt: bns.contigs[rid as usize].is_alt,
                 first: -1,
                 frac_rep: 0.0,
-                seeds: vec![seed],
+                seeds: Vec::new(),
             };
             chains.push(chain);
             ends.push(Ends::new(rid, &seed));
+            pool.push((idx as u32, seed));
+            n_seeds.push(1);
             if flat {
                 keys.insert(rank, (rbeg as u64) << FLAT_CI_BITS | idx as u64);
             } else {
@@ -1005,17 +1028,34 @@ fn chain_seeds(
         }
     }
     ENDS.set(ends);
-    let order = if flat {
+    let order: Vec<usize> = if flat {
         keys.iter().map(|&k| (k & ci_mask) as usize).collect()
     } else {
         tree.in_order()
     };
-    Some((chains, order))
+    KEYS.set(keys);
+    POOL.set((pool, n_seeds));
+    Some(order)
 }
 
 thread_local! {
     /// [`chain_seeds`]'s [`Ends`], kept for the allocation.
     static ENDS: std::cell::Cell<Vec<Ends>> = const { std::cell::Cell::new(Vec::new()) };
+    /// [`chain_seeds`]'s flat index keys, kept for the allocation.
+    static KEYS: std::cell::Cell<Vec<u64>> = const { std::cell::Cell::new(Vec::new()) };
+    /// [`chain_seeds`]'s accepted `(chain, seed)` pairs and per-chain counts, kept for the
+    /// allocation.
+    #[allow(clippy::type_complexity)]
+    static POOL: std::cell::Cell<(Vec<(u32, MemSeed)>, Vec<u32>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+    /// [`build_chains_from_resolved`]'s chains in creation order, kept for the allocation. Left
+    /// holding seedless chains between reads (their seeds move out), so clearing frees nothing.
+    static CHAINS: std::cell::Cell<Vec<MemChain>> = const { std::cell::Cell::new(Vec::new()) };
+    /// [`build_filtered_chains`]'s seeds back to back, run ends and filter records, kept for the
+    /// allocation.
+    #[allow(clippy::type_complexity)]
+    static FLAT: std::cell::Cell<(Vec<MemSeed>, Vec<u32>, Vec<FltChain>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
 /// The chain merge, given SMEMs already sorted by [`sa_positions_for_read`] and their occurrence
@@ -1052,6 +1092,124 @@ pub fn build_chains_from_resolved(
     rbegs: &[i64],
 ) -> Vec<MemChain> {
     let t_total = chain_time::enabled().then(std::time::Instant::now);
+    let frac = frac_rep(opt, smems, codes);
+    // The flat index first; the kbtree when it declines (an equal `pos`, or too many chains).
+    let mut chains = CHAINS.take();
+    let order = chain_seeds(bns, opt, seqid, smems, counts, rbegs, true, &mut chains)
+        .unwrap_or_else(|| {
+            chain_seeds(bns, opt, seqid, smems, counts, rbegs, false, &mut chains).unwrap()
+        });
+    // Each chain's seeds, allocated once at their final size and in emission order, so consecutive
+    // chains' seeds sit close in memory.
+    let (pool, n_seeds) = POOL.take();
+    for &i in &order {
+        chains[i].seeds = Vec::with_capacity(n_seeds[i] as usize);
+    }
+    for &(ci, seed) in &pool {
+        chains[ci as usize].seeds.push(seed);
+    }
+    POOL.set((pool, n_seeds));
+    finish_chains(chains, order, frac, t_total)
+}
+
+/// [`build_chains_from_resolved`] then [`mem_chain_flt`], the same chains in the same order, but
+/// only the chains the filter keeps get a seed vector: the weights and spans are read off the
+/// seeds laid back to back in one reused array, where a vector per chain was an allocation for
+/// every chain the filter then dropped.
+pub fn build_filtered_chains(
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[u8],
+    seqid: i32,
+    smems: &[bwa_index::Smem],
+    counts: &[i64],
+    rbegs: &[i64],
+) -> Vec<MemChain> {
+    let t_total = chain_time::enabled().then(std::time::Instant::now);
+    let frac = frac_rep(opt, smems, codes);
+    let mut chains = CHAINS.take();
+    let order = chain_seeds(bns, opt, seqid, smems, counts, rbegs, true, &mut chains)
+        .unwrap_or_else(|| {
+            chain_seeds(bns, opt, seqid, smems, counts, rbegs, false, &mut chains).unwrap()
+        });
+    let (pool, n_seeds) = POOL.take();
+    let (mut flat, mut end, mut ranked) = FLAT.take();
+    // Chain `i`'s seeds at `flat[end[i] - n_seeds[i]..end[i]]`, chains in emission order, each
+    // chain's seeds in arrival order (`end[i]` holds the start until the fill below moves it).
+    end.clear();
+    end.resize(chains.len(), 0);
+    let mut at = 0u32;
+    for &i in &order {
+        end[i] = at;
+        at += n_seeds[i];
+    }
+    flat.clear();
+    flat.resize(
+        at as usize,
+        MemSeed {
+            rbeg: 0,
+            qbeg: 0,
+            len: 0,
+            score: 0,
+        },
+    );
+    for &(ci, seed) in &pool {
+        let e = &mut end[ci as usize];
+        flat[*e as usize] = seed;
+        *e += 1;
+    }
+    let seeds_of = |i: usize| &flat[(end[i] - n_seeds[i]) as usize..end[i] as usize];
+    // `mem_chain_flt`'s weight gate, in its input order.
+    ranked.clear();
+    for &i in &order {
+        let s = seeds_of(i);
+        let w = seeds_weight(s);
+        if w >= opt.min_chain_weight {
+            let last = s[s.len() - 1];
+            ranked.push(FltChain::new(
+                w,
+                s[0].qbeg,
+                last.qbeg + last.len,
+                chains[i].is_alt,
+                i,
+            ));
+        }
+    }
+    if !ranked.is_empty() {
+        flt_ranked(opt, &mut ranked);
+    }
+    let out = ranked
+        .iter()
+        .map(|f| {
+            let c = &chains[f.idx as usize];
+            MemChain {
+                seqid: c.seqid,
+                rid: c.rid,
+                pos: c.pos,
+                w: f.w,
+                kept: f.kept,
+                is_alt: c.is_alt,
+                first: f.first,
+                frac_rep: frac,
+                seeds: seeds_of(f.idx as usize).to_vec(),
+            }
+        })
+        .collect();
+    POOL.set((pool, n_seeds));
+    FLAT.set((flat, end, ranked));
+    chains.clear();
+    CHAINS.set(chains);
+    if let Some(t) = t_total {
+        chain_time::TOTAL_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    out
+}
+
+/// The fraction of the read covered by SMEMs too repetitive to sample fully (`frac_rep`).
+fn frac_rep(opt: &MemOpt, smems: &[bwa_index::Smem], codes: &[u8]) -> f32 {
     // Repetitive length -> frac_rep. Union of the query spans of SMEMs too repetitive to sample
     // fully (`s > max_occ`, i.e. the stride sampling threw occurrences away). Because `smems` is
     // sorted by `m`, the union is computed by a single merge-adjacent-intervals sweep: `[b, e)` is
@@ -1085,16 +1243,20 @@ pub fn build_chains_from_resolved(
     }
     l_rep += rep_end - rep_beg;
 
-    // Forward-strand reference length in bases: the 2L-space split point handed to `test_and_merge`.
-    // The flat index first; the kbtree when it declines (an equal `pos`, or too many chains).
-    let (chains, order) = chain_seeds(bns, opt, seqid, smems, counts, rbegs, true)
-        .unwrap_or_else(|| chain_seeds(bns, opt, seqid, smems, counts, rbegs, false).unwrap());
-
     // ---- Pass 3: stamp frac_rep, then emit in kbtree in-order order ---------------------------
     // Fraction of the READ covered by over-repetitive SMEMs, in 0.0..=1.0. Read-wide, so every chain
     // gets the same value; mapq later uses it to discount hits in repeats.
-    let frac = l_rep as f32 / codes.len() as f32;
-    let mut chains = chains;
+    l_rep as f32 / codes.len() as f32
+}
+
+/// The chains of [`build_chains_from_resolved`] in emission order, each with `frac_rep` set and
+/// its seeds moved out of `chains` (which goes back to [`CHAINS`] empty).
+fn finish_chains(
+    mut chains: Vec<MemChain>,
+    order: Vec<usize>,
+    frac: f32,
+    t_total: Option<std::time::Instant>,
+) -> Vec<MemChain> {
     for c in &mut chains {
         c.frac_rep = frac;
     }
@@ -1129,6 +1291,8 @@ pub fn build_chains_from_resolved(
             }
         })
         .collect();
+    chains.clear();
+    CHAINS.set(chains);
     if let Some(t) = t_total {
         chain_time::TOTAL_NS.fetch_add(
             t.elapsed().as_nanos() as u64,
@@ -1510,29 +1674,66 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
         return chains;
     }
     // ---- Stage 1: weight gate ----------------------------------------------------------------
-    // Chains that passed the weight gate, still in input (kbtree) order until the sort below. This
-    // vector's indices are what `kept_idx` and the `first` field refer to from here on, so it must not
-    // be reordered again after the sort.
-    // `with_capacity`, not `new`: this runs once per read, and growing from empty reallocates about
-    // log2(n) times per call for a vector whose element carries its own `Vec<MemSeed>`. The filter
-    // below can only shrink the input, so the input length is an exact upper bound.
-    let mut ranked: Vec<MemChain> = Vec::with_capacity(chains.len());
-    for mut c in chains {
-        c.first = -1;
-        c.kept = 0;
-        c.w = mem_chain_weight(&c);
-        if c.w >= opt.min_chain_weight {
-            ranked.push(c);
+    // Chains that passed the weight gate, still in input (kbtree) order until the sort below, as
+    // the records the filter works on (`idx`: the chain's input position).
+    let mut ranked: Vec<FltChain> = Vec::with_capacity(chains.len());
+    for (i, c) in chains.iter().enumerate() {
+        let w = mem_chain_weight(c);
+        if w >= opt.min_chain_weight {
+            ranked.push(FltChain::new(w, chn_beg(c), chn_end(c), c.is_alt, i));
         }
     }
     if ranked.is_empty() {
-        return ranked;
+        return Vec::new();
     }
+    flt_ranked(opt, &mut ranked);
+    let mut chains: Vec<Option<MemChain>> = chains.into_iter().map(Some).collect();
+    ranked
+        .iter()
+        .map(|f| {
+            let mut c = chains[f.idx as usize].take().unwrap();
+            (c.w, c.kept, c.first) = (f.w, f.kept, f.first);
+            c
+        })
+        .collect()
+}
 
+/// What [`mem_chain_flt`]'s pruning reads of a chain (weight, query span `[beg, end)`, ALT flag)
+/// and the marks it sets (`first`, `kept`), apart from the chain and its seeds: the batched
+/// chainer filters before any chain's seeds have a vector of their own.
+#[derive(Clone, Copy)]
+struct FltChain {
+    w: i32,
+    beg: i32,
+    end: i32,
+    first: i32,
+    kept: u8,
+    is_alt: bool,
+    idx: u32,
+}
+
+impl FltChain {
+    fn new(w: i32, beg: i32, end: i32, is_alt: bool, idx: usize) -> Self {
+        FltChain {
+            w,
+            beg,
+            end,
+            first: -1,
+            kept: 0,
+            is_alt,
+            idx: idx as u32,
+        }
+    }
+}
+
+/// [`mem_chain_flt`]'s stage 2 on the chains that passed the weight gate, in input order:
+/// sorted heaviest-first, shadowed chains dropped, `kept`/`first` filled in. Indices in `first`
+/// refer to `ranked` after the sort and before the final `retain`, as in the C.
+fn flt_ranked(opt: &MemOpt, ranked: &mut Vec<FltChain>) {
     // ---- Stage 2: sort heaviest-first, then prune shadowed chains -----------------------------
     // Sort by weight descending with bwa-mem2's exact (unstable) `ks_introsort`, so equal-weight
     // overlapping chains are ordered identically to the oracle (`flt_lt(a, b) = a.w > b.w`).
-    ks_introsort_by(&mut ranked, |x, y| x.w > y.w);
+    ks_introsort_by(ranked, |x, y| x.w > y.w);
 
     // The heaviest chain is always kept unconditionally, and seeds the accepted list.
     ranked[0].kept = 3;
@@ -1565,17 +1766,12 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
         // `ib`/`ie` = this chain's half-open QUERY span in read offsets (no reference coordinate is
         // consulted anywhere in this loop), `iw` its weight in bases, `ialt` whether it is on an ALT
         // contig. Hoisted because `ranked[j]` is borrowed mutably below.
-        let (ib, ie, iw, ialt) = (
-            chn_beg(&ranked[i]),
-            chn_end(&ranked[i]),
-            ranked[i].w,
-            ranked[i].is_alt,
-        );
+        let (ib, ie, iw, ialt) = (ranked[i].beg, ranked[i].end, ranked[i].w, ranked[i].is_alt);
         // Whether accepted chain `j` overlaps `i` "significantly": the query-span intersection
         // `[b_max, e_min)` is non-empty, an ALT chain never shadows a primary one, and the overlap
         // covers `mask_level` of the shorter span, which is under `max_chain_gap`.
-        let sig = |j: usize, ranked: &[MemChain]| -> bool {
-            let (jb, je, jalt) = (chn_beg(&ranked[j]), chn_end(&ranked[j]), ranked[j].is_alt);
+        let sig = |j: usize, ranked: &[FltChain]| -> bool {
+            let (jb, je, jalt) = (ranked[j].beg, ranked[j].end, ranked[j].is_alt);
             let b_max = jb.max(ib);
             let e_min = je.min(ie);
             if !(e_min > b_max && (!jalt || ialt)) {
@@ -1587,7 +1783,7 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
         // Phase 1: to the first significant overlap.
         let (mut large_ovlp, mut dominated, mut k0) = (false, false, -1i32);
         for (k, &j) in kept_idx.iter().enumerate() {
-            if sig(j, &ranked) {
+            if sig(j, ranked) {
                 large_ovlp = true;
                 if ranked[j].first < 0 {
                     // Record the FIRST chain this accepted chain shadows, so mapq can later account
@@ -1612,7 +1808,7 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
             let mut p = f0_head;
             while p >= 0 {
                 let nx = nxt[p as usize];
-                if p > k0 && sig(kept_idx[p as usize], &ranked) {
+                if p > k0 && sig(kept_idx[p as usize], ranked) {
                     ranked[kept_idx[p as usize]].first = i as i32;
                     f0_remove(&mut nxt, &mut prv, &mut f0_head, &mut f0_tail, p);
                 }
@@ -1687,7 +1883,6 @@ pub fn mem_chain_flt(opt: &MemOpt, chains: Vec<MemChain>) -> Vec<MemChain> {
     ranked.retain(|c| c.kept != 0);
     // Hand the scratch back for the next read on this thread.
     FLT_SCRATCH.with(|c| *c.borrow_mut() = (kept_idx, nxt, prv));
-    ranked
 }
 
 /// Unlink accepted position `p` from the unshadowed list.
@@ -2026,18 +2221,43 @@ mod tests {
                 }
             }
             total += 1;
-            let tree = chain_seeds(&bns, &opt, 7, &smems, &counts, &rbegs, false).unwrap();
-            if let Some(flat) = chain_seeds(&bns, &opt, 7, &smems, &counts, &rbegs, true) {
+            // Each chain's seeds are left in `POOL`, as `(chain, seed)` in arrival order.
+            let emit = |chains: &[MemChain], order: Vec<usize>| -> Vec<(i64, Vec<MemSeed>)> {
+                let (pool, _) = POOL.take();
+                let seeds = |i: usize| -> Vec<MemSeed> {
+                    pool.iter()
+                        .filter(|&&(c, _)| c as usize == i)
+                        .map(|&(_, s)| s)
+                        .collect()
+                };
+                order.iter().map(|&i| (chains[i].pos, seeds(i))).collect()
+            };
+            let mut chains = Vec::new();
+            let order = chain_seeds(&bns, &opt, 7, &smems, &counts, &rbegs, false, &mut chains);
+            let tree = emit(&chains, order.unwrap());
+            let order = chain_seeds(&bns, &opt, 7, &smems, &counts, &rbegs, true, &mut chains);
+            if let Some(order) = order {
                 accepted += 1;
-                let emit =
-                    |(chains, order): (Vec<MemChain>, Vec<usize>)| -> Vec<(i64, Vec<MemSeed>)> {
-                        order
-                            .iter()
-                            .map(|&i| (chains[i].pos, chains[i].seeds.clone()))
-                            .collect()
-                    };
-                assert_eq!(emit(flat), emit(tree));
+                assert_eq!(emit(&chains, order), tree);
             }
+            // Chaining and filtering fused: the same kept chains as the two steps in turn.
+            let codes = vec![0u8; 200];
+            let key = |cs: Vec<MemChain>| -> Vec<_> {
+                cs.into_iter()
+                    .map(|c| {
+                        (
+                            c.pos, c.rid, c.w, c.kept, c.first, c.is_alt, c.frac_rep, c.seeds,
+                        )
+                    })
+                    .collect()
+            };
+            let two = mem_chain_flt(
+                &opt,
+                build_chains_from_resolved(&bns, &opt, &codes, 7, &smems, &counts, &rbegs),
+            );
+            let fused = build_filtered_chains(&bns, &opt, &codes, 7, &smems, &counts, &rbegs);
+            assert!(!two.is_empty());
+            assert_eq!(key(fused), key(two));
         }
         assert!(accepted * 2 > total, "flat accepted {accepted} of {total}");
     }

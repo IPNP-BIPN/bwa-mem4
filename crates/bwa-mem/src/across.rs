@@ -1143,15 +1143,28 @@ fn align_reads_batched_inner<B: SwBackend>(
         .enumerate()
         .zip(reads.iter())
         .map(|((ridx, smems), codes)| {
-            // This read's chains *before* filtering (the C's pre-`mem_chain_flt` list).
-            let pre = if batched_sa {
-                // `counts`: positions contributed by each of this read's SMEMs. `n`: their total,
-                // i.e. how far `sa_cursor` must advance. `rbegs`: this read's own slice of the flat
-                // resolved-position array, in the order the chain builder expects.
+            // `counts`: positions contributed by each of this read's SMEMs. `n`: their total, i.e.
+            // how far `sa_cursor` must advance. `rbegs`: this read's own slice of the flat
+            // resolved-position array, in the order the chain builder expects.
+            let resolved = batched_sa.then(|| {
                 let counts = &per_read_counts[ridx];
                 let n: usize = counts.iter().map(|c| *c as usize).sum();
                 let rbegs = &all_rbegs[sa_cursor..sa_cursor + n];
                 sa_cursor += n;
+                (counts, rbegs)
+            });
+            // Chained and filtered in one step unless the pre-filter chains are dumped: only the
+            // kept chains get seed vectors.
+            if let (Some((counts, rbegs)), false) = (resolved, dump_chains) {
+                let mut out =
+                    bwa_chain::build_filtered_chains(bns, opt, codes, 0, &smems, counts, rbegs);
+                align_split::measure(&align_split::CHAINFLT_NS, || {
+                    crate::seedflt::mem_flt_chained_seeds(fm, bns, opt, codes, &mut out);
+                });
+                return out;
+            }
+            // This read's chains *before* filtering (the C's pre-`mem_chain_flt` list).
+            let pre = if let Some((counts, rbegs)) = resolved {
                 bwa_chain::build_chains_from_resolved(bns, opt, codes, 0, &smems, counts, rbegs)
             } else {
                 build_chains_from_smems(fm, bns, opt, codes, 0, smems)
