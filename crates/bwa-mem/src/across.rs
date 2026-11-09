@@ -1265,6 +1265,16 @@ fn align_reads_batched_inner<B: SwBackend>(
     // anyway, and this way each read's bases and each chain's window are stored ONCE instead of
     // once per seed that slices them.
     let mut arena: Vec<u8> = ARENA.take();
+    // `cal_max_gap` by length for every length a read can produce (`qbeg` and the tail lie in
+    // `0..=len`): the window loop below reads it twice per seed.
+    let max_len = reads.iter().map(|r| r.as_ref().len()).max().unwrap_or(0);
+    let gap_of: Vec<i32> = (0..=max_len as i32).map(|q| cal_max_gap(opt, q)).collect();
+    let gap = |q: i32| {
+        usize::try_from(q)
+            .ok()
+            .and_then(|i| gap_of.get(i).copied())
+            .unwrap_or_else(|| cal_max_gap(opt, q))
+    };
     arena.clear();
     for (r, codes) in reads.iter().enumerate() {
         // This read's bases in the arena, forward then reversed. Right-side jobs slice the forward
@@ -1310,14 +1320,12 @@ fn align_reads_batched_inner<B: SwBackend>(
             for seed in &chain.seeds {
                 // How far left the alignment could possibly reach: the `qbeg` unaligned query bases
                 // ahead of the seed, plus room for the longest indel those bases could pay for.
-                let win_beg =
-                    seed.rbeg - (i64::from(seed.qbeg) + i64::from(cal_max_gap(opt, seed.qbeg)));
+                let win_beg = seed.rbeg - (i64::from(seed.qbeg) + i64::from(gap(seed.qbeg)));
                 // Symmetrically to the right, over the `tail` bases after the seed: `tail` is the
                 // count of unaligned query bases past the seed's 3' end.
                 let tail = l_query - seed.qbeg - seed.len;
-                let win_end = seed.rbeg
-                    + i64::from(seed.len)
-                    + (i64::from(tail) + i64::from(cal_max_gap(opt, tail)));
+                let win_end =
+                    seed.rbeg + i64::from(seed.len) + (i64::from(tail) + i64::from(gap(tail)));
                 rmax0 = rmax0.min(win_beg);
                 rmax1 = rmax1.max(win_end);
             }
