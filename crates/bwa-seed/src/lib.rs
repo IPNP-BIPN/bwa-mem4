@@ -469,14 +469,14 @@ fn collect_smems_batched_bsd(
             };
             slot.step(fm, reads[slot.ridx], min_seed_len, &counts);
             if slot.phase == LsPhase::Done {
-                // Rust: this is the move-out problem and its sanctioned solution. `slot.out` is a
-                // vector owned by a struct that is still in use, so it cannot simply be handed over.
-                // `take` swaps it for an empty vector and returns the original, transferring the
-                // seeds to the output with no copy while leaving `slot` in a valid state, ready to
-                // be reset onto the next read.
-                // Sized like the walk just done, so the next read's pushes rarely regrow it.
-                let cap = slot.out.len();
-                output[slot.ridx] = std::mem::replace(&mut slot.out, Vec::with_capacity(cap));
+                // Copied out with room for rounds 2 and 3, which append in place: on GIAB a read
+                // leaves round 1 with 2.5 SMEMs and ends with 12.8, and handing over the walk's own
+                // buffer made both rounds regrow it (a realloc and a copy each). The slot keeps its
+                // buffer for the next read.
+                let mut v = Vec::with_capacity(slot.out.len() + SMEM_HEADROOM);
+                v.extend_from_slice(&slot.out);
+                slot.out.clear();
+                output[slot.ridx] = v;
                 if bsd.is_some() {
                     walks[slot.ridx] = slot.bsd;
                 }
@@ -1731,6 +1731,10 @@ pub fn mem_collect_smem(fm: &FmIndex, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
     smem_rounds_2_3(fm, codes, opt, &mut smems);
     smems
 }
+
+/// Spare SMEM slots a read's round-1 vector is given for rounds 2 and 3 (see
+/// `collect_smems_batched_bsd`).
+const SMEM_HEADROOM: usize = 16;
 
 /// Batched seeding for a read batch: round-1 SMEMs are collected in **lockstep**
 /// ([`collect_smems_batched`], hiding FM-index latency), then rounds 2/3 (re-seeding + interval-capped
