@@ -1500,7 +1500,7 @@ impl FmIndex {
         )
     }
 
-    /// [`occ4`](Self::occ4) for a genome that is not `wide`, where 32 bits hold any count.
+    /// [`occ4`](Self::occ4) less a `wide` genome's span bases, where 32 bits hold any count.
     ///
     /// All four in one vector on AArch64, where a scalar popcount has to cross to the vector unit and
     /// back: this is `backward_ext`'s whole cost, and the sums below are about 15 instructions for
@@ -1839,27 +1839,12 @@ impl FmIndex {
             p += 1;
             if s >= min_intv && s != curr_s {
                 curr_s = s;
-                // x86 copies the 40-byte candidate field by field (811M instructions on chr21
-                // under callgrind); most survivors stay where they are, so only the three new
-                // fields are written there. AArch64 copies it in two load/store pairs, cheaper
-                // than the test (+2.5G instructions on M4 the other way).
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    if kept != p - 1 {
-                        prev[kept] = prev[p - 1];
-                    }
-                    let d = &mut prev[kept];
-                    (d.k, d.s, d.m) = (k, s, m);
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    prev[kept] = Smem {
-                        k,
-                        s,
-                        m,
-                        ..prev[p - 1]
-                    };
-                }
+                prev[kept] = Smem {
+                    k,
+                    s,
+                    m,
+                    ..prev[p - 1]
+                };
                 kept += 1;
                 self.prefetch_occ(k, k + s);
             }
@@ -1871,7 +1856,7 @@ impl FmIndex {
     /// appended on the right, `n` unchanged. The same result as swapping `k`/`l`, calling
     /// [`backward_ext`](Self::backward_ext) with the complement `3 - aj` and swapping back.
     ///
-    /// For a genome that is not `wide`, only what the swapped-back result reads is
+    /// Only what the swapped-back result reads is
     /// computed: base `c`'s count and size, and the summed sizes of the bases above it (the `l`
     /// recurrence), on AArch64 as three vector reductions of the two blocks' counts, elsewhere as
     /// scalar popcounts. `backward_ext` builds all
@@ -1879,40 +1864,63 @@ impl FmIndex {
     /// round 3's walks, which are compute-bound.
     #[inline(always)]
     pub fn forward_ext(&self, smem: Smem, aj: usize) -> Smem {
-        let c = 3 - aj;
+        // GRCh38 is `wide`: its trimmed copy only adds the span bases.
+        if self.wide {
+            self.forward_ext_trimmed::<true>(smem, 3 - aj)
+        } else {
+            self.forward_ext_trimmed::<false>(smem, 3 - aj)
+        }
+    }
+
+    /// [`forward_ext`](Self::forward_ext) by the complement `c`.
+    #[inline(always)]
+    fn forward_ext_trimmed<const WIDE: bool>(&self, smem: Smem, c: usize) -> Smem {
+        let (sp, ep) = (smem.l, smem.l + smem.s);
+        // As in `backward_ext`: the sentinel row inside `[sp, ep)` shifts the `l` side by one.
+        let so = i64::from((sp <= self.sentinel_index) & (ep > self.sentinel_index));
         #[cfg(target_arch = "aarch64")]
-        if !self.wide {
+        {
             use std::arch::aarch64::*;
-            let sp = smem.l;
-            let ep = smem.l + smem.s;
             let o_sp = self.occ4_narrow(&self.cp_occ[(sp >> CP_SHIFT) as usize], sp);
             let o_ep = self.occ4_narrow(&self.cp_occ[(ep >> CP_SHIFT) as usize], ep);
+            // Counts relative to each end's span. Each base's true difference is below 2^32 (no
+            // interval holds 2^32 rows of one base), so adding the low halves of the span bases
+            // gives it in u32 lanes; only `c`'s count at `sp` needs the full base.
+            let (base_sp, base_ep) = if WIDE {
+                let span = |row: i64| &self.count_base[(row >> self.count_span_shift) as usize];
+                (*span(sp), *span(ep))
+            } else {
+                ([0; 4], [0; 4])
+            };
             // SAFETY: NEON is mandatory on AArch64; the loads read four-element local arrays.
             let (kc, sc, sgt) = unsafe {
-                let (vsp, vep) = (vld1q_u32(o_sp.as_ptr()), vld1q_u32(o_ep.as_ptr()));
-                let d = vsubq_u32(vep, vsp);
+                let (mut vsp, mut vep) = (vld1q_u32(o_sp.as_ptr()), vld1q_u32(o_ep.as_ptr()));
                 let lane = vld1q_u32([0u32, 1, 2, 3].as_ptr());
                 let cv = vdupq_n_u32(c as u32);
                 let (eq, gt) = (vceqq_u32(lane, cv), vcgtq_u32(lane, cv));
+                let kc = vaddvq_u32(vandq_u32(vsp, eq));
+                if WIDE {
+                    vsp = vaddq_u32(vsp, vld1q_u32(base_sp.map(|b| b as u32).as_ptr()));
+                    vep = vaddq_u32(vep, vld1q_u32(base_ep.map(|b| b as u32).as_ptr()));
+                }
+                let d = vsubq_u32(vep, vsp);
                 (
-                    vaddvq_u32(vandq_u32(vsp, eq)),
+                    kc,
                     vaddvq_u32(vandq_u32(d, eq)),
                     vaddlvq_u32(vandq_u32(d, gt)),
                 )
             };
-            // As in `backward_ext`: the sentinel row inside `[sp, ep)` shifts the `l` side by one.
-            let so = i64::from((sp <= self.sentinel_index) & (ep > self.sentinel_index));
-            return Smem {
+            Smem {
                 k: smem.k + so + sgt as i64,
-                l: self.count[c] + i64::from(kc),
+                l: self.count[c] + i64::from(kc) + base_sp[c],
                 s: i64::from(sc),
                 ..smem
-            };
+            }
         }
         // Elsewhere the same three quantities from scalar popcounts: base `c`'s count at each end,
         // and the rows above `c` (planes `hi | lo`, `hi`, `hi & lo` for `c` = A, C, G).
         #[cfg(not(target_arch = "aarch64"))]
-        if !self.wide {
+        {
             let (hx, lx) = (
                 ((c as u64 >> 1) & 1).wrapping_sub(1),
                 (c as u64 & 1).wrapping_sub(1),
@@ -1926,27 +1934,26 @@ impl FmIndex {
                 let b = &cp[(row >> CP_SHIFT) as usize];
                 let plane = (b.hi & mh) | (b.lo & ml) | (b.hi & b.lo & mhl);
                 // In i64: three counts of a human genome overflow u32.
-                let before: i64 = (0..4)
+                let mut before: i64 = (0..4)
                     .map(|x| i64::from(b.cp_count[x]) & 0i64.wrapping_sub(i64::from(x > c)))
                     .sum();
+                if WIDE {
+                    let base = &self.count_base[(row >> self.count_span_shift) as usize];
+                    before += (0..4)
+                        .map(|x| base[x] & 0i64.wrapping_sub(i64::from(x > c)))
+                        .sum::<i64>();
+                }
                 before + i64::from((plane & rows_before(row & CP_MASK)).count_ones())
             };
-            let (sp, ep) = (smem.l, smem.l + smem.s);
-            let kc = self.occ_hoisted::<false, true>(cp, sp, c, hx, lx);
-            let sc = self.occ_hoisted::<false, true>(cp, ep, c, hx, lx) - kc;
-            let so = i64::from((sp <= self.sentinel_index) & (ep > self.sentinel_index));
-            return Smem {
+            let kc = self.occ_hoisted::<WIDE, true>(cp, sp, c, hx, lx);
+            let sc = self.occ_hoisted::<WIDE, true>(cp, ep, c, hx, lx) - kc;
+            Smem {
                 k: smem.k + so + gt(ep) - gt(sp),
                 l: self.count[c] + kc,
                 s: sc,
                 ..smem
-            };
+            }
         }
-        let mut rc = smem;
-        std::mem::swap(&mut rc.k, &mut rc.l);
-        let mut e = self.backward_ext(rc, c);
-        std::mem::swap(&mut e.k, &mut e.l);
-        e
     }
 
     #[inline(always)]
@@ -2935,7 +2942,8 @@ mod tests {
         let n_blocks = 40usize;
         let full = |block: usize| -> [i64; 4] {
             let b = block as i64;
-            [(1 << 32) - 100 + 7 * b, 3 * b, (5 << 32) + 11 * b, b]
+            // Each plane pair below holds 16 rows of every base per block, so counts grow by 16.
+            [(1 << 32) - 100 + 16 * b, 16 * b, (5 << 32) + 16 * b, 16 * b]
         };
         let mut cp_occ: Vec<CpOcc> = (0..n_blocks)
             .map(|b| CpOcc {
@@ -2983,6 +2991,28 @@ mod tests {
                 for (b, &w) in want.iter().enumerate() {
                     assert_eq!(fm.get_occ(row, b), w, "get_occ of {b} at row {row}");
                 }
+            }
+        }
+        // The trimmed forward step against the full backward one it stands for, across spans.
+        let rows = (n_blocks as i64) << CP_SHIFT;
+        for (i, (l, s)) in (0..rows)
+            .step_by(37)
+            .flat_map(|l| [1i64, 5, 64, 300, 1500].map(|s| (l, s)))
+            .filter(|&(l, s)| l + s < rows)
+            .enumerate()
+        {
+            let smem = Smem {
+                k: i as i64 * 13,
+                l,
+                s,
+                ..Default::default()
+            };
+            for aj in 0..4 {
+                let mut rc = smem;
+                std::mem::swap(&mut rc.k, &mut rc.l);
+                let mut want = fm.backward_ext(rc, 3 - aj);
+                std::mem::swap(&mut want.k, &mut want.l);
+                assert_eq!(fm.forward_ext(smem, aj), want, "l {l} s {s} aj {aj}");
             }
         }
     }
