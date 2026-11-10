@@ -1054,9 +1054,7 @@ impl FmIndex {
 
         // Differences of adjacent `count` entries are the per-base totals, and a total below 2^32
         // means every count below it fits too.
-        // `BWA4_FORCE_WIDE` gives a small genome GRCh38's layout, so a chr21 run measures its path.
-        let wide = count.windows(2).any(|w| w[1] - w[0] >= 1 << 32)
-            || std::env::var_os("BWA4_FORCE_WIDE").is_some();
+        let wide = count.windows(2).any(|w| w[1] - w[0] >= 1 << 32);
         // One span entry per 2^32 rows, read straight from the file's full-width counts at each
         // span's first block. The `+ 1` is the span holding row `ref_seq_len` itself.
         let n_spans = if wide {

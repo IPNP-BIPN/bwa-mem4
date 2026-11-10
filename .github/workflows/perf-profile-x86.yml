@@ -459,7 +459,7 @@ jobs:
           # which under valgrind would pick a width no real run uses.
           export BWA4_LOCKSTEP_N=8
           cg="valgrind --tool=callgrind --dump-instr=no --collect-jumps=no --compress-pos=no --compress-strings=no"
-          # OURS_ENV applies to ours only here, e.g. BWA4_FORCE_WIDE=1 for GRCh38's count layout.
+          # OURS_ENV applies to ours only here.
           read -ra kv <<< "$OURS_ENV"
           env "${kv[@]}" $cg --callgrind-out-file=ours.cg ../mem4-v3 mem -t 1 chr21.fa sim1.fq sim2.fq 2>ours.err >ours.sam \
             || { tail -40 ours.err; exit 1; }
