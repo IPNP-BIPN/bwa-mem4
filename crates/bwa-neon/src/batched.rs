@@ -945,25 +945,33 @@ fn prefetch_job(jobs: &[ExtendJob], k: usize) {
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
-    /// Fold every byte of `s` into `h`, 32 at a time in four independent multiply chains so the
-    /// latency of one does not serialise the rest. Covering only 32 bytes at each end let 121M of
-    /// 126M candidate pairs on 1M chr21 pairs collide (repeat windows share their ends), and the
-    /// byte comparisons that rejected them cost more than hashing everything.
+    /// Fold every byte of `s` into `h`, 32 at a time in two independent chains of 64 x 64 -> 128
+    /// multiplies folded back to 64 bits (wyhash's `mum`), one per 16 bytes. Covering only 32 bytes
+    /// at each end let 121M of 126M candidate pairs on 1M chr21 pairs collide (repeat windows share
+    /// their ends), and the byte comparisons that rejected them cost more than hashing everything.
+    /// Four chains of 64-bit multiplies were vectorised by LLVM into emulated AVX2 `vpmuludq`
+    /// sequences, a latency chain that was a fifth of `dispatch_bins` on Zen 5; a 128-bit product
+    /// stays a scalar `mul`. Any fingerprint is correct: equal ones are confirmed byte by byte.
     fn fold(h: &mut u64, s: &[u8]) {
-        const P: u64 = 0x1000_0000_01b3;
+        const S0: u64 = 0xa076_1d64_78bd_642f;
+        const S1: u64 = 0xe703_7ed1_a0b4_28db;
+        const S2: u64 = 0x8ebc_6af0_9c88_c6e3;
+        #[inline(always)]
+        fn mum(a: u64, b: u64) -> u64 {
+            let r = u128::from(a) * u128::from(b);
+            r as u64 ^ (r >> 64) as u64
+        }
         let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
-        let mut acc = [*h, h.rotate_left(16), h.rotate_left(32), h.rotate_left(48)];
+        let (mut a, mut b) = (*h, *h ^ S2);
         let (blocks, rest) = s.as_chunks::<32>();
         for blk in blocks {
-            for (i, a) in acc.iter_mut().enumerate() {
-                *a = (*a ^ word(&blk[8 * i..8 * i + 8])).wrapping_mul(P);
-            }
+            a = mum(word(&blk[..8]) ^ S0, word(&blk[8..16]) ^ a);
+            b = mum(word(&blk[16..24]) ^ S1, word(&blk[24..]) ^ b);
         }
-        let mut t =
-            acc[0] ^ acc[1].rotate_left(13) ^ acc[2].rotate_left(29) ^ acc[3].rotate_left(43);
+        let mut t = a ^ b.rotate_left(32);
         let (words, tail) = rest.as_chunks::<8>();
         for w in words {
-            t = (t ^ u64::from_le_bytes(*w)).wrapping_mul(P);
+            t = mum(u64::from_le_bytes(*w) ^ S0, t ^ S1);
         }
         if !tail.is_empty() {
             // The last eight bytes, overlapping the words before: the lengths are already in `h`.
@@ -971,9 +979,9 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
                 Some(at) => word(&s[at..]),
                 None => tail.iter().rev().fold(0, |v, &b| v << 8 | u64::from(b)),
             };
-            t = (t ^ v).wrapping_mul(P);
+            t = mum(v ^ S0, t ^ S1);
         }
-        *h = (t ^ t >> 29).wrapping_mul(P);
+        *h = mum(t ^ S2, S1);
     }
 
     // Fingerprints first, in a streaming pass, so the table probes below can be prefetched ahead.
