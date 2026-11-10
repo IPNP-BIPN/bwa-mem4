@@ -311,11 +311,23 @@ fn probe_lockstep_width(fm: &FmIndex) -> usize {
     // chase picks 64 (sometimes 32) and the walk is 2% slower in cycles at 64 than at 16 or 32 (2M
     // GIAB reads, -t8). The fork's tuned widths sit at the same half: 16 on M4 (chase knee ~28) and
     // 32 on Zen 5 (~58).
+    //
+    // Except on Zen 5, which runs a slot's step fast enough that half the knee no longer covers
+    // the latency: EPYC 9V45's chase knee is 12 on CI's index (as on Zen 4's 9V74), and same-host
+    // A/B against the halved 8 gave 12 -2.7% (SMEM -4%), 16 -1.3%, 32 -0.9%, where Zen 3 and 4
+    // lose at wider widths. The fork also widens on Zen 5 only (`bwa3_cpu_is_amd_zen5`).
+    let zen5 = amd_zen5();
     let width = CANDIDATES
         .iter()
         .zip(&times)
         .find(|(_, &ns)| ns <= best * 1.05)
-        .map(|(k, _)| (*k / 2).max(CANDIDATES[0]))
+        .map(|(k, _)| {
+            if zen5 {
+                *k
+            } else {
+                (*k / 2).max(CANDIDATES[0])
+            }
+        })
         .unwrap_or(DEFAULT_LOCKSTEP_WIDTH);
 
     if std::env::var_os("BWA4_LOCKSTEP_PROBE").is_some() {
@@ -326,6 +338,31 @@ fn probe_lockstep_width(fm: &FmIndex) -> usize {
         eprintln!("[lockstep-probe] chosen width {width}");
     }
     width
+}
+
+/// Whether this host is an AMD Zen 5 (family 0x1A, the model ranges Linux's `bsp_init_amd`
+/// assigns to Zen 5).
+fn amd_zen5() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (v, id) = (
+            std::arch::x86_64::__cpuid(0),
+            std::arch::x86_64::__cpuid(1).eax,
+        );
+        let amd = (v.ebx, v.edx, v.ecx) == (0x6874_7541, 0x6974_6E65, 0x444D_4163);
+        let family = (id >> 8 & 0xF) + (id >> 20 & 0xFF);
+        let model = (id >> 4 & 0xF) | (id >> 12 & 0xF0);
+        amd && zen5_model(family, model)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+/// Family 0x1A models that are Zen 5: 0x00-0x2F, 0x40-0x4F, 0x60-0x7F, 0xD0-0xD7 (the rest of
+/// the family is Zen 6).
+#[cfg(any(target_arch = "x86_64", test))]
+fn zen5_model(family: u32, model: u32) -> bool {
+    family == 0x1A && matches!(model, 0x00..=0x2F | 0x40..=0x4F | 0x60..=0x7F | 0xD0..=0xD7)
 }
 
 /// Lockstep width: how many independent FM walks are kept in flight, so each slot's `cp_occ`
@@ -2121,6 +2158,15 @@ pub fn seeds_from_smem(fm: &FmIndex, smem: &Smem, max_occ: i32) -> Vec<MemSeed> 
 
 #[cfg(test)]
 mod tests {
+    use super::zen5_model;
+
+    #[test]
+    fn zen5_models() {
+        // Turin, Turin dense, Strix Point: Zen 5. Genoa (family 0x19) and a Zen 6 model: not.
+        assert!(zen5_model(0x1A, 0x02) && zen5_model(0x1A, 0x11) && zen5_model(0x1A, 0x24));
+        assert!(!zen5_model(0x19, 0x11) && !zen5_model(0x1A, 0x50) && !zen5_model(0x1A, 0xD8));
+    }
+
     use super::*;
     use std::path::Path;
 
