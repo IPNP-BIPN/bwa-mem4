@@ -128,8 +128,12 @@ pub struct MemChain {
     /// (`s > max_occ`). Read-wide, so every chain of a read gets the same value. Feeds mapq.
     pub frac_rep: f32,
     /// The chain's seeds, in the order they were appended, which is ascending `qbeg`.
-    pub seeds: Vec<MemSeed>,
+    pub seeds: ChainSeeds,
 }
+
+/// A chain's seeds, the first two held inline: 96% of GIAB's kept chains have one or two (82% one,
+/// mostly repeat hits), and a heap vector each was 11 of a read's 34 allocations.
+pub type ChainSeeds = smallvec::SmallVec<[MemSeed; 2]>;
 
 /// Chain span on the **query**, from `bwamem.cpp`'s `chn_beg`/`chn_end` macros. Half-open
 /// `[chn_beg, chn_end)`. Valid only because seeds are appended in ascending `qbeg` and never sorted.
@@ -1009,7 +1013,7 @@ fn chain_seeds(
                 is_alt: bns.contigs[rid as usize].is_alt,
                 first: -1,
                 frac_rep: 0.0,
-                seeds: Vec::new(),
+                seeds: ChainSeeds::new(),
             };
             chains.push(chain);
             ends.push(Ends::new(rid, &seed));
@@ -1103,7 +1107,7 @@ pub fn build_chains_from_resolved(
     // chains' seeds sit close in memory.
     let (pool, n_seeds) = POOL.take();
     for &i in &order {
-        chains[i].seeds = Vec::with_capacity(n_seeds[i] as usize);
+        chains[i].seeds = ChainSeeds::with_capacity(n_seeds[i] as usize);
     }
     for &(ci, seed) in &pool {
         chains[ci as usize].seeds.push(seed);
@@ -1191,7 +1195,7 @@ pub fn build_filtered_chains(
                 is_alt: c.is_alt,
                 first: f.first,
                 frac_rep: frac,
-                seeds: seeds_of(f.idx as usize).to_vec(),
+                seeds: ChainSeeds::from_slice(seeds_of(f.idx as usize)),
             }
         })
         .collect();
@@ -2054,7 +2058,7 @@ mod tests {
                 .map(|k| {
                     let nseed = 1 + next() % 3;
                     let mut q = (next() % 120) as i32;
-                    let seeds: Vec<MemSeed> = (0..nseed)
+                    let seeds: ChainSeeds = (0..nseed)
                         .map(|_| {
                             let len = (19 + next() % 60) as i32;
                             let s = MemSeed {
