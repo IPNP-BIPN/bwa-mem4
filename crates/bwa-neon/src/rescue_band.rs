@@ -608,6 +608,13 @@ impl Batch {
                 };
             }
         }
+        // Flushed here, or the next `run` subtracts this pass's kernel time from its own clock
+        // and the probe's "other" wraps around.
+        if crate::matesw::cells::enabled() {
+            crate::matesw::cells::BAND_KERNEL_NS
+                .fetch_add(self.work.kernel_ns, std::sync::atomic::Ordering::Relaxed);
+            self.work.kernel_ns = 0;
+        }
     }
 
     /// `score2`/`te2` of a merged parent from its row maxima.
