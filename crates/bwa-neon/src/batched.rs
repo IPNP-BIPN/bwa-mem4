@@ -865,7 +865,7 @@ fn simd_dispatch(
     let dedup_on = job_dedup_enabled();
     let mut fps: Vec<u64> = Vec::new();
     for (k, job) in jobs.iter().enumerate() {
-        prefetch_job(jobs, k + 4);
+        prefetch_job(jobs, k + pf_knobs().1);
         match ungapped_hit(job, a, b, x_threshold, zdrop) {
             Some(result) => out[k] = result,
             None => {
@@ -945,11 +945,31 @@ fn prefetch<T>(p: *const T) {
 #[inline(always)]
 fn prefetch_job(jobs: &[ExtendJob], k: usize) {
     if let Some(n) = jobs.get(k) {
-        for p in [n.query.as_ptr(), n.target.as_ptr()] {
-            prefetch(p);
-            prefetch(p.wrapping_add(64));
+        let lines = pf_knobs().0;
+        for s in [n.query, n.target] {
+            let p = s.as_ptr();
+            for i in 0..lines.min(s.len().div_ceil(64)) {
+                prefetch(p.wrapping_add(64 * i));
+            }
         }
     }
+}
+
+/// shortcut: measurement knobs `BWA4_PF_LINES` / `BWA4_PF_AHEAD` (lines per sequence, jobs
+/// ahead; default 2 and 4), for a same-machine CI A/B; delete once settled.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn pf_knobs() -> (usize, usize) {
+    static K: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let get = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        (get("BWA4_PF_LINES", 2), get("BWA4_PF_AHEAD", 4))
+    })
 }
 
 /// [`dedup_jobs`]'s fingerprint of one job: its lengths, `h0` and every byte of both sequences.
@@ -1251,7 +1271,7 @@ fn dispatch_bins(
         };
         let bands: Vec<i32> = (0..u8_idx.len())
             .map(|i| {
-                if let Some(&n) = u8_idx.get(i + 4) {
+                if let Some(&n) = u8_idx.get(i + pf_knobs().1) {
                     prefetch_job(jobs, n);
                 }
                 band(u8_idx[i])

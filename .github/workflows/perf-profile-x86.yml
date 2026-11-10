@@ -227,6 +227,7 @@ jobs:
                      'bwa_neon::rescue_prune::count_hits' \
                      'bwa_neon::rescue_prune::Scratch::load_query' \
                      'bwa_neon::batched::dispatch_bins' \
+                     'bwa_neon::batched::job_fingerprint::fold' \
                      'bwa_mem4_mem::across::run_side' \
                      'bwa_mem4_mem::across::align_reads_batched' \
                      'bwa_mem4_mem::pe::batch_mate_rescue' \
