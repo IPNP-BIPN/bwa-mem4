@@ -213,7 +213,7 @@ jobs:
           # Where inside our u8 extension and rescue band kernels and the SMEM walk the time goes: per-line
           # summary and hottest instructions.
           for pat in 'bwa_neon::batched::[a-z0-9_]*::batched_extend_[a-z0-9_]*_u8' \
-                     'bwa_neon::rescue_band::[a-z0-9_]*::Work::run' \
+                     'bwa_neon::rescue_band::[a-z0-9_]*::Work::run[a-z_]*' \
                      'bwa_index::fmindex::FmIndex::backward_round[a-z_]*' \
                      'bwa_seed::mem_collect_smem_batched' \
                      'bwa_neon::rescue_prune::count_hits' \

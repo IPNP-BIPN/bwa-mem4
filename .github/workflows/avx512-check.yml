@@ -42,6 +42,7 @@ on:
   pull_request:
     paths:
       - "crates/bwa-neon/**"
+      - "crates/bwa-extend/**"
       - ".github/workflows/avx512-check.yml"
   schedule:
     - cron: "30 6 * * 1"  # Mondays 06:30 UTC
@@ -140,6 +141,10 @@ jobs:
           cargo test -p bwa-mem4-neon --release --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.test == true) | .executable' | tee /tmp/testbins
           test -s /tmp/testbins || { echo "cargo built no test binary" >&2; exit 1; }
+          # The CIGAR wavefront's 32-lane kernel lives in bwa-extend.
+          cargo test -p bwa-mem4-extend --release --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.test == true) | .executable' | tee /tmp/extbins
+          test -s /tmp/extbins || { echo "cargo built no bwa-extend test binary" >&2; exit 1; }
 
       - name: "Run the AVX-512 byte-identity tests on an emulated ${{ matrix.chip }}"
         run: |
@@ -172,6 +177,17 @@ jobs:
             echo "expected 3 avx512 tests (matesw u8, matesw i16, batched u8+i16), got $ran" >&2
             exit 1
           fi
+
+      - name: "Run the CIGAR wavefront test (8, 16 and 32 lanes) on an emulated ${{ matrix.chip }}"
+        run: |
+          set -o pipefail
+          sde="./$SDE_DIR/sde64"
+          for bin in $(cat /tmp/extbins); do
+            "$sde" -${{ matrix.chip }} -- "$bin" wave16_matches_scalar --nocapture --test-threads 1 2>&1 | tee -a /tmp/wave.txt
+          done
+          # The test runs every kernel the host can; under SDE that must include the 32-lane one.
+          grep -q 'wave16 lanes checked: \[8, 16, 32\]' /tmp/wave.txt \
+            || { echo "the 32-lane wavefront kernel did not run" >&2; exit 1; }
 
       - name: Prove the XOR score table really issued, not a fallback
         if: matrix.chip == 'spr'

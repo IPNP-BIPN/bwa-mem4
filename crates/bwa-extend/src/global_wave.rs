@@ -8,11 +8,12 @@
 //! the kernel's floor `w >= |tlen - qlen| + 3`.
 //!
 //! One kernel body ([`wave_fill`]) for every ISA: on x86_64 the NEON intrinsics it uses are the
-//! SSE4.1 shims of [`sse`] (same 8 x int16 lanes, same names) or the AVX2 ones of [`avx2`] (16
-//! lanes, as the fork's AVX2 kernel), and the score lookup and the direction-byte store, the two
-//! steps without a one-instruction twin, are [`score_lanes`] and [`store_dirs`]. A diagonal holds
-//! about `w + 1` in-band cells, so the 16-lane kernel takes bands of [`WIDE_MIN`] and up, which
-//! need two 8-lane chunks per diagonal.
+//! SSE4.1 shims of [`sse`] (same 8 x int16 lanes, same names), the AVX2 ones of [`avx2`] (16
+//! lanes, as the fork's AVX2 kernel) or the AVX-512BW ones of [`avx512`] (32 lanes, as the fork's
+//! AVX-512 kernel), and the score lookup and the direction-byte store, the two steps without a
+//! one-instruction twin, are [`score_lanes`] and [`store_dirs`]. A diagonal holds about `w + 1`
+//! in-band cells, so the 16-lane kernel takes bands of [`WIDE_MIN`] and up, which need two 8-lane
+//! chunks per diagonal, and the 32-lane one bands of [`wide512_min`] and up.
 
 #[cfg(target_arch = "x86_64")]
 use sse::*;
@@ -113,21 +114,47 @@ unsafe fn store_dirs(p: *mut u8, d: __m128i) {
 
 /// Int16 "minus infinity": its own decrement cannot wrap and no feasible score reaches it ([`safe`]).
 const VMINF: i16 = -30000;
-/// Lane numbers, read as the first 8 or 16 of them.
-const IOTA: [i16; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// Lane numbers, read as the first 8, 16 or 32 of them.
+const IOTA: [i16; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31,
+];
 /// Narrowest band the 16-lane AVX2 kernel takes: its diagonals hold up to `w + 1 >= 9` cells.
 #[cfg(target_arch = "x86_64")]
 const WIDE_MIN: usize = 8;
 
-/// Whether bands of [`WIDE_MIN`] and up go to the 16-lane kernel: AVX2 present, and the extension
-/// tier not forced down to SSE4.1 (`BWA4_EXTEND_TIER=sse41` keeps every vector kernel at 128 bits).
+/// The widest kernel this host runs, in int16 lanes: 32 with AVX-512BW, 16 with AVX2, else 8.
+/// `BWA4_EXTEND_TIER=avx2` or `sse41` caps it as it caps the extension kernels.
 #[cfg(target_arch = "x86_64")]
-fn wide_ok() -> bool {
+fn max_lanes() -> usize {
     use std::sync::OnceLock;
-    static W: OnceLock<bool> = OnceLock::new();
+    static W: OnceLock<usize> = OnceLock::new();
     *W.get_or_init(|| {
-        std::arch::is_x86_feature_detected!("avx2")
-            && std::env::var("BWA4_EXTEND_TIER").as_deref() != Ok("sse41")
+        let tier = std::env::var("BWA4_EXTEND_TIER");
+        if std::arch::is_x86_feature_detected!("avx512bw")
+            && !matches!(tier.as_deref(), Ok("avx2" | "sse41"))
+        {
+            32
+        } else if std::arch::is_x86_feature_detected!("avx2") && tier.as_deref() != Ok("sse41") {
+            16
+        } else {
+            8
+        }
+    })
+}
+
+/// Narrowest band the 32-lane kernel takes: below it a diagonal fits one 16-lane chunk.
+/// `BWA4_WAVE512_MIN` overrides it; a huge value keeps those bands on the 16-lane kernel.
+#[cfg(target_arch = "x86_64")]
+fn wide512_min() -> usize {
+    use std::sync::OnceLock;
+    static W: OnceLock<usize> = OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("BWA4_WAVE512_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+            .max(WIDE_MIN)
     })
 }
 /// Bytes of padding on both sides of the query and target copies (the vector loads overhang by 7).
@@ -226,16 +253,20 @@ pub(crate) fn try_wave16(
         return None;
     }
     #[cfg(target_arch = "x86_64")]
-    let wide = w >= WIDE_MIN && wide_ok();
+    let lanes = match max_lanes() {
+        32 if w >= wide512_min() => 32,
+        16 | 32 if w >= WIDE_MIN => 16,
+        _ => 8,
+    };
     #[cfg(not(target_arch = "x86_64"))]
-    let wide = false;
+    let lanes = 8;
     Some(SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
-        // SAFETY: NEON is the AArch64 baseline; SSE4.1 was detected above on x86_64, and AVX2 by
-        // `wide_ok` when `wide`.
+        // SAFETY: NEON is the AArch64 baseline; SSE4.1 was detected above on x86_64, and
+        // `max_lanes` detected AVX2 for 16 lanes and AVX-512BW for 32.
         unsafe {
             wave16(
-                &mut s, query, target, mat, o_del, e_del, o_ins, e_ins, w, wide,
+                &mut s, query, target, mat, o_del, e_del, o_ins, e_ins, w, lanes,
             )
         }
     }))
@@ -484,8 +515,86 @@ mod avx2 {
     );
 }
 
+/// The 32-lane kernel: AVX-512BW shims under the NEON names (compares widened to vector masks,
+/// which LLVM folds back into mask registers), the score lookup as one word permute over the 25
+/// scores, and [`wave_fill`] expanded over them.
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use super::{Scratch, IOTA, PAD, VMINF};
+    use std::arch::x86_64::*;
+    type V = __m512i;
+    macro_rules! shim {
+        ($($name:ident($($a:ident: $t:ty),*) -> $r:ty $body:block)*) => {$(
+            #[inline]
+            #[target_feature(enable = "avx512bw")]
+            unsafe fn $name($($a: $t),*) -> $r $body
+        )*};
+    }
+    shim! {
+        vdupq_n_s16(x: i16) -> V { _mm512_set1_epi16(x) }
+        vld1q_s16(p: *const i16) -> V { _mm512_loadu_si512(p.cast()) }
+        vst1q_s16(p: *mut i16, v: V) -> () { _mm512_storeu_si512(p.cast(), v) }
+        vaddq_s16(a: V, b: V) -> V { _mm512_add_epi16(a, b) }
+        vsubq_s16(a: V, b: V) -> V { _mm512_sub_epi16(a, b) }
+        vmulq_s16(a: V, b: V) -> V { _mm512_mullo_epi16(a, b) }
+        vmaxq_s16(a: V, b: V) -> V { _mm512_max_epi16(a, b) }
+        vminq_s16(a: V, b: V) -> V { _mm512_min_epi16(a, b) }
+        vceqq_s16(a: V, b: V) -> V { _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(a, b)) }
+        vcgtq_s16(a: V, b: V) -> V { _mm512_movm_epi16(_mm512_cmpgt_epi16_mask(a, b)) }
+        vcltq_s16(a: V, b: V) -> V { _mm512_movm_epi16(_mm512_cmplt_epi16_mask(a, b)) }
+        vcgeq_s16(a: V, b: V) -> V { _mm512_movm_epi16(_mm512_cmpge_epi16_mask(a, b)) }
+        vbslq_s16(m: V, a: V, b: V) -> V { _mm512_mask_blend_epi16(_mm512_movepi16_mask(m), b, a) }
+        vandq_u16(a: V, b: V) -> V { _mm512_and_si512(a, b) }
+        vorrq_s16(a: V, b: V) -> V { _mm512_or_si512(a, b) }
+    }
+
+    /// The 25 scores sign-extended to words (the rest of the 32 bytes are zero).
+    type Table = V;
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn load_table(tab: &[u8; 32]) -> Table {
+        _mm512_cvtepi8_epi16(_mm256_loadu_si256(tab.as_ptr().cast()))
+    }
+
+    /// Word `l` is `31 - l`: the permute that reverses the query's 32 lanes.
+    const REV: [i16; 32] = [
+        31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9,
+        8, 7, 6, 5, 4, 3, 2, 1, 0,
+    ];
+
+    /// Lane `l`'s score `mat[t[l] * 5 + q[31 - l]]`: `tp` and `qp` point at 32 bytes. Codes are at
+    /// most 4, so the index is below 25 and `vpermw` (which reads it modulo 32) is exact.
+    #[inline]
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> V {
+        let q = _mm512_permutexvar_epi16(
+            _mm512_loadu_si512(REV.as_ptr().cast()),
+            _mm512_cvtepu8_epi16(_mm256_loadu_si256(qp.cast())),
+        );
+        let t = _mm512_cvtepu8_epi16(_mm256_loadu_si256(tp.cast()));
+        let idx = _mm512_add_epi16(_mm512_add_epi16(_mm512_slli_epi16::<2>(t), t), q);
+        _mm512_permutexvar_epi16(idx, *table)
+    }
+
+    /// The 32 direction bytes of `d` (each lane `< 64`) at `p`.
+    #[inline]
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn store_dirs(p: *mut u8, d: V) {
+        _mm256_storeu_si256(p.cast(), _mm512_cvtepi16_epi8(d));
+    }
+
+    wave_fill!(
+        /// [`wave_fill`] at 32 lanes.
+        ///
+        /// # Safety
+        /// The CPU must have AVX-512BW.
+        #[target_feature(enable = "avx512bw")]
+        pub(super) fill,
+        32
+    );
+}
+
 /// # Safety
-/// On x86_64 the CPU must have SSE4.1, and AVX2 when `wide`.
+/// On x86_64 the CPU must have SSE4.1, AVX2 for 16 `lanes` and AVX-512BW for 32.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "sse4.1"))]
 unsafe fn wave16(
@@ -498,7 +607,7 @@ unsafe fn wave16(
     o_ins: i32,
     e_ins: i32,
     w: usize,
-    wide: bool,
+    lanes: usize,
 ) -> (i32, Vec<u32>) {
     let (qlen, tlen) = (query.len(), target.len());
     let maxlen = qlen.max(tlen);
@@ -524,14 +633,14 @@ unsafe fn wave16(
     sc.tpad[PAD..PAD + tlen].copy_from_slice(target);
     sc.qpad[PAD..PAD + qlen].copy_from_slice(query);
     #[cfg(target_arch = "x86_64")]
-    let score = if wide {
-        avx2::fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w)
-    } else {
-        fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w)
+    let score = match lanes {
+        32 => avx512::fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
+        16 => avx2::fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
+        _ => fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
     };
     #[cfg(not(target_arch = "x86_64"))]
     let score = {
-        let _ = wide;
+        let _ = lanes;
         fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w)
     };
     (score, traceback(sc, qlen, tlen, w))
@@ -574,13 +683,20 @@ fn traceback(sc: &Scratch, qlen: usize, tlen: usize, w: usize) -> Vec<u32> {
     cigar
 }
 
-/// Whether the 16-lane kernel can run here (only x86_64 has one).
+/// The lane counts whose kernels can run here (only x86_64 has the 16- and 32-lane ones).
 #[cfg(test)]
-fn wide_isa_ok() -> bool {
+fn lanes_here() -> Vec<usize> {
     #[cfg(target_arch = "x86_64")]
-    return std::arch::is_x86_feature_detected!("avx2");
+    return [
+        (8, true),
+        (16, std::arch::is_x86_feature_detected!("avx2")),
+        (32, std::arch::is_x86_feature_detected!("avx512bw")),
+    ]
+    .into_iter()
+    .filter_map(|(l, ok)| ok.then_some(l))
+    .collect();
     #[cfg(not(target_arch = "x86_64"))]
-    false
+    vec![8]
 }
 
 #[cfg(test)]
@@ -666,8 +782,8 @@ mod tests {
             let scalar = crate::sw::ksw_global2_scalar(
                 &query, &target, 5, &mat, o_del, e_del, o_ins, e_ins, w,
             );
-            for wide in [false, super::wide_isa_ok()] {
-                // SAFETY: `isa_ok` checked SSE4.1, `wide_isa_ok` AVX2.
+            for lanes in super::lanes_here() {
+                // SAFETY: `isa_ok` checked SSE4.1, `lanes_here` AVX2 and AVX-512BW.
                 let wave = super::SCRATCH.with(|s| unsafe {
                     super::wave16(
                         &mut s.borrow_mut(),
@@ -679,16 +795,18 @@ mod tests {
                         o_ins,
                         e_ins,
                         w as usize,
-                        wide,
+                        lanes,
                     )
                 });
                 assert_eq!(
                     wave, scalar,
-                    "case {case}: qlen {qlen} tlen {tlen} w {w} wide {wide}"
+                    "case {case}: qlen {qlen} tlen {tlen} w {w} lanes {lanes}"
                 );
             }
             checked += 1;
         }
         assert!(checked > 20000, "only {checked} cases reached the kernel");
+        // Read by the SDE job, which must see the 32-lane kernel among them.
+        println!("wave16 lanes checked: {:?}", super::lanes_here());
     }
 }
