@@ -1837,12 +1837,27 @@ impl FmIndex {
             p += 1;
             if s >= min_intv && s != curr_s {
                 curr_s = s;
-                prev[kept] = Smem {
-                    k,
-                    s,
-                    m,
-                    ..prev[p - 1]
-                };
+                // x86 copies the 40-byte candidate field by field (811M instructions on chr21
+                // under callgrind); most survivors stay where they are, so only the three new
+                // fields are written there. AArch64 copies it in two load/store pairs, cheaper
+                // than the test (+2.5G instructions on M4 the other way).
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    if kept != p - 1 {
+                        prev[kept] = prev[p - 1];
+                    }
+                    let d = &mut prev[kept];
+                    (d.k, d.s, d.m) = (k, s, m);
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    prev[kept] = Smem {
+                        k,
+                        s,
+                        m,
+                        ..prev[p - 1]
+                    };
+                }
                 kept += 1;
                 self.prefetch_occ(k, k + s);
             }
