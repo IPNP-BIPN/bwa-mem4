@@ -162,6 +162,9 @@ jobs:
           m4=$(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
           m3=$(bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
           echo "===== output md5: ours $m4 fork $m3 $([ "$m4" = "$m3" ] && echo identical || echo DIFFER) ====="
+          # The SMEM lockstep width this host's startup probe picks (scheduling only).
+          head -4000 "$r1" > probe1.fq; head -4000 "$r2" > probe2.fq
+          BWA4_LOCKSTEP_PROBE=1 ../mem4-v3 mem -t 1 chr21.fa probe1.fq probe2.fq 2>&1 >/dev/null | grep 'lockstep-probe' || true
 
           # `alt`: ours again under OURS_ENV, so a knob's effect is read on the same host.
           arms="ours fork"; [ -n "$OURS_ENV" ] && arms="ours alt fork"
