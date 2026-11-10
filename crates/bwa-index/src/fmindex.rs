@@ -1774,13 +1774,23 @@ impl FmIndex {
         min_seed_len: i64,
         out: &mut Vec<Smem>,
     ) -> usize {
-        // One copy per index kind, so the per-occurrence `wide` test leaves the loop. (Splitting on
-        // `a == 0` too drops the sentinel test, -7G instructions, but the random-base dispatch costs
-        // the cycles back.)
-        if self.wide {
-            self.backward_round_impl::<true, true>(prev, a, m, min_intv, min_seed_len, out)
-        } else {
-            self.backward_round_impl::<false, true>(prev, a, m, min_intv, min_seed_len, out)
+        // One copy per index kind and per `a == 0`, so neither the `wide` test nor, for C/G/T, the
+        // sentinel test runs per occurrence. The base dispatch is one branch per round: M4 cycles
+        // neutral, -9G instructions on GIAB PE; aimed at x86, where seeding ran 16% more
+        // instructions than the fork's (callgrind, chr21).
+        match (self.wide, a == 0) {
+            (true, true) => {
+                self.backward_round_impl::<true, true>(prev, a, m, min_intv, min_seed_len, out)
+            }
+            (true, false) => {
+                self.backward_round_impl::<true, false>(prev, a, m, min_intv, min_seed_len, out)
+            }
+            (false, true) => {
+                self.backward_round_impl::<false, true>(prev, a, m, min_intv, min_seed_len, out)
+            }
+            (false, false) => {
+                self.backward_round_impl::<false, false>(prev, a, m, min_intv, min_seed_len, out)
+            }
         }
     }
 
