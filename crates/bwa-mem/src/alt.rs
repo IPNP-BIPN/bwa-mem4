@@ -228,7 +228,7 @@ pub fn xa_group(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<Vec<usize>> {
 ///
 /// # Returns
 ///
-/// One entry per region, indexed in parallel with `regs`: `Some(string)` for a region that is an XA
+/// Per region, read by its index in `regs` ([`XaTags`]): `Some(string)` for a region that is an XA
 /// primary with at least one surviving alternate, the string being the concatenated
 /// semicolon-terminated records (the value of the `XA:Z:` tag, tag prefix not included); `None`
 /// everywhere else.
@@ -252,7 +252,7 @@ pub fn mem_gen_alt(
     regs: &[MemAlnReg],
     l_query: i32,
     query: &[u8],
-) -> Vec<Option<String>> {
+) -> XaTags {
     // Selection is done first and in full: `groups[p]` is the final, cap-checked alternate list for
     // primary `p`. `out` is the answer under construction, one slot per region, filled only at the
     // indices that turn out to be XA primaries; every other slot stays `None`.
@@ -266,9 +266,16 @@ pub fn mem_gen_alt(
     // 0.291 0.293 0.298 without it against 0.283 0.287 0.287 0.291 0.307 with it, which is a tie.
     // The allocator is not what this stage is spending its time on -- the -10.6% that the `ptmp`
     // clones and the per-pair buffers bought came from the COPYING and the growth memcpys, not from
-    // the malloc calls. Reverted rather than kept, because it also required `mem_gen_alt` to be
-    // allowed to return a short vector, and a vector whose length no longer matches the region
-    // count is a trap for the next caller to index it.
+    // the malloc calls. Reverted then because it returned a short vector, a trap for callers that
+    // index it. Kept since 2026-11-10 in the full-length form below: on Linux (N2, EPYC) mimalloc
+    // is ~1.3% of the profile against the fork's ~0.45%, and this is 3 of ~21 allocations per read.
+    //
+    // No region close enough to the one shadowing it (most reads): no XA anywhere, so skip
+    // `xa_group`'s three vectors. Its own test, so exact. The answer keeps one slot per region.
+    let ratio = f64::from(opt.xa_drop_ratio);
+    if (0..regs.len()).all(|i| get_pri_idx(ratio, regs, i).is_none()) {
+        return XaTags::default();
+    }
     let groups = xa_group(opt, regs);
     let mut out = vec![None; regs.len()];
     for (primary_idx, alt_indices) in groups.iter().enumerate() {
@@ -295,7 +302,25 @@ pub fn mem_gen_alt(
         }
         out[primary_idx] = Some(String::from_utf8(xa_bytes).expect("ASCII XA"));
     }
-    out
+    XaTags(out)
+}
+
+/// [`mem_gen_alt`]'s per-region `XA:Z` values, read by region index. Empty, with no allocation,
+/// when no region has one (most reads), which is why it is read through [`get`](Self::get) and
+/// [`take`](Self::take) and not indexed.
+#[derive(Default)]
+pub struct XaTags(Vec<Option<String>>);
+
+impl XaTags {
+    /// Region `i`'s value, copied.
+    pub fn get(&self, i: usize) -> Option<String> {
+        self.0.get(i).cloned().flatten()
+    }
+
+    /// Region `i`'s value, moved out.
+    pub fn take(&mut self, i: usize) -> Option<String> {
+        self.0.get_mut(i).and_then(Option::take)
+    }
 }
 
 #[cfg(test)]

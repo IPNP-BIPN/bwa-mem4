@@ -15,7 +15,7 @@ Versions exactes gelees dans `Cargo.lock` (pin de record). Justifications :
 | `rust-htslib` | sortie BAM/CRAM (`mem -o out.bam` / `out.cram`) | MIT |
 | `rammap-core` | mapping long-read (`mem -x pacbio\|pbref\|ont2d`), voir plus bas | MIT |
 | `libmimalloc-sys` | allocateur global mimalloc du binaire (feature `mimalloc`), `mi_malloc` direct pour les alignements <= 8 | MIT |
-| `smallvec` | graines d'une chaine (`MemChain.seeds`), les deux premieres en ligne | MIT/Apache-2.0 |
+| `smallvec` | graines d'une chaine (`MemChain.seeds`, deux en ligne) et primaires d'une lecture (`mark_primary_core`) | MIT/Apache-2.0 |
 
 Dev-only (jamais dans le binaire livre) : `noodles-*` (validation SAM/BAM cote test), `gungraun` (comptes d'instructions sous Valgrind, `docker_gates.sh icount`), `rust-bio` /
 `block-aligner` (bootstrap de seeding/SW).

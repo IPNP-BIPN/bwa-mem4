@@ -307,6 +307,7 @@ dependencies = [
  "bwa-mem4-index",
  "bwa-mem4-neon",
  "bwa-mem4-seed",
+ "smallvec",
 ]
 
 [[package]]

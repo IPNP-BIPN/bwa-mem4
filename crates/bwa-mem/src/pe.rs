@@ -1932,6 +1932,29 @@ fn mem_pair(
     a: &[&[MemAlnReg]; 2],
     id: u64,
 ) -> Option<PairResult> {
+    thread_local! {
+        /// `v` and `u` below, kept per thread: two or three allocations per pair otherwise.
+        static PAIR_LISTS: std::cell::RefCell<[Vec<(u64, u64)>; 2]> =
+            const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+    }
+    PAIR_LISTS.with(|c| {
+        let [v, u] = &mut *c.borrow_mut();
+        v.clear();
+        u.clear();
+        mem_pair_in(bns, opt, pes, a, id, v, u)
+    })
+}
+
+/// [`mem_pair`] on the caller's two empty lists.
+fn mem_pair_in(
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    a: &[&[MemAlnReg]; 2],
+    id: u64,
+    v: &mut Vec<(u64, u64)>,
+    u: &mut Vec<(u64, u64)>,
+) -> Option<PairResult> {
     let l_pac = bns.l_pac;
     // `v`: every candidate placement of either read, packed into two u64s so that a plain sort by
     // `x` orders them by genomic position. bwa's `pair64_t` is exactly this pair of fields.
@@ -1948,7 +1971,6 @@ fn mem_pair(
     // fields are recovered later by masking (`y & 1` = read, `y >> 1 & 1` = strand,
     // `y << 32 >> 34` = region index).
     // ---- step 1: flatten both reads' regions into one position-sortable list ----
-    let mut v: Vec<(u64, u64)> = Vec::with_capacity(a[0].len() + a[1].len());
     for (r, regs) in a.iter().enumerate() {
         for (i, reg) in regs.iter().enumerate() {
             // Fold the doubled coordinate back onto the forward strand so both strands' placements
@@ -1982,7 +2004,6 @@ fn mem_pair(
     // element rather than at 0.
     //
     // ---- step 2: sweep left to right, emitting one scored candidate per compatible look-back ----
-    let mut u: Vec<(u64, u64)> = Vec::new();
     let mut y: [i64; 4] = [-1, -1, -1, -1];
     for i in 0..v.len() {
         for r in 0..2u64 {
@@ -2585,7 +2606,7 @@ fn mem_reg2sam(
     // `-a` (MEM_F_ALL): emit every alignment, including the shadowed ones, and emit no XA.
     let all = opt.flag & bwa_core::opt::flags::ALL != 0;
     let xa = if all {
-        vec![None; a.len()]
+        crate::alt::XaTags::default()
     } else {
         mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq)
     };
@@ -2623,7 +2644,7 @@ fn mem_reg2sam(
         }
         // The printable form of region `p`: CIGAR, POS, MAPQ, NM and MD, all derived here.
         let mut aln = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
-        aln.xa = xa[k].clone();
+        aln.xa = xa.get(k);
         aln.flag |= extra_flag;
         // Suppress XS on a secondary (`sub < 0` gates the tag in `mem_aln2sam`). Unreachable here
         // for the same reason as the drop-ratio test above.
@@ -2975,8 +2996,8 @@ pub fn mem_sam_pe<W: Write>(
                 let softclip = opt.flag & bwa_core::opt::flags::SOFTCLIP != 0;
                 let ref_hdr = opt.flag & bwa_core::opt::flags::REF_HDR != 0;
                 let all = opt.flag & bwa_core::opt::flags::ALL != 0;
-                let (xa0, xa1) = if all {
-                    (vec![None; a0.len()], vec![None; a1.len()])
+                let (mut xa0, mut xa1) = if all {
+                    (crate::alt::XaTags::default(), crate::alt::XaTags::default())
                 } else {
                     (
                         crate::emit_split::measure(
@@ -3009,14 +3030,16 @@ pub fn mem_sam_pe<W: Write>(
                     let mut h = reg2aln(fm, bns, opt, seqs[0].len() as i32, seqs[0], &a0[z[0]]);
                     h.mapq = q_se[0].max(0) as u32;
                     h.flag |= 0x40 | extra_flag;
-                    h.xa = xa0[z[0]].clone();
+                    // Moved, not cloned: `z[0] < n_pri0`, and `alt_extra` reads only `xa0[n_pri0]`.
+                    h.xa = xa0.take(z[0]);
                     h
                 };
                 let h1 = {
                     let mut h = reg2aln(fm, bns, opt, seqs[1].len() as i32, seqs[1], &a1[z[1]]);
                     h.mapq = q_se[1].max(0) as u32;
                     h.flag |= 0x80 | extra_flag;
-                    h.xa = xa1[z[1]].clone();
+                    // Moved, not cloned: `z[1] < n_pri1`, and `alt_extra` reads only `xa1[n_pri1]`.
+                    h.xa = xa1.take(z[1]);
                     h
                 };
                 // ---- The ALT hit, if this end has one worth reporting (`bwamem_pair.cpp:496`) --
@@ -3031,7 +3054,7 @@ pub fn mem_sam_pe<W: Write>(
                 // index has no ALT contigs, since then `n_pri == a.len()`.
                 let alt_extra = |a: &[MemAlnReg],
                                  n_pri: usize,
-                                 xa: &[Option<String>],
+                                 xa: &crate::alt::XaTags,
                                  seq: &[u8],
                                  flag_bit: u32|
                  -> Option<MemAln> {
@@ -3044,7 +3067,7 @@ pub fn mem_sam_pe<W: Write>(
                     }
                     let mut g = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
                     g.flag |= 0x800 | flag_bit | extra_flag;
-                    g.xa = xa[n_pri].clone();
+                    g.xa = xa.get(n_pri);
                     Some(g)
                 };
                 // bwa's `aa[i]`: every record emitted for this end, primary first. Its LENGTH is

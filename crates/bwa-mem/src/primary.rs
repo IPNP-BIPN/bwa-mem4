@@ -873,7 +873,8 @@ fn mark_primary_core(opt: &MemOpt, a: &mut [MemAlnReg]) {
     // Indices into `a` of the primaries found so far, in discovery order, which (given the
     // best-first sort) is also descending score order. Invariant at the top of each iteration: it
     // holds every region in `0..i` that no earlier primary absorbed, and it is never empty.
-    let mut primaries: Vec<usize> = vec![0];
+    // Inline: a read has one to three primaries, and this ran once per read per end on the heap.
+    let mut primaries: smallvec::SmallVec<[usize; 8]> = smallvec::smallvec![0];
     for i in 1..n {
         // Fields of the candidate `a[i]`, copied out so the loop below can borrow `a` immutably
         // and then write to `a[j]`: query bounds, score, and whether it is an ALT-contig hit.

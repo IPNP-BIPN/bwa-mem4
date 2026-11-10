@@ -2548,7 +2548,7 @@ fn finish_se(
     // Parallel to `regs`: the `XA:Z` value for each region, or `None` where there is none. All-`None`
     // under `-a`, since the shadowed hits become their own records instead.
     let xa_per_reg = if output_all {
-        vec![None; regs.len()]
+        bwa_mem::alt::XaTags::default()
     } else {
         mem_gen_alt(fm, bns, opt, &regs, codes.len() as i32, codes)
     };
@@ -2612,7 +2612,7 @@ fn finish_se(
             aln,
             mapq,
             is_alt: reg.is_alt,
-            xa: xa_per_reg[reg_idx].clone(),
+            xa: xa_per_reg.get(reg_idx),
             secondary: is_secondary,
             sup: is_supplementary,
         });
