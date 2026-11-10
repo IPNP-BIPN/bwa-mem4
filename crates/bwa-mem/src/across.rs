@@ -1857,11 +1857,12 @@ fn run_side<B: SwBackend>(
             lane_of[job_idx] = lane as u32;
         }
         for (job_idx, &lane) in lane_of.iter().enumerate() {
-            // `results` is read in job order, not its own: hint the line a few jobs ahead (on 9V45
-            // the first read of `res` was this loop's top stall).
+            // `results` is read in job order, not its own: hint the line 16 jobs ahead (the first
+            // read of `res` was this loop's top stall on EPYC 9V45). Same-host CI A/B: -0.2..-0.5%
+            // on 7763 and 9V45, M4 -0.6% cycles.
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             if let Some(&l) = lane_of.get(job_idx + 16) {
-                if l != u32::MAX && scatter_pf() {
+                if l != u32::MAX {
                     bwa_neon::batched::prefetch(results.as_ptr().wrapping_add(l as usize));
                 }
             }
@@ -2185,12 +2186,4 @@ pub mod ungapped_fp {
             CELLS_HIT.load(Relaxed) as f64 * 100.0 / cells as f64,
         );
     }
-}
-
-/// shortcut: `BWA4_SCATTER_PF=1` prefetches `run_side`'s out-of-order `results` reads, for a
-/// same-host CI A/B; delete once settled.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn scatter_pf() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_SCATTER_PF").is_some())
 }

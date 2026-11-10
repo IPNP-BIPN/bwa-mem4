@@ -1038,27 +1038,9 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>], fps: &[u64]) -> (Vec<ExtendJob<'a>>, V
     let mut map: Vec<u32> = Vec::with_capacity(jobs.len());
     const AHEAD: usize = 16;
 
-    let verify_pf = dedup_verify_pf();
     for (i, job) in jobs.iter().enumerate() {
         if let Some(&f) = fps.get(i + AHEAD) {
             prefetch(table.as_ptr().wrapping_add(slot_of(f)));
-        }
-        // Halfway there the slot has landed: when it already holds that fingerprint, the bytes
-        // the comparison will read (the job's and its likely twin's) are hinted too, since both
-        // went cold long ago.
-        if verify_pf {
-            if let Some(&f) = fps.get(i + AHEAD / 2) {
-                let e = table[slot_of(f)];
-                if e.1 != 0 && e.0 == f {
-                    let (u, j) = (&unique[e.1 as usize - 1], &jobs[i + AHEAD / 2]);
-                    for s in [u.query, u.target, j.query, j.target] {
-                        let p = s.as_ptr();
-                        for l in 0..PF_LINES.min(s.len().div_ceil(64)) {
-                            prefetch(p.wrapping_add(64 * l));
-                        }
-                    }
-                }
-            }
         }
         let h = fps[i];
         let mut at = slot_of(h);
@@ -6700,12 +6682,4 @@ mod dedup_jobs_tests {
             }
         }
     }
-}
-
-/// shortcut: `BWA4_DEDUP_VERIFY_PF=1` prefetches the bytes `dedup_jobs` will compare, for a
-/// same-host CI A/B; delete once settled.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn dedup_verify_pf() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_DEDUP_VERIFY_PF").is_some())
 }
