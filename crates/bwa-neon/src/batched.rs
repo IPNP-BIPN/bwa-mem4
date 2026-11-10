@@ -865,7 +865,7 @@ fn simd_dispatch(
     let dedup_on = job_dedup_enabled();
     let mut fps: Vec<u64> = Vec::new();
     for (k, job) in jobs.iter().enumerate() {
-        prefetch_job(jobs, k + pf_knobs().1);
+        prefetch_job(jobs, k + PF_AHEAD);
         match ungapped_hit(job, a, b, x_threshold, zdrop) {
             Some(result) => out[k] = result,
             None => {
@@ -937,39 +937,29 @@ fn prefetch<T>(p: *const T) {
 /// # Returns
 /// `(unique, map)`: the distinct jobs in first-appearance order, and for each input job the index
 /// of its representative in `unique`. `map[i] == i'` means `out[i]` must be `results[i']`.
-/// Hint the first two lines of job `k`'s query and target, if there is a job `k`. A batch is a
-/// whole chunk's jobs in length order, megabytes of bases read at random, so every pass over it
+/// How many jobs ahead of the one being scanned [`prefetch_job`] hints, and how many 64-byte lines
+/// of each of its sequences. Every line: the fingerprint reads every byte, and the ungapped scan
+/// leaves most of them untouched when it exits early. Same-host CI A/B against 4 ahead x 2 lines:
+/// `job_fingerprint::fold` -40% on EPYC 9V45 (-0.75% of all samples), -20..-25% on 7763 and 9V74
+/// at 8 lines; M4 neutral.
+const PF_AHEAD: usize = 8;
+const PF_LINES: usize = 8;
+
+/// Hint the first [`PF_LINES`] lines of job `k`'s query and target, if there is a job `k`. A batch
+/// is a whole chunk's jobs in length order, megabytes of bases read at random, so every pass over it
 /// (ungapped scan, dedup fingerprints, band bounds) waited on its first load of each job: a third
 /// of `run_side` on x86.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
 fn prefetch_job(jobs: &[ExtendJob], k: usize) {
     if let Some(n) = jobs.get(k) {
-        let lines = pf_knobs().0;
         for s in [n.query, n.target] {
             let p = s.as_ptr();
-            for i in 0..lines.min(s.len().div_ceil(64)) {
+            for i in 0..PF_LINES.min(s.len().div_ceil(64)) {
                 prefetch(p.wrapping_add(64 * i));
             }
         }
     }
-}
-
-/// shortcut: measurement knobs `BWA4_PF_LINES` / `BWA4_PF_AHEAD` (lines per sequence, jobs
-/// ahead; default 2 and 4), for a same-machine CI A/B; delete once settled.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-#[inline(always)]
-fn pf_knobs() -> (usize, usize) {
-    static K: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    *K.get_or_init(|| {
-        let get = |k: &str, d: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
-        (get("BWA4_PF_LINES", 2), get("BWA4_PF_AHEAD", 4))
-    })
 }
 
 /// [`dedup_jobs`]'s fingerprint of one job: its lengths, `h0` and every byte of both sequences.
@@ -977,43 +967,49 @@ fn pf_knobs() -> (usize, usize) {
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn job_fingerprint(job: &ExtendJob) -> u64 {
-    /// Fold every byte of `s` into `h`, 32 at a time in two independent chains of 64 x 64 -> 128
-    /// multiplies folded back to 64 bits (wyhash's `mum`), one per 16 bytes. Covering only 32 bytes
-    /// at each end let 121M of 126M candidate pairs on 1M chr21 pairs collide (repeat windows share
-    /// their ends), and the byte comparisons that rejected them cost more than hashing everything.
-    /// Four chains of 64-bit multiplies were vectorised by LLVM into emulated AVX2 `vpmuludq`
-    /// sequences, a latency chain that was a fifth of `dispatch_bins` on Zen 5; a 128-bit product
-    /// stays a scalar `mul`. Any fingerprint is correct: equal ones are confirmed byte by byte.
-    fn fold(h: &mut u64, s: &[u8]) {
-        const S0: u64 = 0xa076_1d64_78bd_642f;
-        const S1: u64 = 0xe703_7ed1_a0b4_28db;
-        const S2: u64 = 0x8ebc_6af0_9c88_c6e3;
-        #[inline(always)]
-        fn mum(a: u64, b: u64) -> u64 {
-            let r = u128::from(a) * u128::from(b);
-            r as u64 ^ (r >> 64) as u64
-        }
+    const S0: u64 = 0xa076_1d64_78bd_642f;
+    const S1: u64 = 0xe703_7ed1_a0b4_28db;
+    const S2: u64 = 0x8ebc_6af0_9c88_c6e3;
+    #[inline(always)]
+    fn mum(a: u64, b: u64) -> u64 {
+        let r = u128::from(a) * u128::from(b);
+        r as u64 ^ (r >> 64) as u64
+    }
+    /// Every byte of `s` folded from `seed`, 32 at a time in two independent chains of 64 x 64 ->
+    /// 128 multiplies folded back to 64 bits (wyhash's `mum`), one per 16 bytes; the last 1..=31
+    /// bytes go in as up to two overlapping 16-byte windows, one per chain (the lengths are hashed
+    /// apart), not as a serial chain of words: on Zen 5 the fold's samples sat on the `xor`s
+    /// waiting for each multiply. Covering only 32 bytes at each end let 121M of 126M candidate
+    /// pairs on 1M chr21 pairs collide (repeat windows share their ends), and the byte comparisons
+    /// that rejected them cost more than hashing everything. Four chains of 64-bit multiplies were
+    /// vectorised by LLVM into emulated AVX2 `vpmuludq` sequences, a latency chain that was a fifth
+    /// of `dispatch_bins` on Zen 5; a 128-bit product stays a scalar `mul`.
+    fn fold(seed: u64, s: &[u8]) -> u64 {
         let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
-        let (mut a, mut b) = (*h, *h ^ S2);
+        let (mut a, mut b) = (seed, seed ^ S2);
         let (blocks, rest) = s.as_chunks::<32>();
         for blk in blocks {
             a = mum(word(&blk[..8]) ^ S0, word(&blk[8..16]) ^ a);
             b = mum(word(&blk[16..24]) ^ S1, word(&blk[24..]) ^ b);
         }
-        let mut t = a ^ b.rotate_left(32);
-        let (words, tail) = rest.as_chunks::<8>();
-        for w in words {
-            t = mum(u64::from_le_bytes(*w) ^ S0, t ^ S1);
+        let n = s.len();
+        match rest.len() {
+            0 => {}
+            r if n >= 16 => {
+                if r > 16 {
+                    a = mum(word(&rest[..8]) ^ S0, word(&rest[8..16]) ^ a);
+                }
+                b = mum(word(&s[n - 16..n - 8]) ^ S1, word(&s[n - 8..]) ^ b);
+            }
+            _ if n >= 8 => a = mum(word(&s[..8]) ^ S0, word(&s[n - 8..]) ^ a),
+            _ => {
+                a = mum(
+                    s.iter().rev().fold(0, |v, &x| v << 8 | u64::from(x)) ^ S0,
+                    a,
+                )
+            }
         }
-        if !tail.is_empty() {
-            // The last eight bytes, overlapping the words before: the lengths are already in `h`.
-            let v = match s.len().checked_sub(8) {
-                Some(at) => word(&s[at..]),
-                None => tail.iter().rev().fold(0, |v, &b| v << 8 | u64::from(b)),
-            };
-            t = mum(v ^ S0, t ^ S1);
-        }
-        *h = mum(t ^ S2, S1);
+        mum(a ^ S2, b ^ S1)
     }
 
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1021,9 +1017,8 @@ fn job_fingerprint(job: &ExtendJob) -> u64 {
     h = h.wrapping_mul(0x1000_0000_01b3);
     h ^= job.h0 as u64;
     h = h.wrapping_mul(0x1000_0000_01b3);
-    fold(&mut h, job.query);
-    fold(&mut h, job.target);
-    h
+    // Two independent folds, so the query's multiplies overlap the target's.
+    mum(fold(h, job.query) ^ S0, fold(h ^ S1, job.target) ^ S2)
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -1271,7 +1266,7 @@ fn dispatch_bins(
         };
         let bands: Vec<i32> = (0..u8_idx.len())
             .map(|i| {
-                if let Some(&n) = u8_idx.get(i + pf_knobs().1) {
+                if let Some(&n) = u8_idx.get(i + PF_AHEAD) {
                     prefetch_job(jobs, n);
                 }
                 band(u8_idx[i])
@@ -6660,5 +6655,31 @@ mod dedup_jobs_tests {
             .map(|x| map.iter().position(|&u| u as usize == x).unwrap())
             .collect();
         assert!(first.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// The fingerprint reads every byte of both sequences at every length: changing any one byte
+    /// changes it (a byte the fold skipped would make all its variants collide).
+    #[test]
+    fn fingerprint_covers_every_byte() {
+        let base: Vec<u8> = (0..200u32).map(|i| (i * 7 % 5) as u8).collect();
+        for n in 0..base.len() {
+            let other = &base[..n.min(40)];
+            for swap in [false, true] {
+                let job = |s: &[u8]| {
+                    let (q, t) = if swap { (other, s) } else { (s, other) };
+                    super::job_fingerprint(&ExtendJob {
+                        query: q,
+                        target: t,
+                        h0: 3,
+                    })
+                };
+                let h = job(&base[..n]);
+                for i in 0..n {
+                    let mut v = base[..n].to_vec();
+                    v[i] ^= 1;
+                    assert_ne!(job(&v), h, "n={n} i={i} swap={swap}");
+                }
+            }
+        }
     }
 }
