@@ -321,71 +321,15 @@ fn unpack_pac_fwd<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut V
         unsafe { unpack_fwd_neon::<XOR>(pac, start, len, out) };
         return;
     }
-    // Bases before the first whole packed byte, done one at a time so the block loop below can
-    // assume `pos % 4 == 0`.
-    let mut pos = start;
-    let end = start + len as i64;
-    while pos < end && (pos & 3) != 0 {
-        out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
-        pos += 1;
-    }
-
-    // The same sixteen-bases-per-iteration unpack on x86. It was missing, and the cost of missing
-    // it is measurable: a side-by-side `perf` profile against fg-labs/bwa-mem3 on an EPYC 7763 put
-    // this function at 3.50% of our run against 1.39% for their `bns_get_seq_into`, because on x86
-    // every base went through the scalar tail below while aarch64 took the vector path above.
-    //
-    // SSSE3 rather than AVX2, and chosen at runtime: `pshufb` is the only instruction here that is
-    // not in SSE2, every x86-64 part since 2006 has it, and the release artefact is built at the
-    // x86-64 baseline, so a compile-time gate would leave the shipped binary on the scalar loop.
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("ssse3") {
-            use std::arch::x86_64::*;
-            // SAFETY: ssse3 detected. Each iteration reads the 4 packed bytes at `pos >> 2` with
-            // `pos + 16 <= end <= 2 * l_pac`, so the byte index is inside the payload, and writes
-            // 16 bytes into capacity the caller reserved (`bases_into` reserves `len + 16`).
-            unsafe {
-                // Byte k of the loaded word into lanes 4k..4k+3, the same spread the NEON arm uses.
-                let spread = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
-                let three = _mm_set1_epi8(3);
-                // x86 has no per-byte variable shift before AVX-512, so the four shifts are done
-                // whole-vector and then selected by lane. A 16-bit shift is safe here even though
-                // the data is bytes: the bits that leak in from the neighbouring byte land in bit
-                // positions 8-s and above, and the `& 3` that follows discards every one of them.
-                // Within a packed byte the most significant pair is base 0, hence 6, 4, 2, 0.
-                let m0 = _mm_setr_epi8(-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0);
-                let m1 = _mm_setr_epi8(0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0);
-                let m2 = _mm_setr_epi8(0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0);
-                let m3 = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
-                while pos + 16 <= end {
-                    let word =
-                        (pac.as_ptr().add((pos >> 2) as usize) as *const u32).read_unaligned();
-                    let v = _mm_shuffle_epi8(_mm_set1_epi32(word as i32), spread);
-                    let s6 = _mm_and_si128(_mm_srli_epi16(v, 6), m0);
-                    let s4 = _mm_and_si128(_mm_srli_epi16(v, 4), m1);
-                    let s2 = _mm_and_si128(_mm_srli_epi16(v, 2), m2);
-                    let s0 = _mm_and_si128(v, m3);
-                    let out_v = _mm_xor_si128(
-                        _mm_and_si128(
-                            _mm_or_si128(_mm_or_si128(s6, s4), _mm_or_si128(s2, s0)),
-                            three,
-                        ),
-                        _mm_set1_epi8(XOR as i8),
-                    );
-                    let n = out.len();
-                    _mm_storeu_si128(out.as_mut_ptr().add(n) as *mut __m128i, out_v);
-                    out.set_len(n + 16);
-                    pos += 16;
-                }
-            }
-        }
+    if std::is_x86_feature_detected!("ssse3") {
+        // SAFETY: ssse3 detected; `out` has `len + 16` bytes of room, as every caller reserves.
+        unsafe { unpack_fwd_ssse3::<XOR>(pac, start, len, out) };
+        return;
     }
-
-    // Tail, and the whole range on a build with neither vector path.
-    while pos < end {
+    // The whole range on a build with neither vector path.
+    for pos in start..start + len as i64 {
         out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
-        pos += 1;
     }
 }
 
@@ -605,11 +549,115 @@ fn unpack_pac_rev_neon<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &
     }
 }
 
+/// The four 2-bit fields of each byte of `q`, base 0 of the byte first (`rev`: last first, for
+/// bytes already in reversed order). A 16-bit shift is safe on byte data: what leaks in from the
+/// neighbouring byte lands above bit 1 and the `& 3` drops it.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn fields_x86(q: std::arch::x86_64::__m128i, rev: bool) -> [std::arch::x86_64::__m128i; 4] {
+    use std::arch::x86_64::*;
+    let m = _mm_set1_epi8(3);
+    let (s6, s4, s2, s0) = (
+        _mm_and_si128(_mm_srli_epi16(q, 6), m),
+        _mm_and_si128(_mm_srli_epi16(q, 4), m),
+        _mm_and_si128(_mm_srli_epi16(q, 2), m),
+        _mm_and_si128(q, m),
+    );
+    if rev {
+        [s0, s2, s4, s6]
+    } else {
+        [s6, s4, s2, s0]
+    }
+}
+
+/// Sixteen bases from the four packed bytes of `word` (first byte lowest), `rev` last first:
+/// fields split by [`fields_x86`], then interleaved by two rounds of unpacks.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn unpack16_x86(word: u32, rev: bool) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    let w = if rev { word.swap_bytes() } else { word };
+    let [f0, f1, f2, f3] = fields_x86(_mm_cvtsi32_si128(w as i32), rev);
+    _mm_unpacklo_epi16(_mm_unpacklo_epi8(f0, f1), _mm_unpacklo_epi8(f2, f3))
+}
+
+/// The x86 twin of [`unpack64`] (`p % 4 == 0`): bases `[p, p + 64)` from their 16 packed bytes in
+/// one load, `rev` last first, `^ xor`, the fields of [`fields_x86`] interleaved into four stores.
+///
+/// # Safety
+/// SSSE3, `p >= 0`, `(p >> 2) + 16 <= pac.len()`, and `dst` valid for 64 bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+#[inline]
+unsafe fn unpack64_x86(pac: &[u8], p: i64, rev: bool, xor: u8, dst: *mut u8) {
+    use std::arch::x86_64::*;
+    let mut q = _mm_xor_si128(
+        _mm_loadu_si128(pac.as_ptr().add((p >> 2) as usize).cast()),
+        _mm_set1_epi8(xor.wrapping_mul(0x55) as i8),
+    );
+    if rev {
+        q = _mm_shuffle_epi8(
+            q,
+            _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0),
+        );
+    }
+    let [f0, f1, f2, f3] = fields_x86(q, rev);
+    let (a_lo, a_hi) = (_mm_unpacklo_epi8(f0, f1), _mm_unpackhi_epi8(f0, f1));
+    let (b_lo, b_hi) = (_mm_unpacklo_epi8(f2, f3), _mm_unpackhi_epi8(f2, f3));
+    let d = dst.cast::<__m128i>();
+    _mm_storeu_si128(d, _mm_unpacklo_epi16(a_lo, b_lo));
+    _mm_storeu_si128(d.add(1), _mm_unpackhi_epi16(a_lo, b_lo));
+    _mm_storeu_si128(d.add(2), _mm_unpacklo_epi16(a_hi, b_hi));
+    _mm_storeu_si128(d.add(3), _mm_unpackhi_epi16(a_hi, b_hi));
+}
+
+/// [`unpack_pac_fwd`] on SSSE3, the structure of [`unpack_fwd_neon`]: at most three bases one at a
+/// time to a byte boundary, then 64 per step ([`unpack64_x86`]), then sixteen per step with the last
+/// one stored whole and trimmed. SSSE3 and chosen at runtime because the release artefact is built
+/// at the x86-64 baseline; `pshufb` is the one instruction here past SSE2.
+///
+/// # Safety
+/// SSSE3; `out` has room for `len + 16` bytes past its length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn unpack_fwd_ssse3<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    use std::arch::x86_64::*;
+    let scalar = |p: i64| ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3) ^ XOR;
+    let end = start + len as i64;
+    let mut pos = start;
+    while pos < end && pos & 3 != 0 {
+        out.push(scalar(pos));
+        pos += 1;
+    }
+    // `pos + 64 <= end <= l_pac`, so the 16 bytes from `pos >> 2` are inside `pac`.
+    while pos + 64 <= end {
+        let n = out.len();
+        unpack64_x86(pac, pos, false, XOR, out.as_mut_ptr().add(n));
+        out.set_len(n + 64);
+        pos += 64;
+    }
+    let xor = u32::from(XOR).wrapping_mul(0x5555_5555);
+    while pos < end && ((pos >> 2) as usize) + 4 <= pac.len() {
+        let word = (pac.as_ptr().add((pos >> 2) as usize) as *const u32).read_unaligned();
+        let n = out.len();
+        _mm_storeu_si128(
+            out.as_mut_ptr().add(n).cast(),
+            unpack16_x86(word ^ xor, false),
+        );
+        out.set_len(n + (end - pos).min(16) as usize);
+        pos += 16;
+    }
+    while pos < end {
+        out.push(scalar(pos));
+        pos += 1;
+    }
+}
+
 /// [`unpack_pac_fwd`] of `[start, start + len)` reversed, and complemented when `XOR` is 3, in one
-/// SSSE3 pass, as [`unpack_pac_rev_neon`] does on aarch64: the source is walked from its end, 16
-/// bases (4 packed bytes) per step, each step unpacked, reversed by `pshufb` and `^ XOR`. Before, x86
-/// unpacked forward, then reversed, then complemented: three passes over every reverse-strand
-/// window. Appends to `out`, which must have room for `len + 16` bytes.
+/// SSSE3 pass, as [`unpack_pac_rev_neon`] does on aarch64: the source is walked from its end, at
+/// most three bases one at a time to a byte boundary, then 64 per step ([`unpack64_x86`]), then
+/// sixteen per step with the last one stored whole and trimmed. Appends to `out`, which must have
+/// room for `len + 16` bytes.
 ///
 /// # Safety
 /// SSSE3.
@@ -625,35 +673,28 @@ unsafe fn unpack_pac_rev_ssse3<const XOR: u8>(
     let scalar = |p: i64| ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3) ^ XOR;
     // Output base `o` is source base `end - 1 - o`, `^ XOR`.
     let mut end = start + len as i64;
-    // Top bases down to a byte boundary, so every vector step reads whole packed bytes.
     while end > start && end & 3 != 0 {
         out.push(scalar(end - 1));
         end -= 1;
     }
-    let spread = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
-    let rev = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
-    let three = _mm_set1_epi8(3);
-    // Within a packed byte the most significant pair is base 0, hence shifts 6, 4, 2, 0 by lane.
-    let m0 = _mm_setr_epi8(-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0);
-    let m1 = _mm_setr_epi8(0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0);
-    let m2 = _mm_setr_epi8(0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0);
-    let m3 = _mm_setr_epi8(0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1);
-    while end - 16 >= start {
-        // `end <= l_pac` and `end - 16 >= 0`, so the 4 bytes at `(end - 16) >> 2` are inside `pac`.
-        let word = (pac.as_ptr().add(((end - 16) >> 2) as usize) as *const u32).read_unaligned();
-        let v = _mm_shuffle_epi8(_mm_set1_epi32(word as i32), spread);
-        let s6 = _mm_and_si128(_mm_srli_epi16(v, 6), m0);
-        let s4 = _mm_and_si128(_mm_srli_epi16(v, 4), m1);
-        let s2 = _mm_and_si128(_mm_srli_epi16(v, 2), m2);
-        let s0 = _mm_and_si128(v, m3);
-        let fwd = _mm_and_si128(
-            _mm_or_si128(_mm_or_si128(s6, s4), _mm_or_si128(s2, s0)),
-            three,
-        );
-        let r = _mm_xor_si128(_mm_shuffle_epi8(fwd, rev), _mm_set1_epi8(XOR as i8));
+    // `end <= l_pac`, so the 16 bytes from `(end - 64) >> 2` are inside `pac`.
+    while end - 64 >= start {
         let n = out.len();
-        _mm_storeu_si128(out.as_mut_ptr().add(n) as *mut __m128i, r);
-        out.set_len(n + 16);
+        unpack64_x86(pac, end - 64, true, XOR, out.as_mut_ptr().add(n));
+        out.set_len(n + 64);
+        end -= 64;
+    }
+    // The 16 bases below `end`, keeping as many as the window still wants: `end` is a byte
+    // boundary at most `l_pac`, so the 4 bytes up to `end >> 2` are inside `pac`.
+    let xor = u32::from(XOR).wrapping_mul(0x5555_5555);
+    while end > start && end >= 16 {
+        let word = (pac.as_ptr().add(((end - 16) >> 2) as usize) as *const u32).read_unaligned();
+        let n = out.len();
+        _mm_storeu_si128(
+            out.as_mut_ptr().add(n).cast(),
+            unpack16_x86(word ^ xor, true),
+        );
+        out.set_len(n + (end - start).min(16) as usize);
         end -= 16;
     }
     while end > start {
