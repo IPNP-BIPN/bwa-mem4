@@ -156,7 +156,7 @@ jobs:
           set -euo pipefail
           cd work
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
-          r1="${SET}1.fq"; r2="${SET}2.fq""
+          r1="${SET}1.fq"; r2="${SET}2.fq"
           # Warm the page cache for both, so the first one recorded is not paying for the index read.
           ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
           bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
