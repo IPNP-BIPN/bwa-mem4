@@ -860,11 +860,20 @@ fn simd_dispatch(
     let mut out = vec![default_result(); jobs.len()];
     // Indices of the jobs the fast path declined, i.e. the ones that still need the real DP.
     let mut needs_dp: Vec<usize> = Vec::new();
+    // Dedup fingerprints of the declined jobs, taken here while the scan has their bytes in cache:
+    // a pass of its own reloaded every job cold (on EPYC 9V45 the fold took 1.6x its Zen 4 time).
+    let dedup_on = job_dedup_enabled();
+    let mut fps: Vec<u64> = Vec::new();
     for (k, job) in jobs.iter().enumerate() {
         prefetch_job(jobs, k + 4);
         match ungapped_hit(job, a, b, x_threshold, zdrop) {
             Some(result) => out[k] = result,
-            None => needs_dp.push(k),
+            None => {
+                needs_dp.push(k);
+                if dedup_on {
+                    fps.push(job_fingerprint(job));
+                }
+            }
         }
     }
     if needs_dp.is_empty() {
@@ -873,7 +882,7 @@ fn simd_dispatch(
     if needs_dp.len() == jobs.len() {
         // No HITs: bin `jobs` directly (avoid the gather).
         return dispatch_bins(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            jobs, &fps, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
     }
     // Gather the declined jobs into a dense batch (kernels want full lanes, and a sparse batch
@@ -881,7 +890,7 @@ fn simd_dispatch(
     // is `jobs[needs_dp[s]]`, so `dp_results[s]` belongs at `out[needs_dp[s]]`.
     let dp_jobs: Vec<ExtendJob> = needs_dp.iter().map(|&k| jobs[k]).collect();
     let dp_results = dispatch_bins(
-        &dp_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        &dp_jobs, &fps, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
     );
     for (dp_slot, &k) in needs_dp.iter().enumerate() {
         out[k] = dp_results[dp_slot];
@@ -943,8 +952,11 @@ fn prefetch_job(jobs: &[ExtendJob], k: usize) {
     }
 }
 
+/// [`dedup_jobs`]'s fingerprint of one job: its lengths, `h0` and every byte of both sequences.
+/// Any value is correct, since equal fingerprints are confirmed byte by byte.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
+#[inline]
+fn job_fingerprint(job: &ExtendJob) -> u64 {
     /// Fold every byte of `s` into `h`, 32 at a time in two independent chains of 64 x 64 -> 128
     /// multiplies folded back to 64 bits (wyhash's `mum`), one per 16 bytes. Covering only 32 bytes
     /// at each end let 121M of 126M candidate pairs on 1M chr21 pairs collide (repeat windows share
@@ -984,22 +996,19 @@ fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
         *h = mum(t ^ S2, S1);
     }
 
-    // Fingerprints first, in a streaming pass, so the table probes below can be prefetched ahead.
-    let fps: Vec<u64> = jobs
-        .iter()
-        .enumerate()
-        .map(|(i, job)| {
-            prefetch_job(jobs, i + 4);
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            h ^= (job.query.len() as u64) << 32 | job.target.len() as u64;
-            h = h.wrapping_mul(0x1000_0000_01b3);
-            h ^= job.h0 as u64;
-            h = h.wrapping_mul(0x1000_0000_01b3);
-            fold(&mut h, job.query);
-            fold(&mut h, job.target);
-            h
-        })
-        .collect();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    h ^= (job.query.len() as u64) << 32 | job.target.len() as u64;
+    h = h.wrapping_mul(0x1000_0000_01b3);
+    h ^= job.h0 as u64;
+    h = h.wrapping_mul(0x1000_0000_01b3);
+    fold(&mut h, job.query);
+    fold(&mut h, job.target);
+    h
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>], fps: &[u64]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
+    debug_assert_eq!(fps.len(), jobs.len());
     // Open addressing, linear probe, at most half full. A slot is `(fingerprint, latest distinct
     // job with it + 1)`, 0 meaning empty; `older[i]`: the previous distinct job with job `i`'s
     // fingerprint (`u32::MAX`: none). Distinct jobs never compare equal, so at most one on a chain
@@ -1083,6 +1092,8 @@ fn job_dedup_enabled() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn dispatch_bins(
     jobs: &[ExtendJob],
+    // `job_fingerprint` of each job when dedup is on (see `batched_extend`), else empty.
+    fps: &[u64],
     m: usize,
     mat: &[i8],
     o_del: i32,
@@ -1132,7 +1143,7 @@ fn dispatch_bins(
     // Identical jobs are one job's work and a copy; see `dedup_jobs`. Done here rather than deeper
     // so every bin below sees the deduplicated batch, and undone at the end by indexing through
     // `dup_map`, which leaves the returned vector in caller order exactly as before.
-    let dedup = (jobs.len() > 1 && job_dedup_enabled()).then(|| dedup_jobs(jobs));
+    let dedup = (jobs.len() > 1 && job_dedup_enabled()).then(|| dedup_jobs(jobs, fps));
     let (jobs, dup_map): (&[ExtendJob], Option<&[u32]>) = match &dedup {
         Some((unique, map)) => (unique.as_slice(), Some(map.as_slice())),
         None => (jobs, None),
@@ -6608,7 +6619,8 @@ mod dedup_jobs_tests {
                 h0: (i % 3) as i32,
             })
             .collect();
-        let (unique, map) = super::dedup_jobs(&jobs);
+        let fps: Vec<u64> = jobs.iter().map(super::job_fingerprint).collect();
+        let (unique, map) = super::dedup_jobs(&jobs, &fps);
         let same = |a: &ExtendJob, b: &ExtendJob| {
             a.h0 == b.h0 && a.query == b.query && a.target == b.target
         };
