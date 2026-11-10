@@ -39,6 +39,10 @@ on:
         description: "Also sweep the three memory-level-parallelism knobs that have no x86 measurement"
         default: "false"
         required: false
+      ours_env:
+        description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4"
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -147,18 +151,22 @@ jobs:
         shell: bash -el {0}
         env:
           SET: ${{ github.event.inputs.read_set || 'sim' }}
+          OURS_ENV: ${{ github.event.inputs.ours_env || '' }}
         run: |
           set -euo pipefail
           cd work
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
-          r1="${SET}1.fq"; r2="${SET}2.fq"
+          r1="${SET}1.fq"; r2="${SET}2.fq""
           # Warm the page cache for both, so the first one recorded is not paying for the index read.
           ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
           bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
 
-          for arm in ours fork; do
+          # `alt`: ours again under OURS_ENV, so a knob's effect is read on the same host.
+          arms="ours fork"; [ -n "$OURS_ENV" ] && arms="ours alt fork"
+          for arm in $arms; do
             case "$arm" in
               ours) cmd=(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
+              alt)  read -ra kv <<< "$OURS_ENV"; cmd=(env "${kv[@]}" ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
               fork) cmd=(bwa-mem3   mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2") ;;
             esac
             echo "::group::perf record: $arm"
