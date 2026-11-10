@@ -1754,15 +1754,27 @@ pub(crate) fn fill_fast(dst: &mut [u8], b: u8) {
     }
 }
 
-/// One lane-major staging row of `fill_soa`: `seq` (none for a lane past the jobs) then zeros, up
-/// to `len`.
+/// The first and last `a` bytes of a sequence of `1..16` bytes at `p`, as little-endian words,
+/// with `a` the largest power of two `<= len`, so that the two cover the sequence: the boundary
+/// tile of `piece16` read without touching a byte outside it.
+///
+/// # Safety
+/// `p` valid for `len` bytes, `1 <= len < 16`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-#[inline]
-fn stage_row(st: &mut [u8], at: usize, len: usize, seq: Option<&[u8]>) {
-    let row = &mut st[at..at + len];
-    let seq = seq.unwrap_or(&[]);
-    copy_fast(&mut row[..seq.len()], seq);
-    fill_fast(&mut row[seq.len()..], 0);
+#[inline(always)]
+unsafe fn short_ends(p: *const u8, len: usize) -> (u64, u64, usize) {
+    if len >= 8 {
+        let w = |o: usize| (p.add(o) as *const u64).read_unaligned();
+        (w(0), w(len - 8), 8)
+    } else if len >= 4 {
+        let w = |o: usize| u64::from((p.add(o) as *const u32).read_unaligned());
+        (w(0), w(len - 4), 4)
+    } else if len >= 2 {
+        let w = |o: usize| u64::from((p.add(o) as *const u16).read_unaligned());
+        (w(0), w(len - 2), 2)
+    } else {
+        (u64::from(*p), u64::from(*p), 1)
+    }
 }
 
 /// A buffer whose slice starts on a 64-byte boundary, so a vector at a multiple of its own width
@@ -3544,6 +3556,20 @@ pub(crate) mod x86_row {
     /// # Safety
     /// `src` holds 16 rows of 16 bytes at stride `ss`, `dst` 16 at stride `ds`.
     pub(crate) unsafe fn t16(src: *const u8, ss: usize, dst: *mut u8, ds: usize) {
+        let mut v = [_mm_setzero_si128(); 16];
+        for (l, x) in v.iter_mut().enumerate() {
+            *x = _mm_loadu_si128(src.add(l * ss) as *const __m128i);
+        }
+        t16v(v, dst, ds);
+    }
+
+    /// [`t16`] on 16 rows already in registers: byte `c` of `v[l]` goes to byte `l` of the row at
+    /// `dst + c * ds`.
+    ///
+    /// # Safety
+    /// `dst` holds 16 rows at stride `ds`.
+    #[inline(always)]
+    unsafe fn t16v(v: [__m128i; 16], dst: *mut u8, ds: usize) {
         macro_rules! round {
             ($v:ident, $lo:ident, $hi:ident) => {{
                 let mut o = [_mm_setzero_si128(); 16];
@@ -3554,10 +3580,6 @@ pub(crate) mod x86_row {
                 o
             }};
         }
-        let mut v = [_mm_setzero_si128(); 16];
-        for (l, x) in v.iter_mut().enumerate() {
-            *x = _mm_loadu_si128(src.add(l * ss) as *const __m128i);
-        }
         let v = round!(v, _mm_unpacklo_epi8, _mm_unpackhi_epi8);
         let v = round!(v, _mm_unpacklo_epi16, _mm_unpackhi_epi16);
         let v = round!(v, _mm_unpacklo_epi32, _mm_unpackhi_epi32);
@@ -3567,31 +3589,56 @@ pub(crate) mod x86_row {
         }
     }
 
-    /// `n` positions (a multiple of 16) of 16 lane-major rows of `stride` bytes at `src`, stored
-    /// position-major into lanes `off..off + 16` of `N`-lane vectors at `dst`.
+    /// Bytes `[b, b + 16)` of `seq`, zero past its end, read without touching memory outside
+    /// `seq` (fg-labs/bwa-mem3's `x86_soa_piece16`): a tile inside the sequence is one load, one
+    /// past it is zero, and the boundary tile is the 16 bytes that end at the sequence's end
+    /// shifted down by `pshufb`, or for a sequence under 16 bytes its first and last `a` bytes
+    /// (`a` the largest power of two `<= len`, so the two cover it). `pshufb` zeroes a byte whose
+    /// index has bit 7 set, which is how every byte past the end comes out zero.
     ///
     /// # Safety
-    /// `src` holds `16 * stride` bytes with `n <= stride`; `dst` holds `n * N` bytes.
-    unsafe fn transpose_to<const N: usize>(
-        src: *const u8,
-        stride: usize,
-        n: usize,
-        dst: *mut u8,
-        off: usize,
-    ) {
-        for b in (0..n).step_by(16) {
-            t16(src.add(b), stride, dst.add(b * N + off), N);
+    /// SSSE3; `b` a multiple of 16 (so a sequence under 16 bytes has only the tile at 0).
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    pub(crate) unsafe fn piece16(seq: &[u8], b: usize) -> __m128i {
+        debug_assert_eq!(b % 16, 0);
+        let (p, len) = (seq.as_ptr(), seq.len());
+        if b + 16 <= len {
+            return _mm_loadu_si128(p.add(b) as *const __m128i);
         }
+        if b >= len {
+            return _mm_setzero_si128();
+        }
+        let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let r = len - b;
+        let past = _mm_cmpgt_epi8(iota, _mm_set1_epi8(r as i8 - 1));
+        if len >= 16 {
+            // `seq[b + t]` is byte `t + 16 - r` of the last 16.
+            let idx = _mm_or_si128(_mm_add_epi8(iota, _mm_set1_epi8((16 - r) as i8)), past);
+            return _mm_shuffle_epi8(_mm_loadu_si128(p.add(len - 16) as *const __m128i), idx);
+        }
+        let (lo, hi, a) = super::short_ends(p, len);
+        // Byte `t < a` is byte `t` of `lo`; byte `a <= t < len` is byte `t - (len - a)` of `hi`.
+        let low = _mm_cmplt_epi8(iota, _mm_set1_epi8(a as i8));
+        let idx = _mm_or_si128(
+            _mm_and_si128(low, iota),
+            _mm_andnot_si128(low, _mm_add_epi8(iota, _mm_set1_epi8((8 + a - len) as i8))),
+        );
+        _mm_shuffle_epi8(
+            _mm_set_epi64x(hi as i64, lo as i64),
+            _mm_or_si128(idx, past),
+        )
     }
 
     /// Fill a chunk's SoA buffers (`cols` query positions, `rows` target positions, both multiples
-    /// of 16, `N` lanes each) from the jobs, 16 lanes at a time: each sequence is copied into a
-    /// lane-major staging row, zero past its end, then transposed 16 positions at a time. Every
+    /// of 16, `N` lanes each) from the jobs, 16 lanes and 16 positions at a time: each lane's tile
+    /// read straight from its sequence ([`piece16`]) and the 16 transposed in registers. Every
     /// lane is written, lanes past `jobs` with zeros, so the buffers need no clearing first.
     ///
     /// # Safety
-    /// `qcode` holds `cols * N` bytes and `tcode` `rows * N`; every sequence fits; `N` is a
+    /// SSSE3; `qcode` holds `cols * N` bytes and `tcode` `rows * N`; every sequence fits; `N` is a
     /// multiple of 16 and `jobs.len() <= N`.
+    #[target_feature(enable = "ssse3")]
     pub(super) unsafe fn fill_soa<const N: usize>(
         jobs: &[bwa_extend::ExtendJob],
         cols: usize,
@@ -3599,30 +3646,17 @@ pub(crate) mod x86_row {
         qcode: *mut u8,
         tcode: *mut u8,
     ) {
-        let stride = cols.max(rows);
-        STAGE.with(|st| {
-            let st = &mut *st.borrow_mut();
-            if st.len() < 16 * stride {
-                st.resize(16 * stride, 0);
-            }
-            for blk in 0..N / 16 {
-                let js = jobs.get(blk * 16..).unwrap_or(&[]);
-                let js = &js[..js.len().min(16)];
-                for l in 0..16 {
-                    super::stage_row(st, l * stride, cols, js.get(l).map(|j| j.query));
+        for blk in 0..N / 16 {
+            let js = jobs.get(blk * 16..).unwrap_or(&[]);
+            let q: [&[u8]; 16] = std::array::from_fn(|l| js.get(l).map_or(&[][..], |j| j.query));
+            let t: [&[u8]; 16] = std::array::from_fn(|l| js.get(l).map_or(&[][..], |j| j.target));
+            for (seqs, n, dst) in [(&q, cols, qcode), (&t, rows, tcode)] {
+                for b in (0..n).step_by(16) {
+                    let v = std::array::from_fn(|l| piece16(seqs[l], b));
+                    t16v(v, dst.add(b * N + blk * 16), N);
                 }
-                transpose_to::<N>(st.as_ptr(), stride, cols, qcode, blk * 16);
-                for l in 0..16 {
-                    super::stage_row(st, l * stride, rows, js.get(l).map(|j| j.target));
-                }
-                transpose_to::<N>(st.as_ptr(), stride, rows, tcode, blk * 16);
             }
-        });
-    }
-
-    thread_local! {
-        /// The lane-major staging area of [`fill_soa`].
-        static STAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
     }
 
     #[cfg(test)]
@@ -3689,6 +3723,44 @@ mod copy_fill_fast_tests {
                 super::fill_fast(&mut got[at..at + n], 7);
                 want[at..at + n].fill(7);
                 assert_eq!(got, want, "fill n = {n} at = {at}");
+            }
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod piece16_tests {
+    /// Every length up to 40 at every tile start (a multiple of 16), the sequence inside a buffer of `0xAA` guard
+    /// bytes: the tile is the sequence's bytes then zeros, never a guard byte.
+    #[test]
+    fn piece16_is_the_tile_zero_padded() {
+        let mut buf = [0xAAu8; 96];
+        for (k, x) in buf[32..72].iter_mut().enumerate() {
+            *x = (k as u8).wrapping_mul(37) | 1;
+        }
+        for len in 0..=40usize {
+            let seq = &buf[32..32 + len];
+            for b in (0..=len + 16).step_by(16) {
+                let want: Vec<u8> = (b..b + 16)
+                    .map(|i| seq.get(i).copied().unwrap_or(0))
+                    .collect();
+                let mut got = [0u8; 16];
+                // SAFETY: NEON is mandatory on aarch64; on x86_64 the test needs SSSE3.
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    std::arch::aarch64::vst1q_u8(
+                        got.as_mut_ptr(),
+                        super::neon_row::piece16(seq, b),
+                    );
+                }
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_storeu_si128(
+                        got.as_mut_ptr().cast(),
+                        super::x86_row::piece16(seq, b),
+                    );
+                }
+                assert_eq!(&got[..], &want[..], "len {len} b {b}");
             }
         }
     }
@@ -4073,9 +4145,51 @@ mod neon_row {
         (gb, ge, fl, fh, u64::from(bits(narrow_mask(nxt))))
     }
 
+    /// Bytes `[b, b + 16)` of `seq`, zero past its end, read without touching memory outside
+    /// `seq` (fg-labs/bwa-mem3's `neon_soa_pack16` tiles): a tile inside the sequence is one load,
+    /// one past it is zero, and the boundary tile is the 16 bytes that end at the sequence's end
+    /// shifted down by `tbl`, or for a sequence under 16 bytes its first and last `a` bytes (`a`
+    /// the largest power of two `<= len`, so the two cover it). `tbl` reads an index past 15 as
+    /// zero, which is how every byte past the end comes out zero.
+    ///
+    /// # Safety
+    /// NEON; `b` a multiple of 16 (so a sequence under 16 bytes has only the tile at 0).
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) unsafe fn piece16(seq: &[u8], b: usize) -> uint8x16_t {
+        debug_assert_eq!(b % 16, 0);
+        let (p, len) = (seq.as_ptr(), seq.len());
+        if b + 16 <= len {
+            return vld1q_u8(p.add(b));
+        }
+        if b >= len {
+            return vdupq_n_u8(0);
+        }
+        const IOTA: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let iota = vld1q_u8(IOTA.as_ptr());
+        if len >= 16 {
+            // `seq[b + t]` is byte `t + 16 - r` of the last 16, `r = len - b`.
+            let idx = vaddq_u8(iota, vdupq_n_u8((16 - (len - b)) as u8));
+            return vqtbl1q_u8(vld1q_u8(p.add(len - 16)), idx);
+        }
+        let (lo, hi, a) = super::short_ends(p, len);
+        // Byte `t < a` is byte `t` of `lo`; byte `a <= t < len` is byte `t - (len - a)` of `hi`.
+        let idx = vbslq_u8(
+            vcltq_u8(iota, vdupq_n_u8(a as u8)),
+            iota,
+            vaddq_u8(iota, vdupq_n_u8((8 + a - len) as u8)),
+        );
+        let idx = vorrq_u8(idx, vcgeq_u8(iota, vdupq_n_u8(len as u8)));
+        vqtbl1q_u8(
+            vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(lo), vcreate_u64(hi))),
+            idx,
+        )
+    }
+
     /// Fill the chunk's SoA buffers (`cols` query positions, `rows` target positions, both
-    /// multiples of 16, 16 lanes each) from the jobs: each sequence is copied into a lane-major
-    /// staging row, zero past its end, then transposed 16 positions at a time.
+    /// multiples of 16, 16 lanes each) from the jobs, 16 positions at a time: each lane's tile
+    /// read straight from its sequence ([`piece16`]) and the 16 transposed in registers. Every
+    /// lane is written, lanes past `jobs` with zeros.
     ///
     /// # Safety
     /// NEON; `qcode` holds `cols * 16` bytes and `tcode` `rows * 16`; every sequence fits.
@@ -4087,27 +4201,17 @@ mod neon_row {
         qcode: *mut u8,
         tcode: *mut u8,
     ) {
-        debug_assert!(N == 16);
-        let stride = cols.max(rows);
-        STAGE.with(|st| {
-            let st = &mut *st.borrow_mut();
-            if st.len() < 16 * stride {
-                st.resize(16 * stride, 0);
+        debug_assert!(N == 16 && jobs.len() <= 16);
+        let q: [&[u8]; 16] = std::array::from_fn(|l| jobs.get(l).map_or(&[][..], |j| j.query));
+        let t: [&[u8]; 16] = std::array::from_fn(|l| jobs.get(l).map_or(&[][..], |j| j.target));
+        for (seqs, n, dst) in [(&q, cols, qcode), (&t, rows, tcode)] {
+            for b in (0..n).step_by(16) {
+                let v = std::array::from_fn(|l| piece16(seqs[l], b));
+                for (k, x) in crate::rescue_band::neon::transpose16(v).iter().enumerate() {
+                    vst1q_u8(dst.add((b + k) * 16), *x);
+                }
             }
-            for l in 0..16 {
-                super::stage_row(st, l * stride, cols, jobs.get(l).map(|j| j.query));
-            }
-            crate::rescue_band::neon::transpose_to(st.as_ptr(), stride, cols, qcode);
-            for l in 0..16 {
-                super::stage_row(st, l * stride, rows, jobs.get(l).map(|j| j.target));
-            }
-            crate::rescue_band::neon::transpose_to(st.as_ptr(), stride, rows, tcode);
-        });
-    }
-
-    thread_local! {
-        /// The lane-major staging area of [`fill_soa`].
-        static STAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
     }
 
     /// The row epilogue's trackers; returns one bit per lane still live (active and not

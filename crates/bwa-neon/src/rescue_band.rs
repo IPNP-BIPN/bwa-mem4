@@ -904,7 +904,7 @@ pub(crate) mod neon {
 
     /// 16x16 byte transpose in registers: `out[t][l] = v[l][t]`.
     #[target_feature(enable = "neon")]
-    unsafe fn transpose16(v: [uint8x16_t; 16]) -> [uint8x16_t; 16] {
+    pub(crate) unsafe fn transpose16(v: [uint8x16_t; 16]) -> [uint8x16_t; 16] {
         let mut a = v;
         // Bytes.
         for i in 0..8 {
