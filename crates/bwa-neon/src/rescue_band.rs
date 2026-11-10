@@ -448,9 +448,11 @@ impl Batch {
         self.order
             .sort_unstable_by_key(|&i| self.jobs[i as usize].key);
         let gl = self.work.lanes();
+        // Once per call, not per group (a `memset` of the whole array each time): a group writes
+        // and reads only its first `nl` lanes.
+        let mut lanes = [kernel::Lane::default(); kernel::L];
         for g in (0..n).step_by(gl) {
             let nl = gl.min(n - g);
-            let mut lanes = [kernel::Lane::default(); kernel::L];
             let (mut wmax, mut omax) = (1, i32::MIN);
             for l in 0..nl {
                 let j = &self.jobs[self.order[g + l] as usize];
@@ -568,9 +570,11 @@ impl Batch {
         self.order
             .sort_unstable_by_key(|&i| self.jobs[i as usize].key);
         let gl = self.work.lanes();
+        // Once per call, not per group (a `memset` of the whole array each time): a group writes
+        // and reads only its first `nl` lanes.
+        let mut lanes = [kernel::Lane::default(); kernel::L];
         for g in (0..n).step_by(gl) {
             let nl = gl.min(n - g);
-            let mut lanes = [kernel::Lane::default(); kernel::L];
             let (mut wmax, mut omax) = (1, i32::MIN);
             for l in 0..nl {
                 let j = &self.jobs[self.order[g + l] as usize];

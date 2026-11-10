@@ -592,11 +592,14 @@ mod neon {
         }
         let rb = s.rbuf.as_mut_ptr();
         let mut ov = vdupq_n_u8(0);
+        // Stored through an opaque zero: a plain load-store loop is turned into a `memcpy` call
+        // plus a second pass for the OR (0.1% of M4 PE in the call alone).
+        let z = std::hint::black_box(vdupq_n_u8(0));
         let mut i = 0;
         while i + 16 <= len1 {
             let x = vld1q_u8(t.as_ptr().add(i));
             ov = vorrq_u8(ov, x);
-            vst1q_u8(rb.add(i), x);
+            vst1q_u8(rb.add(i), vorrq_u8(x, z));
             i += 16;
         }
         let mut tail = 0u8;
@@ -987,11 +990,13 @@ mod sse {
         }
         let rb = s.rbuf.as_mut_ptr();
         let mut ov = _mm_setzero_si128();
+        // Through an opaque zero, or the loop becomes a `memcpy` call (see the NEON version).
+        let z = std::hint::black_box(_mm_setzero_si128());
         let mut i = 0;
         while i + 16 <= len1 {
             let x = ld(t.as_ptr().add(i));
             ov = _mm_or_si128(ov, x);
-            _mm_storeu_si128(rb.add(i) as *mut __m128i, x);
+            _mm_storeu_si128(rb.add(i) as *mut __m128i, _mm_or_si128(x, z));
             i += 16;
         }
         let mut tail = 0u8;

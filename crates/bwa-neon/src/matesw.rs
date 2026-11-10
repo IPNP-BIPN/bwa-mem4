@@ -547,16 +547,30 @@ pub fn batched_mate_rescue(
     )
 }
 
+/// Three 8-byte words of a window (first, middle, last; all of it when shorter) folded into one:
+/// equal windows get equal values, and different ones almost never do. A prefilter only, the
+/// bytes are still compared.
+fn window_fp(t: &[u8]) -> u64 {
+    let n = t.len();
+    if n < 8 {
+        return t.iter().fold(n as u64, |h, &b| h << 8 | u64::from(b));
+    }
+    let w = |at: usize| u64::from_le_bytes(t[at..at + 8].try_into().unwrap());
+    w(0) ^ w((n - 8) / 2).rotate_left(21) ^ w(n - 8).rotate_left(42)
+}
+
 /// A grouping key for a query's bytes: equal queries get equal keys. Collisions only cost a
 /// cache miss in the filter, never a wrong result (`load_query` compares the bytes).
 fn query_key(q: &[u8]) -> u64 {
-    let mut h = q.len() as u64;
-    for c in q.chunks(8) {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        h = (h ^ u64::from_le_bytes(w))
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .rotate_left(29);
+    let mix = |h: u64, w: u64| (h ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+    let (words, tail) = q.as_chunks::<8>();
+    let mut h = words
+        .iter()
+        .fold(q.len() as u64, |h, w| mix(h, u64::from_le_bytes(*w)));
+    // The tail as a zero-padded little-endian word, without the `memcpy` call per chunk that
+    // `copy_from_slice` into a padded buffer made.
+    if !tail.is_empty() {
+        h = mix(h, tail.iter().rev().fold(0, |v, &b| v << 8 | u64::from(b)));
     }
     h
 }
@@ -694,27 +708,32 @@ pub(crate) fn batched_align(
     //      candidates are the earlier jobs of the current query group (`ord` groups by query).
     //      `alias`: (job, source job, row shift). ----
     let mut alias: Vec<(u32, u32, i32)> = Vec::new();
-    let mut group: Vec<(u32, u32, u32)> = Vec::new(); // (job, first kept row, kept rows)
+    // (job, first kept row, kept rows, `window_fp` of those rows)
+    let mut group: Vec<(u32, u32, u32, u64)> = Vec::new();
     let mut group_q: &[u8] = &[];
     let kept = |d: &rescue_prune::Decision, len1: usize| match *d {
         rescue_prune::Decision::Hull { hb, he } => Some((hb, he + 1 - hb)),
         rescue_prune::Decision::Full => Some((0, len1)),
         rescue_prune::Decision::Fail => None,
     };
-    // The source among `group` for job `j` with kept rows `(hb, n)`, if any.
-    let find = |group: &[(u32, u32, u32)], j: &KswJob, hb: usize, n: usize| {
+    // The source among `group` for job `j` with kept rows `(hb, n)` and fingerprint `fp`, if any.
+    // The fingerprint turns most misses away without a `memcmp` call (one was 0.27% of M4 PE).
+    let find = |group: &[(u32, u32, u32, u64)], j: &KswJob, hb: usize, n: usize, fp: u64| {
         group
             .iter()
-            .find(|&&(s, shb, sn)| {
+            .find(|&&(s, shb, sn, sfp)| {
                 sn as usize == n
+                    && sfp == fp
                     && jobs[s as usize].target[shb as usize..shb as usize + n]
                         == j.target[hb..hb + n]
             })
-            .map(|&(s, shb, _)| (s, hb as i32 - shb as i32))
+            .map(|&(s, shb, _, _)| (s, hb as i32 - shb as i32))
     };
     for &(_, i) in &ord {
         let (i, j) = (i as usize, &jobs[i as usize]);
-        if prune.is_some() && group_q != j.query {
+        // Jobs of one mate share its slice: the pointer test skips the byte compare for them.
+        let same_q = std::ptr::eq(group_q, j.query) || group_q == j.query;
+        if prune.is_some() && !same_q {
             group.clear();
             group_q = j.query;
         }
@@ -730,11 +749,12 @@ pub(crate) fn batched_align(
                 let quanta = ksw_padded_qlen(j.query.len(), max_sc);
                 let (d, t1) = band.decide(j.target, j.query, &p, prune_max_hits());
                 if let Some((hb, n)) = kept(&d, j.target.len()) {
-                    if let Some((src, sh)) = find(&group, j, hb, n) {
+                    let fp = window_fp(&j.target[hb..hb + n]);
+                    if let Some((src, sh)) = find(&group, j, hb, n, fp) {
                         alias.push((i as u32, src, sh));
                         continue;
                     }
-                    group.push((i as u32, hb as u32, n as u32));
+                    group.push((i as u32, hb as u32, n as u32, fp));
                 }
                 match band.commit(i, j.target, j.query, d, t1, &p, quanta) {
                     Some(d) => Some(d),
@@ -751,11 +771,12 @@ pub(crate) fn batched_align(
             Some(p) => {
                 let d = rescue_prune::decide(j.target, j.query, &p, prune_max_hits());
                 if let Some((hb, n)) = kept(&d, j.target.len()) {
-                    if let Some((src, sh)) = find(&group, j, hb, n) {
+                    let fp = window_fp(&j.target[hb..hb + n]);
+                    if let Some((src, sh)) = find(&group, j, hb, n, fp) {
                         alias.push((i as u32, src, sh));
                         continue;
                     }
-                    group.push((i as u32, hb as u32, n as u32));
+                    group.push((i as u32, hb as u32, n as u32, fp));
                 }
                 Some(d)
             }
