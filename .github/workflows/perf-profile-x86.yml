@@ -386,7 +386,8 @@ jobs:
   # their AVX2 kernels.
   icount:
     if: github.event.inputs.icount == 'true'
-    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
+    # 24.04's valgrind 3.22: 22.04's 3.18 cannot read the fork's DWARF 5 debug info and gives up.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
