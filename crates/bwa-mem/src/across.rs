@@ -651,6 +651,13 @@ thread_local! {
     /// memory mimalloc had recycled zeroed it again (`rep stosb`, 0.3% of samples on EPYC 9V45).
     static SA_BUFS: std::cell::Cell<(Vec<i64>, Vec<i64>)> =
         const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+    /// `reg_meta` and `reg_preskip`, kept between chunks for the same reason: every pushed region
+    /// writes its own slot before any pass reads it, and nothing reads past `regs[r].len()`.
+    static META_BUFS: std::cell::Cell<(Vec<RegMeta>, Vec<bool>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+    /// `run_side`'s active job list and its counting-sort output.
+    static SIDE_BUFS: std::cell::Cell<(Vec<usize>, Vec<usize>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
 }
 
 /// One pending one-sided extension, with a back-pointer to the region it fills.
@@ -1249,15 +1256,17 @@ fn align_reads_batched_inner<B: SwBackend>(
         slot0.push(n_slots);
         n_slots += n_seeds(r);
     }
-    let mut reg_meta = vec![
+    // `resize` writes only past the old length: the slots are written before they are read.
+    let (mut reg_meta, mut reg_preskip) = META_BUFS.take();
+    reg_meta.resize(
+        n_slots,
         RegMeta {
             chain: 0,
             pos: 0,
-            seed: 0
-        };
-        n_slots
-    ];
-    let mut reg_preskip = vec![false; n_slots];
+            seed: 0,
+        },
+    );
+    reg_preskip.resize(n_slots, false);
 
     // The two pending-extension queues, pooled across the WHOLE batch rather than per read: that is
     // what gives the SIMD kernel enough same-length work to fill its lanes. A seed contributes a left
@@ -1679,6 +1688,7 @@ fn align_reads_batched_inner<B: SwBackend>(
     for read_regs in regs.iter_mut() {
         read_regs.retain(|reg| reg.qe > reg.qb);
     }
+    META_BUFS.set((reg_meta, reg_preskip));
 
     regs
 }
@@ -1766,8 +1776,13 @@ fn run_side<B: SwBackend>(
         // Indices into `jobs` of everything still needing a pass. Invariant at the top of each round:
         // it holds exactly the jobs no acceptance test has yet passed, so it shrinks monotonically
         // and the loop stops as soon as it is empty.
-        let mut active_idxs: Vec<usize> = (0..jobs.len()).filter(|&k| jobs[k].active).collect();
+        // Both buffers are the thread's, kept between rounds and calls (fresh ones were zeroed or
+        // first-touched every round).
+        let (mut active_idxs, mut sorted) = SIDE_BUFS.take();
+        active_idxs.clear();
+        active_idxs.extend((0..jobs.len()).filter(|&k| jobs[k].active));
         if active_idxs.is_empty() {
+            SIDE_BUFS.set((active_idxs, sorted));
             break;
         }
         // Purely a throughput sort: a SIMD batch runs for as long as its longest lane, so grouping
@@ -1788,13 +1803,14 @@ fn run_side<B: SwBackend>(
         for b in 1..start.len() {
             start[b] += start[b - 1];
         }
-        let mut sorted = vec![0usize; active_idxs.len()];
+        // Every slot is written below, so `resize` (which fills only past the old length) suffices.
+        sorted.resize(active_idxs.len(), 0);
         for &k in &active_idxs {
             let b = kmax - key(k);
             sorted[start[b]] = k;
             start[b] += 1;
         }
-        active_idxs = sorted;
+        std::mem::swap(&mut active_idxs, &mut sorted);
 
         // ---- step 2: run the batch at this round's band width ----
         // Band width for this round: `opt.w`, then `2*opt.w` (`bwamem.cpp:2474`).
@@ -1949,6 +1965,7 @@ fn run_side<B: SwBackend>(
             reg.w = reg.w.max(w);
         }
         align_split::record_round(round as usize, active_idxs.len(), requeued_this_round);
+        SIDE_BUFS.set((active_idxs, sorted));
     }
 }
 
