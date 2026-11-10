@@ -469,7 +469,7 @@ mod sort_scratch {
         /// packed into one u128 off x86-64 (see [`super::sort_hlt`]).
         #[cfg(target_arch = "x86_64")]
         #[allow(clippy::type_complexity)]
-        pub static PERM_PRI: RefCell<Vec<((std::cmp::Reverse<i32>, bool, u64), u32)>> =
+        pub static PERM_PRI: RefCell<Vec<((u64, u64), u32)>> =
             const { RefCell::new(Vec::new()) };
         #[cfg(not(target_arch = "x86_64"))]
         pub static PERM_PRI: RefCell<Vec<u128>> = const { RefCell::new(Vec::new()) };
@@ -689,7 +689,9 @@ pub fn mem_sort_dedup_patch(
                 perm,
                 spare,
                 |r| (r.score, r.rb, r.qb),
-                |x, y| x.0 > y.0 || (x.0 == y.0 && (x.1 < y.1 || (x.1 == y.1 && x.2 < y.2))),
+                // Bitwise, not short-circuit (fg-labs/bwa-mem3's `dedup_psc_lt_bf`): the same
+                // boolean, without three data-dependent branches per comparison.
+                |x, y| (x.0 > y.0) | ((x.0 == y.0) & ((x.1 < y.1) | ((x.1 == y.1) & (x.2 < y.2)))),
             );
             #[cfg(not(target_arch = "x86_64"))]
             ks_introsort_by_key(&mut a, perm, spare, score_key, |x, y| x < y);
@@ -982,10 +984,26 @@ fn sort_hlt(a: &mut [MemAlnReg]) {
                             .map(|&k| a[(k as u32 & 0x7fff_ffff) as usize].clone()),
                     );
                 }
+                // x86-64: fg-labs/bwa-mem3's `primary_pair`, `(!score << 1 | alt, hash)` compared
+                // bitwise. The pair is distinct per region, so the index never breaks a tie.
                 #[cfg(target_arch = "x86_64")]
                 {
-                    perm.extend(a.iter().enumerate().map(|(i, r)| (key(r), i as u32)));
-                    perm.sort_unstable();
+                    perm.extend(a.iter().enumerate().map(|(i, r)| {
+                        let k0 =
+                            u64::from(!(r.score as u32 ^ 0x8000_0000)) << 1 | u64::from(r.is_alt);
+                        ((k0, r.hash), i as u32)
+                    }));
+                    perm.sort_unstable_by(|x, y| {
+                        let (a, b) = (x.0, y.0);
+                        let lt = (a.0 < b.0) | ((a.0 == b.0) & (a.1 < b.1));
+                        if lt {
+                            std::cmp::Ordering::Less
+                        } else if a == b {
+                            std::cmp::Ordering::Equal
+                        } else {
+                            std::cmp::Ordering::Greater
+                        }
+                    });
                     spare.clear();
                     spare.extend(perm.iter().map(|&(_, i)| a[i as usize].clone()));
                 }

@@ -97,7 +97,9 @@ pub(crate) struct Batch {
     bands: Vec<Band>,
     parents: Vec<Parent>,
     jobs: Vec<Job>,
-    order: Vec<u32>,
+    /// Jobs in group order, as `key << 32 | index` words: a primitive sort, with no key lookup
+    /// per comparison. The index is the low half.
+    order: Vec<u64>,
     r2: Vec<u32>,
     pool: Vec<u8>,
     c19: Vec<Comp>,
@@ -450,9 +452,13 @@ impl Batch {
     ) {
         let n = self.jobs.len();
         self.order.clear();
-        self.order.extend(0..n as u32);
-        self.order
-            .sort_unstable_by_key(|&i| self.jobs[i as usize].key);
+        self.order.extend(
+            self.jobs
+                .iter()
+                .enumerate()
+                .map(|(i, j)| u64::from(j.key) << 32 | i as u64),
+        );
+        self.order.sort_unstable();
         let gl = self.work.lanes();
         // Once per call, not per group (a `memset` of the whole array each time): a group writes
         // and reads only its first `nl` lanes.
@@ -461,7 +467,7 @@ impl Batch {
             let nl = gl.min(n - g);
             let (mut wmax, mut omax) = (1, i32::MIN);
             for l in 0..nl {
-                let j = &self.jobs[self.order[g + l] as usize];
+                let j = &self.jobs[self.order[g + l] as u32 as usize];
                 let b = &j.band;
                 let kj = &jobs[self.parents[j.parent as usize].job as usize];
                 lanes[l] = kernel::Lane {
@@ -488,7 +494,7 @@ impl Batch {
                 self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
             }
             for l in 0..nl {
-                let ji = self.order[g + l] as usize;
+                let ji = self.order[g + l] as u32 as usize;
                 let (pi, b) = (self.jobs[ji].parent as usize, self.jobs[ji].band);
                 let p = &mut self.parents[pi];
                 let g8 = i32::from(self.work.gmax[l]);
@@ -572,9 +578,13 @@ impl Batch {
         }
         let n = self.jobs.len();
         self.order.clear();
-        self.order.extend(0..n as u32);
-        self.order
-            .sort_unstable_by_key(|&i| self.jobs[i as usize].key);
+        self.order.extend(
+            self.jobs
+                .iter()
+                .enumerate()
+                .map(|(i, j)| u64::from(j.key) << 32 | i as u64),
+        );
+        self.order.sort_unstable();
         let gl = self.work.lanes();
         // Once per call, not per group (a `memset` of the whole array each time): a group writes
         // and reads only its first `nl` lanes.
@@ -583,7 +593,7 @@ impl Batch {
             let nl = gl.min(n - g);
             let (mut wmax, mut omax) = (1, i32::MIN);
             for l in 0..nl {
-                let j = &self.jobs[self.order[g + l] as usize];
+                let j = &self.jobs[self.order[g + l] as u32 as usize];
                 let (q, t, s) = jobs[j.parent as usize];
                 lanes[l] = kernel::Lane {
                     q,
@@ -605,7 +615,7 @@ impl Batch {
                 self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
             }
             for l in 0..nl {
-                let i = self.jobs[self.order[g + l] as usize].parent as usize;
+                let i = self.jobs[self.order[g + l] as u32 as usize].parent as usize;
                 let g8 = i32::from(self.work.gmax[l]);
                 out[i] = if g8 > 0 {
                     (g8, self.work.te[l], i32::from(self.work.qe[l]))

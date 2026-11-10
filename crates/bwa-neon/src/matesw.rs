@@ -832,17 +832,22 @@ pub(crate) fn batched_align(
         // `ord[k]` is the original index of the job the kernel will run in slot `k`. Sorted by
         // target length first because it dominates the cell count (~1400 rows against ~150
         // columns), then by the PADDED query length, which is what the kernel actually walks.
-        let mut ord: Vec<u32> = (0..fwd_jobs.len() as u32).collect();
-        ord.sort_unstable_by_key(|&i| {
-            let j = &fwd_jobs[i as usize];
-            (j.target.len(), ksw_padded_qlen(j.query.len(), max_sc))
-        });
-        let sorted: Vec<FwdJob> = ord.iter().map(|&i| fwd_jobs[i as usize]).collect();
+        // Keys computed once, not per comparison: `(target_len << 32 | padded_qlen, index)`.
+        let mut ord: Vec<(u64, u32)> = fwd_jobs
+            .iter()
+            .enumerate()
+            .map(|(i, j)| {
+                let pad = ksw_padded_qlen(j.query.len(), max_sc) as u64;
+                ((j.target.len() as u64) << 32 | pad, i as u32)
+            })
+            .collect();
+        ord.sort_unstable();
+        let sorted: Vec<FwdJob> = ord.iter().map(|&(_, i)| fwd_jobs[i as usize]).collect();
         let got = fwd_local_sw_batch(&sorted, m, mat, o_del, e_del, o_ins, e_ins, max_sc);
         // Scatter back to caller order: every downstream index (`out`, pass 2, the caller's
         // orientation cursor) is in job order and must stay that way.
         let mut back = vec![(0i32, 0i32, 0i32, 0i32, 0i32); got.len()];
-        for (slot, &i) in ord.iter().enumerate() {
+        for (slot, &(_, i)) in ord.iter().enumerate() {
             back[i as usize] = got[slot];
         }
         back
