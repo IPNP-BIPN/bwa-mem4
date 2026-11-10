@@ -228,7 +228,7 @@ dependencies = [
  "bwa-mem4-mem",
  "bwa-mem4-neon",
  "clap",
- "mimalloc",
+ "libmimalloc-sys",
  "rammap-core",
  "rayon",
  "rust-htslib",
@@ -1234,15 +1234,6 @@ dependencies = [
  "log",
  "objc",
  "paste",
-]
-
-[[package]]
-name = "mimalloc"
-version = "0.1.52"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
-dependencies = [
- "libmimalloc-sys",
 ]
 
 [[package]]

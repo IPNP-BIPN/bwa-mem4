@@ -28,7 +28,55 @@ use clap::{Parser, Subcommand};
 // binary is unchanged.
 #[cfg(all(feature = "mimalloc", not(feature = "stage-alloc")))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: MiMalloc = MiMalloc;
+
+/// mimalloc, called the way C's `malloc` calls it. The `mimalloc` crate sends every request through
+/// `mi_malloc_aligned`, whose fast path only covers blocks of at most 1 KiB with a free slot ready:
+/// any other size that is not a power of two falls to its over-allocation path (`size + align - 1`,
+/// often one size class up) and leaves the page flagged for interior pointers. Every mimalloc block
+/// is at least 8-byte aligned, so an alignment of 8 or less needs none of that.
+#[cfg(feature = "mimalloc")]
+struct MiMalloc;
+
+#[cfg(feature = "mimalloc")]
+// SAFETY: every path returns a block of at least `size` bytes aligned to `align` (mimalloc's
+// word alignment covers `align <= 8`; the aligned calls cover the rest), or null on failure.
+unsafe impl std::alloc::GlobalAlloc for MiMalloc {
+    #[inline]
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        use libmimalloc_sys::{mi_malloc, mi_malloc_aligned};
+        if l.align() <= 8 {
+            mi_malloc(l.size()).cast()
+        } else {
+            mi_malloc_aligned(l.size(), l.align()).cast()
+        }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        use libmimalloc_sys::{mi_zalloc, mi_zalloc_aligned};
+        if l.align() <= 8 {
+            mi_zalloc(l.size()).cast()
+        } else {
+            mi_zalloc_aligned(l.size(), l.align()).cast()
+        }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, _: std::alloc::Layout) {
+        libmimalloc_sys::mi_free(p.cast());
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, size: usize) -> *mut u8 {
+        use libmimalloc_sys::{mi_realloc, mi_realloc_aligned};
+        if l.align() <= 8 {
+            mi_realloc(p.cast(), size).cast()
+        } else {
+            mi_realloc_aligned(p.cast(), size, l.align()).cast()
+        }
+    }
+}
 
 // With `--features stage-alloc`, the same allocator wrapped in `stage_alloc::Counting`, which
 // forwards every request and counts the bytes against the pipeline stage that asked for them. Off
@@ -37,8 +85,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // for why issue #25 needs a counter inside the allocator rather than another peak-RSS snapshot.
 #[cfg(all(feature = "mimalloc", feature = "stage-alloc"))]
 #[global_allocator]
-static GLOBAL: bwa_mem4::stage_alloc::Counting<mimalloc::MiMalloc> =
-    bwa_mem4::stage_alloc::Counting::new(mimalloc::MiMalloc);
+static GLOBAL: bwa_mem4::stage_alloc::Counting<MiMalloc> =
+    bwa_mem4::stage_alloc::Counting::new(MiMalloc);
 
 // Without the `mimalloc` feature the binary declares no allocator at all and gets the system one.
 // The probe still wraps it, so a build made to compare allocators can measure both with the same
