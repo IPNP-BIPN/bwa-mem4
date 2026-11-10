@@ -160,7 +160,9 @@ fn wide512_min() -> usize {
 /// Bytes of padding on both sides of the query and target copies (the vector loads overhang by 7).
 const PAD: usize = 64;
 
-/// Narrowest band routed here (the fork's NEON crossover, `KSW_WAVE16_WMIN`). `BWA4_WAVE_WMIN`
+/// Narrowest band routed here (the fork's `KSW_WAVE16_WMIN`: 4 on x86, 5 on NEON, where 4
+/// measured neutral). On x86 the `w = 4` bands, the 1 bp indel floor, run faster as one 8-lane
+/// diagonal than scalar: ksw_global2 -1.5..-3% on EPYC 7763 and 9V74. `BWA4_WAVE_WMIN`
 /// overrides it; a huge value keeps every call on the scalar kernel.
 fn wmin() -> usize {
     use std::sync::OnceLock;
@@ -169,7 +171,7 @@ fn wmin() -> usize {
         std::env::var("BWA4_WAVE_WMIN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5)
+            .unwrap_or(if cfg!(target_arch = "x86_64") { 4 } else { 5 })
             .max(3)
     })
 }
