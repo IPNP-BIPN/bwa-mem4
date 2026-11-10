@@ -223,7 +223,7 @@ jobs:
           done
 
           # Where inside our u8 extension and rescue band kernels and the SMEM walk the time goes: per-line
-          # summary and hottest instructions.
+          # summary and hottest instructions. mimalloc's entry points too: x86 alloc is ~2x the fork's.
           for pat in 'bwa_neon::batched::[a-z0-9_]*::batched_extend_[a-z0-9_]*_u8' \
                      'bwa_neon::rescue_band::[a-z0-9_]*::Work::run[a-z_]*' \
                      'bwa_index::fmindex::FmIndex::backward_round[a-z_]*' \
@@ -235,7 +235,9 @@ jobs:
                      'bwa_mem4_mem::across::run_side' \
                      'bwa_mem4_mem::across::align_reads_batched' \
                      'bwa_mem4_mem::pe::batch_mate_rescue' \
-                     'bwa_mem4_mem::cigar::gen_cigar2'; do
+                     'bwa_mem4_mem::cigar::gen_cigar2' \
+                     '_mi_theap_malloc_zero' \
+                     'mi_free'; do
           sym=$("$PERF" report -i ours.data --stdio --no-children 2>/dev/null \
             | grep -o "$pat" | head -1 || true)
           if [ -n "$sym" ]; then
