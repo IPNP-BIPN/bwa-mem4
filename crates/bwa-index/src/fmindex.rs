@@ -1637,6 +1637,19 @@ impl FmIndex {
         };
         #[cfg(not(target_arch = "aarch64"))]
         let rows = ((b.hi ^ hx) & (b.lo ^ lx) & rows_before(pp & CP_MASK)).count_ones();
+        self.occ_from_rows::<WIDE, A0>(b, pp, a, rows)
+    }
+
+    /// [`occ_hoisted`](Self::occ_hoisted)'s count from its block `b` and the popcount `rows` of
+    /// base `a`'s rows before `pp` in it.
+    #[inline(always)]
+    fn occ_from_rows<const WIDE: bool, const A0: bool>(
+        &self,
+        b: &CpOcc,
+        pp: i64,
+        a: usize,
+        rows: u32,
+    ) -> i64 {
         let mut o = i64::from(b.cp_count[a]) + i64::from(rows);
         if WIDE {
             o += self.count_base[(pp >> self.count_span_shift) as usize][a];
@@ -1663,10 +1676,27 @@ impl FmIndex {
         if c.s == 1 {
             // SAFETY: as in `occ_hoisted`.
             let b = unsafe { cp.get_unchecked((c.k >> CP_SHIFT) as usize) };
-            let hit = (!A0 || c.k != self.sentinel_index) && Self::base_at(b, c.k) == a;
+            // Base `a`'s rows of the block serve both the hit test and the count. (AArch64 counts
+            // in vector registers, where the hit test would have to cross back.)
+            #[cfg(not(target_arch = "aarch64"))]
+            let (o, hit) = {
+                let x = (b.hi ^ hx) & (b.lo ^ lx);
+                let y = c.k & CP_MASK;
+                let rows = (x & rows_before(y)).count_ones();
+                // MSB-first: row `y` is bit `63 - y`.
+                (
+                    self.occ_from_rows::<WIDE, A0>(b, c.k, a, rows),
+                    (x << y) >> 63 == 1,
+                )
+            };
+            #[cfg(target_arch = "aarch64")]
+            let (o, hit) = (
+                self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx),
+                Self::base_at(b, c.k) == a,
+            );
             (
-                count_a + self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx),
-                i64::from(hit),
+                count_a + o,
+                i64::from(hit && (!A0 || c.k != self.sentinel_index)),
             )
         } else {
             let o = self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx);
