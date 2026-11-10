@@ -1792,23 +1792,7 @@ impl FmIndex {
         // reloaded every candidate.
         macro_rules! go {
             ($w:literal, $a0:literal, $a:literal) => {
-                if br_cursor() {
-                    self.backward_round_impl::<$w, $a0, $a, true>(
-                        prev,
-                        m,
-                        min_intv,
-                        min_seed_len,
-                        out,
-                    )
-                } else {
-                    self.backward_round_impl::<$w, $a0, $a, false>(
-                        prev,
-                        m,
-                        min_intv,
-                        min_seed_len,
-                        out,
-                    )
-                }
+                self.backward_round_impl::<$w, $a0, $a>(prev, m, min_intv, min_seed_len, out)
             };
         }
         match (self.wide, a) {
@@ -1825,7 +1809,7 @@ impl FmIndex {
 
     /// [`backward_round`](Self::backward_round) for base `A` (`A0` is `A == 0`).
     #[inline]
-    fn backward_round_impl<const WIDE: bool, const A0: bool, const A: usize, const CUR: bool>(
+    fn backward_round_impl<const WIDE: bool, const A0: bool, const A: usize>(
         &self,
         prev: &mut [Smem],
         m: u32,
@@ -1860,53 +1844,29 @@ impl FmIndex {
             }
         }
         // The rest survive only with a new occurrence count, and none is emitted.
-        if CUR {
-            // A read cursor and a write head, the loop-carried values, rather than `p`, `n` and
-            // `kept` over the slice base: x86 spilled the count and `kept` and stepped them in
-            // memory every candidate.
-            let base = prev.as_mut_ptr();
-            // SAFETY: `kept <= p <= n`, so every pointer is within or one past `prev`; the write
-            // head never passes the cursor (at most one survivor per candidate read).
-            unsafe {
-                let end = base.add(n);
-                let mut r = base.add(p);
-                let mut w = base.add(kept);
-                while r < end {
-                    let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
-                    if s >= min_intv && s != curr_s {
-                        curr_s = s;
-                        *w = Smem { k, s, m, ..*r };
-                        w = w.add(1);
-                        self.prefetch_occ(k, k + s);
-                    }
-                    r = r.add(1);
+        // A read cursor and a write head, the loop-carried values, rather than `p`, `n` and
+        // `kept` over the slice base: x86 spilled the count and `kept` and stepped them in
+        // memory every candidate. Same-host CI A/B: SMEM samples -3.5% on EPYC 7763, -4.1..-4.5%
+        // on 9V74, -2.3% on Xeon 8370C; M4 neutral.
+        let base = prev.as_mut_ptr();
+        // SAFETY: `kept <= p <= n`, so every pointer is within or one past `prev`; the write
+        // head never passes the cursor (at most one survivor per candidate read).
+        unsafe {
+            let end = base.add(n);
+            let mut r = base.add(p);
+            let mut w = base.add(kept);
+            while r < end {
+                let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                if s >= min_intv && s != curr_s {
+                    curr_s = s;
+                    *w = Smem { k, s, m, ..*r };
+                    w = w.add(1);
+                    self.prefetch_occ(k, k + s);
                 }
-                return w.offset_from(base) as usize;
+                r = r.add(1);
             }
+            w.offset_from(base) as usize
         }
-        while p < n {
-            // Borrowed, not copied: only `k` and `s` feed the counts, and holding the whole
-            // candidate across them spilled it to the stack every iteration.
-            let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &prev[p], a, count_a, hx, lx);
-            p += 1;
-            if s >= min_intv && s != curr_s {
-                curr_s = s;
-                debug_assert!(kept < p);
-                // SAFETY: `kept < p <= n`: at most one survivor per candidate visited, and
-                // candidate `p - 1` was just visited. (The bounds test took a register x86 lacks.)
-                unsafe {
-                    *prev.get_unchecked_mut(kept) = Smem {
-                        k,
-                        s,
-                        m,
-                        ..*prev.get_unchecked(p - 1)
-                    };
-                }
-                kept += 1;
-                self.prefetch_occ(k, k + s);
-            }
-        }
-        kept
     }
 
     /// The forward extension of `smem` by base `aj` (`0..4`): the interval of the pattern with `aj`
@@ -3112,12 +3072,4 @@ pub mod traffic {
             total as f64 * 128.0 / 1e9 / wall_s.max(1e-9),
         );
     }
-}
-
-/// shortcut: `BWA4_BR_CURSOR=1` runs [`FmIndex::backward_round`]'s survivor loop on pointers, for a
-/// same-host CI A/B; delete once settled.
-#[inline(always)]
-fn br_cursor() -> bool {
-    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *C.get_or_init(|| std::env::var_os("BWA4_BR_CURSOR").is_some())
 }
