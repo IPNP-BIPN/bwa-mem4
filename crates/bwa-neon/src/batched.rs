@@ -901,7 +901,7 @@ fn simd_dispatch(
 /// Hint the line holding `p` into L1. No effect on any result.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-fn prefetch<T>(p: *const T) {
+pub fn prefetch<T>(p: *const T) {
     // SAFETY: a prefetch never faults, whatever the address.
     #[cfg(target_arch = "aarch64")]
     unsafe {
