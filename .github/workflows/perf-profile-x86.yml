@@ -31,8 +31,12 @@ on:
         description: "Runner image"
         default: "ubuntu-22.04"
         required: false
+      # Our profile build forces frame pointers for perf's call graphs; the fork (bioconda) has none,
+      # so on x86 ours runs one register short in every hot loop. `-C force-frame-pointers=no` (the
+      # last -C wins) gives the shipped codegen and a fair ours/fork ratio; the callers sections
+      # are then unreliable, the self-time tables and annotations are not.
       extra_rustflags:
-        description: "Appended to our profile build's RUSTFLAGS (codegen experiments, e.g. -C target-cpu=neoverse-n2)"
+        description: "Appended to our profile build's RUSTFLAGS (e.g. -C force-frame-pointers=no for a fair ratio, -C target-cpu=neoverse-n2)"
         default: ""
         required: false
       knob_sweep:
