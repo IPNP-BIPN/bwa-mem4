@@ -464,6 +464,19 @@ jobs:
           grep -v '^@PG' ours.sam | md5sum > ours.md5; grep -v '^@PG' fork.sam | md5sum > fork.md5
           echo "===== output md5: ours $(cut -c1-32 ours.md5) fork $(cut -c1-32 fork.md5) $(cmp -s ours.md5 fork.md5 && echo identical || echo DIFFER) ====="
           for arm in ours fork; do
+            # Lines come as `count (pct)  file:function [object]`, split by the source file inlined
+            # code came from; summed per function here.
+            callgrind_annotate --threshold=100 "$arm.cg" > "$arm.txt" || true
             echo "===== $arm: instructions by function (self) ====="
-            callgrind_annotate --threshold=99.5 "$arm.cg" | grep -E '^ *[0-9,]+ ' | head -150
+            grep -m1 'PROGRAM TOTALS' "$arm.txt" || true
+            awk '/^ *[0-9,]+ +\(/ && !/PROGRAM TOTALS/ {
+                   n = $1; gsub(",", "", n); l = $0; sub(/^ *[0-9,]+ +\([^)]*\) +/, "", l);
+                   sub(/ \[[^]]*\]$/, "", l); f = substr(l, index(l, ":") + 1); c[f] += n }
+                 END { for (f in c) printf "%15d %s\n", c[f], f }' "$arm.txt" | sort -rn > "$arm.fn"
+            head -150 "$arm.fn"
+            # Who calls libc's copies and fills: callgrind keeps the real call edges.
+            echo "===== $arm: callers of libc mem* ====="
+            callgrind_annotate --tree=caller --threshold=100 "$arm.cg" 2>/dev/null \
+              | awk '/^ *[0-9,]+ +\(/ { blk = blk $0 "\n" } /^$/ { if (blk ~ /\* .*__mem(set|cpy|move|cmp)/) printf "%s\n", blk; blk = "" }' \
+              | grep -E '<|\*' | head -80 || true
           done
