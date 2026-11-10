@@ -1792,7 +1792,23 @@ impl FmIndex {
         // reloaded every candidate.
         macro_rules! go {
             ($w:literal, $a0:literal, $a:literal) => {
-                self.backward_round_impl::<$w, $a0, $a>(prev, m, min_intv, min_seed_len, out)
+                if br_cursor() {
+                    self.backward_round_impl::<$w, $a0, $a, true>(
+                        prev,
+                        m,
+                        min_intv,
+                        min_seed_len,
+                        out,
+                    )
+                } else {
+                    self.backward_round_impl::<$w, $a0, $a, false>(
+                        prev,
+                        m,
+                        min_intv,
+                        min_seed_len,
+                        out,
+                    )
+                }
             };
         }
         match (self.wide, a) {
@@ -1809,7 +1825,7 @@ impl FmIndex {
 
     /// [`backward_round`](Self::backward_round) for base `A` (`A0` is `A == 0`).
     #[inline]
-    fn backward_round_impl<const WIDE: bool, const A0: bool, const A: usize>(
+    fn backward_round_impl<const WIDE: bool, const A0: bool, const A: usize, const CUR: bool>(
         &self,
         prev: &mut [Smem],
         m: u32,
@@ -1844,6 +1860,30 @@ impl FmIndex {
             }
         }
         // The rest survive only with a new occurrence count, and none is emitted.
+        if CUR {
+            // A read cursor and a write head, the loop-carried values, rather than `p`, `n` and
+            // `kept` over the slice base: x86 spilled the count and `kept` and stepped them in
+            // memory every candidate.
+            let base = prev.as_mut_ptr();
+            // SAFETY: `kept <= p <= n`, so every pointer is within or one past `prev`; the write
+            // head never passes the cursor (at most one survivor per candidate read).
+            unsafe {
+                let end = base.add(n);
+                let mut r = base.add(p);
+                let mut w = base.add(kept);
+                while r < end {
+                    let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                    if s >= min_intv && s != curr_s {
+                        curr_s = s;
+                        *w = Smem { k, s, m, ..*r };
+                        w = w.add(1);
+                        self.prefetch_occ(k, k + s);
+                    }
+                    r = r.add(1);
+                }
+                return w.offset_from(base) as usize;
+            }
+        }
         while p < n {
             // Borrowed, not copied: only `k` and `s` feed the counts, and holding the whole
             // candidate across them spilled it to the stack every iteration.
@@ -3072,4 +3112,12 @@ pub mod traffic {
             total as f64 * 128.0 / 1e9 / wall_s.max(1e-9),
         );
     }
+}
+
+/// shortcut: `BWA4_BR_CURSOR=1` runs [`FmIndex::backward_round`]'s survivor loop on pointers, for a
+/// same-host CI A/B; delete once settled.
+#[inline(always)]
+fn br_cursor() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var_os("BWA4_BR_CURSOR").is_some())
 }
