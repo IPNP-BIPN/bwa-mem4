@@ -473,9 +473,12 @@ impl Batch {
             for lane in lanes[..nl].iter_mut() {
                 lane.o += (omax - lane.o).min(wmax - lane.w);
             }
-            let t0 = std::time::Instant::now();
+            // Timed only for the probe: two clock reads per group were paid on every run.
+            let t0 = crate::matesw::cells::enabled().then(std::time::Instant::now);
             self.work.run(&lanes[..nl], wmax as usize, tbl, gaps);
-            self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
+            if let Some(t0) = t0 {
+                self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
+            }
             for l in 0..nl {
                 let ji = self.order[g + l] as usize;
                 let (pi, b) = (self.jobs[ji].parent as usize, self.jobs[ji].band);
@@ -586,9 +589,11 @@ impl Batch {
             for lane in lanes[..nl].iter_mut() {
                 lane.o += (omax - lane.o).min(wmax - lane.w);
             }
-            let t0 = std::time::Instant::now();
+            let t0 = crate::matesw::cells::enabled().then(std::time::Instant::now);
             self.work.run(&lanes[..nl], wmax as usize, &tbl, gaps);
-            self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
+            if let Some(t0) = t0 {
+                self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
+            }
             for l in 0..nl {
                 let i = self.jobs[self.order[g + l] as usize].parent as usize;
                 let g8 = i32::from(self.work.gmax[l]);
