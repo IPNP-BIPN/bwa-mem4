@@ -1068,6 +1068,9 @@ pub(crate) fn batched_align(
             started_at.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        for r in &out {
+            cells::count_outcome(r.score >= minsc && r.qb >= 0);
+        }
     }
     out
 }
