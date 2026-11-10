@@ -2443,6 +2443,7 @@ fn batched_regs(
     // per-worker share. Scheduling only -- the per-read regions do not depend on the chunk size.
     const INFLIGHT_READS: usize = 16384; // total reads' intermediates resident at once, all workers
     const MIN_CHUNK: usize = 512; // lockstep floor: enough reads in flight to hide FM latency
+
     // Ceiling per chunk whatever `-t`: a chunk's extension passes stream its regions and job bases
     // (~10 KB a read), which past ~2048 reads spill a 1-2 MB L2. Same-host fair CI A/B, 4096 -> 2048
     // reads a chunk (-t4): EPYC 9V45 -2.8%, Xeon 8573C -1.4%; 1024 neutral on 9V45. M4 at -t4
