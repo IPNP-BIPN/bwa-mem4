@@ -646,6 +646,11 @@ thread_local! {
     /// The collection pass's `arena`, kept between chunks: about 20 MB a chunk at -t8, which built
     /// afresh each time was regrown by doubling (a memmove each) and page-faulted anew.
     static ARENA: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+    /// `all_rbegs` and the repeat-skip path's walked rows, kept between chunks. Both are written in
+    /// full before anything reads them, so a reused buffer needs no fill, where `vec![0; n]` on
+    /// memory mimalloc had recycled zeroed it again (`rep stosb`, 0.3% of samples on EPYC 9V45).
+    static SA_BUFS: std::cell::Cell<(Vec<i64>, Vec<i64>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
 }
 
 /// One pending one-sided extension, with a back-pointer to the region it fills.
@@ -987,7 +992,8 @@ fn align_reads_batched_inner<B: SwBackend>(
         let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SA);
         // Output buffer for `get_sa_batch`, pre-sized and zero-filled because the batch API writes by
         // index rather than pushing.
-        let mut rbegs = vec![0i64; all_positions.len()];
+        let (mut rbegs, mut walked) = SA_BUFS.take();
+        rbegs.resize(all_positions.len(), 0);
         // Start instant for the optional `get_sa` profiling counters, or `None` when profiling is
         // off, in which case no clock is read at all.
         // `BWA4_SA_DUP=1`: how many of a chunk's lookups ask for a row another lookup in the same
@@ -1087,7 +1093,7 @@ fn align_reads_batched_inner<B: SwBackend>(
                 dst_of.push(i as u32);
                 i += 1;
             }
-            let mut walked = vec![0i64; to_walk.len()];
+            walked.resize(to_walk.len(), 0);
             fm.get_sa_batch(&to_walk, &mut walked);
             for (k, &i) in dst_of.iter().enumerate() {
                 rbegs[i as usize] = walked[k];
@@ -1124,6 +1130,7 @@ fn align_reads_batched_inner<B: SwBackend>(
                 bwa_chain::chain_time::GET_SA_SKIPPED.fetch_add(skipped as u64, Relaxed);
             }
         }
+        SA_BUFS.set((Vec::new(), walked));
         rbegs
     } else {
         Vec::new()
@@ -1207,6 +1214,10 @@ fn align_reads_batched_inner<B: SwBackend>(
             out
         })
         .collect();
+    SA_BUFS.with(|b| {
+        let (_, walked) = b.take();
+        b.set((all_rbegs, walked));
+    });
 
     // Chaining is over; everything from the region skeleton to the final compaction is extension.
     #[cfg(feature = "stage-alloc")]
