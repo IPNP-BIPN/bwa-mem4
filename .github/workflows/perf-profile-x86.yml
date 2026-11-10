@@ -157,9 +157,11 @@ jobs:
           cd work
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
           r1="${SET}1.fq"; r2="${SET}2.fq"
-          # Warm the page cache for both, so the first one recorded is not paying for the index read.
-          ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
-          bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2>/dev/null
+          # Warm the page cache for both, so the first one recorded is not paying for the index read,
+          # and check on this host's kernels that both print the same records.
+          m4=$(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+          m3=$(bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+          echo "===== output md5: ours $m4 fork $m3 $([ "$m4" = "$m3" ] && echo identical || echo DIFFER) ====="
 
           # `alt`: ours again under OURS_ENV, so a knob's effect is read on the same host.
           arms="ours fork"; [ -n "$OURS_ENV" ] && arms="ours alt fork"

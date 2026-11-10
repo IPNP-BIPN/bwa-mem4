@@ -30,6 +30,12 @@ use neon as kernel;
 #[cfg(target_arch = "x86_64")]
 use x86 as kernel;
 
+/// Whether the kernel takes these gap costs: the x86 kernels compute in signed bytes, so each
+/// open-plus-extend must stay under 128 (NEON's unsigned lanes take any byte).
+pub(crate) fn gaps_ok(o_del: i32, e_del: i32, o_ins: i32, e_ins: i32) -> bool {
+    cfg!(target_arch = "aarch64") || (o_del + e_del).max(o_ins + e_ins) < 128
+}
+
 /// Whether this machine runs the band kernel.
 pub(crate) fn kernel_available() -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -1304,14 +1310,16 @@ pub(crate) mod neon {
     }
 }
 
-/// The AVX2 band kernel: the NEON kernel's structure at 32 lanes, two skewed rows per step (16
-/// vector registers), a scalar SoA build, and two encodings x86 has no NEON TBL / SQADD for:
-/// `PSHUFB` zeroes an entry only for an index with bit 7 set, so the pad and nonexistent query
-/// codes both carry it (`QPAD` 0x80, `DEAD` 0xC0); and the cell is the biased form
-/// `subs(adds(H, score + bias), bias)` with the bias applied on real query columns only, so a pad
-/// column carries the diagonal as NEON's `+0` does. The reference pad code `RPAD` (0x80) then
-/// scores against a pad column, which does not matter: those rows are past the lane's range,
-/// excluded from the row bookkeeping, and feed only later rows of the same lane.
+/// The AVX2 band kernel: the NEON kernel's cell at 32 lanes, two skewed rows per step (16 vector
+/// registers), and two encodings for what x86 has no NEON TBL / USQADD for. `PSHUFB` zeroes an
+/// entry only for an index with bit 7 set, so the pad and nonexistent query codes both carry it
+/// (`QPAD` 0x80, `DEAD` 0xC0). And H, E and F live in the signed domain `H - 128` (`HZ` is the
+/// DP's 0), where `adds_epi8(H, score)` is USQADD's `clamp(H + score, 0, 255)` exactly and every
+/// gap subtract saturates at 0 as `subs_epu8` did: [`super::gaps_ok`] keeps the gap constants
+/// under 128. A pad column's table entry is then 0 and carries the diagonal, as NEON's `+0` does.
+/// The reference pad code `RPAD` (0x80) scores against a pad column, which does not matter: those
+/// rows are past the lane's range, excluded from the row bookkeeping, and feed only later rows of
+/// the same lane.
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use crate::batched::{x86_row::t16, ABuf};
@@ -1321,6 +1329,8 @@ mod avx2 {
     const DEAD: u8 = 0xC0;
     const QPAD: u8 = 0x80;
     const RPAD: u8 = 0x80;
+    /// The DP's 0 in the signed domain the kernels compute in.
+    pub(super) const HZ: u8 = 0x80;
 
     /// As the NEON kernel's `Lane`.
     #[derive(Clone, Copy, Default)]
@@ -1342,6 +1352,8 @@ mod avx2 {
         a: ABuf<u8>,
         refv: ABuf<u8>,
         h: ABuf<u8>,
+        /// H of row `r` of a two-row step (row `r + 1` is in `h`), kept for the `qe` scan.
+        hr: ABuf<u8>,
         e: ABuf<u8>,
         r: ABuf<u8>,
         rl: Vec<u8>,
@@ -1363,12 +1375,27 @@ mod avx2 {
             &self.rl[l * self.rstride..l * self.rstride + nrows]
         }
 
-        /// Run one group of `lanes` (at most `L`) at width `w`; `tbl` is the signed score table.
+        /// Run one group of `lanes` (at most `L`) at width `w`; `tbl` is the signed score table,
+        /// `gaps` each under 128.
         ///
         /// # Safety
         /// AVX2 available.
-        #[target_feature(enable = "avx2")]
         pub(super) unsafe fn run(
+            &mut self,
+            lanes: &[Lane],
+            w: usize,
+            tbl: &[u8; 16],
+            gaps: [u8; 4],
+        ) {
+            if gaps[0] == gaps[2] {
+                self.run_impl::<true>(lanes, w, tbl, gaps)
+            } else {
+                self.run_impl::<false>(lanes, w, tbl, gaps)
+            }
+        }
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn run_impl<const SHARE: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -1384,11 +1411,13 @@ mod avx2 {
             fit(&mut self.st, 16 * stride);
             self.a.fit(npp * L, 0);
             self.refv.fit(nrp * L, 0);
-            self.h.fit(2 * hs * L, 0);
-            self.e.fit((w + 9) * L, 0);
+            self.h.fit(2 * hs * L, HZ);
+            // `hr` needs no clearing: the qe scan reads only slots its two-row step wrote.
+            self.hr.fit(hs * L, HZ);
+            self.e.fit((w + 9) * L, HZ);
             self.r.fit(nrp * L, 0);
-            self.h[..2 * hs * L].fill(0);
-            self.e[..(w + 9) * L].fill(0);
+            self.h[..2 * hs * L].fill(HZ);
+            self.e[..(w + 9) * L].fill(HZ);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
             // The SoA buffers through a lane-major staging area, 16 lanes at a time, and 16x16
@@ -1452,21 +1481,15 @@ mod avx2 {
                     );
                 }
             }
-            // The biased table, replicated per 128-bit half: `score + bias`, bias the mismatch
-            // penalty, so every entry is a non-negative magnitude. Slots 9-11 are unreachable.
-            let bias = tbl[1].wrapping_neg();
-            let mut tblb = [0u8; 32];
-            for i in 0..16 {
-                tblb[i] = tbl[i].wrapping_add(bias);
-                tblb[16 + i] = tblb[i];
-            }
-            let tblv = _mm256_loadu_si256(tblb.as_ptr() as *const __m256i);
-            let biasv = _mm256_set1_epi8(bias as i8);
-            let zero = _mm256_setzero_si256();
-            let ones = _mm256_set1_epi8(-1);
+            // The signed table in both 128-bit halves.
+            let t128 = _mm_loadu_si128(tbl.as_ptr() as *const __m128i);
+            let tblv = _mm256_set_m128i(t128, t128);
+            let hz = _mm256_set1_epi8(HZ as i8);
+            let nil = _mm256_setzero_si256();
             let one = _mm256_set1_epi8(1);
-            let eight = _mm256_set1_epi8(8);
             let deadv = _mm256_set1_epi8(DEAD as i8);
+            // `dead ^ 0x7F`: -128 on a dead lane, 127 on a live one, the bound `min` clamps H to.
+            let x7f = _mm256_set1_epi8(0x7F);
             let (oe_del, e_del, oe_ins, e_ins) = (
                 _mm256_set1_epi8(gaps[0] as i8),
                 _mm256_set1_epi8(gaps[1] as i8),
@@ -1474,11 +1497,12 @@ mod avx2 {
                 _mm256_set1_epi8(gaps[3] as i8),
             );
             let ov = _mm256_loadu_si256(ob.as_ptr() as *const __m256i);
-            let mut tb = [0u8; L];
+            // Targets in the H domain; an absent lane's (HZ) is always reached.
+            let mut tb = [HZ; L];
             for (l, lane) in lanes.iter().enumerate() {
-                tb[l] = lane.target;
+                tb[l] = lane.target ^ HZ;
             }
-            let early = tb.iter().any(|&t| t > 0);
+            let early = lanes.iter().any(|l| l.target > 0);
             let tgt = _mm256_loadu_si256(tb.as_ptr() as *const __m256i);
             let a = self.a.as_ptr();
             let e = self.e.as_mut_ptr().add(3 * L);
@@ -1487,17 +1511,17 @@ mod avx2 {
                 self.h.as_mut_ptr().add(3 * L),
                 self.h.as_mut_ptr().add((hs + 3) * L),
             );
+            let hr0 = self.hr.as_mut_ptr().add(3 * L);
             let li = L as isize;
-            let mut gmax = zero;
-            // Last improving row as two bytes and its column, blended per lane like gmax.
-            let (mut te_lo, mut te_hi, mut qev) = (zero, zero, zero);
+            let mut gmax = hz;
+            // `te` as its low and high bytes per lane, written with the row on every improving
+            // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
+            let (mut te_lo, mut te_hi, mut qev) = (nil, nil, nil);
             let wm1 = w as i32 - 1;
+            // `qe` from H where a run of improving rows ends, as the NEON kernel's `qe_scan`.
+            let mut pend = nil;
+            let mut prev: (*const u8, i32) = (std::ptr::null(), -1);
 
-            macro_rules! cge {
-                ($x:expr, $y:expr) => {
-                    _mm256_cmpeq_epi8(_mm256_max_epu8($x, $y), $x)
-                };
-            }
             macro_rules! ld {
                 ($p:expr) => {
                     _mm256_loadu_si256($p as *const __m256i)
@@ -1508,41 +1532,73 @@ mod avx2 {
                     _mm256_storeu_si256($p as *mut __m256i, $v)
                 };
             }
-            // One cell, as the NEON kernel's: `bi` is the bias on this column (0 off real bases).
-            macro_rules! cell {
-                ($d:expr, $ein:expr, $f:ident, $q:expr, $bi:expr, $rref:expr, $rmax:ident,
-                 $jcol:ident, $jv:expr, $top:expr, $live:expr) => {{
-                    let sc = _mm256_shuffle_epi8(tblv, _mm256_xor_si256($q, $rref));
-                    let h0 = _mm256_max_epu8(_mm256_subs_epu8(_mm256_adds_epu8($d, sc), $bi), $ein);
-                    let mut h = _mm256_max_epu8(h0, $f);
-                    if let Some(m) = $top {
-                        h = _mm256_and_si256(h, m);
+            macro_rules! qe_scan {
+                ($buf:expr, $row:expr, $msk:expr) => {{
+                    let (kl, kh) = (0.max($row + ominq), wm1.min($row + omax));
+                    let mut jv = _mm256_add_epi8(_mm256_set1_epi8(($row - kl) as i8), ov);
+                    let mut best = nil;
+                    for k in kl..=kh {
+                        let eq = _mm256_cmpeq_epi8(ld!($buf.add(k as usize * L)), gmax);
+                        best = _mm256_blendv_epi8(best, jv, eq);
+                        jv = _mm256_sub_epi8(jv, one);
                     }
-                    let hl = if $live {
-                        _mm256_andnot_si256(cge!($q, deadv), h)
-                    } else {
-                        h
+                    qev = _mm256_blendv_epi8(qev, best, $msk);
+                }};
+            }
+            // One cell, as the NEON kernel's (gaps open from G = max(diagonal, E)): `d` the
+            // diagonal H, `ein` the E carry, `f` the row's F carry (updated), `top` whether a cell
+            // past `w - 1` is valid (`None`: it is), `clamp` the live bound (`None`: no dead lane
+            // here). Returns `(H, E for the row below)`.
+            macro_rules! cell {
+                ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
+                 $clamp:expr) => {{
+                    let sc = _mm256_shuffle_epi8(tblv, _mm256_xor_si256($q, $rref));
+                    let mut h0 = _mm256_max_epi8(_mm256_adds_epi8($d, sc), $ein);
+                    let ok: Option<bool> = $top;
+                    if ok == Some(false) {
+                        h0 = hz;
+                    }
+                    let mut h = _mm256_max_epi8(h0, $f);
+                    if ok == Some(false) {
+                        h = hz;
+                    }
+                    let cl: Option<__m256i> = $clamp;
+                    let hl = match cl {
+                        Some(b) => _mm256_min_epi8(h, b),
+                        None => h,
                     };
-                    let rn = _mm256_max_epu8($rmax, hl);
-                    $jcol = _mm256_blendv_epi8($jv, $jcol, _mm256_cmpeq_epi8(rn, $rmax));
-                    $rmax = rn;
-                    let eout =
-                        _mm256_max_epu8(_mm256_subs_epu8(h, oe_del), _mm256_subs_epu8($ein, e_del));
-                    $f = _mm256_max_epu8(_mm256_subs_epu8(h, oe_ins), _mm256_subs_epu8($f, e_ins));
+                    $rmax = _mm256_max_epi8($rmax, hl);
+                    let t = _mm256_subs_epi8(h0, oe_del);
+                    let eout = _mm256_max_epi8(t, _mm256_subs_epi8($ein, e_del));
+                    let ti = if SHARE {
+                        t
+                    } else {
+                        _mm256_subs_epi8(h0, oe_ins)
+                    };
+                    $f = _mm256_max_epi8(ti, _mm256_subs_epi8($f, e_ins));
                     (h, eout)
                 }};
             }
+            // Row bookkeeping: publish the row max, update the lanes' best, close the runs of
+            // improving rows that ended on the previous row. `$buf` holds this row's H.
             macro_rules! finish_row {
-                ($row:expr, $rmax:expr, $jcol:expr, $rref:expr) => {{
-                    st!(rout.add($row * L), $rmax);
-                    let cgt = _mm256_xor_si256(cge!(gmax, $rmax), ones);
-                    let imp = _mm256_andnot_si256(_mm256_cmpgt_epi8(zero, $rref), cgt);
+                ($row:expr, $rmax:expr, $rref:expr, $buf:expr) => {{
+                    st!(rout.add($row * L), _mm256_xor_si256($rmax, hz));
+                    let imp = _mm256_andnot_si256(
+                        _mm256_cmpgt_epi8(nil, $rref),
+                        _mm256_cmpgt_epi8($rmax, gmax),
+                    );
+                    let flush = _mm256_andnot_si256(imp, pend);
+                    if _mm256_movemask_epi8(flush) != 0 {
+                        qe_scan!(prev.0, prev.1, flush);
+                    }
                     gmax = _mm256_blendv_epi8(gmax, $rmax, imp);
                     te_lo = _mm256_blendv_epi8(te_lo, _mm256_set1_epi8($row as i8), imp);
                     if $row >= 256 {
                         te_hi = _mm256_blendv_epi8(te_hi, _mm256_set1_epi8(($row >> 8) as i8), imp);
                     }
-                    qev = _mm256_blendv_epi8(qev, $jcol, imp);
+                    pend = imp;
+                    prev = ($buf as *const u8, $row as i32);
                 }};
             }
 
@@ -1553,41 +1609,37 @@ mod avx2 {
                 let klo = 0.max(ri + ominq);
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
-                let mut jv = _mm256_add_epi8(_mm256_set1_epi8((ri - khi) as i8), ov);
                 if r + 1 < nr {
                     self.cells += 2 * (khi - klo + 1).max(0) as u64;
                     let rref0 = ld!(self.refv.as_ptr().add(r * L));
                     let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
-                    let (mut f0, mut f1, mut d1) = (zero, zero, zero);
-                    let (mut rmax0, mut rmax1, mut jcol0, mut jcol1) = (zero, zero, zero, zero);
+                    let (mut f0, mut f1, mut d1) = (hz, hz, hz);
+                    let (mut rmax0, mut rmax1) = (hz, hz);
                     macro_rules! step2 {
                         ($mask:expr, $live:expr) => {{
                             let ko = k as isize;
-                            let valid = |i: i32| -> Option<__m256i> {
+                            let valid = |i: i32| -> Option<bool> {
                                 if $mask {
-                                    Some(_mm256_set1_epi8(if (0..=wm1).contains(&(k + i)) {
-                                        -1
-                                    } else {
-                                        0
-                                    }))
+                                    Some((0..=wm1).contains(&(k + i)))
                                 } else {
                                     None
                                 }
                             };
                             let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            // The bias applies on real query columns (codes `< 8`, unsigned):
-                            // a pad or nonexistent code must carry the diagonal unbiased.
-                            let bi = _mm256_andnot_si256(cge!(q, eight), biasv);
+                            // DEAD is the only query code at or above 0xC0.
+                            let clamp = if $live {
+                                Some(_mm256_xor_si256(_mm256_cmpeq_epi8(q, deadv), x7f))
+                            } else {
+                                None
+                            };
                             let e0 = ld!(e.offset(ko * li));
                             let d0 = ld!(hp.offset(ko * li));
-                            let (h0, e1) =
-                                cell!(d0, e0, f0, q, bi, rref0, rmax0, jcol0, jv, valid(0), $live);
-                            let (h1, e2) =
-                                cell!(d1, e1, f1, q, bi, rref1, rmax1, jcol1, jv, valid(1), $live);
+                            let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), clamp);
+                            let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), clamp);
+                            st!(hr0.offset(ko * li), h0);
                             st!(hc.offset((ko + 1) * li), h1);
                             st!(e.offset((ko + 2) * li), e2);
                             d1 = h0;
-                            jv = _mm256_add_epi8(jv, one);
                             k -= 1;
                         }};
                     }
@@ -1604,30 +1656,27 @@ mod avx2 {
                     while k >= kend {
                         step2!(true, true);
                     }
-                    finish_row!(r, rmax0, jcol0, rref0);
-                    finish_row!(r + 1, rmax1, jcol1, rref1);
+                    finish_row!(r, rmax0, rref0, hr0);
+                    finish_row!(r + 1, rmax1, rref1, hc);
                     r += 2;
-                    if early && _mm256_movemask_epi8(cge!(gmax, tgt)) == -1 {
-                        break;
-                    }
                 } else {
                     self.cells += (khi - klo + 1).max(0) as u64;
                     let rref = ld!(self.refv.as_ptr().add(r * L));
-                    let (mut f, mut rmax, mut jcol) = (zero, zero, zero);
+                    let (mut f, mut rmax) = (hz, hz);
                     macro_rules! step1 {
                         ($live:expr) => {{
                             let ko = k as isize;
                             let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            // The bias applies on real query columns (codes `< 8`, unsigned):
-                            // a pad or nonexistent code must carry the diagonal unbiased.
-                            let bi = _mm256_andnot_si256(cge!(q, eight), biasv);
+                            let clamp = if $live {
+                                Some(_mm256_xor_si256(_mm256_cmpeq_epi8(q, deadv), x7f))
+                            } else {
+                                None
+                            };
                             let e0 = ld!(e.offset(ko * li));
                             let d0 = ld!(hp.offset(ko * li));
-                            let (h, e1) =
-                                cell!(d0, e0, f, q, bi, rref, rmax, jcol, jv, None, $live);
+                            let (h, e1) = cell!(d0, e0, f, q, rref, rmax, None, clamp);
                             st!(hc.offset(ko * li), h);
                             st!(e.offset((ko + 1) * li), e1);
-                            jv = _mm256_add_epi8(jv, one);
                             k -= 1;
                         }};
                     }
@@ -1637,15 +1686,18 @@ mod avx2 {
                     while k >= klo {
                         step1!(true);
                     }
-                    finish_row!(r, rmax, jcol, rref);
+                    finish_row!(r, rmax, rref, hc);
                     r += 1;
-                    if early && _mm256_movemask_epi8(cge!(gmax, tgt)) == -1 {
-                        break;
-                    }
+                }
+                if early && _mm256_movemask_epi8(_mm256_cmpgt_epi8(tgt, gmax)) == 0 {
+                    break;
                 }
                 std::mem::swap(&mut hc, &mut hp);
             }
-            st!(self.gmax.as_mut_ptr(), gmax);
+            if _mm256_movemask_epi8(pend) != 0 {
+                qe_scan!(prev.0, prev.1, pend);
+            }
+            st!(self.gmax.as_mut_ptr(), _mm256_xor_si256(gmax, hz));
             let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
             st!(lo.as_mut_ptr(), te_lo);
             st!(hi.as_mut_ptr(), te_hi);
@@ -1675,8 +1727,11 @@ mod avx2 {
     }
 }
 
+/// The AVX-512BW band kernel: the AVX2 kernel at 64 lanes, with mask registers for the live
+/// lanes and the row bookkeeping.
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
+    use super::avx2::HZ;
     use crate::batched::{x86_row::t16, ABuf};
     use std::arch::x86_64::*;
 
@@ -1693,6 +1748,8 @@ mod avx512 {
         a: ABuf<u8>,
         refv: ABuf<u8>,
         h: ABuf<u8>,
+        /// H of row `r` of a two-row step (row `r + 1` is in `h`), kept for the `qe` scan.
+        hr: ABuf<u8>,
         e: ABuf<u8>,
         r: ABuf<u8>,
         rl: Vec<u8>,
@@ -1710,6 +1767,7 @@ mod avx512 {
                 a: ABuf::new(),
                 refv: ABuf::new(),
                 h: ABuf::new(),
+                hr: ABuf::new(),
                 e: ABuf::new(),
                 r: ABuf::new(),
                 rl: Vec::new(),
@@ -1733,12 +1791,27 @@ mod avx512 {
             &self.rl[l * self.rstride..l * self.rstride + nrows]
         }
 
-        /// Run one group of `lanes` (at most `L`) at width `w`; `tbl` is the signed score table.
+        /// Run one group of `lanes` (at most `L`) at width `w`; `tbl` is the signed score table,
+        /// `gaps` each under 128.
         ///
         /// # Safety
         /// AVX-512BW available.
-        #[target_feature(enable = "avx512bw")]
         pub(super) unsafe fn run(
+            &mut self,
+            lanes: &[Lane],
+            w: usize,
+            tbl: &[u8; 16],
+            gaps: [u8; 4],
+        ) {
+            if gaps[0] == gaps[2] {
+                self.run_impl::<true>(lanes, w, tbl, gaps)
+            } else {
+                self.run_impl::<false>(lanes, w, tbl, gaps)
+            }
+        }
+
+        #[target_feature(enable = "avx512bw")]
+        unsafe fn run_impl<const SHARE: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -1754,11 +1827,13 @@ mod avx512 {
             fit(&mut self.st, 16 * stride);
             self.a.fit(npp * L, 0);
             self.refv.fit(nrp * L, 0);
-            self.h.fit(2 * hs * L, 0);
-            self.e.fit((w + 9) * L, 0);
+            self.h.fit(2 * hs * L, HZ);
+            // `hr` needs no clearing: the qe scan reads only slots its two-row step wrote.
+            self.hr.fit(hs * L, HZ);
+            self.e.fit((w + 9) * L, HZ);
             self.r.fit(nrp * L, 0);
-            self.h[..2 * hs * L].fill(0);
-            self.e[..(w + 9) * L].fill(0);
+            self.h[..2 * hs * L].fill(HZ);
+            self.e[..(w + 9) * L].fill(HZ);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
             // The SoA buffers through a lane-major staging area, 16 lanes at a time, and 16x16
@@ -1822,19 +1897,13 @@ mod avx512 {
                     );
                 }
             }
-            // The biased table, replicated per 128-bit half: `score + bias`, bias the mismatch
-            // penalty, so every entry is a non-negative magnitude. Slots 9-11 are unreachable.
-            let bias = tbl[1].wrapping_neg();
-            let mut tblb = [0u8; 64];
-            for i in 0..64 {
-                tblb[i] = tbl[i % 16].wrapping_add(bias);
-            }
-            let tblv = _mm512_loadu_si512(tblb.as_ptr() as *const _);
-            let biasv = _mm512_set1_epi8(bias as i8);
-            let zero = _mm512_setzero_si512();
+            // The signed table in every 128-bit lane.
+            let tblv = _mm512_broadcast_i32x4(_mm_loadu_si128(tbl.as_ptr() as *const __m128i));
+            let hz = _mm512_set1_epi8(HZ as i8);
+            let nil = _mm512_setzero_si512();
             let one = _mm512_set1_epi8(1);
-            let eight = _mm512_set1_epi8(8);
             let deadv = _mm512_set1_epi8(DEAD as i8);
+            let rpadv = _mm512_set1_epi8(RPAD as i8);
             let (oe_del, e_del, oe_ins, e_ins) = (
                 _mm512_set1_epi8(gaps[0] as i8),
                 _mm512_set1_epi8(gaps[1] as i8),
@@ -1842,11 +1911,12 @@ mod avx512 {
                 _mm512_set1_epi8(gaps[3] as i8),
             );
             let ov = _mm512_loadu_si512(ob.as_ptr() as *const _);
-            let mut tb = [0u8; L];
+            // Targets in the H domain; an absent lane's (HZ) is always reached.
+            let mut tb = [HZ; L];
             for (l, lane) in lanes.iter().enumerate() {
-                tb[l] = lane.target;
+                tb[l] = lane.target ^ HZ;
             }
-            let early = tb.iter().any(|&t| t > 0);
+            let early = lanes.iter().any(|l| l.target > 0);
             let tgt = _mm512_loadu_si512(tb.as_ptr() as *const _);
             let a = self.a.as_ptr();
             let e = self.e.as_mut_ptr().add(3 * L);
@@ -1855,11 +1925,16 @@ mod avx512 {
                 self.h.as_mut_ptr().add(3 * L),
                 self.h.as_mut_ptr().add((hs + 3) * L),
             );
+            let hr0 = self.hr.as_mut_ptr().add(3 * L);
             let li = L as isize;
-            let mut gmax = zero;
-            // Last improving row as two bytes and its column, blended per lane like gmax.
-            let (mut te_lo, mut te_hi, mut qev) = (zero, zero, zero);
+            let mut gmax = hz;
+            // `te` as its low and high bytes per lane, written with the row on every improving
+            // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
+            let (mut te_lo, mut te_hi, mut qev) = (nil, nil, nil);
             let wm1 = w as i32 - 1;
+            // `qe` from H where a run of improving rows ends, as the NEON kernel's `qe_scan`.
+            let mut pend: __mmask64 = 0;
+            let mut prev: (*const u8, i32) = (std::ptr::null(), -1);
 
             macro_rules! ld {
                 ($p:expr) => {
@@ -1871,42 +1946,67 @@ mod avx512 {
                     _mm512_storeu_si512($p as *mut _, $v)
                 };
             }
-            // One cell, as the NEON kernel's: `bi` is the bias on this column (0 off real bases).
-            macro_rules! cell {
-                ($d:expr, $ein:expr, $f:ident, $q:expr, $bi:expr, $rref:expr, $rmax:ident,
-                 $jcol:ident, $jv:expr, $top:expr, $live:expr) => {{
-                    let sc = _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref));
-                    let h0 = _mm512_max_epu8(_mm512_subs_epu8(_mm512_adds_epu8($d, sc), $bi), $ein);
-                    let mut h = _mm512_max_epu8(h0, $f);
-                    if let Some(m) = $top {
-                        h = _mm512_and_si512(h, m);
+            macro_rules! qe_scan {
+                ($buf:expr, $row:expr, $msk:expr) => {{
+                    let (kl, kh) = (0.max($row + ominq), wm1.min($row + omax));
+                    let mut jv = _mm512_add_epi8(_mm512_set1_epi8(($row - kl) as i8), ov);
+                    let mut best = nil;
+                    for k in kl..=kh {
+                        let eq = _mm512_cmpeq_epi8_mask(ld!($buf.add(k as usize * L)), gmax);
+                        best = _mm512_mask_mov_epi8(best, eq, jv);
+                        jv = _mm512_sub_epi8(jv, one);
                     }
-                    let hl = if $live {
-                        _mm512_maskz_mov_epi8(_mm512_cmplt_epu8_mask($q, deadv), h)
-                    } else {
-                        h
+                    qev = _mm512_mask_mov_epi8(qev, $msk, best);
+                }};
+            }
+            // One cell, as the AVX2 kernel's; `live` is the mask of lanes on a live cell (`None`:
+            // all).
+            macro_rules! cell {
+                ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
+                 $live:expr) => {{
+                    let sc = _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref));
+                    let mut h0 = _mm512_max_epi8(_mm512_adds_epi8($d, sc), $ein);
+                    let ok: Option<bool> = $top;
+                    if ok == Some(false) {
+                        h0 = hz;
+                    }
+                    let mut h = _mm512_max_epi8(h0, $f);
+                    if ok == Some(false) {
+                        h = hz;
+                    }
+                    let lv: Option<__mmask64> = $live;
+                    $rmax = match lv {
+                        Some(m) => _mm512_mask_max_epi8($rmax, m, $rmax, h),
+                        None => _mm512_max_epi8($rmax, h),
                     };
-                    let rn = _mm512_max_epu8($rmax, hl);
-                    $jcol = _mm512_mask_blend_epi8(_mm512_cmpeq_epi8_mask(rn, $rmax), $jv, $jcol);
-                    $rmax = rn;
-                    let eout =
-                        _mm512_max_epu8(_mm512_subs_epu8(h, oe_del), _mm512_subs_epu8($ein, e_del));
-                    $f = _mm512_max_epu8(_mm512_subs_epu8(h, oe_ins), _mm512_subs_epu8($f, e_ins));
+                    let t = _mm512_subs_epi8(h0, oe_del);
+                    let eout = _mm512_max_epi8(t, _mm512_subs_epi8($ein, e_del));
+                    let ti = if SHARE {
+                        t
+                    } else {
+                        _mm512_subs_epi8(h0, oe_ins)
+                    };
+                    $f = _mm512_max_epi8(ti, _mm512_subs_epi8($f, e_ins));
                     (h, eout)
                 }};
             }
             macro_rules! finish_row {
-                ($row:expr, $rmax:expr, $jcol:expr, $rref:expr) => {{
-                    st!(rout.add($row * L), $rmax);
+                ($row:expr, $rmax:expr, $rref:expr, $buf:expr) => {{
+                    st!(rout.add($row * L), _mm512_xor_si512($rmax, hz));
                     let imp =
-                        _mm512_cmpgt_epu8_mask($rmax, gmax) & _mm512_cmpge_epi8_mask($rref, zero);
-                    gmax = _mm512_mask_blend_epi8(imp, gmax, $rmax);
-                    te_lo = _mm512_mask_blend_epi8(imp, te_lo, _mm512_set1_epi8($row as i8));
+                        _mm512_cmpgt_epi8_mask($rmax, gmax) & _mm512_cmplt_epu8_mask($rref, rpadv);
+                    let flush = pend & !imp;
+                    if flush != 0 {
+                        qe_scan!(prev.0, prev.1, flush);
+                    }
+                    gmax = _mm512_mask_mov_epi8(gmax, imp, $rmax);
+                    te_lo = _mm512_mask_mov_epi8(te_lo, imp, _mm512_set1_epi8($row as i8));
                     if $row >= 256 {
                         te_hi =
-                            _mm512_mask_blend_epi8(imp, te_hi, _mm512_set1_epi8(($row >> 8) as i8));
+                            _mm512_mask_mov_epi8(te_hi, imp, _mm512_set1_epi8(($row >> 8) as i8));
                     }
-                    qev = _mm512_mask_blend_epi8(imp, qev, $jcol);
+                    pend = imp;
+                    prev = ($buf as *const u8, $row as i32);
                 }};
             }
 
@@ -1917,41 +2017,36 @@ mod avx512 {
                 let klo = 0.max(ri + ominq);
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
-                let mut jv = _mm512_add_epi8(_mm512_set1_epi8((ri - khi) as i8), ov);
                 if r + 1 < nr {
                     self.cells += 2 * (khi - klo + 1).max(0) as u64;
                     let rref0 = ld!(self.refv.as_ptr().add(r * L));
                     let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
-                    let (mut f0, mut f1, mut d1) = (zero, zero, zero);
-                    let (mut rmax0, mut rmax1, mut jcol0, mut jcol1) = (zero, zero, zero, zero);
+                    let (mut f0, mut f1, mut d1) = (hz, hz, hz);
+                    let (mut rmax0, mut rmax1) = (hz, hz);
                     macro_rules! step2 {
                         ($mask:expr, $live:expr) => {{
                             let ko = k as isize;
-                            let valid = |i: i32| -> Option<__m512i> {
+                            let valid = |i: i32| -> Option<bool> {
                                 if $mask {
-                                    Some(_mm512_set1_epi8(if (0..=wm1).contains(&(k + i)) {
-                                        -1
-                                    } else {
-                                        0
-                                    }))
+                                    Some((0..=wm1).contains(&(k + i)))
                                 } else {
                                     None
                                 }
                             };
                             let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            // The bias applies on real query columns (codes `< 8`, unsigned):
-                            // a pad or nonexistent code must carry the diagonal unbiased.
-                            let bi = _mm512_maskz_mov_epi8(_mm512_cmplt_epu8_mask(q, eight), biasv);
+                            let live = if $live {
+                                Some(_mm512_cmplt_epu8_mask(q, deadv))
+                            } else {
+                                None
+                            };
                             let e0 = ld!(e.offset(ko * li));
                             let d0 = ld!(hp.offset(ko * li));
-                            let (h0, e1) =
-                                cell!(d0, e0, f0, q, bi, rref0, rmax0, jcol0, jv, valid(0), $live);
-                            let (h1, e2) =
-                                cell!(d1, e1, f1, q, bi, rref1, rmax1, jcol1, jv, valid(1), $live);
+                            let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), live);
+                            let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), live);
+                            st!(hr0.offset(ko * li), h0);
                             st!(hc.offset((ko + 1) * li), h1);
                             st!(e.offset((ko + 2) * li), e2);
                             d1 = h0;
-                            jv = _mm512_add_epi8(jv, one);
                             k -= 1;
                         }};
                     }
@@ -1968,30 +2063,27 @@ mod avx512 {
                     while k >= kend {
                         step2!(true, true);
                     }
-                    finish_row!(r, rmax0, jcol0, rref0);
-                    finish_row!(r + 1, rmax1, jcol1, rref1);
+                    finish_row!(r, rmax0, rref0, hr0);
+                    finish_row!(r + 1, rmax1, rref1, hc);
                     r += 2;
-                    if early && _mm512_cmpge_epu8_mask(gmax, tgt) == u64::MAX {
-                        break;
-                    }
                 } else {
                     self.cells += (khi - klo + 1).max(0) as u64;
                     let rref = ld!(self.refv.as_ptr().add(r * L));
-                    let (mut f, mut rmax, mut jcol) = (zero, zero, zero);
+                    let (mut f, mut rmax) = (hz, hz);
                     macro_rules! step1 {
                         ($live:expr) => {{
                             let ko = k as isize;
                             let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            // The bias applies on real query columns (codes `< 8`, unsigned):
-                            // a pad or nonexistent code must carry the diagonal unbiased.
-                            let bi = _mm512_maskz_mov_epi8(_mm512_cmplt_epu8_mask(q, eight), biasv);
+                            let live = if $live {
+                                Some(_mm512_cmplt_epu8_mask(q, deadv))
+                            } else {
+                                None
+                            };
                             let e0 = ld!(e.offset(ko * li));
                             let d0 = ld!(hp.offset(ko * li));
-                            let (h, e1) =
-                                cell!(d0, e0, f, q, bi, rref, rmax, jcol, jv, None, $live);
+                            let (h, e1) = cell!(d0, e0, f, q, rref, rmax, None, live);
                             st!(hc.offset(ko * li), h);
                             st!(e.offset((ko + 1) * li), e1);
-                            jv = _mm512_add_epi8(jv, one);
                             k -= 1;
                         }};
                     }
@@ -2001,15 +2093,18 @@ mod avx512 {
                     while k >= klo {
                         step1!(true);
                     }
-                    finish_row!(r, rmax, jcol, rref);
+                    finish_row!(r, rmax, rref, hc);
                     r += 1;
-                    if early && _mm512_cmpge_epu8_mask(gmax, tgt) == u64::MAX {
-                        break;
-                    }
+                }
+                if early && _mm512_cmpge_epi8_mask(gmax, tgt) == u64::MAX {
+                    break;
                 }
                 std::mem::swap(&mut hc, &mut hp);
             }
-            st!(self.gmax.as_mut_ptr(), gmax);
+            if pend != 0 {
+                qe_scan!(prev.0, prev.1, pend);
+            }
+            st!(self.gmax.as_mut_ptr(), _mm512_xor_si512(gmax, hz));
             let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
             st!(lo.as_mut_ptr(), te_lo);
             st!(hi.as_mut_ptr(), te_hi);

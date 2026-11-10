@@ -677,6 +677,7 @@ pub(crate) fn batched_align(
     let band_ok = prune.is_some()
         && !matches!(forced_rescue_tier(), RescueTier::Scalar)
         && crate::rescue_band::kernel_available()
+        && crate::rescue_band::gaps_ok(o_del, e_del, o_ins, e_ins)
         && mat_is_standard(m, mat)
         && u8_table_has_headroom(mat);
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
