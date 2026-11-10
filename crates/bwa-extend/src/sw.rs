@@ -1006,20 +1006,15 @@ pub fn tightened_global_band(
     // `short_len`: the shorter length, which caps the aligned pairs. `gap`: the length difference.
     let short_len = qlen.min(tlen);
     let gap = qlen.abs_diff(tlen);
-    let cell = |pos_q: usize, pos_t: usize| -> i32 {
-        i32::from(mat[target[pos_t] as usize * m + query[pos_q] as usize])
-    };
-    // Walk the gap's position left to right: `run` starts with every pair on the far diagonal and
-    // moves one pair per step onto the near one. `best` keeps the highest total seen.
     let (t_shift, q_shift) = if tlen >= qlen { (gap, 0) } else { (0, gap) };
-    let mut run: i32 = (0..short_len).map(|k| cell(k + q_shift, k + t_shift)).sum();
-    let mut best = run;
-    if gap != 0 {
-        for k in 0..short_len {
-            run += cell(k, k) - cell(k + q_shift, k + t_shift);
-            best = best.max(run);
-        }
-    }
+    // bwa's matrices score a pair by equality alone, so compares stand in for the table: one
+    // lookup per pair was the whole cost of this scan on x86.
+    let best = match uniform_cells(mat, m) {
+        Some(u) => single_gap_best(query, target, short_len, q_shift, t_shift, uniform_cell(u)),
+        None => single_gap_best(query, target, short_len, q_shift, t_shift, |x, y| {
+            i32::from(mat[y as usize * m + x as usize])
+        }),
+    };
     let gap = gap as i32;
     // `gap_cost`: what the one mandatory gap costs, and the extend penalty of its side.
     let (gap_cost, e_long) = if gap == 0 {
@@ -1040,6 +1035,81 @@ pub fn tightened_global_band(
     // `v_max`: the largest overshoot whose ceiling still reaches `score`.
     let v_max = (budget / denom).max(0);
     ((gap + v_max).min(w_), score)
+}
+
+/// `(match, mismatch, n)` when the `m x m` matrix scores every pair of codes `0..4` by equality
+/// alone and every pair involving code 4 (`N`) alike, as `bwa_fill_scmat` builds it.
+fn uniform_cells(mat: &[i8], m: usize) -> Option<(i32, i32, i32)> {
+    if m != 5 {
+        return None;
+    }
+    let (ma, mi, n) = (mat[0], mat[1], mat[4]);
+    let expect = |i: usize, j: usize| match (i == 4 || j == 4, i == j) {
+        (true, _) => n,
+        (false, true) => ma,
+        (false, false) => mi,
+    };
+    (0..25)
+        .all(|c| mat[c] == expect(c / 5, c % 5))
+        .then_some((ma.into(), mi.into(), n.into()))
+}
+
+/// The score of a query code against a target code under [`uniform_cells`]'s `(match, mismatch, n)`.
+#[inline(always)]
+fn uniform_cell((ma, mi, n): (i32, i32, i32)) -> impl Fn(u8, u8) -> i32 {
+    move |x, y| {
+        if x >= 4 || y >= 4 {
+            n
+        } else if x == y {
+            ma
+        } else {
+            mi
+        }
+    }
+}
+
+/// [`tightened_global_band`]'s scan: the best total over the alignments with one gap of the length
+/// difference. `run` starts with every pair on the far diagonal (`q_shift`/`t_shift` in) and moves
+/// one pair per step onto the near one (`k, k`); the highest total seen is returned. `cell(q, t)`
+/// scores a query code against a target code.
+#[inline(always)]
+fn single_gap_best(
+    query: &[u8],
+    target: &[u8],
+    short_len: usize,
+    q_shift: usize,
+    t_shift: usize,
+    cell: impl Fn(u8, u8) -> i32,
+) -> i32 {
+    let (qf, tf) = (
+        &query[q_shift..q_shift + short_len],
+        &target[t_shift..t_shift + short_len],
+    );
+    let mut run: i32 = qf.iter().zip(tf).map(|(&x, &y)| cell(x, y)).sum();
+    if q_shift == t_shift {
+        return run;
+    }
+    let mut best = run;
+    // In blocks, so the per-pair differences vectorize and only the running maximum is serial.
+    let mut d = [0i32; 64];
+    let (qn, tn) = (&query[..short_len], &target[..short_len]);
+    for k0 in (0..short_len).step_by(d.len()) {
+        let r = k0..(k0 + d.len()).min(short_len);
+        let n = r.len();
+        for (o, ((&a, &b), (&c, &e))) in d[..n].iter_mut().zip(
+            qn[r.clone()]
+                .iter()
+                .zip(&tn[r.clone()])
+                .zip(qf[r.clone()].iter().zip(&tf[r])),
+        ) {
+            *o = cell(a, b) - cell(c, e);
+        }
+        for &v in &d[..n] {
+            run += v;
+            best = best.max(run);
+        }
+    }
+    best
 }
 
 /// Result of `ksw_align2`: a local (Smith-Waterman) alignment with start/end coordinates and the
@@ -1560,6 +1630,45 @@ mod tests {
     /// `tightened_global_band` promises the same score and CIGAR, ties included, as the band it
     /// replaces. A two-letter alphabet, cheap gaps and low-complexity targets are what make ties and
     /// gap-adjacent paths common; matching bwa's defaults alone would hardly exercise them.
+    /// The compare-based scan of a uniform matrix gives the table lookup's best single-gap total,
+    /// N codes, both gap sides and block boundaries included; a non-uniform matrix keeps the table.
+    #[test]
+    fn single_gap_scan_matches_table() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| -> u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for _ in 0..20_000 {
+            let mat = scmat(1 + next(4) as i8, 1 + next(6) as i8);
+            let u = uniform_cells(&mat, 5).expect("scmat is uniform");
+            let (ql, tl) = (1 + next(200) as usize, 1 + next(200) as usize);
+            let q: Vec<u8> = (0..ql).map(|_| next(5) as u8).collect();
+            let t: Vec<u8> = (0..tl).map(|_| next(5) as u8).collect();
+            let (short, gap) = (ql.min(tl), ql.abs_diff(tl));
+            let (ts, qs) = if tl >= ql { (gap, 0) } else { (0, gap) };
+            // The scan as first written: one table lookup per pair.
+            let cell = |pq: usize, pt: usize| i32::from(mat[t[pt] as usize * 5 + q[pq] as usize]);
+            let mut run: i32 = (0..short).map(|k| cell(k + qs, k + ts)).sum();
+            let mut best = run;
+            if gap != 0 {
+                for k in 0..short {
+                    run += cell(k, k) - cell(k + qs, k + ts);
+                    best = best.max(run);
+                }
+            }
+            assert_eq!(
+                single_gap_best(&q, &t, short, qs, ts, uniform_cell(u)),
+                best
+            );
+        }
+        let mut odd = scmat(1, 4);
+        odd[2] = -3;
+        assert_eq!(uniform_cells(&odd, 5), None);
+    }
+
     #[test]
     fn tightened_band_is_byte_identical() {
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
