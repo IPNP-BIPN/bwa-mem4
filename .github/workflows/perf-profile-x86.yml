@@ -456,7 +456,7 @@ jobs:
           # One thread, and the lockstep width the CI hosts' probe picks: the probe times loads,
           # which under valgrind would pick a width no real run uses.
           export BWA4_LOCKSTEP_N=8
-          cg="valgrind --tool=callgrind --dump-instr=no --collect-jumps=no"
+          cg="valgrind --tool=callgrind --dump-instr=no --collect-jumps=no --compress-pos=no --compress-strings=no"
           $cg --callgrind-out-file=ours.cg ../mem4-v3 mem -t 1 chr21.fa sim1.fq sim2.fq 2>ours.err >ours.sam \
             || { tail -40 ours.err; exit 1; }
           $cg --callgrind-out-file=fork.cg bwa-mem3 mem --compat=bwa-mem2 -t 1 chr21.fa sim1.fq sim2.fq 2>fork.err >fork.sam \
@@ -479,4 +479,23 @@ jobs:
             callgrind_annotate --tree=caller --threshold=100 "$arm.cg" 2>/dev/null \
               | awk '/^ *[0-9,]+ +\(/ { blk = blk $0 "\n" } /^$/ { if (blk ~ /\* .*__mem(set|cpy|move|cmp)/) printf "%s\n", blk; blk = "" }' \
               | grep -E '<|\*' | head -80 || true
+            # Self instructions per source line (inlined code under its own file), top 100.
+            echo "===== $arm: instructions by source line ====="
+            python3 - "$arm.cg" <<'PY'
+          import sys, collections
+          c = collections.Counter(); f = "?"; skip = False
+          for l in open(sys.argv[1]):
+              if l[:1].isdigit():
+                  if skip:
+                      skip = False
+                      continue
+                  t = l.split()
+                  c[(f, int(t[0]))] += int(t[1])
+              elif l.startswith(("fl=", "fi=", "fe=")):
+                  f = l[3:].strip()
+              elif l.startswith("calls="):
+                  skip = True  # the next cost line is the callee's inclusive cost
+          for (f, ln), ir in c.most_common(100):
+              print(f"{ir:14d} {f.split('/bwa-mem4/bwa-mem4/')[-1]}:{ln}")
+          PY
           done
