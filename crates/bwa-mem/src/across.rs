@@ -337,6 +337,12 @@ pub(crate) struct RegMeta {
 /// * `preskip`: parallel to `regs`, true for a slot whose extension nh13's `seed_ext_redundant`
 ///   elided. Read-only; it seeds the local `purged` vector so a never-extended slot behaves exactly
 ///   like one the C had already tombstoned with `srt2[k] = UINT_MAX`.
+/// Probe: hint the region a job lands in 16 jobs ahead (scatter and right-job `h0` reads).
+fn reg_pf() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_REG_PF").is_some())
+}
+
 pub(crate) fn discard_contained(
     opt: &MemOpt,
     l_query: i32,
@@ -1603,7 +1609,14 @@ fn align_reads_batched_inner<B: SwBackend>(
     // extension resumes from the score the left extension reached, so every left job in the whole
     // batch must have landed before any right job can even be parameterised. bwa-mem2 does the same
     // fixup in its own loop at `bwamem.cpp:2672-2677` (`sp->h0 = a->score;`).
-    for job in &mut right_jobs {
+    for i in 0..right_jobs.len() {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        if reg_pf() {
+            if let Some(j) = right_jobs.get(i + 16) {
+                bwa_neon::batched::prefetch(regs[j.read].as_ptr().wrapping_add(j.reg));
+            }
+        }
+        let job = &mut right_jobs[i];
         job.h0 = regs[job.read][job.reg].score;
         // `prev` starts at the region's current score, not -1, because that is literally what the C
         // reads: `int prev = a->score;` (`bwamem.cpp:2492`) runs on every band retry including the
@@ -1864,6 +1877,10 @@ fn run_side<B: SwBackend>(
             if let Some(&l) = lane_of.get(job_idx + 16) {
                 if l != u32::MAX {
                     bwa_neon::batched::prefetch(results.as_ptr().wrapping_add(l as usize));
+                    if reg_pf() {
+                        let j = &jobs[job_idx + 16];
+                        bwa_neon::batched::prefetch(regs[j.read].as_ptr().wrapping_add(j.reg));
+                    }
                 }
             }
             if lane == u32::MAX {
