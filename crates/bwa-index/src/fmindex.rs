@@ -1774,36 +1774,39 @@ impl FmIndex {
         min_seed_len: i64,
         out: &mut Vec<Smem>,
     ) -> usize {
-        // One copy per index kind and per `a == 0`, so neither the `wide` test nor, for C/G/T, the
-        // sentinel test runs per occurrence. The base dispatch is one branch per round: M4 cycles
-        // neutral, -9G instructions on GIAB PE; aimed at x86, where seeding ran 16% more
-        // instructions than the fork's (callgrind, chr21).
-        match (self.wide, a == 0) {
-            (true, true) => {
-                self.backward_round_impl::<true, true>(prev, a, m, min_intv, min_seed_len, out)
-            }
-            (true, false) => {
-                self.backward_round_impl::<true, false>(prev, a, m, min_intv, min_seed_len, out)
-            }
-            (false, true) => {
-                self.backward_round_impl::<false, true>(prev, a, m, min_intv, min_seed_len, out)
-            }
-            (false, false) => {
-                self.backward_round_impl::<false, false>(prev, a, m, min_intv, min_seed_len, out)
-            }
+        // One copy per index kind and per base, so neither the `wide` test nor, for C/G/T, the
+        // sentinel test runs per occurrence, and the base's plane masks, count and checkpoint
+        // column are constants. Per `a == 0` alone: M4 cycles neutral, -9G instructions on GIAB
+        // PE. Per base: x86 kept `a`, both masks, `min_intv` and the survivor count on the stack,
+        // reloaded every candidate.
+        macro_rules! go {
+            ($w:literal, $a0:literal, $a:literal) => {
+                self.backward_round_impl::<$w, $a0, $a>(prev, m, min_intv, min_seed_len, out)
+            };
+        }
+        match (self.wide, a) {
+            (false, 0) => go!(false, true, 0),
+            (false, 1) => go!(false, false, 1),
+            (false, 2) => go!(false, false, 2),
+            (false, _) => go!(false, false, 3),
+            (true, 0) => go!(true, true, 0),
+            (true, 1) => go!(true, false, 1),
+            (true, 2) => go!(true, false, 2),
+            (true, _) => go!(true, false, 3),
         }
     }
 
+    /// [`backward_round`](Self::backward_round) for base `A` (`A0` is `A == 0`).
     #[inline]
-    fn backward_round_impl<const WIDE: bool, const A0: bool>(
+    fn backward_round_impl<const WIDE: bool, const A0: bool, const A: usize>(
         &self,
         prev: &mut [Smem],
-        a: usize,
         m: u32,
         min_intv: i64,
         min_seed_len: i64,
         out: &mut Vec<Smem>,
     ) -> usize {
+        let a = A;
         let hx = ((a as u64 >> 1) & 1).wrapping_sub(1);
         let lx = (a as u64 & 1).wrapping_sub(1);
         let count_a = self.count[a];
@@ -1837,12 +1840,17 @@ impl FmIndex {
             p += 1;
             if s >= min_intv && s != curr_s {
                 curr_s = s;
-                prev[kept] = Smem {
-                    k,
-                    s,
-                    m,
-                    ..prev[p - 1]
-                };
+                debug_assert!(kept < p);
+                // SAFETY: `kept < p <= n`: at most one survivor per candidate visited, and
+                // candidate `p - 1` was just visited. (The bounds test took a register x86 lacks.)
+                unsafe {
+                    *prev.get_unchecked_mut(kept) = Smem {
+                        k,
+                        s,
+                        m,
+                        ..*prev.get_unchecked(p - 1)
+                    };
+                }
                 kept += 1;
                 self.prefetch_occ(k, k + s);
             }
