@@ -2443,17 +2443,12 @@ fn batched_regs(
     // per-worker share. Scheduling only -- the per-read regions do not depend on the chunk size.
     const INFLIGHT_READS: usize = 16384; // total reads' intermediates resident at once, all workers
     const MIN_CHUNK: usize = 512; // lockstep floor: enough reads in flight to hide FM latency
-
-    // shortcut: `BWA4_INFLIGHT` overrides the budget for a same-host CI A/B; delete once settled.
-    static INFLIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let inflight = *INFLIGHT.get_or_init(|| {
-        std::env::var("BWA4_INFLIGHT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(INFLIGHT_READS)
-    });
-    let budget_chunk = (inflight / worker_count).max(MIN_CHUNK);
+    // Ceiling per chunk whatever `-t`: a chunk's extension passes stream its regions and job bases
+    // (~10 KB a read), which past ~2048 reads spill a 1-2 MB L2. Same-host fair CI A/B, 4096 -> 2048
+    // reads a chunk (-t4): EPYC 9V45 -2.8%, Xeon 8573C -1.4%; 1024 neutral on 9V45. M4 at -t4
+    // +0.3% (its 16 MB shared L2 holds 4096), unchanged at -t8 and up where the budget is lower.
+    const MAX_CHUNK: usize = 2048;
+    let budget_chunk = (INFLIGHT_READS / worker_count).clamp(MIN_CHUNK, MAX_CHUNK);
     let reads_per_chunk = codes.len().div_ceil(worker_count).min(budget_chunk).max(1);
     crate::stage_time::barrier::region(crate::stage_time::Stage::Align, || {
         codes
