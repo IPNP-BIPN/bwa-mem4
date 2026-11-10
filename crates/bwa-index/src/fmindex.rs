@@ -1187,7 +1187,18 @@ impl FmIndex {
     /// backward extension of the reverse-complement view). An absent string keeps `s = 0` and its
     /// parent's rows: a walk leaves at the first `s < min_intv`, so nothing reads past it.
     fn build_seed_jump(&mut self) {
-        let mut table = vec![SeedJump::default(); seed_jump_level_off(SEED_JUMP_DEPTH + 1)];
+        // Hinted before the first write, like `cp_occ`: every walk start reads up to nine entries
+        // at random across its 33.6 MB, which at 4 KiB pages is a TLB miss each on x86 (the fork
+        // hints its table the same way).
+        let n = seed_jump_level_off(SEED_JUMP_DEPTH + 1);
+        let mut table = Vec::<SeedJump>::with_capacity(n);
+        unsafe {
+            crate::hugepage::advise_hugepage(
+                table.as_ptr() as *const u8,
+                n * std::mem::size_of::<SeedJump>(),
+            );
+        }
+        table.resize(n, SeedJump::default());
         for a in 0..4 {
             table[seed_jump_level_off(1) + a] = SeedJump {
                 k: self.count[a],

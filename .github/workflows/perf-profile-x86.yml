@@ -75,6 +75,7 @@ jobs:
           lscpu | grep -E '^(Model name|Vendor ID)' || true
           echo "cores: $(nproc)"
           grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null) defrag: $(cat /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null)"
 
       - name: Install perf
         run: |
