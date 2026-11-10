@@ -78,6 +78,24 @@ unsafe impl std::alloc::GlobalAlloc for MiMalloc {
     }
 }
 
+/// mimalloc returns freed pages to the OS a second after they empty (`purge_delay`), and the
+/// next chunk faults them back in: on Linux that is `MADV_DONTNEED` plus a zeroed page per touch,
+/// measured at 1.8% of the cycles on a Neoverse N2 (0.5% on an M4), for +8% peak RSS on chr21 and
+/// none on a human index. Never purging keeps them; `MIMALLOC_PURGE_DELAY` still overrides.
+#[cfg(feature = "mimalloc")]
+fn keep_freed_pages() {
+    extern "C" {
+        fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
+    }
+    // `mi_option_purge_delay` in mimalloc v3's `mi_option_t` (libmimalloc-sys's own constant is
+    // v2's numbering).
+    const MI_OPTION_PURGE_DELAY: std::ffi::c_int = 15;
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+        // SAFETY: plain option setter; mimalloc reads it when it next considers a purge.
+        unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1) };
+    }
+}
+
 // With `--features stage-alloc`, the same allocator wrapped in `stage_alloc::Counting`, which
 // forwards every request and counts the bytes against the pipeline stage that asked for them. Off
 // by default because that wrapper costs a measured +0.5% even disarmed, one branch per allocation
@@ -157,6 +175,8 @@ fn main() -> anyhow::Result<()> {
     // reads the environment (which allocates) and the allocator must never do that itself; every
     // allocation before this line goes uncounted, which is clap's parsing and nothing else.
     bwa_mem4::stage_alloc::init();
+    #[cfg(feature = "mimalloc")]
+    keep_freed_pages();
     match Cli::parse().cmd {
         Cmd::Index(args) => cmd_index::run(args),
         Cmd::Mem(args) => cmd_mem::run(args, &argv),
