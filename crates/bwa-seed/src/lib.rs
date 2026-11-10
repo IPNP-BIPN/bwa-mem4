@@ -228,12 +228,6 @@ fn prefetch_ahead() -> usize {
     })
 }
 
-/// Probe `BWA4_SJ_EARLY`: hint the next start's seed-jump lines when the forward phase ends.
-fn sj_early() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_SJ_EARLY").is_some())
-}
-
 /// Hint the next read's bases into the cache when a slot takes the one before it. They were
 /// encoded with the whole batch and are cold by the time a walk reaches them, and its first step
 /// loads them (on EPYC 9V45 that load was 6.8% of `mem_collect_smem_batched`). The first 256 bases
@@ -831,22 +825,7 @@ impl LsSlot {
     /// candidates longest-first and enter `Bwd`. Returns whether the first backward round reads
     /// the index, in which case the caller yields so the hints issued here land first.
     #[inline(always)]
-    fn bwd_init(&mut self, fm: &FmIndex, codes: &[u8], min_intv: i64) -> bool {
-        // Probe: the next start is known now; hint its deep table lines while the backward rounds run.
-        if sj_early() && !self.single_pos {
-            let x = self.next_x;
-            let lim = fm.seed_jump_depth().min(codes.len().saturating_sub(x));
-            if lim >= 2 && codes[x] < AMBIGUOUS_BASE {
-                let (mut jdp, mut code) = (1, u32::from(codes[x]));
-                while jdp < lim && codes[x + jdp] < AMBIGUOUS_BASE {
-                    code = code << 2 | u32::from(codes[x + jdp]);
-                    jdp += 1;
-                }
-                for d in 6..=jdp {
-                    fm.prefetch_seed_jump(d, code >> (2 * (jdp - d)));
-                }
-            }
-        }
+    fn bwd_init(&mut self, fm: &FmIndex, min_intv: i64) -> bool {
         if self.smem.s >= min_intv {
             self.prev[self.num_prev] = self.smem;
             self.num_prev += 1;
@@ -967,7 +946,7 @@ impl LsSlot {
                                 self.bsd_resolve(codes, j);
                             }
                             self.next_x = j;
-                            if self.bwd_init(fm, codes, min_intv) {
+                            if self.bwd_init(fm, min_intv) {
                                 return;
                             }
                             continue;
@@ -994,7 +973,7 @@ impl LsSlot {
                         if self.bsd_j != usize::MAX {
                             self.bsd_resolve(codes, self.j);
                         }
-                        if self.bwd_init(fm, codes, min_intv) {
+                        if self.bwd_init(fm, min_intv) {
                             return;
                         }
                         continue;
@@ -1006,7 +985,7 @@ impl LsSlot {
                         if self.bsd_j != usize::MAX {
                             self.bsd_resolve(codes, self.j);
                         }
-                        if self.bwd_init(fm, codes, min_intv) {
+                        if self.bwd_init(fm, min_intv) {
                             return;
                         }
                         continue;
@@ -1040,7 +1019,7 @@ impl LsSlot {
                             self.bsd_resolve(codes, self.j);
                         }
                         self.next_x = self.j;
-                        if self.bwd_init(fm, codes, min_intv) {
+                        if self.bwd_init(fm, min_intv) {
                             return;
                         }
                         continue;
@@ -1119,7 +1098,7 @@ impl LsSlot {
                         }
                     }
                     self.smem.n = (j - 1) as u32;
-                    if self.bwd_init(fm, codes, min_intv) {
+                    if self.bwd_init(fm, min_intv) {
                         return;
                     }
                 }
