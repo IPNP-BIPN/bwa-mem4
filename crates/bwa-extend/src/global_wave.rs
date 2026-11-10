@@ -1,15 +1,18 @@
 //! Anti-diagonal (wavefront) `ksw_global2` in int16 lanes, NEON or SSE4.1: fg-labs/bwa-mem3's `ksw_g2_wave16`
 //! (`ksw_global2_wave.h`, with its LEMMA 1-10 proof of byte-identity to the scalar `ksw_global2`).
 //!
-//! Cells on one anti-diagonal `s = i + j` depend only on diagonals `s - 1` and `s - 2`, so eight rows
-//! of a diagonal go in one vector. H/E/F live in rings indexed by row (`+1` store offset), the
+//! Cells on one anti-diagonal `s = i + j` depend only on diagonals `s - 1` and `s - 2`, so a vector's
+//! worth of rows of a diagonal (8, or 16 under AVX2) go in one vector. H/E/F live in rings indexed by row (`+1` store offset), the
 //! direction bytes in diagonal-major order, and the traceback walks them exactly as the scalar walks
 //! its row-major bytes. Entered only where [`safe`] proves every value fits int16 and the band meets
 //! the kernel's floor `w >= |tlen - qlen| + 3`.
 //!
-//! One kernel body for both ISAs: on x86_64 the NEON intrinsics it uses are the SSE4.1 shims of
-//! [`sse`] (same 8 x int16 lanes, same names), and the score lookup and the direction-byte store,
-//! the two steps without a one-instruction twin, are [`score8`] and [`store_dirs`].
+//! One kernel body ([`wave_fill`]) for every ISA: on x86_64 the NEON intrinsics it uses are the
+//! SSE4.1 shims of [`sse`] (same 8 x int16 lanes, same names) or the AVX2 ones of [`avx2`] (16
+//! lanes, as the fork's AVX2 kernel), and the score lookup and the direction-byte store, the two
+//! steps without a one-instruction twin, are [`score_lanes`] and [`store_dirs`]. A diagonal holds
+//! about `w + 1` in-band cells, so the 16-lane kernel takes bands of [`WIDE_MIN`] and up, which
+//! need two 8-lane chunks per diagonal.
 
 #[cfg(target_arch = "x86_64")]
 use sse::*;
@@ -27,7 +30,7 @@ unsafe fn load_table(tab: &[u8; 32]) -> Table {
 /// Lane `l`'s score `mat[t[l] * 5 + q[7 - l]]`, sign-extended: `tp` and `qp` point at 8 bytes.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn score8(table: &Table, tp: *const u8, qp: *const u8) -> int16x8_t {
+unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> int16x8_t {
     let idx = vmla_u8(vrev64_u8(vld1_u8(qp)), vld1_u8(tp), vdup_n_u8(5));
     vmovl_s8(vreinterpret_s8_u8(vqtbl2_u8(*table, idx)))
 }
@@ -86,7 +89,7 @@ unsafe fn load_table(tab: &[u8; 32]) -> Table {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "sse4.1")]
-unsafe fn score8(table: &Table, tp: *const u8, qp: *const u8) -> __m128i {
+unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> __m128i {
     let rev = _mm_setr_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -1, -1, -1, -1, -1, -1, -1);
     let q = _mm_shuffle_epi8(_mm_loadl_epi64(qp.cast()), rev);
     let t = _mm_cvtepu8_epi16(_mm_loadl_epi64(tp.cast()));
@@ -110,6 +113,23 @@ unsafe fn store_dirs(p: *mut u8, d: __m128i) {
 
 /// Int16 "minus infinity": its own decrement cannot wrap and no feasible score reaches it ([`safe`]).
 const VMINF: i16 = -30000;
+/// Lane numbers, read as the first 8 or 16 of them.
+const IOTA: [i16; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// Narrowest band the 16-lane AVX2 kernel takes: its diagonals hold up to `w + 1 >= 9` cells.
+#[cfg(target_arch = "x86_64")]
+const WIDE_MIN: usize = 8;
+
+/// Whether bands of [`WIDE_MIN`] and up go to the 16-lane kernel: AVX2 present, and the extension
+/// tier not forced down to SSE4.1 (`BWA4_EXTEND_TIER=sse41` keeps every vector kernel at 128 bits).
+#[cfg(target_arch = "x86_64")]
+fn wide_ok() -> bool {
+    use std::sync::OnceLock;
+    static W: OnceLock<bool> = OnceLock::new();
+    *W.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::env::var("BWA4_EXTEND_TIER").as_deref() != Ok("sse41")
+    })
+}
 /// Bytes of padding on both sides of the query and target copies (the vector loads overhang by 7).
 const PAD: usize = 64;
 
@@ -205,15 +225,267 @@ pub(crate) fn try_wave16(
     {
         return None;
     }
+    #[cfg(target_arch = "x86_64")]
+    let wide = w >= WIDE_MIN && wide_ok();
+    #[cfg(not(target_arch = "x86_64"))]
+    let wide = false;
     Some(SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
-        // SAFETY: NEON is the AArch64 baseline; SSE4.1 was detected above on x86_64.
-        unsafe { wave16(&mut s, query, target, mat, o_del, e_del, o_ins, e_ins, w) }
+        // SAFETY: NEON is the AArch64 baseline; SSE4.1 was detected above on x86_64, and AVX2 by
+        // `wide_ok` when `wide`.
+        unsafe {
+            wave16(
+                &mut s, query, target, mat, o_del, e_del, o_ins, e_ins, w, wide,
+            )
+        }
     }))
 }
 
+/// The forward pass in `L`-row chunks of each anti-diagonal (`L` = the vector's int16 lanes): fills
+/// `sc.z`, `sc.zoff` and `sc.zis` for [`traceback`] and returns the score. [`wave16`] has sized the
+/// scratch and copied the sequences. Expanded once per vector width, each with its own
+/// [`score_lanes`], [`store_dirs`] and lane ops in scope.
+macro_rules! wave_fill {
+    ($(#[$m:meta])* $vis:vis $name:ident, $lanes:expr) => {
+        $(#[$m])*
+        #[allow(clippy::too_many_arguments)]
+        $vis unsafe fn $name(
+            sc: &mut Scratch,
+            qlen: usize,
+            tlen: usize,
+            mat: &[i8],
+            o_del: i32,
+            e_del: i32,
+            o_ins: i32,
+            e_ins: i32,
+            w: usize,
+        ) -> i32 {
+            const L: usize = $lanes;
+            let sdim = tlen + qlen - 1;
+            let stride = sc.stride;
+            let (oe_del, oe_ins) = (o_del + e_del, o_ins + e_ins);
+            let mut score = if qlen <= w {
+                -(o_ins + e_ins * qlen as i32)
+            } else {
+                crate::sw::MINUS_INF
+            };
+            let mut tab = [0u8; 32];
+            for (d, &v) in tab.iter_mut().zip(&mat[..25]) {
+                *d = v as u8;
+            }
+            let (w16, q16) = (w as i16, qlen as i16);
+            let mut roff = 0usize;
+            // SAFETY: the ISA is the caller's contract (see above). Every pointer below stays inside its buffer: ring rows are
+            // `stride >= maxlen + 33` long and lanes reach at most row `tlen + L <= tlen + 16`; the
+            // query/target copies have `PAD` bytes on both sides of the at most `L - 1`-byte overhang; `z`
+            // holds `zneed` bytes, the in-band cell count plus 64 for the last chunk's overhang.
+            unsafe {
+                let table = load_table(&tab);
+                let vminf = vdupq_n_s16(VMINF);
+                let laneid = vld1q_s16(IOTA.as_ptr());
+                let (hb, eb, fb) = (sc.hb.as_mut_ptr(), sc.eb.as_mut_ptr(), sc.fb.as_mut_ptr());
+                let (tp, qp, z) = (
+                    sc.tpad.as_ptr().add(PAD),
+                    sc.qpad.as_ptr().add(PAD),
+                    sc.z.as_mut_ptr(),
+                );
+                let (mut hc, mut hd2, mut efc) = (0usize, 1usize, 0usize);
+                for s in 0..sdim {
+                    let (hcur, hdiag2) = (hb.add(hc * stride), hb.add(hd2 * stride));
+                    let (ecur, ep1) = (eb.add(efc * stride), eb.add((efc ^ 1) * stride));
+                    let (fcur, fp1) = (fb.add(efc * stride), fb.add((efc ^ 1) * stride));
+                    let si = s as isize;
+                    let i_lo = (si - (qlen as isize - 1))
+                        .max((si - w as isize + 1) >> 1)
+                        .max(0) as usize;
+                    let i_hi = (s.min((s + w) >> 1)).min(tlen - 1);
+                    sc.zoff[s] = roff;
+                    sc.zis[s] = i_lo;
+                    let zbase = roff;
+                    if i_hi >= i_lo {
+                        roff += i_hi - i_lo + 1;
+                    }
+                    let mut i0 = i_lo;
+                    while i0 <= i_hi {
+                        let (hdiag, e, f);
+                        if i0 > i_lo && i0 + (L - 1) < i_hi {
+                            hdiag = vld1q_s16(hdiag2.add(i0));
+                            e = vld1q_s16(ep1.add(i0));
+                            f = vld1q_s16(fp1.add(i0 + 1));
+                        } else if i0 > 0 && s - i0 > L - 1 {
+                            // Band-edge chunk (LEMMA 8b): no lane on row 0 or column 0; only the lane on the
+                            // band's lower edge loses E and the one on its upper edge loses F.
+                            hdiag = vld1q_s16(hdiag2.add(i0));
+                            let (mut ev, mut fv) = (vld1q_s16(ep1.add(i0)), vld1q_s16(fp1.add(i0 + 1)));
+                            if (s + w) & 1 == 0 {
+                                let el = (((s as isize - w as isize) / 2) - i0 as isize) as i16;
+                                let fl = (((s + w) / 2) as isize - i0 as isize) as i16;
+                                ev = vbslq_s16(vceqq_s16(laneid, vdupq_n_s16(el)), vminf, ev);
+                                fv = vbslq_s16(vceqq_s16(laneid, vdupq_n_s16(fl)), vminf, fv);
+                            }
+                            e = ev;
+                            f = fv;
+                        } else {
+                            let iv = vaddq_s16(vdupq_n_s16(i0 as i16), laneid);
+                            let jv = vsubq_s16(vdupq_n_s16((s - i0) as i16), laneid);
+                            let beg = vmaxq_s16(vdupq_n_s16(0), vsubq_s16(iv, vdupq_n_s16(w16)));
+                            let mut hd = vld1q_s16(hdiag2.add(i0));
+                            let i0m = vceqq_s16(iv, vdupq_n_s16(0));
+                            let j0m = vceqq_s16(jv, vdupq_n_s16(0));
+                            let hi0 = vbslq_s16(
+                                j0m,
+                                vdupq_n_s16(0),
+                                vsubq_s16(
+                                    vdupq_n_s16(-o_ins as i16),
+                                    vmulq_s16(vdupq_n_s16(e_ins as i16), jv),
+                                ),
+                            );
+                            let hj0 = vsubq_s16(
+                                vdupq_n_s16(-o_del as i16),
+                                vmulq_s16(vdupq_n_s16(e_del as i16), iv),
+                            );
+                            hd = vbslq_s16(j0m, hj0, hd);
+                            hd = vbslq_s16(i0m, hi0, hd);
+                            hdiag = hd;
+                            let begm1 = vmaxq_s16(vdupq_n_s16(0), vsubq_s16(iv, vdupq_n_s16(w16 + 1)));
+                            let endm1 = vminq_s16(vdupq_n_s16(q16), vaddq_s16(iv, vdupq_n_s16(w16)));
+                            let evalid = vandq_u16(
+                                vcgeq_s16(iv, vdupq_n_s16(1)),
+                                vandq_u16(vcgeq_s16(jv, begm1), vcltq_s16(jv, endm1)),
+                            );
+                            e = vbslq_s16(evalid, vld1q_s16(ep1.add(i0)), vminf);
+                            f = vbslq_s16(vceqq_s16(jv, beg), vminf, vld1q_s16(fp1.add(i0 + 1)));
+                        }
+                        // Score index t*5 + q per byte lane; lane l reads query column s - i0 - l.
+                        let sv = score_lanes(&table, tp.add(i0), qp.offset((s - i0) as isize - (L as isize - 1)));
+                        let mm = vaddq_s16(hdiag, sv);
+                        let h_me = vmaxq_s16(mm, e);
+                        let h = vmaxq_s16(h_me, f);
+                        let t1 = vsubq_s16(mm, vdupq_n_s16(oe_del as i16));
+                        let em = vsubq_s16(e, vdupq_n_s16(e_del as i16));
+                        let t2 = vsubq_s16(mm, vdupq_n_s16(oe_ins as i16));
+                        let fm = vsubq_s16(f, vdupq_n_s16(e_ins as i16));
+                        vst1q_s16(hcur.add(i0 + 1), h);
+                        vst1q_s16(ecur.add(i0 + 1), vmaxq_s16(em, t1));
+                        vst1q_s16(fcur.add(i0 + 1), vmaxq_s16(fm, t2));
+                        let mut d = vbslq_s16(vcgeq_s16(mm, e), vdupq_n_s16(0), vdupq_n_s16(1));
+                        d = vbslq_s16(vcgeq_s16(h_me, f), d, vdupq_n_s16(2));
+                        d = vorrq_s16(
+                            d,
+                            vbslq_s16(vcgtq_s16(em, t1), vdupq_n_s16(1 << 2), vdupq_n_s16(0)),
+                        );
+                        d = vorrq_s16(
+                            d,
+                            vbslq_s16(vcgtq_s16(fm, t2), vdupq_n_s16(2 << 4), vdupq_n_s16(0)),
+                        );
+                        store_dirs(z.add(zbase + (i0 - i_lo)), d);
+                        i0 += L;
+                    }
+                    // The terminal column (LEMMA 9): in band on this diagonal iff its row is `i_lo`.
+                    if s + 1 == i_lo + qlen && i_lo <= i_hi {
+                        score = i32::from(*hcur.add(i_lo + 1));
+                    }
+                    hc = if hc == 2 { 0 } else { hc + 1 };
+                    hd2 = if hd2 == 2 { 0 } else { hd2 + 1 };
+                    efc ^= 1;
+                }
+            }
+            score
+        }
+    };
+}
+
+wave_fill!(
+    /// [`wave_fill`] at eight lanes: NEON, or the SSE4.1 shims on x86_64.
+    ///
+    /// # Safety
+    /// On x86_64 the CPU must have SSE4.1.
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "sse4.1"))]
+    fill,
+    8
+);
+
+/// The 16-lane kernel: AVX2 shims under the NEON names, the 16-lane score lookup and direction
+/// store, and [`wave_fill`] expanded over them.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::{Scratch, IOTA, PAD, VMINF};
+    use std::arch::x86_64::*;
+    type V = __m256i;
+    macro_rules! shim {
+        ($($name:ident($($a:ident: $t:ty),*) -> $r:ty $body:block)*) => {$(
+            #[inline]
+            #[target_feature(enable = "avx2")]
+            unsafe fn $name($($a: $t),*) -> $r $body
+        )*};
+    }
+    shim! {
+        vdupq_n_s16(x: i16) -> V { _mm256_set1_epi16(x) }
+        vld1q_s16(p: *const i16) -> V { _mm256_loadu_si256(p.cast()) }
+        vst1q_s16(p: *mut i16, v: V) -> () { _mm256_storeu_si256(p.cast(), v) }
+        vaddq_s16(a: V, b: V) -> V { _mm256_add_epi16(a, b) }
+        vsubq_s16(a: V, b: V) -> V { _mm256_sub_epi16(a, b) }
+        vmulq_s16(a: V, b: V) -> V { _mm256_mullo_epi16(a, b) }
+        vmaxq_s16(a: V, b: V) -> V { _mm256_max_epi16(a, b) }
+        vminq_s16(a: V, b: V) -> V { _mm256_min_epi16(a, b) }
+        vceqq_s16(a: V, b: V) -> V { _mm256_cmpeq_epi16(a, b) }
+        vcgtq_s16(a: V, b: V) -> V { _mm256_cmpgt_epi16(a, b) }
+        vcltq_s16(a: V, b: V) -> V { _mm256_cmpgt_epi16(b, a) }
+        vcgeq_s16(a: V, b: V) -> V { _mm256_cmpeq_epi16(_mm256_max_epi16(a, b), a) }
+        vbslq_s16(m: V, a: V, b: V) -> V { _mm256_blendv_epi8(b, a, m) }
+        vandq_u16(a: V, b: V) -> V { _mm256_and_si256(a, b) }
+        vorrq_s16(a: V, b: V) -> V { _mm256_or_si256(a, b) }
+    }
+
+    type Table = (__m128i, __m128i);
+    #[target_feature(enable = "avx2")]
+    unsafe fn load_table(tab: &[u8; 32]) -> Table {
+        (
+            _mm_loadu_si128(tab.as_ptr().cast()),
+            _mm_loadu_si128(tab.as_ptr().add(16).cast()),
+        )
+    }
+
+    /// Lane `l`'s score `mat[t[l] * 5 + q[15 - l]]`, sign-extended: `tp` and `qp` point at 16 bytes.
+    /// Codes are at most 4, so `t * 5 + q < 25` fits a byte and the SSE4.1 lookup applies as is.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> V {
+        let rev = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+        let q = _mm_shuffle_epi8(_mm_loadu_si128(qp.cast()), rev);
+        let t = _mm_loadu_si128(tp.cast());
+        let t4 = _mm_add_epi8(_mm_add_epi8(t, t), _mm_add_epi8(t, t));
+        let idx = _mm_add_epi8(_mm_add_epi8(t4, t), q);
+        let hi = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));
+        let s = _mm_blendv_epi8(
+            _mm_shuffle_epi8(table.0, idx),
+            _mm_shuffle_epi8(table.1, idx),
+            hi,
+        );
+        _mm256_cvtepi8_epi16(s)
+    }
+
+    /// The sixteen direction bytes of `d` (each lane `< 64`) at `p`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn store_dirs(p: *mut u8, d: V) {
+        let b = _mm_packus_epi16(_mm256_castsi256_si128(d), _mm256_extracti128_si256::<1>(d));
+        _mm_storeu_si128(p.cast(), b);
+    }
+
+    wave_fill!(
+        /// [`wave_fill`] at sixteen lanes.
+        ///
+        /// # Safety
+        /// The CPU must have AVX2.
+        #[target_feature(enable = "avx2")]
+        pub(super) fill,
+        16
+    );
+}
+
 /// # Safety
-/// On x86_64 the CPU must have SSE4.1.
+/// On x86_64 the CPU must have SSE4.1, and AVX2 when `wide`.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "sse4.1"))]
 unsafe fn wave16(
@@ -226,6 +498,7 @@ unsafe fn wave16(
     o_ins: i32,
     e_ins: i32,
     w: usize,
+    wide: bool,
 ) -> (i32, Vec<u32>) {
     let (qlen, tlen) = (query.len(), target.len());
     let maxlen = qlen.max(tlen);
@@ -250,135 +523,23 @@ unsafe fn wave16(
     }
     sc.tpad[PAD..PAD + tlen].copy_from_slice(target);
     sc.qpad[PAD..PAD + qlen].copy_from_slice(query);
-    let stride = sc.stride;
-    let (oe_del, oe_ins) = (o_del + e_del, o_ins + e_ins);
-    let mut score = if qlen <= w {
-        -(o_ins + e_ins * qlen as i32)
+    #[cfg(target_arch = "x86_64")]
+    let score = if wide {
+        avx2::fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w)
     } else {
-        super::sw::MINUS_INF
+        fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w)
     };
-    let mut tab = [0u8; 32];
-    for (d, &v) in tab.iter_mut().zip(&mat[..25]) {
-        *d = v as u8;
-    }
-    let (w16, q16) = (w as i16, qlen as i16);
-    let mut roff = 0usize;
-    // SAFETY: the ISA is the caller's contract (see above). Every pointer below stays inside its buffer: ring rows are
-    // `stride >= maxlen + 33` long and lanes reach at most row `tlen + 8`; the query/target copies
-    // have `PAD` bytes on both sides of the at most 7-byte overhang; `z` holds `zneed` bytes, the
-    // in-band cell count plus 64 for the last chunk's overhang.
-    unsafe {
-        let table = load_table(&tab);
-        let vminf = vdupq_n_s16(VMINF);
-        let laneid = vld1q_s16([0i16, 1, 2, 3, 4, 5, 6, 7].as_ptr());
-        let (hb, eb, fb) = (sc.hb.as_mut_ptr(), sc.eb.as_mut_ptr(), sc.fb.as_mut_ptr());
-        let (tp, qp, z) = (
-            sc.tpad.as_ptr().add(PAD),
-            sc.qpad.as_ptr().add(PAD),
-            sc.z.as_mut_ptr(),
-        );
-        let (mut hc, mut hd2, mut efc) = (0usize, 1usize, 0usize);
-        for s in 0..sdim {
-            let (hcur, hdiag2) = (hb.add(hc * stride), hb.add(hd2 * stride));
-            let (ecur, ep1) = (eb.add(efc * stride), eb.add((efc ^ 1) * stride));
-            let (fcur, fp1) = (fb.add(efc * stride), fb.add((efc ^ 1) * stride));
-            let si = s as isize;
-            let i_lo = (si - (qlen as isize - 1))
-                .max((si - w as isize + 1) >> 1)
-                .max(0) as usize;
-            let i_hi = (s.min((s + w) >> 1)).min(tlen - 1);
-            sc.zoff[s] = roff;
-            sc.zis[s] = i_lo;
-            let zbase = roff;
-            if i_hi >= i_lo {
-                roff += i_hi - i_lo + 1;
-            }
-            let mut i0 = i_lo;
-            while i0 <= i_hi {
-                let (hdiag, e, f);
-                if i0 > i_lo && i0 + 7 < i_hi {
-                    hdiag = vld1q_s16(hdiag2.add(i0));
-                    e = vld1q_s16(ep1.add(i0));
-                    f = vld1q_s16(fp1.add(i0 + 1));
-                } else if i0 > 0 && s - i0 > 7 {
-                    // Band-edge chunk (LEMMA 8b): no lane on row 0 or column 0; only the lane on the
-                    // band's lower edge loses E and the one on its upper edge loses F.
-                    hdiag = vld1q_s16(hdiag2.add(i0));
-                    let (mut ev, mut fv) = (vld1q_s16(ep1.add(i0)), vld1q_s16(fp1.add(i0 + 1)));
-                    if (s + w) & 1 == 0 {
-                        let el = (((s as isize - w as isize) / 2) - i0 as isize) as i16;
-                        let fl = (((s + w) / 2) as isize - i0 as isize) as i16;
-                        ev = vbslq_s16(vceqq_s16(laneid, vdupq_n_s16(el)), vminf, ev);
-                        fv = vbslq_s16(vceqq_s16(laneid, vdupq_n_s16(fl)), vminf, fv);
-                    }
-                    e = ev;
-                    f = fv;
-                } else {
-                    let iv = vaddq_s16(vdupq_n_s16(i0 as i16), laneid);
-                    let jv = vsubq_s16(vdupq_n_s16((s - i0) as i16), laneid);
-                    let beg = vmaxq_s16(vdupq_n_s16(0), vsubq_s16(iv, vdupq_n_s16(w16)));
-                    let mut hd = vld1q_s16(hdiag2.add(i0));
-                    let i0m = vceqq_s16(iv, vdupq_n_s16(0));
-                    let j0m = vceqq_s16(jv, vdupq_n_s16(0));
-                    let hi0 = vbslq_s16(
-                        j0m,
-                        vdupq_n_s16(0),
-                        vsubq_s16(
-                            vdupq_n_s16(-o_ins as i16),
-                            vmulq_s16(vdupq_n_s16(e_ins as i16), jv),
-                        ),
-                    );
-                    let hj0 = vsubq_s16(
-                        vdupq_n_s16(-o_del as i16),
-                        vmulq_s16(vdupq_n_s16(e_del as i16), iv),
-                    );
-                    hd = vbslq_s16(j0m, hj0, hd);
-                    hd = vbslq_s16(i0m, hi0, hd);
-                    hdiag = hd;
-                    let begm1 = vmaxq_s16(vdupq_n_s16(0), vsubq_s16(iv, vdupq_n_s16(w16 + 1)));
-                    let endm1 = vminq_s16(vdupq_n_s16(q16), vaddq_s16(iv, vdupq_n_s16(w16)));
-                    let evalid = vandq_u16(
-                        vcgeq_s16(iv, vdupq_n_s16(1)),
-                        vandq_u16(vcgeq_s16(jv, begm1), vcltq_s16(jv, endm1)),
-                    );
-                    e = vbslq_s16(evalid, vld1q_s16(ep1.add(i0)), vminf);
-                    f = vbslq_s16(vceqq_s16(jv, beg), vminf, vld1q_s16(fp1.add(i0 + 1)));
-                }
-                // Score index t*5 + q per byte lane; lane l reads query column s - i0 - l.
-                let sv = score8(&table, tp.add(i0), qp.offset(s as isize - i0 as isize - 7));
-                let mm = vaddq_s16(hdiag, sv);
-                let h_me = vmaxq_s16(mm, e);
-                let h = vmaxq_s16(h_me, f);
-                let t1 = vsubq_s16(mm, vdupq_n_s16(oe_del as i16));
-                let em = vsubq_s16(e, vdupq_n_s16(e_del as i16));
-                let t2 = vsubq_s16(mm, vdupq_n_s16(oe_ins as i16));
-                let fm = vsubq_s16(f, vdupq_n_s16(e_ins as i16));
-                vst1q_s16(hcur.add(i0 + 1), h);
-                vst1q_s16(ecur.add(i0 + 1), vmaxq_s16(em, t1));
-                vst1q_s16(fcur.add(i0 + 1), vmaxq_s16(fm, t2));
-                let mut d = vbslq_s16(vcgeq_s16(mm, e), vdupq_n_s16(0), vdupq_n_s16(1));
-                d = vbslq_s16(vcgeq_s16(h_me, f), d, vdupq_n_s16(2));
-                d = vorrq_s16(
-                    d,
-                    vbslq_s16(vcgtq_s16(em, t1), vdupq_n_s16(1 << 2), vdupq_n_s16(0)),
-                );
-                d = vorrq_s16(
-                    d,
-                    vbslq_s16(vcgtq_s16(fm, t2), vdupq_n_s16(2 << 4), vdupq_n_s16(0)),
-                );
-                store_dirs(z.add(zbase + (i0 - i_lo)), d);
-                i0 += 8;
-            }
-            // The terminal column (LEMMA 9): in band on this diagonal iff its row is `i_lo`.
-            if s + 1 == i_lo + qlen && i_lo <= i_hi {
-                score = i32::from(*hcur.add(i_lo + 1));
-            }
-            hc = if hc == 2 { 0 } else { hc + 1 };
-            hd2 = if hd2 == 2 { 0 } else { hd2 + 1 };
-            efc ^= 1;
-        }
-    }
-    // Traceback (LEMMA 10): the scalar's walk over the same bytes, diagonal-major.
+    #[cfg(not(target_arch = "x86_64"))]
+    let score = {
+        let _ = wide;
+        fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w)
+    };
+    (score, traceback(sc, qlen, tlen, w))
+}
+
+/// The traceback (LEMMA 10): the scalar's walk over the direction bytes [`wave_fill`] stored,
+/// diagonal-major. Independent of the lane width.
+fn traceback(sc: &Scratch, qlen: usize, tlen: usize, w: usize) -> Vec<u32> {
     let mut cigar: Vec<u32> = Vec::new();
     let mut i = tlen as i64 - 1;
     let mut k = (tlen as i64 + w as i64).min(qlen as i64) - 1;
@@ -389,28 +550,37 @@ unsafe fn wave16(
         which = (d >> (which << 1)) & 3;
         match which {
             0 => {
-                super::sw::push_cigar(&mut cigar, 0, 1);
+                crate::sw::push_cigar(&mut cigar, 0, 1);
                 i -= 1;
                 k -= 1;
             }
             1 => {
-                super::sw::push_cigar(&mut cigar, 2, 1);
+                crate::sw::push_cigar(&mut cigar, 2, 1);
                 i -= 1;
             }
             _ => {
-                super::sw::push_cigar(&mut cigar, 1, 1);
+                crate::sw::push_cigar(&mut cigar, 1, 1);
                 k -= 1;
             }
         }
     }
     if i >= 0 {
-        super::sw::push_cigar(&mut cigar, 2, (i + 1) as u32);
+        crate::sw::push_cigar(&mut cigar, 2, (i + 1) as u32);
     }
     if k >= 0 {
-        super::sw::push_cigar(&mut cigar, 1, (k + 1) as u32);
+        crate::sw::push_cigar(&mut cigar, 1, (k + 1) as u32);
     }
     cigar.reverse();
-    (score, cigar)
+    cigar
+}
+
+/// Whether the 16-lane kernel can run here (only x86_64 has one).
+#[cfg(test)]
+fn wide_isa_ok() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    false
 }
 
 #[cfg(test)]
@@ -493,24 +663,30 @@ mod tests {
             if !super::isa_ok() {
                 return;
             }
-            // SAFETY: `isa_ok` checked the ISA.
-            let wave = super::SCRATCH.with(|s| unsafe {
-                super::wave16(
-                    &mut s.borrow_mut(),
-                    &query,
-                    &target,
-                    &mat,
-                    o_del,
-                    e_del,
-                    o_ins,
-                    e_ins,
-                    w as usize,
-                )
-            });
             let scalar = crate::sw::ksw_global2_scalar(
                 &query, &target, 5, &mat, o_del, e_del, o_ins, e_ins, w,
             );
-            assert_eq!(wave, scalar, "case {case}: qlen {qlen} tlen {tlen} w {w}");
+            for wide in [false, super::wide_isa_ok()] {
+                // SAFETY: `isa_ok` checked SSE4.1, `wide_isa_ok` AVX2.
+                let wave = super::SCRATCH.with(|s| unsafe {
+                    super::wave16(
+                        &mut s.borrow_mut(),
+                        &query,
+                        &target,
+                        &mat,
+                        o_del,
+                        e_del,
+                        o_ins,
+                        e_ins,
+                        w as usize,
+                        wide,
+                    )
+                });
+                assert_eq!(
+                    wave, scalar,
+                    "case {case}: qlen {qlen} tlen {tlen} w {w} wide {wide}"
+                );
+            }
             checked += 1;
         }
         assert!(checked > 20000, "only {checked} cases reached the kernel");
