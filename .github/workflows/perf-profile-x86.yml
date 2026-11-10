@@ -43,6 +43,10 @@ on:
         description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4"
         default: ""
         required: false
+      icount:
+        description: "Instead of the profile, count each function's x86 instructions under callgrind (read_pairs 50000)"
+        default: "false"
+        required: false
 
 permissions:
   contents: read
@@ -53,6 +57,7 @@ env:
 
 jobs:
   profile:
+    if: github.event.inputs.icount != 'true'
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 90
     steps:
@@ -373,4 +378,91 @@ jobs:
             ok="identical"; [ "$md5" = "$ref_md5" ] || ok="OUTPUT CHANGED"
             awk -v a="$arm" -v t="$t" -v c="$c" -v o="$ok" \
               'BEGIN{printf "%-22s %6.2fs   control %6.2fs   %+5.1f%%   %s\n", a, t, c, (c/t-1)*100, o}'
+          done
+
+  # The x86 runners expose no PMU, so the profile can only compare cpu-clock samples: where the
+  # time goes, not how much work each side does there. Callgrind counts every x86 instruction each
+  # function retires, exactly and independent of the host. Valgrind hides AVX-512, so both sides run
+  # their AVX2 kernels.
+  icount:
+    if: github.event.inputs.icount == 'true'
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install valgrind
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq valgrind libc6-dbg
+          valgrind --version
+
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
+      - name: Install bwa-mem2 + bwa-mem3 + wgsim (bioconda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
+          environment-name: bench
+          condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem2
+            bwa-mem3=0.16.0
+            wgsim
+          init-shell: bash
+
+      - name: Build ours at the tier we ship
+        run: |
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C target-cpu=x86-64-v3" \
+            cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-icount
+          cp target-icount/release/bwa-mem4 ./mem4-v3
+
+      - name: Reference, index and reads
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          sed -i '1s/.*/>chr21/' chr21.fa
+          bwa-mem2 index chr21.fa
+          wgsim -S 11 -N "${{ github.event.inputs.read_pairs || '50000' }}" -1 150 -2 150 chr21.fa sim1.fq sim2.fq > /dev/null
+
+      - name: Count both binaries
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          cd work
+          # One thread, and the lockstep width the CI hosts' probe picks: the probe times loads,
+          # which under valgrind would pick a width no real run uses.
+          export BWA4_LOCKSTEP_N=8
+          cg="valgrind --tool=callgrind --dump-instr=no --collect-jumps=no"
+          $cg --callgrind-out-file=ours.cg ../mem4-v3 mem -t 1 chr21.fa sim1.fq sim2.fq 2>ours.err >ours.sam \
+            || { tail -40 ours.err; exit 1; }
+          $cg --callgrind-out-file=fork.cg bwa-mem3 mem --compat=bwa-mem2 -t 1 chr21.fa sim1.fq sim2.fq 2>fork.err >fork.sam \
+            || { tail -40 fork.err; exit 1; }
+          grep -v '^@PG' ours.sam | md5sum > ours.md5; grep -v '^@PG' fork.sam | md5sum > fork.md5
+          echo "===== output md5: ours $(cut -c1-32 ours.md5) fork $(cut -c1-32 fork.md5) $(cmp -s ours.md5 fork.md5 && echo identical || echo DIFFER) ====="
+          for arm in ours fork; do
+            echo "===== $arm: instructions by function (self) ====="
+            callgrind_annotate --threshold=99.5 "$arm.cg" | grep -E '^ *[0-9,]+ ' | head -150
           done
