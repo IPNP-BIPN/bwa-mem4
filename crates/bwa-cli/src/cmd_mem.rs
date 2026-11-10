@@ -2443,7 +2443,16 @@ fn batched_regs(
     // per-worker share. Scheduling only -- the per-read regions do not depend on the chunk size.
     const INFLIGHT_READS: usize = 16384; // total reads' intermediates resident at once, all workers
     const MIN_CHUNK: usize = 512; // lockstep floor: enough reads in flight to hide FM latency
-    let budget_chunk = (INFLIGHT_READS / worker_count).max(MIN_CHUNK);
+    // shortcut: `BWA4_INFLIGHT` overrides the budget for a same-host CI A/B; delete once settled.
+    static INFLIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let inflight = *INFLIGHT.get_or_init(|| {
+        std::env::var("BWA4_INFLIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(INFLIGHT_READS)
+    });
+    let budget_chunk = (inflight / worker_count).max(MIN_CHUNK);
     let reads_per_chunk = codes.len().div_ceil(worker_count).min(budget_chunk).max(1);
     crate::stage_time::barrier::region(crate::stage_time::Stage::Align, || {
         codes
