@@ -1020,7 +1020,7 @@ fn chain_seeds(
             pool.push((idx as u32, seed));
             n_seeds.push(1);
             if flat {
-                keys.insert(rank, (rbeg as u64) << FLAT_CI_BITS | idx as u64);
+                insert_inline(&mut keys, rank, (rbeg as u64) << FLAT_CI_BITS | idx as u64);
             } else {
                 // bwa keys chains by `pos` in a kbtree, which *permits duplicates*: when several
                 // chains share a pos, `kb_intervalp`'s lower_bound returns the first one inserted
@@ -1040,6 +1040,31 @@ fn chain_seeds(
     KEYS.set(keys);
     POOL.set((pool, n_seeds));
     Some(order)
+}
+
+/// `v.insert(at, x)`, a short tail shifted in place 16 bytes a step from the end: `Vec::insert`
+/// calls libc `memmove` even for a tail of a few keys, and on x86 that call was 0.6% of the run.
+/// A long tail (a repeat's hundreds of chains) still goes to `memmove`.
+fn insert_inline(v: &mut Vec<u64>, at: usize, x: u64) {
+    if v.len() - at > 16 {
+        v.insert(at, x);
+        return;
+    }
+    v.push(x);
+    let p = v.as_mut_ptr();
+    let mut j = v.len() - 1;
+    // SAFETY: `at <= j < v.len()`, and every access is inside `at..=j`.
+    unsafe {
+        while j >= at + 2 {
+            let pair = p.add(j - 2).cast::<[u64; 2]>().read_unaligned();
+            p.add(j - 1).cast::<[u64; 2]>().write_unaligned(pair);
+            j -= 2;
+        }
+        if j > at {
+            *p.add(j) = *p.add(j - 1);
+        }
+        *p.add(at) = x;
+    }
 }
 
 thread_local! {
@@ -1913,6 +1938,20 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    /// `insert_inline` is `Vec::insert` for every position and length, odd tails included.
+    #[test]
+    fn insert_inline_matches_vec_insert() {
+        for len in 0..40u64 {
+            for at in 0..=len as usize {
+                let mut a: Vec<u64> = (0..len).collect();
+                let mut b = a.clone();
+                a.insert(at, 99);
+                super::insert_inline(&mut b, at, 99);
+                assert_eq!(a, b, "len {len} at {at}");
+            }
+        }
+    }
+
     use super::*;
     use bwa_index::BntSeq;
     use std::path::Path;
