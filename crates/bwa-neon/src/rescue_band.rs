@@ -90,6 +90,10 @@ struct Job {
 const OVH: i64 = 8;
 /// More components than this at `minsc`: keep the hull.
 const COMP_CAP: usize = 64;
+/// Rows of H the band kernels keep: a row's `qe` scan waits until the row is about to be
+/// overwritten, and is skipped for the lanes that improved again by then (most of them: a
+/// mismatch costs a run about six rows). A multiple of 4, under 256.
+const RING: usize = 16;
 
 /// Per-thread banding state, reused across kernel calls.
 #[derive(Default)]
@@ -477,6 +481,7 @@ impl Batch {
                     o: b.r0 - b.dlo,
                     w: b.dhi - b.dlo + 1,
                     target: 0,
+                    thr: minsc.clamp(0, 255) as u8,
                 };
                 wmax = wmax.max(lanes[l].w);
                 omax = omax.max(lanes[l].o);
@@ -602,6 +607,7 @@ impl Batch {
                     o: -j.band.dlo,
                     w: j.band.dhi - j.band.dlo + 1,
                     target: s as u8,
+                    thr: s as u8,
                 };
                 wmax = wmax.max(lanes[l].w);
                 omax = omax.max(lanes[l].o);
@@ -839,6 +845,7 @@ fn write(p: &Parent, o: &mut KswAlignResult) {
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod neon {
+    use super::RING;
     use std::arch::aarch64::*;
 
     pub(super) const L: usize = 16;
@@ -861,6 +868,9 @@ pub(crate) mod neon {
         /// Early exit (the reverse pass): the group stops once every lane's best score has
         /// reached its target; 0 means none.
         pub target: u8,
+        /// `qe` is only read off H while the lane's best reaches this: a lower result is dropped
+        /// by the caller (forward pass: `minsc`; reverse pass: `target`).
+        pub thr: u8,
     }
 
     /// Kernel scratch and per-lane outputs: the best score, its first row (band-relative) and
@@ -870,10 +880,8 @@ pub(crate) mod neon {
         st: Vec<u8>,
         a: Vec<u8>,
         refv: Vec<u8>,
+        /// H of the last [`RING`] rows, row `x` in slot `x % RING`.
         h: Vec<u8>,
-        /// H of rows `r`, `r + 1`, `r + 2` of a four-row step (row `r + 3` is in `h`), kept for
-        /// the `qe` scan.
-        hr: Vec<u8>,
         e: Vec<u8>,
         r: Vec<u8>,
         rl: Vec<u8>,
@@ -1021,12 +1029,11 @@ pub(crate) mod neon {
             // H and E carry 3 slack vectors before slot 0 and a few past `w - 1`: the skewed body's
             // masked cells read and write there (see the row loop).
             let hs = w + 7;
-            fit(&mut self.h, 2 * hs * L);
-            fit(&mut self.hr, 3 * hs * L);
+            fit(&mut self.h, RING * hs * L);
             fit(&mut self.e, (w + 9) * L);
             fit(&mut self.r, nrp * L);
-            // `hr` needs no clearing: the qe scan reads only slots its four-row step wrote.
-            self.h[..2 * hs * L].fill(0);
+            // All of it: a row reads the row above's cells past that row's own top, never written.
+            self.h[..RING * hs * L].fill(0);
             self.e[..(w + 9) * L].fill(0);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
@@ -1100,12 +1107,9 @@ pub(crate) mod neon {
             let a = self.a.as_ptr();
             let e = self.e.as_mut_ptr().add(3 * L);
             let rout = self.r.as_mut_ptr();
-            let (mut hc, mut hp) = (
-                self.h.as_mut_ptr().add(3 * L),
-                self.h.as_mut_ptr().add((hs + 3) * L),
-            );
-            let hr0 = self.hr.as_mut_ptr().add(3 * L);
-            let (hr1, hr2) = (hr0.add(hs * L), hr0.add(2 * hs * L));
+            let h0p = self.h.as_mut_ptr().add(3 * L);
+            // Row `x`'s H (`x` = -1: slot RING - 1, still zero).
+            let slot = |x: usize| h0p.add(x % RING * hs * L);
             let li = L as isize;
             let mut gmax = zero;
             // `te` as its low and high bytes per lane, written with the row on every improving
@@ -1114,14 +1118,18 @@ pub(crate) mod neon {
             let mut qev = zero;
             let wm1 = w as i32 - 1;
             // `qe` is not tracked per cell. A lane's (te, qe) is that of its last improving row, so
-            // `qe` is read off H only where a run of consecutive improving rows ends (`pend`: the
-            // lanes that improved on the previous row, `prev`: that row's H), a few times per lane:
+            // `qe` is read off H only where a lane's run of improving rows ended and no later row
+            // improved before the ring overwrites it (`pm`: the lanes whose `te` row is unread):
             // the largest k in the row's computed range whose H equals gmax. That is the cell the
             // per-cell tracking picked (the first, in k-descending order, reaching the live row
             // max): cells above a lane's range are j < 0 and hold 0 < gmax, and its dead
             // (j >= quanta) cells all lie below its live ones, so the largest match is live.
-            let mut pend = zero;
-            let mut prev: (*const u8, i32) = (std::ptr::null(), -1);
+            let mut pm = zero;
+            let mut th = [0u8; L];
+            for (l, lane) in lanes.iter().enumerate() {
+                th[l] = lane.thr;
+            }
+            let thrv = vld1q_u8(th.as_ptr());
             let qe_scan =
                 |buf: *const u8, row: i32, msk: uint8x16_t, gmax: uint8x16_t, qev: uint8x16_t| {
                     let (kl, kh) = (0.max(row + ominq), wm1.min(row + omax));
@@ -1134,6 +1142,24 @@ pub(crate) mod neon {
                     }
                     vbslq_u8(msk, best, qev)
                 };
+            // Read `qe` off rows `x0..x0 + n` (`n <= RING`) for the lanes whose `te` is one of
+            // them. Every earlier row was read the same way, so a `pm` lane's `te` is at least
+            // `x0` and below `x0 + 256`: its low byte names it.
+            macro_rules! due {
+                ($x0:expr, $n:expr) => {{
+                    let x0: usize = $x0;
+                    let off = vsubq_u8(te_lo, vdupq_n_u8(x0 as u8));
+                    if vmaxvq_u8(vandq_u8(vcltq_u8(off, vdupq_n_u8($n as u8)), pm)) != 0 {
+                        for x in x0..x0 + $n {
+                            let m = vandq_u8(vceqq_u8(te_lo, vdupq_n_u8(x as u8)), pm);
+                            if vmaxvq_u8(m) != 0 {
+                                qev = qe_scan(slot(x), x as i32, m, gmax, qev);
+                                pm = vbicq_u8(pm, m);
+                            }
+                        }
+                    }
+                }};
+            }
 
             // One cell: `d` the diagonal H, `ein` the E carry, `f` the row's F carry (updated),
             // `top` the validity mask of a cell past `w - 1` (`None`: valid), `LIVE` whether a lane
@@ -1172,23 +1198,17 @@ pub(crate) mod neon {
                     (h, eout)
                 }};
             }
-            // Row bookkeeping: publish the row max, update the lanes' best, close the runs of
-            // improving rows that ended on the previous row. `$buf` holds this row's H.
+            // Row bookkeeping: publish the row max, update the lanes' best.
             macro_rules! finish_row {
-                ($row:expr, $rmax:expr, $rref:expr, $buf:expr) => {{
+                ($row:expr, $rmax:expr, $rref:expr) => {{
                     vst1q_u8(rout.add($row * L), $rmax);
                     let imp = vandq_u8(vcgtq_u8($rmax, gmax), vcltq_u8($rref, rpadv));
-                    let flush = vbicq_u8(pend, imp);
-                    if vmaxvq_u8(flush) != 0 {
-                        qev = qe_scan(prev.0, prev.1, flush, gmax, qev);
-                    }
                     gmax = vbslq_u8(imp, $rmax, gmax);
                     te_lo = vbslq_u8(imp, vdupq_n_u8($row as u8), te_lo);
                     if $row >= 256 {
                         te_hi = vbslq_u8(imp, vdupq_n_u8(($row >> 8) as u8), te_hi);
                     }
-                    pend = imp;
-                    prev = ($buf as *const u8, $row as i32);
+                    pm = vorrq_u8(pm, vandq_u8(imp, vcgeq_u8($rmax, thrv)));
                 }};
             }
 
@@ -1199,7 +1219,13 @@ pub(crate) mod neon {
                 let klo = 0.max(ri + ominq);
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
+                let hp = slot(r + RING - 1);
                 if r + 3 < nr {
+                    // Rows `r..r + 4` take the slots of `r - RING..`: read those first.
+                    if r >= RING {
+                        due!(r - RING, 4);
+                    }
+                    let (hr0, hr1, hr2, hc) = (slot(r), slot(r + 1), slot(r + 2), slot(r + 3));
                     // Four rows per step, skewed: `(r, k)`, `(r+1, k+1)`, `(r+2, k+2)`, `(r+3, k+3)`
                     // share the query position `p = r + c - k`; each row's diagonal and E carry come
                     // from the row above's previous step and this step, in registers. Cells past
@@ -1258,15 +1284,19 @@ pub(crate) mod neon {
                     while k >= kend {
                         step4!(true, true);
                     }
-                    finish_row!(r, rmax0, rref0, hr0);
-                    finish_row!(r + 1, rmax1, rref1, hr1);
-                    finish_row!(r + 2, rmax2, rref2, hr2);
-                    finish_row!(r + 3, rmax3, rref3, hc);
+                    finish_row!(r, rmax0, rref0);
+                    finish_row!(r + 1, rmax1, rref1);
+                    finish_row!(r + 2, rmax2, rref2);
+                    finish_row!(r + 3, rmax3, rref3);
                     r += 4;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
                     }
                 } else {
+                    if r >= RING {
+                        due!(r - RING, 1);
+                    }
+                    let hc = slot(r);
                     self.cells += (khi - klo + 1).max(0) as u64;
                     let rref = vld1q_u8(self.refv.as_ptr().add(r * L));
                     let (mut f, mut rmax) = (zero, zero);
@@ -1288,17 +1318,15 @@ pub(crate) mod neon {
                     while k >= klo {
                         step1!(true);
                     }
-                    finish_row!(r, rmax, rref, hc);
+                    finish_row!(r, rmax, rref);
                     r += 1;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
                     }
                 }
-                std::mem::swap(&mut hc, &mut hp);
             }
-            if vmaxvq_u8(pend) != 0 {
-                qev = qe_scan(prev.0, prev.1, pend, gmax, qev);
-            }
+            let x0 = r.saturating_sub(RING);
+            due!(x0, r - x0);
             vst1q_u8(self.gmax.as_mut_ptr(), gmax);
             let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
             vst1q_u8(lo.as_mut_ptr(), te_lo);
@@ -1332,6 +1360,7 @@ pub(crate) mod neon {
 /// the same lane.
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
+    use super::RING;
     use crate::batched::{x86_row::t16, ABuf};
     use std::arch::x86_64::*;
 
@@ -1353,6 +1382,9 @@ mod avx2 {
         /// Early exit (the reverse pass): the group stops once every lane's best score has
         /// reached its target; 0 means none.
         pub target: u8,
+        /// `qe` is only read off H while the lane's best reaches this: a lower result is dropped
+        /// by the caller (forward pass: `minsc`; reverse pass: `target`).
+        pub thr: u8,
     }
 
     /// As the NEON kernel's `Work`.
@@ -1361,9 +1393,8 @@ mod avx2 {
         st: Vec<u8>,
         a: ABuf<u8>,
         refv: ABuf<u8>,
+        /// H of the last [`RING`] rows, row `x` in slot `x % RING`.
         h: ABuf<u8>,
-        /// H of row `r` of a two-row step (row `r + 1` is in `h`), kept for the `qe` scan.
-        hr: ABuf<u8>,
         e: ABuf<u8>,
         r: ABuf<u8>,
         rl: Vec<u8>,
@@ -1421,12 +1452,11 @@ mod avx2 {
             fit(&mut self.st, 16 * stride);
             self.a.fit(npp * L, 0);
             self.refv.fit(nrp * L, 0);
-            self.h.fit(2 * hs * L, HZ);
-            // `hr` needs no clearing: the qe scan reads only slots its two-row step wrote.
-            self.hr.fit(hs * L, HZ);
+            self.h.fit(RING * hs * L, HZ);
             self.e.fit((w + 9) * L, HZ);
             self.r.fit(nrp * L, 0);
-            self.h[..2 * hs * L].fill(HZ);
+            // All of it: a row reads the row above's cells past that row's own top, never written.
+            self.h[..RING * hs * L].fill(HZ);
             self.e[..(w + 9) * L].fill(HZ);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
@@ -1517,20 +1547,22 @@ mod avx2 {
             let a = self.a.as_ptr();
             let e = self.e.as_mut_ptr().add(3 * L);
             let rout = self.r.as_mut_ptr();
-            let (mut hc, mut hp) = (
-                self.h.as_mut_ptr().add(3 * L),
-                self.h.as_mut_ptr().add((hs + 3) * L),
-            );
-            let hr0 = self.hr.as_mut_ptr().add(3 * L);
+            let h0p = self.h.as_mut_ptr().add(3 * L);
+            // Row `x`'s H (`x` = -1: slot RING - 1, still zero).
+            let slot = |x: usize| h0p.add(x % RING * hs * L);
             let li = L as isize;
             let mut gmax = hz;
             // `te` as its low and high bytes per lane, written with the row on every improving
             // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
             let (mut te_lo, mut te_hi, mut qev) = (nil, nil, nil);
             let wm1 = w as i32 - 1;
-            // `qe` from H where a run of improving rows ends, as the NEON kernel's `qe_scan`.
-            let mut pend = nil;
-            let mut prev: (*const u8, i32) = (std::ptr::null(), -1);
+            // `qe` from H as the NEON kernel's `qe_scan` and `due`; `thrv` in the H domain.
+            let mut pm = nil;
+            let mut th = [HZ; L];
+            for (l, lane) in lanes.iter().enumerate() {
+                th[l] = lane.thr ^ HZ;
+            }
+            let thrv = _mm256_loadu_si256(th.as_ptr() as *const __m256i);
 
             macro_rules! ld {
                 ($p:expr) => {
@@ -1591,24 +1623,47 @@ mod avx2 {
             }
             // Row bookkeeping: publish the row max, update the lanes' best, close the runs of
             // improving rows that ended on the previous row. `$buf` holds this row's H.
+            // Rows `x0..x0 + n` (`n <= RING`), as the NEON kernel's `due`.
+            macro_rules! due {
+                ($x0:expr, $n:expr) => {{
+                    let (x0, n): (usize, usize) = ($x0, $n);
+                    // `off < n` unsigned, as `min(off, n - 1) == off`.
+                    let off = _mm256_sub_epi8(te_lo, _mm256_set1_epi8(x0 as i8));
+                    let near = _mm256_cmpeq_epi8(
+                        _mm256_min_epu8(off, _mm256_set1_epi8(n.max(1) as i8 - 1)),
+                        off,
+                    );
+                    if n > 0 && _mm256_movemask_epi8(_mm256_and_si256(near, pm)) != 0 {
+                        for x in x0..x0 + n {
+                            let m = _mm256_and_si256(
+                                _mm256_cmpeq_epi8(te_lo, _mm256_set1_epi8(x as i8)),
+                                pm,
+                            );
+                            if _mm256_movemask_epi8(m) != 0 {
+                                qe_scan!(slot(x), x as i32, m);
+                                pm = _mm256_andnot_si256(m, pm);
+                            }
+                        }
+                    }
+                }};
+            }
+            // Row bookkeeping: publish the row max, update the lanes' best.
             macro_rules! finish_row {
-                ($row:expr, $rmax:expr, $rref:expr, $buf:expr) => {{
+                ($row:expr, $rmax:expr, $rref:expr) => {{
                     st!(rout.add($row * L), _mm256_xor_si256($rmax, hz));
                     let imp = _mm256_andnot_si256(
                         _mm256_cmpgt_epi8(nil, $rref),
                         _mm256_cmpgt_epi8($rmax, gmax),
                     );
-                    let flush = _mm256_andnot_si256(imp, pend);
-                    if _mm256_movemask_epi8(flush) != 0 {
-                        qe_scan!(prev.0, prev.1, flush);
-                    }
                     gmax = _mm256_blendv_epi8(gmax, $rmax, imp);
                     te_lo = _mm256_blendv_epi8(te_lo, _mm256_set1_epi8($row as i8), imp);
                     if $row >= 256 {
                         te_hi = _mm256_blendv_epi8(te_hi, _mm256_set1_epi8(($row >> 8) as i8), imp);
                     }
-                    pend = imp;
-                    prev = ($buf as *const u8, $row as i32);
+                    pm = _mm256_or_si256(
+                        pm,
+                        _mm256_andnot_si256(_mm256_cmpgt_epi8(thrv, $rmax), imp),
+                    );
                 }};
             }
 
@@ -1619,7 +1674,13 @@ mod avx2 {
                 let klo = 0.max(ri + ominq);
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
+                let hp = slot(r + RING - 1);
                 if r + 1 < nr {
+                    // Rows `r`, `r + 1` take the slots of `r - RING..`: read those first.
+                    if r >= RING {
+                        due!(r - RING, 2);
+                    }
+                    let (hr0, hc) = (slot(r), slot(r + 1));
                     self.cells += 2 * (khi - klo + 1).max(0) as u64;
                     let rref0 = ld!(self.refv.as_ptr().add(r * L));
                     let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
@@ -1666,10 +1727,14 @@ mod avx2 {
                     while k >= kend {
                         step2!(true, true);
                     }
-                    finish_row!(r, rmax0, rref0, hr0);
-                    finish_row!(r + 1, rmax1, rref1, hc);
+                    finish_row!(r, rmax0, rref0);
+                    finish_row!(r + 1, rmax1, rref1);
                     r += 2;
                 } else {
+                    if r >= RING {
+                        due!(r - RING, 1);
+                    }
+                    let hc = slot(r);
                     self.cells += (khi - klo + 1).max(0) as u64;
                     let rref = ld!(self.refv.as_ptr().add(r * L));
                     let (mut f, mut rmax) = (hz, hz);
@@ -1696,17 +1761,15 @@ mod avx2 {
                     while k >= klo {
                         step1!(true);
                     }
-                    finish_row!(r, rmax, rref, hc);
+                    finish_row!(r, rmax, rref);
                     r += 1;
                 }
                 if early && _mm256_movemask_epi8(_mm256_cmpgt_epi8(tgt, gmax)) == 0 {
                     break;
                 }
-                std::mem::swap(&mut hc, &mut hp);
             }
-            if _mm256_movemask_epi8(pend) != 0 {
-                qe_scan!(prev.0, prev.1, pend);
-            }
+            let x0 = r.saturating_sub(RING);
+            due!(x0, r - x0);
             st!(self.gmax.as_mut_ptr(), _mm256_xor_si256(gmax, hz));
             let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
             st!(lo.as_mut_ptr(), te_lo);
@@ -1742,6 +1805,7 @@ mod avx2 {
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use super::avx2::HZ;
+    use super::RING;
     use crate::batched::{x86_row::t16, ABuf};
     use std::arch::x86_64::*;
 
@@ -1757,9 +1821,8 @@ mod avx512 {
         st: Vec<u8>,
         a: ABuf<u8>,
         refv: ABuf<u8>,
+        /// H of the last [`RING`] rows, row `x` in slot `x % RING`.
         h: ABuf<u8>,
-        /// H of row `r` of a two-row step (row `r + 1` is in `h`), kept for the `qe` scan.
-        hr: ABuf<u8>,
         e: ABuf<u8>,
         r: ABuf<u8>,
         rl: Vec<u8>,
@@ -1777,7 +1840,6 @@ mod avx512 {
                 a: ABuf::new(),
                 refv: ABuf::new(),
                 h: ABuf::new(),
-                hr: ABuf::new(),
                 e: ABuf::new(),
                 r: ABuf::new(),
                 rl: Vec::new(),
@@ -1837,12 +1899,11 @@ mod avx512 {
             fit(&mut self.st, 16 * stride);
             self.a.fit(npp * L, 0);
             self.refv.fit(nrp * L, 0);
-            self.h.fit(2 * hs * L, HZ);
-            // `hr` needs no clearing: the qe scan reads only slots its two-row step wrote.
-            self.hr.fit(hs * L, HZ);
+            self.h.fit(RING * hs * L, HZ);
             self.e.fit((w + 9) * L, HZ);
             self.r.fit(nrp * L, 0);
-            self.h[..2 * hs * L].fill(HZ);
+            // All of it: a row reads the row above's cells past that row's own top, never written.
+            self.h[..RING * hs * L].fill(HZ);
             self.e[..(w + 9) * L].fill(HZ);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
@@ -1931,20 +1992,22 @@ mod avx512 {
             let a = self.a.as_ptr();
             let e = self.e.as_mut_ptr().add(3 * L);
             let rout = self.r.as_mut_ptr();
-            let (mut hc, mut hp) = (
-                self.h.as_mut_ptr().add(3 * L),
-                self.h.as_mut_ptr().add((hs + 3) * L),
-            );
-            let hr0 = self.hr.as_mut_ptr().add(3 * L);
+            let h0p = self.h.as_mut_ptr().add(3 * L);
+            // Row `x`'s H (`x` = -1: slot RING - 1, still zero).
+            let slot = |x: usize| h0p.add(x % RING * hs * L);
             let li = L as isize;
             let mut gmax = hz;
             // `te` as its low and high bytes per lane, written with the row on every improving
             // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
             let (mut te_lo, mut te_hi, mut qev) = (nil, nil, nil);
             let wm1 = w as i32 - 1;
-            // `qe` from H where a run of improving rows ends, as the NEON kernel's `qe_scan`.
-            let mut pend: __mmask64 = 0;
-            let mut prev: (*const u8, i32) = (std::ptr::null(), -1);
+            // `qe` from H as the NEON kernel's `qe_scan` and `due`; `thrv` in the H domain.
+            let mut pm: __mmask64 = 0;
+            let mut th = [HZ; L];
+            for (l, lane) in lanes.iter().enumerate() {
+                th[l] = lane.thr ^ HZ;
+            }
+            let thrv = _mm512_loadu_si512(th.as_ptr() as *const _);
 
             macro_rules! ld {
                 ($p:expr) => {
@@ -2000,23 +2063,36 @@ mod avx512 {
                     (h, eout)
                 }};
             }
+            // Rows `x0..x0 + n` (`n <= RING`), as the NEON kernel's `due`.
+            macro_rules! due {
+                ($x0:expr, $n:expr) => {{
+                    let (x0, n): (usize, usize) = ($x0, $n);
+                    let off = _mm512_sub_epi8(te_lo, _mm512_set1_epi8(x0 as i8));
+                    if _mm512_mask_cmplt_epu8_mask(pm, off, _mm512_set1_epi8(n as i8)) != 0 {
+                        for x in x0..x0 + n {
+                            let m =
+                                _mm512_mask_cmpeq_epi8_mask(pm, te_lo, _mm512_set1_epi8(x as i8));
+                            if m != 0 {
+                                qe_scan!(slot(x), x as i32, m);
+                                pm &= !m;
+                            }
+                        }
+                    }
+                }};
+            }
+            // Row bookkeeping: publish the row max, update the lanes' best.
             macro_rules! finish_row {
-                ($row:expr, $rmax:expr, $rref:expr, $buf:expr) => {{
+                ($row:expr, $rmax:expr, $rref:expr) => {{
                     st!(rout.add($row * L), _mm512_xor_si512($rmax, hz));
                     let imp =
                         _mm512_cmpgt_epi8_mask($rmax, gmax) & _mm512_cmplt_epu8_mask($rref, rpadv);
-                    let flush = pend & !imp;
-                    if flush != 0 {
-                        qe_scan!(prev.0, prev.1, flush);
-                    }
                     gmax = _mm512_mask_mov_epi8(gmax, imp, $rmax);
                     te_lo = _mm512_mask_mov_epi8(te_lo, imp, _mm512_set1_epi8($row as i8));
                     if $row >= 256 {
                         te_hi =
                             _mm512_mask_mov_epi8(te_hi, imp, _mm512_set1_epi8(($row >> 8) as i8));
                     }
-                    pend = imp;
-                    prev = ($buf as *const u8, $row as i32);
+                    pm |= imp & _mm512_cmpge_epi8_mask($rmax, thrv);
                 }};
             }
 
@@ -2027,7 +2103,13 @@ mod avx512 {
                 let klo = 0.max(ri + ominq);
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
+                let hp = slot(r + RING - 1);
                 if r + 1 < nr {
+                    // Rows `r`, `r + 1` take the slots of `r - RING..`: read those first.
+                    if r >= RING {
+                        due!(r - RING, 2);
+                    }
+                    let (hr0, hc) = (slot(r), slot(r + 1));
                     self.cells += 2 * (khi - klo + 1).max(0) as u64;
                     let rref0 = ld!(self.refv.as_ptr().add(r * L));
                     let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
@@ -2073,10 +2155,14 @@ mod avx512 {
                     while k >= kend {
                         step2!(true, true);
                     }
-                    finish_row!(r, rmax0, rref0, hr0);
-                    finish_row!(r + 1, rmax1, rref1, hc);
+                    finish_row!(r, rmax0, rref0);
+                    finish_row!(r + 1, rmax1, rref1);
                     r += 2;
                 } else {
+                    if r >= RING {
+                        due!(r - RING, 1);
+                    }
+                    let hc = slot(r);
                     self.cells += (khi - klo + 1).max(0) as u64;
                     let rref = ld!(self.refv.as_ptr().add(r * L));
                     let (mut f, mut rmax) = (hz, hz);
@@ -2103,17 +2189,15 @@ mod avx512 {
                     while k >= klo {
                         step1!(true);
                     }
-                    finish_row!(r, rmax, rref, hc);
+                    finish_row!(r, rmax, rref);
                     r += 1;
                 }
                 if early && _mm512_cmpge_epi8_mask(gmax, tgt) == u64::MAX {
                     break;
                 }
-                std::mem::swap(&mut hc, &mut hp);
             }
-            if pend != 0 {
-                qe_scan!(prev.0, prev.1, pend);
-            }
+            let x0 = r.saturating_sub(RING);
+            due!(x0, r - x0);
             st!(self.gmax.as_mut_ptr(), _mm512_xor_si512(gmax, hz));
             let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
             st!(lo.as_mut_ptr(), te_lo);
@@ -2424,6 +2508,7 @@ mod tests {
                     o: *o,
                     w: w as i32,
                     target: 0,
+                    thr: (next() % 40) as u8,
                 })
                 .collect();
             let n5 = 33 + next() % 32;
@@ -2438,8 +2523,9 @@ mod tests {
                     let k = l - lo;
                     let msg = format!("round {round} lane {l} w {w}");
                     assert_eq!(w5.gmax[l], w2.gmax[k], "gmax {msg}");
-                    if w2.gmax[k] > 0 {
-                        assert_eq!((w5.te[l], w5.qe[l]), (w2.te[k], w2.qe[k]), "end {msg}");
+                    assert_eq!(w5.te[l], w2.te[k], "te {msg}");
+                    if w2.gmax[k] > 0 && w2.gmax[k] >= lanes[l].thr {
+                        assert_eq!(w5.qe[l], w2.qe[k], "qe {msg}");
                     }
                     let nr = lanes[l].t.len();
                     assert_eq!(w5.lane_rows(l, nr), w2.lane_rows(k, nr), "rows {msg}");
