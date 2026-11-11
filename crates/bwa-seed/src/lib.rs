@@ -934,6 +934,10 @@ impl LsSlot {
                     // the `s < min_intv` exit and the unique-match hand-off can end the run early.
                     let (jdp, code) = (self.jdp, self.jcode);
                     self.jdp = 0;
+                    // `self.smem` through the steps, stored back at each exit: kept in the slot,
+                    // each step read the interval whole just after the last one stored it field by
+                    // field, a failed store forward per step on x86.
+                    let mut cur = self.smem;
                     for d in 2..=jdp {
                         let e = fm.seed_jump(d, code >> (2 * (jdp - d)));
                         let j = self.x + d - 1;
@@ -945,13 +949,14 @@ impl LsSlot {
                             l: e.l,
                             s: e.s,
                         };
-                        self.prev[self.num_prev] = self.smem;
-                        if new_smem.s != self.smem.s {
+                        self.prev[self.num_prev] = cur;
+                        if new_smem.s != cur.s {
                             self.num_prev += 1;
                             // The first backward round reads this candidate's blocks: hinted now, visits ahead.
-                            fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
+                            fm.prefetch_occ(cur.k, cur.k + cur.s);
                         }
                         if new_smem.s < min_intv {
+                            self.smem = cur;
                             if self.bsd_j != usize::MAX {
                                 self.bsd_resolve(codes, j);
                             }
@@ -965,9 +970,10 @@ impl LsSlot {
                         if j >= self.bsd_j {
                             self.bsd_note(j, &new_smem);
                         }
-                        self.smem = new_smem;
+                        cur = new_smem;
                         self.j = j + 1;
                         if new_smem.s == 1 && readlength - self.j >= S1_MIN_REST {
+                            self.smem = cur;
                             self.lf_row = new_smem.k;
                             self.lf_off = 0;
                             self.phase = LsPhase::S1Lf;
@@ -975,8 +981,9 @@ impl LsSlot {
                             return;
                         }
                     }
+                    self.smem = cur;
                     self.phase = LsPhase::Fwd;
-                    fm.prefetch_occ(self.smem.l, self.smem.l + self.smem.s);
+                    fm.prefetch_occ(cur.l, cur.l + cur.s);
                     return;
                 }
                 LsPhase::Fwd => {
