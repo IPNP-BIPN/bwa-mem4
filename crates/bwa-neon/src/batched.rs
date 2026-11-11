@@ -2026,8 +2026,46 @@ fn tight_band_enabled() -> bool {
 
 /// Set by the field-level equivalence gates to pin the full band; see [`tight_band_enabled`].
 /// Sticky by design: gates run concurrently under the test harness, so an unset would race.
+/// It also turns off [`exact_stop_enabled`], which moves the same fields.
 pub(crate) static FULL_BAND_FOR_FIELD_GATES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the SIMD extension kernels retire a lane as soon as no later row can change what the
+/// caller reads (the exact early stop). At the end of row `i`, every later cell scores at most
+/// `B = vmax + max_sc * min(tlen - 1 - i, qlen - beg)`: it descends from a cell of row `i`'s band
+/// `[beg, end)` (row max `vmax`) or, while `beg == 0`, from the virtual column -1 (at most `h0`,
+/// folded into `vmax`), by at most that many diagonal steps worth `max_sc` each, and gaps only
+/// cost. So once `B <= max`, the local result is final (`max` moves on a strict `>`), and once also
+/// `B < gscore`, so are `gscore`/`gtle` (they move on `<=`). If instead `B <= max - end_bonus`, every
+/// to-end score, now or later, is one the caller rejects (`run_side` passes its `pen_clip` as
+/// `end_bonus` and takes the global branch only on `gscore > score - pen_clip`), so it clips with
+/// or without the stop: the window [`tight_band_bound`] already relies on. A lane whose alignment
+/// has ended otherwise runs every remaining target row, since z-drop never fires on a pure
+/// deletion tail: 22% of the rows (10% of the cells) of 100k GIAB pairs come after the stop.
+///
+/// # Returns
+/// True unless `BWA4_NO_EXACT_STOP` is set to anything at all; false under
+/// [`FULL_BAND_FOR_FIELD_GATES`] in tests, unless [`EXACT_STOP_TEST`] says otherwise.
+fn exact_stop_enabled() -> bool {
+    use std::sync::OnceLock;
+    #[cfg(test)]
+    if let Some(on) = EXACT_STOP_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    if cfg!(test) && FULL_BAND_FOR_FIELD_GATES.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_NO_EXACT_STOP").is_none())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's override of [`exact_stop_enabled`]: per thread, so a test can pin it either
+    /// way while the field gates hold the sticky [`FULL_BAND_FOR_FIELD_GATES`].
+    pub(crate) static EXACT_STOP_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Bit position of column `k` in [`block_mismatches`]' mask is `k << BLOCK_SHIFT`: NEON narrows a
 /// byte compare to four bits per column, the other targets to one.
@@ -2378,6 +2416,8 @@ macro_rules! define_sw_kernel {
             let oe_ins = o_ins + e_ins;
             // Best single-cell score in the matrix, used only by `clamp_band`.
             let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
+            // The exact early stop (`exact_stop_enabled`), read once per call.
+            let stop = super::exact_stop_enabled().then_some((max_sc, end_bonus));
 
             // One slot per job, overwritten chunk by chunk before returning.
             let mut out = vec![default_result(); jobs.len()];
@@ -3046,6 +3086,10 @@ macro_rules! define_sw_kernel {
                                     gscore.as_mut_ptr().cast(),
                                     max_off.as_mut_ptr().cast(),
                                     done.as_mut_ptr(),
+                                    beg.as_ptr().cast(),
+                                    tlen32.as_ptr().cast(),
+                                    h0.as_ptr().cast(),
+                                    stop,
                                 )
                             };
                             // Band tightening (`ksw.cpp:519-523`) from the column loop's trackers,
@@ -3135,6 +3179,16 @@ macro_rules! define_sw_kernel {
                                     mx - row_max_l - ((mj_l - mjj) - (i - mi)) * e_ins
                                 };
                                 if drop > zdrop {
+                                    done[l] = true;
+                                    continue;
+                                }
+                            }
+                            // The exact stop (see `exact_stop_enabled`), from the row's own `beg`.
+                            if let Some((sc, eb)) = stop {
+                                let (b, mx) = (i32::from(beg[l]), i32::from(max[l]));
+                                let vmax = if b == 0 { row_max_l.max(i32::from(h0[l])) } else { row_max_l };
+                                let bound = vmax + sc.max(0) * (tlen[l] as i32 - 1 - i).min(qlen_l - b);
+                                if bound <= mx && (bound < i32::from(gscore[l]) || bound <= mx.saturating_sub(eb)) {
                                     done[l] = true;
                                     continue;
                                 }
@@ -3512,6 +3566,10 @@ pub(crate) mod x86_row {
         gscore: *mut i16,
         max_off: *mut i16,
         done: *mut bool,
+        beg: *const i16,
+        tlen: *const i16,
+        h0: *const i16,
+        stop: Option<(i32, i32)>,
     ) -> u64 {
         let iv = _mm256_set1_epi16(i as i16);
         let zero = _mm256_setzero_si256();
@@ -3525,6 +3583,14 @@ pub(crate) mod x86_row {
         let zd = _mm256_set1_epi16(zdrop.clamp(0, 1024) as i16);
         let (c255, c256) = (_mm256_set1_epi16(255), _mm256_set1_epi16(256));
         let zdrop_on = _mm256_set1_epi16(if zdrop > 0 { -1 } else { 0 });
+        // The exact stop's `(max_sc, end_bonus)`, clamped as in `neon_row::epilogue`.
+        let (sc_v, eb_v) = stop.map_or((zero, zero), |(sc, eb)| {
+            (
+                _mm256_set1_epi16(sc.clamp(0, 127) as i16),
+                _mm256_set1_epi16(eb.clamp(0, 1024) as i16),
+            )
+        });
+        let ivp1 = _mm256_set1_epi16(i as i16 + 1);
         let mut live_bits = 0u64;
         for o in (0..N).step_by(16) {
             let a = _mm256_cmpgt_epi16(widen16(active.add(o) as *const u8), zero);
@@ -3538,7 +3604,8 @@ pub(crate) mod x86_row {
                 _mm256_and_si256(a, _mm256_cmpeq_epi16(ld(end.add(o)), ld(qlen.add(o)))),
             );
             st(max_ie.add(o), sel(g_upd, iv, ld(max_ie.add(o))));
-            st(gscore.add(o), sel(g_upd, h1, gs));
+            let gs = sel(g_upd, h1, gs);
+            st(gscore.add(o), gs);
             let improve = _mm256_and_si256(a, _mm256_cmpgt_epi16(rm, mx));
             let off = _mm256_abs_epi16(_mm256_sub_epi16(mj, iv));
             let (di, dj) = (_mm256_sub_epi16(iv, mi), _mm256_sub_epi16(mj, mjj));
@@ -3546,7 +3613,7 @@ pub(crate) mod x86_row {
             let dd = _mm256_mullo_epi16(ad, sel(_mm256_cmpgt_epi16(di, dj), ed, ei));
             let l = _mm256_sub_epi16(_mm256_sub_epi16(mx, rm), zd);
             let drops = _mm256_cmpgt_epi16(l, _mm256_min_epu16(dd, c256));
-            let dead = _mm256_and_si256(
+            let mut dead = _mm256_and_si256(
                 a,
                 _mm256_or_si256(
                     _mm256_cmpeq_epi16(rm, zero),
@@ -3562,7 +3629,28 @@ pub(crate) mod x86_row {
                     mo,
                 ),
             );
-            st(max.add(o), sel(improve, rm, mx));
+            let mx = sel(improve, rm, mx);
+            if stop.is_some() {
+                // The exact stop (see `exact_stop_enabled`), on the updated `max` and `gscore`.
+                let b = ld(beg.add(o));
+                let rem = _mm256_sub_epi16(ld(tlen.add(o)), ivp1);
+                let steps = _mm256_min_epi16(rem, _mm256_sub_epi16(ld(qlen.add(o)), b));
+                let vmax = sel(
+                    _mm256_cmpeq_epi16(b, zero),
+                    _mm256_max_epi16(rm, ld(h0.add(o))),
+                    rm,
+                );
+                let bound = _mm256_adds_epi16(vmax, _mm256_mullo_epi16(steps, sc_v));
+                let open = _mm256_or_si256(
+                    _mm256_cmpgt_epi16(bound, mx),
+                    _mm256_andnot_si256(
+                        _mm256_cmpgt_epi16(gs, bound),
+                        _mm256_cmpgt_epi16(_mm256_adds_epi16(bound, eb_v), mx),
+                    ),
+                );
+                dead = _mm256_or_si256(dead, _mm256_andnot_si256(open, a));
+            }
+            st(max.add(o), mx);
             st(max_i.add(o), sel(improve, iv, mi));
             st(max_j.add(o), sel(improve, mj, mjj));
             let d = _mm256_or_si256(
@@ -3917,6 +4005,22 @@ mod tighten_tests {
             let gscore0: [i32; N] = std::array::from_fn(|_| r(257, &mut next) - 1);
             let max_off0: [i32; N] = std::array::from_fn(|_| r(256, &mut next));
             let done0: [bool; N] = std::array::from_fn(|l| !active[l] && next() % 2 == 0);
+            // The exact stop's inputs: the row's `beg <= end`, a target with this row, the seed.
+            let beg: [i32; N] = std::array::from_fn(|l| {
+                if next() % 3 == 0 {
+                    0
+                } else {
+                    r(end[l] as u64 + 1, &mut next)
+                }
+            });
+            let tlen: [i32; N] = std::array::from_fn(|_| i + 1 + r(300, &mut next));
+            let h0: [i32; N] = std::array::from_fn(|_| r(256, &mut next));
+            let stop = (next() % 4 != 0).then(|| {
+                (
+                    pick(next(), &[-3, 0, 1, 2, 5, 127]),
+                    pick(next(), &[-5, 0, 1, 5, 100, 255, 1024, 1025, 100_000]),
+                )
+            });
             let t = |a: &[i32; N]| -> [i16; N] { a.map(|v| v as i16) };
             let (end16, qlen16) = (t(&end), t(&qlen));
             let (mut mx, mut mi, mut mjj) = (t(&max0), t(&max_i0), t(&max_j0));
@@ -3941,6 +4045,10 @@ mod tighten_tests {
                     gs.as_mut_ptr(),
                     mo.as_mut_ptr(),
                     done.as_mut_ptr(),
+                    t(&beg).as_ptr(),
+                    t(&tlen).as_ptr(),
+                    t(&h0).as_ptr(),
+                    stop,
                 )
             };
             for l in 0..N {
@@ -3966,6 +4074,11 @@ mod tighten_tests {
                             (dj - di) * i64::from(e_ins)
                         };
                         dead = i64::from(e_mx - rm_l) - dd > i64::from(zdrop);
+                    }
+                    if let (false, Some((sc, eb))) = (dead, stop) {
+                        let vmax = if beg[l] == 0 { rm_l.max(h0[l]) } else { rm_l };
+                        let bound = vmax + sc.max(0) * (tlen[l] - 1 - i).min(qlen[l] - beg[l]);
+                        dead = bound <= e_mx && (bound < e_gs || bound <= e_mx.saturating_sub(eb));
                     }
                 }
                 let w = i32::from;
@@ -4268,6 +4381,10 @@ mod neon_row {
         gscore: *mut i16,
         max_off: *mut i16,
         done: *mut bool,
+        beg: *const i16,
+        tlen: *const i16,
+        h0: *const i16,
+        stop: Option<(i32, i32)>,
     ) -> u64 {
         debug_assert!(N == 16);
         let iv = vdupq_n_s16(i as i16);
@@ -4284,6 +4401,16 @@ mod neon_row {
         let zd = vdupq_n_s16(zdrop.clamp(0, 1024) as i16);
         let c255 = vdupq_n_u16(255);
         let zdrop_on = vdupq_n_u16(if zdrop > 0 { !0 } else { 0 });
+        // The exact stop's `(max_sc, end_bonus)`, clamped where the i16 test keeps its outcome:
+        // `steps <= qlen < 256`, so `max_sc <= 127` keeps `B` below 2^15; past 1024 (or below 0)
+        // the `end_bonus` arm is false (or implied by `B <= max`) either way.
+        let (sc_v, eb_v) = stop.map_or((vdupq_n_s16(0), vdupq_n_s16(0)), |(sc, eb)| {
+            (
+                vdupq_n_s16(sc.clamp(0, 127) as i16),
+                vdupq_n_s16(eb.clamp(0, 1024) as i16),
+            )
+        });
+        let ivp1 = vdupq_n_s16(i as i16 + 1);
         let mut live = [vdupq_n_u16(0); 2];
         for q in 0..2 {
             let o = 8 * q;
@@ -4293,18 +4420,17 @@ mod neon_row {
                 vld1q_s16(max_i.add(o)),
                 vld1q_s16(max_j.add(o)),
             );
+            let gs = vld1q_s16(gscore.add(o));
             let g_upd = vandq_u16(
                 vandq_u16(a, vceqq_s16(vld1q_s16(end.add(o)), vld1q_s16(qlen.add(o)))),
-                vcleq_s16(vld1q_s16(gscore.add(o)), h1[q]),
+                vcleq_s16(gs, h1[q]),
             );
             vst1q_s16(
                 max_ie.add(o),
                 vbslq_s16(g_upd, iv, vld1q_s16(max_ie.add(o))),
             );
-            vst1q_s16(
-                gscore.add(o),
-                vbslq_s16(g_upd, h1[q], vld1q_s16(gscore.add(o))),
-            );
+            let gs = vbslq_s16(g_upd, h1[q], gs);
+            vst1q_s16(gscore.add(o), gs);
             let improve = vandq_u16(a, vcgtq_s16(rm[q], mx));
             // `mj` is meaningful once the row max is positive; a zero row terminates the lane,
             // and every use of `mj` below is selected away otherwise.
@@ -4314,7 +4440,7 @@ mod neon_row {
             let dd = vmulq_u16(ad, vbslq_u16(vcgtq_s16(di, dj), ed, ei));
             let l = vsubq_s16(vsubq_s16(mx, rm[q]), zd);
             let drops = vandq_u16(vcgtzq_s16(l), vcgtq_u16(vreinterpretq_u16_s16(l), dd));
-            let dead = vandq_u16(
+            let mut dead = vandq_u16(
                 a,
                 vorrq_u16(
                     vceqzq_s16(rm[q]),
@@ -4326,7 +4452,21 @@ mod neon_row {
                 max_off.add(o),
                 vbslq_s16(vandq_u16(improve, vcgtq_s16(off, mo)), off, mo),
             );
-            vst1q_s16(max.add(o), vbslq_s16(improve, rm[q], mx));
+            let mx = vbslq_s16(improve, rm[q], mx);
+            if stop.is_some() {
+                // The exact stop (see `exact_stop_enabled`), on the updated `max` and `gscore`.
+                let b = vld1q_s16(beg.add(o));
+                let rem = vsubq_s16(vld1q_s16(tlen.add(o)), ivp1);
+                let steps = vminq_s16(rem, vsubq_s16(vld1q_s16(qlen.add(o)), b));
+                let vmax = vbslq_s16(vceqzq_s16(b), vmaxq_s16(rm[q], vld1q_s16(h0.add(o))), rm[q]);
+                let bound = vqaddq_s16(vmax, vmulq_s16(steps, sc_v));
+                let open = vorrq_u16(
+                    vcgtq_s16(bound, mx),
+                    vbicq_u16(vcgtq_s16(vqaddq_s16(bound, eb_v), mx), vcgtq_s16(gs, bound)),
+                );
+                dead = vorrq_u16(dead, vbicq_u16(a, open));
+            }
+            vst1q_s16(max.add(o), mx);
             vst1q_s16(max_i.add(o), vbslq_s16(improve, iv, mi));
             vst1q_s16(max_j.add(o), vbslq_s16(improve, mj[q], mjj));
             live[q] = vbicq_u16(a, dead);
@@ -6676,6 +6816,110 @@ mod dedup_jobs_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod exact_stop_tests {
+    use bwa_extend::{ExtendJob, ExtendResult};
+
+    /// The SIMD kernels with the exact early stop ([`super::exact_stop_enabled`]) against the
+    /// scalar reference, which runs every row, on what the caller reads: `score`, `qle`, `tle` and
+    /// `max_off` always, the clip decision `gscore > 0 && gscore > score - end_bonus`, and
+    /// `gscore`/`gtle` when that decision goes to the end. The targets run far past the query's
+    /// alignment, mostly as deletion tails, where the stop retires lanes; that it fires at all is
+    /// checked against the same kernels with the stop off.
+    #[test]
+    fn exact_stop_keeps_what_the_caller_reads() {
+        super::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut mat = vec![-4i8; 25];
+        for k in 0..5 {
+            mat[k * 5 + 4] = -1;
+            mat[20 + k] = -1;
+        }
+        for k in 0..4 {
+            mat[k * 6] = 1;
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let run = |jobs: &[ExtendJob], stop, w, eb, zd| {
+            super::EXACT_STOP_TEST.with(|c| c.set(Some(stop)));
+            super::batched_extend(jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd)
+        };
+        let mut fired = 0;
+        for round in 0..300u32 {
+            let (w, eb, zd) = (
+                1 + (next() % 120) as i32,
+                (next() % 12) as i32,
+                [0, 30, 100, 1000][(next() % 4) as usize],
+            );
+            let n = 1 + (next() % 70) as usize;
+            let mut seqs: Vec<(Vec<u8>, Vec<u8>, i32)> = Vec::new();
+            for _ in 0..n {
+                let qlen = if next() % 4 == 0 {
+                    150 + next() % 300
+                } else {
+                    1 + next() % 140
+                } as usize;
+                let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                // A noisy copy of a prefix of the query, then a random tail of up to 300 bases.
+                let (keep, tail) = (
+                    (next() % (qlen as u64 + 1)) as usize,
+                    (next() % 300) as usize,
+                );
+                let mut t: Vec<u8> = Vec::new();
+                for &b in &q[..keep] {
+                    match next() % 50 {
+                        0 => t.push((next() % 4) as u8),
+                        1 => {}
+                        2 => t.extend([b, (next() % 4) as u8]),
+                        _ => t.push(b),
+                    }
+                }
+                t.extend((0..tail).map(|_| (next() % 4) as u8));
+                if t.is_empty() {
+                    t.push(0);
+                }
+                seqs.push((q, t, 1 + (next() % 60) as i32));
+            }
+            let jobs: Vec<ExtendJob> = seqs
+                .iter()
+                .map(|(q, t, h0)| ExtendJob {
+                    query: q,
+                    target: t,
+                    h0: *h0,
+                })
+                .collect();
+            let want = super::batched_extend_scalar(&jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd);
+            let got = run(&jobs, true, w, eb, zd);
+            let full = run(&jobs, false, w, eb, zd);
+            assert_eq!(full, want, "round {round}: the kernels with the stop off");
+            let seen = |r: &ExtendResult| {
+                let glob = r.gscore > 0 && r.gscore > r.score - eb;
+                (
+                    r.score,
+                    r.qle,
+                    r.tle,
+                    r.max_off,
+                    glob,
+                    glob.then_some((r.gscore, r.gtle)),
+                )
+            };
+            for (k, (g, e)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(seen(g), seen(e), "round {round} job {k}: {g:?} vs {e:?}");
+                fired += usize::from(g != e);
+            }
+        }
+        super::EXACT_STOP_TEST.with(|c| c.set(None));
+        assert!(
+            fired > 0,
+            "the stop never moved an unread field: was it reached?"
+        );
     }
 }
 
