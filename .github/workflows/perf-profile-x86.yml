@@ -152,10 +152,14 @@ jobs:
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf
           cp target-perf/release/bwa-mem4 ./mem4-v3
           if [ -n "$ALT_RUSTFLAGS" ]; then
+            # An explicit `--target` keeps RUSTFLAGS off build scripts and proc macros: rustc loads
+            # those, so a `-C target-cpu=x86-64-v4` proc macro killed rustc with SIGILL on a host
+            # without AVX-512. Only the binary may need the newer CPU; the run step skips it if so.
+            host=$(rustc -vV | sed -n 's/^host: //p')
             CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CFLAGS="-O3 -fno-omit-frame-pointer" \
             RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }} $ALT_RUSTFLAGS" \
-              cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf-alt
-            cp target-perf-alt/release/bwa-mem4 ./mem4-alt
+              cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf-alt --target "$host"
+            cp "target-perf-alt/$host/release/bwa-mem4" ./mem4-alt
           fi
 
       - name: Reference, index and reads
