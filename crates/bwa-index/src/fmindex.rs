@@ -274,6 +274,19 @@ pub const fn seed_jump_level_off(d: usize) -> usize {
     ((1usize << (2 * d)) - 4) / 3
 }
 
+/// [`seed_jump_level_off`] of levels `1..=SEED_JUMP_DEPTH + 1`, for the lookups at a runtime
+/// depth: the seeding walks read the table at every depth of every start, and the division cost
+/// 1% of the drivers' instructions on x86.
+const SEED_JUMP_LEVEL_OFFS: [usize; SEED_JUMP_DEPTH + 2] = {
+    let mut t = [0; SEED_JUMP_DEPTH + 2];
+    let mut d = 1;
+    while d < t.len() {
+        t[d] = seed_jump_level_off(d);
+        d += 1;
+    }
+    t
+};
+
 /// Unpack the reference base at 2L-space position `pos` from the 2-bit-packed, forward-only `.pac`.
 ///
 /// The old `.0123` stored `forward ++ reverse_complement(forward)` as one byte per base (2L bytes);
@@ -1253,7 +1266,7 @@ impl FmIndex {
     /// The table entry of the `d`-base string with 2-bit code `code` (`1 <= d <= depth`).
     #[inline]
     pub fn seed_jump(&self, d: usize, code: u32) -> SeedJump {
-        self.seed_jump[seed_jump_level_off(d) + code as usize]
+        self.seed_jump[SEED_JUMP_LEVEL_OFFS[d] + code as usize]
     }
 
     /// Prefetch that entry's line.
@@ -1262,7 +1275,7 @@ impl FmIndex {
         let p = self
             .seed_jump
             .as_ptr()
-            .wrapping_add(seed_jump_level_off(d) + code as usize);
+            .wrapping_add(SEED_JUMP_LEVEL_OFFS[d] + code as usize);
         #[cfg(target_arch = "aarch64")]
         // SAFETY: a hint on an address inside the table; never faults or writes.
         unsafe {
@@ -1923,34 +1936,65 @@ impl FmIndex {
                 ..smem
             };
         }
-        // Elsewhere the same three quantities from scalar popcounts: base `c`'s count at each end,
-        // and the rows above `c` (planes `hi | lo`, `hi`, `hi & lo` for `c` = A, C, G).
-        #[cfg(not(target_arch = "aarch64"))]
+        // On x86 the same three quantities from scalar popcounts: base `c`'s count at each end,
+        // and the rows above `c` (planes `hi | lo`, `hi`, `hi & lo` for `c` = A, C, G), the two
+        // blocks' counts above `c` summed in one SSE2 register. The per-base masks come from
+        // tables: `c` is a random base (a `match` mispredicts), and computing them from compares
+        // left x86 juggling selects and spills in the seeding drivers this inlines into.
+        #[cfg(target_arch = "x86_64")]
         if !self.wide {
-            let (hx, lx) = (
-                ((c as u64 >> 1) & 1).wrapping_sub(1),
-                (c as u64 & 1).wrapping_sub(1),
-            );
-            let cp = &self.cp_occ[..];
-            // Branch-free plane select (`c` is a random base, a `match` mispredicts): `hi` for
-            // c <= 1, `lo` for c == 0, `hi & lo` for c == 2, nothing for c == 3.
-            let mask = |on: bool| 0u64.wrapping_sub(u64::from(on));
-            let (mh, ml, mhl) = (mask(c <= 1), mask(c == 0), mask(c == 2));
-            let gt = |row: i64| {
-                let b = &cp[(row >> CP_SHIFT) as usize];
-                let plane = (b.hi & mh) | (b.lo & ml) | (b.hi & b.lo & mhl);
-                // In i64: three counts of a human genome overflow u32.
-                let before: i64 = (0..4)
-                    .map(|x| i64::from(b.cp_count[x]) & 0i64.wrapping_sub(i64::from(x > c)))
-                    .sum();
-                before + i64::from((plane & rows_before(row & CP_MASK)).count_ones())
-            };
+            use std::arch::x86_64::*;
+            // Base `c`'s rows are `(hi ^ hx) & (lo ^ lx)`, the rows above it
+            // `(hi & mh) | (lo & ml) | (hi & lo & mhl)`: `[hx, lx, mh, ml, mhl]`.
+            static SEL: [[u64; 5]; 4] = [
+                [!0, !0, !0, !0, 0],
+                [!0, 0, !0, 0, 0],
+                [0, !0, 0, 0, !0],
+                [0, 0, 0, 0, 0],
+            ];
+            // Lanes of the bases above `c`.
+            static ABOVE: [[u32; 4]; 4] = [[0, !0, !0, !0], [0, 0, !0, !0], [0, 0, 0, !0], [0; 4]];
+            debug_assert!(c < 4);
+            let [hx, lx, mh, ml, mhl] = SEL[c & 3];
             let (sp, ep) = (smem.l, smem.l + smem.s);
-            let kc = self.occ_hoisted::<false, true>(cp, sp, c, hx, lx);
-            let sc = self.occ_hoisted::<false, true>(cp, ep, c, hx, lx) - kc;
+            debug_assert!(((ep >> CP_SHIFT) as usize) < self.cp_occ.len());
+            // SAFETY: the rows of a live interval, at most `ref_seq_len`, whose blocks exist (as
+            // in `occ_hoisted`).
+            let (bsp, bep) = unsafe {
+                (
+                    self.cp_occ.get_unchecked((sp >> CP_SHIFT) as usize),
+                    self.cp_occ.get_unchecked((ep >> CP_SHIFT) as usize),
+                )
+            };
+            let (msp, mep) = (rows_before(sp & CP_MASK), rows_before(ep & CP_MASK));
+            let occ = |b: &CpOcc, row: i64, m: u64| {
+                let rows = ((b.hi ^ hx) & (b.lo ^ lx) & m).count_ones();
+                self.occ_from_rows::<false, true>(b, row, c, rows)
+            };
+            let above = |b: &CpOcc, m: u64| {
+                (((b.hi & mh) | (b.lo & ml) | (b.hi & b.lo & mhl)) & m).count_ones()
+            };
+            // Wrapping u32 is exact: the rows above `c` in `[sp, ep)` are at most `s`, which for an
+            // interval of one or more bases is one base's count, below 2^32 when not `wide`.
+            // SAFETY: SSE2 is baseline on x86_64; `cp_count` starts a 32-byte-aligned block and
+            // `ABOVE[c & 3]` is four `u32`s.
+            let sgt = unsafe {
+                let d = _mm_sub_epi32(
+                    _mm_load_si128(bep.cp_count.as_ptr().cast()),
+                    _mm_load_si128(bsp.cp_count.as_ptr().cast()),
+                );
+                let x = _mm_and_si128(d, _mm_loadu_si128(ABOVE[c & 3].as_ptr().cast()));
+                let x = _mm_add_epi32(x, _mm_shuffle_epi32::<0b01_00_11_10>(x));
+                let x = _mm_add_epi32(x, _mm_shuffle_epi32::<0b10_11_00_01>(x));
+                (_mm_cvtsi128_si32(x) as u32)
+                    .wrapping_add(above(bep, mep))
+                    .wrapping_sub(above(bsp, msp))
+            };
+            let kc = occ(bsp, sp, msp);
+            let sc = occ(bep, ep, mep) - kc;
             let so = i64::from((sp <= self.sentinel_index) & (ep > self.sentinel_index));
             return Smem {
-                k: smem.k + so + gt(ep) - gt(sp),
+                k: smem.k + so + i64::from(sgt),
                 l: self.count[c] + kc,
                 s: sc,
                 ..smem
