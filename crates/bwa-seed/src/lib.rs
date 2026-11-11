@@ -228,14 +228,6 @@ fn prefetch_ahead() -> usize {
     })
 }
 
-/// shortcut: `BWA4_FWD_CAND_PF=0` hints a forward walk's candidates all at once when the walk
-/// ends (fg-labs/bwa-mem3's `ls_prepare_backward`) instead of one per forward step, for a
-/// same-host CI A/B on Zen 5; delete once settled.
-fn fwd_cand_pf() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_FWD_CAND_PF").is_none_or(|v| v != "0"))
-}
-
 /// Hint the next read's bases into the cache when a slot takes the one before it. They were
 /// encoded with the whole batch and are cold by the time a walk reaches them, and its first step
 /// loads them (on EPYC 9V45 that load was 6.8% of `mem_collect_smem_batched`). The first 256 bases
@@ -841,11 +833,6 @@ impl LsSlot {
             // last one is hinted only now (a hint cannot change a result).
             fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
         }
-        if !fwd_cand_pf() {
-            for c in &self.prev[..self.num_prev] {
-                fm.prefetch_occ(c.k, c.k + c.s);
-            }
-        }
         self.prev[..self.num_prev].reverse();
         self.jj = self.x as i64 - 1;
         self.phase = LsPhase::Bwd;
@@ -952,9 +939,7 @@ impl LsSlot {
                         if new_smem.s != self.smem.s {
                             self.num_prev += 1;
                             // The first backward round reads this candidate's blocks: hinted now, visits ahead.
-                            if fwd_cand_pf() {
-                                fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
-                            }
+                            fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
                         }
                         if new_smem.s < min_intv {
                             if self.bsd_j != usize::MAX {
@@ -1027,9 +1012,7 @@ impl LsSlot {
                     if new_smem.s != self.smem.s {
                         self.num_prev += 1;
                         // The first backward round reads this candidate's blocks: hinted now, visits ahead.
-                        if fwd_cand_pf() {
-                            fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
-                        }
+                        fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
                     }
                     if new_smem.s < min_intv {
                         if self.bsd_j != usize::MAX {
