@@ -2418,6 +2418,8 @@ macro_rules! define_sw_kernel {
             let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
             // The exact early stop (`exact_stop_enabled`), read once per call.
             let stop = super::exact_stop_enabled().then_some((max_sc, end_bonus));
+            // The unmasked regime of fully-in-band columns (`band_fast_enabled`), likewise.
+            let band_fast = super::band_fast_enabled();
 
             // One slot per job, overwritten chunk by chunk before returning.
             let mut out = vec![default_result(); jobs.len()];
@@ -3014,7 +3016,7 @@ macro_rules! define_sw_kernel {
                         // `[fast_lo, fast_hi)` is where every lane is active and in band, so the mask is all-ones.
                         // Empty the moment one lane has finished, which is why it is recomputed per row rather than
                         // assumed: `run_side` re-collects active jobs per ROUND, but a lane can go inactive mid-DP.
-                        let (fast_lo, fast_hi) = if super::band_fast_enabled() {
+                        let (fast_lo, fast_hi) = if band_fast {
                             (fast_lo_raw.max(gbeg), fast_hi_raw.min(gend))
                         } else {
                             (gbeg, gbeg)
