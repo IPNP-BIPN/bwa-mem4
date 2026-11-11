@@ -445,12 +445,6 @@ fn bsd_lockstep_width(fm: &FmIndex) -> usize {
     pin.unwrap_or_else(|| lockstep_width(fm))
 }
 
-/// Probe `BWA4_LS_UNROLL`: round 1's lockstep pass unrolled per slot (see the driver).
-fn ls_unroll() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_LS_UNROLL").is_some())
-}
-
 /// Lockstep round-1 SMEM collection across a batch of reads (bwa-mem2's batched FM-index search,
 /// Vasimuddin et al. IPDPS 2019; nh13's `getSMEMsOnePosOneThread_lockstep`). Each read is a slot
 /// whose SMEM walk is a state machine (forward extension / backward search) stepped one FM operation
@@ -543,24 +537,7 @@ fn collect_smems_batched_bsd(
     // `next_read..` have not been started. Progress is guaranteed because every `step` either
     // advances a cursor or moves the phase forward.
     let mut live = slots.iter().filter(|s| s.is_some()).count();
-    let unroll = ls_unroll() && slots.len() <= 16;
     while live > 0 {
-        if unroll {
-            // Probe: one visit site per slot, so each slot's phase test has a branch of its own
-            // (a slot stays in one phase for ~15 passes); finished walks are harvested below.
-            macro_rules! visit {
-                ($($i:literal)*) => {$(
-                    if let Some(Some(slot)) = slots.get_mut($i) {
-                        if slot.phase == LsPhase::Bwd {
-                            slot.bwd_step(fm, reads[slot.ridx], min_seed_len);
-                        } else {
-                            slot.step_call(fm, reads[slot.ridx], min_seed_len, &counts);
-                        }
-                    }
-                )*};
-            }
-            visit!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
-        }
         // Rust: `.iter_mut()` walks the slot table yielding an exclusive borrow of each entry, so
         // each in-flight read can be advanced in place. `.as_mut()` on the `Option` turns "maybe a
         // slot" into "maybe an exclusive borrow of a slot" without moving anything out, and the
@@ -569,9 +546,7 @@ fn collect_smems_batched_bsd(
             let Some(slot) = slot_opt.as_mut() else {
                 continue;
             };
-            if !unroll {
-                slot.step(fm, reads[slot.ridx], min_seed_len, &counts);
-            }
+            slot.step(fm, reads[slot.ridx], min_seed_len, &counts);
             if slot.phase == LsPhase::Done {
                 // Copied out with room for rounds 2 and 3, which append in place: on GIAB a read
                 // leaves round 1 with 2.5 SMEMs and ends with 12.8, and handing over the walk's own
@@ -877,45 +852,6 @@ impl LsSlot {
         self.jj >= 0 && self.num_prev != 0
     }
 
-    /// The `Bwd` phase's step: one backward round over the live candidates, or the phase's end.
-    #[inline]
-    fn bwd_step(&mut self, fm: &FmIndex, codes: &[u8], min_seed_len: i32) {
-        if self.jj < 0 {
-            self.phase = LsPhase::PosDone;
-            return;
-        }
-        // Base code at the READ offset being prepended on the left this round.
-        let a = codes[self.jj as usize];
-        if a > 3 {
-            self.phase = LsPhase::PosDone;
-            return;
-        }
-        #[cfg(feature = "seed-stats")]
-        if seed_stats::enabled() {
-            seed_stats::BWD_STEPS
-                .fetch_add(self.num_prev as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-        let num_curr = fm.backward_round(
-            &mut self.prev[..self.num_prev],
-            a as usize,
-            self.jj as u32,
-            self.min_intv,
-            i64::from(min_seed_len),
-            &mut self.out,
-        );
-        self.num_prev = num_curr;
-        self.jj -= 1;
-        if num_curr == 0 {
-            self.phase = LsPhase::PosDone;
-        }
-    }
-
-    /// [`step`](Self::step) as a call, for the probe's per-slot visit sites.
-    #[inline(never)]
-    fn step_call(&mut self, fm: &FmIndex, codes: &[u8], min_seed_len: i32, counts: &[i64; 5]) {
-        self.step(fm, codes, min_seed_len, counts);
-    }
-
     #[inline(always)]
     fn step(&mut self, fm: &FmIndex, codes: &[u8], min_seed_len: i32, counts: &[i64; 5]) {
         // Read once per call rather than per extension, and compiled out entirely unless the
@@ -1180,7 +1116,34 @@ impl LsSlot {
                     }
                 }
                 LsPhase::Bwd => {
-                    self.bwd_step(fm, codes, min_seed_len);
+                    if self.jj < 0 {
+                        self.phase = LsPhase::PosDone;
+                        return;
+                    }
+                    // Base code at the READ offset being prepended on the left this round.
+                    let a = codes[self.jj as usize];
+                    if a > 3 {
+                        self.phase = LsPhase::PosDone;
+                        return;
+                    }
+                    #[cfg(feature = "seed-stats")]
+                    if stats_on {
+                        seed_stats::BWD_STEPS
+                            .fetch_add(self.num_prev as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let num_curr = fm.backward_round(
+                        &mut self.prev[..self.num_prev],
+                        a as usize,
+                        self.jj as u32,
+                        min_intv,
+                        i64::from(min_seed_len),
+                        &mut self.out,
+                    );
+                    self.num_prev = num_curr;
+                    self.jj -= 1;
+                    if num_curr == 0 {
+                        self.phase = LsPhase::PosDone;
+                    }
                     return;
                 }
                 LsPhase::PosDone => {
