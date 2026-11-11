@@ -255,8 +255,23 @@ jobs:
             sed -n '/Runtime profile/,/Important parameter/p' fk.err | grep -vE '^\s*$' | head -30
             echo; echo "===== $set: ours (v3 build, one batch in flight so shares are exact) ====="
             env BWA4_NO_BATCH_OVERLAP=1 BWA4_STAGE_TIME=1 BWA4_CHAIN_TIME=1 BWA4_EMIT_SPLIT=1 BWA4_RESCUE_SPLIT=1 \
-              ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> m4.err
-            grep -E '^\[(stage-time|chain-time|emit-split|rescue-split)\]' m4.err
+              BWA4_BARRIER_TIME=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> m4.err
+            grep -E '^\[(stage-time|chain-time|emit-split|rescue-split|barrier)\]' m4.err
+          done
+          # How busy each side keeps the cores, in normal runs: CPU time over wall shows the idle the
+          # per-stage numbers cannot, and involuntary switches show workers losing the core to the
+          # reader and writer threads on a host with exactly `T` cores.
+          for set in sim real; do
+            r1="${set}1.fq"; r2="${set}2.fq"
+            for arm in ours fork; do
+              case $arm in
+                ours) cmd=(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
+                fork) cmd=(bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2") ;;
+              esac
+              /usr/bin/time -v -o tv.txt "${cmd[@]}" > /dev/null 2>/dev/null
+              echo "$set $arm: $(grep -E 'Elapsed|User time|System time|Percent of CPU|context switches|Maximum resident' tv.txt \
+                | sed -E 's/^\s+//; s/ \(.*\)//; s/: /=/' | tr '\n' ' ')"
+            done
           done
 
       - name: And the two of ours still agree
