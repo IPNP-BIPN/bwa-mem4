@@ -462,6 +462,22 @@ fn staged_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_NO_STAGED").is_none())
 }
 
+/// Waves [`run_staged`] judges before it extends whatever is left. The first wave runs 98% of the
+/// jobs on GIAB; later ones a few jobs each, for reads with long runs of kept seeds, and cost more
+/// in near-empty kernel batches than they save (M4 GIAB SE cycles: 1 wave +2%, 3 -2%, no cap -1%).
+const STAGED_WAVES: usize = 3;
+
+/// How a read leaves [`run_staged`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Every slot judged in the waves.
+    Staged,
+    /// Still undecided after [`STAGED_WAVES`]: the rest extended, then [`discard_contained`].
+    Finish,
+    /// A kept region without bounds: extended in full, then [`discard_contained`].
+    Full,
+}
+
 /// A slot's place in [`run_staged`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -490,7 +506,8 @@ enum Stage {
 ///
 /// A kept region left without bounds would switch bwa-mem2's pass from the kept-set test to its
 /// order-dependent scan, which can read later slots' regions; such a read is extended in full and
-/// handed to [`discard_contained`] as before.
+/// handed to [`discard_contained`] as before. A read still undecided after [`STAGED_WAVES`] has
+/// the rest extended and goes to [`discard_contained`] with its purged slots as pre-skipped.
 #[allow(clippy::too_many_arguments)]
 fn run_staged<B: SwBackend>(
     backend: &B,
@@ -511,8 +528,8 @@ fn run_staged<B: SwBackend>(
         .iter()
         .map(|&p| if p { Stage::Purged } else { Stage::Undecided })
         .collect();
-    // Reads extended in full for [`discard_contained`] (see above).
-    let mut full = vec![false; reads.len()];
+    // How each read ends (see above): staged, extended in full, or finished after `STAGED_WAVES`.
+    let mut mode = vec![Mode::Staged; reads.len()];
     let mut ix = KEPT_INDEX.with(|c| std::mem::take(&mut *c.borrow_mut()));
     let mut blocking = KeptIndex::default();
     // This wave's extending slots, as (read, slot within the read).
@@ -521,6 +538,7 @@ fn run_staged<B: SwBackend>(
     // Reads with a slot still undecided, and each read's first undecided slot.
     let mut todo: Vec<usize> = (0..reads.len()).collect();
     let mut first = vec![0usize; reads.len()];
+    let mut wave = 0;
     while !todo.is_empty() {
         pending.clear();
         let mut w = 0;
@@ -528,16 +546,11 @@ fn run_staged<B: SwBackend>(
             let r = todo[t];
             let (base, n) = (slot0[r], regs[r].len());
             let st = &mut st[base..base + n];
-            let open = if full[r] {
-                for (i, s) in st.iter_mut().enumerate() {
-                    if *s == Stage::Purged && !preskip[base + i] || *s == Stage::Undecided {
-                        *s = Stage::Pending;
-                        pending.push((r, i));
-                    }
-                }
-                false
-            } else {
-                judge(
+            if mode[r] == Mode::Staged && wave == STAGED_WAVES {
+                mode[r] = Mode::Finish;
+            }
+            let open = match mode[r] {
+                Mode::Staged => judge(
                     opt,
                     reads[r].len() as i32,
                     &chains[r],
@@ -549,7 +562,17 @@ fn run_staged<B: SwBackend>(
                     &mut ix,
                     &mut blocking,
                     |i| pending.push((r, i)),
-                )
+                ),
+                m => {
+                    for (i, s) in st.iter_mut().enumerate() {
+                        let redo = m == Mode::Full && *s == Stage::Purged && !preskip[base + i];
+                        if redo || *s == Stage::Undecided {
+                            *s = Stage::Pending;
+                            pending.push((r, i));
+                        }
+                    }
+                    false
+                }
             };
             if open {
                 todo[w] = r;
@@ -557,6 +580,7 @@ fn run_staged<B: SwBackend>(
             }
         }
         todo.truncate(w);
+        wave += 1;
         if pending.is_empty() {
             break;
         }
@@ -585,8 +609,8 @@ fn run_staged<B: SwBackend>(
         for &(r, i) in &pending {
             st[slot0[r] + i] = Stage::Kept;
             let g = &regs[r][i];
-            if g.qb == -1 && g.qe == -1 && !full[r] {
-                full[r] = true;
+            if g.qb == -1 && g.qe == -1 && mode[r] != Mode::Full {
+                mode[r] = Mode::Full;
                 if todo.last() != Some(&r) && !todo.contains(&r) {
                     todo.push(r);
                 }
@@ -594,26 +618,38 @@ fn run_staged<B: SwBackend>(
         }
     }
     KEPT_INDEX.with(|c| *c.borrow_mut() = ix);
+    let mut purged = Vec::new();
     for r in 0..reads.len() {
         let (base, n) = (slot0[r], regs[r].len());
-        if full[r] {
-            discard_contained(
-                opt,
-                reads[r].len() as i32,
-                &chains[r],
-                &mut regs[r],
-                &meta[base..base + n],
-                &preskip[base..base + n],
-            );
-            continue;
-        }
-        for (i, g) in regs[r].iter_mut().enumerate() {
-            if st[base + i] == Stage::Purged && !preskip[base + i] {
-                // The discard pass's tombstone, as it writes it (see there).
-                g.qb = -1;
-                g.qe = -1;
+        let preskip = &preskip[base..base + n];
+        if mode[r] != Mode::Full {
+            for (i, g) in regs[r].iter_mut().enumerate() {
+                if st[base + i] == Stage::Purged && !preskip[i] {
+                    // The discard pass's tombstone, as it writes it (see there).
+                    g.qb = -1;
+                    g.qe = -1;
+                }
             }
         }
+        let purged = match mode[r] {
+            Mode::Staged => continue,
+            Mode::Full => preskip,
+            // Its purged slots were judged as the pass judges them, so the pass may take them as
+            // pre-skipped; it judges the slots the last wave extended unjudged.
+            Mode::Finish => {
+                purged.clear();
+                purged.extend(st[base..base + n].iter().map(|&s| s == Stage::Purged));
+                &purged[..]
+            }
+        };
+        discard_contained(
+            opt,
+            reads[r].len() as i32,
+            &chains[r],
+            &mut regs[r],
+            &meta[base..base + n],
+            purged,
+        );
     }
 }
 
