@@ -483,6 +483,7 @@ jobs:
             bwa-mem2
             bwa-mem3=0.16.0
             wgsim
+            samtools
           init-shell: bash
 
       - name: Build ours at the tier we ship
@@ -500,7 +501,18 @@ jobs:
           curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           sed -i '1s/.*/>chr21/' chr21.fa
           bwa-mem2 index chr21.fa
-          wgsim -S 11 -N "${{ github.event.inputs.read_pairs || '50000' }}" -1 150 -2 150 chr21.fa sim1.fq sim2.fq > /dev/null
+          n="${{ github.event.inputs.read_pairs || '50000' }}"
+          if [ "${{ github.event.inputs.read_set || 'sim' }}" = real ]; then
+            # The profile's HG002 slice, first `n` pairs, under the names the steps below read.
+            bam="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG002.GRCh38.300x.bam"
+            samtools view -@ 4 -b -s 0.5 "$bam" chr21:20000000-22000000 > slice.bam
+            samtools collate -@ 4 -u -O slice.bam \
+              | samtools fastq -@ 4 -1 r1.fq -2 r2.fq -0 /dev/null -s /dev/null -n
+            head -n $((4 * n)) r1.fq > sim1.fq; head -n $((4 * n)) r2.fq > sim2.fq
+            echo "real: $(( $(wc -l < sim1.fq) / 4 )) pairs"
+          else
+            wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa sim1.fq sim2.fq > /dev/null
+          fi
 
       - name: Count both binaries
         shell: bash -el {0}
