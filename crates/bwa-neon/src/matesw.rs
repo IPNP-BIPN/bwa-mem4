@@ -984,18 +984,17 @@ pub(crate) fn batched_align(
             // The prefixes ending at the alignment's end, reversed. Aligning these to each other
             // finds the same alignment read backwards, so its end offsets are distances back from
             // (qe, te) to the alignment's start.
+            // Copied, then reversed in place: `slice::reverse` is vectorised, a `rev()` iterator
+            // copy goes byte by byte.
             let q_off = rev_arena.len();
-            rev_arena.extend(j.query[..=qe as usize].iter().rev().copied());
+            rev_arena.extend_from_slice(&j.query[..=qe as usize]);
+            rev_arena[q_off..].reverse();
             let t_off = rev_arena.len();
             // Reversed, so the FIRST `rev_tlen(i)` bytes of the reversed prefix are the ones nearest
             // `te`, which is where the alignment ends and therefore where it must start being read.
-            rev_arena.extend(
-                j.target[..=te as usize]
-                    .iter()
-                    .rev()
-                    .take(rev_tlen(i))
-                    .copied(),
-            );
+            let t = &j.target[..=te as usize];
+            rev_arena.extend_from_slice(&t[t.len() - rev_tlen(i)..]);
+            rev_arena[t_off..].reverse();
             rev_spans.push((q_off, t_off - q_off, t_off, rev_arena.len() - t_off));
             rev_of_job.push(i);
         }

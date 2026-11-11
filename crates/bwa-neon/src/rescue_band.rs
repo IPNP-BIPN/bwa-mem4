@@ -698,61 +698,108 @@ impl Tracker {
     /// does not change in between (every row that could change it is still pushed). The first row
     /// above `s2` leaves the same state either way, opening or raising to `(v, row)`.
     fn scan(&mut self, rows: &[u8], row0: i32, minsc: i32, from: usize, to: usize) {
-        #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(target_arch = "aarch64", target_arch = "x86_64")),
+            allow(unused_mut)
+        )]
         let mut r = from;
         // Rows are `u8`, so the vector test needs `minsc` in `1..=255`; any other `minsc` takes
-        // the row loop below for every row.
+        // the row loop below for every row. A chunk pushes every row reaching the bar it started
+        // with: a row the bar would have skipped since is pushed exactly as the row loop does.
         #[cfg(target_arch = "aarch64")]
-        if (1..=255).contains(&minsc) {
+        if (1..=255).contains(&minsc) && to >= from + 16 {
             use std::arch::aarch64::*;
-            // SAFETY: NEON is part of the aarch64 baseline; each load reads 16 bytes inside `rows`
-            // (`r + 16 <= to <= rows.len()`).
+            // Four bits per row of `a` at `base`, set where the row reaches `bar`, from row `skip`.
+            macro_rules! push_rows {
+                ($a:expr, $base:expr, $bar:expr, $skip:expr) => {{
+                    let mut nib = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                        vreinterpretq_u16_u8(vcgeq_u8($a, vdupq_n_u8($bar))),
+                    ))) & (0x1111_1111_1111_1111 << (4 * $skip));
+                    while nib != 0 {
+                        let x = $base + nib.trailing_zeros() as usize / 4;
+                        self.push(row0 + x as i32, i32::from(rows[x]));
+                        nib &= nib - 1;
+                    }
+                }};
+            }
+            // SAFETY: NEON is part of the aarch64 baseline; each load reads 16 bytes inside
+            // `rows` (`base + 16 <= to <= rows.len()`).
             unsafe {
-                while r + 16 <= to {
-                    // The bar a row must reach: `minsc`, or above `s2` once one is kept. Past 255
-                    // no `u8` row can.
-                    let bar = minsc.max(self.s2 + 1);
-                    if bar > 255 {
+                let p = rows.as_ptr();
+                // The bar a row must reach: `minsc`, or above `s2` once one is kept. Past 255 no
+                // `u8` row can.
+                let bar = |s2: i32| minsc.max(s2 + 1);
+                while r + 32 <= to {
+                    let b = bar(self.s2);
+                    if b > 255 {
                         return;
                     }
-                    let a = vld1q_u8(rows.as_ptr().add(r));
-                    // One vector max per chunk: almost every row maximum is below the bar.
-                    if vmaxvq_u8(a) >= bar as u8 {
-                        // Four bits per row, set where the row reaches the bar.
-                        let mut nib = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
-                            vreinterpretq_u16_u8(vcgeq_u8(a, vdupq_n_u8(bar as u8))),
-                        ))) & 0x1111_1111_1111_1111;
-                        while nib != 0 {
-                            let x = r + nib.trailing_zeros() as usize / 4;
-                            self.push(row0 + x as i32, i32::from(rows[x]));
-                            nib &= nib - 1;
-                        }
+                    let (a0, a1) = (vld1q_u8(p.add(r)), vld1q_u8(p.add(r + 16)));
+                    // One vector max per 32 rows: almost every row maximum is below the bar.
+                    if vmaxvq_u8(vmaxq_u8(a0, a1)) >= b as u8 {
+                        push_rows!(a0, r, b as u8, 0);
+                        push_rows!(a1, r + 16, b as u8, 0);
                     }
-                    r += 16;
+                    r += 32;
+                }
+                // The rest as at most two chunks, the last one ending at `to` (its rows below `r`
+                // were pushed already).
+                while r < to {
+                    let b = bar(self.s2);
+                    if b > 255 {
+                        return;
+                    }
+                    let base = r.min(to - 16);
+                    let a = vld1q_u8(p.add(base));
+                    if vmaxvq_u8(a) >= b as u8 {
+                        push_rows!(a, base, b as u8, r - base);
+                    }
+                    r = base + 16;
                 }
             }
         }
-        // The same scan with SSE2 (x86_64 baseline): `max(a, bar) == a` is `a >= bar` unsigned.
+        // The same scan on x86 (SSE2 baseline, AVX2 in a v3 build): `max(a, bar) == a` is
+        // `a >= bar` unsigned.
         #[cfg(target_arch = "x86_64")]
-        if (1..=255).contains(&minsc) {
+        if (1..=255).contains(&minsc) && to >= from + 16 {
             use std::arch::x86_64::*;
-            // SAFETY: SSE2 is part of the x86_64 baseline; each load reads 16 bytes inside `rows`
-            // (`r + 16 <= to <= rows.len()`).
-            unsafe {
-                while r + 16 <= to {
-                    let bar = minsc.max(self.s2 + 1);
-                    if bar > 255 {
-                        return;
-                    }
-                    let a = _mm_loadu_si128(rows.as_ptr().add(r).cast());
-                    let ge = _mm_cmpeq_epi8(_mm_max_epu8(a, _mm_set1_epi8(bar as u8 as i8)), a);
-                    let mut bits = _mm_movemask_epi8(ge) as u32;
+            macro_rules! push_bits {
+                ($bits:expr, $base:expr) => {{
+                    let mut bits = $bits;
                     while bits != 0 {
-                        let x = r + bits.trailing_zeros() as usize;
+                        let x = $base + bits.trailing_zeros() as usize;
                         self.push(row0 + x as i32, i32::from(rows[x]));
                         bits &= bits - 1;
                     }
-                    r += 16;
+                }};
+            }
+            // SAFETY: SSE2 is part of the x86_64 baseline (AVX2 where compiled in); each load
+            // reads inside `rows` (`base + width <= to <= rows.len()`).
+            unsafe {
+                let p = rows.as_ptr();
+                let bar = |s2: i32| minsc.max(s2 + 1);
+                #[cfg(target_feature = "avx2")]
+                while r + 32 <= to {
+                    let b = bar(self.s2);
+                    if b > 255 {
+                        return;
+                    }
+                    let a = _mm256_loadu_si256(p.add(r).cast());
+                    let ge =
+                        _mm256_cmpeq_epi8(_mm256_max_epu8(a, _mm256_set1_epi8(b as u8 as i8)), a);
+                    push_bits!(_mm256_movemask_epi8(ge) as u32, r);
+                    r += 32;
+                }
+                while r < to {
+                    let b = bar(self.s2);
+                    if b > 255 {
+                        return;
+                    }
+                    let base = r.min(to - 16);
+                    let a = _mm_loadu_si128(p.add(base).cast());
+                    let ge = _mm_cmpeq_epi8(_mm_max_epu8(a, _mm_set1_epi8(b as u8 as i8)), a);
+                    push_bits!(_mm_movemask_epi8(ge) as u32 & (0xFFFF << (r - base)), base);
+                    r = base + 16;
                 }
             }
         }
