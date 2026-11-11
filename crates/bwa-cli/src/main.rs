@@ -159,6 +159,32 @@ enum Cmd {
     Version,
 }
 
+/// A baseline x86 build hands the process over to the `x86-64-v3` build shipped beside it
+/// (`bwa-mem4-x86-64-v3`, same release archive) when this CPU runs it: identical output, 11%
+/// faster on real reads (5.45M GIAB pairs on an EPYC 9V74: 41.3 s against 46.4 s). `argv[0]` is
+/// passed through, so the @PG line is the same. Returns only when there is nothing to hand over to,
+/// or the `exec` failed, and the baseline build runs on.
+#[cfg(all(unix, target_arch = "x86_64", not(target_feature = "avx2")))]
+fn exec_v3() {
+    use std::os::unix::process::CommandExt;
+    let v3 = is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("fma")
+        && is_x86_feature_detected!("f16c")
+        && is_x86_feature_detected!("lzcnt")
+        && is_x86_feature_detected!("movbe");
+    let Some(exe) = v3.then(std::env::current_exe).and_then(Result::ok) else {
+        return;
+    };
+    let exe = exe.with_file_name("bwa-mem4-x86-64-v3");
+    if exe.is_file() {
+        let mut args = std::env::args_os();
+        let arg0 = args.next().unwrap_or_default();
+        let _ = std::process::Command::new(exe).arg0(arg0).args(args).exec();
+    }
+}
+
 /// Process entry point: capture argv, parse it, dispatch to the chosen subcommand.
 ///
 /// # Returns
@@ -167,6 +193,8 @@ enum Cmd {
 /// flushed and finalized). Any error propagates out of `main`, so the process exits non-zero and
 /// prints the anyhow chain; there is no partial-success exit code.
 fn main() -> anyhow::Result<()> {
+    #[cfg(all(unix, target_arch = "x86_64", not(target_feature = "avx2")))]
+    exec_v3();
     // Capture the raw command line for the @PG CL tag before clap consumes it. It must be the raw
     // argv, not a reconstruction from the parsed args: the CL field is meant to record what the
     // user actually typed, defaults and all, so the SAM file documents its own provenance.

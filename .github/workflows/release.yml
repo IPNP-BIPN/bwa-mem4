@@ -403,10 +403,16 @@ jobs:
               printf 'It produces **identical output**: the release job rebuilds the committed index with it and diffs\n'
               printf 'a full alignment against the baseline binary'\''s, byte for byte, before either is packaged.\n\n'
               [ -n "$SPEED" ] && printf '%s\n\n' "$SPEED"
-              printf 'Use it if your CPU has the instruction set:\n\n'
-              printf '    grep -q %s /proc/cpuinfo && ./bwa-mem4-%s mem ...\n\n' "$PROBE" "$VC"
               printf '`bwa-mem4` itself stays compiled at the x86-64 baseline so that it runs anywhere, including hosts\n'
-              printf 'where the variant would die with an illegal instruction. Nothing chooses between them for you.\n'
+              printf 'where the variant would die with an illegal instruction.\n'
+              if [ "$VC" = x86-64-v3 ]; then
+                # `exec_v3` in crates/bwa-cli/src/main.rs looks for exactly this file name.
+                printf 'On a host with %s it hands over to `bwa-mem4-%s` beside it at startup, so keep\n' "$NEEDS" "$VC"
+                printf 'the two files together and run `./bwa-mem4 mem ...` as usual.\n'
+              else
+                printf 'Use it if your CPU has the instruction set:\n\n'
+                printf '    grep -q %s /proc/cpuinfo && ./bwa-mem4-%s mem ...\n' "$PROBE" "$VC"
+              fi
             } > "dist/$NAME/VARIANT-$VC.md"
           fi
           # LICENSE travels with the binary: this is a derivative work of bwa-mem2 and the MIT terms
