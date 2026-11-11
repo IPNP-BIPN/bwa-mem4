@@ -59,7 +59,7 @@ pub fn init() {
 /// `_`, or the tag is restored immediately.
 #[inline]
 pub fn enter(stage: Stage) -> StageGuard {
-    // The discriminants ARE the bucket indices for the first nine buckets; the test below is what
+    // The discriminants ARE the bucket indices for the first eight buckets; the test below is what
     // keeps that true.
     alloc_probe::enter(stage as u8)
 }

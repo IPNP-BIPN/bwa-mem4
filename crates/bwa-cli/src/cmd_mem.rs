@@ -1618,9 +1618,16 @@ fn se_read_batches(
         let mut base_id = 0u64;
         loop {
             // Up to `k_batch` INPUT BASES worth of reads; empty only at end of file.
-            let batch = reader.next_batch(k_batch)?;
+            let mut batch = reader.next_batch(k_batch)?;
             if batch.is_empty() {
                 break;
+            }
+            // nt4 in place, for the reason given in `pe_read_batches`. The SAM text is printed back
+            // out of these codes, as bwa does.
+            for rec in batch.iter_mut() {
+                for base in rec.seq_mut() {
+                    *base = dna::nt4(*base);
+                }
             }
             // Read count, saved before the move so `base_id` can advance after the send.
             let n = batch.len() as u64;
@@ -2344,18 +2351,8 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // `batch` is one `-K` worth of reads in input order; `base_id` is the global id of its first
     // read (see the reader above). Returns the batch's complete SAM text.
     let process = |batch: Vec<Record>, base_id: u64| -> Vec<Vec<u8>> {
-        // ASCII bases -> nt4 codes (A=0, C=1, G=2, T=3, anything else 4), once per read.
-        // Parallel to `batch`: `all_codes[i]` is `batch[i]`'s sequence, same length.
-        //
-        // Run on the pool, as bwa-mem2 does (it encodes inside `mem_kernel1_core`, under `kt_for`).
-        // `dna::nt4` is a pure 256-entry table lookup, so `all_codes[i]` depends on `batch[i]` and
-        // nothing else, and `par_iter` is INDEXED so element order is preserved: byte-identical.
-        let all_codes: Vec<Vec<u8>> = stage_time::measure(Stage::Encode, || {
-            batch
-                .par_iter()
-                .map(|rec| rec.seq().iter().map(|&base| dna::nt4(base)).collect())
-                .collect()
-        });
+        // The bases are nt4 codes already: the reader encoded them (see `se_read_batches`).
+        let all_codes: Vec<&[u8]> = batch.iter().map(Record::seq).collect();
         // The denominator of the bytes-per-base column issue #25 is written in. One sum per batch,
         // and only when `BWA4_STAGE_ALLOC` is armed.
         if crate::stage_alloc::enabled() {
@@ -2638,7 +2635,7 @@ fn finish_se(
         sam::write_unmapped(
             &mut buf,
             rec.name(),
-            &dna::to_sam_ascii(rec.seq()),
+            &sam_seq(codes, false),
             rec.qual(),
             rec.comment(),
         )
@@ -2673,6 +2670,18 @@ struct EmitAln {
     secondary: bool,
     /// A later *primary* hit: supplementary (0x800, or 0x10000 -> 0x100 under `-M`).
     sup: bool,
+}
+
+/// SAM column 10 out of nt4 codes: bwa's `"ACGTN"[c]`, or on the reverse strand the reverse
+/// complement. Lowercase and non-ACGT input were folded into the codes by the reader.
+fn sam_seq(codes: &[u8], rev: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(codes.len());
+    if rev {
+        bwa_mem::emit::push_seq_rev(&mut out, codes);
+    } else {
+        bwa_mem::emit::push_seq_fwd(&mut out, codes);
+    }
+    out
 }
 
 /// `mem_aln2sam` for one of a read's alignments. `which` indexes `alns`: 0 is the primary, any other
@@ -2895,15 +2904,10 @@ fn write_aln_se(
             sliced.reverse();
             sliced
         });
-        (dna::revcomp_ascii(&rec.seq()[qb..qe]), reversed_qual)
+        (sam_seq(&rec.seq()[qb..qe], true), reversed_qual)
     } else {
         (
-            // `to_sam_ascii`, not `to_vec`: SAM column 10 is bwa's `"ACGTN"[code]` and not the
-            // FASTQ's own bytes, so lowercase input is upper-cased and anything that is not a base
-            // becomes `N`. The reverse branch above gets the same normalisation from
-            // `revcomp_ascii`. Skipping it here leaked raw input into every forward-strand
-            // single-end record.
-            dna::to_sam_ascii(&rec.seq()[qb..qe]),
+            sam_seq(&rec.seq()[qb..qe], false),
             rec.qual().map(|quals| quals[qb..qe].to_vec()),
         )
     };

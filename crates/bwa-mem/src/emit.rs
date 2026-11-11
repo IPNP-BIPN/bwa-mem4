@@ -310,4 +310,22 @@ mod tests {
             assert_eq!(got, want, "reverse QUAL at len {len}");
         }
     }
+
+    /// SAM column 10 is over `ACGTN` only, whatever the FASTQ held: lowercase comes back upper-cased
+    /// and every byte that is not a base (IUPAC, `.`, `*`, a space) prints as `N`, as bwa-mem2 2.3
+    /// does. A space leaking through would end the field and break the record.
+    #[test]
+    fn sam_seq_is_only_acgtn() {
+        let codes: Vec<u8> = b"acgtNRY-.* ACGT"
+            .iter()
+            .map(|&b| bwa_core::dna::nt4(b))
+            .collect();
+        let mut fwd = Vec::new();
+        push_seq_fwd(&mut fwd, &codes);
+        assert_eq!(fwd, b"ACGTNNNNNNNACGT");
+        // Complemented and reversed: this input happens to be its own reverse complement.
+        let mut rev = Vec::new();
+        push_seq_rev(&mut rev, &codes);
+        assert_eq!(rev, b"ACGTNNNNNNNACGT");
+    }
 }

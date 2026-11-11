@@ -18,8 +18,8 @@
 //! | complement | the base pairing with it on the opposite DNA strand (A with T, C with G) |
 //! | reverse complement | the same stretch of DNA read from the other strand: complement, backwards |
 //!
-//! Reading order: [`NT4_TABLE`] and [`nt4`] (ASCII in, code out), [`comp2`] (code in, code out),
-//! then [`revcomp_ascii`] (ASCII in, ASCII out) which is the only one used at SAM-emission time.
+//! Reading order: [`NT4_TABLE`] and [`nt4`] (ASCII in, code out), then [`comp2`] (code in, code
+//! out). SAM SEQ is printed back out of the codes, by `bwa_mem::emit::push_seq_fwd` / `_rev`.
 //!
 //! # Rust mechanics used in this file
 //!
@@ -149,104 +149,6 @@ pub fn comp2(code: u8) -> u8 {
     }
 }
 
-/// Reverse-complement an ASCII nucleotide sequence (A<->T, C<->G, case-normalized to upper;
-/// non-ACGT bytes pass through unchanged). Used for reverse-strand SAM SEQ output.
-///
-/// Both halves matter: DNA's two strands run antiparallel, so the reverse-strand rendering of a
-/// read is its complement read backwards, not either operation alone. SAM stores SEQ relative to
-/// the reference strand, so a read aligned with FLAG 0x10 must be written this way. Its QUAL is
-/// reversed but NOT complemented (a quality score has no complement), which is why that reversal
-/// lives at the call site rather than here.
-///
-/// Note the ASCII output is upper-cased, unlike [`nt4`]'s code path which is case-agnostic: a
-/// soft-masked lowercase reference base would otherwise leak lowercase into SAM SEQ.
-///
-/// # Parameters
-///
-/// - `seq`: ASCII nucleotides, NOT nt4 codes (feeding it codes would leave them untouched, since
-///   0..=4 are not ACGT bytes). Any length including empty; no other precondition. Supplied by the
-///   SAM writer as the read's SEQ field when the alignment is on the reverse strand.
-///
-/// # Returns
-///
-/// A freshly allocated `Vec` of the same length, reversed and complemented, upper-cased for ACGT.
-/// Bytes that are not ACGT/acgt (`N`, IUPAC letters, `.`, `*`, whitespace) become `N`, which is what
-/// bwa emits for them: it holds SEQ as nt4 codes and prints `"ACGTN"[code]`.
-pub fn revcomp_ascii(seq: &[u8]) -> Vec<u8> {
-    // Read as one sentence: walk the input backwards, swap each base for its partner, and gather
-    // the result into a new buffer. The two halves of "reverse complement" are the `.rev()` and the
-    // `match`; doing only one of them would be a silent, and biologically wrong, bug.
-    //
-    // Rust: this is a pipeline built from four steps, evaluated lazily. Nothing happens until
-    // `.collect()` at the end pulls values through; there is no intermediate array per stage, so
-    // despite reading like four passes it compiles to a single loop.
-    seq.iter()
-        // Walk the borrowed input. `seq` is `&[u8]`, a window onto the caller's buffer, so nothing
-        // is copied and the caller's data is never modified.
-        .rev()
-        // Walk it last byte to first. This is the "reverse" half.
-        .map(|&base| match base {
-            // `|&base|` is an inline anonymous function. The `&` in front of the parameter name
-            // undoes the reference `.iter()` yields, so `base` is the byte itself rather than a
-            // pointer to it. This is called destructuring, and it is why the `match` arms below can
-            // compare against plain byte literals.
-            //
-            // The `match` is the "complement" half. `b'A' | b'a'` means "either of these two
-            // bytes", which folds the case-normalisation into the same table: both cases of A
-            // produce upper-case T.
-            b'A' | b'a' => b'T',
-            b'C' | b'c' => b'G',
-            b'G' | b'g' => b'C',
-            b'T' | b't' => b'A',
-            // The catch-all arm: every byte that is not one of the four bases becomes `N`. bwa
-            // never sees the original byte at this point, because it encoded SEQ into nt4 codes on
-            // input and prints it back as `"ACGTN"[code]`, so an IUPAC letter, a `.`, a `*` or a
-            // stray space all leave its emitter as a plain `N`. Passing the byte through instead,
-            // which is what this arm used to do, put an `R` or a SPACE into SAM column 10 -- a
-            // byte-parity break on the first count and a malformed record on the second, since a
-            // space ends the field. Rust requires this arm: a `match` must cover every possible
-            // value or it does not compile, which is what guarantees there is no unhandled byte.
-            _ => NT4_N_ASCII,
-        })
-        // Run the pipeline and build the output. `.collect()` does not say which container to
-        // build; the compiler reads the function's declared return type, `Vec<u8>`, and picks it.
-        // The `Vec` is freshly allocated and OWNED by the caller, which is what lets this function
-        // hand back a buffer that outlives the borrowed input.
-        .collect()
-}
-
-/// The ASCII letter bwa prints for the unknown-base code, i.e. `"ACGTN"[NT4_N]`.
-const NT4_N_ASCII: u8 = b'N';
-
-/// The five letters bwa prints for nt4 codes 0..=4, its `"ACGTN"`.
-const NT4_ASCII: [u8; 5] = *b"ACGTN";
-
-/// SAM column 10 for a forward-strand record: the read's bases in bwa's emitted alphabet.
-///
-/// WHY THIS IS NOT A COPY. bwa encodes SEQ into nt4 codes when it reads the FASTQ and prints it
-/// back as `"ACGTN"[code]`, so its output alphabet is exactly the five letters `ACGTN`: lowercase
-/// input comes back upper-cased, and every byte that is not a base -- `N`, an IUPAC letter, `.`,
-/// `*`, a stray space -- comes back as `N`. Handing the raw FASTQ bytes to the writer instead, as
-/// the single-end path used to, leaked all of that into column 10. Lowercase reads (soft-masked
-/// references, reads recovered from a masked FASTA) differed from bwa on EVERY base, and a read
-/// carrying a space produced a record SAM cannot parse, because a space ends the field.
-///
-/// The paired-end emitter never had the bug: it holds nt4 codes and goes through
-/// `crate::emit::push_seq_fwd`, which is this same mapping on the code side.
-///
-/// # Parameters
-///
-/// - `seq`: ASCII nucleotides, NOT nt4 codes. Any length including empty; no other precondition.
-///
-/// # Returns
-///
-/// A freshly allocated `Vec` of the same length, over the alphabet `ACGTN`.
-pub fn to_sam_ascii(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .map(|&base| NT4_ASCII[nt4(base) as usize])
-        .collect()
-}
-
 // Rust: everything below is compiled only under `cargo test` and is absent from the shipped
 // binary, so tests can sit in the same file as the code they check without costing anything at
 // run time. `mod tests` opens a nested namespace; `use super::*` pulls in every item from the file
@@ -265,40 +167,6 @@ mod tests {
         assert_eq!(nt4(b't'), 3);
         assert_eq!(nt4(b'N'), 4);
         assert_eq!(nt4(b'-'), 4);
-    }
-
-    /// SAM column 10 is over the alphabet `ACGTN` and nothing else, in both directions.
-    ///
-    /// The single-end emitter used to hand the FASTQ's own bytes to the writer, so a soft-masked
-    /// (lowercase) read differed from bwa on every base, and a read carrying a space produced a
-    /// record SAM cannot parse. Each byte class below was checked against bwa-mem2 2.3 one at a
-    /// time before being written down here.
-    #[test]
-    fn sam_seq_is_only_acgtn() {
-        assert_eq!(to_sam_ascii(b"ACGT"), b"ACGT");
-        assert_eq!(to_sam_ascii(b"acgt"), b"ACGT");
-        // N, an IUPAC ambiguity letter, a gap, an asterisk and a space: all `N` in bwa's output.
-        assert_eq!(to_sam_ascii(b"NnRY-.* "), b"NNNNNNNN");
-        assert_eq!(to_sam_ascii(b""), b"");
-
-        // Reverse strand: complemented, upper-cased, and the same catch-all.
-        assert_eq!(revcomp_ascii(b"ACGT"), b"ACGT");
-        assert_eq!(revcomp_ascii(b"acgt"), b"ACGT");
-        assert_eq!(revcomp_ascii(b"AAAC"), b"GTTT");
-        assert_eq!(revcomp_ascii(b"RY-. *"), b"NNNNNN");
-        // The two directions agree on which bytes survive, which is what keeps a record's SEQ over
-        // one alphabet no matter which strand it landed on.
-        let mixed = b"acgtNRY-.* ACGT";
-        let fwd = to_sam_ascii(mixed);
-        let mut rev = revcomp_ascii(mixed);
-        rev.reverse();
-        for (f, r) in fwd.iter().zip(rev.iter()) {
-            assert_eq!(
-                *f == b'N',
-                *r == b'N',
-                "one direction kept a byte the other did not"
-            );
-        }
     }
 
     #[test]

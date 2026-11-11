@@ -61,35 +61,31 @@ pub enum Stage {
     /// value here means input (decompress + parse + per-read allocation) is the bottleneck and no
     /// amount of compute parallelism will help.
     WaitRead = 0,
-    /// ASCII bases to nt4 codes. Serial on the main thread today, and O(`-K` bases), so it grows
-    /// with `-t` under the default `-K = 10M * threads`.
-    Encode = 1,
     /// `batched_regs`: seeding, `get_sa`, chaining and banded extension. The one genuinely
     /// parallel stage, and the one whose share should dominate if scaling were healthy.
-    Align = 2,
+    Align = 1,
     /// Paired-end de-interleave of the flat interleaved code/region lists back into pairs.
-    Deinterleave = 3,
+    Deinterleave = 2,
     /// Paired-end: the borrowed per-mate view of the batch's regions that `mem_pestat` reads.
-    DedupPrep = 4,
+    DedupPrep = 3,
     /// `mem_pestat`: the per-batch insert-size model. Serial, and it sorts the whole batch.
-    Pestat = 5,
+    Pestat = 4,
     /// Batched mate rescue. Parallel, and per `docs/perf-levers.md` it is 47-64% of paired-end
     /// compute, so its fork/join imbalance is worth this much attention.
-    Rescue = 6,
+    Rescue = 5,
     /// SAM record formatting (`finish_se` / `mem_sam_pe`), parallel.
-    SamEmit = 7,
+    SamEmit = 6,
     /// Blocked in `sam_tx.send()`, i.e. the aligner is throttled by the writer thread.
     ///
     /// There is deliberately no `Concat` stage between this and [`Stage::SamEmit`]: the per-record
     /// pieces go to the writer as they are, so the single-threaded concatenation that used to sit
     /// here no longer exists (see `run_pipeline`).
-    WaitWrite = 8,
+    WaitWrite = 7,
 }
 
 /// Human-readable names, indexed by [`Stage`]'s discriminant.
 const NAMES: [&str; N_STAGES] = [
     "wait_read",
-    "encode",
     "align",
     "deinterleave",
     "dedup_prep",
@@ -104,7 +100,7 @@ const NAMES: [&str; N_STAGES] = [
 ///
 /// Public because [`crate::stage_alloc`] tiles the same stages with three buckets of its own and
 /// must agree with this count exactly.
-pub const N_STAGES: usize = 9;
+pub const N_STAGES: usize = 8;
 
 /// The stage labels, in discriminant order.
 ///
@@ -122,7 +118,7 @@ pub fn names() -> &'static [&'static str; N_STAGES] {
 ///
 /// This used to be a `thread_local`, on the belief that only the main thread records. That was
 /// wrong and it silently lost almost everything: `run_pipeline` runs each batch's `process` on a
-/// `scope.spawn`ed thread, so every stage between `encode` and `sam_emit` was credited to a thread
+/// `scope.spawn`ed thread, so every stage between `align` and `sam_emit` was credited to a thread
 /// that then died, and the table showed only `wait_read`, `wait_write` and a giant `unaccounted`.
 /// A run that spent 95% of its time somewhere reported that somewhere as "index load, header,
 /// teardown".
