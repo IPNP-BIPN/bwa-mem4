@@ -655,57 +655,12 @@ unsafe fn query_profile_ssse3(row: &mut [i8], query: &[u8], tab: &[i8; 16], n: u
 /// writes back the same span plus `eh[i+w+1] = {h1, MINUS_INF}`. Row `i + 1` reads only what row
 /// `i` wrote and nothing reads `eh[i-w]` again, so the window stays in registers, shifted by one
 /// cell per row, and is stored back after the last row. Same cells, same order as the row loop.
+/// `target` and `z` are cut to the rows up front and walked as iterators, so the loop keeps no
+/// bounds of its own for them (N = 3 then has no stack traffic left, and every N runs 8-22% fewer
+/// instructions per row); the gaps are copied local so they stay in registers.
 #[allow(clippy::type_complexity)]
 #[inline(never)]
 fn global_mid_rows<const N: usize>(
-    (eh_h, eh_e, qp, target, z, qlen, g): (
-        &mut [i32],
-        &mut [i32],
-        &[i8],
-        &[u8],
-        &mut [u8],
-        usize,
-        &GlobalGaps,
-    ),
-    i0: usize,
-    i1: usize,
-) {
-    let w = (N - 1) / 2;
-    let mut wh = [0i32; N];
-    let mut we = [0i32; N];
-    wh.copy_from_slice(&eh_h[i0 - w..i0 - w + N]);
-    we.copy_from_slice(&eh_e[i0 - w..i0 - w + N]);
-    for i in i0..i1 {
-        let tc = target[i] as usize;
-        let q: &[i8; N] = qp[tc * qlen + i - w..][..N].try_into().unwrap();
-        let zi: &mut [u8; N] = (&mut z[i * N..][..N]).try_into().unwrap();
-        let (mut f, mut h1) = (MINUS_INF, MINUS_INF);
-        let (mut nh, mut ne) = ([0i32; N], [0i32; N]);
-        for k in 0..N {
-            let s = h1;
-            let (d, e) = global_cell(wh[k], we[k], q[k], &mut f, &mut h1, g);
-            zi[k] = d;
-            // eh[beg + k] becomes {s, e}; the next row's window starts one cell later.
-            if k > 0 {
-                nh[k - 1] = s;
-                ne[k - 1] = e;
-            }
-        }
-        nh[N - 1] = h1;
-        ne[N - 1] = MINUS_INF;
-        wh = nh;
-        we = ne;
-    }
-    eh_h[i1 - w..i1 - w + N].copy_from_slice(&wh);
-    eh_e[i1 - w..i1 - w + N].copy_from_slice(&we);
-}
-
-/// Probe twin of [`global_mid_rows`] (`BWA4_MR2=1`): the same cells in the same order, with
-/// `target` and `z` cut to the rows up front and walked as iterators, so the loop keeps no bounds
-/// of its own for them.
-#[allow(clippy::type_complexity)]
-#[inline(never)]
-fn global_mid_rows2<const N: usize>(
     (eh_h, eh_e, qp, target, z, qlen, g): (
         &mut [i32],
         &mut [i32],
@@ -735,6 +690,7 @@ fn global_mid_rows2<const N: usize>(
             let s = h1;
             let (d, e) = global_cell(wh[k], we[k], q[k], &mut f, &mut h1, &g);
             zi[k] = d;
+            // eh[beg + k] becomes {s, e}; the next row's window starts one cell later.
             if k > 0 {
                 nh[k - 1] = s;
                 ne[k - 1] = e;
@@ -747,13 +703,6 @@ fn global_mid_rows2<const N: usize>(
     }
     eh_h[i1 - w..i1 - w + N].copy_from_slice(&wh);
     eh_e[i1 - w..i1 - w + N].copy_from_slice(&we);
-}
-
-/// `BWA4_MR2=1` (probe): [`ksw_global2`]'s interior rows on [`global_mid_rows2`].
-fn mr2() -> bool {
-    use std::sync::OnceLock;
-    static O: OnceLock<bool> = OnceLock::new();
-    *O.get_or_init(|| std::env::var("BWA4_MR2").is_ok_and(|v| v == "1"))
 }
 
 /// Banded **global** (end-to-end, Needleman-Wunsch with affine gaps) alignment with traceback: a
@@ -930,19 +879,6 @@ pub(crate) fn ksw_global2_scalar(
         while i < tlen {
             if i == mid_lo && mid_hi > mid_lo && (1..=7).contains(&w) {
                 let rows = (&mut *eh_h, &mut *eh_e, &*qp, target, &mut *z, qlen, &g);
-                if mr2() {
-                    match w {
-                        1 => global_mid_rows2::<3>(rows, mid_lo, mid_hi),
-                        2 => global_mid_rows2::<5>(rows, mid_lo, mid_hi),
-                        3 => global_mid_rows2::<7>(rows, mid_lo, mid_hi),
-                        4 => global_mid_rows2::<9>(rows, mid_lo, mid_hi),
-                        5 => global_mid_rows2::<11>(rows, mid_lo, mid_hi),
-                        6 => global_mid_rows2::<13>(rows, mid_lo, mid_hi),
-                        _ => global_mid_rows2::<15>(rows, mid_lo, mid_hi),
-                    }
-                    i = mid_hi;
-                    continue;
-                }
                 match w {
                     1 => global_mid_rows::<3>(rows, mid_lo, mid_hi),
                     2 => global_mid_rows::<5>(rows, mid_lo, mid_hi),
