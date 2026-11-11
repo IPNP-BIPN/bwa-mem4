@@ -515,8 +515,8 @@ fn run_staged<B: SwBackend>(
     reads: &[&[u8]],
     chains: &[Vec<MemChain>],
     arena: &[u8],
-    left_jobs: &[SideJob],
-    right_jobs: &[SideJob],
+    left_jobs: &mut [SideJob],
+    right_jobs: &mut [SideJob],
     regs: &mut [Vec<MemAlnReg>],
     slot0: &[usize],
     meta: &[RegMeta],
@@ -584,27 +584,50 @@ fn run_staged<B: SwBackend>(
         if pending.is_empty() {
             break;
         }
-        wl.clear();
-        wr.clear();
-        for &(r, i) in &pending {
-            let (lj, rj) = slot_jobs[slot0[r] + i];
-            if lj != NO_JOB {
-                wl.push(left_jobs[lj as usize]);
+        // The first wave runs nearly every job: in place, the other slots' jobs switched off
+        // (`run_side` runs the active ones and leaves every job inactive). Later waves copy theirs.
+        let (wl, wr) = if wave == 1 {
+            for (k, &(lj, rj)) in slot_jobs.iter().enumerate() {
+                if st[k] != Stage::Pending {
+                    if lj != NO_JOB {
+                        left_jobs[lj as usize].active = false;
+                    }
+                    if rj != NO_JOB {
+                        right_jobs[rj as usize].active = false;
+                    }
+                }
             }
-            if rj != NO_JOB {
-                wr.push(right_jobs[rj as usize]);
+            (&mut *left_jobs, &mut *right_jobs)
+        } else {
+            wl.clear();
+            wr.clear();
+            for &(r, i) in &pending {
+                let (lj, rj) = slot_jobs[slot0[r] + i];
+                if lj != NO_JOB {
+                    wl.push(SideJob {
+                        active: true,
+                        ..left_jobs[lj as usize]
+                    });
+                }
+                if rj != NO_JOB {
+                    wr.push(SideJob {
+                        active: true,
+                        ..right_jobs[rj as usize]
+                    });
+                }
             }
-        }
+            (&mut wl[..], &mut wr[..])
+        };
         // As the unstaged path: left first, then the right jobs resume from the left's score.
         align_split::measure(&align_split::SIDE_NS, || {
-            run_side(backend, opt, arena, &mut wl, regs, opt.pen_clip5, true)
+            run_side(backend, opt, arena, wl, regs, opt.pen_clip5, true)
         });
-        for job in &mut wr {
+        for job in wr.iter_mut().filter(|j| j.active) {
             job.h0 = regs[job.read][job.reg].score;
             job.prev = job.h0;
         }
         align_split::measure(&align_split::SIDE_NS, || {
-            run_side(backend, opt, arena, &mut wr, regs, opt.pen_clip3, false)
+            run_side(backend, opt, arena, wr, regs, opt.pen_clip3, false)
         });
         for &(r, i) in &pending {
             st[slot0[r] + i] = Stage::Kept;
@@ -1910,8 +1933,8 @@ fn align_reads_batched_inner<B: SwBackend>(
             reads,
             &per_read_chains,
             &arena,
-            &left_jobs,
-            &right_jobs,
+            &mut left_jobs,
+            &mut right_jobs,
             &mut regs,
             &slot0,
             &reg_meta,
