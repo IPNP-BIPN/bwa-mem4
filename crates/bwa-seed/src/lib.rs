@@ -865,7 +865,7 @@ impl LsSlot {
         let readlength = codes.len();
         // Phases that touch no index memory run on at once; the others return after issuing
         // their prefetches, so the other slots' loads overlap this one's.
-        loop {
+        'walk: loop {
             match self.phase {
                 LsPhase::Start => {
                     if self.x >= readlength {
@@ -959,7 +959,8 @@ impl LsSlot {
                             if self.bwd_init(fm, min_intv) {
                                 return;
                             }
-                            continue;
+                            // On to `Bwd`, not the table's next depth: the walk has ended.
+                            continue 'walk;
                         }
                         if j >= self.bsd_j {
                             self.bsd_note(j, &new_smem);
@@ -2561,6 +2562,38 @@ mod tests {
                     per_read.iter().map(sans_l).collect::<Vec<_>>(),
                     "batched != per-read at read {r} (len {}, msl={msl}, mi={mi})",
                     read.len()
+                );
+            }
+        }
+    }
+
+    /// A batch of reads no longer than the seed-jump table is deep, starting with strings the
+    /// reference lacks: a walk from base 0 that ends inside the table must stop there, or it keeps
+    /// pushing candidates into a `prev` sized by the batch's longest read.
+    #[test]
+    fn short_reads_ending_inside_the_jump_table() {
+        let fm = tiny();
+        let mut state = 0x0005_4017_0000_0003u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let reads: Vec<Vec<u8>> = (0..400)
+            .map(|_| (0..10).map(|_| (next() % 4) as u8).collect())
+            .collect();
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        for &msl in &[19i32, 8, 5] {
+            let batched = collect_smems_batched(&fm, &refs, msl, 1);
+            for (r, read) in reads.iter().enumerate() {
+                assert_eq!(
+                    batched[r].iter().map(sans_l).collect::<Vec<_>>(),
+                    collect_smems(&fm, read, msl, 1)
+                        .iter()
+                        .map(sans_l)
+                        .collect::<Vec<_>>(),
+                    "read {r}, msl={msl}"
                 );
             }
         }
