@@ -2246,7 +2246,10 @@ mod tests {
             #[cfg(feature = "seed-stats")]
             let s0 = snap();
             let a = std::time::Instant::now();
-            let mut per_read = collect_smems_batched(&fm, &refs, opt.min_seed_len, 1);
+            // As `mem_collect_smem_batched`: round 1 also records round 3's first walks.
+            let r3 = (opt.max_mem_intv > 0).then_some((opt.max_mem_intv, opt.min_seed_len + 1));
+            let (mut per_read, walks) =
+                collect_smems_batched_bsd(&fm, &refs, opt.min_seed_len, 1, r3);
             t1 += a.elapsed().as_nanos();
             #[cfg(feature = "seed-stats")]
             let s1 = snap();
@@ -2275,7 +2278,7 @@ mod tests {
                     &refs,
                     opt.max_mem_intv,
                     opt.min_seed_len + 1,
-                    &[],
+                    &walks,
                     &mut per_read,
                 );
             }
