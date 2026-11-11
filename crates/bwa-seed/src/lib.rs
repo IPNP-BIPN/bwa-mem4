@@ -1014,8 +1014,13 @@ impl LsSlot {
                         }
                     }
                     // `new_smem`: the forward interval of the read substring `codes[x ..= j]`, one
-                    // base longer on the RIGHT than `self.smem`.
-                    let mut new_smem = fm.forward_ext(self.smem, aj as usize);
+                    // base longer on the RIGHT than `self.smem` (a unique match near the read's end
+                    // steps here rather than in `S1Cmp`).
+                    let mut new_smem = if self.smem.s == 1 {
+                        fm.forward_ext_s1(self.smem, aj as usize)
+                    } else {
+                        fm.forward_ext(self.smem, aj as usize)
+                    };
                     new_smem.n = self.j as u32;
 
                     self.prev[self.num_prev] = self.smem;
