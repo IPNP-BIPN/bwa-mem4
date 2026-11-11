@@ -2970,6 +2970,15 @@ fn pe_read_batches(
             if batch.is_empty() {
                 break;
             }
+            // nt4 in place, as bwa does in `mem_kernel1_core`; nothing downstream reads the ASCII
+            // bases of a pair. Here rather than on the pool, where it ran at ~14% occupancy (1.3% of
+            // the wall at -t8): this thread waits on the hand-off anyway, so it costs no wall.
+            let mut batch = batch;
+            for (rec1, rec2) in batch.iter_mut() {
+                for base in rec1.seq_mut().iter_mut().chain(rec2.seq_mut()) {
+                    *base = dna::nt4(*base);
+                }
+            }
             let n = batch.len() as u64;
             if tx.send((batch, base_pair)).is_err() {
                 break;
@@ -3023,21 +3032,8 @@ fn run_pe(
     // path; primary marking and pairing happen later, per bwa-mem2.
     // `batch` is one `-K` worth of read PAIRS in input order; `base_pair` is the global id of its
     // first pair. Returns the batch's complete SAM text.
-    let process = |mut batch: Vec<(Record, Record)>, base_pair: u64| -> Vec<Vec<u8>> {
-        // ---- nt4 in place, as bwa does (`mem_kernel1_core`, under `kt_for`) ----
-        // Nothing downstream reads the ASCII bases of a pair, and a second, separately allocated
-        // copy of every base held for the whole batch cost ~85 MB per 80M-base batch.
-        stage_time::measure(Stage::Encode, || {
-            stage_time::barrier::region(Stage::Encode, || {
-                batch.par_iter_mut().for_each(|(rec1, rec2)| {
-                    stage_time::barrier::worker(|| {
-                        for base in rec1.seq_mut().iter_mut().chain(rec2.seq_mut()) {
-                            *base = dna::nt4(*base);
-                        }
-                    })
-                })
-            })
-        });
+    let process = |batch: Vec<(Record, Record)>, base_pair: u64| -> Vec<Vec<u8>> {
+        // The bases are nt4 codes already: the reader encoded them (see `pe_read_batches`).
         // Both mates of every pair, interleaved c1,c2,c1,c2,... so the batched extension sees one
         // flat list of reads: index `2i` is pair `i`'s mate 1 and `2i+1` its mate 2.
         let all_codes: Vec<&[u8]> = batch
