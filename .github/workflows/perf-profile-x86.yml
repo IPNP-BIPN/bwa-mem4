@@ -551,4 +551,31 @@ jobs:
           for (f, ln), ir in c.most_common(100):
               print(f"{ir:14d} {f.split('/bwa-mem4/bwa-mem4/')[-1]}:{ln}")
           PY
+            # The same per line, inside the seeding drivers only (their inlined code included).
+            echo "===== $arm: instructions by source line in the seeding drivers ====="
+            python3 - "$arm.cg" <<'PY'
+          import sys, collections, re
+          want = re.compile(r"mem_collect_smem_batched|getSMEMs|bwtSeedStrategy|mem_kernel1_core|ls_advance|bsd_")
+          c = collections.Counter(); fn = collections.Counter(); fl = f = g = "?"; skip = False
+          for l in open(sys.argv[1]):
+              if l[:1].isdigit():
+                  if skip:
+                      skip = False
+                      continue
+                  if want.search(g):
+                      t = l.split()
+                      c[(f, int(t[0]))] += int(t[1]); fn[g] += int(t[1])
+              elif l.startswith("fl="):
+                  fl = f = l[3:].strip()
+              elif l.startswith(("fi=", "fe=")):
+                  f = l[3:].strip()
+              elif l.startswith("fn="):
+                  g = l[3:].strip(); f = fl  # a function's own lines are in its `fl=` file
+              elif l.startswith("calls="):
+                  skip = True
+          for g, ir in fn.most_common(10):
+              print(f"{ir:14d} fn {g[:120]}")
+          for (f, ln), ir in c.most_common(150):
+              print(f"{ir:14d} {f.split('/bwa-mem4/bwa-mem4/')[-1]}:{ln}")
+          PY
           done
