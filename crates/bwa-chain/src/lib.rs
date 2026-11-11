@@ -445,16 +445,17 @@ pub struct RepeatedRun {
 /// - `positions`: output, **appended to** (never cleared), so a caller can accumulate across many
 ///   reads before one batched `get_sa` call. Each pushed value is a suffix-array ROW (`p.k + k`), not
 ///   yet a reference position.
-///
-/// # Returns
-/// One count per SMEM, in the post-sort SMEM order: how many rows that SMEM appended to `positions`.
-/// Each count is in `1 ..= max_occ` (a SMEM always has `s >= 1`).
+/// - `counts`: output, **appended to** like `positions`: one count per SMEM, in the post-sort SMEM
+///   order (so `smems.len()` of them), how many rows that SMEM appended to `positions`. Each count is
+///   in `1 ..= max_occ` (a SMEM always has `s >= 1`). One flat list for a whole batch spares a
+///   vector per read.
 pub fn sa_positions_for_read(
     opt: &MemOpt,
     smems: &mut Vec<bwa_index::Smem>,
     positions: &mut Vec<i64>,
     repeats: &mut Vec<RepeatedRun>,
-) -> Vec<i64> {
+    counts: &mut Vec<i64>,
+) {
     // bwa sorts the whole batch's SMEMs with `compare_smem` = (rid, m, n) ascending (`sortSMEMs`,
     // via `FMI_search.cpp:987`). Within one read `rid` is constant, so packing `(m, n)` into a single
     // u64 key (`m` in the high half, `n` in the low half, both u32) yields the same permutation. It
@@ -571,7 +572,7 @@ pub fn sa_positions_for_read(
     }
     let first_row = positions.len();
     runs.clear();
-    let mut counts: Vec<i64> = Vec::with_capacity(smems.len());
+    counts.reserve(smems.len());
     // The last SMEM whose rows were actually enumerated for walking, and where its run starts. A
     // duplicate does not replace it, so a run of identical SMEMs all point at the first.
     let mut previous: Option<(bwa_index::Smem, usize)> = None;
@@ -670,7 +671,6 @@ pub fn sa_positions_for_read(
         chain_time::SA_DUP_ROWS.fetch_add(dups as u64, std::sync::atomic::Ordering::Relaxed);
     }
     SCRATCH.set(scratch);
-    counts
 }
 
 /// An unstrided run of rows pushed for one SMEM: rows `k .. k + count` at `positions[start..]`.
@@ -755,7 +755,13 @@ mod repeat_tests {
                 smems[1] = smems[0];
             }
             let (mut positions, mut repeats) = (Vec::new(), Vec::new());
-            sa_positions_for_read(&opt, &mut smems, &mut positions, &mut repeats);
+            sa_positions_for_read(
+                &opt,
+                &mut smems,
+                &mut positions,
+                &mut repeats,
+                &mut Vec::new(),
+            );
             // A stand-in for the SA: any injective function of the row.
             let walk = |row: i64| {
                 if row < 0 {
@@ -888,7 +894,8 @@ pub fn build_chains_from_smems(
     // `bwa-mem4-mem` is), so it walks every row and discards the repeat list rather than carrying
     // the copy machinery for one read's worth of rows.
     let mut repeats: Vec<RepeatedRun> = Vec::new();
-    let counts = sa_positions_for_read(opt, &mut smems, &mut positions, &mut repeats);
+    let mut counts: Vec<i64> = Vec::new();
+    sa_positions_for_read(opt, &mut smems, &mut positions, &mut repeats, &mut counts);
     // Output buffer for the resolved 2L-space REFERENCE positions, one per row, same index.
     let mut rbegs = vec![0i64; positions.len()];
     // `Some(start instant)` only under `BWA4_CHAIN_TIME=1`; `None` (and zero cost) otherwise.

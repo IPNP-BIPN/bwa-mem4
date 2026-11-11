@@ -970,22 +970,23 @@ fn align_reads_batched_inner<B: SwBackend>(
     // path) or falls back to per-read calls. A/B switch only: both produce identical positions.
     let batched_sa = std::env::var_os("BWA4_SA_PER_READ").is_none();
     // `all_positions`: every read's SA-interval offsets concatenated, in read order then SMEM order,
-    // ready for one lockstep `get_sa_batch`. `per_read_counts`: per read, how many positions each of
-    // its SMEMs contributed, which is what lets the chain builder re-split the flat result. Both are
-    // left empty on the per-read fallback path, where nothing reads them.
+    // ready for one lockstep `get_sa_batch`. `all_counts`: how many positions each SMEM contributed,
+    // flat in the same order (a read's run is `smems.len()` long), which is what lets the chain
+    // builder re-split the flat result. Both are left empty on the per-read fallback path, where
+    // nothing reads them.
     // Filled by the position walk below when the batched path runs; empty otherwise.
     let mut sa_repeats: Vec<bwa_chain::RepeatedRun> = Vec::new();
-    let (all_positions, per_read_counts): (Vec<i64>, Vec<Vec<i64>>) = if batched_sa {
+    let (all_positions, all_counts): (Vec<i64>, Vec<i64>) = if batched_sa {
         #[cfg(feature = "stage-alloc")]
         let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SA);
         let mut pos = Vec::new();
         // Runs of rows that repeat an earlier run exactly, because two adjacent SMEMs are identical
         // after the sort. Collected here and consumed by the resolution below; see `RepeatedRun`.
         let mut repeats = Vec::new();
-        let counts = per_read_smems
-            .iter_mut()
-            .map(|smems| bwa_chain::sa_positions_for_read(opt, smems, &mut pos, &mut repeats))
-            .collect();
+        let mut counts = Vec::new();
+        for smems in &mut per_read_smems {
+            bwa_chain::sa_positions_for_read(opt, smems, &mut pos, &mut repeats, &mut counts);
+        }
         sa_repeats = repeats;
         (pos, counts)
     } else {
@@ -1146,6 +1147,8 @@ fn align_reads_batched_inner<B: SwBackend>(
     // body: it points at the first resolved position belonging to that read, and it advances by that
     // read's total position count. Only meaningful on the batched path.
     let mut sa_cursor = 0usize;
+    // Where this read's run of `all_counts` starts.
+    let mut count_cursor = 0usize;
 
     // Build and filter each read's chains from the (now resolved) SMEM occurrences.
     // One entry per read, in `reads` order: the chains that survive `mem_chain_flt`, each holding
@@ -1154,14 +1157,14 @@ fn align_reads_batched_inner<B: SwBackend>(
     let _chain_tag = alloc_probe::enter(alloc_probe::B_ALIGN_CHAIN);
     let per_read_chains: Vec<Vec<MemChain>> = per_read_smems
         .into_iter()
-        .enumerate()
         .zip(reads.iter())
-        .map(|((ridx, smems), codes)| {
+        .map(|(smems, codes)| {
             // `counts`: positions contributed by each of this read's SMEMs. `n`: their total, i.e.
             // how far `sa_cursor` must advance. `rbegs`: this read's own slice of the flat
             // resolved-position array, in the order the chain builder expects.
             let resolved = batched_sa.then(|| {
-                let counts = &per_read_counts[ridx];
+                let counts = &all_counts[count_cursor..count_cursor + smems.len()];
+                count_cursor += smems.len();
                 let n: usize = counts.iter().map(|c| *c as usize).sum();
                 let rbegs = &all_rbegs[sa_cursor..sa_cursor + n];
                 sa_cursor += n;
