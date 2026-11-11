@@ -1661,6 +1661,52 @@ pub fn ks_introsort_by_key<T: Clone, K: Copy>(
     std::mem::swap(a, spare);
 }
 
+/// Index bits of a [`ks_introsort_by_u40_key`] slot; the key takes the 40 above them.
+const PACK_IX_BITS: u32 = 24;
+
+/// [`ks_introsort_by_key`] for `i64` keys in `[0, 2^40)` ordered by `<`, with key and index packed into one
+/// `u64` (`key << 24 | index`). Same array out. Distinct packed words have one sorted order, and
+/// `sort_unstable` sorts 8-byte words with branchless networks where a `(key, u32)` pair takes the
+/// general path; a sorted run with two equal keys is rebuilt and takes the exact introsort on the
+/// key bits, the same `lt` outcomes as the pair version. A key outside `[0, 2^40)`, or more than
+/// 2^24 elements, falls back to the direct sort.
+pub fn ks_introsort_by_u40_key<T: Clone>(
+    a: &mut Vec<T>,
+    perm: &mut Vec<u64>,
+    spare: &mut Vec<T>,
+    key: impl Fn(&T) -> i64,
+) {
+    let n = a.len();
+    let fits = n < 1 << PACK_IX_BITS
+        && a.iter()
+            .all(|e| (0..1 << (64 - PACK_IX_BITS)).contains(&key(e)));
+    if n <= INDIRECT_SORT_MIN || !fits {
+        ks_introsort_by(a.as_mut_slice(), |x, y| key(x) < key(y));
+        return;
+    }
+    let pack = |perm: &mut Vec<u64>| {
+        perm.clear();
+        perm.extend(
+            a.iter()
+                .enumerate()
+                .map(|(i, e)| (key(e) as u64) << PACK_IX_BITS | i as u64),
+        );
+    };
+    pack(perm);
+    perm.sort_unstable();
+    if perm
+        .windows(2)
+        .any(|w| w[0] >> PACK_IX_BITS == w[1] >> PACK_IX_BITS)
+    {
+        pack(perm);
+        ks_introsort_by(perm, |x, y| x >> PACK_IX_BITS < y >> PACK_IX_BITS);
+    }
+    let ix = |w: u64| (w & ((1 << PACK_IX_BITS) - 1)) as usize;
+    spare.clear();
+    spare.extend(perm.iter().map(|&w| a[ix(w)].clone()));
+    std::mem::swap(a, spare);
+}
+
 /// Filter chains for a single read: drop light chains, then prune overlapping ones. Port of
 /// `mem_chain_flt` (`bwamem.cpp:506`), restricted to one `seqid` group.
 ///
@@ -2027,6 +2073,33 @@ mod tests {
                 let (mut perm, mut spare) = (Vec::new(), Vec::new());
                 ks_introsort_by_key(&mut indirect, &mut perm, &mut spare, |e| e.0, |x, y| x < y);
                 assert_eq!(direct, indirect, "n={n}, keys mod {modulus}");
+            }
+        }
+    }
+
+    /// The packed-word version gives the direct sort's array too, ties and big keys included.
+    #[test]
+    fn u40_sort_matches_direct() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 20
+        };
+        for &n in &[0usize, 1, 2, 16, 17, 33, 64, 105, 200, 1000] {
+            for &modulus in &[3u64, 8, 1000, 1 << 40, 1 << 44] {
+                // Shifted down by 2 on the widest range, so some keys are negative.
+                let shift = if modulus == 1 << 44 { 2 } else { 0 };
+                let orig: Vec<(i64, u32)> = (0..n)
+                    .map(|i| ((next() % modulus) as i64 - shift, i as u32))
+                    .collect();
+                let mut direct = orig.clone();
+                ks_introsort_by(&mut direct, |x, y| x.0 < y.0);
+                let mut packed = orig.clone();
+                let (mut perm, mut spare) = (Vec::new(), Vec::new());
+                ks_introsort_by_u40_key(&mut packed, &mut perm, &mut spare, |e| e.0);
+                assert_eq!(direct, packed, "n={n}, keys mod {modulus}");
             }
         }
     }

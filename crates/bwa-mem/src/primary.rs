@@ -77,7 +77,7 @@
 //! out and leaves an empty one behind, which is how a stage rebuilds its input in place without
 //! cloning it or leaving a half-valid value visible.
 
-use bwa_chain::{ks_introsort_by, ks_introsort_by_key};
+use bwa_chain::{ks_introsort_by, ks_introsort_by_key, ks_introsort_by_u40_key};
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 
@@ -450,8 +450,8 @@ mod sort_scratch {
     use super::MemAlnReg;
     use std::cell::RefCell;
 
-    /// Pass 1a's permutation: `re` and the index of the region it came from.
-    type PermRe = Vec<(i64, u32)>;
+    /// Pass 1a's permutation: `re << 24 | index` (see `ks_introsort_by_u40_key`).
+    type PermRe = Vec<u64>;
     /// Pass 3's permutation: the sort key and the index of the region it came from.
     ///
     /// The key's SHAPE is per-architecture, and that is measured rather than assumed. See the sort
@@ -533,7 +533,7 @@ pub fn mem_sort_dedup_patch(
     let _t1 = crate::rescue_split::start();
     sort_scratch::PERM_RE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
-            ks_introsort_by_key(&mut a, perm, spare, |r| r.re, |x, y| x < y);
+            ks_introsort_by_u40_key(&mut a, perm, spare, |r| r.re);
         });
     });
     crate::rescue_split::stop(&crate::rescue_split::T_SORT1, _t1);
