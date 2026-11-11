@@ -191,6 +191,12 @@ fn br_dyn() -> bool {
     *ON.get_or_init(|| std::env::var_os("BWA4_BR_DYN").is_some())
 }
 
+/// Probe `BWA4_BR_FLAT`: [`FmIndex::backward_round`]'s survivor loop without a branch.
+fn br_flat() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_BR_FLAT").is_some())
+}
+
 /// The rows strictly before offset `y` in a block: the top `y` bits. `y == 0` gives 0, which is why
 /// the shift is the complement of an all-ones right shift rather than a left shift by `64 - y`.
 #[inline(always)]
@@ -1876,6 +1882,22 @@ impl FmIndex {
             let end = base.add(n);
             let mut r = base.add(p);
             let mut w = base.add(kept);
+            if br_flat() {
+                // Probe: no branch on the survivor test. Each candidate is written at the head
+                // whether kept or not (`w <= r`: a slot not kept is overwritten by the next
+                // survivor or lies past the count returned), and both its rows are hinted.
+                while r < end {
+                    let c = *r;
+                    let (k, s) = self.konly_hoisted::<WIDE>(cp, &c, a, a0, count_a, hx, lx);
+                    let keep = (s >= min_intv) & (s != curr_s);
+                    *w = Smem { k, s, m, ..c };
+                    w = w.add(usize::from(keep));
+                    curr_s = std::hint::select_unpredictable(keep, s, curr_s);
+                    self.prefetch_occ(k, k + s);
+                    r = r.add(1);
+                }
+                return w.offset_from(base) as usize;
+            }
             while r < end {
                 let (k, s) = self.konly_hoisted::<WIDE>(cp, &*r, a, a0, count_a, hx, lx);
                 if s >= min_intv && s != curr_s {
