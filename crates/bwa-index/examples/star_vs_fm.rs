@@ -150,7 +150,6 @@ fn main() {
     // level and ends at 4^K entries.
     let mut level: Vec<Smem> = (0..4)
         .map(|a| Smem {
-            rid: 0,
             m: 0,
             n: 0,
             k: c[a],
@@ -306,7 +305,6 @@ fn main() {
             .map(|q| {
                 let a = q[0] as usize;
                 Smem {
-                    rid: 0,
                     m: 0,
                     n: 0,
                     k: c[a],

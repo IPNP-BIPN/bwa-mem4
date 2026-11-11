@@ -99,9 +99,6 @@ pub fn sa_untag(t: i64) -> i64 {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Smem {
-    /// Read index within the batch this SMEM came from. Not a reference contig id (that is `rid`
-    /// in the bntseq sense); the name is inherited from the C's `SMEM.rid`.
-    pub rid: u32,
     /// Start offset of the match in the read, inclusive.
     pub m: u32,
     /// End offset of the match in the read, inclusive in bwa's usage. `n - m + 1` is the match
@@ -1242,7 +1239,6 @@ impl FmIndex {
                         } else {
                             let ext = self.backward_ext(
                                 Smem {
-                                    rid: 0,
                                     m: 0,
                                     n: 0,
                                     k: p.l,
@@ -1601,7 +1597,6 @@ impl FmIndex {
     #[inline]
     pub fn full_interval(&self) -> Smem {
         Smem {
-            rid: 0,
             m: 0,
             n: 0,
             k: 0,
@@ -2599,7 +2594,6 @@ mod tests {
             let bases: Vec<usize> = (0..d).map(|_| next(4) as usize).collect();
             let code = bases.iter().fold(0u32, |c, &b| c << 2 | b as u32);
             let mut cur = Smem {
-                rid: 0,
                 m: 0,
                 n: 0,
                 k: count[bases[0]],
@@ -2650,7 +2644,6 @@ mod tests {
                 s,
                 m: 3,
                 n: 9,
-                ..Default::default()
             };
             for aj in 0..4 {
                 let mut rc = smem;

@@ -889,7 +889,6 @@ impl LsSlot {
                     // that base, `l` the first row of its complement (the RC-side interval, which makes
                     // the later k/l swap valid), `s` the number of times the base occurs in the 2L text.
                     self.smem = Smem {
-                        rid: 0,
                         m: self.x as u32,
                         n: self.x as u32,
                         k: counts[a],
@@ -940,7 +939,6 @@ impl LsSlot {
                         let j = self.x + d - 1;
                         self.next_x = j + 1;
                         let new_smem = Smem {
-                            rid: 0,
                             m: self.x as u32,
                             n: j as u32,
                             k: e.k,
@@ -1252,7 +1250,6 @@ fn smems_from_pos(
     // The interval currently being extended. Right now it is the interval of the one-base pattern
     // `codes[x]`; the forward loop grows it rightwards one base per iteration.
     let mut smem = Smem {
-        rid: 0,
         m: x as u32,
         n: x as u32,
         k: counts[a],
@@ -1468,7 +1465,6 @@ fn bwt_seed_strategy(
             let a = codes[x] as usize;
             // Single-base interval at `x`, grown rightwards only (round 3 has no backward phase).
             let mut smem = Smem {
-                rid: 0,
                 m: x as u32,
                 n: x as u32,
                 k: counts[a],
@@ -1582,7 +1578,6 @@ impl BwtSeedSlot {
         if let Some(r) = walks.get(self.ridx).filter(|r| r.x > 0) {
             if r.s > 0 {
                 self.out.push(Smem {
-                    rid: 0,
                     m: 0,
                     n: r.n,
                     k: r.k,
@@ -1646,7 +1641,6 @@ impl BwtSeedSlot {
                 // Single-base interval at `x`: `k` the first BWT ROW starting with that base, `l` the
                 // first row of its complement, `s` the base's occurrence count in the 2L text.
                 self.smem = Smem {
-                    rid: 0,
                     m: self.x as u32,
                     n: self.x as u32,
                     k: counts[a],
@@ -1677,7 +1671,6 @@ impl BwtSeedSlot {
                 // The walk's state after its first `jd - 1` forward steps, `next_x` included.
                 let e = fm.seed_jump(self.jd, self.jcode);
                 self.smem = Smem {
-                    rid: 0,
                     m: self.x as u32,
                     n: (self.x + self.jd - 1) as u32,
                     k: e.k,
@@ -2366,8 +2359,8 @@ mod tests {
     /// # Returns
     /// The brute-force occurrence count, which must equal the FM interval's `s`.
     /// An SMEM without its `l`, which the production walks do not maintain (see `backward_ext_konly`).
-    fn sans_l(s: &Smem) -> (u32, u32, u32, i64, i64) {
-        (s.rid, s.m, s.n, s.k, s.s)
+    fn sans_l(s: &Smem) -> (u32, u32, i64, i64) {
+        (s.m, s.n, s.k, s.s)
     }
 
     fn naive_occ(reference: &[u8], pat: &[u8]) -> i64 {

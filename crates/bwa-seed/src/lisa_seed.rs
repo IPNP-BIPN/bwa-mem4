@@ -152,7 +152,6 @@ fn smems_from_pos_lsa(
     // `k` is its SA row start, `s` its occurrence count. `l` stays 0 (the FM path's RC start, unused
     // here). Reassigned at the end of each accepted forward step.
     let mut smem = Smem {
-        rid: 0,
         m: x as u32,
         n: x as u32,
         k: lo as i64,
@@ -181,7 +180,6 @@ fn smems_from_pos_lsa(
         let (nlo, nhi) = lsa.narrow(lo, hi, j - x, aj);
         // Candidate for the one-base-longer span `codes[x..=j]`.
         let new_smem = Smem {
-            rid: 0,
             m: x as u32,
             n: j as u32,
             k: nlo as i64,
@@ -246,7 +244,6 @@ fn smems_from_pos_lsa(
             // forward phase there is no incremental `narrow`. `k` is an SA ROW, `s` a count.
             let (k, s) = interval_of(lsa, codes, jj as usize, sm.n as usize);
             let new_smem = Smem {
-                rid: 0,
                 m: jj as u32,
                 n: sm.n,
                 k,
@@ -278,7 +275,6 @@ fn smems_from_pos_lsa(
             let sm = prev[p];
             let (k, s) = interval_of(lsa, codes, jj as usize, sm.n as usize);
             let new_smem = Smem {
-                rid: 0,
                 m: jj as u32,
                 n: sm.n,
                 k,
@@ -402,7 +398,6 @@ fn forward_lem(
 #[inline]
 fn push_smem(out: &mut Vec<Smem>, lo: usize, hi: usize, m: usize, n: usize) {
     out.push(Smem {
-        rid: 0,
         m: m as u32,
         n: n as u32,
         k: lo as i64,
@@ -849,7 +844,6 @@ fn bwt_seed_strategy_lsa(
                 // Occurrence count of the one-base-longer span, non-increasing in span length.
                 let s = (nhi - nlo) as i64;
                 let smem = Smem {
-                    rid: 0,
                     m: x as u32,
                     n: j as u32,
                     k: nlo as i64,

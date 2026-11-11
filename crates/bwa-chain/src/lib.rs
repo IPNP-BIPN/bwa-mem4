@@ -735,7 +735,6 @@ mod repeat_tests {
                     let s = 1 + next(if wide { 30 } else { 8 }) as i64;
                     let m = next(20) as u32;
                     bwa_index::Smem {
-                        rid: 0,
                         m,
                         n: m + 19 + next(10) as u32,
                         k,
@@ -2323,7 +2322,6 @@ mod tests {
                 let n = m + 18 + (next() % 60) as u32;
                 let c = 1 + next() % 4;
                 smems.push(bwa_index::Smem {
-                    rid: 0,
                     m,
                     n,
                     ..Default::default()

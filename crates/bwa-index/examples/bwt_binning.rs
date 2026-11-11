@@ -85,7 +85,6 @@ fn pass(fm: &FmIndex, pos: &[i64], c: &[i64; 5]) -> i64 {
             // so the extension reads exactly the checkpoint blocks around `p`. `rid`/`m`/`n` are the
             // read id and query span, unused here and left 0.
             let s = Smem {
-                rid: 0,
                 m: 0,
                 n: 0,
                 k: p,
