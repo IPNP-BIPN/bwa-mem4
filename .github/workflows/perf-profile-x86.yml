@@ -174,6 +174,15 @@ jobs:
           n="${{ github.event.inputs.read_pairs || '1000000' }}"
           wgsim -S 11 -N "$n" -1 150 -2 150 chr21.fa sim1.fq sim2.fq > /dev/null
           echo "simulated: $n pairs"
+          # `real`: head-to-head's HG002 slice (real repeats and error profile; SMEM weighs far
+          # more than on wgsim reads).
+          if [ "${{ github.event.inputs.read_set || 'sim' }}" = real ]; then
+            bam="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/NIST_HiSeq_HG002_Homogeneity-10953946/NHGRI_Illumina300X_AJtrio_novoalign_bams/HG002.GRCh38.300x.bam"
+            samtools view -@ 4 -b -s 0.5 "$bam" chr21:20000000-30000000 > slice.bam
+            samtools collate -@ 4 -u -O slice.bam \
+              | samtools fastq -@ 4 -1 real1.fq -2 real2.fq -0 /dev/null -s /dev/null -n
+            echo "real: $(( $(wc -l < real1.fq) / 4 )) pairs"
+          fi
 
       - name: Record both binaries
         shell: bash -el {0}
