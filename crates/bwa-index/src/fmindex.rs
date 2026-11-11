@@ -185,18 +185,6 @@ const fn sa_hi_log2_bits(ref_seq_len: i64) -> u32 {
     }
 }
 
-/// Probe `BWA4_BR_DYN`: [`FmIndex::backward_round`] without the per-base copies.
-fn br_dyn() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_BR_DYN").is_some())
-}
-
-/// Probe `BWA4_BR_FLAT`: [`FmIndex::backward_round`]'s survivor loop without a branch.
-fn br_flat() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_BR_FLAT").is_some())
-}
-
 /// The rows strictly before offset `y` in a block: the top `y` bits. `y == 0` gives 0, which is why
 /// the shift is the complement of an all-ones right shift rather than a left shift by `64 - y`.
 #[inline(always)]
@@ -1670,12 +1658,11 @@ impl FmIndex {
     /// [`occ_in`](Self::occ_in) for [`backward_round`](Self::backward_round), with `a`'s plane masks
     /// (`hx`, `lx`, each all ones where `a` has that bit clear) computed once by the caller.
     #[inline(always)]
-    fn occ_hoisted<const WIDE: bool>(
+    fn occ_hoisted<const WIDE: bool, const A0: bool>(
         &self,
         cp: &[CpOcc],
         pp: i64,
         a: usize,
-        a0: bool,
         hx: u64,
         lx: u64,
     ) -> i64 {
@@ -1702,27 +1689,25 @@ impl FmIndex {
         };
         #[cfg(not(target_arch = "aarch64"))]
         let rows = ((b.hi ^ hx) & (b.lo ^ lx) & rows_before(pp & CP_MASK)).count_ones();
-        self.occ_from_rows::<WIDE>(b, pp, a, a0, rows)
+        self.occ_from_rows::<WIDE, A0>(b, pp, a, rows)
     }
 
     /// [`occ_hoisted`](Self::occ_hoisted)'s count from its block `b` and the popcount `rows` of
     /// base `a`'s rows before `pp` in it.
     #[inline(always)]
-    fn occ_from_rows<const WIDE: bool>(
+    fn occ_from_rows<const WIDE: bool, const A0: bool>(
         &self,
         b: &CpOcc,
         pp: i64,
         a: usize,
-        a0: bool,
         rows: u32,
     ) -> i64 {
         let mut o = i64::from(b.cp_count[a]) + i64::from(rows);
         if WIDE {
             o += self.count_base[(pp >> self.count_span_shift) as usize][a];
         }
-        // The sentinel row is stored as an `A`, so only base 0 needs the correction (`a0`). `&`, not
-        // `&&`: a run-time `a0` is a random base, the block test is almost never true.
-        if a0 & (pp >> CP_SHIFT == self.sentinel_block) {
+        // The sentinel row is stored as an `A`, so only base 0 needs the correction (`A0`).
+        if A0 && pp >> CP_SHIFT == self.sentinel_block {
             o -= self.sentinel_before(pp, a);
         }
         o
@@ -1731,13 +1716,11 @@ impl FmIndex {
     /// [`backward_ext_konly`](Self::backward_ext_konly)'s new `k` and `s` for
     /// [`backward_round`](Self::backward_round), on the caller's hoisted values.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn konly_hoisted<const WIDE: bool>(
+    fn konly_hoisted<const WIDE: bool, const A0: bool>(
         &self,
         cp: &[CpOcc],
         c: &Smem,
         a: usize,
-        a0: bool,
         count_a: i64,
         hx: u64,
         lx: u64,
@@ -1754,24 +1737,24 @@ impl FmIndex {
                 let rows = (x & rows_before(y)).count_ones();
                 // MSB-first: row `y` is bit `63 - y`.
                 (
-                    self.occ_from_rows::<WIDE>(b, c.k, a, a0, rows),
+                    self.occ_from_rows::<WIDE, A0>(b, c.k, a, rows),
                     (x << y) >> 63 == 1,
                 )
             };
             #[cfg(target_arch = "aarch64")]
             let (o, hit) = (
-                self.occ_hoisted::<WIDE>(cp, c.k, a, a0, hx, lx),
+                self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx),
                 Self::base_at(b, c.k) == a,
             );
             (
                 count_a + o,
-                i64::from(hit & (!a0 | (c.k != self.sentinel_index))),
+                i64::from(hit && (!A0 || c.k != self.sentinel_index)),
             )
         } else {
-            let o = self.occ_hoisted::<WIDE>(cp, c.k, a, a0, hx, lx);
+            let o = self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx);
             (
                 count_a + o,
-                self.occ_hoisted::<WIDE>(cp, c.k + c.s, a, a0, hx, lx) - o,
+                self.occ_hoisted::<WIDE, A0>(cp, c.k + c.s, a, hx, lx) - o,
             )
         }
     }
@@ -1808,16 +1791,8 @@ impl FmIndex {
         // PE. Per base: x86 kept `a`, both masks, `min_intv` and the survivor count on the stack,
         // reloaded every candidate.
         macro_rules! go {
-            ($w:literal, $a0:expr, $a:expr) => {
-                self.backward_round_impl::<$w>($a, $a0, prev, m, min_intv, min_seed_len, out)
-            };
-        }
-        if br_dyn() {
-            // Probe: one copy per index kind with `a` at run time, no jump on a random base.
-            return if self.wide {
-                go!(true, a == 0, a)
-            } else {
-                go!(false, a == 0, a)
+            ($w:literal, $a0:literal, $a:literal) => {
+                self.backward_round_impl::<$w, $a0, $a>(prev, m, min_intv, min_seed_len, out)
             };
         }
         match (self.wide, a) {
@@ -1832,19 +1807,17 @@ impl FmIndex {
         }
     }
 
-    /// [`backward_round`](Self::backward_round) for base `a` (`a0` is `a == 0`).
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn backward_round_impl<const WIDE: bool>(
+    /// [`backward_round`](Self::backward_round) for base `A` (`A0` is `A == 0`).
+    #[inline]
+    fn backward_round_impl<const WIDE: bool, const A0: bool, const A: usize>(
         &self,
-        a: usize,
-        a0: bool,
         prev: &mut [Smem],
         m: u32,
         min_intv: i64,
         min_seed_len: i64,
         out: &mut Vec<Smem>,
     ) -> usize {
+        let a = A;
         let hx = ((a as u64 >> 1) & 1).wrapping_sub(1);
         let lx = (a as u64 & 1).wrapping_sub(1);
         let count_a = self.count[a];
@@ -1857,7 +1830,7 @@ impl FmIndex {
         while p < n {
             let c = prev[p];
             p += 1;
-            let (k, s) = self.konly_hoisted::<WIDE>(cp, &c, a, a0, count_a, hx, lx);
+            let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &c, a, count_a, hx, lx);
             if s >= min_intv {
                 curr_s = s;
                 prev[0] = Smem { k, s, m, ..c };
@@ -1882,24 +1855,8 @@ impl FmIndex {
             let end = base.add(n);
             let mut r = base.add(p);
             let mut w = base.add(kept);
-            if br_flat() {
-                // Probe: no branch on the survivor test. Each candidate is written at the head
-                // whether kept or not (`w <= r`: a slot not kept is overwritten by the next
-                // survivor or lies past the count returned), and both its rows are hinted.
-                while r < end {
-                    let c = *r;
-                    let (k, s) = self.konly_hoisted::<WIDE>(cp, &c, a, a0, count_a, hx, lx);
-                    let keep = (s >= min_intv) & (s != curr_s);
-                    *w = Smem { k, s, m, ..c };
-                    w = w.add(usize::from(keep));
-                    curr_s = std::hint::select_unpredictable(keep, s, curr_s);
-                    self.prefetch_occ(k, k + s);
-                    r = r.add(1);
-                }
-                return w.offset_from(base) as usize;
-            }
             while r < end {
-                let (k, s) = self.konly_hoisted::<WIDE>(cp, &*r, a, a0, count_a, hx, lx);
+                let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
                 if s >= min_intv && s != curr_s {
                     curr_s = s;
                     *w = Smem { k, s, m, ..*r };
@@ -1977,8 +1934,8 @@ impl FmIndex {
                 before + i64::from((plane & rows_before(row & CP_MASK)).count_ones())
             };
             let (sp, ep) = (smem.l, smem.l + smem.s);
-            let kc = self.occ_hoisted::<false>(cp, sp, c, true, hx, lx);
-            let sc = self.occ_hoisted::<false>(cp, ep, c, true, hx, lx) - kc;
+            let kc = self.occ_hoisted::<false, true>(cp, sp, c, hx, lx);
+            let sc = self.occ_hoisted::<false, true>(cp, ep, c, hx, lx) - kc;
             let so = i64::from((sp <= self.sentinel_index) & (ep > self.sentinel_index));
             return Smem {
                 k: smem.k + so + gt(ep) - gt(sp),
