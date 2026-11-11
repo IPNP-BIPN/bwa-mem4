@@ -1083,8 +1083,10 @@ pub(crate) mod neon {
             fit(&mut self.h, RING * hs * L);
             fit(&mut self.e, (w + 9) * L);
             fit(&mut self.r, nrp * L);
-            // All of it: a row reads the row above's cells past that row's own top, never written.
-            self.h[..RING * hs * L].fill(0);
+            // Only row -1's slot (the DP's zero row). A row reads the row above at most one cell
+            // past that row's top (the band climbs a diagonal per row): each step zeroes that cell
+            // itself, after the last row it computed.
+            self.h[(RING - 1) * hs * L..RING * hs * L].fill(0);
             self.e[..(w + 9) * L].fill(0);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
@@ -1339,6 +1341,8 @@ pub(crate) mod neon {
                     finish_row!(r + 1, rmax1, rref1);
                     finish_row!(r + 2, rmax2, rref2);
                     finish_row!(r + 3, rmax3, rref3);
+                    // Row `r + 4` reads row `r + 3` up to `khi + 4`; row `r + 3` wrote up to `khi + 3`.
+                    vst1q_u8(hc.offset((khi + 4).max(0) as isize * li), zero);
                     r += 4;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
@@ -1370,6 +1374,7 @@ pub(crate) mod neon {
                         step1!(true);
                     }
                     finish_row!(r, rmax, rref);
+                    vst1q_u8(hc.offset((khi + 1).max(0) as isize * li), zero);
                     r += 1;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
@@ -1506,8 +1511,8 @@ mod avx2 {
             self.h.fit(RING * hs * L, HZ);
             self.e.fit((w + 9) * L, HZ);
             self.r.fit(nrp * L, 0);
-            // All of it: a row reads the row above's cells past that row's own top, never written.
-            self.h[..RING * hs * L].fill(HZ);
+            // Only row -1's slot, as the NEON kernel's.
+            self.h[(RING - 1) * hs * L..RING * hs * L].fill(HZ);
             self.e[..(w + 9) * L].fill(HZ);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
@@ -1780,6 +1785,8 @@ mod avx2 {
                     }
                     finish_row!(r, rmax0, rref0);
                     finish_row!(r + 1, rmax1, rref1);
+                    // Row `r + 2` reads row `r + 1` up to `khi + 2`; row `r + 1` wrote up to `khi + 1`.
+                    st!(hc.offset((khi + 2).max(0) as isize * li), hz);
                     r += 2;
                 } else {
                     if r >= RING {
@@ -1813,6 +1820,7 @@ mod avx2 {
                         step1!(true);
                     }
                     finish_row!(r, rmax, rref);
+                    st!(hc.offset((khi + 1).max(0) as isize * li), hz);
                     r += 1;
                 }
                 if early && _mm256_movemask_epi8(_mm256_cmpgt_epi8(tgt, gmax)) == 0 {
@@ -1953,8 +1961,8 @@ mod avx512 {
             self.h.fit(RING * hs * L, HZ);
             self.e.fit((w + 9) * L, HZ);
             self.r.fit(nrp * L, 0);
-            // All of it: a row reads the row above's cells past that row's own top, never written.
-            self.h[..RING * hs * L].fill(HZ);
+            // Only row -1's slot, as the NEON kernel's.
+            self.h[(RING - 1) * hs * L..RING * hs * L].fill(HZ);
             self.e[..(w + 9) * L].fill(HZ);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
@@ -2208,6 +2216,8 @@ mod avx512 {
                     }
                     finish_row!(r, rmax0, rref0);
                     finish_row!(r + 1, rmax1, rref1);
+                    // Row `r + 2` reads row `r + 1` up to `khi + 2`; row `r + 1` wrote up to `khi + 1`.
+                    st!(hc.offset((khi + 2).max(0) as isize * li), hz);
                     r += 2;
                 } else {
                     if r >= RING {
@@ -2241,6 +2251,7 @@ mod avx512 {
                         step1!(true);
                     }
                     finish_row!(r, rmax, rref);
+                    st!(hc.offset((khi + 1).max(0) as isize * li), hz);
                     r += 1;
                 }
                 if early && _mm512_cmpge_epi8_mask(gmax, tgt) == u64::MAX {
