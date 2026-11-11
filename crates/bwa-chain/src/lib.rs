@@ -424,52 +424,6 @@ pub struct RepeatedRun {
     pub len: usize,
 }
 
-/// Probe `BWA4_SMEM_KEYSORT`: sort a read's SMEMs as packed `(m, n, index)` keys, then gather.
-fn smem_keysort() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_SMEM_KEYSORT").is_some())
-}
-
-/// `smems` stably sorted by `(m, n)`. The keysort path packs `m`, `n` and the index into one u64
-/// (distinct keys, so an unstable sort of them is that stable order) and moves each 40-byte SMEM
-/// once instead of shifting it through an insertion sort.
-fn sort_smems(smems: &mut [bwa_index::Smem]) {
-    if !(smem_keysort() && keysort_smems(smems)) {
-        smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
-    }
-}
-
-/// [`sort_smems`]'s packed-key path; false (and `smems` untouched) when a field does not fit.
-fn keysort_smems(smems: &mut [bwa_index::Smem]) -> bool {
-    const B: u32 = 21;
-    let fits = |x: usize| x < 1 << B;
-    if !fits(smems.len())
-        || !smems
-            .iter()
-            .all(|s| fits(s.m as usize) && fits(s.n as usize))
-    {
-        return false;
-    }
-    thread_local! {
-        static KEYS: std::cell::Cell<(Vec<u64>, Vec<bwa_index::Smem>)> =
-            const { std::cell::Cell::new((Vec::new(), Vec::new())) };
-    }
-    let (mut keys, mut tmp) = KEYS.take();
-    keys.clear();
-    keys.extend(
-        smems
-            .iter()
-            .enumerate()
-            .map(|(i, s)| u64::from(s.m) << (2 * B) | u64::from(s.n) << B | i as u64),
-    );
-    keys.sort_unstable();
-    tmp.clear();
-    tmp.extend(keys.iter().map(|&k| smems[(k & ((1 << B) - 1)) as usize]));
-    smems.copy_from_slice(&tmp);
-    KEYS.set((keys, tmp));
-    true
-}
-
 /// Sort a read's SMEMs into bwa's intra-read order and enumerate every sampled occurrence position
 /// the chain merge will consume, in exactly that order, plus each SMEM's sampled count.
 ///
@@ -512,7 +466,7 @@ pub fn sa_positions_for_read(
     // first and only falls through to `n` when the `m`s are equal. This is the standard way to get a
     // multi-field sort out of a single-key sort, and it is exact rather than approximate because
     // both fields are known to fit in 32 bits.
-    sort_smems(smems);
+    smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
     // `BWA4_SMEM_DUP=1`: how many of this read's SMEMs are EXACT duplicates of the one before them,
     // now that they are sorted. fg-labs/bwa-mem3 compacts those away in `smem_dedup.cpp` before the
     // position walk, on the grounds that they enumerate the same suffix-array rows twice; the
@@ -1984,34 +1938,6 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn keysort_smems_is_the_stable_m_n_sort() {
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = |r: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % r
-        };
-        for len in [0usize, 1, 2, 13, 40, 300] {
-            let v: Vec<bwa_index::Smem> = (0..len)
-                .map(|i| bwa_index::Smem {
-                    rid: 0,
-                    m: next(8) as u32,
-                    n: next(4) as u32,
-                    k: i as i64,
-                    l: 0,
-                    s: 1,
-                })
-                .collect();
-            let mut want = v.clone();
-            want.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
-            let mut got = v.clone();
-            assert!(super::keysort_smems(&mut got));
-            assert_eq!(got, want, "len {len}");
-        }
-    }
-
     /// `insert_inline` is `Vec::insert` for every position and length, odd tails included.
     #[test]
     fn insert_inline_matches_vec_insert() {
