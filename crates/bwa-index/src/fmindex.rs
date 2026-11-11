@@ -2439,7 +2439,7 @@ impl FmIndex {
     /// against text positions `t..` (2L space), ending at the end of `q`, at the end of the text, or
     /// at the first base that differs (a read code of 4 differs from every text base). The same
     /// result as stepping [`base`](Self::base) one position at a time, sixteen bases per compare
-    /// on NEON (fg-labs/bwa-mem3's `ls_text_match`, eight at a time).
+    /// on NEON and SSE2 (fg-labs/bwa-mem3's `ls_text_match`, eight at a time).
     pub fn text_match(&self, q: &[u8], mut j: usize, mut t: i64) -> usize {
         let l_pac = self.l_pac();
         #[cfg(target_arch = "aarch64")]
@@ -2492,6 +2492,61 @@ impl FmIndex {
                     let k = first(ne);
                     if k < 16 {
                         return j + k;
+                    }
+                    j += 16;
+                    t += 16;
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64. Each word load reads pac bytes `[p >> 2, +4)`, checked
+        // against `pac.len()`; each read load is `q[j..j + 16]`, checked against `q.len()`.
+        unsafe {
+            use std::arch::x86_64::*;
+            let pac = &self.pac[..];
+            // The first base of `q[j..j + 16]` that differs from `x`, 16 when none does.
+            let first = |x: __m128i, j: usize| -> u32 {
+                let eq =
+                    _mm_movemask_epi8(_mm_cmpeq_epi8(x, _mm_loadu_si128(q.as_ptr().add(j).cast())));
+                (!eq as u32 & 0xFFFF).trailing_zeros().min(16)
+            };
+            if t < l_pac {
+                // One base at a time to a byte boundary, then sixteen per compare from one word.
+                while t & 3 != 0 && j < q.len() && t < l_pac {
+                    if q[j] != self.base(t) {
+                        return j;
+                    }
+                    j += 1;
+                    t += 1;
+                }
+                while j + 16 <= q.len() && t + 16 <= l_pac && ((t >> 2) as usize) + 4 <= pac.len() {
+                    let w = (pac.as_ptr().add((t >> 2) as usize) as *const u32).read_unaligned();
+                    let k = first(unpack16_x86(w, false), j);
+                    if k < 16 {
+                        return j + k as usize;
+                    }
+                    j += 16;
+                    t += 16;
+                }
+            } else {
+                // Text `t..t + 16` is forward `[2L - t - 16, 2L - t)` reversed and complemented: to
+                // where that range starts on a byte, then sixteen per compare.
+                while (2 * l_pac - t) & 3 != 0 && j < q.len() && t < 2 * l_pac {
+                    if q[j] != self.base(t) {
+                        return j;
+                    }
+                    j += 1;
+                    t += 1;
+                }
+                while j + 16 <= q.len()
+                    && 2 * l_pac - t - 16 >= 0
+                    && (((2 * l_pac - t - 16) >> 2) as usize) + 4 <= pac.len()
+                {
+                    let w = (pac.as_ptr().add(((2 * l_pac - t - 16) >> 2) as usize) as *const u32)
+                        .read_unaligned();
+                    let k = first(unpack16_x86(!w, true), j);
+                    if k < 16 {
+                        return j + k as usize;
                     }
                     j += 16;
                     t += 16;
