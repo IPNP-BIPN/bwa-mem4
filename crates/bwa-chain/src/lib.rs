@@ -1226,7 +1226,7 @@ pub fn build_filtered_chains(
                 is_alt: c.is_alt,
                 first: f.first,
                 frac_rep: frac,
-                seeds: ChainSeeds::from_slice(seeds_of(f.idx as usize)),
+                seeds: seeds_from(seeds_of(f.idx as usize)),
             }
         })
         .collect();
@@ -1241,6 +1241,16 @@ pub fn build_filtered_chains(
         );
     }
     out
+}
+
+/// `ChainSeeds::from_slice`, minus its variable-length `memcpy` call for the inline case: one or
+/// two seeds (96% of kept chains) become plain stores. That call was 0.6% of an EPYC 9V74 run.
+fn seeds_from(s: &[MemSeed]) -> ChainSeeds {
+    match *s {
+        [a] => smallvec::smallvec![a],
+        [a, b] => smallvec::smallvec![a, b],
+        _ => ChainSeeds::from_slice(s),
+    }
 }
 
 /// The fraction of the read covered by SMEMs too repetitive to sample fully (`frac_rep`).
