@@ -1890,6 +1890,8 @@ mod avx512 {
         pub te: [i32; L],
         pub qe: [u8; L],
         pub cells: u64,
+        /// Probe: `BWA4_BAND_ROWS2=1` keeps the two-row step only (A/B of the four-row one).
+        four: bool,
     }
 
     impl Default for Work {
@@ -1907,6 +1909,7 @@ mod avx512 {
                 te: [0; L],
                 qe: [0; L],
                 cells: 0,
+                four: std::env::var_os("BWA4_BAND_ROWS2").is_none(),
             }
         }
     }
@@ -2163,7 +2166,74 @@ mod avx512 {
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
                 let hp = slot(r + RING - 1);
-                if r + 1 < nr {
+                if self.four && r + 3 < nr {
+                    // Four rows per step, skewed, as the NEON kernel's (32 vector registers hold
+                    // them: the AVX2 kernel's 16 hold two). Their slots are those of `r - RING..`.
+                    if r >= RING {
+                        due!(r - RING, 4);
+                    }
+                    let (hr0, hr1, hr2, hc) = (slot(r), slot(r + 1), slot(r + 2), slot(r + 3));
+                    self.cells += 4 * (khi - klo + 1).max(0) as u64;
+                    let rref0 = ld!(self.refv.as_ptr().add(r * L));
+                    let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
+                    let rref2 = ld!(self.refv.as_ptr().add((r + 2) * L));
+                    let rref3 = ld!(self.refv.as_ptr().add((r + 3) * L));
+                    let (mut f0, mut f1, mut f2, mut f3) = (hz, hz, hz, hz);
+                    let (mut d1, mut d2, mut d3) = (hz, hz, hz);
+                    let (mut rmax0, mut rmax1, mut rmax2, mut rmax3) = (hz, hz, hz, hz);
+                    macro_rules! step4 {
+                        ($mask:expr, $live:expr) => {{
+                            let ko = k as isize;
+                            let valid = |i: i32| -> Option<bool> {
+                                if $mask {
+                                    Some((0..=wm1).contains(&(k + i)))
+                                } else {
+                                    None
+                                }
+                            };
+                            let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                            let live = if $live {
+                                Some(_mm512_cmplt_epu8_mask(q, deadv))
+                            } else {
+                                None
+                            };
+                            let e0 = ld!(e.offset(ko * li));
+                            let d0 = ld!(hp.offset(ko * li));
+                            let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), live);
+                            let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), live);
+                            let (h2, e3) = cell!(d2, e2, f2, q, rref2, rmax2, valid(2), live);
+                            let (h3, e4) = cell!(d3, e3, f3, q, rref3, rmax3, valid(3), live);
+                            st!(hr0.offset(ko * li), h0);
+                            st!(hr1.offset((ko + 1) * li), h1);
+                            st!(hr2.offset((ko + 2) * li), h2);
+                            st!(hc.offset((ko + 3) * li), h3);
+                            st!(e.offset((ko + 4) * li), e4);
+                            (d1, d2, d3) = (h0, h1, h2);
+                            k -= 1;
+                        }};
+                    }
+                    while k >= klo && k > wm1 - 3 {
+                        step4!(true, true);
+                    }
+                    while k >= kun {
+                        step4!(false, false);
+                    }
+                    while k >= klo {
+                        step4!(false, true);
+                    }
+                    // Bottom clamped at 0: rows `r+1..r+3` still have cells `k+i` in `0..i`.
+                    let kend = (ri + ominq).max(-3);
+                    while k >= kend {
+                        step4!(true, true);
+                    }
+                    finish_row!(r, rmax0, rref0);
+                    finish_row!(r + 1, rmax1, rref1);
+                    finish_row!(r + 2, rmax2, rref2);
+                    finish_row!(r + 3, rmax3, rref3);
+                    // Row `r + 4` reads row `r + 3` up to `khi + 4`; row `r + 3` wrote up to `khi + 3`.
+                    st!(hc.offset((khi + 4).max(0) as isize * li), hz);
+                    r += 4;
+                } else if r + 1 < nr {
                     // Rows `r`, `r + 1` take the slots of `r - RING..`: read those first.
                     if r >= RING {
                         due!(r - RING, 2);
