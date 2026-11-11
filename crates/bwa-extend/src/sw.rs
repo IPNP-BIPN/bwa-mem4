@@ -713,6 +713,9 @@ pub fn ksw_global2(
     e_ins: i32,
     w: i32,
 ) -> (i32, Vec<u32>) {
+    if g2_outline() {
+        return ksw_global2_outlined(query, target, m, mat, o_del, e_del, o_ins, e_ins, w);
+    }
     // The wavefront kernel (NEON, or SSE4.1 on x86_64) where it is proven byte-identical and
     // wide enough to pay.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -721,6 +724,66 @@ pub fn ksw_global2(
     {
         return r;
     }
+    ksw_global2_scalar(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
+}
+
+/// Probe: `BWA4_G2_OUTLINE=1` runs [`ksw_global2`] with the wave and scalar kernels as calls.
+fn g2_outline() -> bool {
+    use std::sync::OnceLock;
+    static O: OnceLock<bool> = OnceLock::new();
+    *O.get_or_init(|| std::env::var("BWA4_G2_OUTLINE").is_ok_and(|v| v == "1"))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn ksw_global2_outlined(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w: i32,
+) -> (i32, Vec<u32>) {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if let Some(r) = wave_outlined(query, target, m, mat, o_del, e_del, o_ins, e_ins, w) {
+        return r;
+    }
+    scalar_outlined(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn wave_outlined(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w: i32,
+) -> Option<(i32, Vec<u32>)> {
+    crate::global_wave::try_wave16(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn scalar_outlined(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w: i32,
+) -> (i32, Vec<u32>) {
     ksw_global2_scalar(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
 }
 
