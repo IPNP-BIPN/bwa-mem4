@@ -2078,9 +2078,19 @@ fn extend(s: &Scratch, p: &Params, tau: i32, nd: usize, cm: &mut Comp) {
     }
 }
 
+/// The banded kernel's round-1 threshold `T1 = max(minsc, 5 * ub2 / 8)`, `ub2` the second-best
+/// component bound. Speed only: round 1 is final when `S >= T1` and `score2 >= T1` (or the hull
+/// lies in the `score2` exclusion zone), and round 2 reruns the rest at `minsc`, so a higher `T1`
+/// trades narrower round-1 bands for more round-2 parents. Band cells on 100k GIAB pairs by the
+/// fraction of `ub2`: 1/4 40.4G, 1/2 (fg-labs/bwa-mem3's) 32.3G, 9/16 31.6G, 3/5 31.4G, 5/8 31.4G,
+/// 2/3 31.5G, 3/4 32.3G, 1 41.1G.
+pub(crate) fn round1_threshold(minsc: i32, ub2: i32) -> i32 {
+    minsc.max(ub2 * 5 / 8)
+}
+
 /// [`decide`], and on a `Hull` the components the banded kernel runs: `c19` at `minsc` and, when
-/// the band threshold `T1 = max(minsc, ub2 / 2)` (`ub2` the second-best component bound) exceeds
-/// `minsc`, `ct` at `T1`. Returns `T1`, or 0 when the decision is not a hull.
+/// the band threshold [`round1_threshold`] exceeds `minsc`, `ct` at it. Returns `T1`, or 0 when
+/// the decision is not a hull.
 pub(crate) fn decide_bands(
     t: &[u8],
     q: &[u8],
@@ -2111,7 +2121,7 @@ pub(crate) fn decide_bands(
                 ub2 = c.ub;
             }
         }
-        let t1 = p.minsc.max(ub2 / 2);
+        let t1 = round1_threshold(p.minsc, ub2);
         std::mem::swap(&mut s.c19, c19);
         if s.dense {
             // The dense components are the threshold's whole runs: already extended.
@@ -2369,7 +2379,7 @@ pub(crate) mod tests {
                                 ub2 = c.ub;
                             }
                         }
-                        let t1 = p.minsc.max(ub2 / 2);
+                        let t1 = round1_threshold(p.minsc, ub2);
                         let (mut ct, mut dt) = (Vec::new(), Vec::new());
                         components(s, p, t1, off, nd, true, &mut ct);
                         unsafe { dense::components(s, t1, off, nd, &mut dt) };
@@ -2921,7 +2931,7 @@ pub(crate) mod tests {
     }
 
     /// Prices fg-labs/bwa-mem3's round-1 rescue bands offline (no kernel): per job, the hull our
-    /// filter keeps against the diagonal bands of the components at `T1 = max(minsc, ub2 / 2)`, and
+    /// filter keeps against the diagonal bands of the components at `T1` ([`round1_threshold`]), and
     /// how many jobs round 1 cannot finish (checked with the scalar DP on every `STRIDE`-th job).
     /// `BWA4_PRUNE_BENCH=jobs.bin cargo test --release -p bwa-mem4-neon band_t1_bench -- --ignored --nocapture`
     #[test]
@@ -2992,7 +3002,7 @@ pub(crate) mod tests {
             if c0.len() == 1 {
                 nsingle += 1;
             }
-            let t1 = p.minsc.max(ub2 / 2);
+            let t1 = round1_threshold(p.minsc, ub2);
             let band_cells = |cs: &[(i32, i64, i64, i64, i64)]| -> u64 {
                 cs.iter().map(|c| (c.3 - c.2 + 1 + c.4) as u64 * ql).sum()
             };

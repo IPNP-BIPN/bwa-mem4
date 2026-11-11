@@ -9,7 +9,8 @@
 //! * a zero-state DP restricted to any cell set never exceeds the full DP and is exact on every
 //!   cell of an alignment it contains, so per-row maxima over the bands are `<=` the true ones and
 //!   equal wherever an alignment scoring `>= tau` ends;
-//! * round 1 runs the components at `T1 = max(minsc, ub2 / 2)`; its merged outputs are exact iff
+//! * round 1 runs the components at `T1 = max(minsc, 5 * ub2 / 8)` (fg-labs/bwa-mem3's `ub2 / 2`,
+//!   retuned: `rescue_prune::round1_threshold`); its merged outputs are exact iff
 //!   `T1 == minsc`, or `S >= T1` and either `score2 >= T1` or the whole hull lies in the `score2`
 //!   exclusion zone around `te`. Otherwise round 2 runs the components at `minsc`.
 //!
