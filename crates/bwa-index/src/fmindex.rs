@@ -1926,8 +1926,17 @@ impl FmIndex {
             use std::arch::aarch64::*;
             let sp = smem.l;
             let ep = smem.l + smem.s;
-            let o_sp = self.occ4_narrow(&self.cp_occ[(sp >> CP_SHIFT) as usize], sp);
-            let o_ep = self.occ4_narrow(&self.cp_occ[(ep >> CP_SHIFT) as usize], ep);
+            debug_assert!(((ep >> CP_SHIFT) as usize) < self.cp_occ.len());
+            // SAFETY: the rows of a live interval, at most `ref_seq_len`, whose blocks exist (as
+            // in `occ_hoisted`).
+            let (bsp, bep) = unsafe {
+                (
+                    self.cp_occ.get_unchecked((sp >> CP_SHIFT) as usize),
+                    self.cp_occ.get_unchecked((ep >> CP_SHIFT) as usize),
+                )
+            };
+            let o_sp = self.occ4_narrow(bsp, sp);
+            let o_ep = self.occ4_narrow(bep, ep);
             // SAFETY: NEON is mandatory on AArch64; the loads read four-element local arrays.
             let (kc, sc, sgt) = unsafe {
                 let (vsp, vep) = (vld1q_u32(o_sp.as_ptr()), vld1q_u32(o_ep.as_ptr()));
