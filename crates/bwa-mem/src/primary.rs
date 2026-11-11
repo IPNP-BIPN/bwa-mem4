@@ -43,7 +43,6 @@
 //! | `seedlen0` | length of the seed the chain was founded on |
 //! | `frac_rep` | fraction of the read covered by seeds that hit repetitive loci; scales MAPQ down at the end |
 //! | `w` | band width (in bp) used for the banded dynamic programming of this region |
-//! | `n_comp` | how many original regions were folded into this one by merging |
 //! | `hash` | Thomas Wang hash of the global read id plus the region index: a deterministic, thread-count-independent tie-breaker for equal-scoring regions |
 //! | `l` | in MAPQ, the alignment length (longer of the query and reference spans) |
 //! | `identity` | in MAPQ, the fractional identity *inferred from the score*, not counted from a CIGAR |
@@ -538,11 +537,6 @@ pub fn mem_sort_dedup_patch(
     });
     crate::rescue_split::stop(&crate::rescue_split::T_SORT1, _t1);
     let _t2 = crate::rescue_split::start();
-    // `n_comp` counts how many original regions were folded into this one; it starts at 1 (itself)
-    // and the merge branch accumulates. Only `mem_patch_reg` merging changes it.
-    for r in &mut a {
-        r.n_comp = 1;
-    }
 
     // ---- Pass 1b: backward scan, killing redundant regions and merging collinear ones ---------
     for i in 1..a.len() {
@@ -618,11 +612,7 @@ pub fn mem_sort_dedup_patch(
                     // `truesc` and `score` both become the *global* merged score, so the retry loop
                     // in `reg2aln` will later compare that global score against itself and converge
                     // immediately: merged regions never trigger a band retry.
-                    //
-                    // `+ 1` in the `n_comp` update mirrors `bwamem.cpp:325` exactly. It appears to
-                    // double count (`q` contributes its own `n_comp` and then one more), but it is
-                    // the C's arithmetic and `n_comp` only feeds heuristics, never SAM bytes.
-                    a[i].n_comp += a[j_idx].n_comp + 1;
+                    // (bwa also sums an `n_comp` here, which nothing ever reads; it is not kept.)
                     a[i].seedcov = a[i].seedcov.max(a[j_idx].seedcov);
                     a[i].sub = a[i].sub.max(a[j_idx].sub);
                     a[i].csub = a[i].csub.max(a[j_idx].csub);
@@ -739,12 +729,10 @@ pub fn mem_sort_dedup_patch(
 ///   whatever survives, since equal triples would have passed the test above. So the position is
 ///   unique, whatever the permutation before it.
 ///
-/// The full pass also sets `n_comp` to 1, which `ma`'s regions already hold.
-///
 /// # Parameters
 /// * `opt`: for `mask_level_redun`.
 /// * `ma`: a list returned by [`mem_sort_dedup_patch`] with empty `codes` from at least two regions.
-///   The caller tracks that: a shorter input returns early, without the `n_comp` reset, and a pass
+///   The caller tracks that: a shorter input returns early, and a pass
 ///   with `codes` can leave pairs it merged untested.
 /// * `b`: the new region.
 ///
@@ -753,7 +741,7 @@ pub fn mem_sort_dedup_patch(
 pub(crate) fn insert_into_settled(
     opt: &MemOpt,
     ma: &mut Vec<MemAlnReg>,
-    mut b: MemAlnReg,
+    b: MemAlnReg,
 ) -> Result<(), MemAlnReg> {
     let mask_level_redun = opt.mask_level_redun;
     // Below 1 is what makes the tied-`re` argument hold, and a zero-length `b` is the compaction's.
@@ -792,14 +780,13 @@ pub(crate) fn insert_into_settled(
         let mr = (q.re - q.rb).min(b.re - b.rb);
         let mq = (q.qe - q.qb).min(b.qe - b.qb);
         if or_ as f32 > mask_level_redun * mr as f32 && oq as f32 > mask_level_redun * mq as f32 {
-            if !same_but_n_comp(q, &b) {
+            if !same_region(q, &b) {
                 return Err(b);
             }
             identical = true;
         }
     }
     if !identical {
-        b.n_comp = 1;
         let at = ma.partition_point(|r| {
             (-i64::from(r.score), r.rb, r.qb) < (-i64::from(b.score), b.rb, b.qb)
         });
@@ -808,9 +795,8 @@ pub(crate) fn insert_into_settled(
     Ok(())
 }
 
-/// Whether two regions are indistinguishable to everything after the dedup. `n_comp` is left out
-/// because the pass resets it on both.
-pub(crate) fn same_but_n_comp(x: &MemAlnReg, y: &MemAlnReg) -> bool {
+/// Whether two regions are indistinguishable to everything after the dedup: every field equal.
+pub(crate) fn same_region(x: &MemAlnReg, y: &MemAlnReg) -> bool {
     x.rb == y.rb
         && x.re == y.re
         && x.qb == y.qb
@@ -1427,7 +1413,6 @@ mod tests {
             r.truesc = 0;
             r.csub = next(3) as i32;
             r.seedcov = next(2) as i32;
-            r.n_comp = 0;
             r
         };
         let same = |x: &[MemAlnReg], y: &[MemAlnReg]| format!("{x:?}") == format!("{y:?}");
@@ -1442,7 +1427,6 @@ mod tests {
                 let mut b = region(&mut next);
                 if next(2) == 0 {
                     b = settled[next(settled.len() as u64) as usize].clone();
-                    b.n_comp = 0;
                     match next(4) {
                         0 => b.csub += 1,
                         1 => b.re += 1,
@@ -1515,7 +1499,6 @@ mod tests {
             is_alt: false,
             alt_sc: 0,
             hash: 0,
-            n_comp: 0,
         }
     }
 

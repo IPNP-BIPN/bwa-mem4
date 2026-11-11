@@ -75,7 +75,7 @@ use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
 use crate::primary::{
     hash_64, insert_into_settled, mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch,
-    same_but_n_comp,
+    same_region,
 };
 use crate::MemAlnReg;
 
@@ -510,8 +510,8 @@ fn mem_matesw(
                     let seedcov = ((b_re - b_rb).min(i64::from(qe - qb)) >> 1) as i32;
                     // The C `memset`s the whole `mem_alnreg_t` to zero and then fills six fields,
                     // so every field left at 0 / -1 / 0.0 below is that memset, not an oversight:
-                    // `truesc`, `sub`, `sub_n`, `seedlen0`, `secondary_all`, `w`, `frac_rep`,
-                    // `hash` and `n_comp` are all zero for a rescued region, and `secondary` is the
+                    // `truesc`, `sub`, `sub_n`, `seedlen0`, `secondary_all`, `w`, `frac_rep` and
+                    // `hash` are all zero for a rescued region, and `secondary` is the
                     // one field the C sets to -1 explicitly. `csub` carries ksw's second-best score
                     // (KSW_XSUBO), which later caps the paired MAPQ at the tandem-repeat score.
                     let b = MemAlnReg {
@@ -535,7 +535,6 @@ fn mem_matesw(
                         // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                         alt_sc: 0,
                         hash: 0,
-                        n_comp: 0,
                     };
                     // ---- step 4: insert the accepted hit, keeping `ma` score-sorted ----
                     // Insert keeping `ma` sorted by score descending (bwa's manual insertion at
@@ -801,7 +800,7 @@ fn insert_settled_view(
     opt: &MemOpt,
     ma: &mut Vec<MemAlnReg>,
     view: &mut RegionView,
-    mut b: MemAlnReg,
+    b: MemAlnReg,
 ) -> Result<(), MemAlnReg> {
     let mask_level_redun = opt.mask_level_redun;
     if ma.is_empty() || b.rid < 0 || b.qe <= b.qb || b.re <= b.rb {
@@ -835,7 +834,7 @@ fn insert_settled_view(
             let same = ma
                 .iter()
                 .filter(|q| q.rb == rb && q.re == re && q.qb == qb && q.qe == qe)
-                .all(|q| same_but_n_comp(q, &b));
+                .all(|q| same_region(q, &b));
             if !same {
                 return Err(b);
             }
@@ -843,7 +842,6 @@ fn insert_settled_view(
         }
     }
     if !identical {
-        b.n_comp = 1;
         view.push(&b);
         // Appended, not inserted: a rescued hit lands near the front of a long score-descending
         // list, and shifting ~100 96-byte regions per hit was 2 s of memmove per 2M pairs. Until
@@ -1164,7 +1162,6 @@ fn matesw_apply(
                     // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                     alt_sc: 0,
                     hash: 0,
-                    n_comp: 0,
                 };
                 // A settled list can often take the hit without the full pass. See the function.
                 let b = if view.settled {
@@ -3458,7 +3455,6 @@ mod region_view_tests {
             is_alt: false,
             alt_sc: 0,
             hash: 0,
-            n_comp: 0,
         }
     }
 
@@ -3519,7 +3515,6 @@ mod region_view_tests {
                 let mut b = region(&mut next);
                 if next(2) == 0 {
                     b = full[next(full.len() as u64) as usize].clone();
-                    b.n_comp = 0;
                     match next(4) {
                         0 => b.csub += 1,
                         1 => b.re += 1,
@@ -3582,7 +3577,6 @@ mod matesw_apply_tests {
             is_alt: false,
             alt_sc: 0,
             hash: 0,
-            n_comp: 0,
         };
         let ma0 = vec![region(90), region(80)];
         let want = mem_sort_dedup_patch(&fm, &opt, &[], ma0.clone());

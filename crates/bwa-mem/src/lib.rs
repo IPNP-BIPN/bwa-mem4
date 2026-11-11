@@ -368,8 +368,6 @@ pub struct MemAlnReg {
     /// during primary marking, so that ordering does not depend on sort stability. Derived from
     /// the read id, hence the `read_id` parameter threaded through `align_read_se`.
     pub hash: u64,
-    /// Number of chain components merged into this region by the dedup pass. Starts at 1.
-    pub n_comp: i32,
 }
 
 /// Longest gap worth allowing for a `qlen`-base extension, i.e. how far the reference window must
@@ -794,7 +792,6 @@ pub(crate) fn mem_chain2aln_meta(
                 // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                 alt_sc: 0,
                 hash: 0,
-                n_comp: 1,
             });
             continue;
         }
@@ -824,7 +821,6 @@ pub(crate) fn mem_chain2aln_meta(
             // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
             alt_sc: 0,
             hash: 0,
-            n_comp: 1,
         };
 
         // ---------------------------- step 3a: extend leftwards ----------------------------

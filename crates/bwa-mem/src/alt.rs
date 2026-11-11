@@ -337,7 +337,7 @@ mod tests {
     ///   Stored into BOTH `secondary` and `secondary_all`; the test does not exercise the paths
     ///   where those two diverge. `xa_group` reads only `secondary_all`.
     ///
-    /// Every other field is zeroed (or `n_comp = 1`, the "one component" default) and is not read
+    /// Every other field is zeroed and is not read
     /// by `xa_group`; in particular `is_alt = false` means the strict `max_xa_hits` cap applies.
     fn reg(score: i32, secondary: i32) -> MemAlnReg {
         MemAlnReg {
@@ -360,7 +360,6 @@ mod tests {
             is_alt: false,
             alt_sc: 0,
             hash: 0,
-            n_comp: 1,
         }
     }
 
