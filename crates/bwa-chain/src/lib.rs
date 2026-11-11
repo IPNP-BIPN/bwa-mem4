@@ -467,7 +467,18 @@ pub fn sa_positions_for_read(
     // first and only falls through to `n` when the `m`s are equal. This is the standard way to get a
     // multi-field sort out of a single-key sort, and it is exact rather than approximate because
     // both fields are known to fit in 32 bits.
-    smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
+    // Per-thread scratch, reused across reads: three allocations per read added up to ~10% of the
+    // whole run's malloc count.
+    thread_local! {
+        static SCRATCH: std::cell::Cell<SaScratch> = const { std::cell::Cell::new(SaScratch::new()) };
+    }
+    let mut scratch = SCRATCH.take();
+    // `BWA4_KEYSORT=1`: the packed-key sort, for a same-host x86 A/B (a tie on M4).
+    if keysort_enabled() {
+        sort_smems_mn(smems, &mut scratch.keys, &mut scratch.sorted);
+    } else {
+        smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
+    }
     // `BWA4_SMEM_DUP=1`: how many of this read's SMEMs are EXACT duplicates of the one before them,
     // now that they are sorted. fg-labs/bwa-mem3 compacts those away in `smem_dedup.cpp` before the
     // position walk, on the grounds that they enumerate the same suffix-array rows twice; the
@@ -533,16 +544,11 @@ pub fn sa_positions_for_read(
     // occurrence at `q_T + m_T`, hence at `q_T + m_U` (fg-labs/bwa-mem3's `s1_tag_contained`).
     // The list is sorted by `(m, n)`, so a container has `m_T <= m_U`: either earlier, or in the
     // same-`m` run after `U` (then `n_T >= n_U`). `resolved[i]` is `q + m` for each such SMEM.
-    // Per-thread scratch, reused across reads: three allocations per read added up to ~10% of the
-    // whole run's malloc count.
-    thread_local! {
-        static SCRATCH: std::cell::Cell<SaScratch> = const { std::cell::Cell::new(SaScratch::new()) };
-    }
-    let mut scratch = SCRATCH.take();
     let SaScratch {
         resolved,
         runs,
         pieces,
+        ..
     } = &mut scratch;
     resolved.clear();
     resolved.resize(smems.len(), i64::MIN);
@@ -685,6 +691,8 @@ struct SaScratch {
     resolved: Vec<i64>,
     runs: Vec<Run>,
     pieces: Vec<(i64, i64, usize)>,
+    keys: Vec<u64>,
+    sorted: Vec<bwa_index::Smem>,
 }
 
 impl SaScratch {
@@ -693,8 +701,49 @@ impl SaScratch {
             resolved: Vec::new(),
             runs: Vec::new(),
             pieces: Vec::new(),
+            keys: Vec::new(),
+            sorted: Vec::new(),
         }
     }
+}
+
+/// Whether `BWA4_KEYSORT` is set. Read once and cached.
+fn keysort_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_KEYSORT").is_some())
+}
+
+/// Stable sort of a read's SMEMs by `(m, n)`: the same order as
+/// `smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n))`, which it falls back to.
+///
+/// They arrive as short descending runs, one per seeding position, and the stable sort spends its
+/// time shifting 32-byte SMEMs in an insertion sort. Packed `(m, n, index)` keys are unique, so an
+/// unstable sort of plain `u64`s gives exactly the stable order, and one gather puts the SMEMs there.
+///
+/// # Parameters
+/// - `smems`: sorted in place.
+/// - `keys`, `sorted`: scratch, overwritten.
+fn sort_smems_mn(
+    smems: &mut [bwa_index::Smem],
+    keys: &mut Vec<u64>,
+    sorted: &mut Vec<bwa_index::Smem>,
+) {
+    // 24 bits for each of `m` and `n`, 16 for the index.
+    if smems.len() > 1 << 16 || smems.iter().any(|s| s.m.max(s.n) >= 1 << 24) {
+        smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
+        return;
+    }
+    keys.clear();
+    keys.extend(
+        smems
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (u64::from(s.m) << 40) | (u64::from(s.n) << 16) | i as u64),
+    );
+    keys.sort_unstable();
+    sorted.clear();
+    sorted.extend(keys.iter().map(|&k| smems[(k & 0xffff) as usize]));
+    smems.copy_from_slice(sorted);
 }
 
 impl Default for SaScratch {
@@ -2000,6 +2049,40 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    /// `sort_smems_mn` puts SMEMs in the stable `(m, n)` order, ties in arrival order, on both the
+    /// packed path and the long-read fallback.
+    #[test]
+    fn smem_sort_is_the_stable_sort() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let (mut keys, mut sorted) = (Vec::new(), Vec::new());
+        for len in 0..70usize {
+            for far in [0u32, 1 << 24] {
+                // Few distinct `(m, n)`, so ties are common; `k` tells tied SMEMs apart.
+                let mut smems: Vec<bwa_index::Smem> = (0..len)
+                    .map(|i| {
+                        let m = next() % 6;
+                        bwa_index::Smem {
+                            m: m + far,
+                            n: m + far + next() % 3,
+                            k: i as i64,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+                let mut want = smems.clone();
+                want.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
+                super::sort_smems_mn(&mut smems, &mut keys, &mut sorted);
+                assert_eq!(smems, want, "len {len}, far {far}");
+            }
+        }
+    }
+
     /// `insert_inline` is `Vec::insert` for every position and length, odd tails included.
     #[test]
     fn insert_inline_matches_vec_insert() {
