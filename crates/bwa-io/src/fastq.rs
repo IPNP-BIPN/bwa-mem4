@@ -838,8 +838,14 @@ impl FastqReader {
                 // Lossy UTF-8, as before, and free in the normal case: `from_utf8_lossy` borrows
                 // when the bytes are already valid and only allocates for a header with a stray
                 // byte, which is the rare path this tolerates rather than rejecting the file over.
-                let name = String::from_utf8_lossy(name_bytes);
-                let comment = comment_bytes.map(String::from_utf8_lossy);
+                // `from_utf8` first: its word-at-a-time ASCII scan is what nearly every header
+                // takes, where the lossy decoder walks chunk by chunk.
+                let utf8 = |b| match std::str::from_utf8(b) {
+                    Ok(s) => std::borrow::Cow::Borrowed(s),
+                    Err(_) => String::from_utf8_lossy(b),
+                };
+                let name = utf8(name_bytes);
+                let comment = comment_bytes.map(utf8);
                 // FASTQ line 2 (bases) and line 4 (Phred+33). `qual` is `None` for FASTA input,
                 // where lines 3 and 4 do not exist.
                 let seq = rec.seq();
@@ -1322,6 +1328,27 @@ mod tests {
             let mut r = FastqReader::from_path(p).unwrap();
             assert!(r.next_record().unwrap().is_none(), "{}", p.display());
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A header byte that is not UTF-8 becomes U+FFFD in the name and the comment, and a clean
+    /// header comes through as is.
+    #[test]
+    fn non_utf8_header_is_replaced() {
+        let dir = std::env::temp_dir().join(format!("bwa4_lossy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("l.fq");
+        std::fs::write(
+            &p,
+            b"@r\xffx c\xfe\nACGT\n+\nIIII\n@ok tag\nACGT\n+\nIIII\n",
+        )
+        .unwrap();
+        let mut r = FastqReader::from_path(&p).unwrap();
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(rec.name(), "r\u{fffd}x");
+        assert_eq!(rec.comment(), Some("c\u{fffd}"));
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!((rec.name(), rec.comment()), ("ok", Some("tag")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
