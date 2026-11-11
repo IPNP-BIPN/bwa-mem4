@@ -1269,25 +1269,31 @@ impl FmIndex {
         self.seed_jump[SEED_JUMP_LEVEL_OFFS[d] + code as usize]
     }
 
-    /// Prefetch that entry's line.
+    /// Prefetch that entry's lines: a 24-byte entry straddles two lines for a quarter of the codes
+    /// (64-byte lines), so its first and last bytes are both hinted.
     #[inline]
     pub fn prefetch_seed_jump(&self, d: usize, code: u32) {
         let p = self
             .seed_jump
             .as_ptr()
             .wrapping_add(SEED_JUMP_LEVEL_OFFS[d] + code as usize);
+        let q = p
+            .cast::<u8>()
+            .wrapping_add(std::mem::size_of::<SeedJump>() - 1);
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: a hint on an address inside the table; never faults or writes.
+        // SAFETY: hints on addresses inside the table; never fault or write.
         unsafe {
             std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) q, options(nostack, readonly, preserves_flags));
         }
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as above.
         unsafe {
             std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            std::arch::x86_64::_mm_prefetch(q as *const i8, std::arch::x86_64::_MM_HINT_T0);
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let _ = p;
+        let _ = (p, q);
     }
 
     /// Measure how many independent cache-line fetches this core can keep in flight, by chasing
