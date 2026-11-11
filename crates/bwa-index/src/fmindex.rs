@@ -1796,14 +1796,14 @@ impl FmIndex {
         // AArch64 takes two copies instead, base 0 and one for the other three: the base is the
         // read's, so the four-way dispatch mispredicted most rounds, and with 31 registers the
         // values the copies hoist stay in them.
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", bwa4_any_base))]
         return match (self.wide, a) {
             (false, 0) => go!(false, true, 0),
             (false, _) => go!(false, false, ANY_BASE),
             (true, 0) => go!(true, true, 0),
             (true, _) => go!(true, false, ANY_BASE),
         };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", bwa4_any_base)))]
         match (self.wide, a) {
             (false, 0) => go!(false, true, 0),
             (false, 1) => go!(false, false, 1),
