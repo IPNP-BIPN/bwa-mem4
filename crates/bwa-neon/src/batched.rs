@@ -2229,9 +2229,11 @@ fn tight_band_bound(
 /// `k = (qlen*max_sc + end_bonus - o_ins) / e_ins + 1`; likewise for deletions. `.max(1)` keeps the
 /// band from collapsing to zero on very short queries.
 ///
-/// This must stay in `f64`, not integer division: the C computes it in `double` and truncates once
-/// at the cast, and integer division would round differently for negative numerators (short query,
-/// large `o_ins`), producing a different band and therefore a different alignment.
+/// The C computes `(int)((double)x / e + 1.)` and `.max(1)` follows. Every negative `x` lands at or
+/// below 0 and so on 1, and for `x >= 0` the double quotient truncates exactly as integer division
+/// does (a non-integer `x / e` stays at least `1 / e` from an integer, far more than an f64 ulp at
+/// these magnitudes), so `max(x, 0) / e + 1` is the same number without the two divides in double
+/// precision, which were a dependency chain on every job (`dispatch_bins`' hottest line on x86).
 ///
 /// Returns the clamped half-width in cells. `w0` is the user's `-w`; the result is never larger.
 ///
@@ -2263,20 +2265,13 @@ fn clamp_band(
     o_del: i32,
     e_del: i32,
 ) -> i32 {
-    let mut clamped = w0;
-    // Longest insertion, in bases, that could still pay for itself: the point where
-    // `o_ins + k*e_ins` consumes the whole score the alignment could earn. Same below for `max_del`
-    // with the deletion penalties. Both can come out negative or zero on a very short query, which
-    // is what the `.max(1)` guards against.
-    let max_ins = (((qlen as f64 * f64::from(max_sc) + f64::from(end_bonus) - f64::from(o_ins))
-        / f64::from(e_ins))
-        + 1.0) as i32;
-    clamped = clamped.min(max_ins.max(1));
-    let max_del = (((qlen as f64 * f64::from(max_sc) + f64::from(end_bonus) - f64::from(o_del))
-        / f64::from(e_del))
-        + 1.0) as i32;
-    clamped = clamped.min(max_del.max(1));
-    clamped
+    // The most the alignment could earn; the longest gap that still pays for itself is the one
+    // whose `o + k*e` eats all of it, already floored at one column.
+    let earn = qlen as i64 * i64::from(max_sc) + i64::from(end_bonus);
+    let useful = |o: i32, e: i32| (earn - i64::from(o)).max(0) / i64::from(e) + 1;
+    i64::from(w0)
+        .min(useful(o_ins, e_ins))
+        .min(useful(o_del, e_del)) as i32
 }
 
 /// Generate a batched banded-SW kernel for a lane element type + target-feature string. One macro
@@ -6678,6 +6673,48 @@ mod dedup_jobs_tests {
                     let mut v = base[..n].to_vec();
                     v[i] ^= 1;
                     assert_ne!(job(&v), h, "n={n} i={i} swap={swap}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod clamp_band_tests {
+    /// The C's double-precision form, as [`super::clamp_band`] had it.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(w0: i32, qlen: usize, a: i32, eb: i32, oi: i32, ei: i32, od: i32, ed: i32) -> i32 {
+        let max_ins = (((qlen as f64 * f64::from(a) + f64::from(eb) - f64::from(oi))
+            / f64::from(ei))
+            + 1.0) as i32;
+        let max_del = (((qlen as f64 * f64::from(a) + f64::from(eb) - f64::from(od))
+            / f64::from(ed))
+            + 1.0) as i32;
+        w0.min(max_ins.max(1)).min(max_del.max(1))
+    }
+
+    #[test]
+    fn integer_clamp_matches_the_double_one() {
+        for qlen in (0..400).chain([1000, 10_000, 100_000, 1_000_000]) {
+            for a in [1, 2, 5] {
+                for eb in [0, 5, 30] {
+                    for (o, e) in [
+                        (0, 1),
+                        (6, 1),
+                        (5, 3),
+                        (40, 1),
+                        (11, 7),
+                        (100, 13),
+                        (3000, 2),
+                    ] {
+                        for w0 in [1, 10, 100, 1000, i32::MAX] {
+                            assert_eq!(
+                                super::clamp_band(w0, qlen, a, eb, o, e, e + 5, o / 2 + 1),
+                                reference(w0, qlen, a, eb, o, e, e + 5, o / 2 + 1),
+                                "w0 {w0} qlen {qlen} a {a} eb {eb} o {o} e {e}"
+                            );
+                        }
+                    }
                 }
             }
         }
