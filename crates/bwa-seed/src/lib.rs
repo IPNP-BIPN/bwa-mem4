@@ -432,6 +432,19 @@ pub fn collect_smems(fm: &FmIndex, codes: &[u8], min_seed_len: i32, min_intv: i6
     out
 }
 
+/// Probe `BWA4_BSD_LOCKSTEP_N`: round 3's width apart from rounds 1 and 2 (fg-labs/bwa-mem3 keeps
+/// its bwtSeed width separate: 24 by default, 32 on AMD Zen 5).
+fn bsd_lockstep_width(fm: &FmIndex) -> usize {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let pin = *N.get_or_init(|| {
+        std::env::var("BWA4_BSD_LOCKSTEP_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+    });
+    pin.unwrap_or_else(|| lockstep_width(fm))
+}
+
 /// Probe `BWA4_LS_UNROLL`: round 1's lockstep pass unrolled per slot (see the driver).
 fn ls_unroll() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1768,7 +1781,7 @@ fn bwt_seed_strategy_batched(
     walks: &[FirstWalk],
     out: &mut [Vec<Smem>],
 ) {
-    let lockstep_slots = lockstep_width(fm);
+    let lockstep_slots = bsd_lockstep_width(fm);
     if reads.is_empty() {
         return;
     }
