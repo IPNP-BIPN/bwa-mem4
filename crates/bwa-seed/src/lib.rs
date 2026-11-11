@@ -1713,8 +1713,13 @@ impl BwtSeedSlot {
                     self.end_pos(readlength);
                     return;
                 }
-                // Interval of `codes[x ..= j]`, one base longer on the RIGHT than before.
-                let mut new_smem = fm.forward_ext(self.smem, aj as usize);
+                // Interval of `codes[x ..= j]`, one base longer on the RIGHT than before; a third
+                // of round 3's steps start from one row (chr21).
+                let mut new_smem = if self.smem.s == 1 {
+                    fm.forward_ext_s1(self.smem, aj as usize)
+                } else {
+                    fm.forward_ext(self.smem, aj as usize)
+                };
                 new_smem.n = self.j as u32;
                 self.smem = new_smem;
                 if self.smem.s < max_intv

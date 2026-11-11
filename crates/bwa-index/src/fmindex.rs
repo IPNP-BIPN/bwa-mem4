@@ -2007,6 +2007,34 @@ impl FmIndex {
         e
     }
 
+    /// [`forward_ext`](Self::forward_ext) of an interval of one row (`smem.s == 1`): that row's
+    /// own base decides `s` and `k`, so only base `c`'s count at the row is computed (one count,
+    /// no rows-above sum).
+    #[inline(always)]
+    pub fn forward_ext_s1(&self, smem: Smem, aj: usize) -> Smem {
+        debug_assert_eq!(smem.s, 1);
+        if self.wide {
+            return self.forward_ext(smem, aj);
+        }
+        let c = 3 - aj;
+        let sp = smem.l;
+        let b = &self.cp_occ[(sp >> CP_SHIFT) as usize];
+        // The row's 2-bit base (`hi lo`); the sentinel row is stored as an `A`.
+        let bit = 63 - (sp & CP_MASK) as u32;
+        let sym = ((b.hi >> bit) & 1) << 1 | ((b.lo >> bit) & 1);
+        let sent = sp == self.sentinel_index;
+        let hx = ((c as u64 >> 1) & 1).wrapping_sub(1);
+        let lx = (c as u64 & 1).wrapping_sub(1);
+        let kc = self.occ_hoisted::<false, true>(&self.cp_occ, sp, c, hx, lx);
+        Smem {
+            // The rows above `c` and the sentinel row move `k` (`forward_ext`'s `so + sgt`).
+            k: smem.k + i64::from(sent || sym > c as u64),
+            l: self.count[c] + kc,
+            s: i64::from(!sent && sym == c as u64),
+            ..smem
+        }
+    }
+
     #[inline(always)]
     pub fn backward_ext(&self, smem: Smem, a: usize) -> Smem {
         // Load the sp/ep checkpoint blocks once (all 4 bases share them), rather than re-deriving
@@ -2656,8 +2684,9 @@ mod tests {
 
     /// The k-only backward step agrees with the full one on `k` and `s` for every base, on
     /// intervals of every size, including the sentinel's block and the whole-BWT interval.
-    /// `forward_ext` against the swap / `backward_ext` / swap it stands for, on random intervals
-    /// (both `k` and `l` random, so every `l`-side block and the sentinel's are reached).
+    /// `forward_ext` (and `forward_ext_s1` on one-row intervals) against the swap / `backward_ext`
+    /// / swap it stands for, on random intervals (both `k` and `l` random, so every `l`-side block
+    /// and the sentinel's are reached).
     #[test]
     fn forward_ext_equals_swapped_backward() {
         let fm = tiny();
@@ -2676,6 +2705,8 @@ mod tests {
             let s = 1 + next() % (n - l).min(1 + next() % 5000);
             intervals.push((next() % n, l, s));
         }
+        // Every one-row interval, the sentinel's included, for `forward_ext_s1`.
+        intervals.extend((0..n).map(|l| (next() % n, l, 1)));
         for (k, l, s) in intervals {
             let smem = Smem {
                 k,
@@ -2690,6 +2721,9 @@ mod tests {
                 let mut want = fm.backward_ext(rc, 3 - aj);
                 std::mem::swap(&mut want.k, &mut want.l);
                 assert_eq!(fm.forward_ext(smem, aj), want, "k {k} l {l} s {s} aj {aj}");
+                if s == 1 {
+                    assert_eq!(fm.forward_ext_s1(smem, aj), want, "k {k} l {l} aj {aj}");
+                }
             }
         }
     }
