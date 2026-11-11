@@ -432,18 +432,17 @@ pub fn collect_smems(fm: &FmIndex, codes: &[u8], min_seed_len: i32, min_intv: i6
     out
 }
 
-/// Probe `BWA4_BSD_LOCKSTEP_N`: round 3's width apart from rounds 1 and 2 (fg-labs/bwa-mem3 keeps
-/// its bwtSeed width separate: 24 by default, 32 on AMD Zen 5).
+/// Round 3's lockstep width: at least [`BSD_LOCKSTEP_MIN`], whatever rounds 1 and 2 use. Its walks
+/// are forward-only and shallow, so they want more in flight (fg-labs/bwa-mem3 also keeps its
+/// bwtSeed width apart: 24, 32 on AMD Zen 5). Same-host A/B against the shared width (8 on these
+/// hosts): Neoverse N2 -0.55% / -0.8% cycles; `mem_collect_smem_batched`, where round 3 inlines,
+/// -100 (EPYC 9V74), -136 (Xeon 8573C) samples; M4 already probes 32.
 fn bsd_lockstep_width(fm: &FmIndex) -> usize {
-    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let pin = *N.get_or_init(|| {
-        std::env::var("BWA4_BSD_LOCKSTEP_N")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0)
-    });
-    pin.unwrap_or_else(|| lockstep_width(fm))
+    lockstep_width(fm).max(BSD_LOCKSTEP_MIN)
 }
+
+/// Round 3's width floor (see [`bsd_lockstep_width`]).
+const BSD_LOCKSTEP_MIN: usize = 32;
 
 /// Lockstep round-1 SMEM collection across a batch of reads (bwa-mem2's batched FM-index search,
 /// Vasimuddin et al. IPDPS 2019; nh13's `getSMEMsOnePosOneThread_lockstep`). Each read is a slot
