@@ -859,6 +859,24 @@ fn read_at_parallel(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> Result
         })
 }
 
+/// `BWA4_PAC_ANON=1` (probe): `.pac` read into an anonymous mapping hinted for huge pages, as the
+/// fork's calloc'd pack table is, instead of mapping the file (a file mapping takes no huge pages on
+/// most Linux filesystems, so every reference fetch can miss the 4 KiB-page TLB).
+fn pac_anon() -> bool {
+    std::env::var_os("BWA4_PAC_ANON").is_some_and(|v| v == "1")
+}
+
+/// The whole `.pac` in a fresh anonymous mapping, hinted before the fill so it faults in at the
+/// promoted page size, then made read-only.
+fn load_pac_anon(file: &std::fs::File) -> Result<Mmap> {
+    let len = file.metadata()?.len() as usize;
+    let mut m = memmap2::MmapMut::map_anon(len)?;
+    // SAFETY: `m` is a live mapping of `len` bytes for the whole call.
+    unsafe { crate::hugepage::advise_hugepage(m.as_ptr(), len) };
+    read_at_parallel(file, 0, &mut m)?;
+    Ok(m.make_read_only()?)
+}
+
 /// Sequential fallback: same contract as the parallel version, for targets without `pread`.
 #[cfg(not(unix))]
 fn read_at_parallel(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> Result<()> {
@@ -1142,7 +1160,11 @@ impl FmIndex {
         let pac_file = std::fs::File::open(sibling(prefix, "pac"))?;
         // SAFETY: the index files are not mutated while a run holds them open; a concurrent external
         // truncation is out of scope (same assumption as bwa-mem2's mmap'd index).
-        let pac = unsafe { Mmap::map(&pac_file)? };
+        let pac = if pac_anon() {
+            load_pac_anon(&pac_file)?
+        } else {
+            unsafe { Mmap::map(&pac_file)? }
+        };
         // The unpack loops read `.pac` with unchecked SIMD loads sized from the BWT's `l_pac`, so
         // a `.pac` from another reference (or a truncated one) must be refused here. bwa's layout:
         // ceil(L/4) packed bytes, a zero byte when L % 4 == 0, then the byte L % 4: always L/4 + 2.
