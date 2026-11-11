@@ -655,8 +655,6 @@ pub(crate) struct RegionView {
     /// `(rb, re, qb, qe)` of every region, ascending by `rb` up to `sorted`, then the few pushed
     /// since, unordered. Meaningful only while `built`.
     by_rb: Vec<(i64, i64, i32, i32)>,
-    /// Scratch for [`RegionView::ensure`]'s sort, kept for its capacity.
-    keys: Vec<u64>,
     sorted: usize,
     /// Longest `re - rb` in `by_rb`: how far left of a hit an overlapping region's `rb` can lie.
     max_len: i64,
@@ -670,6 +668,16 @@ pub(crate) struct RegionView {
     /// [`settle_order`] before anything that reads the order.
     pending: usize,
 }
+
+thread_local! {
+    /// [`RegionView::ensure`]'s tuples and sort keys, kept per thread: a view lives one batch, so
+    /// buffers of its own were two allocations per view built.
+    static VIEW_SCRATCH: std::cell::RefCell<ViewScratch> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// `(rb, re, qb, qe)` per region, then the packed sort keys.
+type ViewScratch = (Vec<(i64, i64, i32, i32)>, Vec<u64>);
 
 impl RegionView {
     /// Index `ma` unless it is short; returns whether the view is usable for it.
@@ -688,34 +696,32 @@ impl RegionView {
             // on the 24-byte tuples alone. Three passes (keys, max length, cleanliness) plus a
             // gather back through `ma` in sorted order were most of `batch_mate_rescue` on x86.
             let (mut max_len, mut clean, mut packable) = (0i64, true, ma.len() < 1 << 24);
-            let tuples: Vec<(i64, i64, i32, i32)> = ma
-                .iter()
-                .map(|q| {
+            VIEW_SCRATCH.with_borrow_mut(|(tuples, keys)| {
+                tuples.clear();
+                tuples.extend(ma.iter().map(|q| {
                     max_len = max_len.max(q.re - q.rb);
                     clean &= q.rid >= 0 && q.re > q.rb;
                     packable &= (0..1 << 40).contains(&q.rb);
                     (q.rb, q.re, q.qb, q.qe)
-                })
-                .collect();
-            self.by_rb.clear();
-            // Sorted as packed `rb << 24 | index` words: a primitive sort, not a keyed tuple one.
-            if packable {
-                let mut keys = std::mem::take(&mut self.keys);
-                keys.clear();
-                keys.extend(
-                    tuples
-                        .iter()
-                        .enumerate()
-                        .map(|(i, q)| (q.0 as u64) << 24 | i as u64),
-                );
-                keys.sort_unstable();
-                self.by_rb
-                    .extend(keys.iter().map(|&k| tuples[(k & 0xff_ffff) as usize]));
-                self.keys = keys;
-            } else {
-                self.by_rb.extend_from_slice(&tuples);
-                self.by_rb.sort_unstable_by_key(|q| q.0);
-            }
+                }));
+                self.by_rb.clear();
+                // Sorted as packed `rb << 24 | index` words: a primitive sort, not a keyed tuple one.
+                if packable {
+                    keys.clear();
+                    keys.extend(
+                        tuples
+                            .iter()
+                            .enumerate()
+                            .map(|(i, q)| (q.0 as u64) << 24 | i as u64),
+                    );
+                    keys.sort_unstable();
+                    self.by_rb
+                        .extend(keys.iter().map(|&k| tuples[(k & 0xff_ffff) as usize]));
+                } else {
+                    self.by_rb.extend_from_slice(tuples);
+                    self.by_rb.sort_unstable_by_key(|q| q.0);
+                }
+            });
             self.sorted = self.by_rb.len();
             self.max_len = max_len;
             self.clean = clean;
