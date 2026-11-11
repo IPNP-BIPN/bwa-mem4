@@ -391,7 +391,7 @@ pub(crate) fn discard_contained(
         // (fg-labs/bwa-mem3's Pass-3 kept-set index). A kept region that is not live (its bounds
         // already `-1`) would let the scan run past `idx`, so from then on the read uses the scan.
         let contained = if index_ok {
-            ix.contains(&seed, regs, l_query, opt)
+            ix.contains(&seed, regs, l_query, opt, idx)
         } else {
             // Loop state for the containment scan. Invariant at the top of each iteration:
             // `scan_idx` is the next slot to examine, and `n_rejected` counts how many
@@ -417,58 +417,9 @@ pub(crate) fn discard_contained(
 
         // ---- step 2: confirm no comparably long off-diagonal seed of this chain interferes ----
         if contained {
-            // The seed is (almost) contained in an existing alignment. Confirm it cannot lead to a
-            // different one: look for a comparably long, already-processed seed of the same chain
-            // that overlaps it on a *different* diagonal. bwa scans `srt2[k+1..]` (higher scores,
-            // i.e. our earlier positions); only whether one exists matters, not which.
-            //
-            // Why `srt2[k+1..]` maps to `0..cur_meta.pos`: `srt2` is sorted *ascending* by the packed
-            // `score<<32 | i` key and the C walks `k` downward from `c->n-1`, so indices above `k`
-            // are the higher-scoring, already-visited seeds. Our `pos` counts from the top of the
-            // same order, so "already visited" is `pos` strictly less than ours, i.e.
-            // `0..cur_meta.pos`.
-            // bwa expresses "none found" as the loop running to completion (`v == c->n` at
-            // `bwamem.cpp:2978`); we use an explicit `interferes` flag for the same thing.
-            // Slot index of this chain's *first* seed. Valid because a chain's slots are contiguous
-            // and `pos` is the seed's offset inside that block, so `idx - pos` cannot underflow.
-            let chain_first_slot = idx - cur_meta.pos as usize;
-            // Invariant at the top of each iteration: false means no already-visited seed of this
-            // chain has yet been found that is comparably long, overlapping, and off-diagonal. Set
-            // once and broken out of; true is the C's "v != c->n" outcome, meaning do NOT purge.
-            let mut interferes = false;
-            for q in 0..cur_meta.pos as usize {
-                // The slot of the q-th higher-scoring seed of this chain, i.e. one already judged.
-                let earlier_slot = chain_first_slot + q;
-                // `bwamem.cpp:2967`: `if (srt2[v] == UINT_MAX) continue;`. A seed purged earlier in
-                // this very pass is not allowed to vouch for keeping this one. Our `purged` vector
-                // is the stand-in for that sentinel write, and it is seeded from `preskip` so the
-                // nh13 pre-skips are treated identically.
-                if purged[earlier_slot] {
-                    continue;
-                }
-                // The competing seed itself (the C's `t`): a higher-scoring, still-alive seed of the
-                // same chain, the only kind allowed to vouch for keeping `seed`.
-                let earlier_seed = chain.seeds[meta[earlier_slot].seed as usize];
-                // Only a comparably long seed can plausibly anchor a different alignment.
-                if f64::from(earlier_seed.len) < f64::from(seed.len) * COMPARABLE_LEN_FRAC {
-                    continue;
-                }
-                if seed.qbeg <= earlier_seed.qbeg
-                    && seed.qbeg + seed.len - earlier_seed.qbeg >= seed.len >> 2
-                    && i64::from(earlier_seed.qbeg - seed.qbeg) != earlier_seed.rbeg - seed.rbeg
-                {
-                    interferes = true;
-                    break;
-                }
-                if earlier_seed.qbeg <= seed.qbeg
-                    && earlier_seed.qbeg + earlier_seed.len - seed.qbeg >= seed.len >> 2
-                    && i64::from(seed.qbeg - earlier_seed.qbeg) != seed.rbeg - earlier_seed.rbeg
-                {
-                    interferes = true;
-                    break;
-                }
-            }
-            if !interferes {
+            // The seed is (almost) contained in an existing alignment. Purge it unless a comparably
+            // long seed of this chain overlaps it on another diagonal (see [`interferes`]).
+            if !interferes(chain, meta, |i| purged[i], idx, &seed) {
                 // `bwamem.cpp:2979-2982`: purge the alignment and blank the sort slot. `-1` (not the
                 // `H0_SENTINEL`) is bwa's chosen tombstone, and it is exactly what the
                 // `prior.qb == -1 && prior.qe == -1` skip at the top of the scan and the final
@@ -499,6 +450,293 @@ pub(crate) fn discard_contained(
     }
     (ix.purged, ix.bounds) = (purged, bounds);
     KEPT_INDEX.with(|c| *c.borrow_mut() = ix);
+}
+
+/// No job on that side of the slot (`slot_jobs` in `align_reads_batched_inner`).
+const NO_JOB: u32 = u32::MAX;
+
+/// Whether the extension runs in waves that skip the seeds the discard pass would purge (see
+/// [`run_staged`]). `BWA4_NO_STAGED` restores extend-everything-then-purge, for A/B. Read once.
+fn staged_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_NO_STAGED").is_none())
+}
+
+/// A slot's place in [`run_staged`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Not judged yet: an earlier slot still undecided or extending may contain this seed.
+    Undecided,
+    /// Kept; extending in the current wave.
+    Pending,
+    /// Kept and extended.
+    Kept,
+    /// Purged without an extension, or pre-skipped.
+    Purged,
+}
+
+/// The extension and the discard pass, in waves that never extend a seed the pass would purge.
+///
+/// bwa-mem2 extends every seed, then [`discard_contained`] walks the slots in order and purges each
+/// seed that an earlier kept region contains: 44% of the extension jobs on wgsim chr21. That
+/// judgement reads the seed and the earlier KEPT regions, never the seed's own extension, so a slot
+/// can be judged once every earlier region that could contain its seed has landed. A slot's region
+/// lies inside `slot_win` (its chain's window, the one its jobs slice, widened to its seed), so
+/// only the earlier slots whose window covers the seed can matter, plus, for the interference test,
+/// the earlier slots of its own chain (see [`judge`] for when a slot must wait). Each wave judges
+/// what it can, purges or keeps it, and extends the kept slots; their regions let the next wave
+/// judge more. The judgement is the pass's own on the same earlier kept
+/// set (the index is cut at the slot), so it purges exactly what bwa-mem2 purges.
+///
+/// A kept region left without bounds would switch bwa-mem2's pass from the kept-set test to its
+/// order-dependent scan, which can read later slots' regions; such a read is extended in full and
+/// handed to [`discard_contained`] as before.
+#[allow(clippy::too_many_arguments)]
+fn run_staged<B: SwBackend>(
+    backend: &B,
+    opt: &MemOpt,
+    reads: &[&[u8]],
+    chains: &[Vec<MemChain>],
+    arena: &[u8],
+    left_jobs: &[SideJob],
+    right_jobs: &[SideJob],
+    regs: &mut [Vec<MemAlnReg>],
+    slot0: &[usize],
+    meta: &[RegMeta],
+    preskip: &[bool],
+    slot_jobs: &[(u32, u32)],
+    slot_win: &[(i64, i64)],
+) {
+    let mut st: Vec<Stage> = preskip
+        .iter()
+        .map(|&p| if p { Stage::Purged } else { Stage::Undecided })
+        .collect();
+    // Reads extended in full for [`discard_contained`] (see above).
+    let mut full = vec![false; reads.len()];
+    let mut ix = KEPT_INDEX.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let mut blocking = KeptIndex::default();
+    // This wave's extending slots, as (read, slot within the read).
+    let mut pending: Vec<(usize, usize)> = Vec::new();
+    let (mut wl, mut wr): (Vec<SideJob>, Vec<SideJob>) = (Vec::new(), Vec::new());
+    // Reads with a slot still undecided, and each read's first undecided slot.
+    let mut todo: Vec<usize> = (0..reads.len()).collect();
+    let mut first = vec![0usize; reads.len()];
+    while !todo.is_empty() {
+        pending.clear();
+        let mut w = 0;
+        for t in 0..todo.len() {
+            let r = todo[t];
+            let (base, n) = (slot0[r], regs[r].len());
+            let st = &mut st[base..base + n];
+            let open = if full[r] {
+                for (i, s) in st.iter_mut().enumerate() {
+                    if *s == Stage::Purged && !preskip[base + i] || *s == Stage::Undecided {
+                        *s = Stage::Pending;
+                        pending.push((r, i));
+                    }
+                }
+                false
+            } else {
+                judge(
+                    opt,
+                    reads[r].len() as i32,
+                    &chains[r],
+                    &regs[r],
+                    &meta[base..base + n],
+                    &slot_win[base..base + n],
+                    st,
+                    &mut first[r],
+                    &mut ix,
+                    &mut blocking,
+                    |i| pending.push((r, i)),
+                )
+            };
+            if open {
+                todo[w] = r;
+                w += 1;
+            }
+        }
+        todo.truncate(w);
+        if pending.is_empty() {
+            break;
+        }
+        wl.clear();
+        wr.clear();
+        for &(r, i) in &pending {
+            let (lj, rj) = slot_jobs[slot0[r] + i];
+            if lj != NO_JOB {
+                wl.push(left_jobs[lj as usize]);
+            }
+            if rj != NO_JOB {
+                wr.push(right_jobs[rj as usize]);
+            }
+        }
+        // As the unstaged path: left first, then the right jobs resume from the left's score.
+        align_split::measure(&align_split::SIDE_NS, || {
+            run_side(backend, opt, arena, &mut wl, regs, opt.pen_clip5, true)
+        });
+        for job in &mut wr {
+            job.h0 = regs[job.read][job.reg].score;
+            job.prev = job.h0;
+        }
+        align_split::measure(&align_split::SIDE_NS, || {
+            run_side(backend, opt, arena, &mut wr, regs, opt.pen_clip3, false)
+        });
+        for &(r, i) in &pending {
+            st[slot0[r] + i] = Stage::Kept;
+            let g = &regs[r][i];
+            if g.qb == -1 && g.qe == -1 && !full[r] {
+                full[r] = true;
+                if todo.last() != Some(&r) && !todo.contains(&r) {
+                    todo.push(r);
+                }
+            }
+        }
+    }
+    KEPT_INDEX.with(|c| *c.borrow_mut() = ix);
+    for r in 0..reads.len() {
+        let (base, n) = (slot0[r], regs[r].len());
+        if full[r] {
+            discard_contained(
+                opt,
+                reads[r].len() as i32,
+                &chains[r],
+                &mut regs[r],
+                &meta[base..base + n],
+                &preskip[base..base + n],
+            );
+            continue;
+        }
+        for (i, g) in regs[r].iter_mut().enumerate() {
+            if st[base + i] == Stage::Purged && !preskip[base + i] {
+                // The discard pass's tombstone, as it writes it (see there).
+                g.qb = -1;
+                g.qe = -1;
+            }
+        }
+    }
+}
+
+/// One read's judgement pass in [`run_staged`]: every undecided slot whose fate no undecided or
+/// extending slot can still change is purged or kept, as [`discard_contained`] would, the kept ones
+/// handed to `extend`. `st`, `meta` and `win` are the read's slots; slots before `*first` are
+/// decided, and `*first` moves to the first slot left undecided. Returns whether there is one.
+///
+/// A seed that an extended kept region already contains stays contained whatever the earlier slots
+/// still extending add, so it is decided at once (its interference test reads only the fates of
+/// its chain's earlier slots). Otherwise it waits while an earlier extending or undecided slot's
+/// window covers it, or while an earlier slot of its chain is undecided.
+#[allow(clippy::too_many_arguments)]
+fn judge(
+    opt: &MemOpt,
+    l_query: i32,
+    chains: &[MemChain],
+    regs: &[MemAlnReg],
+    meta: &[RegMeta],
+    win: &[(i64, i64)],
+    st: &mut [Stage],
+    first: &mut usize,
+    ix: &mut KeptIndex,
+    blocking: &mut KeptIndex,
+    mut extend: impl FnMut(usize),
+) -> bool {
+    let start = *first;
+    ix.clear();
+    for (i, s) in st.iter().enumerate() {
+        if *s == Stage::Kept {
+            let g = &regs[i];
+            ix.insert(i, (g.rb, g.re, g.qb, g.qe));
+        }
+    }
+    // Windows of the undecided and extending slots so far, and whether the current chain has an
+    // undecided one (its later slots' interference test reads that fate). Every slot before
+    // `start` is decided, and no slot is extending at the top of a wave.
+    blocking.clear();
+    // A chain's slots mostly share its window: one member for a run of them.
+    let mut last_win = (i64::MIN, i64::MIN);
+    let mut block = |blocking: &mut KeptIndex, i: usize| {
+        if win[i] != last_win {
+            last_win = win[i];
+            blocking.insert(i, (win[i].0, win[i].1, 0, 0));
+        }
+    };
+    let (mut chain, mut chain_open) = (u32::MAX, false);
+    *first = st.len();
+    for i in start..st.len() {
+        let m = meta[i];
+        if m.chain != chain {
+            (chain, chain_open) = (m.chain, false);
+        }
+        if st[i] != Stage::Undecided {
+            continue;
+        }
+        let c = &chains[m.chain as usize];
+        let seed = c.seeds[m.seed as usize];
+        let (s, e) = (seed.rbeg, seed.rbeg + i64::from(seed.len));
+        if !chain_open && ix.contains(&seed, regs, l_query, opt, i) {
+            if !interferes(c, meta, |j| st[j] == Stage::Purged, i, &seed) {
+                st[i] = Stage::Purged;
+                continue;
+            }
+        } else if chain_open || blocking.any_spanning(s, e, |_| true) {
+            if *first == st.len() {
+                *first = i;
+            }
+            chain_open = true;
+            block(blocking, i);
+            continue;
+        }
+        st[i] = Stage::Pending;
+        extend(i);
+        block(blocking, i);
+    }
+    *first < st.len()
+}
+
+/// Whether a comparably long, already-processed, still-alive seed of the same chain overlaps `seed`
+/// on a *different* diagonal (`bwamem.cpp:2961-2978`): then a contained seed may still lead to a
+/// distinct alignment and is kept. bwa scans `srt2[k+1..]` (higher scores, i.e. our earlier
+/// positions); only whether one exists matters, not which.
+///
+/// `idx` is the seed's slot and `meta` the read's slot metadata; `purged(i)` says whether slot `i`
+/// is tombstoned (bwa's `srt2[v] == UINT_MAX`), which bars it from vouching.
+fn interferes(
+    chain: &MemChain,
+    meta: &[RegMeta],
+    purged: impl Fn(usize) -> bool,
+    idx: usize,
+    seed: &MemSeed,
+) -> bool {
+    // `srt2` is sorted ascending by the packed `score<<32 | i` key and the C walks `k` downward, so
+    // the indices above `k` are the higher-scoring, already-visited seeds: our `pos` counts from the
+    // top of the same order, so those are `0..pos`. A chain's slots are contiguous and `pos` is the
+    // seed's offset inside that block, so `idx - pos` is the chain's first slot.
+    let pos = meta[idx].pos as usize;
+    let chain_first_slot = idx - pos;
+    for q in 0..pos {
+        let earlier_slot = chain_first_slot + q;
+        if purged(earlier_slot) {
+            continue;
+        }
+        let earlier_seed = chain.seeds[meta[earlier_slot].seed as usize];
+        // Only a comparably long seed can plausibly anchor a different alignment.
+        if f64::from(earlier_seed.len) < f64::from(seed.len) * COMPARABLE_LEN_FRAC {
+            continue;
+        }
+        if seed.qbeg <= earlier_seed.qbeg
+            && seed.qbeg + seed.len - earlier_seed.qbeg >= seed.len >> 2
+            && i64::from(earlier_seed.qbeg - seed.qbeg) != earlier_seed.rbeg - seed.rbeg
+        {
+            return true;
+        }
+        if earlier_seed.qbeg <= seed.qbeg
+            && earlier_seed.qbeg + earlier_seed.len - seed.qbeg >= seed.len >> 2
+            && i64::from(seed.qbeg - earlier_seed.qbeg) != seed.rbeg - earlier_seed.rbeg
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether region `prior` (bounds `b`: `rb, re, qb, qe`) contains `seed` closely enough that the
@@ -593,19 +831,18 @@ impl KeptIndex {
         self.recs.push((b.0, b.1, b.2, b.3, slot as u32, next));
     }
 
-    /// Whether some member [`contains`] `seed`.
-    fn contains(&self, seed: &MemSeed, regs: &[MemAlnReg], l_query: i32, opt: &MemOpt) -> bool {
-        if self.recs.is_empty() {
-            return false;
-        }
+    /// Whether some member in a slot before `before` [`contains`] `seed`.
+    fn contains(
+        &self,
+        seed: &MemSeed,
+        regs: &[MemAlnReg],
+        l_query: i32,
+        opt: &MemOpt,
+        before: usize,
+    ) -> bool {
         let (s, e) = (seed.rbeg, seed.rbeg + i64::from(seed.len));
-        let lo = e - self.maxspan;
-        if lo > s {
-            return false;
-        }
-        let hit = |r: &(i64, i64, i32, i32, u32, i32)| {
-            r.0 <= s
-                && r.1 >= e
+        self.any_spanning(s, e, |r| {
+            (r.4 as usize) < before
                 && contains(
                     seed,
                     &regs[r.4 as usize],
@@ -613,7 +850,24 @@ impl KeptIndex {
                     l_query,
                     opt,
                 )
-        };
+        })
+    }
+
+    /// Whether some member spanning `[s, e)` on the reference passes `hit`.
+    fn any_spanning(
+        &self,
+        s: i64,
+        e: i64,
+        hit: impl Fn(&(i64, i64, i32, i32, u32, i32)) -> bool,
+    ) -> bool {
+        if self.recs.is_empty() {
+            return false;
+        }
+        let lo = e - self.maxspan;
+        if lo > s {
+            return false;
+        }
+        let hit = |r: &(i64, i64, i32, i32, u32, i32)| r.0 <= s && r.1 >= e && hit(r);
         let (b_lo, b_hi) = (lo >> Self::BUCKET_SHIFT, s >> Self::BUCKET_SHIFT);
         if b_hi - b_lo >= Self::MAX_BUCKET_WALK {
             return self.recs.iter().any(hit);
@@ -666,6 +920,7 @@ thread_local! {
 /// bytes inline where the C stores `(idq, idr, len1, len2)` offsets into shared arenas. `read`/`reg`
 /// are the C's `sp.seqid` / `sp.regid` (`bwamem.cpp:2251-2252` for left, `2331-2332` for right),
 /// which is how the scatter finds `av_v[sp->seqid].a[sp->regid]`.
+#[derive(Clone, Copy)]
 struct SideJob {
     /// Index into the batch's `reads` / `regs` outer vectors (the C's `seqid`).
     read: usize,
@@ -1293,6 +1548,14 @@ fn align_reads_batched_inner<B: SwBackend>(
     // elide the DP for same-diagonal contained seeds (default true, byte-identical).
     let purge = discard_enabled();
     let skip_contained = skip_contained_enabled();
+    // Staged extension (see `run_staged`): per slot, its left and right job (`NO_JOB` for none) and
+    // its chain's reference window.
+    let staged = purge && staged_enabled();
+    let (mut slot_jobs, mut slot_win) = if staged {
+        (vec![(NO_JOB, NO_JOB); n_slots], vec![(0i64, 0i64); n_slots])
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     // ---- collection pass: one region skeleton + up to one left and one right job per seed ----
     let mut order: Vec<u64> = Vec::new();
@@ -1442,6 +1705,9 @@ fn align_reads_batched_inner<B: SwBackend>(
                         seed: si as u32,
                     };
                     reg_preskip[k] = true;
+                    if staged {
+                        slot_win[k] = (rmax0, rmax1);
+                    }
                     // A placeholder region, born purged. Bounds are `-1` (the discard pass's
                     // tombstone) rather than `H0_SENTINEL`, so the seedcov pass skips it, the
                     // discard pass's `qb == -1 && qe == -1` check skips it, and the final
@@ -1473,6 +1739,7 @@ fn align_reads_batched_inner<B: SwBackend>(
                     continue;
                 }
                 let seed = chain.seeds[si];
+                let (n_left, n_right) = (left_jobs.len(), right_jobs.len());
                 // Region skeleton (the C's `a`), matching the `memset(a, 0, ...)` plus explicit field
                 // writes at `bwamem.cpp:2211-2222`. All four bounds (`qb`/`qe` query offsets,
                 // `rb`/`re` reference positions) start at `H0_SENTINEL` (bwa's `H0_`, -99): a value
@@ -1585,75 +1852,104 @@ fn align_reads_batched_inner<B: SwBackend>(
                     seed: si as u32,
                 };
                 reg_preskip[k] = false;
+                if staged {
+                    let job = |n0: usize, n: usize| if n > n0 { n0 as u32 } else { NO_JOB };
+                    slot_jobs[k] = (job(n_left, left_jobs.len()), job(n_right, right_jobs.len()));
+                    // The region's reach: the window its jobs slice, and the seed a side without a
+                    // job keeps as its bound.
+                    slot_win[k] = (
+                        rmax0.min(seed.rbeg),
+                        rmax1.max(seed.rbeg + i64::from(seed.len)),
+                    );
+                }
                 regs[r].push(reg);
             }
         }
     }
 
-    // ---- left extensions (h0 already set), then fill right h0 and run right extensions ----
-    // `pen_clip5` for the left side, `pen_clip3` for the right: bwa constructs two
-    // `BandedPairWiseSW` objects differing only in that penalty (`bwamem.cpp:2452-2458`). The
-    // penalty decides whether a soft clip beats running the alignment to the end of the query.
-    align_split::measure(&align_split::SIDE_NS, || {
-        run_side(
+    if staged {
+        run_staged(
             backend,
             opt,
+            reads,
+            &per_read_chains,
             &arena,
-            &mut left_jobs,
+            &left_jobs,
+            &right_jobs,
             &mut regs,
-            opt.pen_clip5,
-            true,
-        )
-    });
-
-    // The hard serialisation point, and the reason there are two job arrays rather than one: a right
-    // extension resumes from the score the left extension reached, so every left job in the whole
-    // batch must have landed before any right job can even be parameterised. bwa-mem2 does the same
-    // fixup in its own loop at `bwamem.cpp:2672-2677` (`sp->h0 = a->score;`).
-    for job in &mut right_jobs {
-        job.h0 = regs[job.read][job.reg].score;
-        // `prev` starts at the region's current score, not -1, because that is literally what the C
-        // reads: `int prev = a->score;` (`bwamem.cpp:2492`) runs on every band retry including the
-        // first, and by now `a->score` holds the left extension's result. For a *left* job the
-        // region still carries the -1 it was initialised with (`bwamem.cpp:2218`), which is why -1
-        // remains right there.
-        //
-        // This used to be -1 on both sides, justified by an equivalence argument: a right extension
-        // whose round-0 score equals `h0` gained nothing, and `ksw_extend2` only updates `max_off`
-        // inside `if (m > max)` with `max` starting at `h0` (`ksw.cpp:479-480`), so `max_off` is
-        // still 0 and acceptance test 2 fires anyway. That argument is sound, but it has a hole:
-        // test 2 reads `max_off < (w >> 1) + (w >> 2)`, which for `w <= 1` is `0 < 0`, false. With
-        // `-w 0` or `-w 1` the C accepts at round 0 via test 1 while we would retry at double the
-        // band and could return a different alignment. Reproducing the C removes the reasoning
-        // instead of narrowing it.
-        job.prev = job.h0;
-    }
-    align_split::measure(&align_split::SIDE_NS, || {
-        run_side(
-            backend,
-            opt,
-            &arena,
-            &mut right_jobs,
-            &mut regs,
-            opt.pen_clip3,
-            false,
-        )
-    });
-    ARENA.set(arena);
-
-    // ---- bwa-mem2's discard pass, after every extension has landed ----
-    if purge {
-        for r in 0..reads.len() {
-            let l_query = reads[r].len() as i32;
-            let n = regs[r].len();
-            discard_contained(
+            &slot0,
+            &reg_meta,
+            &reg_preskip,
+            &slot_jobs,
+            &slot_win,
+        );
+        ARENA.set(arena);
+    } else {
+        // ---- left extensions (h0 already set), then fill right h0 and run right extensions ----
+        // `pen_clip5` for the left side, `pen_clip3` for the right: bwa constructs two
+        // `BandedPairWiseSW` objects differing only in that penalty (`bwamem.cpp:2452-2458`). The
+        // penalty decides whether a soft clip beats running the alignment to the end of the query.
+        align_split::measure(&align_split::SIDE_NS, || {
+            run_side(
+                backend,
                 opt,
-                l_query,
-                &per_read_chains[r],
-                &mut regs[r],
-                &reg_meta[slot0[r]..slot0[r] + n],
-                &reg_preskip[slot0[r]..slot0[r] + n],
-            );
+                &arena,
+                &mut left_jobs,
+                &mut regs,
+                opt.pen_clip5,
+                true,
+            )
+        });
+
+        // The hard serialisation point, and the reason there are two job arrays rather than one: a right
+        // extension resumes from the score the left extension reached, so every left job in the whole
+        // batch must have landed before any right job can even be parameterised. bwa-mem2 does the same
+        // fixup in its own loop at `bwamem.cpp:2672-2677` (`sp->h0 = a->score;`).
+        for job in &mut right_jobs {
+            job.h0 = regs[job.read][job.reg].score;
+            // `prev` starts at the region's current score, not -1, because that is literally what the C
+            // reads: `int prev = a->score;` (`bwamem.cpp:2492`) runs on every band retry including the
+            // first, and by now `a->score` holds the left extension's result. For a *left* job the
+            // region still carries the -1 it was initialised with (`bwamem.cpp:2218`), which is why -1
+            // remains right there.
+            //
+            // This used to be -1 on both sides, justified by an equivalence argument: a right extension
+            // whose round-0 score equals `h0` gained nothing, and `ksw_extend2` only updates `max_off`
+            // inside `if (m > max)` with `max` starting at `h0` (`ksw.cpp:479-480`), so `max_off` is
+            // still 0 and acceptance test 2 fires anyway. That argument is sound, but it has a hole:
+            // test 2 reads `max_off < (w >> 1) + (w >> 2)`, which for `w <= 1` is `0 < 0`, false. With
+            // `-w 0` or `-w 1` the C accepts at round 0 via test 1 while we would retry at double the
+            // band and could return a different alignment. Reproducing the C removes the reasoning
+            // instead of narrowing it.
+            job.prev = job.h0;
+        }
+        align_split::measure(&align_split::SIDE_NS, || {
+            run_side(
+                backend,
+                opt,
+                &arena,
+                &mut right_jobs,
+                &mut regs,
+                opt.pen_clip3,
+                false,
+            )
+        });
+        ARENA.set(arena);
+
+        // ---- bwa-mem2's discard pass, after every extension has landed ----
+        if purge {
+            for r in 0..reads.len() {
+                let l_query = reads[r].len() as i32;
+                let n = regs[r].len();
+                discard_contained(
+                    opt,
+                    l_query,
+                    &per_read_chains[r],
+                    &mut regs[r],
+                    &reg_meta[slot0[r]..slot0[r] + n],
+                    &reg_preskip[slot0[r]..slot0[r] + n],
+                );
+            }
         }
     }
 
