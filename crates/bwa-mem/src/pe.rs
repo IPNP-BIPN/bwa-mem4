@@ -2096,11 +2096,9 @@ fn mem_pair_in(
     tie_margin = tie_margin
         .max(opt.o_del + opt.e_del)
         .max(opt.o_ins + opt.e_ins);
-    // Ascending sort, so the BEST pair is the LAST element (bwa reads `u.a[u.n-1]`). The high half
-    // of `px` is the score and the low half the hash, so this is "score, then hash tie-break".
-    u.sort_unstable();
-    // The winning candidate pair: highest `q`, hash-tie-broken. `u` is non-empty by the check above.
-    let last = *u.last().unwrap();
+    // The winning candidate pair (highest `q`, hash-tie-broken), the runner-up score and how many
+    // others sit within `tie_margin` of it. `u` is non-empty by the check above.
+    let (last, sub, n_sub) = best_pair(u, tie_margin);
     // Unpack the two `v` indices from `py`. `i` was the current placement, `k` the partner.
     let i = (last.1 >> 32) as usize;
     let k = (last.1 & 0xffff_ffff) as usize;
@@ -2116,33 +2114,35 @@ fn mem_pair_in(
     z[(v[k].1 & 1) as usize] = (v[k].1 << 32 >> 34) as usize;
     // Winning pair's combined score, already floored at 0 when it was packed.
     let score = (last.0 >> 32) as i32;
-    // Runner-up score. Note `u` holds one entry per candidate *pairing*, so the runner-up is very
-    // often the same two regions paired through a different intermediate, not a genuinely different
-    // locus. That is intentional: the caller uses `sub` only to damp MAPQ.
-    let sub = if u.len() > 1 {
-        (u[u.len() - 2].0 >> 32) as i32
-    } else {
-        0
-    };
-    // Count runner-ups within `tie_margin` of `sub`. bwa's loop is `for (i = u.n - 2; i >= 0; --i)`, i.e.
-    // it starts at the runner-up itself (so `n_sub` is at least 1 whenever `u.len() >= 2`) and
-    // walks down to index 0. Since `u` is ascending, later iterations only ever see smaller scores,
-    // but the C does NOT break out on the first failure, so neither do we. The reversed iterator
-    // over `u[..len-1]` is that same traversal.
-    let mut n_sub = 0;
-    if u.len() >= 2 {
-        for cand in u[..u.len() - 1].iter().rev() {
-            if sub - (cand.0 >> 32) as i32 <= tie_margin {
-                n_sub += 1;
-            }
-        }
-    }
     Some(PairResult {
         score,
         sub,
         n_sub,
         z,
     })
+}
+
+/// `mem_pair`'s pick from its non-empty candidate list `u`: the best `(px, py)`, the runner-up score
+/// `sub` and `n_sub`, the count of other candidates within `tie_margin` of `sub`. bwa sorts `u`
+/// ascending and reads `u[n-1]`, `u[n-2]` and every score below; nothing else sees the order, so
+/// one scan for the maximum gives the same three answers.
+///
+/// Note `u` holds one entry per candidate *pairing*, so the runner-up is very often the same two
+/// regions paired through a different intermediate, not a genuinely different locus. That is
+/// intentional: the caller uses `sub` only to damp MAPQ.
+fn best_pair(u: &[(u64, u64)], tie_margin: i32) -> ((u64, u64), i32, i32) {
+    let best = (0..u.len()).max_by_key(|&j| u[j]).unwrap();
+    let others = || {
+        u.iter()
+            .enumerate()
+            .filter(move |&(j, _)| j != best)
+            .map(|(_, c)| (c.0 >> 32) as i32)
+    };
+    // The sorted list's second-to-last entry, i.e. the top score among the others.
+    let sub = others().max().unwrap_or(0);
+    // bwa's loop over `u.a[0 .. u.n-2]`: every entry but the best, so `n_sub >= 1` once `n >= 2`.
+    let n_sub = others().filter(|&q| sub - q <= tie_margin).count() as i32;
+    (u[best], sub, n_sub)
 }
 
 /// Convert a score margin into a phred-scaled mapping quality. Port of the `raw_mapq` macro
@@ -3250,7 +3250,38 @@ pub fn mem_sam_pe<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::mem_infer_dir;
+    use super::{best_pair, mem_infer_dir};
+
+    /// [`best_pair`] answers what bwa reads off the sorted candidate list, including heavy score ties.
+    #[test]
+    fn best_pair_matches_sorted_list() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for n in [1usize, 2, 3, 7, 40, 300] {
+            for spread in [2u64, 9, 1000] {
+                let u: Vec<(u64, u64)> = (0..n as u64)
+                    .map(|j| ((next() % spread) << 32 | next() & 0xffff, j))
+                    .collect();
+                let mut s = u.clone();
+                s.sort_unstable();
+                let sub = if n > 1 { (s[n - 2].0 >> 32) as i32 } else { 0 };
+                let n_sub = s[..n - 1]
+                    .iter()
+                    .filter(|c| sub - (c.0 >> 32) as i32 <= 5)
+                    .count() as i32;
+                assert_eq!(
+                    best_pair(&u, 5),
+                    (s[n - 1], sub, n_sub),
+                    "n={n} spread={spread}"
+                );
+            }
+        }
+    }
 
     /// Pins the FF/FR/RF/RR encoding of [`mem_infer_dir`], which every `pes[4]` lookup in this file
     /// depends on. Getting the code wrong would silently swap two orientations' insert windows,
