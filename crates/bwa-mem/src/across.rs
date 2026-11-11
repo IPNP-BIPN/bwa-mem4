@@ -1292,7 +1292,7 @@ fn align_reads_batched_inner<B: SwBackend>(
     let skip_contained = skip_contained_enabled();
 
     // ---- collection pass: one region skeleton + up to one left and one right job per seed ----
-    let mut order: Vec<usize> = Vec::new();
+    let mut order: Vec<u64> = Vec::new();
     // Backing store for every job's query and target. Cleared once per chunk; the ranges in
     // `SideJob` index it. Holding it whole for the chunk is what the owned vectors were doing
     // anyway, and this way each read's bases and each chain's window are stored ONCE instead of
@@ -1406,8 +1406,9 @@ fn align_reads_batched_inner<B: SwBackend>(
             // which is the same permutation. Two details are load-bearing:
             //   - packing the index into the low 32 bits makes the order total, so ties in score are
             //     broken by seed index and the sort's own stability never matters. That is exactly
-            //     why we can use `sort_by_key` here while the dedup elsewhere must stay unstable to
-            //     match the C.
+            //     why any sort will do here while the dedup elsewhere must reproduce the C's: the
+            //     keys themselves are sorted, complemented so ascending is descending, as plain
+            //     words (`sort_unstable` takes its branchless networks for them).
             //   - `score as u32` before widening: `score` is i32 and the C reinterprets it as the
             //     high half of a u64, so a (never observed in practice) negative score would sort as
             //     a huge positive one. Reproducing the reinterpretation rather than sign-extending is
@@ -1415,14 +1416,19 @@ fn align_reads_batched_inner<B: SwBackend>(
             // One scratch list for every chain of the batch (109M chains per 2M pairs: a `Vec`
             // each was a malloc each), sorted only when there is something to sort.
             order.clear();
-            order.extend(0..chain.seeds.len());
+            order.extend(
+                (chain.seeds.iter().enumerate())
+                    .map(|(i, s)| !((u64::from(s.score as u32) << 32) | i as u64)),
+            );
             if order.len() > 1 {
-                order.sort_by_key(|&i| {
-                    std::cmp::Reverse((u64::from(chain.seeds[i].score as u32) << 32) | i as u64)
-                });
+                order.sort_unstable();
             }
 
-            for (pos, &si) in order.iter().enumerate() {
+            for (pos, si) in order
+                .iter()
+                .map(|&k| (!k & 0xffff_ffff) as usize)
+                .enumerate()
+            {
                 if skip_contained && seed_ext_redundant(&chain.seeds, si) {
                     // Keep the slot, skip the DP: the discard pass would purge this seed anyway
                     // (its container is a longer same-diagonal seed, extended earlier).
