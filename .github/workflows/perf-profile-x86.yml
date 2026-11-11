@@ -236,6 +236,7 @@ jobs:
                      'bwa_mem4_mem::across::align_reads_batched' \
                      'bwa_mem4_mem::pe::batch_mate_rescue' \
                      'bwa_mem4_mem::cigar::gen_cigar2' \
+                     'bwa_mem4_extend::sw::ksw_global2' \
                      '_mi_theap_malloc_zero' \
                      'mi_free'; do
           sym=$("$PERF" report -i ours.data --stdio --no-children 2>/dev/null \
@@ -255,7 +256,9 @@ jobs:
           # Mangled names: the fork's are C++ with spaces once demangled.
           for side in "ours:_[RZ][0-9A-Za-z_]*batched_extend_[a-z0-9]*_u8[0-9A-Za-z_]*" \
                       "fork:_Z[0-9A-Za-z_]*smithWatermanBatchWrapper8Compact[0-9A-Za-z_]*" \
-                      "fork:_Z[0-9A-Za-z_]*getSMEMsOnePosOneThread_lockstep[0-9A-Za-z_]*"; do
+                      "fork:_Z[0-9A-Za-z_]*getSMEMsOnePosOneThread_lockstep[0-9A-Za-z_]*" \
+                      "ours:_[RZ][0-9A-Za-z_]*ksw_global2[0-9A-Za-z_]*" \
+                      "fork:ksw_global2[a-z0-9_]*"; do
             bin=${side%%:*}; pat=${side#*:}
             sym=$("$PERF" report -i "$bin.data" --stdio --no-children --no-demangle 2>/dev/null \
               | grep -o "$pat" | head -1 || true)
