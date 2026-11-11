@@ -47,6 +47,10 @@ on:
         description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4"
         default: ""
         required: false
+      alt_rustflags:
+        description: "If set, the alt arm is a second build of ours with these RUSTFLAGS appended (same-host A/B of codegen), e.g. -C target-cpu=x86-64-v4; skipped where that binary does not run"
+        default: ""
+        required: false
       icount:
         description: "Instead of the profile, count each function's x86 instructions under callgrind (read_pairs 50000)"
         default: "false"
@@ -130,6 +134,8 @@ jobs:
           init-shell: bash
 
       - name: Build ours at the tier we ship
+        env:
+          ALT_RUSTFLAGS: ${{ github.event.inputs.alt_rustflags || '' }}
         run: |
           set -euo pipefail
           # `-C force-frame-pointers=yes` so `perf` can walk the stack without DWARF unwinding, and
@@ -145,6 +151,12 @@ jobs:
           RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }}" \
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf
           cp target-perf/release/bwa-mem4 ./mem4-v3
+          if [ -n "$ALT_RUSTFLAGS" ]; then
+            CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CFLAGS="-O3 -fno-omit-frame-pointer" \
+            RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }} $ALT_RUSTFLAGS" \
+              cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf-alt
+            cp target-perf-alt/release/bwa-mem4 ./mem4-alt
+          fi
 
       - name: Reference, index and reads
         shell: bash -el {0}
@@ -178,12 +190,25 @@ jobs:
           head -4000 "$r1" > probe1.fq; head -4000 "$r2" > probe2.fq
           BWA4_LOCKSTEP_PROBE=1 ../mem4-v3 mem -t 1 chr21.fa probe1.fq probe2.fq 2>&1 >/dev/null | grep 'lockstep-probe' || true
 
-          # `alt`: ours again under OURS_ENV, so a knob's effect is read on the same host.
-          arms="ours fork"; [ -n "$OURS_ENV" ] && arms="ours alt fork"
+          # `alt`: ours again under OURS_ENV, and/or the alt_rustflags build, so a knob's or a
+          # codegen's effect is read on the same host. A build this CPU cannot run (x86-64-v4 on a
+          # host without AVX-512) drops the arm instead of failing the run.
+          alt_bin=../mem4-v3; alt_ok=""
+          if [ -x ../mem4-alt ]; then
+            ma=$(../mem4-alt mem -t "$T" chr21.fa "$r1" "$r2" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32) || ma=""
+            if [ -n "$ma" ]; then
+              alt_bin=../mem4-alt; alt_ok=1
+              echo "===== alt build output md5: $ma $([ "$ma" = "$m3" ] && echo identical || echo DIFFER) ====="
+            else
+              echo "===== alt build does not run on this host: arm skipped ====="
+            fi
+          fi
+          [ -n "$OURS_ENV" ] && alt_ok=1
+          arms="ours fork"; [ -n "$alt_ok" ] && arms="ours alt fork"
           for arm in $arms; do
             case "$arm" in
               ours) cmd=(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
-              alt)  read -ra kv <<< "$OURS_ENV"; cmd=(env "${kv[@]}" ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
+              alt)  read -ra kv <<< "$OURS_ENV"; cmd=(env "${kv[@]}" "$alt_bin" mem -t "$T" chr21.fa "$r1" "$r2") ;;
               fork) cmd=(bwa-mem3   mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2") ;;
             esac
             echo "::group::perf record: $arm"
