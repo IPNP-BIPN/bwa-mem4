@@ -1554,8 +1554,13 @@ impl Output {
 
 /// How many batches may be in flight, as `(readahead, writebehind)`.
 ///
-/// One each way, which is double buffering: while the aligner works on a batch, the reader may have
-/// exactly one more ready and the writer may have exactly one still draining. Nothing deeper.
+/// Double buffering: while the aligner works on a batch, the reader may have exactly one more ready
+/// and the writer may have exactly one still draining. Nothing deeper.
+///
+/// The read side is a rendezvous (`sync_channel(0)`) because the reader holds the batch it is
+/// building on top of whatever sits in the queue: a queue of one let it park a second finished batch
+/// behind the queued one, two batches ahead of the aligner, 0.28 GB of records on GIAB PE at
+/// `-K 100M`. The write side stays at one, so the aligner never waits on a sink still draining.
 ///
 /// It used to be 2 and 3, and those were the whole of the memory gap against `fg-labs/bwa-mem3`
 /// reported in issue #25. The queues are bounded in BATCHES, and a batch is `-K` bases, which at the
@@ -1573,17 +1578,17 @@ impl Output {
 /// just memory.
 ///
 /// `BWA4_QUEUE_DEPTH=read,write` raises them again, so the trade can be measured on a machine where
-/// input really is the bottleneck rather than argued about here. A value that does not parse, or
-/// that asks for a zero-length queue, is ignored rather than clamped silently: a typo in a benchmark
-/// script should not quietly change what is being measured.
-const BATCH_READAHEAD: usize = 1;
+/// input really is the bottleneck rather than argued about here (`read` may be 0, the default). A
+/// value that does not parse, or that asks for a zero-length write queue, is ignored rather than
+/// clamped silently: a typo in a benchmark script should not quietly change what is being measured.
+const BATCH_READAHEAD: usize = 0;
 const SAM_WRITEBEHIND: usize = 1;
 
 fn queue_depths() -> (usize, usize) {
     if let Ok(s) = std::env::var("BWA4_QUEUE_DEPTH") {
         if let Some((r, w)) = s.split_once(',') {
             if let (Ok(r), Ok(w)) = (r.trim().parse::<usize>(), w.trim().parse::<usize>()) {
-                if r >= 1 && w >= 1 {
+                if w >= 1 {
                     return (r, w);
                 }
             }
@@ -3345,7 +3350,7 @@ mod tests {
     #[test]
     fn queue_depth_defaults_to_double_buffering() {
         assert_eq!(queue_depths(), (BATCH_READAHEAD, SAM_WRITEBEHIND));
-        assert_eq!((BATCH_READAHEAD, SAM_WRITEBEHIND), (1, 1));
+        assert_eq!((BATCH_READAHEAD, SAM_WRITEBEHIND), (0, 1));
     }
 
     /// Two SAM records against a one-contig header, as the aligner would have formatted them.
