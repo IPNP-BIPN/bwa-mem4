@@ -519,9 +519,13 @@ impl Batch {
                         (-1, -1)
                     };
                 } else {
-                    let buf = &mut self.pool[p.buf as usize + (b.r0 - p.hb) as usize..];
-                    for (x, &v) in buf[..nrows].iter_mut().zip(rl) {
-                        *x = (*x).max(v);
+                    // Every row of a band below `minsc` is too (`g8` is their max), and `score2`
+                    // reads no row below `minsc`: such a band would leave it unchanged.
+                    if g8 >= minsc {
+                        let buf = &mut self.pool[p.buf as usize + (b.r0 - p.hb) as usize..];
+                        for (x, &v) in buf[..nrows].iter_mut().zip(rl) {
+                            *x = (*x).max(v);
+                        }
                     }
                     if g8 > p.s || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)))
                     {
