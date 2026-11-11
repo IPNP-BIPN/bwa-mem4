@@ -962,6 +962,12 @@ fn prefetch_job(jobs: &[ExtendJob], k: usize) {
     }
 }
 
+/// Probe `BWA4_FOLD2`: the fingerprint's previous two-chain fold, for a same-host A/B.
+fn fold2() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_FOLD2").is_some())
+}
+
 /// [`dedup_jobs`]'s fingerprint of one job: its lengths, `h0` and every byte of both sequences.
 /// Any value is correct, since equal fingerprints are confirmed byte by byte.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -970,14 +976,16 @@ fn job_fingerprint(job: &ExtendJob) -> u64 {
     const S0: u64 = 0xa076_1d64_78bd_642f;
     const S1: u64 = 0xe703_7ed1_a0b4_28db;
     const S2: u64 = 0x8ebc_6af0_9c88_c6e3;
+    const S3: u64 = 0x5899_65cc_7537_4cc3;
     #[inline(always)]
     fn mum(a: u64, b: u64) -> u64 {
         let r = u128::from(a) * u128::from(b);
         r as u64 ^ (r >> 64) as u64
     }
-    /// Every byte of `s` folded from `seed`, 32 at a time in two independent chains of 64 x 64 ->
-    /// 128 multiplies folded back to 64 bits (wyhash's `mum`), one per 16 bytes; the last 1..=31
-    /// bytes go in as up to two overlapping 16-byte windows, one per chain (the lengths are hashed
+    /// Every byte of `s` folded from `seed`, 64 at a time in four independent chains (then 32 in
+    /// two) of 64 x 64 -> 128 multiplies folded back to 64 bits (wyhash's `mum`), one per 16
+    /// bytes; the last 1..=31 bytes go in as up to two overlapping 16-byte windows, one per chain
+    /// (the lengths are hashed
     /// apart), not as a serial chain of words: on Zen 5 the fold's samples sat on the `xor`s
     /// waiting for each multiply. Covering only 32 bytes at each end let 121M of 126M candidate
     /// pairs on 1M chr21 pairs collide (repeat windows share their ends), and the byte comparisons
@@ -987,7 +995,24 @@ fn job_fingerprint(job: &ExtendJob) -> u64 {
     fn fold(seed: u64, s: &[u8]) -> u64 {
         let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
         let (mut a, mut b) = (seed, seed ^ S2);
-        let (blocks, rest) = s.as_chunks::<32>();
+        // 64 bytes at a time in four chains (the samples sat on each multiply's latency, two
+        // chains deep), then at most one 32-byte block in two.
+        let (wide, rest) = if fold2() {
+            (&[][..], s)
+        } else {
+            s.as_chunks::<64>()
+        };
+        if !wide.is_empty() {
+            let (mut c, mut d) = (seed ^ S0, seed ^ S3);
+            for blk in wide {
+                a = mum(word(&blk[..8]) ^ S0, word(&blk[8..16]) ^ a);
+                b = mum(word(&blk[16..24]) ^ S1, word(&blk[24..32]) ^ b);
+                c = mum(word(&blk[32..40]) ^ S2, word(&blk[40..48]) ^ c);
+                d = mum(word(&blk[48..56]) ^ S3, word(&blk[56..]) ^ d);
+            }
+            a ^= mum(c ^ S1, d ^ S2);
+        }
+        let (blocks, rest) = rest.as_chunks::<32>();
         for blk in blocks {
             a = mum(word(&blk[..8]) ^ S0, word(&blk[8..16]) ^ a);
             b = mum(word(&blk[16..24]) ^ S1, word(&blk[24..]) ^ b);
