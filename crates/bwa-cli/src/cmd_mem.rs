@@ -2463,8 +2463,10 @@ fn batched_regs(
                     // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
                     // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
                     // apiece, and most die here. Held to the end of the batch they were the largest
-                    // live item in the run, and doing it late also kept their capacity, so the
-                    // survivors' lists are given back too.
+                    // live item in the run. The survivors keep their lists' capacity: a
+                    // `shrink_to_fit` here was a realloc and a copy per read, a quarter of the
+                    // allocator's samples on EPYC 9V45 (real reads, -0.9% overall), for no RSS on
+                    // chr21 and +1% on GIAB.
                     if !leave_undeduped {
                         for (r, codes) in regs.iter_mut().zip(chunk) {
                             let mut kept =
@@ -2472,11 +2474,6 @@ fn batched_regs(
                             // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
                             // the dedup and before any primary marking reads it.
                             bwa_mem::stamp_is_alt(bns, &mut kept);
-                            // `BWA4_NO_SHRINK=1` keeps the slack, for a same-host x86 A/B: the
-                            // shrink is a realloc and a copy per read.
-                            if !no_shrink() {
-                                kept.shrink_to_fit();
-                            }
                             *r = kept;
                         }
                     }
@@ -2497,12 +2494,6 @@ fn batched_regs(
 /// # Returns
 ///
 /// Whether the dump is on. Read once per process and cached, because this is called for every read.
-/// Whether `BWA4_NO_SHRINK` is set. Read once and cached.
-fn no_shrink() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BWA4_NO_SHRINK").is_some())
-}
-
 fn dump_regs_enabled() -> bool {
     // Cached decision. `OnceLock` rather than a plain static so the env read happens exactly once
     // even when several rayon workers reach it simultaneously.
