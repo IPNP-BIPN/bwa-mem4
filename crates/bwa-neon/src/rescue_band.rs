@@ -1941,7 +1941,7 @@ mod avx512 {
             }
         }
 
-        #[target_feature(enable = "avx512bw")]
+        #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
         unsafe fn run_impl<const SHARE: bool>(
             &mut self,
             lanes: &[Lane],
@@ -2598,7 +2598,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_band_kernel_matches_avx2() {
-        if !std::arch::is_x86_feature_detected!("avx512bw") {
+        if !bwa_extend::has_avx512() {
             eprintln!("skipping avx512: avx512bw not detected");
             return;
         }
@@ -2668,7 +2668,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_bands_reproduce_ksw_align2() {
-        if !std::arch::is_x86_feature_detected!("avx512bw") {
+        if !bwa_extend::has_avx512() {
             eprintln!("skipping avx512: avx512bw not detected");
             return;
         }

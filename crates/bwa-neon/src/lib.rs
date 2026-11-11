@@ -291,8 +291,7 @@ impl SwBackend for NeonBackend {
 // unconditional helper would be dead code the lint gate rejects.
 #[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn avx512_testable() -> bool {
-    std::arch::is_x86_feature_detected!("avx512bw")
-        || std::env::var_os("BWA4_TEST_FORCE_AVX512").is_some()
+    bwa_extend::has_avx512() || std::env::var_os("BWA4_TEST_FORCE_AVX512").is_some()
 }
 
 #[cfg(test)]

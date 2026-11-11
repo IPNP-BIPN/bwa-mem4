@@ -131,9 +131,7 @@ fn max_lanes() -> usize {
     static W: OnceLock<usize> = OnceLock::new();
     *W.get_or_init(|| {
         let tier = std::env::var("BWA4_EXTEND_TIER");
-        if std::arch::is_x86_feature_detected!("avx512bw")
-            && !matches!(tier.as_deref(), Ok("avx2" | "sse41"))
-        {
+        if crate::has_avx512() && !matches!(tier.as_deref(), Ok("avx2" | "sse41")) {
             32
         } else if std::arch::is_x86_feature_detected!("avx2") && tier.as_deref() != Ok("sse41") {
             16
@@ -528,7 +526,7 @@ mod avx512 {
     macro_rules! shim {
         ($($name:ident($($a:ident: $t:ty),*) -> $r:ty $body:block)*) => {$(
             #[inline]
-            #[target_feature(enable = "avx512bw")]
+            #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
             unsafe fn $name($($a: $t),*) -> $r $body
         )*};
     }
@@ -552,7 +550,7 @@ mod avx512 {
 
     /// The 25 scores sign-extended to words (the rest of the 32 bytes are zero).
     type Table = V;
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     unsafe fn load_table(tab: &[u8; 32]) -> Table {
         _mm512_cvtepi8_epi16(_mm256_loadu_si256(tab.as_ptr().cast()))
     }
@@ -566,7 +564,7 @@ mod avx512 {
     /// Lane `l`'s score `mat[t[l] * 5 + q[31 - l]]`: `tp` and `qp` point at 32 bytes. Codes are at
     /// most 4, so the index is below 25 and `vpermw` (which reads it modulo 32) is exact.
     #[inline]
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> V {
         let q = _mm512_permutexvar_epi16(
             _mm512_loadu_si512(REV.as_ptr().cast()),
@@ -579,7 +577,7 @@ mod avx512 {
 
     /// The 32 direction bytes of `d` (each lane `< 64`) at `p`.
     #[inline]
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     unsafe fn store_dirs(p: *mut u8, d: V) {
         _mm256_storeu_si256(p.cast(), _mm512_cvtepi16_epi8(d));
     }
@@ -589,7 +587,7 @@ mod avx512 {
         ///
         /// # Safety
         /// The CPU must have AVX-512BW.
-        #[target_feature(enable = "avx512bw")]
+        #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
         pub(super) fill,
         32
     );
@@ -693,7 +691,7 @@ fn lanes_here() -> Vec<usize> {
     return [
         (8, true),
         (16, std::arch::is_x86_feature_detected!("avx2")),
-        (32, std::arch::is_x86_feature_detected!("avx512bw")),
+        (32, crate::has_avx512()),
     ]
     .into_iter()
     .filter_map(|(l, ok)| ok.then_some(l))

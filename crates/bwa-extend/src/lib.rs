@@ -57,6 +57,17 @@
 mod global_wave;
 pub mod sw;
 
+/// Whether this CPU runs the `avx512` kernels, which all enable `avx512bw,avx512vl,avx512dq`: every
+/// AVX-512BW CPU has the other two (Skylake-SP, Zen 4 and later). VL is what gives the kernels'
+/// 128- and 256-bit code EVEX forms and registers 16-31; with BW alone the u8 extension kernel ran
+/// 3.6-4.6% slower than in an `x86-64-v4` build (same-host A/B on EPYC 9V74, 9V45, Xeon 8370C).
+#[cfg(target_arch = "x86_64")]
+pub fn has_avx512() -> bool {
+    std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512dq")
+}
+
 /// Multiplier of the 64-bit linear congruential generator the acceptance gates use for their
 /// deterministic pseudo-random cases. This value and [`LCG_INCREMENT`] are the widely used pair
 /// from Knuth's MMIX (also the LCG stage inside PCG). They are here only so the two gates below

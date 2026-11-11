@@ -1461,7 +1461,7 @@ fn forced_rescue_tier() -> RescueTier {
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn rescue_avx512_ok() -> bool {
     matches!(forced_rescue_tier(), RescueTier::Auto | RescueTier::Avx512)
-        && std::arch::is_x86_feature_detected!("avx512bw")
+        && bwa_extend::has_avx512()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1549,15 +1549,15 @@ pub(crate) fn fwd_local_sw_batch(
                 tier,
                 RescueTier::Auto | RescueTier::Sse41 | RescueTier::Avx2
             );
-            if want_avx512 && std::arch::is_x86_feature_detected!("avx512bw") {
+            if want_avx512 && bwa_extend::has_avx512() {
                 if fits_u8 {
-                    // SAFETY: avx512bw detected; u8 preconditions hold; standard mat.
+                    // SAFETY: AVX-512 BW/VL/DQ detected; u8 preconditions hold; standard mat.
                     return unsafe {
                         fwd_local_sw_avx512_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                     };
                 }
                 if fits_i16 {
-                    // SAFETY: avx512bw detected; i16 range guaranteed; standard mat.
+                    // SAFETY: AVX-512 BW/VL/DQ detected; i16 range guaranteed; standard mat.
                     return unsafe {
                         fwd_local_sw_avx512_i16(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                     };
@@ -4614,7 +4614,7 @@ unsafe fn fwd_local_sw_sse41_i16(
 /// Caller must have confirmed AVX-512BW is available. Loads/stores use unchecked offsets bounded by
 /// `qmax`/`tmax`, derived from the same buffers.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw")]
+#[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn fwd_local_sw_avx512_u8(
     jobs: &[FwdJob],
@@ -4666,7 +4666,7 @@ unsafe fn fwd_local_sw_avx512_u8(
     let bias_v = _mm512_set1_epi8(bias as i8);
     // The `vpshufb` / `vqtbl1q_u8` reachable-index argument is the one spelled out in
     // `fwd_local_sw_avx2_u8`; the encoding and therefore the argument are the same.
-    #[target_feature(enable = "avx512f,avx512bw")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn score_diag(
         tbl: __m512i,
@@ -5015,7 +5015,7 @@ unsafe fn fwd_local_sw_avx512_u8(
 /// Caller must have confirmed AVX-512BW is available. Loads/stores use unchecked offsets bounded by
 /// `qmax`/`tmax`, derived from the same buffers.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw")]
+#[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn fwd_local_sw_avx512_i16(
     jobs: &[FwdJob],
@@ -5667,7 +5667,7 @@ mod avx512_verify {
             })
             .collect();
         let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
-        // SAFETY: avx512bw just confirmed; u8 preconditions hold for these stock-DNA-scored jobs.
+        // SAFETY: AVX-512 BW/VL/DQ just confirmed; u8 preconditions hold for these stock-DNA-scored jobs.
         let got =
             unsafe { fwd_local_sw_avx512_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
         for i in 0..jobs.len() {
@@ -5699,7 +5699,7 @@ mod avx512_verify {
             })
             .collect();
         let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
-        // SAFETY: avx512bw just confirmed; every ceiling is under I16_SCORE_LIMIT and mat is standard.
+        // SAFETY: AVX-512 BW/VL/DQ just confirmed; every ceiling is under I16_SCORE_LIMIT and mat is standard.
         let got =
             unsafe { fwd_local_sw_avx512_i16(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
         for i in 0..jobs.len() {
@@ -5835,7 +5835,7 @@ mod bench {
             fwd_local_sw_avx2_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
         });
         eprintln!("  avx2 vs scalar: {:.2}x", scalar / avx2);
-        if std::arch::is_x86_feature_detected!("avx512bw") {
+        if bwa_extend::has_avx512() {
             let avx512 = bench("avx512_u8", &|| unsafe {
                 fwd_local_sw_avx512_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
             });

@@ -250,7 +250,7 @@ fn extend_tier() -> Tier {
     use std::sync::OnceLock;
     static TIER: OnceLock<Tier> = OnceLock::new();
     *TIER.get_or_init(|| {
-        let have_512 = is_x86_feature_detected!("avx512bw");
+        let have_512 = bwa_extend::has_avx512();
         let have_2 = is_x86_feature_detected!("avx2");
         let have_sse = is_x86_feature_detected!("sse4.1");
         match std::env::var("BWA4_EXTEND_TIER").as_deref() {
@@ -4867,14 +4867,14 @@ mod avx512 {
     /// # Returns
     /// A 512-bit vector whose every byte lane equals `x`. `as i8` is a bit reinterpretation: the u8
     /// kernel treats lanes as unsigned, so values above 127 are intended.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn set1_u8(x: u8) -> __m512i {
         _mm512_set1_epi8(x as i8)
     }
     /// # Returns
     /// A 512-bit vector whose every 16-bit lane equals `x`.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn set1_i16(x: i16) -> __m512i {
         _mm512_set1_epi16(x)
@@ -4882,27 +4882,27 @@ mod avx512 {
 
     // Loads and stores: `p` addresses at least LANES elements of that type (64 u8, or 32 u16/i16),
     // which the kernel guarantees is in bounds. Unaligned forms, 64 bytes moved.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn loadu_u8(p: *const u8) -> __m512i {
         _mm512_loadu_si512(p as *const __m512i)
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn loadu_u16(p: *const u16) -> __m512i {
         _mm512_loadu_si512(p as *const __m512i)
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn loadu_i16(p: *const i16) -> __m512i {
         _mm512_loadu_si512(p as *const __m512i)
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn storeu_u8(p: *mut u8, v: __m512i) {
         _mm512_storeu_si512(p as *mut __m512i, v)
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn storeu_i16(p: *mut i16, v: __m512i) {
         _mm512_storeu_si512(p as *mut __m512i, v)
@@ -4910,40 +4910,40 @@ mod avx512 {
 
     // Comparisons. Each returns the all-ones/all-zero VECTOR the shared macro body expects, built
     // from the opmask with `movm`. `v`/`a`/`b` are vectors of DP values or column indices.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn ceqz8(v: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpeq_epi8_mask(v, _mm512_setzero_si512()))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn ceqz16(v: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(v, _mm512_setzero_si512()))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn ceq8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpeq_epi8_mask(a, b))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn ceq16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(a, b))
     }
     /// Unsigned `a >= b`. Native here, unlike AVX2 where it has to be recovered from `max`.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     /// `(j >= beg) & (j < end)` for the AVX-512 u8 kernel. AVX-512BW HAS native unsigned compares
     /// (`vpcmpltub`, `vpcmpnltub`), and the disassembly confirms LLVM emits them from `cge_epu8` /
     /// `clt_epu8` rather than the max/cmpeq emulation AVX2 gets, so there is nothing to rewrite here
     /// and `band_bias` is 0. That is why its column loop is 38 instructions against AVX2's 54.
-    #[target_feature(enable = "avx512f,avx512bw")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
     unsafe fn band_epu8(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
         _mm512_and_si512(cge_epu8(j, beg), clt_epu8(j, end))
     }
 
     /// `(j >= beg) & (j < end)` for the AVX-512 i16 kernel. Native signed compares, `band_bias` 0.
-    #[target_feature(enable = "avx512f,avx512bw")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
     unsafe fn band_epi16(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
         _mm512_and_si512(cge_epi16(j, beg), clt_epi16(j, end))
     }
@@ -4951,17 +4951,17 @@ mod avx512 {
     unsafe fn cge_epu8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpge_epu8_mask(a, b))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn clt_epu8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmplt_epu8_mask(a, b))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn cge_epi16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpge_epi16_mask(a, b))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn clt_epi16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmplt_epi16_mask(a, b))
@@ -4970,7 +4970,7 @@ mod avx512 {
     /// `mask ? a : b`, the same convention as NEON's `vbslq`. One `ternarylogic`: the immediate
     /// 0xCA is the truth table of `(mask & a) | (!mask & b)`, and the operation is bitwise so the
     /// 32-bit lane granularity of the intrinsic is irrelevant.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn bsl512(mask: __m512i, a: __m512i, b: __m512i) -> __m512i {
         _mm512_ternarylogic_epi32(mask, a, b, 0xCA)
@@ -4981,7 +4981,7 @@ mod avx512 {
         i16,
         u16,
         32,
-        feat = "avx512bw",
+        feat = "avx512bw,avx512vl,avx512dq",
         dup = set1_i16,
         lds = loadu_i16,
         sts = storeu_i16,
@@ -5013,7 +5013,7 @@ mod avx512 {
         u8,
         u8,
         64,
-        feat = "avx512bw",
+        feat = "avx512bw,avx512vl,avx512dq",
         dup = set1_u8,
         lds = loadu_u8,
         sts = storeu_u8,
@@ -6228,7 +6228,7 @@ mod x86_extend_bench {
                 &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
             )
         });
-        if std::arch::is_x86_feature_detected!("avx512bw") {
+        if bwa_extend::has_avx512() {
             bench("avx512_u8", &|| unsafe {
                 super::avx512::batched_extend_avx512_u8::<true>(
                     &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
@@ -6362,7 +6362,7 @@ mod avx512_verify {
                         h0: h0s[i],
                     })
                     .collect();
-                // SAFETY: `avx512bw` was checked above.
+                // SAFETY: AVX-512 BW/VL/DQ was checked above.
                 let got = unsafe {
                     if big {
                         super::avx512::batched_extend_avx512_i16::<true>(
