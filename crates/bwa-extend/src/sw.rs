@@ -523,6 +523,39 @@ pub(crate) fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
     cigar.push((len << 4) | op);
 }
 
+/// A traceback's CIGAR, built back to front one op per step with the current `(op, len)` run kept
+/// apart and handed to [`push_cigar`] only when the op changes: the same words one push per step
+/// builds, without the per-step check of the last word (fg-labs/bwa-mem3's `ksw_g2_backtrack`).
+#[derive(Default)]
+pub(crate) struct RunCigar {
+    cigar: Vec<u32>,
+    op: u32,
+    len: u32,
+}
+
+impl RunCigar {
+    /// One step of operation `op` (`0 = M`, `1 = I`, `2 = D`).
+    #[inline(always)]
+    pub(crate) fn step(&mut self, op: u32) {
+        if op == self.op {
+            self.len += 1;
+        } else {
+            if self.len > 0 {
+                push_cigar(&mut self.cigar, self.op, self.len);
+            }
+            (self.op, self.len) = (op, 1);
+        }
+    }
+
+    /// The CIGAR so far, still back to front, with the open run flushed.
+    pub(crate) fn finish(mut self) -> Vec<u32> {
+        if self.len > 0 {
+            push_cigar(&mut self.cigar, self.op, self.len);
+        }
+        self.cigar
+    }
+}
+
 /// Gap costs of [`ksw_global2`]'s cell: first base (open + extend) and each further base.
 struct GlobalGaps {
     oe_del: i32,
@@ -713,9 +746,6 @@ pub fn ksw_global2(
     e_ins: i32,
     w: i32,
 ) -> (i32, Vec<u32>) {
-    if g2_outline() {
-        return ksw_global2_outlined(query, target, m, mat, o_del, e_del, o_ins, e_ins, w);
-    }
     // The wavefront kernel (NEON, or SSE4.1 on x86_64) where it is proven byte-identical and
     // wide enough to pay.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -724,66 +754,6 @@ pub fn ksw_global2(
     {
         return r;
     }
-    ksw_global2_scalar(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
-}
-
-/// Probe: `BWA4_G2_OUTLINE=1` runs [`ksw_global2`] with the wave and scalar kernels as calls.
-fn g2_outline() -> bool {
-    use std::sync::OnceLock;
-    static O: OnceLock<bool> = OnceLock::new();
-    *O.get_or_init(|| std::env::var("BWA4_G2_OUTLINE").is_ok_and(|v| v == "1"))
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn ksw_global2_outlined(
-    query: &[u8],
-    target: &[u8],
-    m: usize,
-    mat: &[i8],
-    o_del: i32,
-    e_del: i32,
-    o_ins: i32,
-    e_ins: i32,
-    w: i32,
-) -> (i32, Vec<u32>) {
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if let Some(r) = wave_outlined(query, target, m, mat, o_del, e_del, o_ins, e_ins, w) {
-        return r;
-    }
-    scalar_outlined(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
-}
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn wave_outlined(
-    query: &[u8],
-    target: &[u8],
-    m: usize,
-    mat: &[i8],
-    o_del: i32,
-    e_del: i32,
-    o_ins: i32,
-    e_ins: i32,
-    w: i32,
-) -> Option<(i32, Vec<u32>)> {
-    crate::global_wave::try_wave16(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn scalar_outlined(
-    query: &[u8],
-    target: &[u8],
-    m: usize,
-    mat: &[i8],
-    o_del: i32,
-    e_del: i32,
-    o_ins: i32,
-    e_ins: i32,
-    w: i32,
-) -> (i32, Vec<u32>) {
     ksw_global2_scalar(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
 }
 
@@ -968,7 +938,7 @@ pub(crate) fn ksw_global2_scalar(
         // Traceback from the bottom-right cell of the band (`ksw.cpp:650-664`). `k` is the last query
         // column row `tlen-1` actually evaluated, i.e. `min(i + w + 1, qlen) - 1`.
         // The CIGAR under construction, built back to front (reversed at the very end).
-        let mut cigar: Vec<u32> = Vec::new();
+        let mut run = RunCigar::default();
         // The traceback cursor: `i` is the current target row and `k` the current query column, both
         // 0-based and both walking down to -1. At the top of each iteration they name the cell whose
         // direction bits are about to be read; the step then decrements whichever sequence the emitted
@@ -981,24 +951,40 @@ pub(crate) fn ksw_global2_scalar(
         // reads bits 2-3 (does the deletion continue), state 2 reads bits 4-5. That is the whole reason
         // the forward pass stored the continuation bits.
         let mut which = 0u8;
-        while i >= 0 && k >= 0 {
-            // Recompute the row's `beg` to undo the band-relative storage. Must match the forward pass.
-            let beg = (i as usize).saturating_sub(w);
-            // The traceback byte the forward pass stored for cell (i, k): `f<<4 | e<<2 | h`.
-            let d = z[i as usize * n_col + (k as usize - beg)];
-            which = (d >> (which << 1)) & 3;
-            if which == 0 {
-                push_cigar(&mut cigar, 0, 1);
-                i -= 1;
-                k -= 1;
-            } else if which == 1 {
-                push_cigar(&mut cigar, 2, 1);
-                i -= 1;
-            } else {
-                push_cigar(&mut cigar, 1, 1);
-                k -= 1;
+        if i >= 0 && k >= 0 {
+            // Where cell (i, k) is stored, band-relative as the forward pass wrote it, moved with
+            // each step rather than recomputed: `beg` drops by one with `i` exactly when `i > w`.
+            let mut idx = i as usize * n_col + (k as usize - (i as usize).saturating_sub(w));
+            loop {
+                // The traceback byte the forward pass stored for cell (i, k): `f<<4 | e<<2 | h`.
+                which = (z[idx] >> (which << 1)) & 3;
+                run.step(match which {
+                    0 => 0,
+                    1 => 2,
+                    _ => 1,
+                });
+                let shift = usize::from(i > w as i64);
+                match which {
+                    0 => {
+                        idx = idx.wrapping_sub(n_col + 1 - shift);
+                        i -= 1;
+                        k -= 1;
+                    }
+                    1 => {
+                        idx = idx.wrapping_sub(n_col - shift);
+                        i -= 1;
+                    }
+                    _ => {
+                        idx = idx.wrapping_sub(1);
+                        k -= 1;
+                    }
+                }
+                if i < 0 || k < 0 {
+                    break;
+                }
             }
         }
+        let mut cigar = run.finish();
         // The loop stops as soon as *either* sequence is exhausted; whatever remains of the other must
         // be a single leading gap, emitted here (target left over = D, query left over = I).
         if i >= 0 {

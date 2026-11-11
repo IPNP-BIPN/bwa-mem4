@@ -651,7 +651,7 @@ unsafe fn wave16(
 /// The traceback (LEMMA 10): the scalar's walk over the direction bytes [`wave_fill`] stored,
 /// diagonal-major. Independent of the lane width.
 fn traceback(sc: &Scratch, qlen: usize, tlen: usize, w: usize) -> Vec<u32> {
-    let mut cigar: Vec<u32> = Vec::new();
+    let mut run = crate::sw::RunCigar::default();
     let mut i = tlen as i64 - 1;
     let mut k = (tlen as i64 + w as i64).min(qlen as i64) - 1;
     let mut which = 0u8;
@@ -661,20 +661,21 @@ fn traceback(sc: &Scratch, qlen: usize, tlen: usize, w: usize) -> Vec<u32> {
         which = (d >> (which << 1)) & 3;
         match which {
             0 => {
-                crate::sw::push_cigar(&mut cigar, 0, 1);
+                run.step(0);
                 i -= 1;
                 k -= 1;
             }
             1 => {
-                crate::sw::push_cigar(&mut cigar, 2, 1);
+                run.step(2);
                 i -= 1;
             }
             _ => {
-                crate::sw::push_cigar(&mut cigar, 1, 1);
+                run.step(1);
                 k -= 1;
             }
         }
     }
+    let mut cigar = run.finish();
     if i >= 0 {
         crate::sw::push_cigar(&mut cigar, 2, (i + 1) as u32);
     }
