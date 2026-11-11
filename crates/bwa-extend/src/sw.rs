@@ -526,11 +526,22 @@ pub(crate) fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
 /// A traceback's CIGAR, built back to front one op per step with the current `(op, len)` run kept
 /// apart and handed to [`push_cigar`] only when the op changes: the same words one push per step
 /// builds, without the per-step check of the last word (fg-labs/bwa-mem3's `ksw_g2_backtrack`).
-#[derive(Default)]
 pub(crate) struct RunCigar {
     cigar: Vec<u32>,
     op: u32,
     len: u32,
+}
+
+impl Default for RunCigar {
+    /// Eight words up front: a gapped read's few ops plus the two soft clips `reg2aln` adds later,
+    /// so neither the traceback nor the clips reallocate.
+    fn default() -> Self {
+        Self {
+            cigar: Vec::with_capacity(8),
+            op: 0,
+            len: 0,
+        }
+    }
 }
 
 impl RunCigar {

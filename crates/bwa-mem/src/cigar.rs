@@ -306,6 +306,14 @@ fn infer_bw(l1: i32, l2: i32, score: i32, a: i32, q: i32, r: i32) -> i32 {
     w
 }
 
+/// `l_query` M, with room for the two soft clips `reg2aln` may add, so adding them never
+/// reallocates (a capacity-1 `Vec` did, for every clipped read).
+fn ungapped_cigar(l_query: i32) -> Vec<u32> {
+    let mut cigar = Vec::with_capacity(3);
+    cigar.push((l_query as u32) << 4);
+    cigar
+}
+
 /// Global-align `query_codes` (the seed-region query slice) to reference `[rb, re)` and compute the
 /// CIGAR, NM and MD. Port of `bwa_gen_cigar2` (`bwa.cpp:260`).
 ///
@@ -440,7 +448,7 @@ pub(crate) fn gen_cigar2(
             }
         }
         // `(len << 4) | 0`: op 0 is M, so the `| 0` is elided.
-        (diagonal_score, vec![(l_query as u32) << 4])
+        (diagonal_score, ungapped_cigar(l_query))
     } else {
         // Derive an internal band from affordability, then intersect it with the caller's `w_`.
         // `((l_query+1)>>1) * match_score` is the score of matching *half* the query: bwa's
@@ -486,7 +494,7 @@ pub(crate) fn gen_cigar2(
                     &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
                 );
                 if w == 0 {
-                    (lower_bound, vec![(l_query as u32) << 4])
+                    (lower_bound, ungapped_cigar(l_query))
                 } else {
                     ksw_global2(
                         &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
