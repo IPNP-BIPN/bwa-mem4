@@ -265,6 +265,9 @@ pub struct SeedJump {
 /// Longest string in the seed jump table: 10 bases, `(4^11 - 4) / 3` = 1.4M entries, 34 MB.
 pub const SEED_JUMP_DEPTH: usize = 10;
 
+/// [`FmIndex::backward_round_impl`]'s `A` for a base known only at run time.
+const ANY_BASE: usize = 4;
+
 /// Offset of level `d` (the strings of `d` bases) in the seed jump table.
 #[inline]
 pub const fn seed_jump_level_off(d: usize) -> usize {
@@ -1786,10 +1789,21 @@ impl FmIndex {
         // PE. Per base: x86 kept `a`, both masks, `min_intv` and the survivor count on the stack,
         // reloaded every candidate.
         macro_rules! go {
-            ($w:literal, $a0:literal, $a:literal) => {
-                self.backward_round_impl::<$w, $a0, $a>(prev, m, min_intv, min_seed_len, out)
+            ($w:literal, $a0:literal, $a:expr) => {
+                self.backward_round_impl::<$w, $a0, { $a }>(prev, a, m, min_intv, min_seed_len, out)
             };
         }
+        // AArch64 takes two copies instead, base 0 and one for the other three: the base is the
+        // read's, so the four-way dispatch mispredicted most rounds, and with 31 registers the
+        // values the copies hoist stay in them.
+        #[cfg(target_arch = "aarch64")]
+        return match (self.wide, a) {
+            (false, 0) => go!(false, true, 0),
+            (false, _) => go!(false, false, ANY_BASE),
+            (true, 0) => go!(true, true, 0),
+            (true, _) => go!(true, false, ANY_BASE),
+        };
+        #[cfg(not(target_arch = "aarch64"))]
         match (self.wide, a) {
             (false, 0) => go!(false, true, 0),
             (false, 1) => go!(false, false, 1),
@@ -1802,17 +1816,19 @@ impl FmIndex {
         }
     }
 
-    /// [`backward_round`](Self::backward_round) for base `A` (`A0` is `A == 0`).
+    /// [`backward_round`](Self::backward_round) for base `A` (`A0` is `A == 0`), or for the
+    /// runtime base `a` when `A` is [`ANY_BASE`] (`A0` then says whether `a` may be 0).
     #[inline]
     fn backward_round_impl<const WIDE: bool, const A0: bool, const A: usize>(
         &self,
         prev: &mut [Smem],
+        a: usize,
         m: u32,
         min_intv: i64,
         min_seed_len: i64,
         out: &mut Vec<Smem>,
     ) -> usize {
-        let a = A;
+        let a = if A == ANY_BASE { a } else { A };
         let hx = ((a as u64 >> 1) & 1).wrapping_sub(1);
         let lx = (a as u64 & 1).wrapping_sub(1);
         let count_a = self.count[a];
