@@ -1517,6 +1517,11 @@ fn bwt_seed_strategy(
 enum BwtPhase {
     /// Read the planned seed jump entry (see the `Start` arm) and resume `Fwd` past it.
     Jump,
+    /// Read the seed jump entry of the walk's last `jd` bases up to `min_seed_len` (see the `Start`
+    /// arm) and go on to `Bwd`.
+    JumpB,
+    /// One k-only backward step towards `x` over the walk's first `min_seed_len` bases.
+    Bwd,
     /// Set up the single-base interval at `x` (or skip an `N` and move to the next position).
     Start,
     /// One forward-extension iteration: append `codes[j]` on the right, and emit plus end the
@@ -1528,8 +1533,9 @@ enum BwtPhase {
 
 /// One read's round-3 (`bwt_seed_strategy`) forward-seeding walk as a resumable state machine, so a
 /// batch of reads can run their walks in lockstep (see [`bwt_seed_strategy_batched`]) and hide the
-/// `cp_occ` DRAM latency of the forward extension. Mirrors [`bwt_seed_strategy`] exactly: `Start`
-/// seeds the single-base interval at `x`, `Fwd` runs one forward-extension iteration.
+/// `cp_occ` DRAM latency of the forward extension. The same SMEMs as [`bwt_seed_strategy`] (up to
+/// `l`): `Start` seeds the single-base interval at `x`, `Fwd` runs one forward-extension iteration,
+/// and `JumpB` / `Bwd` find a walk's interval at its `min_seed_len`-th base right to left.
 struct BwtSeedSlot {
     /// Index of the read this slot is currently walking, within the caller's `reads` slice.
     ridx: usize,
@@ -1539,13 +1545,14 @@ struct BwtSeedSlot {
     /// to one past wherever the forward walk stopped.
     next_x: usize,
     /// Forward cursor: the READ offset being appended on the right. Runs `x + 1 ..= readlength`.
+    /// In `Bwd`, the leftmost READ offset of `smem`, moving down to `x`.
     j: usize,
     /// The interval being extended: `k`/`l` are BWT ROWS, `s` the occurrence count, `m`/`n` the
-    /// inclusive READ span. Valid only while `phase == Fwd`.
+    /// inclusive READ span. Valid only while `phase` is `Fwd`, or `Bwd` (`l` unset there).
     smem: Smem,
     /// Which phase the next `step` call executes. `Done` tells the driver to harvest and refill.
     phase: BwtPhase,
-    /// The planned seed jump (see `Jump`): its length and the 2-bit code of `read[x .. x + jd)`.
+    /// The planned seed jump (see `Jump`, `JumpB`): its length and the 2-bit code of its bases.
     jd: usize,
     jcode: u32,
     /// SMEMs emitted by the current walk, moved out when the slot reaches `Done`.
@@ -1657,7 +1664,28 @@ impl BwtSeedSlot {
                 // Nothing below can end a walk before it is `min_seed_len` long, so its first
                 // `jd` bases come from the seed jump table in one entry when they are all ACGT
                 // (the fork's `bsd_plan_jump`); the entry is prefetched here and read by `Jump`.
-                let jd = fm.seed_jump_depth().min(min_seed_len.max(1) as usize - 1);
+                let msl = min_seed_len.max(1) as usize;
+                let jd = fm.seed_jump_depth().min(msl - 1);
+                // Most walks end at their `msl`-th base, where the count first falls under
+                // `max_intv`. So an N-free first `msl` bases are searched right to left instead:
+                // the last `jd` from the jump table, the rest by k-only backward steps, half a
+                // forward step's work (`l`, which only a forward step needs, is not computed; the
+                // emitted SMEM's is 0, and nothing downstream reads it). Only a count still at
+                // `max_intv` there sends the walk forward, from the start. `x + msl <= readlength`
+                // (checked above).
+                if jd >= 2
+                    && codes[self.x + 1..self.x + msl]
+                        .iter()
+                        .all(|&b| b < AMBIGUOUS_BASE)
+                {
+                    self.jd = jd;
+                    self.jcode = codes[self.x + msl - jd..self.x + msl]
+                        .iter()
+                        .fold(0u32, |c, &b| c << 2 | u32::from(b));
+                    fm.prefetch_seed_jump(jd, self.jcode);
+                    self.phase = BwtPhase::JumpB;
+                    return;
+                }
                 if jd >= 2
                     && self.x + jd <= readlength
                     && codes[self.x + 1..self.x + jd]
@@ -1686,6 +1714,51 @@ impl BwtSeedSlot {
                 self.next_x = self.j;
                 self.phase = BwtPhase::Fwd;
                 fm.prefetch_occ(self.smem.l, self.smem.l + self.smem.s);
+            }
+            BwtPhase::JumpB => {
+                // The interval of `read[j .. x + msl)`, `j = x + msl - jd`.
+                let e = fm.seed_jump(self.jd, self.jcode);
+                let msl = min_seed_len.max(1) as usize;
+                self.j = self.x + msl - self.jd;
+                self.smem = Smem {
+                    m: self.j as u32,
+                    n: (self.x + msl - 1) as u32,
+                    k: e.k,
+                    l: 0,
+                    s: e.s,
+                };
+                self.next_x = self.x + msl;
+                self.phase = BwtPhase::Bwd;
+                fm.prefetch_occ(e.k, e.k + e.s);
+            }
+            BwtPhase::Bwd => {
+                // An empty interval stays empty: the walk ends at its `msl`-th base, unemitted.
+                if self.smem.s == 0 {
+                    self.end_pos(readlength);
+                    return;
+                }
+                self.j -= 1;
+                self.smem = fm.backward_ext_konly(self.smem, codes[self.j] as usize);
+                self.smem.m = self.j as u32;
+                if self.j > self.x {
+                    fm.prefetch_occ(self.smem.k, self.smem.k + self.smem.s);
+                    return;
+                }
+                // The interval of the walk's first `msl` bases, where the forward walk first
+                // tests its count.
+                if self.smem.s < max_intv {
+                    if self.smem.s > 0 {
+                        self.out.push(self.smem);
+                    }
+                    self.end_pos(readlength);
+                    return;
+                }
+                // Still `max_intv` rows or more: the forward walk, from its first `jd` bases.
+                self.jcode = codes[self.x..self.x + self.jd]
+                    .iter()
+                    .fold(0u32, |c, &b| c << 2 | u32::from(b));
+                fm.prefetch_seed_jump(self.jd, self.jcode);
+                self.phase = BwtPhase::Jump;
             }
             BwtPhase::Fwd => {
                 if self.smem.s == 0 {

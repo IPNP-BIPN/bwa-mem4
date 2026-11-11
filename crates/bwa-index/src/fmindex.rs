@@ -1646,6 +1646,14 @@ impl FmIndex {
     /// `l` is left as it was, so the result is only for callers that never extend it forward.
     #[inline(always)]
     pub fn backward_ext_konly(&self, smem: Smem, a: usize) -> Smem {
+        if !self.wide {
+            // `backward_round`'s step (vector counts on AArch64, one block for one row).
+            let hx = ((a as u64 >> 1) & 1).wrapping_sub(1);
+            let lx = (a as u64 & 1).wrapping_sub(1);
+            let (k, s) =
+                self.konly_hoisted::<false, true>(&self.cp_occ, &smem, a, self.count[a], hx, lx);
+            return Smem { k, s, ..smem };
+        }
         if smem.s == 1 {
             // One row: it extends iff its BWT base is `a` (the sentinel row extends nothing), and
             // then one count gives the new row. One block instead of two.
