@@ -1683,6 +1683,25 @@ impl BwtSeedSlot {
                 fm.prefetch_occ(self.smem.l, self.smem.l + self.smem.s);
             }
             BwtPhase::Fwd => {
+                if self.smem.s == 0 {
+                    // An empty interval stays empty and is never emitted, so where the walk ends
+                    // depends on the read alone: at its end, at its first `N`, or at the step
+                    // where it is `min_seed_len` long. Found here without the FM steps (14% of
+                    // round 3's on chr21). `next_x == j` on entry to `Fwd`.
+                    let last = self.x + min_seed_len.max(1) as usize - 1;
+                    let mut j = self.j;
+                    self.next_x = loop {
+                        if j >= readlength {
+                            break j;
+                        }
+                        if codes[j] >= AMBIGUOUS_BASE || j >= last {
+                            break j + 1;
+                        }
+                        j += 1;
+                    };
+                    self.end_pos(readlength);
+                    return;
+                }
                 if self.j >= readlength {
                     self.end_pos(readlength);
                     return;
