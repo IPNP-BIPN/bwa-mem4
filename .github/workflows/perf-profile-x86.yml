@@ -269,6 +269,7 @@ jobs:
                      'bwa_neon::rescue_band::Batch::add_jobs' \
                      'bwa_neon::rescue_band::Tracker::scan' \
                      'bwa_mem4_mem::cigar::gen_cigar2' \
+                     'bwa_mem4_mem::cigar::gen_cigar2::{{closure}}' \
                      'bwa_mem4_extend::sw::ksw_global2' \
                      '_mi_theap_malloc_zero' \
                      'mi_free'; do
