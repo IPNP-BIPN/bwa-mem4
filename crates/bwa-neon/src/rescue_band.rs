@@ -1890,8 +1890,6 @@ mod avx512 {
         pub te: [i32; L],
         pub qe: [u8; L],
         pub cells: u64,
-        /// Probe: `BWA4_BAND_ROWS2=1` keeps the two-row step only (A/B of the four-row one).
-        four: bool,
     }
 
     impl Default for Work {
@@ -1909,7 +1907,6 @@ mod avx512 {
                 te: [0; L],
                 qe: [0; L],
                 cells: 0,
-                four: std::env::var_os("BWA4_BAND_ROWS2").is_none(),
             }
         }
     }
@@ -2166,7 +2163,7 @@ mod avx512 {
                 let kun = klo.max(ri + omaskq);
                 let mut k = khi;
                 let hp = slot(r + RING - 1);
-                if self.four && r + 3 < nr {
+                if r + 3 < nr {
                     // Four rows per step, skewed, as the NEON kernel's (32 vector registers hold
                     // them: the AVX2 kernel's 16 hold two). Their slots are those of `r - RING..`.
                     if r >= RING {
