@@ -22,9 +22,9 @@ repository = "https://github.com/IPNP-BIPN/bwa-mem4"
 # currently satisfy. They are allowed EXPLICITLY, not silenced globally, so a NEW lint of any other
 # kind still fails the build. Burn these down rather than adding to them.
 [workspace.lints.rust]
-# Same-host A/Bs in perf CI (alt_rustflags): `bwa4_bwd_one` runs a one-candidate backward round
-# in the driver, `bwa4_br_inline` inlines `backward_round` into it.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bwa4_bwd_one)', 'cfg(bwa4_br_inline)'] }
+# Same-host A/B in perf CI (alt_rustflags): `bwa4_wide_split` gives each index kind its own copy of
+# the seeding rounds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bwa4_wide_split)'] }
 
 [workspace.lints.clippy]
 # Doc-comment formatting in the module headers written during the documentation pass. Cosmetic,
