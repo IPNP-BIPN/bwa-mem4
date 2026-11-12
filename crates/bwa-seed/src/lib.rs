@@ -1635,6 +1635,7 @@ impl BwtSeedSlot {
     /// - `min_seed_len`: emission length floor in bases (`opt.min_seed_len + 1` from the caller).
     /// - `counts`: the index's C array, hoisted by the driver; `counts[b]` is the first BWT ROW whose
     ///   suffix begins with base `b`.
+    #[cfg_attr(bwa4_r3_outline, inline(never))]
     fn step(
         &mut self,
         fm: &FmIndex,

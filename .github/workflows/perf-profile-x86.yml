@@ -491,8 +491,11 @@ jobs:
           init-shell: bash
 
       - name: Build ours at the tier we ship
+        env:
+          # Counts the alt build instead when given (e.g. a cfg that outlines one stage).
+          ALT_RUSTFLAGS: ${{ github.event.inputs.alt_rustflags || '' }}
         run: |
-          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C target-cpu=x86-64-v3" \
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C target-cpu=x86-64-v3 $ALT_RUSTFLAGS" \
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-icount
           cp target-icount/release/bwa-mem4 ./mem4-v3
 
