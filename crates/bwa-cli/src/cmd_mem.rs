@@ -101,8 +101,8 @@ use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, InterleavedFastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
     align_reads_batched, alt::mem_gen_alt, batch_mate_rescue, cigar::cigar_string_which,
-    cigar::MemAln, cigar_string, mem_approx_mapq_se, mem_mark_primary_se, mem_pestat, mem_sam_pe,
-    mem_sort_dedup_patch, reg2aln, MemAlnReg, PairRescueData, PeStat,
+    cigar::MemAln, cigar_string, mem_approx_mapq_se, mem_mark_primary_se, mem_pestat_from,
+    mem_sam_pe, mem_sort_dedup_patch, pestat_samples, reg2aln, MemAlnReg, PairRescueData, PeStat,
 };
 use bwa_neon::NeonBackend;
 
@@ -2453,34 +2453,38 @@ fn batched_regs(
     const MAX_CHUNK: usize = 2048;
     let budget_chunk = (INFLIGHT_READS / worker_count).clamp(MIN_CHUNK, MAX_CHUNK);
     let reads_per_chunk = codes.len().div_ceil(worker_count).min(budget_chunk).max(1);
+    let chunks = guided_bounds(codes.len(), MIN_CHUNK.min(reads_per_chunk), reads_per_chunk)
+        .into_iter()
+        .map(|r| &codes[r])
+        .collect();
     crate::stage_time::barrier::region(crate::stage_time::Stage::Align, || {
-        codes
-            .par_chunks(reads_per_chunk)
-            .flat_map(|chunk| {
-                crate::stage_time::barrier::worker(|| {
-                    let mut regs = align_reads_batched(fm, bns, opt, chunk, &NeonBackend);
-                    // Dedup here, chunk by chunk, not once the whole batch has aligned. The pass is
-                    // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
-                    // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
-                    // apiece, and most die here. Held to the end of the batch they were the largest
-                    // live item in the run. The survivors keep their lists' capacity: a
-                    // `shrink_to_fit` here was a realloc and a copy per read, a quarter of the
-                    // allocator's samples on EPYC 9V45 (real reads, -0.9% overall), for no RSS on
-                    // chr21 and +1% on GIAB.
-                    if !leave_undeduped {
-                        for (r, codes) in regs.iter_mut().zip(chunk) {
-                            let mut kept =
-                                mem_sort_dedup_patch(fm, opt, codes.as_ref(), std::mem::take(r));
-                            // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
-                            // the dedup and before any primary marking reads it.
-                            bwa_mem::stamp_is_alt(bns, &mut kept);
-                            *r = kept;
-                        }
+        run_in_order(chunks, |chunk| {
+            crate::stage_time::barrier::worker(|| {
+                let mut regs = align_reads_batched(fm, bns, opt, chunk, &NeonBackend);
+                // Dedup here, chunk by chunk, not once the whole batch has aligned. The pass is
+                // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
+                // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
+                // apiece, and most die here. Held to the end of the batch they were the largest
+                // live item in the run. The survivors keep their lists' capacity: a
+                // `shrink_to_fit` here was a realloc and a copy per read, a quarter of the
+                // allocator's samples on EPYC 9V45 (real reads, -0.9% overall), for no RSS on
+                // chr21 and +1% on GIAB.
+                if !leave_undeduped {
+                    for (r, codes) in regs.iter_mut().zip(chunk) {
+                        let mut kept =
+                            mem_sort_dedup_patch(fm, opt, codes.as_ref(), std::mem::take(r));
+                        // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
+                        // the dedup and before any primary marking reads it.
+                        bwa_mem::stamp_is_alt(bns, &mut kept);
+                        *r = kept;
                     }
-                    regs
-                })
+                }
+                regs
             })
-            .collect()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     })
 }
 
@@ -3084,7 +3088,22 @@ fn run_pe(
         // unambiguous pairs. Read by both mate rescue and `mem_sam_pe`.
         let pes = match pes0 {
             Some(fixed) => fixed,
-            None => stage_time::measure(Stage::Pestat, || mem_pestat(opt, bns.l_pac, &regs_ref)),
+            // `mem_pestat` spread over the pool: its walk over every pair's regions (~24 ns a pair,
+            // cache misses) and its sorts were a serial 0.7% of the wall on four cores. The lists
+            // are sorted before the fit, so the order they are gathered in cannot matter.
+            None => stage_time::measure(Stage::Pestat, || {
+                let mut samples = regs_ref
+                    .par_chunks(2 * 8192)
+                    .map(|reads| pestat_samples(opt, bns.l_pac, reads))
+                    .reduce(<[Vec<i64>; 4]>::default, |mut all, part| {
+                        for (a, p) in all.iter_mut().zip(part) {
+                            a.extend(p);
+                        }
+                        all
+                    });
+                samples.iter_mut().for_each(|s| s.par_sort_unstable());
+                mem_pestat_from(samples)
+            }),
         };
 
         // Mate rescue, batched across the whole pair batch so the per-anchor insert-window SW fills
@@ -3123,8 +3142,17 @@ fn run_pe(
                 // is otherwise a serial section) while byte-identical to the per-pair path.
                 // Read before the mutable borrow below; `par_chunks_mut` would otherwise hold it.
                 let chunk_pairs = rescue_pairs_per_chunk(rescue_jobs.len());
+                // Shrinking toward the floor only (a forced size stays fixed).
+                let min = rescue_pairs_override().unwrap_or(RESCUE_MIN_PAIRS_PER_CHUNK);
+                let mut rest = rescue_jobs.as_mut_slice();
+                let mut chunks = Vec::new();
+                for r in guided_bounds(rest.len(), min, chunk_pairs) {
+                    let (chunk, tail) = std::mem::take(&mut rest).split_at_mut(r.len());
+                    chunks.push(chunk);
+                    rest = tail;
+                }
                 stage_time::barrier::region(Stage::Rescue, || {
-                    rescue_jobs.par_chunks_mut(chunk_pairs).for_each(|chunk| {
+                    run_in_order(chunks, |chunk| {
                         stage_time::barrier::worker(|| batch_mate_rescue(fm, bns, opt, &pes, chunk))
                     });
                 });
@@ -3149,7 +3177,9 @@ fn run_pe(
                         SAM_CHUNK_PAIRS,
                         || Vec::with_capacity(SAM_CHUNK_PAIRS * 1024),
                         |mut buf, (pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
-                            stage_time::barrier::worker(|| {
+                            // `move`: the pair is freed inside, so `BWA4_BARRIER_TIME` counts its
+                            // frees as work, not as tail (1.5 points of the 3.7% tail at -t4).
+                            stage_time::barrier::worker(move || {
                                 // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
                                 // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
                                 let names = [rec1.name(), rec2.name()];
@@ -3174,8 +3204,8 @@ fn run_pe(
                                     &mut buf,
                                 )
                                 .expect("write to Vec");
-                            });
-                            buf
+                                buf
+                            })
                         },
                     )
                     .collect()
@@ -3191,6 +3221,10 @@ fn run_pe(
     let overlap = batch_overlap_enabled(verbose);
     run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)
 }
+
+/// Floor of a rescue chunk, so a small batch (or a stage's last chunks) is not shredded into slivers
+/// narrower than the kernel's lanes.
+const RESCUE_MIN_PAIRS_PER_CHUNK: usize = 256;
 
 /// Read pairs handed to one parallel mate-rescue task, derived from the batch rather than fixed.
 ///
@@ -3274,8 +3308,6 @@ fn rescue_pairs_per_chunk(n_pairs: usize) -> usize {
     /// Two chunks per worker: enough for work-stealing to rebalance, few enough to keep the SIMD
     /// batches wide.
     const CHUNKS_PER_WORKER: usize = 2;
-    /// Floor, so a small batch is not shredded into slivers narrower than the kernel's lanes.
-    const RESCUE_MIN_PAIRS_PER_CHUNK: usize = 256;
     if let Some(forced) = rescue_pairs_override() {
         return forced;
     }
@@ -3297,9 +3329,75 @@ fn rescue_pairs_override() -> Option<usize> {
     })
 }
 
+/// `n` items cut for guided scheduling: each chunk is what is left over `2 * workers`, within
+/// `[min, max]`. Taken in order (see [`run_in_order`]), the last chunks are the small ones, so a
+/// stage ends with its workers finishing together. With one batch in flight every stage's tail is
+/// idle cores: equal chunks left three of four waiting on the last one (EPYC 9V74, `-t4`: align
+/// 98.1% busy, rescue 95.7%).
+fn guided_bounds(n: usize, min: usize, max: usize) -> Vec<std::ops::Range<usize>> {
+    let workers = rayon::current_num_threads().max(1);
+    let max = max.max(1);
+    let min = min.clamp(1, max);
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let size = ((n - at) / (2 * workers)).clamp(min, max).min(n - at);
+        out.push(at..at + size);
+        at += size;
+    }
+    out
+}
+
+/// `f` on every chunk, each pool worker taking the next chunk in order as it frees up, and the
+/// results in chunk order. Not a rayon iterator: its splitting hands the LAST chunks to thieves
+/// first, which defeats shrinking them.
+fn run_in_order<C: Send, R: Send>(chunks: Vec<C>, f: impl Fn(C) -> R + Sync) -> Vec<R> {
+    let queue = std::sync::Mutex::new(chunks.into_iter().enumerate());
+    let done = std::sync::Mutex::new(Vec::new());
+    rayon::broadcast(|_| loop {
+        let next = queue.lock().expect("chunk queue").next();
+        let Some((k, chunk)) = next else { break };
+        let r = f(chunk);
+        done.lock().expect("chunk results").push((k, r));
+    });
+    let mut done = done.into_inner().expect("chunk results");
+    done.sort_unstable_by_key(|&(k, _)| k);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunks tile `0..n` in order within `[min, max]` (only the last may be shorter), and
+    /// [`run_in_order`] hands results back in chunk order whichever worker finished first.
+    #[test]
+    fn guided_chunks_tile_the_batch_and_keep_their_order() {
+        for (n, min, max) in [
+            (0, 4, 16),
+            (1, 4, 16),
+            (1000, 4, 16),
+            (5000, 256, 2048),
+            (7, 0, 0),
+        ] {
+            let bounds = guided_bounds(n, min, max);
+            assert_eq!(bounds.iter().map(|r| r.len()).sum::<usize>(), n);
+            let mut at = 0;
+            for (k, r) in bounds.iter().enumerate() {
+                assert_eq!(r.start, at);
+                assert!(r.len() <= max.max(1));
+                assert!(r.len() >= min.clamp(1, max.max(1)) || k + 1 == bounds.len());
+                at = r.end;
+            }
+        }
+        let items: Vec<usize> = (0..5000).collect();
+        let chunks: Vec<&[usize]> = guided_bounds(items.len(), 4, 64)
+            .into_iter()
+            .map(|r| &items[r])
+            .collect();
+        let back: Vec<usize> = run_in_order(chunks, |c| c.to_vec()).concat();
+        assert_eq!(back, items);
+    }
 
     /// The separator rule is bwa's; the trailing-character refusal is ours (see [`parse_int_pair`]).
     #[test]

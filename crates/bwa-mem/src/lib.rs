@@ -285,7 +285,10 @@ pub mod primary;
 pub mod seedflt;
 pub use across::align_reads_batched;
 pub use cigar::{cigar_string, reg2aln, MemAln};
-pub use pe::{batch_mate_rescue, mem_pestat, mem_sam_pe, PairRescueData, PeStat};
+pub use pe::{
+    batch_mate_rescue, mem_pestat, mem_pestat_from, mem_sam_pe, pestat_samples, PairRescueData,
+    PeStat,
+};
 pub use primary::{mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch, stamp_is_alt};
 
 /// Sentinel for uninitialized region bounds (bwa's `H0_`, `macro.h:44`: `#define H0_ -99`).

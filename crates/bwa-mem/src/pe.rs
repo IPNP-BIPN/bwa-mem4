@@ -1730,7 +1730,13 @@ fn dump_pestat() -> bool {
 /// RETURNS the four `PeStat`s by orientation code (FF, FR, RF, RR). Orientations with too little
 /// support come back `failed`, which downstream code treats as "never pair or rescue this way".
 pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4] {
-    let mut pes = [PeStat::default(); 4];
+    mem_pestat_from(pestat_samples(opt, l_pac, regs))
+}
+
+/// [`mem_pestat`]'s step 1 alone: the insert sizes it fits, one list per orientation. A caller may
+/// collect them over slices of the batch (an even number of reads each) and concatenate the lists
+/// in any order, since [`mem_pestat_from`] sorts them.
+pub fn pestat_samples(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [Vec<i64>; 4] {
     // One insert-size sample list per orientation. bwa uses `uint64_v`; the values are distances so
     // they are non-negative, and we keep them as i64 to avoid signed/unsigned comparison hazards in
     // the inlier tests below.
@@ -1773,7 +1779,13 @@ pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4
             insert_sizes[dir].push(ins_size);
         }
     }
+    insert_sizes
+}
 
+/// [`mem_pestat`]'s step 2: the four orientations' fit, from [`pestat_samples`]' lists in any
+/// order (each is sorted here, a no-op on a sorted list).
+pub fn mem_pestat_from(mut insert_sizes: [Vec<i64>; 4]) -> [PeStat; 4] {
+    let mut pes = [PeStat::default(); 4];
     if dump_pestat() {
         eprintln!(
             "[PE] # candidate unique pairs for (FF, FR, RF, RR): ({}, {}, {}, {})",
