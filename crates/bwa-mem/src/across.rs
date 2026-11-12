@@ -1298,7 +1298,9 @@ fn align_reads_batched_inner<B: SwBackend>(
         // after the sort. Collected here and consumed by the resolution below; see `RepeatedRun`.
         let mut repeats = Vec::new();
         let mut counts = Vec::new();
-        for smems in &mut per_read_smems {
+        for ri in 0..per_read_smems.len() {
+            prefetch_smems(per_read_smems.get(ri + 1));
+            let smems = &mut per_read_smems[ri];
             bwa_chain::sa_positions_for_read(opt, smems, &mut pos, &mut repeats, &mut counts);
         }
         sa_repeats = repeats;
@@ -1469,10 +1471,11 @@ fn align_reads_batched_inner<B: SwBackend>(
     // the seeds the extension phase will work through. Everything downstream indexes this by read.
     #[cfg(feature = "stage-alloc")]
     let _chain_tag = alloc_probe::enter(alloc_probe::B_ALIGN_CHAIN);
-    let per_read_chains: Vec<Vec<MemChain>> = per_read_smems
-        .into_iter()
+    let per_read_chains: Vec<Vec<MemChain>> = (0..per_read_smems.len())
         .zip(reads.iter())
-        .map(|(smems, codes)| {
+        .map(|(ri, codes)| {
+            prefetch_smems(per_read_smems.get(ri + 1));
+            let smems = std::mem::take(&mut per_read_smems[ri]);
             // `counts`: positions contributed by each of this read's SMEMs. `n`: their total, i.e.
             // how far `sa_cursor` must advance. `rbegs`: this read's own slice of the flat
             // resolved-position array, in the order the chain builder expects.
@@ -2333,6 +2336,30 @@ fn run_side<B: SwBackend>(
         align_split::record_round(round as usize, active_idxs.len(), requeued_this_round);
         SIDE_BUFS.set((active_idxs, sorted));
     }
+}
+
+/// Hint a read's SMEMs into L1, a read ahead. Each read's are their own heap block, cold again by
+/// the time SA preparation and chaining come back to them (the batch's seeding, or its SA walk, ran
+/// in between), and no hardware prefetcher follows a list of pointers: chaining's first touch,
+/// `frac_rep`'s loop, was a fifth to a third of its inlined samples on x86. No effect on any result.
+#[inline(always)]
+fn prefetch_smems(smems: Option<&Vec<bwa_index::Smem>>) {
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(bwa4_no_smem_pf)
+    ))]
+    if let Some(s) = smems {
+        let p = s.as_ptr().cast::<u8>();
+        // Up to eight lines: sixteen SMEMs, past the 12.8 a read averages.
+        for off in (0..std::mem::size_of_val(s.as_slice())).step_by(64).take(8) {
+            bwa_neon::batched::prefetch(p.wrapping_add(off));
+        }
+    }
+    #[cfg(any(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        bwa4_no_smem_pf
+    ))]
+    let _ = smems;
 }
 
 #[cfg(test)]

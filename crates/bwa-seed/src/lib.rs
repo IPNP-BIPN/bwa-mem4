@@ -1645,9 +1645,9 @@ impl BwtSeedSlot {
         counts: &[i64; 5],
     ) {
         self.step_once(fm, codes, max_intv, min_seed_len, counts);
-        // A/B (`--cfg bwa4_r3_merge`): a walk that ended here starts the next one at once, as the
-        // fork's step does. `Start` reads no index memory, only prefetches the next phase's.
-        #[cfg(bwa4_r3_merge)]
+        // A walk that ended here starts the next one at once, as the fork's step does: `Start` reads
+        // no index memory, only prefetches the next phase's, so a visit of its own bought nothing.
+        // Same-host CI, real reads, SMEM: -1.6% mean over 9 x86 hosts (6 lower), M4 GIAB -0.4%.
         if self.phase == BwtPhase::Start {
             self.step_once(fm, codes, max_intv, min_seed_len, counts);
         }
