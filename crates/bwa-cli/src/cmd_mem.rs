@@ -2463,10 +2463,11 @@ fn batched_regs(
                 // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
                 // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
                 // apiece, and most die here. Held to the end of the batch they were the largest
-                // live item in the run. The survivors keep their lists' capacity: a
-                // `shrink_to_fit` here was a realloc and a copy per read, a quarter of the
-                // allocator's samples on EPYC 9V45 (real reads, -0.9% overall), for no RSS on
-                // chr21 and +1% on GIAB.
+                // live item in the run. Only lists left with 4+ empty slots are shrunk: a
+                // `shrink_to_fit` on every read was a realloc and a copy each, a quarter of the
+                // allocator's samples on EPYC 9V45 (real reads, -0.9% overall), while keeping all
+                // the slack cost 10% RSS on chr21 at -t4 (none on GIAB, where the index rules).
+                // The 13% (GIAB) to 29% (chr21) of reads past the threshold hold ~57% of it.
                 if !leave_undeduped {
                     for (r, codes) in regs.iter_mut().zip(chunk) {
                         let mut kept =
@@ -2474,6 +2475,9 @@ fn batched_regs(
                         // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
                         // the dedup and before any primary marking reads it.
                         bwa_mem::stamp_is_alt(bns, &mut kept);
+                        if kept.capacity() - kept.len() >= 4 {
+                            kept.shrink_to_fit();
+                        }
                         *r = kept;
                     }
                 }
