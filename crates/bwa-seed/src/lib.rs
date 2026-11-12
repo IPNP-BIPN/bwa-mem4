@@ -1644,6 +1644,25 @@ impl BwtSeedSlot {
         min_seed_len: i32,
         counts: &[i64; 5],
     ) {
+        self.step_once(fm, codes, max_intv, min_seed_len, counts);
+        // A/B (`--cfg bwa4_r3_merge`): a walk that ended here starts the next one at once, as the
+        // fork's step does. `Start` reads no index memory, only prefetches the next phase's.
+        #[cfg(bwa4_r3_merge)]
+        if self.phase == BwtPhase::Start {
+            self.step_once(fm, codes, max_intv, min_seed_len, counts);
+        }
+    }
+
+    /// One phase iteration of [`step`](Self::step).
+    #[inline(always)]
+    fn step_once(
+        &mut self,
+        fm: &FmIndex,
+        codes: &[u8],
+        max_intv: i64,
+        min_seed_len: i32,
+        counts: &[i64; 5],
+    ) {
         // Read length in bases: the exclusive bound on every READ offset here.
         let readlength = codes.len();
         match self.phase {
