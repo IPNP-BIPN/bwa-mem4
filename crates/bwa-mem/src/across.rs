@@ -2344,10 +2344,7 @@ fn run_side<B: SwBackend>(
 /// `frac_rep`'s loop, was a fifth to a third of its inlined samples on x86. No effect on any result.
 #[inline(always)]
 fn prefetch_smems(smems: Option<&Vec<bwa_index::Smem>>) {
-    #[cfg(all(
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        not(bwa4_no_smem_pf)
-    ))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     if let Some(s) = smems {
         let p = s.as_ptr().cast::<u8>();
         // Up to eight lines: sixteen SMEMs, past the 12.8 a read averages.
@@ -2355,10 +2352,7 @@ fn prefetch_smems(smems: Option<&Vec<bwa_index::Smem>>) {
             bwa_neon::batched::prefetch(p.wrapping_add(off));
         }
     }
-    #[cfg(any(
-        not(any(target_arch = "aarch64", target_arch = "x86_64")),
-        bwa4_no_smem_pf
-    ))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = smems;
 }
 

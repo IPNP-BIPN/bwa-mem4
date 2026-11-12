@@ -1800,8 +1800,7 @@ impl FmIndex {
     ///
     /// # Returns
     /// The number of survivors.
-    #[cfg_attr(bwa4_br_inline, inline(always))]
-    #[cfg_attr(not(bwa4_br_inline), inline)]
+    #[inline]
     pub fn backward_round(
         &self,
         prev: &mut [Smem],
@@ -1824,22 +1823,16 @@ impl FmIndex {
         // AArch64 takes two copies instead, base 0 and one for the other three: the base is the
         // read's, so the four-way dispatch mispredicted most rounds, and with 31 registers the
         // values the copies hoist stay in them. On x86 two copies made this function 3-6% slower
-        // (same-host CI, EPYC 7763 x2 and 9V74). `--cfg bwa4_br_two` builds them on x86 too, for Intel;
-        // `--cfg bwa4_br_one` one copy for every base, so no branch on the base at all.
-        #[cfg(bwa4_br_one)]
-        return if self.wide {
-            go!(true, true, ANY_BASE)
-        } else {
-            go!(false, true, ANY_BASE)
-        };
-        #[cfg(all(not(bwa4_br_one), any(target_arch = "aarch64", bwa4_br_two)))]
+        // (same-host CI, EPYC 7763 x2 and 9V74) and gained nothing on Intel; one copy for every
+        // base, and either form inlined into the driver, lost too (2026-11-12, 20 x86 hosts).
+        #[cfg(target_arch = "aarch64")]
         return match (self.wide, a) {
             (false, 0) => go!(false, true, 0),
             (false, _) => go!(false, false, ANY_BASE),
             (true, 0) => go!(true, true, 0),
             (true, _) => go!(true, false, ANY_BASE),
         };
-        #[cfg(not(any(target_arch = "aarch64", bwa4_br_two, bwa4_br_one)))]
+        #[cfg(not(target_arch = "aarch64"))]
         match (self.wide, a) {
             (false, 0) => go!(false, true, 0),
             (false, 1) => go!(false, false, 1),
