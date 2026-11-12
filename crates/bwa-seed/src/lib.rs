@@ -478,7 +478,6 @@ pub fn collect_smems_batched(
 
 /// [`collect_smems_batched`], also recording each read's round-3 first walk when `bsd` is
 /// `Some((max_intv, min_len))` (round 3's arguments): see [`FirstWalk`].
-#[cfg_attr(bwa4_wide_split, inline(always))]
 fn collect_smems_batched_bsd(
     fm: &FmIndex,
     reads: &[&[u8]],
@@ -1142,8 +1141,7 @@ impl LsSlot {
                         seed_stats::BWD_STEPS
                             .fetch_add(self.num_prev as u64, std::sync::atomic::Ordering::Relaxed);
                     }
-                    let num_curr = bwd_round_call(
-                        fm,
+                    let num_curr = fm.backward_round(
                         &mut self.prev[..self.num_prev],
                         a as usize,
                         self.jj as u32,
@@ -1860,7 +1858,6 @@ impl BwtSeedSlot {
 /// - `min_seed_len`: emission length floor in bases (`opt.min_seed_len + 1`).
 /// - `out`: per-read SMEM vectors, already holding rounds 1 and 2. Must have the same length as
 ///   `reads`, since it is indexed by `ridx`. Round-3 SMEMs are **appended**, never replacing.
-#[cfg_attr(bwa4_wide_split, inline(always))]
 fn bwt_seed_strategy_batched(
     fm: &FmIndex,
     reads: &[&[u8]],
@@ -1955,62 +1952,7 @@ const SMEM_HEADROOM: usize = 16;
 /// # Returns
 /// One SMEM vector per read, ordered round 1, then round 2, then round 3.
 pub fn mem_collect_smem_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> Vec<Vec<Smem>> {
-    // A/B (`--cfg bwa4_wide_split`): one copy of the three rounds per index kind, so neither
-    // carries the other's count code between its hot blocks.
-    #[cfg(bwa4_wide_split)]
-    return if fm.wide() {
-        collect_rounds_w::<true>(fm, reads, opt)
-    } else {
-        collect_rounds_w::<false>(fm, reads, opt)
-    };
-    #[cfg(not(bwa4_wide_split))]
     collect_rounds(fm, reads, opt)
-}
-
-/// [`collect_rounds`] for an index whose [`FmIndex::wide`] is `W`.
-#[cfg(bwa4_wide_split)]
-#[inline(never)]
-fn collect_rounds_w<const W: bool>(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt) -> Vec<Vec<Smem>> {
-    // SAFETY: the only caller, `mem_collect_smem_batched`, picks `W` from `fm.wide()`.
-    unsafe { std::hint::assert_unchecked(fm.wide() == W) };
-    collect_rounds(fm, reads, opt)
-}
-
-/// One backward round of a slot: [`FmIndex::backward_round`], or under `--cfg bwa4_wide_split`
-/// the copy for this index's kind (one test, folded inside [`collect_rounds_w`]).
-#[inline(always)]
-fn bwd_round_call(
-    fm: &FmIndex,
-    prev: &mut [Smem],
-    a: usize,
-    m: u32,
-    min_intv: i64,
-    min_seed_len: i64,
-    out: &mut Vec<Smem>,
-) -> usize {
-    // A/B (`--cfg bwa4_bwd_one`): one candidate decided here, without the call and its per-base
-    // dispatch, as the fork's `numPrev == 1` path.
-    #[cfg(bwa4_bwd_one)]
-    if let [c] = prev {
-        let e = fm.backward_ext_konly(*c, a);
-        if e.s >= min_intv {
-            *c = Smem { m, ..e };
-            fm.prefetch_occ(e.k, e.k + e.s);
-            return 1;
-        }
-        if i64::from(c.n) - i64::from(c.m) + 1 >= min_seed_len {
-            out.push(*c);
-        }
-        return 0;
-    }
-    #[cfg(bwa4_wide_split)]
-    return if fm.wide() {
-        fm.backward_round_w::<true>(prev, a, m, min_intv, min_seed_len, out)
-    } else {
-        fm.backward_round_w::<false>(prev, a, m, min_intv, min_seed_len, out)
-    };
-    #[cfg(not(bwa4_wide_split))]
-    fm.backward_round(prev, a, m, min_intv, min_seed_len, out)
 }
 
 /// The body of [`mem_collect_smem_batched`]: rounds 1, 2 and 3.
@@ -2182,7 +2124,6 @@ struct ReseedJob {
 /// - `per_read`: each read's round-1 SMEMs on entry (must be indexed the same as `reads`, since
 ///   `ridx` indexes both). Round-2 SMEMs are appended in place. Jobs are enumerated from the entry
 ///   contents, so the SMEMs appended here are never themselves re-seeded.
-#[cfg_attr(bwa4_wide_split, inline(always))]
 fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &mut [Vec<Smem>]) {
     let lockstep_slots = lockstep_width(fm);
     // Same threshold as `smem_round_2`, in bases: 28 with the defaults. The `f32` arithmetic must

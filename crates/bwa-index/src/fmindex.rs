@@ -1852,41 +1852,6 @@ impl FmIndex {
         }
     }
 
-    /// [`backward_round`](Self::backward_round) for an index whose [`wide`](Self::wide) is `W`, so
-    /// the function holds only that kind's per-base copies (A/B `--cfg bwa4_wide_split`).
-    ///
-    /// # Panics
-    /// In debug builds, if `W` is not this index's kind.
-    #[inline]
-    pub fn backward_round_w<const W: bool>(
-        &self,
-        prev: &mut [Smem],
-        a: usize,
-        m: u32,
-        min_intv: i64,
-        min_seed_len: i64,
-        out: &mut Vec<Smem>,
-    ) -> usize {
-        debug_assert_eq!(W, self.wide);
-        macro_rules! go {
-            ($a0:literal, $a:expr) => {
-                self.backward_round_impl::<W, $a0, { $a }>(prev, a, m, min_intv, min_seed_len, out)
-            };
-        }
-        #[cfg(target_arch = "aarch64")]
-        return match a {
-            0 => go!(true, 0),
-            _ => go!(false, ANY_BASE),
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        match a {
-            0 => go!(true, 0),
-            1 => go!(false, 1),
-            2 => go!(false, 2),
-            _ => go!(false, 3),
-        }
-    }
-
     /// [`backward_round`](Self::backward_round) for base `A` (`A0` is `A == 0`), or for the
     /// runtime base `a` when `A` is [`ANY_BASE`] (`A0` then says whether `a` may be 0).
     #[inline]
