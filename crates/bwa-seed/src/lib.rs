@@ -811,6 +811,7 @@ impl LsSlot {
     /// s = 0, ending at the first `N` (x = p + 1), at the first step `>= bsd_j` (no seed,
     /// x = p + 1), or at the read's end.
     #[cold]
+    #[cfg_attr(bwa4_slim, inline(never))]
     fn bsd_resolve(&mut self, codes: &[u8], mut p: usize) {
         let rl = codes.len();
         while p < rl && codes[p] < AMBIGUOUS_BASE && p < self.bsd_j {
@@ -2072,6 +2073,7 @@ fn smem_rounds_2_3(fm: &FmIndex, codes: &[u8], opt: &MemOpt, smems: &mut Vec<Sme
 /// - `codes`: the 2-bit-encoded read the SMEMs came from.
 /// - `opt`: alignment options; reads `min_seed_len`, `split_factor` and `split_width`.
 /// - `smems`: the read's round-1 SMEMs on entry; round-2 SMEMs are appended in place.
+#[cfg_attr(bwa4_slim, inline(never))]
 fn smem_round_2(fm: &FmIndex, codes: &[u8], opt: &MemOpt, smems: &mut Vec<Smem>) {
     // Length threshold in bases above which a round-1 SMEM is considered "long" enough to re-seed.
     // Defaults: 19 * 1.5 + 0.499 truncates to 28.
