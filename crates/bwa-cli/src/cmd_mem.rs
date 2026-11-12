@@ -1625,9 +1625,7 @@ fn se_read_batches(
             // nt4 in place, for the reason given in `pe_read_batches`. The SAM text is printed back
             // out of these codes, as bwa does.
             for rec in batch.iter_mut() {
-                for base in rec.seq_mut() {
-                    *base = dna::nt4(*base);
-                }
+                dna::nt4_in_place(rec.seq_mut());
             }
             // Read count, saved before the move so `base_id` can advance after the send.
             let n = batch.len() as u64;
@@ -2984,9 +2982,8 @@ fn pe_read_batches(
             // the wall at -t8): this thread waits on the hand-off anyway, so it costs no wall.
             let mut batch = batch;
             for (rec1, rec2) in batch.iter_mut() {
-                for base in rec1.seq_mut().iter_mut().chain(rec2.seq_mut()) {
-                    *base = dna::nt4(*base);
-                }
+                dna::nt4_in_place(rec1.seq_mut());
+                dna::nt4_in_place(rec2.seq_mut());
             }
             let n = batch.len() as u64;
             if tx.send((batch, base_pair)).is_err() {
