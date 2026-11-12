@@ -872,7 +872,6 @@ fn simd_dispatch(
     // The NEON kernels score DNA with a vector compare that assumes the uniform bwa matrix
     // (diagonal `a`, off-diagonal `mm`, ambiguous row/col = `npen`). Any other matrix -> scalar.
     if !is_uniform_dna(mat, m) {
-        #[cfg(target_arch = "aarch64")]
         if m == 5
             && mat[1] < 0
             && mat[..25].iter().all(|v| (mat[1]..=mat[0]).contains(v))
@@ -882,8 +881,6 @@ fn simd_dispatch(
                 jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
             );
         }
-        // shortcut: on x86_64 a `--meth` neutral/genomic matrix extends with the scalar kernel,
-        // give the AVX2/AVX-512 u8 kernels a `tab5` form when `--meth` speed on x86 matters.
         return batched_extend_scalar(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
@@ -968,7 +965,7 @@ fn simd_dispatch(
 /// those gains sum below the cheapest gap, `gap_min = o_min + e_min`: at a uniform matrix that is
 /// `X (a + b) < o_min + e_min`, [`simd_dispatch`]'s bound. The walk is [`ungapped_hit`]'s, cell by
 /// cell: the best moves on a strict `>`, and only a falling cell can kill the diagonal or z-drop.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn ungapped_hit_mat(job: &ExtendJob, mat: &[i8], gap_min: i32, zdrop: i32) -> Option<ExtendResult> {
     let n = job.query.len();
     if n == 0 || job.h0 <= 0 || job.target.len() < n {
@@ -1004,10 +1001,10 @@ fn ungapped_hit_mat(job: &ExtendJob, mat: &[i8], gap_min: i32, zdrop: i32) -> Op
 }
 
 /// Extension under a 5x5 matrix with diagonal `mat[0]` and every cell in `[mat[1], mat[0]]`
-/// (`--meth`'s neutral and genomic): [`ungapped_hit_mat`] first, then the NEON u8 kernel's `tab5`
-/// form for every job it can hold, the scalar reference for the rest. The positive-`h0`-only
-/// kernel is never given a seed the matrix scored `<= 0`.
-#[cfg(target_arch = "aarch64")]
+/// (`--meth`'s neutral and genomic): [`ungapped_hit_mat`] first, then the u8 kernel's `tab5` form
+/// (NEON, or the calibrated x86 tier) for every job it can hold, the scalar reference for the rest.
+/// The positive-`h0`-only kernel is never given a seed the matrix scored `<= 0`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn mat5_extend(
     jobs: &[ExtendJob],
@@ -1046,17 +1043,36 @@ fn mat5_extend(
     let pick = |idx: &[usize]| idx.iter().map(|&k| jobs[k]).collect::<Vec<_>>();
     let inl = inline_sbt_enabled();
     let fit_jobs = pick(&fit);
-    // SAFETY: NEON was detected by the caller; every job passed the u8 bounds above; the matrix
-    // is the `tab5` shape.
+    // The kernel for this ISA and `INL_SBT`; on x86 the tier the standard matrix calibrated to.
+    macro_rules! mat5_kernel {
+        ($md:ident :: $k:ident) => {
+            if inl {
+                $md::$k::<true>(
+                    &fit_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            } else {
+                $md::$k::<false>(
+                    &fit_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+        };
+    }
+    // SAFETY: the caller detected the ISA (NEON, or SSE4.1 at least on x86, whose tier names
+    // only a feature the host has); every job passed the u8 bounds above; the matrix is the
+    // `tab5` shape.
     let got = unsafe {
-        if inl {
-            neon::batched_extend_neon_u8_mat5::<true>(
+        #[cfg(target_arch = "aarch64")]
+        {
+            mat5_kernel!(neon::batched_extend_neon_u8_mat5)
+        }
+        #[cfg(target_arch = "x86_64")]
+        match extend_tier() {
+            Tier::Avx512 => mat5_kernel!(avx512::batched_extend_avx512_u8_mat5),
+            Tier::Avx2 => mat5_kernel!(avx2::batched_extend_avx2_u8_mat5),
+            Tier::Sse41 => mat5_kernel!(sse41::batched_extend_sse41_u8_mat5),
+            Tier::Scalar => batched_extend_scalar(
                 &fit_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
-        } else {
-            neon::batched_extend_neon_u8_mat5::<false>(
-                &fit_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
+            ),
         }
     };
     for (&k, r) in fit.iter().zip(got) {
@@ -5025,6 +5041,57 @@ mod avx2 {
         trk = i16,
         row = x86_row
     );
+    // `tab5` (`--meth`'s neutral and genomic matrices, see [`mat5_extend`]): the 32-entry table
+    // as its low half and `low ^ high`, each broadcast per 128-bit lane, read at `i = 5 t + q` by
+    // two in-lane shuffles. The first reads `low[i & 15]`; the second's index is `i - 16`, whose
+    // sign bit zeroes it for `i < 16`, so the XOR is `low[i]` below 16 and `high[i - 16]` above.
+    define_sw_kernel!(
+        batched_extend_avx2_u8_mat5,
+        u8,
+        u8,
+        32,
+        feat = "avx2",
+        dup = set1_u8,
+        lds = loadu_u8,
+        sts = storeu_u8,
+        ldu = loadu_u8,
+        sub = _mm256_subs_epu8,
+        max = _mm256_max_epu8,
+        ceqz = ceqz8,
+        cge = cge_epu8,
+        ceq = _mm256_cmpeq_epi8,
+        orru = _mm256_or_si256,
+        orr = _mm256_or_si256,
+        andu = _mm256_and_si256,
+        bsl = bsl256,
+        band = band_epi8,
+        band_bias = 0x80,
+        band_width = false,
+        diag = |m, s, bias| _mm256_subs_epu8(_mm256_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| {
+            let (lo, hi) = (
+                _mm_loadu_si128(p as *const __m128i),
+                _mm_loadu_si128(p.add(16) as *const __m128i),
+            );
+            (
+                _mm256_broadcastsi128_si256(lo),
+                _mm256_broadcastsi128_si256(_mm_xor_si128(lo, hi)),
+            )
+        },
+        tbl = |t, k, q| {
+            let i = _mm256_add_epi8(_mm256_add_epi8(_mm256_slli_epi16::<2>(k), k), q);
+            _mm256_xor_si256(
+                _mm256_shuffle_epi8(t.0, i),
+                _mm256_shuffle_epi8(t.1, _mm256_subs_epi8(i, _mm256_set1_epi8(16))),
+            )
+        },
+        rowvec = true,
+        trk = i16,
+        row = x86_row
+    );
 }
 
 /// SSE4.1 (x86_64) instantiations of [`define_sw_kernel!`]: 16 u8 lanes / 8 i16 lanes, the same
@@ -5213,6 +5280,54 @@ mod sse41 {
         tab5 = false,
         tbl_ld = |p| _mm_loadu_si128(p as *const __m128i),
         tbl = |t, k, q| _mm_shuffle_epi8(t, _mm_xor_si128(k, q)),
+        rowvec = false,
+        trk = i32,
+        row = x86_row
+    );
+    // `tab5` (`--meth`'s neutral and genomic matrices, see [`mat5_extend`]): the 32-entry table
+    // as its low half and `low ^ high`, each broadcast per 128-bit lane, read at `i = 5 t + q` by
+    // two in-lane shuffles. The first reads `low[i & 15]`; the second's index is `i - 16`, whose
+    // sign bit zeroes it for `i < 16`, so the XOR is `low[i]` below 16 and `high[i - 16]` above.
+    define_sw_kernel!(
+        batched_extend_sse41_u8_mat5,
+        u8,
+        u8,
+        16,
+        feat = "sse4.1",
+        dup = set1_u8,
+        lds = loadu_u8,
+        sts = storeu_u8,
+        ldu = loadu_u8,
+        sub = _mm_subs_epu8,
+        max = _mm_max_epu8,
+        ceqz = ceqz8,
+        cge = cge_epu8,
+        ceq = _mm_cmpeq_epi8,
+        orru = _mm_or_si128,
+        orr = _mm_or_si128,
+        andu = _mm_and_si128,
+        bsl = bsl128,
+        band = band_epi8,
+        band_bias = 0x80,
+        band_width = false,
+        diag = |m, s, bias| _mm_subs_epu8(_mm_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| {
+            let (lo, hi) = (
+                _mm_loadu_si128(p as *const __m128i),
+                _mm_loadu_si128(p.add(16) as *const __m128i),
+            );
+            (lo, _mm_xor_si128(lo, hi))
+        },
+        tbl = |t, k, q| {
+            let i = _mm_add_epi8(_mm_add_epi8(_mm_slli_epi16::<2>(k), k), q);
+            _mm_xor_si128(
+                _mm_shuffle_epi8(t.0, i),
+                _mm_shuffle_epi8(t.1, _mm_subs_epi8(i, _mm_set1_epi8(16))),
+            )
+        },
         rowvec = false,
         trk = i32,
         row = x86_row
@@ -5407,6 +5522,57 @@ mod avx512 {
         tab5 = false,
         tbl_ld = |p| _mm512_broadcast_i32x4(_mm_loadu_si128(p as *const __m128i)),
         tbl = |t, k, q| _mm512_shuffle_epi8(t, _mm512_xor_si512(k, q)),
+        rowvec = true,
+        trk = i16,
+        row = x86_row
+    );
+    // `tab5` (`--meth`'s neutral and genomic matrices, see [`mat5_extend`]): the 32-entry table
+    // as its low half and `low ^ high`, each broadcast per 128-bit lane, read at `i = 5 t + q` by
+    // two in-lane shuffles. The first reads `low[i & 15]`; the second's index is `i - 16`, whose
+    // sign bit zeroes it for `i < 16`, so the XOR is `low[i]` below 16 and `high[i - 16]` above.
+    define_sw_kernel!(
+        batched_extend_avx512_u8_mat5,
+        u8,
+        u8,
+        64,
+        feat = "avx512bw,avx512vl,avx512dq",
+        dup = set1_u8,
+        lds = loadu_u8,
+        sts = storeu_u8,
+        ldu = loadu_u8,
+        sub = _mm512_subs_epu8,
+        max = _mm512_max_epu8,
+        ceqz = ceqz8,
+        cge = cge_epu8,
+        ceq = ceq8,
+        orru = _mm512_or_si512,
+        orr = _mm512_or_si512,
+        andu = _mm512_and_si512,
+        bsl = bsl512,
+        band = band_epu8,
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm512_subs_epu8(_mm512_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| {
+            let (lo, hi) = (
+                _mm_loadu_si128(p as *const __m128i),
+                _mm_loadu_si128(p.add(16) as *const __m128i),
+            );
+            (
+                _mm512_broadcast_i32x4(lo),
+                _mm512_broadcast_i32x4(_mm_xor_si128(lo, hi)),
+            )
+        },
+        tbl = |t, k, q| {
+            let i = _mm512_add_epi8(_mm512_add_epi8(_mm512_slli_epi16::<2>(k), k), q);
+            _mm512_xor_si512(
+                _mm512_shuffle_epi8(t.0, i),
+                _mm512_shuffle_epi8(t.1, _mm512_subs_epi8(i, _mm512_set1_epi8(16))),
+            )
+        },
         rowvec = true,
         trk = i16,
         row = x86_row
@@ -7197,7 +7363,7 @@ mod clamp_band_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod mat5_tests {
     use bwa_extend::ExtendJob;
 
@@ -7282,6 +7448,59 @@ mod mat5_tests {
                             .count();
                     }
                     let want = super::batched_extend_scalar(&jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd);
+                    // Every x86 `tab5` tier on the jobs it takes (`mat5_extend`'s u8 bounds),
+                    // whatever the calibration picks. AVX2 needs an AVX2 executor (Rosetta is one).
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let fit: Vec<ExtendJob> = jobs
+                            .iter()
+                            .copied()
+                            .filter(|j| {
+                                j.h0 > 0
+                                    && j.query.len() < 256
+                                    && j.target.len() < 256
+                                    && super::cell_bound(j, 1) + 5 < 256
+                            })
+                            .collect();
+                        let want =
+                            super::batched_extend_scalar(&fit, 5, &mat, 6, 1, 6, 1, w, eb, zd);
+                        super::EXACT_STOP_TEST.with(|c| c.set(Some(false)));
+                        // SAFETY: SSE4.1 is in every x86_64 this runs on, AVX2 in the executor,
+                        // AVX-512 checked; `fit` holds the u8 bounds; the matrix is `tab5`'s.
+                        unsafe {
+                            let tag = format!("freed ({r},{q}) conv {conv} round {round}");
+                            assert_eq!(
+                                super::sse41::batched_extend_sse41_u8_mat5::<true>(
+                                    &fit, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} sse41"
+                            );
+                            assert_eq!(
+                                super::avx2::batched_extend_avx2_u8_mat5::<false>(
+                                    &fit, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} avx2"
+                            );
+                            assert_eq!(
+                                super::avx2::batched_extend_avx2_u8_mat5::<true>(
+                                    &fit, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} avx2 inline"
+                            );
+                            if bwa_extend::has_avx512() {
+                                assert_eq!(
+                                    super::avx512::batched_extend_avx512_u8_mat5::<true>(
+                                        &fit, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                    ),
+                                    want,
+                                    "{tag} avx512"
+                                );
+                            }
+                        }
+                    }
                     let run = |stop| {
                         super::EXACT_STOP_TEST.with(|c| c.set(Some(stop)));
                         super::batched_extend(&jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd)

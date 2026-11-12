@@ -49,6 +49,18 @@ pub(crate) fn kernel_available() -> bool {
     }
 }
 
+/// The kernels' `mat5` for `mat`: a `--meth` matrix (`matesw::mat5_u8_ok`) as signed cells
+/// `[ref * 5 + read]`, past 25 zero; `None` for the standard matrix.
+fn mat5_of(mat: &[i8]) -> Option<[u8; 32]> {
+    (!crate::matesw::mat_is_standard(5, mat)).then(|| {
+        let mut t = [0u8; 32];
+        for (e, &v) in t.iter_mut().zip(&mat[..25]) {
+            *e = v as u8;
+        }
+        t
+    })
+}
+
 /// A band in full-window coordinates: target rows `r0..=r1`, diagonals `dlo..=dhi` (`d = i - j`).
 #[derive(Clone, Copy, Debug)]
 struct Band {
@@ -312,8 +324,8 @@ impl Batch {
     /// give (`qb`/`tb` stay -1 for the reverse pass).
     ///
     /// # Safety
-    /// NEON must be available; `mat` must be the standard 5x5 table (or, on aarch64, one
-    /// `matesw::mat5_u8_ok` admits) and every banded job's score ceiling under the u8 limit (the
+    /// NEON must be available; `mat` must be the standard 5x5 table or one
+    /// `matesw::mat5_u8_ok` admits and every banded job's score ceiling under the u8 limit (the
     /// caller's u8-kernel conditions).
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn run(
@@ -338,10 +350,7 @@ impl Batch {
             e_ins as u8,
         ];
         let tbl = crate::matesw::u8_score_table(mat);
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.work.mat5 = neon::mat5_of(mat);
-        }
+        self.work.mat5 = mat5_of(mat);
         let probe = crate::matesw::cells::enabled();
         let t_all = probe.then(std::time::Instant::now);
         let cells0 = self.work.cells;
@@ -574,10 +583,7 @@ impl Batch {
             e_ins as u8,
         ];
         let tbl = crate::matesw::u8_score_table(mat);
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.work.mat5 = neon::mat5_of(mat);
-        }
+        self.work.mat5 = mat5_of(mat);
         self.jobs.clear();
         for (i, &(q, t, s)) in jobs.iter().enumerate() {
             let (len2, nrows) = (q.len() as i32, t.len() as i32);
@@ -911,17 +917,6 @@ pub(crate) mod neon {
     use std::arch::aarch64::*;
 
     pub(super) const L: usize = 16;
-
-    /// [`Work::mat5`] for `mat`.
-    pub(super) fn mat5_of(mat: &[i8]) -> Option<[u8; 32]> {
-        (!crate::matesw::mat_is_standard(5, mat)).then(|| {
-            let mut t = [0u8; 32];
-            for (e, &v) in t.iter_mut().zip(&mat[..25]) {
-                *e = v as u8;
-            }
-            t
-        })
-    }
 
     /// Query code of a cell outside the query (`j < 0` or `j >= quanta`): dead, scores 0.
     const DEAD: u8 = 0xC0;
@@ -1485,6 +1480,8 @@ mod avx2 {
     /// As the NEON kernel's `Work`.
     #[derive(Default)]
     pub(super) struct Work {
+        /// As the NEON kernel's: the `--meth` matrix, scored at `5 * target + query`.
+        pub(super) mat5: Option<[u8; 32]>,
         st: Vec<u8>,
         a: ABuf<u8>,
         refv: ABuf<u8>,
@@ -1523,15 +1520,16 @@ mod avx2 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            if gaps[0] == gaps[2] {
-                self.run_impl::<true>(lanes, w, tbl, gaps)
-            } else {
-                self.run_impl::<false>(lanes, w, tbl, gaps)
+            match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
             }
         }
 
         #[target_feature(enable = "avx2")]
-        unsafe fn run_impl<const SHARE: bool>(
+        unsafe fn run_impl<const SHARE: bool, const MAT5: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -1598,8 +1596,12 @@ mod avx2 {
                     };
                     crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
                     crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
-                    // Target N re-encoded as 12 (see the NEON kernel).
-                    if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
+                    // `MAT5`: targets as `5 * b` (see the NEON kernel), else N re-encoded as 12.
+                    if MAT5 {
+                        for b in row[..lane.t.len()].iter_mut() {
+                            *b *= 5;
+                        }
+                    } else if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
                         for b in row[..lane.t.len()].iter_mut() {
                             if *b == 4 {
                                 *b = 12;
@@ -1619,6 +1621,16 @@ mod avx2 {
             // The signed table in both 128-bit halves.
             let t128 = _mm_loadu_si128(tbl.as_ptr() as *const __m128i);
             let tblv = _mm256_set_m128i(t128, t128);
+            // `MAT5`: the 32 cells as their low 16 and `low ^ high`, read at `i = 5 t + q` by two
+            // in-lane shuffles (`batched`'s `tab5`): every pad code has bit 7 and the saturating
+            // add keeps it, so both read 0; `i - 16`'s sign zeroes the second for `i < 16`.
+            let (t5lo, t5hi) = {
+                let t5 = self.mat5.unwrap_or([0; 32]);
+                let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
+                let hi = _mm_xor_si128(lo, _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i));
+                (_mm256_set_m128i(lo, lo), _mm256_set_m128i(hi, hi))
+            };
+            let sixteen = _mm256_set1_epi8(16);
             let hz = _mm256_set1_epi8(HZ as i8);
             let nil = _mm256_setzero_si256();
             let one = _mm256_set1_epi8(1);
@@ -1689,7 +1701,15 @@ mod avx2 {
             macro_rules! cell {
                 ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
                  $clamp:expr) => {{
-                    let sc = _mm256_shuffle_epi8(tblv, _mm256_xor_si256($q, $rref));
+                    let sc = if MAT5 {
+                        let i = _mm256_adds_epu8($rref, $q);
+                        _mm256_xor_si256(
+                            _mm256_shuffle_epi8(t5lo, i),
+                            _mm256_shuffle_epi8(t5hi, _mm256_subs_epi8(i, sixteen)),
+                        )
+                    } else {
+                        _mm256_shuffle_epi8(tblv, _mm256_xor_si256($q, $rref))
+                    };
                     let mut h0 = _mm256_max_epi8(_mm256_adds_epi8($d, sc), $ein);
                     let ok: Option<bool> = $top;
                     if ok == Some(false) {
@@ -1916,6 +1936,8 @@ mod avx512 {
 
     /// As the NEON kernel's `Work`.
     pub(super) struct Work {
+        /// As the NEON kernel's: the `--meth` matrix, scored at `5 * target + query`.
+        pub(super) mat5: Option<[u8; 32]>,
         st: Vec<u8>,
         a: ABuf<u8>,
         refv: ABuf<u8>,
@@ -1934,6 +1956,7 @@ mod avx512 {
     impl Default for Work {
         fn default() -> Self {
             Work {
+                mat5: None,
                 st: Vec::new(),
                 a: ABuf::new(),
                 refv: ABuf::new(),
@@ -1973,15 +1996,16 @@ mod avx512 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            if gaps[0] == gaps[2] {
-                self.run_impl::<true>(lanes, w, tbl, gaps)
-            } else {
-                self.run_impl::<false>(lanes, w, tbl, gaps)
+            match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
             }
         }
 
         #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-        unsafe fn run_impl<const SHARE: bool>(
+        unsafe fn run_impl<const SHARE: bool, const MAT5: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -2048,8 +2072,12 @@ mod avx512 {
                     };
                     crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
                     crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
-                    // Target N re-encoded as 12 (see the NEON kernel).
-                    if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
+                    // `MAT5`: targets as `5 * b` (see the NEON kernel), else N re-encoded as 12.
+                    if MAT5 {
+                        for b in row[..lane.t.len()].iter_mut() {
+                            *b *= 5;
+                        }
+                    } else if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
                         for b in row[..lane.t.len()].iter_mut() {
                             if *b == 4 {
                                 *b = 12;
@@ -2068,6 +2096,14 @@ mod avx512 {
             }
             // The signed table in every 128-bit lane.
             let tblv = _mm512_broadcast_i32x4(_mm_loadu_si128(tbl.as_ptr() as *const __m128i));
+            // `MAT5`: as the AVX2 kernel's.
+            let (t5lo, t5hi) = {
+                let t5 = self.mat5.unwrap_or([0; 32]);
+                let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
+                let hi = _mm_xor_si128(lo, _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i));
+                (_mm512_broadcast_i32x4(lo), _mm512_broadcast_i32x4(hi))
+            };
+            let sixteen = _mm512_set1_epi8(16);
             let hz = _mm512_set1_epi8(HZ as i8);
             let nil = _mm512_setzero_si512();
             let one = _mm512_set1_epi8(1);
@@ -2135,7 +2171,15 @@ mod avx512 {
             macro_rules! cell {
                 ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
                  $live:expr) => {{
-                    let sc = _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref));
+                    let sc = if MAT5 {
+                        let i = _mm512_adds_epu8($rref, $q);
+                        _mm512_xor_si512(
+                            _mm512_shuffle_epi8(t5lo, i),
+                            _mm512_shuffle_epi8(t5hi, _mm512_subs_epi8(i, sixteen)),
+                        )
+                    } else {
+                        _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref))
+                    };
                     let mut h0 = _mm512_max_epi8(_mm512_adds_epi8($d, sc), $ein);
                     let ok: Option<bool> = $top;
                     if ok == Some(false) {
@@ -2408,6 +2452,8 @@ mod x86 {
     pub(super) const L: usize = avx512::L;
 
     pub(super) struct Work {
+        /// As the NEON kernel's, handed to whichever kernel runs.
+        pub(super) mat5: Option<[u8; 32]>,
         w2: avx2::Work,
         w5: avx512::Work,
         wide: bool,
@@ -2421,6 +2467,7 @@ mod x86 {
     impl Default for Work {
         fn default() -> Self {
             Work {
+                mat5: None,
                 w2: Default::default(),
                 w5: Default::default(),
                 wide: crate::matesw::rescue_avx512_ok(),
@@ -2462,12 +2509,14 @@ mod x86 {
         ) {
             let n = lanes.len();
             if self.wide {
+                self.w5.mat5 = self.mat5;
                 self.w5.run(lanes, w, tbl, gaps);
                 self.gmax[..n].copy_from_slice(&self.w5.gmax[..n]);
                 self.te[..n].copy_from_slice(&self.w5.te[..n]);
                 self.qe[..n].copy_from_slice(&self.w5.qe[..n]);
                 self.cells = self.w5.cells;
             } else {
+                self.w2.mat5 = self.mat5;
                 self.w2.run(lanes, w, tbl, gaps);
                 self.gmax[..n].copy_from_slice(&self.w2.gmax[..n]);
                 self.te[..n].copy_from_slice(&self.w2.te[..n]);

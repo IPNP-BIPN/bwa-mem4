@@ -9,6 +9,7 @@
 # GENOME  a GRCh38 FASTA with .fai (contigs 20, 22, MT), only needed to build work/meth/ref.fa
 #         the first time [work/giab/genome.fa]
 # PAIRS   simulated pairs per library [5000]
+# OURS    our binary [target/release/bwa-mem4, built first]
 #
 # The reference is chr20:44.0-44.4M, chr22:20.0-20.2M with a 30-N run and a 200 bp lowercase run
 # injected, and chrM: two nuclear contigs, ambiguous bases, soft-masked bases and a contig end.
@@ -48,8 +49,11 @@ with open(sys.argv[2], "w") as out:
 EOF
 fi
 
-cargo build --release --quiet
-OURS=target/release/bwa-mem4
+# OURS: another build of ours (e.g. an x86_64 one under Rosetta) instead of this tree's release.
+if [ -z "${OURS:-}" ]; then
+  cargo build --release --quiet
+  OURS=target/release/bwa-mem4
+fi
 
 echo "[index] fork and ours, --meth"
 for t in fork ours; do cp "$W/ref.fa" "$W/$t/ref.fa"; done

@@ -24,7 +24,7 @@ on:
         default: "1000000"
         required: false
       read_set:
-        description: "sim | real"
+        description: "sim | real | meth (the meth job: --meth EM-seq and TAPS, ours vs the fork)"
         default: "sim"
         required: false
       runner:
@@ -73,7 +73,7 @@ env:
 
 jobs:
   profile:
-    if: github.event.inputs.icount != 'true'
+    if: github.event.inputs.icount != 'true' && github.event.inputs.read_set != 'meth'
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 90
     steps:
@@ -707,3 +707,131 @@ jobs:
           PY
             fi
           done
+
+  # `--meth` (read_set=meth): ours against the fork 0.16 on simulated EM-seq and TAPS pairs over
+  # chr21 (`scripts/meth_sim.py`), one host, one read set, each tool on its own `index --meth`.
+  # Wall, CPU (user + sys) and peak RSS per arm at -t1 and -t<cores, max 8>, the two arms
+  # interleaved and each run twice; the summary keeps each arm's faster run. `-K` is fixed so the
+  # fork's batches, hence its output, do not depend on -t, and the outputs are compared first.
+  meth:
+    if: github.event.inputs.read_set == 'meth'
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
+    timeout-minutes: 90
+    steps:
+      - name: What machine is this
+        id: host
+        env:
+          CPU_MATCH: ${{ github.event.inputs.cpu_match || '' }}
+        run: |
+          awk -F': ' '/^model name/{print "cpu: "$2; exit}' /proc/cpuinfo
+          echo "cores: $(nproc)"
+          grep -o -E 'avx2|avx512bw' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          if [ -z "$CPU_MATCH" ] || grep -m1 '^model name' /proc/cpuinfo | grep -qE "$CPU_MATCH"; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "not a $CPU_MATCH host: skipping"
+          fi
+
+      - if: steps.host.outputs.ok == '1'
+        uses: actions/checkout@v7
+
+      - if: steps.host.outputs.ok == '1'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - if: steps.host.outputs.ok == '1'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        if: steps.host.outputs.ok == '1'
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
+      - name: Install bwa-mem3 (bioconda)
+        if: steps.host.outputs.ok == '1'
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
+          environment-name: bench
+          condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem3=0.16.0
+          init-shell: bash
+
+      - name: Build ours at the tier we ship
+        if: steps.host.outputs.ok == '1'
+        run: |
+          RUSTFLAGS="-C target-cpu=x86-64-v3 ${{ github.event.inputs.extra_rustflags }}" \
+            cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-meth
+          cp target-meth/release/bwa-mem4 ./mem4-v3
+
+      - name: Reference, indexes and reads
+        if: steps.host.outputs.ok == '1'
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          mkdir -p work/fork work/ours && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          sed -i '1s/.*/>chr21/' chr21.fa
+          cp chr21.fa fork/ && cp chr21.fa ours/
+          bwa-mem3 index --meth fork/chr21.fa > /dev/null 2>&1
+          ../mem4-v3 index --meth ours/chr21.fa 2> /dev/null
+          n="${{ github.event.inputs.read_pairs || '200000' }}"
+          python3 ../scripts/meth_sim.py chr21.fa em --pairs "$n" --seed 11
+          python3 ../scripts/meth_sim.py chr21.fa taps --pairs "$n" --seed 7 --taps
+          echo "simulated: $n EM-seq pairs, $n TAPS pairs"
+
+      - name: Time both
+        if: steps.host.outputs.ok == '1'
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          rows=rows.csv; : > "$rows"
+          for lib in em taps; do
+            mode=--meth; [ "$lib" = taps ] && mode=--meth=taps
+            reads=("${lib}_1.fq" "${lib}_2.fq")
+            # The command line of one arm at `-t $2`, options before the index and reads.
+            line() {
+              if [ "$1" = ours ]; then cmd=(../mem4-v3 mem "$mode" -K 10000000 -t "$2" ours/chr21.fa "${reads[@]}")
+              else cmd=(bwa-mem3 mem "$mode" -K 10000000 -t "$2" fork/chr21.fa "${reads[@]}"); fi
+            }
+            # Also warms the page cache for both.
+            line ours "$T"; m4=$("${cmd[@]}" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+            line fork "$T"; m3=$("${cmd[@]}" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+            echo "===== $lib output md5: ours $m4 fork $m3 $([ "$m4" = "$m3" ] && echo identical || echo DIFFER) ====="
+            for t in 1 "$T"; do
+              for rep in 1 2; do
+                for arm in ours fork; do
+                  line "$arm" "$t"
+                  /usr/bin/time -f '%e %U %S %M' -o t.txt "${cmd[@]}" > /dev/null 2> /dev/null
+                  read -r e u sy m < t.txt
+                  echo "$lib,$t,$arm,$rep,$e,$u,$sy,$m" | tee -a "$rows"
+                done
+              done
+            done
+          done
+          echo "===== meth summary: faster of 2 runs per arm (wall s, cpu s = user + sys, rss MB) ====="
+          printf "%-5s %3s  %15s  %15s  %13s  %s\n" lib -t "wall ours/fork" "cpu ours/fork" "rss ours/fork" "ratio wall cpu rss"
+          awk -F, '{ k = $1 "," $2 "," $3; c = $6 + $7
+                     if (!(k in w) || $5 < w[k]) w[k] = $5
+                     if (!(k in cpu) || c < cpu[k]) cpu[k] = c
+                     if (!(k in r) || $8 < r[k]) r[k] = $8 }
+               END { for (k in w) { split(k, a, ","); if (a[3] != "ours") continue
+                       f = a[1] "," a[2] ",fork"
+                       printf "%-5s %3s  %7.2f/%-7.2f  %7.2f/%-7.2f  %6d/%-6d  %.3f %.3f %.3f\n", a[1], a[2],
+                         w[k], w[f], cpu[k], cpu[f], r[k] / 1024, r[f] / 1024, w[k] / w[f], cpu[k] / cpu[f], r[k] / r[f] } }' "$rows" | sort
