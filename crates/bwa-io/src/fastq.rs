@@ -112,16 +112,16 @@ pub struct Record {
 impl Record {
     /// SAM column 1 (QNAME).
     ///
-    /// # Panics
-    /// Never in practice: the bytes were produced by `String::from_utf8_lossy` at parse time, so
-    /// they are valid UTF-8 by construction. The check is kept rather than elided with `unsafe`
-    /// because it costs a scan of ~40 bytes per call against the ~150-byte copies this type exists
-    /// to remove.
+    /// Not validated again: `next_record` validated it once. Each pair's names and comments were
+    /// checked ten times on their way to SAM, and `from_utf8` was a sixth of the reader thread's
+    /// time on M4 (2M GIAB reads).
     #[inline]
     #[must_use]
     pub fn name(&self) -> &str {
-        std::str::from_utf8(&self.buf[..self.name_len as usize])
-            .expect("record name is UTF-8 by construction (from_utf8_lossy at parse time)")
+        // SAFETY: `next_record`, the only constructor, copies these bytes from ASCII or from
+        // `String::from_utf8_lossy`'s output, and nothing writes this range afterwards
+        // (`seq_mut` hands out the bases only).
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.name_len as usize]) }
     }
 
     /// FASTQ line 2: the ASCII bases.
@@ -151,10 +151,8 @@ impl Record {
         Some(&self.buf[start..start + self.seq_len as usize])
     }
 
-    /// The kseq `comment`, or `None` for a bare-name header.
-    ///
-    /// # Panics
-    /// Never in practice, for the same reason as [`Record::name`].
+    /// The kseq `comment`, or `None` for a bare-name header. Not validated again, like
+    /// [`Record::name`].
     #[inline]
     #[must_use]
     pub fn comment(&self) -> Option<&str> {
@@ -162,10 +160,8 @@ impl Record {
             return None;
         }
         let end = self.buf.len();
-        Some(
-            std::str::from_utf8(&self.buf[end - self.comment_len as usize..])
-                .expect("record comment is UTF-8 by construction (from_utf8_lossy at parse time)"),
-        )
+        // SAFETY: as for `name`: built from ASCII or `from_utf8_lossy`'s output, never rewritten.
+        Some(unsafe { std::str::from_utf8_unchecked(&self.buf[end - self.comment_len as usize..]) })
     }
 }
 
@@ -835,17 +831,8 @@ impl FastqReader {
                 // Split into the two halves: the first becomes SAM QNAME, the second the `-C`
                 // trailer. Both are still borrowed from needletail's buffer at this point.
                 let (name_bytes, comment_bytes) = split_id(rec.id());
-                // Lossy UTF-8, as before, and free in the normal case: `from_utf8_lossy` borrows
-                // when the bytes are already valid and only allocates for a header with a stray
-                // byte, which is the rare path this tolerates rather than rejecting the file over.
-                // `from_utf8` first: its word-at-a-time ASCII scan is what nearly every header
-                // takes, where the lossy decoder walks chunk by chunk.
-                let utf8 = |b| match std::str::from_utf8(b) {
-                    Ok(s) => std::borrow::Cow::Borrowed(s),
-                    Err(_) => String::from_utf8_lossy(b),
-                };
-                let name = utf8(name_bytes);
-                let comment = comment_bytes.map(utf8);
+                let name = ascii_or_lossy(name_bytes);
+                let comment = comment_bytes.map(ascii_or_lossy);
                 // FASTQ line 2 (bases) and line 4 (Phred+33). `qual` is `None` for FASTA input,
                 // where lines 3 and 4 do not exist.
                 let seq = rec.seq();
@@ -857,13 +844,13 @@ impl FastqReader {
                 let mut buf = Vec::with_capacity(
                     name.len() + seq.len() + qual.map_or(0, <[u8]>::len) + comment_len,
                 );
-                buf.extend_from_slice(name.as_bytes());
+                buf.extend_from_slice(&name);
                 buf.extend_from_slice(&seq);
                 if let Some(q) = qual {
                     buf.extend_from_slice(q);
                 }
                 if let Some(c) = &comment {
-                    buf.extend_from_slice(c.as_bytes());
+                    buf.extend_from_slice(c);
                 }
                 Ok(Some(Record {
                     name_len: name.len() as u32,
@@ -1186,6 +1173,35 @@ impl InterleavedFastqReader {
     }
 }
 
+/// A header field as UTF-8 bytes: lossy, as before, and free in the normal case. ASCII (nearly
+/// every header, and `is_ascii` is a word-at-a-time scan where `from_utf8` walked these ~40 bytes
+/// one at a time) is kept as is, and `from_utf8_lossy` keeps valid UTF-8 as is too and only
+/// allocates for a header with a stray byte, the rare path this tolerates rather than rejecting
+/// the file over.
+fn ascii_or_lossy(b: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if b.is_ascii() {
+        std::borrow::Cow::Borrowed(b)
+    } else {
+        std::borrow::Cow::Owned(String::from_utf8_lossy(b).into_owned().into_bytes())
+    }
+}
+
+/// Index of the first byte `<= b' '` in `b` (every ASCII whitespace byte is one), or `b.len()`.
+fn first_le_space(b: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let (chunks, rest) = b.as_chunks::<8>();
+    for (k, c) in chunks.iter().enumerate() {
+        let x = u64::from_le_bytes(*c);
+        // The high bit of each byte below 0x21, plus maybe some above a flagged one (borrows only
+        // run upward), so the lowest flag is exact.
+        let m = x.wrapping_sub(ONES * 0x21) & !x & (ONES * 0x80);
+        if m != 0 {
+            return 8 * k + (m.trailing_zeros() / 8) as usize;
+        }
+    }
+    b.len() - rest.len() + rest.iter().position(|&c| c <= b' ').unwrap_or(rest.len())
+}
+
 /// Both halves of a FASTQ header at once, as BORROWED slices of it.
 ///
 /// The record builder needs the two together and must not allocate for either: it copies them
@@ -1206,10 +1222,16 @@ impl InterleavedFastqReader {
 fn split_id(id: &[u8]) -> (&[u8], Option<&[u8]>) {
     // One past the last QNAME byte: the first whitespace, or the whole slice for a bare-name
     // header (which is the common case for simulated reads).
-    let name_end = id
-        .iter()
-        .position(u8::is_ascii_whitespace)
-        .unwrap_or(id.len());
+    // Eight bytes a step to each byte at or below a space, then the exact test there: the byte loop
+    // was a sixth of the parse on GIAB headers (~37 printable bytes before the first space).
+    let mut name_end = 0;
+    loop {
+        name_end += first_le_space(&id[name_end..]);
+        if name_end == id.len() || id[name_end].is_ascii_whitespace() {
+            break;
+        }
+        name_end += 1;
+    }
     let mut name = &id[..name_end];
     // Trailing `/<digit>` (bwa's `trim_readno`). READNO_SUFFIX_LEN is the `/` plus the digit. The
     // length guard means a read literally named `/1` keeps its name rather than becoming empty, and
@@ -1305,7 +1327,9 @@ mod multi_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_unwrapping, split_id, FastqReader, PairedFastqReader, UnwrapFastq};
+    use super::{
+        first_le_space, needs_unwrapping, split_id, FastqReader, PairedFastqReader, UnwrapFastq,
+    };
     use std::io::Write;
 
     /// An empty FASTQ, plain or gzipped, is zero reads (bwa-mem2 exits 0 on it), not an error.
@@ -1656,6 +1680,23 @@ mod tests {
             writer.join().unwrap();
         }
         got
+    }
+
+    /// The word-at-a-time scan against the byte loop it replaced, around every chunk boundary.
+    #[test]
+    fn first_le_space_matches_the_byte_scan() {
+        for len in 0..40 {
+            for at in 0..=len {
+                for c in [b' ', b'\t', b'\x0c', b'\x01', 0x20, 0x21, 0x7f, 0x80, 0xff] {
+                    let mut v = vec![b'A'; len];
+                    if at < len {
+                        v[at] = c;
+                    }
+                    let want = v.iter().position(|&x| x <= b' ').unwrap_or(len);
+                    assert_eq!(first_le_space(&v), want, "len {len} at {at} byte {c:#x}");
+                }
+            }
+        }
     }
 
     /// The header split, on the four shapes that matter: a comment, both read-number suffixes, and
