@@ -326,9 +326,6 @@ const SPARE_CAP: usize = 16;
 
 /// A recycled CIGAR and MD buffer pair, possibly holding old contents, or two empty ones.
 fn spare_bufs() -> (Vec<u32>, String) {
-    if cfg!(bwa4_alloc_old) {
-        return Default::default();
-    }
     SPARE
         .with(|s| {
             let mut v = s.take();

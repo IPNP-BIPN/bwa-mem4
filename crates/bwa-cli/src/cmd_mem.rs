@@ -3132,8 +3132,11 @@ fn run_pe(
         }
 
         // Emit paired SAM in parallel (each pair owns its regions; global pair id fixes hashes).
-        // One entry per pair, in pair order: that pair's SAM records (normally two, more when either
-        // mate is split). rayon's indexed parallel iterator preserves the order.
+        // One entry per `SAM_CHUNK_PAIRS` pairs, in pair order: those pairs' SAM records (normally
+        // two a pair, more when a mate is split). rayon's indexed `fold_chunks` preserves the order.
+        // A buffer per pair was an allocation per pair, freed on the writer's thread. 64 pairs a
+        // buffer cost +0.2 GB RSS on GIAB at -K 100M (blocks in a larger mimalloc class); 16 none.
+        const SAM_CHUNK_PAIRS: usize = 16;
         let bufs: Vec<Vec<u8>> = stage_time::measure(Stage::SamEmit, || {
             stage_time::barrier::region(Stage::SamEmit, || {
                 // `into_par_iter`, so each pair's records and regions are freed as its text appears.
@@ -3142,37 +3145,39 @@ fn run_pe(
                     .into_par_iter()
                     .zip(paired.into_par_iter())
                     .enumerate()
-                    .map(|(pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
-                        stage_time::barrier::worker(|| {
-                            // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
-                            // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
-                            let names = [rec1.name(), rec2.name()];
-                            let seqs = [rec1.seq(), rec2.seq()];
-                            let quals = [rec1.qual(), rec2.qual()];
-                            let comments = [rec1.comment(), rec2.comment()];
-                            // This pair's SAM text.
-                            let mut buf = Vec::new();
-                            mem_sam_pe(
-                                fm,
-                                bns,
-                                opt,
-                                &pes,
-                                base_pair + pair_in_batch as u64,
-                                &names,
-                                &seqs,
-                                &quals,
-                                &comments,
-                                &mut regs1,
-                                &mut regs2,
-                                // rescue_done: true when nothing further should rescue -- either the batched
-                                // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
-                                !scalar_rescue || no_rescue,
-                                &mut buf,
-                            )
-                            .expect("write to Vec");
+                    .fold_chunks(
+                        SAM_CHUNK_PAIRS,
+                        || Vec::with_capacity(SAM_CHUNK_PAIRS * 1024),
+                        |mut buf, (pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
+                            stage_time::barrier::worker(|| {
+                                // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
+                                // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
+                                let names = [rec1.name(), rec2.name()];
+                                let seqs = [rec1.seq(), rec2.seq()];
+                                let quals = [rec1.qual(), rec2.qual()];
+                                let comments = [rec1.comment(), rec2.comment()];
+                                mem_sam_pe(
+                                    fm,
+                                    bns,
+                                    opt,
+                                    &pes,
+                                    base_pair + pair_in_batch as u64,
+                                    &names,
+                                    &seqs,
+                                    &quals,
+                                    &comments,
+                                    &mut regs1,
+                                    &mut regs2,
+                                    // rescue_done: true when nothing further should rescue -- either the batched
+                                    // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
+                                    !scalar_rescue || no_rescue,
+                                    &mut buf,
+                                )
+                                .expect("write to Vec");
+                            });
                             buf
-                        })
-                    })
+                        },
+                    )
                     .collect()
             })
         });

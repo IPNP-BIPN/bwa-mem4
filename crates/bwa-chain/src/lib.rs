@@ -948,9 +948,6 @@ fn chain_seeds(
     chains.clear();
     // The kbtree only off the flat index: one per read was an allocation the flat path never read.
     let mut tree = (!flat).then(crate::kbtree::KbTree::new);
-    if cfg!(bwa4_alloc_old) && flat {
-        std::hint::black_box(crate::kbtree::KbTree::new());
-    }
     // The flat index, the thread's allocation like `ends`: a fresh one per read regrew by
     // doubling, a realloc and a copy each time.
     let mut keys = KEYS.take();
@@ -1221,9 +1218,7 @@ pub fn build_filtered_chains(
             ));
         }
     }
-    if !cfg!(bwa4_alloc_old) {
-        ORDER.set(order);
-    }
+    ORDER.set(order);
     if !ranked.is_empty() {
         flt_ranked(opt, &mut ranked);
     }
