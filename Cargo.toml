@@ -23,8 +23,16 @@ repository = "https://github.com/IPNP-BIPN/bwa-mem4"
 # kind still fails the build. Burn these down rather than adding to them.
 [workspace.lints.rust]
 # Same-host A/B in perf CI (alt_rustflags): `bwa4_wide_split` gives each index kind its own copy of
-# the seeding rounds; `bwa4_r3_outline` keeps round 3's step out of line, so icount counts it apart.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bwa4_wide_split)', 'cfg(bwa4_r3_outline)'] }
+# the seeding rounds; `bwa4_r3_outline` keeps round 3's step out of line, so icount counts it apart;
+# `bwa4_br_two` takes AArch64's two backward-round copies on x86; `bwa4_bwd_one` decides a
+# one-candidate round in the driver; `bwa4_br_inline` inlines the backward round there.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(bwa4_wide_split)',
+    'cfg(bwa4_r3_outline)',
+    'cfg(bwa4_br_two)',
+    'cfg(bwa4_bwd_one)',
+    'cfg(bwa4_br_inline)',
+] }
 
 [workspace.lints.clippy]
 # Doc-comment formatting in the module headers written during the documentation pass. Cosmetic,

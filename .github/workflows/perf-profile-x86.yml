@@ -48,12 +48,16 @@ on:
         default: ""
         required: false
       alt_rustflags:
-        description: "If set, the alt arm is a second build of ours with these RUSTFLAGS appended (same-host A/B of codegen), e.g. -C target-cpu=x86-64-v4; skipped where that binary does not run"
+        description: "If set, the alt arm is a second build of ours with these RUSTFLAGS appended (same-host A/B of codegen), e.g. -C target-cpu=x86-64-v4; skipped where that binary does not run. Several builds separated by ';' are arms alt, alt2, alt3..."
         default: ""
         required: false
       icount:
         description: "Instead of the profile, count each function's x86 instructions under callgrind (read_pairs 50000)"
         default: "false"
+        required: false
+      cpu_match:
+        description: "If set, profile only on a host whose CPU model matches this regex (e.g. Intel); any other host stops after naming itself"
+        default: ""
         required: false
       cg_flags:
         description: "icount only: extra callgrind flags, e.g. --branch-sim=yes (mispredicts per function and seeding line) or --cache-sim=yes"
@@ -73,23 +77,37 @@ jobs:
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.96.1"
-
-      - uses: Swatinem/rust-cache@v2
-
       - name: What machine is this
+        id: host
+        env:
+          CPU_MATCH: ${{ github.event.inputs.cpu_match || '' }}
         run: |
           awk -F': ' '/^model name/{print "cpu: "$2; exit}' /proc/cpuinfo
           lscpu | grep -E '^(Model name|Vendor ID)' || true
           echo "cores: $(nproc)"
           grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           echo "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null) defrag: $(cat /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null)"
+          # The hosts are a lottery; a same-host A/B on one CPU kind is many dispatches, of which
+          # the other kinds stop here.
+          if [ -z "$CPU_MATCH" ] || grep -m1 '^model name' /proc/cpuinfo | grep -qE "$CPU_MATCH"; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "not a $CPU_MATCH host: skipping"
+          fi
+
+      - if: steps.host.outputs.ok == '1'
+        uses: actions/checkout@v7
+
+      - if: steps.host.outputs.ok == '1'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - if: steps.host.outputs.ok == '1'
+        uses: Swatinem/rust-cache@v2
 
       - name: Install perf
+        if: steps.host.outputs.ok == '1'
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -106,6 +124,7 @@ jobs:
           "$PERF" --version || true
 
       - name: Fetch micromamba (retried; its CDN returns 504s)
+        if: steps.host.outputs.ok == '1'
         shell: bash
         run: |
           case "$(uname -s)-$(uname -m)" in
@@ -119,6 +138,7 @@ jobs:
           done
           chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + bwa-mem3 + wgsim (bioconda)
+        if: steps.host.outputs.ok == '1'
         uses: mamba-org/setup-micromamba@v2
         with:
           download-micromamba: false
@@ -138,6 +158,7 @@ jobs:
           init-shell: bash
 
       - name: Build ours at the tier we ship
+        if: steps.host.outputs.ok == '1'
         env:
           ALT_RUSTFLAGS: ${{ github.event.inputs.alt_rustflags || '' }}
         run: |
@@ -155,18 +176,25 @@ jobs:
           RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }}" \
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf
           cp target-perf/release/bwa-mem4 ./mem4-v3
-          if [ -n "$ALT_RUSTFLAGS" ]; then
+          # One build per ';'-separated entry, so one host (the hosts are a lottery) measures them all.
+          i=1
+          while IFS= read -r flags; do
+            [ -n "${flags// /}" ] || continue
+            sfx=""; [ "$i" -gt 1 ] && sfx="$i"
             # An explicit `--target` keeps RUSTFLAGS off build scripts and proc macros: rustc loads
             # those, so a `-C target-cpu=x86-64-v4` proc macro killed rustc with SIGILL on a host
             # without AVX-512. Only the binary may need the newer CPU; the run step skips it if so.
             host=$(rustc -vV | sed -n 's/^host: //p')
             CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CFLAGS="-O3 -fno-omit-frame-pointer" \
-            RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }} $ALT_RUSTFLAGS" \
-              cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-perf-alt --target "$host"
-            cp "target-perf-alt/$host/release/bwa-mem4" ./mem4-alt
-          fi
+            RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }} $flags" \
+              cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir "target-perf-alt$sfx" --target "$host"
+            cp "target-perf-alt$sfx/$host/release/bwa-mem4" "./mem4-alt$sfx"
+            echo "alt$sfx: $flags"
+            i=$((i + 1))
+          done < <(tr ';' '\n' <<< "$ALT_RUSTFLAGS")
 
       - name: Reference, index and reads
+        if: steps.host.outputs.ok == '1'
         shell: bash -el {0}
         run: |
           set -euo pipefail
@@ -189,6 +217,7 @@ jobs:
           fi
 
       - name: Record both binaries
+        if: steps.host.outputs.ok == '1'
         shell: bash -el {0}
         env:
           SET: ${{ github.event.inputs.read_set || 'sim' }}
@@ -210,22 +239,25 @@ jobs:
           # `alt`: ours again under OURS_ENV, and/or the alt_rustflags build, so a knob's or a
           # codegen's effect is read on the same host. A build this CPU cannot run (x86-64-v4 on a
           # host without AVX-512) drops the arm instead of failing the run.
-          alt_bin=../mem4-v3; alt_ok=""
-          if [ -x ../mem4-alt ]; then
-            ma=$(../mem4-alt mem -t "$T" chr21.fa "$r1" "$r2" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32) || ma=""
+          arms="ours"
+          [ -n "$OURS_ENV" ] && [ ! -x ../mem4-alt ] && arms="ours alt"
+          for b in ../mem4-alt ../mem4-alt[0-9]*; do
+            [ -x "$b" ] || continue
+            arm=${b#../mem4-}
+            ma=$("$b" mem -t "$T" chr21.fa "$r1" "$r2" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32) || ma=""
             if [ -n "$ma" ]; then
-              alt_bin=../mem4-alt; alt_ok=1
-              echo "===== alt build output md5: $ma $([ "$ma" = "$m3" ] && echo identical || echo DIFFER) ====="
+              arms="$arms $arm"
+              echo "===== $arm build output md5: $ma $([ "$ma" = "$m3" ] && echo identical || echo DIFFER) ====="
             else
-              echo "===== alt build does not run on this host: arm skipped ====="
+              echo "===== $arm build does not run on this host: arm skipped ====="
             fi
-          fi
-          [ -n "$OURS_ENV" ] && alt_ok=1
-          arms="ours fork"; [ -n "$alt_ok" ] && arms="ours alt fork"
+          done
+          arms="$arms fork"
           for arm in $arms; do
             case "$arm" in
               ours) cmd=(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
-              alt)  read -ra kv <<< "$OURS_ENV"; cmd=(env "${kv[@]}" "$alt_bin" mem -t "$T" chr21.fa "$r1" "$r2") ;;
+              alt*) bin=../mem4-$arm; [ -x "$bin" ] || bin=../mem4-v3
+                    read -ra kv <<< "$OURS_ENV"; cmd=(env "${kv[@]}" "$bin" mem -t "$T" chr21.fa "$r1" "$r2") ;;
               fork) cmd=(bwa-mem3   mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2") ;;
             esac
             echo "::group::perf record: $arm"
@@ -316,7 +348,7 @@ jobs:
           done
 
       - name: Keep the recordings
-        if: always()
+        if: always() && steps.host.outputs.ok == '1'
         uses: actions/upload-artifact@v4
         with:
           name: perf-data

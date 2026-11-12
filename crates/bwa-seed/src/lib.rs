@@ -1969,6 +1969,21 @@ fn bwd_round_call(
     min_seed_len: i64,
     out: &mut Vec<Smem>,
 ) -> usize {
+    // A/B (`--cfg bwa4_bwd_one`): one candidate decided here, without the call and its per-base
+    // dispatch, as the fork's `numPrev == 1` path.
+    #[cfg(bwa4_bwd_one)]
+    if let [c] = prev {
+        let e = fm.backward_ext_konly(*c, a);
+        if e.s >= min_intv {
+            *c = Smem { m, ..e };
+            fm.prefetch_occ(e.k, e.k + e.s);
+            return 1;
+        }
+        if i64::from(c.n) - i64::from(c.m) + 1 >= min_seed_len {
+            out.push(*c);
+        }
+        return 0;
+    }
     #[cfg(bwa4_wide_split)]
     return if fm.wide() {
         fm.backward_round_w::<true>(prev, a, m, min_intv, min_seed_len, out)
