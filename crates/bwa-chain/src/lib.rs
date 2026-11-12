@@ -946,7 +946,11 @@ fn chain_seeds(
     let l_pac = bns.l_pac;
     // Chains in CREATION order; the indices stay valid because nothing is removed.
     chains.clear();
-    let mut tree = crate::kbtree::KbTree::new();
+    // The kbtree only off the flat index: one per read was an allocation the flat path never read.
+    let mut tree = (!flat).then(crate::kbtree::KbTree::new);
+    if cfg!(bwa4_alloc_old) && flat {
+        std::hint::black_box(crate::kbtree::KbTree::new());
+    }
     // The flat index, the thread's allocation like `ends`: a fresh one per read regrew by
     // doubling, a realloc and a copy each time.
     let mut keys = KEYS.take();
@@ -979,11 +983,12 @@ fn chain_seeds(
             }
             // The chain with the largest `pos <= rbeg`, and on the flat index the number of keys
             // at or below `rbeg` (where a new key goes).
-            let (lower, rank) = if flat {
-                let r = keys.partition_point(|&k| (k >> FLAT_CI_BITS) as i64 <= rbeg);
-                (r.checked_sub(1).map(|x| (keys[x] & ci_mask) as usize), r)
-            } else {
-                (tree.lower(rbeg), 0)
+            let (lower, rank) = match &tree {
+                None => {
+                    let r = keys.partition_point(|&k| (k >> FLAT_CI_BITS) as i64 <= rbeg);
+                    (r.checked_sub(1).map(|x| (keys[x] & ci_mask) as usize), r)
+                }
+                Some(tree) => (tree.lower(rbeg), 0),
             };
             if let Some(chain_index) = lower {
                 match test_and_merge(opt, l_pac, &mut ends[chain_index], &seed, rid) {
@@ -1025,23 +1030,27 @@ fn chain_seeds(
             ends.push(Ends::new(rid, &seed));
             pool.push((idx as u32, seed));
             n_seeds.push(1);
-            if flat {
-                insert_inline(&mut keys, rank, (rbeg as u64) << FLAT_CI_BITS | idx as u64);
-            } else {
+            match &mut tree {
+                None => insert_inline(&mut keys, rank, (rbeg as u64) << FLAT_CI_BITS | idx as u64),
                 // bwa keys chains by `pos` in a kbtree, which *permits duplicates*: when several
                 // chains share a pos, `kb_intervalp`'s lower_bound returns the first one inserted
                 // (klib appends later duplicates after it). A plain map would overwrite, silently
                 // redirecting later seeds to the most recent chain instead, which changes which
                 // chain they merge into and can lose a chain entirely.
-                tree.put(rbeg, idx);
+                Some(tree) => tree.put(rbeg, idx),
             }
         }
     }
     ENDS.set(ends);
-    let order: Vec<usize> = if flat {
-        keys.iter().map(|&k| (k & ci_mask) as usize).collect()
-    } else {
-        tree.in_order()
+    let order: Vec<usize> = match tree {
+        // The thread's allocation, which `build_filtered_chains` hands back.
+        None => {
+            let mut order = ORDER.take();
+            order.clear();
+            order.extend(keys.iter().map(|&k| (k & ci_mask) as usize));
+            order
+        }
+        Some(tree) => tree.in_order(),
     };
     KEYS.set(keys);
     POOL.set((pool, n_seeds));
@@ -1078,6 +1087,8 @@ thread_local! {
     static ENDS: std::cell::Cell<Vec<Ends>> = const { std::cell::Cell::new(Vec::new()) };
     /// [`chain_seeds`]'s flat index keys, kept for the allocation.
     static KEYS: std::cell::Cell<Vec<u64>> = const { std::cell::Cell::new(Vec::new()) };
+    /// [`chain_seeds`]'s flat-path emission order, kept for the allocation.
+    static ORDER: std::cell::Cell<Vec<usize>> = const { std::cell::Cell::new(Vec::new()) };
     /// [`chain_seeds`]'s accepted `(chain, seed)` pairs and per-chain counts, kept for the
     /// allocation.
     #[allow(clippy::type_complexity)]
@@ -1209,6 +1220,9 @@ pub fn build_filtered_chains(
                 i,
             ));
         }
+    }
+    if !cfg!(bwa4_alloc_old) {
+        ORDER.set(order);
     }
     if !ranked.is_empty() {
         flt_ranked(opt, &mut ranked);

@@ -1831,17 +1831,6 @@ impl FmIndex {
             (true, 0) => go!(true, true, 0),
             (true, _) => go!(true, false, ANY_BASE),
         };
-        // `BWA4_BR_TWO_COPY=1`: AArch64's two copies on x86 too, for a same-host A/B on Zen 5,
-        // where the four-way dispatch's mispredicts and the copies' spills may weigh otherwise.
-        #[cfg(not(target_arch = "aarch64"))]
-        if Self::br_two_copy() {
-            return match (self.wide, a) {
-                (false, 0) => go!(false, true, 0),
-                (false, _) => go!(false, false, ANY_BASE),
-                (true, 0) => go!(true, true, 0),
-                (true, _) => go!(true, false, ANY_BASE),
-            };
-        }
         #[cfg(not(target_arch = "aarch64"))]
         match (self.wide, a) {
             (false, 0) => go!(false, true, 0),
@@ -1853,13 +1842,6 @@ impl FmIndex {
             (true, 2) => go!(true, false, 2),
             (true, _) => go!(true, false, 3),
         }
-    }
-
-    /// Whether `BWA4_BR_TWO_COPY` is set. Read once and cached.
-    #[cfg(not(target_arch = "aarch64"))]
-    fn br_two_copy() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BWA4_BR_TWO_COPY").is_some())
     }
 
     /// [`backward_round`](Self::backward_round) for base `A` (`A0` is `A == 0`), or for the

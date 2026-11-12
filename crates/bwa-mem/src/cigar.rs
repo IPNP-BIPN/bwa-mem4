@@ -306,12 +306,57 @@ fn infer_bw(l1: i32, l2: i32, score: i32, a: i32, q: i32, r: i32) -> i32 {
     w
 }
 
-/// `l_query` M, with room for the two soft clips `reg2aln` may add, so adding them never
-/// reallocates (a capacity-1 `Vec` did, for every clipped read).
-fn ungapped_cigar(l_query: i32) -> Vec<u32> {
-    let mut cigar = Vec::with_capacity(3);
+/// `l_query` M in `cigar` (emptied first), with room for the two soft clips `reg2aln` may add, so
+/// adding them never reallocates (a capacity-1 `Vec` did, for every clipped read).
+fn ungapped_cigar(l_query: i32, mut cigar: Vec<u32>) -> Vec<u32> {
+    cigar.clear();
+    cigar.reserve(3);
     cigar.push((l_query as u32) << 4);
     cigar
+}
+
+thread_local! {
+    /// The CIGAR and MD buffers of this thread's dropped [`MemAln`]s, which [`gen_cigar2`] fills
+    /// again: a fresh pair per emitted record was half of SAM emission's allocations.
+    static SPARE: std::cell::Cell<Vec<(Vec<u32>, String)>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Most buffer pairs [`SPARE`] keeps per thread; a pair holds at most a few hundred bytes.
+const SPARE_CAP: usize = 16;
+
+/// A recycled CIGAR and MD buffer pair, possibly holding old contents, or two empty ones.
+fn spare_bufs() -> (Vec<u32>, String) {
+    if cfg!(bwa4_alloc_old) {
+        return Default::default();
+    }
+    SPARE
+        .with(|s| {
+            let mut v = s.take();
+            let pair = v.pop();
+            s.set(v);
+            pair
+        })
+        .unwrap_or_default()
+}
+
+impl Drop for MemAln {
+    fn drop(&mut self) {
+        if self.cigar.capacity() == 0 && self.md.capacity() == 0 {
+            return;
+        }
+        let pair = (
+            std::mem::take(&mut self.cigar),
+            std::mem::take(&mut self.md),
+        );
+        // `try_with`: a record dropped while the thread is being torn down just frees its buffers.
+        let _ = SPARE.try_with(|s| {
+            let mut v = s.take();
+            if v.len() < SPARE_CAP {
+                v.push(pair);
+            }
+            s.set(v);
+        });
+    }
 }
 
 /// Global-align `query_codes` (the seed-region query slice) to reference `[rb, re)` and compute the
@@ -418,6 +463,7 @@ pub(crate) fn gen_cigar2(
     // the reference. Both come from one branch or the other and are final from here on; step 4 only
     // reads them.
     global_fp::survey(l_query, rlen, &query, &rseq, opt, w_);
+    let (spare_cigar, mut md) = spare_bufs();
     let (score, cigar) = if l_query == rlen && w_ == 0 {
         // Ungapped fast path (bwa.cpp:280): equal lengths and a proven-zero band mean the CIGAR is
         // a single M run and the score is just the sum of matrix cells down the diagonal. The
@@ -448,7 +494,7 @@ pub(crate) fn gen_cigar2(
             }
         }
         // `(len << 4) | 0`: op 0 is M, so the `| 0` is elided.
-        (diagonal_score, ungapped_cigar(l_query))
+        (diagonal_score, ungapped_cigar(l_query, spare_cigar))
     } else {
         // Derive an internal band from affordability, then intersect it with the caller's `w_`.
         // `((l_query+1)>>1) * match_score` is the score of matching *half* the query: bwa's
@@ -494,7 +540,7 @@ pub(crate) fn gen_cigar2(
                     &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
                 );
                 if w == 0 {
-                    (lower_bound, ungapped_cigar(l_query))
+                    (lower_bound, ungapped_cigar(l_query, spare_cigar))
                 } else {
                     ksw_global2(
                         &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
@@ -536,7 +582,8 @@ pub(crate) fn gen_cigar2(
     // Sized from the reference span: MD alternates run lengths and mismatched bases, so it cannot
     // exceed a few bytes per aligned base and is usually far shorter. Growing from empty cost two
     // or three reallocations per record.
-    let mut md = String::with_capacity((rlen as usize / 4).max(16));
+    md.clear();
+    md.reserve((rlen as usize / 4).max(16));
     // Three cursors, named `x`, `y` and `u` in the C: the query position, the reference position,
     // and the length of the match run currently being accumulated (the integers that alternate with
     // the letters in an MD string).

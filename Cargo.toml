@@ -21,6 +21,10 @@ repository = "https://github.com/IPNP-BIPN/bwa-mem4"
 # between "the gate is meaningful" and "the gate is off". Each entry is a lint the tree does not
 # currently satisfy. They are allowed EXPLICITLY, not silenced globally, so a NEW lint of any other
 # kind still fails the build. Burn these down rather than adding to them.
+[workspace.lints.rust]
+# `--cfg bwa4_alloc_old`: chaining and SAM emission allocate per read as before (same-host A/B).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bwa4_alloc_old)'] }
+
 [workspace.lints.clippy]
 # Doc-comment formatting in the module headers written during the documentation pass. Cosmetic,
 # affects rustdoc rendering only. Safe to fix, just not worth a reflow of every glossary table today.
