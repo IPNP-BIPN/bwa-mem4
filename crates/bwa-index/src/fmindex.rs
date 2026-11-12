@@ -1824,15 +1824,22 @@ impl FmIndex {
         // AArch64 takes two copies instead, base 0 and one for the other three: the base is the
         // read's, so the four-way dispatch mispredicted most rounds, and with 31 registers the
         // values the copies hoist stay in them. On x86 two copies made this function 3-6% slower
-        // (same-host CI, EPYC 7763 x2 and 9V74). `--cfg bwa4_br_two` builds them on x86 too, for Intel.
-        #[cfg(any(target_arch = "aarch64", bwa4_br_two))]
+        // (same-host CI, EPYC 7763 x2 and 9V74). `--cfg bwa4_br_two` builds them on x86 too, for Intel;
+        // `--cfg bwa4_br_one` one copy for every base, so no branch on the base at all.
+        #[cfg(bwa4_br_one)]
+        return if self.wide {
+            go!(true, true, ANY_BASE)
+        } else {
+            go!(false, true, ANY_BASE)
+        };
+        #[cfg(all(not(bwa4_br_one), any(target_arch = "aarch64", bwa4_br_two)))]
         return match (self.wide, a) {
             (false, 0) => go!(false, true, 0),
             (false, _) => go!(false, false, ANY_BASE),
             (true, 0) => go!(true, true, 0),
             (true, _) => go!(true, false, ANY_BASE),
         };
-        #[cfg(not(any(target_arch = "aarch64", bwa4_br_two)))]
+        #[cfg(not(any(target_arch = "aarch64", bwa4_br_two, bwa4_br_one)))]
         match (self.wide, a) {
             (false, 0) => go!(false, true, 0),
             (false, 1) => go!(false, false, 1),
