@@ -1800,7 +1800,8 @@ impl FmIndex {
     ///
     /// # Returns
     /// The number of survivors.
-    #[inline]
+    #[cfg_attr(bwa4_br_inline, inline(always))]
+    #[cfg_attr(not(bwa4_br_inline), inline)]
     pub fn backward_round(
         &self,
         prev: &mut [Smem],

@@ -1141,6 +1141,36 @@ impl LsSlot {
                         seed_stats::BWD_STEPS
                             .fetch_add(self.num_prev as u64, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // A/B (`--cfg bwa4_bwd_one`): one candidate decided here, without the call and
+                    // its per-base dispatch, as the fork's `numPrev == 1` path.
+                    #[cfg(bwa4_bwd_one)]
+                    let num_curr = if self.num_prev == 1 {
+                        let c = self.prev[0];
+                        let e = fm.backward_ext_konly(c, a as usize);
+                        if e.s >= min_intv {
+                            self.prev[0] = Smem {
+                                m: self.jj as u32,
+                                ..e
+                            };
+                            fm.prefetch_occ(e.k, e.k + e.s);
+                            1
+                        } else {
+                            if i64::from(c.n) - i64::from(c.m) + 1 >= i64::from(min_seed_len) {
+                                self.out.push(c);
+                            }
+                            0
+                        }
+                    } else {
+                        fm.backward_round(
+                            &mut self.prev[..self.num_prev],
+                            a as usize,
+                            self.jj as u32,
+                            min_intv,
+                            i64::from(min_seed_len),
+                            &mut self.out,
+                        )
+                    };
+                    #[cfg(not(bwa4_bwd_one))]
                     let num_curr = fm.backward_round(
                         &mut self.prev[..self.num_prev],
                         a as usize,

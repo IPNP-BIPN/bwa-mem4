@@ -55,6 +55,10 @@ on:
         description: "Instead of the profile, count each function's x86 instructions under callgrind (read_pairs 50000)"
         default: "false"
         required: false
+      cg_flags:
+        description: "icount only: extra callgrind flags, e.g. --branch-sim=yes (mispredicts per function and seeding line) or --cache-sim=yes"
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -518,13 +522,14 @@ jobs:
         shell: bash -el {0}
         env:
           OURS_ENV: ${{ github.event.inputs.ours_env || '' }}
+          CG_FLAGS: ${{ github.event.inputs.cg_flags || '' }}
         run: |
           set -euo pipefail
           cd work
           # One thread, and the lockstep width the CI hosts' probe picks: the probe times loads,
           # which under valgrind would pick a width no real run uses.
           export BWA4_LOCKSTEP_N=8
-          cg="valgrind --tool=callgrind --dump-instr=no --collect-jumps=no --compress-pos=no --compress-strings=no"
+          cg="valgrind --tool=callgrind --dump-instr=no --collect-jumps=no --compress-pos=no --compress-strings=no $CG_FLAGS"
           # OURS_ENV applies to ours only here.
           read -ra kv <<< "$OURS_ENV"
           env "${kv[@]}" $cg --callgrind-out-file=ours.cg ../mem4-v3 mem -t 1 chr21.fa sim1.fq sim2.fq 2>ours.err >ours.sam \
@@ -536,7 +541,7 @@ jobs:
           for arm in ours fork; do
             # Lines come as `count (pct)  file:function [object]`, split by the source file inlined
             # code came from; summed per function here.
-            callgrind_annotate --threshold=100 "$arm.cg" > "$arm.txt" || true
+            callgrind_annotate --show=Ir --threshold=100 "$arm.cg" > "$arm.txt" || true
             echo "===== $arm: instructions by function (self) ====="
             grep -m1 'PROGRAM TOTALS' "$arm.txt" || true
             awk '/^ *[0-9,]+ +\(/ && !/PROGRAM TOTALS/ {
@@ -546,11 +551,11 @@ jobs:
             head -150 "$arm.fn"
             # Who calls libc's copies and fills: callgrind keeps the real call edges.
             echo "===== $arm: callers of libc mem* ====="
-            callgrind_annotate --tree=caller --threshold=100 "$arm.cg" 2>/dev/null \
+            callgrind_annotate --show=Ir --tree=caller --threshold=100 "$arm.cg" 2>/dev/null \
               | awk '/^ *[0-9,]+ +\(/ { blk = blk $0 "\n" } /^$/ { if (blk ~ /\* .*__mem(set|cpy|move|cmp)/) printf "%s\n", blk; blk = "" }' \
               | grep -E '<|\*' | head -80 || true
             echo "===== $arm: callers of sorts ====="
-            callgrind_annotate --tree=caller --threshold=100 "$arm.cg" 2>/dev/null \
+            callgrind_annotate --show=Ir --tree=caller --threshold=100 "$arm.cg" 2>/dev/null \
               | awk '/^ *[0-9,]+ +\(/ { blk = blk $0 "\n" } /^$/ { if (blk ~ /\* .*(ipnsort|driftsort)/) printf "%s\n", blk; blk = "" }' \
               | grep -E "<|\*" | head -200 || true
             # Self instructions per source line (inlined code under its own file), top 100.
@@ -599,4 +604,45 @@ jobs:
           for (f, ln), ir in c.most_common(150):
               print(f"{ir:14d} {f.split('/bwa-mem4/bwa-mem4/')[-1]}:{ln}")
           PY
+            # Under CG_FLAGS' simulators: each miss event (branch mispredicts Bcm/Bim, cache misses
+            # D1mr/DLmr...) per function, then per source line inside the seeding drivers.
+            if [ -n "$CG_FLAGS" ]; then python3 - "$arm.cg" <<'PY'
+          import sys, re, collections
+          want = re.compile(r"mem_collect_smem_batched|backward_round|getSMEMs|bwtSeedStrategy|mem_kernel1_core|ls_advance|bsd_")
+          ev = []; fn = collections.defaultdict(lambda: None); ln = collections.defaultdict(lambda: None)
+          fl = f = g = "?"; skip = False
+          def add(d, k, v):
+              cur = d[k]
+              d[k] = v if cur is None else [a + b for a, b in zip(cur, v)]
+          for l in open(sys.argv[1]):
+              if l.startswith("events:"):
+                  ev = l.split()[1:]
+              elif l[:1].isdigit():
+                  if skip:
+                      skip = False
+                      continue
+                  t = [int(x) for x in l.split()[1:]]
+                  t += [0] * (len(ev) - len(t))
+                  add(fn, g, t)
+                  if want.search(g):
+                      add(ln, (f, int(l.split()[0])), t)
+              elif l.startswith("fl="):
+                  fl = f = l[3:].strip()
+              elif l.startswith(("fi=", "fe=")):
+                  f = l[3:].strip()
+              elif l.startswith("fn="):
+                  g = l[3:].strip(); f = fl
+              elif l.startswith("calls="):
+                  skip = True
+          miss = [i for i, e in enumerate(ev) if e.endswith(("m", "mr", "mw"))]
+          tot = [sum(v[i] for v in fn.values()) for i in range(len(ev))]
+          print("===== miss events per function (self), events: " + " ".join(ev) + " =====")
+          print("totals " + " ".join(f"{e}={t}" for e, t in zip(ev, tot)))
+          for g, v in sorted(fn.items(), key=lambda kv: -sum(kv[1][i] for i in miss))[:40]:
+              print(" ".join(f"{v[i]:11d}" for i in range(len(ev))) + f"  {g[:110]}")
+          print("===== miss events per seeding-driver line =====")
+          for (f, n), v in sorted(ln.items(), key=lambda kv: -sum(kv[1][i] for i in miss))[:80]:
+              print(" ".join(f"{v[i]:11d}" for i in range(len(ev))) + f"  {f.split('/bwa-mem4/bwa-mem4/')[-1]}:{n}")
+          PY
+            fi
           done
