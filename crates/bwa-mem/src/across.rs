@@ -1193,7 +1193,7 @@ pub fn align_reads_batched<B: SwBackend>(
 ) -> Vec<Vec<MemAlnReg>> {
     // Whole-function timer for the split probe; `None` and free when the probe is off.
     let t_all = align_split::enabled().then(std::time::Instant::now);
-    let out = align_reads_batched_inner(fm, bns, opt, reads, backend);
+    let out = align_reads_batched_inner(fm, bns, opt, reads, None, backend);
     if let Some(t) = t_all {
         align_split::TOTAL_NS.fetch_add(
             t.elapsed().as_nanos() as u64,
@@ -1201,6 +1201,32 @@ pub fn align_reads_batched<B: SwBackend>(
         );
     }
     out
+}
+
+/// [`align_reads_batched`] for `--meth` reads of one chemistry (`ot`: read 1 / single-end C->T,
+/// else read 2 G->A). `conv` holds each read's converted copy, which seeds on the `--meth` index
+/// `fm`; hits are mapped back to the original genome (`bwa_chain::meth_seed_to_orig`) and the
+/// rest runs on the original `reads` with `opt`, which must carry that chemistry's matrix.
+pub fn align_reads_batched_meth<B: SwBackend>(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    reads: &[impl AsRef<[u8]>],
+    conv: &[&[u8]],
+    ot: bool,
+    backend: &B,
+) -> Vec<Vec<MemAlnReg>> {
+    align_reads_batched_inner(fm, bns, opt, reads, Some((conv, ot)), backend)
+}
+
+/// A `--meth` seed's starting score ([`crate::seed_score`] on the seed's reference bases).
+fn meth_seed_score(fm: &FmIndex, opt: &MemOpt, seed: &MemSeed, codes: &[u8]) -> i32 {
+    crate::seed_score(
+        opt,
+        seed,
+        &fm.bases(seed.rbeg, seed.rbeg + i64::from(seed.len)),
+        codes,
+    )
 }
 
 /// The body of [`align_reads_batched`], split out only so the probe above can time it as a whole.
@@ -1215,6 +1241,7 @@ fn align_reads_batched_inner<B: SwBackend>(
     bns: &BntSeq,
     opt: &MemOpt,
     reads: &[impl AsRef<[u8]>],
+    meth: Option<(&[&[u8]], bool)>,
     backend: &B,
 ) -> Vec<Vec<MemAlnReg>> {
     // Length of the forward strand in bases. Every reference coordinate below lives in `0..2*l_pac`,
@@ -1246,7 +1273,7 @@ fn align_reads_batched_inner<B: SwBackend>(
         #[cfg(feature = "stage-alloc")]
         let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SEED);
         align_split::measure(&align_split::SEED_NS, || {
-            mem_collect_smem_batched(fm, &refs, opt)
+            mem_collect_smem_batched(fm, meth.map_or(&refs[..], |m| m.0), opt)
         })
     };
     if std::env::var_os("BWA4_DUMP_SMEMS").is_some() {
@@ -1282,7 +1309,8 @@ fn align_reads_batched_inner<B: SwBackend>(
     let mut per_read_smems: Vec<Vec<bwa_index::Smem>> = per_read_smems;
     // Whether SA resolution runs as one batch for the whole read batch (the default and the fast
     // path) or falls back to per-read calls. A/B switch only: both produce identical positions.
-    let batched_sa = std::env::var_os("BWA4_SA_PER_READ").is_none();
+    // `--meth` maps the resolved rows back per read, which only the batched path does.
+    let batched_sa = meth.is_some() || std::env::var_os("BWA4_SA_PER_READ").is_none();
     // `all_positions`: every read's SA-interval offsets concatenated, in read order then SMEM order,
     // ready for one lockstep `get_sa_batch`. `all_counts`: how many positions each SMEM contributed,
     // flat in the same order (a read's run is `smems.len()` long), which is what lets the chain
@@ -1487,6 +1515,24 @@ fn align_reads_batched_inner<B: SwBackend>(
                 sa_cursor += n;
                 (counts, rbegs)
             });
+            // `--meth`: each hit back on the original genome, `-1` where the chemistry rejects it.
+            let meth_rbegs: Vec<i64>;
+            let resolved = match (resolved, meth) {
+                (Some((counts, rbegs)), Some((_, ot))) => {
+                    let mut out = Vec::with_capacity(rbegs.len());
+                    let mut at = 0usize;
+                    for (smem, &c) in smems.iter().zip(counts) {
+                        let len = (smem.n + 1 - smem.m) as i32;
+                        for &rb in &rbegs[at..at + c as usize] {
+                            out.push(bwa_chain::meth_seed_to_orig(bns, rb, len, ot).unwrap_or(-1));
+                        }
+                        at += c as usize;
+                    }
+                    meth_rbegs = out;
+                    Some((counts, &meth_rbegs[..]))
+                }
+                (r, _) => r,
+            };
             // Chained and filtered in one step unless the pre-filter chains are dumped: only the
             // kept chains get seed vectors.
             if let (Some((counts, rbegs)), false) = (resolved, dump_chains) {
@@ -1860,14 +1906,22 @@ fn align_reads_batched_inner<B: SwBackend>(
                         target,
                         // The seed itself scores `len` matches at `opt.a` each; the extension starts
                         // from there so z-drop and clipping are judged against the whole alignment.
-                        h0: seed.len * opt.a,
+                        h0: if meth.is_some() {
+                            meth_seed_score(fm, opt, &seed, codes)
+                        } else {
+                            seed.len * opt.a
+                        },
                         prev: -1,
                         active: true,
                     });
                 } else {
                     // Seed already flush with the read's 5' end: nothing to extend, so the region is
                     // final on this side and its score is just the seed's (`bwamem.cpp:2319-2321`).
-                    reg.score = seed.len * opt.a;
+                    reg.score = if meth.is_some() {
+                        meth_seed_score(fm, opt, &seed, codes)
+                    } else {
+                        seed.len * opt.a
+                    };
                     reg.truesc = reg.score;
                     reg.qb = 0;
                     reg.rb = seed.rbeg;

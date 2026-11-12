@@ -138,6 +138,64 @@ mod rescue_prune;
 /// deliberate and mirrors the two different C originals (`ksw_u8` vs `ksw_extend2`).
 pub use matesw::{batched_ksw_align2, batched_mate_rescue, KswJob};
 
+/// `--meth`'s matrices free the pair of bases `x < y` one conversion touches: the cells `[x][y]`
+/// and `[y][x]` score between the mismatch and `a`, at least one of them above the mismatch, and
+/// every other cell is the uniform matrix's. Returns `(x, y, uniform matrix, exact)`. On sequences
+/// with `x` rewritten as `y`, the uniform matrix scores every cell at least as high as `mat` (a pair
+/// cell becomes a match), and exactly as high when both pair cells are `a` (`exact`, the collapsed
+/// scoring). So with `exact` a batch runs on the rewritten bytes through every uniform-only kernel
+/// and fast path; without it, a proof that the rewritten bytes score below a threshold still holds.
+pub(crate) fn merged_pair(m: usize, mat: &[i8]) -> Option<(u8, u8, [i8; 25], bool)> {
+    if m != 5 || mat.len() < 25 {
+        return None;
+    }
+    let a = mat[0];
+    for x in 0..4 {
+        for y in x + 1..4 {
+            // The mismatch score, read off the two bases outside the pair.
+            let (u, v) = {
+                let mut o = (0..4).filter(|&b| b != x && b != y);
+                (o.next().unwrap(), o.next().unwrap())
+            };
+            let mm = mat[u * 5 + v];
+            let pair = [mat[x * 5 + y], mat[y * 5 + x]];
+            let mut uni: [i8; 25] = mat[..25].try_into().unwrap();
+            uni[x * 5 + y] = mm;
+            uni[y * 5 + x] = mm;
+            let uniform = (0..25).all(|k| {
+                uni[k]
+                    == if k / 5 == 4 || k % 5 == 4 {
+                        mat[4]
+                    } else if k / 5 == k % 5 {
+                        a
+                    } else {
+                        mm
+                    }
+            });
+            if uniform && mm < a && pair.iter().all(|c| (mm..=a).contains(c)) && pair != [mm; 2] {
+                return Some((x as u8, y as u8, uni, pair == [a; 2]));
+            }
+        }
+    }
+    None
+}
+
+/// Every job's `(query, target)` with base `x` rewritten as `y`, packed in one buffer; the spans
+/// index it in job order. See [`merged_pair`].
+pub(crate) fn rewrite_jobs<'a>(
+    seqs: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    x: u8,
+    y: u8,
+) -> (Vec<u8>, Vec<(usize, usize, usize)>) {
+    let (mut buf, mut spans) = (Vec::new(), Vec::new());
+    for (q, t) in seqs {
+        let at = buf.len();
+        buf.extend(q.iter().chain(t).map(|&b| if b == x { y } else { b }));
+        spans.push((at, at + q.len(), buf.len()));
+    }
+    (buf, spans)
+}
+
 /// The NEON seed-extension backend. See the module docs: it delegates to the scalar kernel today
 /// and is the drop-in point for the lane-parallel NEON DP (phase 9a).
 #[derive(Debug, Default, Clone, Copy)]

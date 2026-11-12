@@ -2150,14 +2150,18 @@ mod tests {
             n_ambs: 0,
             is_alt: false,
         };
-        BntSeq {
+        let mut bns = BntSeq {
             l_pac: 150,
             n_seqs: 2,
             seed: 11,
             contigs: vec![contig("a", 0, 100), contig("b", 100, 50)],
             n_holes: 0,
             ambs: vec![],
-        }
+            rid_bucket: Vec::new(),
+        };
+        // As a loaded index has them.
+        bns.build_rid_buckets();
+        bns
     }
 
     #[test]

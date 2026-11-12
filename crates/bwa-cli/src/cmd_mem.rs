@@ -2477,7 +2477,7 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
             if opt.meth.is_some() {
                 meth_regs(&fm, &bns, &opt, &all_codes, false)
             } else {
-                batched_regs(&fm, &bns, &opt, &all_codes, dump_regs_enabled())
+                batched_regs(&fm, &bns, &opt, &all_codes, dump_regs_enabled(), None)
             }
         });
         // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
@@ -2558,6 +2558,7 @@ fn batched_regs(
     opt: &MemOpt,
     codes: &[impl AsRef<[u8]> + Sync],
     leave_undeduped: bool,
+    meth: Option<bool>,
 ) -> Vec<Vec<MemAlnReg>> {
     // One chunk per worker, so every thread gets a slice big enough to fill the SIMD lanes.
     // Size of the rayon pool, i.e. effectively `-t`. Clamped so the division below cannot divide
@@ -2589,7 +2590,26 @@ fn batched_regs(
     crate::stage_time::barrier::region(crate::stage_time::Stage::Align, || {
         run_in_order(chunks, |chunk| {
             crate::stage_time::barrier::worker(|| {
-                let mut regs = align_reads_batched(fm, bns, opt, chunk, &NeonBackend);
+                let mut regs = match meth {
+                    None => align_reads_batched(fm, bns, opt, chunk, &NeonBackend),
+                    // `--meth`: seed the chunk's converted copies, align the reads themselves.
+                    Some(ot) => {
+                        let conv: Vec<Vec<u8>> = chunk
+                            .iter()
+                            .map(|c| bwa_core::meth::convert_codes(c.as_ref(), ot))
+                            .collect();
+                        let conv: Vec<&[u8]> = conv.iter().map(Vec::as_slice).collect();
+                        bwa_mem::align_reads_batched_meth(
+                            fm,
+                            bns,
+                            opt,
+                            chunk,
+                            &conv,
+                            ot,
+                            &NeonBackend,
+                        )
+                    }
+                };
                 // Dedup here, chunk by chunk, not once the whole batch has aligned. The pass is
                 // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
                 // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
@@ -2646,11 +2666,9 @@ fn load_meth_index(prefix: &std::path::Path) -> anyhow::Result<(FmIndex, BntSeq)
     Ok((fm, bns))
 }
 
-/// [`batched_regs`] under `--meth`: each read seeded from its converted copy and extended, deduped,
-/// with its own chemistry's matrix. `paired`: `codes` interleaves read 1 and read 2.
-// shortcut: per-read scalar seeding and extension (and scalar mate rescue in run_pe), without the
-// lockstep batching or the NEON kernels, which score bwa's uniform matrix only: ~5.5x bwa-mem3's
-// CPU on EM-seq PE (54% rescue, 26% extension). Batch it if `--meth` throughput matters.
+/// The regions of a `--meth` batch, deduped: the batched aligner run once per chemistry, each
+/// with its own matrix (`MethOpt::mats`). `paired`: `codes` interleaves read 1 (C->T) and read 2
+/// (G->A); otherwise every read is read 1.
 fn meth_regs(
     fm: &FmIndex,
     bns: &BntSeq,
@@ -2658,18 +2676,16 @@ fn meth_regs(
     codes: &[&[u8]],
     paired: bool,
 ) -> Vec<Vec<MemAlnReg>> {
-    codes
-        .par_iter()
-        .enumerate()
-        .map(|(i, read)| {
-            let ot = !paired || i % 2 == 0;
-            let ropt = bwa_mem::meth::read_opt(opt, ot);
-            let regs = bwa_mem::align_read_meth(fm, bns, &ropt, read, ot);
-            let mut kept = mem_sort_dedup_patch(fm, &ropt, read, regs);
-            bwa_mem::stamp_is_alt(bns, &mut kept);
-            kept
-        })
-        .collect()
+    let ot_opt = bwa_mem::meth::read_opt(opt, true);
+    if !paired {
+        return batched_regs(fm, bns, &ot_opt, codes, false, Some(true));
+    }
+    let r1: Vec<&[u8]> = codes.iter().step_by(2).copied().collect();
+    let r2: Vec<&[u8]> = codes.iter().skip(1).step_by(2).copied().collect();
+    let ob_opt = bwa_mem::meth::read_opt(opt, false);
+    let a = batched_regs(fm, bns, &ot_opt, &r1, false, Some(true));
+    let b = batched_regs(fm, bns, &ob_opt, &r2, false, Some(false));
+    a.into_iter().zip(b).flat_map(|(x, y)| [x, y]).collect()
 }
 
 /// [`finish_se`] under `--meth`: bwa's own `mem_reg2sam` (which `finish_se` mirrors) with the
@@ -3278,7 +3294,7 @@ fn run_pe(
             if opt.meth.is_some() {
                 meth_regs(fm, bns, opt, &all_codes, true)
             } else {
-                batched_regs(fm, bns, opt, &all_codes, false)
+                batched_regs(fm, bns, opt, &all_codes, false, None)
             }
         });
         drop(all_codes);
@@ -3335,9 +3351,7 @@ fn run_pe(
         // `BWA4_SCALAR_RESCUE`: set to any value (presence only, content ignored) to skip the
         // batched pass here and let `mem_sam_pe` do its original per-pair rescue instead. Default
         // off. An A/B verification switch: both paths are byte-identical, only the speed differs.
-        // `--meth` rescues on the scalar path, which picks each mate's chemistry matrix: the
-        // batched kernels and their K-mer pruning assume bwa's uniform matrix.
-        let scalar_rescue = std::env::var_os("BWA4_SCALAR_RESCUE").is_some() || opt.meth.is_some();
+        let scalar_rescue = std::env::var_os("BWA4_SCALAR_RESCUE").is_some();
         // `BWA4_NO_RESCUE=1` skips mate rescue entirely, the analogue of bwa-mem2's `-S`. It is a
         // MEASUREMENT gate, not a lever: it changes the output by design, exactly as `-S` does. It
         // exists so our rescue cost can be measured DIRECTLY and compared like-for-like against

@@ -255,6 +255,9 @@ pub struct FmIndex {
     /// for a plain index; the original genome's length for [`FmIndex::load_meth`], whose BWT
     /// covers a converted text twice as long.
     pac_l: i64,
+    /// `--meth` only: the converted text this BWT indexes, which the seed walk's text compare
+    /// ([`Self::text_match`]) reads; `pac` then holds the original genome for extension.
+    seed_pac: Option<Mmap>,
 }
 
 /// One [`FmIndex::seed_jump`] entry: the forward interval `(k, l, s)` of a string, as
@@ -984,7 +987,9 @@ impl FmIndex {
         // build that died mid-write; a long one belongs to another reference.
         let want = 48 + 64 * cp_size as u64 + 5 * sa_size as u64 + 8;
         let got = bwt_file.metadata()?.len();
-        if got != want {
+        // fg-labs/bwa-mem3 appends an 8-byte format word (3) that nothing here reads: accept its
+        // index files (nf-core's `bwamem3/index` builds them) as they are.
+        if got != want && got != want + 8 {
             return Err(Error::IndexFormat(format!(
                 "{}: {got} bytes, expected {want} for {ref_seq_len} rows (truncated or mixed index; rebuild it)",
                 sibling(prefix, "bwt.2bit.64").display()
@@ -1181,6 +1186,7 @@ impl FmIndex {
 
         let mut fm = FmIndex {
             pac_l: (ref_seq_len - 1) / 2,
+            seed_pac: None,
             ref_seq_len,
             count,
             cp_occ,
@@ -2447,7 +2453,11 @@ impl FmIndex {
     /// result as stepping [`base`](Self::base) one position at a time, sixteen bases per compare
     /// on NEON and SSE2 (fg-labs/bwa-mem3's `ls_text_match`, eight at a time).
     pub fn text_match(&self, q: &[u8], mut j: usize, mut t: i64) -> usize {
-        let l_pac = self.l_pac();
+        // The text the BWT indexes: the converted genome under `--meth`, else `pac`.
+        let (text, l_pac) = match &self.seed_pac {
+            Some(p) => (&p[..], (self.ref_seq_len - 1) / 2),
+            None => (&self.pac[..], self.l_pac()),
+        };
         #[cfg(target_arch = "aarch64")]
         // SAFETY: NEON is mandatory on AArch64. Each `unpack16` reads pac bytes `[p >> 2, +8)`,
         // checked against `pac.len()`; each read load is `q[j..j + 16]`, checked against `q.len()`.
@@ -2460,7 +2470,7 @@ impl FmIndex {
                 )));
                 (m.trailing_zeros() / 4) as usize
             };
-            let pac = &self.pac[..];
+            let pac = text;
             if t < l_pac {
                 let o = (t & 3) as usize;
                 let (idx, sh) = (
@@ -2509,7 +2519,7 @@ impl FmIndex {
         // against `pac.len()`; each read load is `q[j..j + 16]`, checked against `q.len()`.
         unsafe {
             use std::arch::x86_64::*;
-            let pac = &self.pac[..];
+            let pac = text;
             // The first base of `q[j..j + 16]` that differs from `x`, 16 when none does.
             let first = |x: __m128i, j: usize| -> u32 {
                 let eq =
@@ -2519,7 +2529,7 @@ impl FmIndex {
             if t < l_pac {
                 // One base at a time to a byte boundary, then sixteen per compare from one word.
                 while t & 3 != 0 && j < q.len() && t < l_pac {
-                    if q[j] != self.base(t) {
+                    if q[j] != unpack_pac_base(text, l_pac, t) {
                         return j;
                     }
                     j += 1;
@@ -2538,7 +2548,7 @@ impl FmIndex {
                 // Text `t..t + 16` is forward `[2L - t - 16, 2L - t)` reversed and complemented: to
                 // where that range starts on a byte, then sixteen per compare.
                 while (2 * l_pac - t) & 3 != 0 && j < q.len() && t < 2 * l_pac {
-                    if q[j] != self.base(t) {
+                    if q[j] != unpack_pac_base(text, l_pac, t) {
                         return j;
                     }
                     j += 1;
@@ -2559,7 +2569,7 @@ impl FmIndex {
                 }
             }
         }
-        while j < q.len() && t < 2 * l_pac && q[j] == self.base(t) {
+        while j < q.len() && t < 2 * l_pac && q[j] == unpack_pac_base(text, l_pac, t) {
             j += 1;
             t += 1;
         }
@@ -2690,7 +2700,18 @@ impl FmIndex {
     pub fn load_meth(seed_prefix: &Path, pac_prefix: &Path, l_pac: i64) -> Result<Self> {
         let mut fm = Self::load(seed_prefix)?;
         let pac_file = std::fs::File::open(sibling(pac_prefix, "pac"))?;
-        fm.pac = unsafe { Mmap::map(&pac_file)? };
+        // SAFETY: as in `load`, the index files are not mutated while a run holds them open.
+        let pac = unsafe { Mmap::map(&pac_file)? };
+        // The same guard as `load`: the unpack loops read `.pac` unchecked, sized from `l_pac`.
+        if pac.len() as u64 != (l_pac as u64 >> 2) + 2 {
+            return Err(Error::IndexFormat(format!(
+                "{}: {} bytes, expected {} for a {l_pac}-base reference (truncated or mixed index)",
+                sibling(pac_prefix, "pac").display(),
+                pac.len(),
+                (l_pac >> 2) + 2
+            )));
+        }
+        fm.seed_pac = Some(std::mem::replace(&mut fm.pac, pac));
         fm.pac_l = l_pac;
         Ok(fm)
     }
@@ -3164,6 +3185,7 @@ mod tests {
                 .unwrap(),
             seed_jump: Vec::new(),
             pac_l: 0,
+            seed_pac: None,
         };
         for block in 0..n_blocks {
             for y in [0i64, 1, 17, 63] {

@@ -284,7 +284,7 @@ pub mod meth;
 pub mod pe;
 pub mod primary;
 pub mod seedflt;
-pub use across::align_reads_batched;
+pub use across::{align_reads_batched, align_reads_batched_meth};
 pub use cigar::{cigar_string, reg2aln, MemAln};
 pub use pe::{
     batch_mate_rescue, mem_pestat, mem_pestat_from, mem_sam_pe, pestat_samples, PairRescueData,

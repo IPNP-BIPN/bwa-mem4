@@ -165,6 +165,12 @@ FORK=/path/to/bwa-mem3 GENOME=/path/to/GRCh38.fa scripts/meth_oracle_diff.sh
 
 Current result: `PASS: every configuration identical`.
 
+The 200,000-pair sets of [Speed](#speed) are also compared, at `-K 10000000`. bwa-mem3 sizes its
+batches by `-t`, and the insert-size model is per batch. EM-seq is identical. TAPS differs on 15
+pairs of 200,000, the same 15 before the speed work (commit 9f2a0df). In each, bwa-mem3 rescues
+a mate from a read-1 region that bwa-mem4 does not list, on a low-complexity read
+(`sim13347` reproduces it alone with `-I 298.36877747837184,49.874227483371115,533,64`).
+
 The script needs the bwa-mem3 binary and a GRCh38 FASTA, so it does not run in CI. CI runs the
 unit tests:
 
@@ -172,6 +178,42 @@ unit tests:
 - the mapping back from the converted index and the chemistry filter (`bwa-chain`);
 - XM calling over context, strand, chemistry, clips and indels (`bwa-mem`);
 - comment re-encoding, `%g` formatting and the spreading of QC-fail.
+
+## Speed
+
+`--meth` runs the plain pipeline's batched stages: lockstep seeding and SA lookup, batched SIMD
+extension, and batched mate rescue with K-mer pruning and the banded kernel. The meth matrices
+reach those kernels in three ways:
+
+- **Collapsed scoring** (the EM-seq default) frees C/T in both directions at the match score. It
+  is exactly the uniform matrix on copies of both sequences with T rewritten as C (A as G for OB),
+  so extension and rescue run the plain kernels on those copies.
+- **Genomic and neutral scoring** (the TAPS and 5-base default) go through a 5×5 table. The NEON
+  u8 extension, rescue and band kernels look up `5 × reference + read` with a two-register `TBL`.
+- **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
+  also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
+  cell scores at most the match score, so the bound holds.
+
+A seed that scores 0 or less under the read's matrix (a pair it matched only in converted space)
+extends on the scalar kernel, as in bwa-mem3.
+
+200,000 simulated pairs on chr20 + chr22 + chrM, Apple M4 Max, `/usr/bin/time -l`:
+
+Each cell is bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each.
+
+| Set | Wall (s) | User CPU (s) | Max RSS (MB) | Cycles (G) |
+|---|---|---|---|---|
+| EM-seq, `-t1` | 14.5 / 17.1 | 14.4 / 16.9 | 952 / 1061 | 56.3 / 65.9 |
+| TAPS, `-t1` | 12.1 / 14.9 | 12.1 / 14.8 | 921 / 1037 | 47.3 / 57.7 |
+| EM-seq, `-t12` | 1.39 / 1.89 | 15.6 / 18.5 | 1825 / 2126 | 60.1 / 68.9 |
+| TAPS, `-t12` | 1.21 / 1.70 | 13.6 / 16.6 | 1771 / 2087 | 51.2 / 60.9 |
+
+The machine was loaded (load average 6 to 9) during these runs. Cycles and instructions are the
+steadier comparison.
+
+On x86, the genomic and neutral matrices (TAPS, 5-base) still extend and rescue with the scalar
+kernels, and the x86 band kernels score the uniform matrix only. EM-seq (collapsed) uses the AVX2
+and AVX-512 kernels. Neither case is measured on x86.
 
 ## Differences from bwa-mem3 0.16
 
@@ -190,11 +232,8 @@ None of these differences shows up on the test set.
 - **`-x` presets** cannot be combined with `--meth`.
 - **bwa-mem3's `--bam` option** (uncompressed BAM output) is not available. Use `-o out.bam` in a
   build with the `hts-output` feature, or pipe the SAM into samtools.
-- **Speed.** The meth path aligns read by read with the scalar kernels, and rescues mates with
-  the scalar Smith-Waterman. On 50,000 EM-seq pairs at `-t1` it takes 8.7 CPU-s, against 1.6 for
-  bwa-mem3 0.16 (Apple M-series). About 54% of that is the scalar mate rescue, 26% the scalar
-  extension and 12% SMEM search. Moving the meth path onto the batched SIMD kernels is the
-  obvious next step. The output does not depend on it.
+- **15 TAPS pairs in 200,000** differ (see [Validation](#validation)). The 5,000-pair test set
+  does not hit them.
 
 ## What Bismark needs
 
@@ -222,8 +261,8 @@ bwa-mem4:
 - **Header and records.** Bismark checks the `@SQ` lines against the genome folder. It needs 0x2
   on both mates, and it reads RNAME, POS, FLAG and CIGAR. It computes its own XM, which is why it
   passes `--meth-tags none`. All of these are as in bwa-mem3.
-- **Speed.** See above: today this path is several times slower than bwa-mem3 0.16, so it is not
-  yet a drop-in replacement in throughput.
+- **Speed.** See [Speed](#speed): on Apple Silicon bwa-mem4 is faster than bwa-mem3 0.16 and
+  uses less memory. On x86, TAPS / 5-base (neutral scoring) still runs scalar kernels.
 
 Bismark itself was not run here. The above comes from reading #1209 and the Bismark
 documentation.

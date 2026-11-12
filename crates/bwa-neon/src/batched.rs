@@ -169,6 +169,59 @@ pub fn batched_extend(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
+    // A `--meth` seed can score `<= 0` (a C/T pair it matched in converted space scores a
+    // mismatch here). The SIMD kernels start from `h0 > 0`; the scalar reference takes any.
+    if jobs.iter().any(|j| j.h0 <= 0) {
+        let (low, pos): (Vec<usize>, Vec<usize>) = (0..jobs.len()).partition(|&k| jobs[k].h0 <= 0);
+        let pick = |idx: &[usize]| idx.iter().map(|&k| jobs[k]).collect::<Vec<_>>();
+        let mut out = vec![default_result(); jobs.len()];
+        let got = batched_extend_scalar(
+            &pick(&low),
+            m,
+            mat,
+            o_del,
+            e_del,
+            o_ins,
+            e_ins,
+            w0,
+            end_bonus,
+            zdrop,
+        );
+        for (&k, r) in low.iter().zip(got) {
+            out[k] = r;
+        }
+        let got = batched_extend(
+            &pick(&pos),
+            m,
+            mat,
+            o_del,
+            e_del,
+            o_ins,
+            e_ins,
+            w0,
+            end_bonus,
+            zdrop,
+        );
+        for (&k, r) in pos.iter().zip(got) {
+            out[k] = r;
+        }
+        return out;
+    }
+    if let Some((x, y, uni, true)) = crate::merged_pair(m, mat) {
+        let (buf, spans) = crate::rewrite_jobs(jobs.iter().map(|j| (j.query, j.target)), x, y);
+        let conv: Vec<ExtendJob> = jobs
+            .iter()
+            .zip(&spans)
+            .map(|(j, &(a, b, c))| ExtendJob {
+                query: &buf[a..b],
+                target: &buf[b..c],
+                h0: j.h0,
+            })
+            .collect();
+        return batched_extend(
+            &conv, m, &uni, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
     extend_shape::record(jobs);
     #[cfg(target_arch = "aarch64")]
     {
@@ -819,6 +872,18 @@ fn simd_dispatch(
     // The NEON kernels score DNA with a vector compare that assumes the uniform bwa matrix
     // (diagonal `a`, off-diagonal `mm`, ambiguous row/col = `npen`). Any other matrix -> scalar.
     if !is_uniform_dna(mat, m) {
+        #[cfg(target_arch = "aarch64")]
+        if m == 5
+            && mat[1] < 0
+            && mat[..25].iter().all(|v| (mat[1]..=mat[0]).contains(v))
+            && (0..4).all(|i| mat[i * 6] == mat[0])
+        {
+            return mat5_extend(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            );
+        }
+        // shortcut: on x86_64 a `--meth` neutral/genomic matrix extends with the scalar kernel,
+        // give the AVX2/AVX-512 u8 kernels a `tab5` form when `--meth` speed on x86 matters.
         return batched_extend_scalar(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
@@ -894,6 +959,115 @@ fn simd_dispatch(
     );
     for (dp_slot, &k) in needs_dp.iter().enumerate() {
         out[k] = dp_results[dp_slot];
+    }
+    out
+}
+
+/// [`ungapped_hit`] under a matrix whose cells lie in `[mat[1], mat[0]]` (`tab5`). A diagonal cell
+/// scoring `s` can gain at most `a - s` on a gapped path, so the walk is provably optimal while
+/// those gains sum below the cheapest gap, `gap_min = o_min + e_min`: at a uniform matrix that is
+/// `X (a + b) < o_min + e_min`, [`simd_dispatch`]'s bound. The walk is [`ungapped_hit`]'s, cell by
+/// cell: the best moves on a strict `>`, and only a falling cell can kill the diagonal or z-drop.
+#[cfg(target_arch = "aarch64")]
+fn ungapped_hit_mat(job: &ExtendJob, mat: &[i8], gap_min: i32, zdrop: i32) -> Option<ExtendResult> {
+    let n = job.query.len();
+    if n == 0 || job.h0 <= 0 || job.target.len() < n {
+        return None;
+    }
+    let a = i32::from(mat[0]);
+    let (mut running, mut best, mut best_end, mut gain) = (job.h0, job.h0, 0usize, 0i32);
+    for (c, (&q, &t)) in job.query.iter().zip(job.target).enumerate() {
+        if (q | t) > 3 {
+            return None;
+        }
+        let sc = i32::from(mat[t as usize * 5 + q as usize]);
+        gain += a - sc;
+        if gain >= gap_min {
+            return None;
+        }
+        running += sc;
+        if running > best {
+            (best, best_end) = (running, c + 1);
+        }
+        if sc < 0 && (running <= 0 || zdrop > 0 && best - running > zdrop) {
+            return None;
+        }
+    }
+    Some(ExtendResult {
+        score: best,
+        qle: best_end as i32,
+        tle: best_end as i32,
+        gtle: n as i32,
+        gscore: running,
+        max_off: 0,
+    })
+}
+
+/// Extension under a 5x5 matrix with diagonal `mat[0]` and every cell in `[mat[1], mat[0]]`
+/// (`--meth`'s neutral and genomic): [`ungapped_hit_mat`] first, then the NEON u8 kernel's `tab5`
+/// form for every job it can hold, the scalar reference for the rest. The positive-`h0`-only
+/// kernel is never given a seed the matrix scored `<= 0`.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn mat5_extend(
+    jobs: &[ExtendJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w0: i32,
+    end_bonus: i32,
+    zdrop: i32,
+) -> Vec<ExtendResult> {
+    const U8_LEN: usize = 256;
+    let max_sc = i32::from(mat[0]);
+    // `dispatch_bins`' u8 headroom, for this matrix.
+    let headroom = (-i32::from(mat[1])).max(-i32::from(mat[m - 1])) + max_sc;
+    let mut out = vec![default_result(); jobs.len()];
+    let gap_min = o_del.min(o_ins) + e_del.min(e_ins);
+    let dp: Vec<usize> = (0..jobs.len())
+        .filter(|&k| match ungapped_hit_mat(&jobs[k], mat, gap_min, zdrop) {
+            Some(r) => {
+                out[k] = r;
+                false
+            }
+            None => true,
+        })
+        .collect();
+    let (fit, rest): (Vec<usize>, Vec<usize>) = dp.into_iter().partition(|&k| {
+        let j = &jobs[k];
+        j.h0 > 0
+            && j.query.len() < U8_LEN
+            && j.target.len() < U8_LEN
+            && cell_bound(j, max_sc) + headroom < U8_LEN as i32
+    });
+    let pick = |idx: &[usize]| idx.iter().map(|&k| jobs[k]).collect::<Vec<_>>();
+    let inl = inline_sbt_enabled();
+    let fit_jobs = pick(&fit);
+    // SAFETY: NEON was detected by the caller; every job passed the u8 bounds above; the matrix
+    // is the `tab5` shape.
+    let got = unsafe {
+        if inl {
+            neon::batched_extend_neon_u8_mat5::<true>(
+                &fit_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            )
+        } else {
+            neon::batched_extend_neon_u8_mat5::<false>(
+                &fit_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            )
+        }
+    };
+    for (&k, r) in fit.iter().zip(got) {
+        out[k] = r;
+    }
+    let rest_jobs = pick(&rest);
+    let got = batched_extend_scalar(
+        &rest_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+    );
+    for (&k, r) in rest.iter().zip(got) {
+        out[k] = r;
     }
     out
 }
@@ -2369,6 +2543,7 @@ macro_rules! define_sw_kernel {
             band_width = $bwidth:expr, diag = |$dm:ident, $ds:ident, $db:ident| $diag:expr,
             sbt_bias = |$bb:ident| $sbias:expr,
             sbt_tbl = $sbt_tbl:literal,
+            tab5 = $tab5:literal,
             tbl_ld = |$tp:ident| $tblld:expr,
             tbl = |$tt:ident, $tk:ident, $tq:ident| $tblx:expr,
             rowvec = $rowvec:literal,
@@ -2465,14 +2640,24 @@ macro_rules! define_sw_kernel {
             // (mismatch), and any N gives >= 4 (12 ^ 0..=3 = 12..=15, 12 ^ 4 = 8, 4 ^ 0..=3 = 4..=7).
             // One XOR and one byte shuffle (`tbl` / `pshufb`) replace the compare/blend chain.
             // Byte lanes only (`sbt_tbl`); the i16 kernels keep the compare form.
+            //
+            // `tab5` (`--meth`'s neutral and genomic matrices, which no `t ^ q` class can hold): the
+            // whole 5x5 matrix at `5 t + q`, 32 entries, with a target N keyed 4 rather than 12 so
+            // the row key is the base itself; `$tblx` forms the index.
             let tab_v = {
-                let mut tab = [(bias + i32::from(mat[m - 1])) as $elem; 16];
-                tab[0] = (bias + i32::from(mat[0])) as $elem;
-                tab[1..4].fill((bias + i32::from(mat[1])) as $elem);
+                let mut tab = [(bias + i32::from(mat[m - 1])) as $elem; 32];
+                if $tab5 {
+                    for (e, &v) in tab.iter_mut().zip(&mat[..25]) {
+                        *e = (bias + i32::from(v)) as $elem;
+                    }
+                } else {
+                    tab[0] = (bias + i32::from(mat[0])) as $elem;
+                    tab[1..4].fill((bias + i32::from(mat[1])) as $elem);
+                }
                 let $tp = tab.as_ptr() as *const u8;
                 $tblld
             };
-            let twelve_v = $dup(12);
+            let twelve_v = $dup(if $tab5 { 4 } else { 12 });
             // Only a kernel that keeps the bias needs non-negative lanes; USQADD's are signed.
             debug_assert!(
                 bias != full_bias
@@ -2601,6 +2786,9 @@ macro_rules! define_sw_kernel {
                             None => clamp_band(w0, st.qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del),
                         };
                         // `BWA4_TIGHT_BAND`: clamp this lane's band by the ungapped-score bound.
+                        // Under `tab5` (diagonal `a`, every cell in `[mat[1], a]`) the walk charges
+                        // each off-diagonal cell `mat[1]`, no more than it scores: the `S` it finds
+                        // is still attained, only lower, so the band only widens.
                         if band_hint.is_none() && tight_band_enabled() {
                             let bound = tight_band_bound(
                                 job.query,
@@ -4536,6 +4724,7 @@ mod neon {
         diag = |m, s, bias| vsubq_s16(vaddq_s16(m, s), bias),
         sbt_bias = |bias| bias,
         sbt_tbl = false,
+        tab5 = false,
         tbl_ld = |_p| vdupq_n_s16(0),
         tbl = |_t, _k, _q| unreachable!(),
         rowvec = false,
@@ -4586,8 +4775,43 @@ mod neon {
         diag = |m, s, _bias| vsqaddq_u8(m, vreinterpretq_s8_u8(s)),
         sbt_bias = |_bias| 0,
         sbt_tbl = true,
+        tab5 = false,
         tbl_ld = |p| vld1q_u8(p),
         tbl = |t, k, q| vqtbl1q_u8(t, veorq_u8(k, q)),
+        rowvec = true,
+        trk = i16,
+        row = neon_row
+    );
+    // The u8 kernel with the 5x5 table (`tab5`), for `--meth`'s neutral and genomic matrices: one
+    // `MLA` forms `q + 5 t` and a two-register `TBL` reads the matrix. See [`mat5_extend`].
+    define_sw_kernel!(
+        batched_extend_neon_u8_mat5,
+        u8,
+        u8,
+        16,
+        feat = "neon",
+        dup = vdupq_n_u8,
+        lds = vld1q_u8,
+        sts = vst1q_u8,
+        ldu = vld1q_u8,
+        sub = vqsubq_u8,
+        max = vmaxq_u8,
+        ceqz = vceqzq_u8,
+        cge = vcgeq_u8,
+        ceq = vceqq_u8,
+        orru = vorrq_u8,
+        orr = vorrq_u8,
+        andu = vandq_u8,
+        bsl = vbslq_u8,
+        band = band_u8,
+        band_bias = 0,
+        band_width = true,
+        diag = |m, s, _bias| vsqaddq_u8(m, vreinterpretq_s8_u8(s)),
+        sbt_bias = |_bias| 0,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| vld1q_u8_x2(p),
+        tbl = |t, k, q| vqtbl2q_u8(t, vmlaq_u8(q, k, vdupq_n_u8(5))),
         rowvec = true,
         trk = i16,
         row = neon_row
@@ -4761,6 +4985,7 @@ mod avx2 {
         diag = |m, s, bias| _mm256_sub_epi16(_mm256_add_epi16(m, s), bias),
         sbt_bias = |bias| bias,
         sbt_tbl = false,
+        tab5 = false,
         tbl_ld = |_p| _mm256_setzero_si256(),
         tbl = |_t, _k, _q| unreachable!(),
         rowvec = false,
@@ -4793,6 +5018,7 @@ mod avx2 {
         diag = |m, s, bias| _mm256_subs_epu8(_mm256_adds_epu8(m, s), bias),
         sbt_bias = |bias| bias,
         sbt_tbl = true,
+        tab5 = false,
         tbl_ld = |p| _mm256_broadcastsi128_si256(_mm_loadu_si128(p as *const __m128i)),
         tbl = |t, k, q| _mm256_shuffle_epi8(t, _mm256_xor_si256(k, q)),
         rowvec = true,
@@ -4951,6 +5177,7 @@ mod sse41 {
         diag = |m, s, bias| _mm_sub_epi16(_mm_add_epi16(m, s), bias),
         sbt_bias = |bias| bias,
         sbt_tbl = false,
+        tab5 = false,
         tbl_ld = |_p| _mm_setzero_si128(),
         tbl = |_t, _k, _q| unreachable!(),
         rowvec = false,
@@ -4983,6 +5210,7 @@ mod sse41 {
         diag = |m, s, bias| _mm_subs_epu8(_mm_adds_epu8(m, s), bias),
         sbt_bias = |bias| bias,
         sbt_tbl = true,
+        tab5 = false,
         tbl_ld = |p| _mm_loadu_si128(p as *const __m128i),
         tbl = |t, k, q| _mm_shuffle_epi8(t, _mm_xor_si128(k, q)),
         rowvec = false,
@@ -5143,6 +5371,7 @@ mod avx512 {
         diag = |m, s, bias| _mm512_sub_epi16(_mm512_add_epi16(m, s), bias),
         sbt_bias = |bias| bias,
         sbt_tbl = false,
+        tab5 = false,
         tbl_ld = |_p| _mm512_setzero_si512(),
         tbl = |_t, _k, _q| unreachable!(),
         rowvec = false,
@@ -5175,6 +5404,7 @@ mod avx512 {
         diag = |m, s, bias| _mm512_subs_epu8(_mm512_adds_epu8(m, s), bias),
         sbt_bias = |bias| bias,
         sbt_tbl = true,
+        tab5 = false,
         tbl_ld = |p| _mm512_broadcast_i32x4(_mm_loadu_si128(p as *const __m128i)),
         tbl = |t, k, q| _mm512_shuffle_epi8(t, _mm512_xor_si512(k, q)),
         rowvec = true,
@@ -6964,5 +7194,135 @@ mod clamp_band_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod mat5_tests {
+    use bwa_extend::ExtendJob;
+
+    /// `--meth`'s matrices (neutral and genomic through the `tab5` kernel, collapsed through the
+    /// rewrite to the uniform matrix) against the scalar reference: noisy copies of the query with
+    /// its C (or G) converted, N on both sides, ragged lengths, `h0` from -9 to 40.
+    #[test]
+    fn meth_matrices_extend_like_scalar() {
+        // Field-level gate: pin the full band (see `tight_band_enabled`).
+        super::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut base = vec![-4i8; 25];
+        for k in 0..5 {
+            base[k * 5 + 4] = -1;
+            base[20 + k] = -1;
+        }
+        for k in 0..4 {
+            base[k * 6] = 1;
+        }
+        // (ref base, read base) freed: OT C->T, OB G->A; freed score 0 (neutral) or 1 (genomic),
+        // and mirrored (collapsed).
+        let mut walked = 0;
+        for (r, q) in [(1usize, 3usize), (2, 0)] {
+            for (conv, mirror) in [(0i8, false), (1, false), (1, true)] {
+                let mut mat = base.clone();
+                mat[r * 5 + q] = conv;
+                if mirror {
+                    mat[q * 5 + r] = 1;
+                }
+                for round in 0..40u32 {
+                    let n = 1 + (next() % 70) as usize;
+                    let mut seqs: Vec<(Vec<u8>, Vec<u8>, i32)> = Vec::new();
+                    for i in 0..n {
+                        // Every other job nearly clean, so the ungapped walk takes some.
+                        let noise = if i % 2 == 0 { 40 } else { 600 };
+                        let qlen = 1 + (next() % 200) as usize;
+                        let qs: Vec<u8> = (0..qlen)
+                            .map(|_| {
+                                if next() % 40 == 0 {
+                                    4
+                                } else {
+                                    (next() % 4) as u8
+                                }
+                            })
+                            .collect();
+                        let mut t: Vec<u8> = Vec::new();
+                        for &b in &qs {
+                            match next() % noise {
+                                0 => {}
+                                1 => t.extend([b, (next() % 4) as u8]),
+                                2 => t.push((next() % 5) as u8),
+                                _ => t.push(if b as usize == q && next() % 2 == 0 {
+                                    r as u8
+                                } else {
+                                    b
+                                }),
+                            }
+                        }
+                        t.extend((0..next() % 60).map(|_| (next() % 4) as u8));
+                        // `h0 <= 0` too: a `--meth` seed can score that.
+                        seqs.push((qs, t, (next() % 50) as i32 - 9));
+                    }
+                    let jobs: Vec<ExtendJob> = seqs
+                        .iter()
+                        .map(|(q, t, h0)| ExtendJob {
+                            query: q,
+                            target: t,
+                            h0: *h0,
+                        })
+                        .collect();
+                    let (w, eb, zd) = (1 + (next() % 120) as i32, (next() % 12) as i32, 100);
+                    if !mirror {
+                        walked += jobs
+                            .iter()
+                            .filter(|j| super::ungapped_hit_mat(j, &mat, 7, zd).is_some())
+                            .count();
+                    }
+                    let want = super::batched_extend_scalar(&jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd);
+                    let run = |stop| {
+                        super::EXACT_STOP_TEST.with(|c| c.set(Some(stop)));
+                        super::batched_extend(&jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd)
+                    };
+                    let tag = format!("freed ({r},{q}) conv {conv} mirror {mirror} round {round}");
+                    assert_eq!(run(false), want, "{tag}, exact stop off");
+                    // With the stop on, what the caller reads (as `exact_stop_keeps_what_the_caller_reads`).
+                    let seen = |r: &bwa_extend::ExtendResult| {
+                        let glob = r.gscore > 0 && r.gscore > r.score - eb;
+                        let g = glob.then_some((r.gscore, r.gtle));
+                        (r.score, r.qle, r.tle, r.max_off, glob, g)
+                    };
+                    for (k, (g, e)) in run(true).iter().zip(&want).enumerate() {
+                        assert_eq!(seen(g), seen(e), "{tag} job {k}");
+                    }
+                    // The kernel's tight band under `tab5` (the gates above pin it off): the
+                    // scalar reference inside that band reads the same.
+                    if !mirror {
+                        for (k, (j, e)) in jobs.iter().zip(&want).enumerate() {
+                            let (a, mm) = (i32::from(mat[0]), i32::from(mat[1]));
+                            let b =
+                                super::tight_band_bound(j.query, j.target, j.h0, a, mm, (6, 1), eb);
+                            let t = super::batched_extend_scalar(
+                                &[*j],
+                                5,
+                                &mat,
+                                6,
+                                1,
+                                6,
+                                1,
+                                w.min(b),
+                                eb,
+                                zd,
+                            );
+                            assert_eq!(seen(&t[0]), seen(e), "{tag} job {k}, tight band {b}");
+                        }
+                    }
+                    super::EXACT_STOP_TEST.with(|c| c.set(None));
+                }
+            }
+        }
+        assert!(walked >= 200, "the ungapped walk took {walked} jobs");
     }
 }

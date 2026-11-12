@@ -182,7 +182,7 @@ impl Batch {
         max_hits: usize,
         quanta: usize,
     ) -> Option<Decision> {
-        let (dec, t1) = self.decide(t, q, p, max_hits);
+        let (dec, t1) = self.decide(t, q, p, max_hits, None);
         self.commit(idx, t, q, dec, t1, p, quanta)
     }
 
@@ -194,8 +194,9 @@ impl Batch {
         q: &[u8],
         p: &Params,
         max_hits: usize,
+        rel: Option<(u8, u8)>,
     ) -> (Decision, i32) {
-        rescue_prune::decide_bands(t, q, p, max_hits, &mut self.c19, &mut self.ct)
+        rescue_prune::decide_bands(t, q, p, max_hits, &mut self.c19, &mut self.ct, rel)
     }
 
     /// [`Self::plan`] after [`Self::decide`] gave `(dec, t1)` for the same `t` and `q`.
@@ -311,8 +312,9 @@ impl Batch {
     /// give (`qb`/`tb` stay -1 for the reverse pass).
     ///
     /// # Safety
-    /// NEON must be available; `mat` must be the standard 5x5 table and every banded job's score
-    /// ceiling under the u8 limit (the caller's u8-kernel conditions).
+    /// NEON must be available; `mat` must be the standard 5x5 table (or, on aarch64, one
+    /// `matesw::mat5_u8_ok` admits) and every banded job's score ceiling under the u8 limit (the
+    /// caller's u8-kernel conditions).
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn run(
         &mut self,
@@ -336,6 +338,10 @@ impl Batch {
             e_ins as u8,
         ];
         let tbl = crate::matesw::u8_score_table(mat);
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.work.mat5 = neon::mat5_of(mat);
+        }
         let probe = crate::matesw::cells::enabled();
         let t_all = probe.then(std::time::Instant::now);
         let cells0 = self.work.cells;
@@ -568,6 +574,10 @@ impl Batch {
             e_ins as u8,
         ];
         let tbl = crate::matesw::u8_score_table(mat);
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.work.mat5 = neon::mat5_of(mat);
+        }
         self.jobs.clear();
         for (i, &(q, t, s)) in jobs.iter().enumerate() {
             let (len2, nrows) = (q.len() as i32, t.len() as i32);
@@ -901,6 +911,18 @@ pub(crate) mod neon {
     use std::arch::aarch64::*;
 
     pub(super) const L: usize = 16;
+
+    /// [`Work::mat5`] for `mat`.
+    pub(super) fn mat5_of(mat: &[i8]) -> Option<[u8; 32]> {
+        (!crate::matesw::mat_is_standard(5, mat)).then(|| {
+            let mut t = [0u8; 32];
+            for (e, &v) in t.iter_mut().zip(&mat[..25]) {
+                *e = v as u8;
+            }
+            t
+        })
+    }
+
     /// Query code of a cell outside the query (`j < 0` or `j >= quanta`): dead, scores 0.
     const DEAD: u8 = 0xC0;
     /// Query code of a ksw pad column (`len2 <= j < quanta`): scores 0, carries the diagonal.
@@ -929,6 +951,10 @@ pub(crate) mod neon {
     /// first query column there, and the row maxima, lane-major (`rl[lane * rstride + row]`).
     #[derive(Default)]
     pub(super) struct Work {
+        /// A `--meth` matrix (`matesw::mat5_u8_ok`) as signed cells `[ref * 5 + read]`, scored by
+        /// `TBL` on `5 * target + query` (targets staged as `5 * b`, N as 20; every pad code is
+        /// past the table and scores 0, as under the XOR form). `None`: the standard matrix.
+        pub(super) mat5: Option<[u8; 32]>,
         st: Vec<u8>,
         a: Vec<u8>,
         refv: Vec<u8>,
@@ -1053,15 +1079,16 @@ pub(crate) mod neon {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            if gaps[0] == gaps[2] {
-                self.run_impl::<true>(lanes, w, tbl, gaps)
-            } else {
-                self.run_impl::<false>(lanes, w, tbl, gaps)
+            match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
             }
         }
 
         #[target_feature(enable = "neon")]
-        unsafe fn run_impl<const SHARE: bool>(
+        unsafe fn run_impl<const SHARE: bool, const MAT5: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -1124,6 +1151,12 @@ pub(crate) mod neon {
                 {
                     crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
                     crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
+                    if MAT5 {
+                        for b in row[..lane.t.len()].iter_mut() {
+                            *b *= 5;
+                        }
+                        continue;
+                    }
                     // A target N scores -1 against everything through the table's slots 8 and
                     // 12-15 once it is re-encoded as 12 (`N_TARGET`); as 4 it would read the
                     // match slot against a query N. A pruned job holds none; a reverse-pass job
@@ -1141,6 +1174,7 @@ pub(crate) mod neon {
 
             // ---- DP ----
             let tblv = vld1q_u8(tbl.as_ptr());
+            let tbl5v = vld1q_u8_x2(self.mat5.unwrap_or([0; 32]).as_ptr());
             let zero = vdupq_n_u8(0);
             let one = vdupq_n_u8(1);
             let deadv = vdupq_n_u8(DEAD);
@@ -1221,7 +1255,11 @@ pub(crate) mod neon {
             macro_rules! cell {
                 ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
                  $live:expr) => {{
-                    let sc = vqtbl1q_u8(tblv, veorq_u8($q, $rref));
+                    let sc = if MAT5 {
+                        vqtbl2q_u8(tbl5v, vqaddq_u8($rref, $q))
+                    } else {
+                        vqtbl1q_u8(tblv, veorq_u8($q, $rref))
+                    };
                     let mut h0 = vmaxq_u8(vsqaddq_u8($d, vreinterpretq_s8_u8(sc)), $ein);
                     if let Some(m) = $top {
                         h0 = vandq_u8(h0, m);
@@ -2568,7 +2606,7 @@ mod tests {
                         target: t,
                     })
                     .collect();
-                let got = batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p));
+                let got = batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p), None);
                 for (i, (t, q)) in chunk.iter().enumerate() {
                     let full = ksw_align2(q, t, 5, &mat, 6, 1, 6, 1, *minsc, 1, 16);
                     let consumed = |r: &KswAlignResult| r.score >= *minsc;
@@ -2702,7 +2740,7 @@ mod tests {
             }
             let quanta = q.len().div_ceil(16) * 16;
             b.clear();
-            let (dec, t1) = rescue_prune::decide_bands(t, q, &p, 1000, &mut b.c19, &mut b.ct);
+            let (dec, t1) = rescue_prune::decide_bands(t, q, &p, 1000, &mut b.c19, &mut b.ct, None);
             let Decision::Hull { hb, he } = dec else {
                 continue;
             };

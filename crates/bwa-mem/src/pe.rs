@@ -1038,6 +1038,43 @@ fn matesw_collect(
 /// borrowed for as long as the iterator lives (the jobs hold slices, they copy nothing).
 ///
 /// RETURNS between 0 and 4 jobs, one per `Some` entry in `call.per_r`, ascending in orientation.
+/// [`batched_mate_rescue`] over `jobs`, each scored with the matrix its mate gets in
+/// [`mem_matesw`]: `opt.mat` outside `--meth`; under it `MethOpt::mats[group[i]]`, where
+/// `group[i]` is the rescued mate's chemistry (read 1 is C->T) XOR the job's `is_rev`. The two
+/// groups run as two kernel calls, results back in `jobs` order.
+fn rescue_kernel(opt: &MemOpt, jobs: &[KswJob], group: &[bool]) -> Vec<KswAlignResult> {
+    let run = |jobs: &[KswJob], mat: &[i8]| {
+        batched_mate_rescue(
+            jobs,
+            5,
+            mat,
+            opt.o_del,
+            opt.e_del,
+            opt.o_ins,
+            opt.e_ins,
+            opt.min_seed_len * opt.a,
+            opt.a,
+        )
+    };
+    let Some(meth) = &opt.meth else {
+        return run(jobs, &opt.mat);
+    };
+    let mut out: Vec<Option<KswAlignResult>> = vec![None; jobs.len()];
+    for g in [false, true] {
+        let idx: Vec<usize> = (0..jobs.len()).filter(|&i| group[i] == g).collect();
+        if idx.is_empty() {
+            continue;
+        }
+        let sub: Vec<KswJob> = idx.iter().map(|&i| jobs[i]).collect();
+        for (i, r) in idx.into_iter().zip(run(&sub, &meth.mats[usize::from(g)])) {
+            out[i] = Some(r);
+        }
+    }
+    out.into_iter()
+        .map(|r| r.expect("every job is in one group"))
+        .collect()
+}
+
 fn rescue_jobs<'a>(
     call: &'a RescueCall,
     ms: &'a [u8],
@@ -1397,6 +1434,8 @@ pub fn batch_mate_rescue(
         }
         // Every collected orientation's job, identical windows of one (pair, dir) merged.
         let mut jobs: Vec<KswJob> = Vec::new();
+        // `--meth`: each job's matrix group (see `rescue_kernel`).
+        let mut group: Vec<bool> = Vec::new();
         call_jobs.clear();
         job_of.clear();
         head.clear();
@@ -1439,6 +1478,7 @@ pub fn batch_mate_rescue(
                         });
                         head.insert(key, (seen.len() - 1) as u32);
                         jobs.push(job);
+                        group.push((at.1 == 1) ^ o.is_rev);
                         (jobs.len() - 1) as u32
                     }));
                 }
@@ -1455,17 +1495,7 @@ pub fn batch_mate_rescue(
         let alns = if jobs.is_empty() {
             Vec::new()
         } else {
-            batched_mate_rescue(
-                &jobs,
-                5,
-                &opt.mat,
-                opt.o_del,
-                opt.e_del,
-                opt.o_ins,
-                opt.e_ins,
-                opt.min_seed_len * opt.a,
-                opt.a,
-            )
+            rescue_kernel(opt, &jobs, &group)
         };
         drop(jobs);
         crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
@@ -1488,17 +1518,13 @@ pub fn batch_mate_rescue(
                     matesw_collect(fm, bns, opt, pes, &a, ms, target, view, &mut own)
                 {
                     let jobs: Vec<KswJob> = rescue_jobs(&call, ms, &own).collect();
-                    let alns = batched_mate_rescue(
-                        &jobs,
-                        5,
-                        &opt.mat,
-                        opt.o_del,
-                        opt.e_del,
-                        opt.o_ins,
-                        opt.e_ins,
-                        opt.min_seed_len * opt.a,
-                        opt.a,
-                    );
+                    let group: Vec<bool> = call
+                        .per_r
+                        .iter()
+                        .flatten()
+                        .map(|o| (dir == 1) ^ o.is_rev)
+                        .collect();
+                    let alns = rescue_kernel(opt, &jobs, &group);
                     matesw_apply(fm, bns, opt, &call, &alns, target, view);
                 }
                 continue;

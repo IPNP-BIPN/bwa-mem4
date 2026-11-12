@@ -397,7 +397,7 @@ pub mod cells {
             PRUNE_HULL.load(Ordering::Relaxed),
             PRUNE_FULL.load(Ordering::Relaxed),
         );
-        if fail + hull + full > 0 {
+        if fail + hull + full + PRUNE_BAND.load(Ordering::Relaxed) > 0 {
             let (rin, rkept) = (
                 HULL_ROWS_IN.load(Ordering::Relaxed),
                 HULL_ROWS_KEPT.load(Ordering::Relaxed),
@@ -484,7 +484,7 @@ pub fn batched_ksw_align2(
     max_sc: i32,
 ) -> Vec<KswAlignResult> {
     batched_align(
-        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, None,
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, None, None,
     )
 }
 
@@ -520,7 +520,42 @@ pub fn batched_mate_rescue(
     minsc: i32,
     max_sc: i32,
 ) -> Vec<KswAlignResult> {
-    let prune = prune_params(m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
+    let merged = crate::merged_pair(m, mat);
+    if let Some((x, y, uni, true)) = merged {
+        let (buf, spans) = crate::rewrite_jobs(jobs.iter().map(|j| (j.query, j.target)), x, y);
+        let conv: Vec<KswJob> = spans
+            .iter()
+            .map(|&(a, b, c)| KswJob {
+                query: &buf[a..b],
+                target: &buf[b..c],
+            })
+            .collect();
+        return batched_mate_rescue(&conv, m, &uni, o_del, e_del, o_ins, e_ins, minsc, max_sc);
+    }
+    // `--meth` neutral / genomic (`merged_pair` without `exact`): the prune bounds the uniform
+    // matrix with the freed cell counted a match (`rescue_prune::decide_rel`'s relation), which
+    // scores every cell at least as high as `mat`, with the same gaps. Every local score, hence
+    // every row maximum, is then at least as high, so a window proven below `minsc` under it is
+    // below it here, and a hull holding every alignment reaching `minsc` holds every one here.
+    let (prune, rel) = match merged {
+        Some((x, y, uni, false)) => {
+            let mm = uni[x as usize * 5 + y as usize];
+            // The freed (target, query) cell; both freed would be the exact rewrite above.
+            let rel = if mat[x as usize * 5 + y as usize] > mm {
+                (x, y)
+            } else {
+                (y, x)
+            };
+            (
+                prune_params(m, &uni, o_del, e_del, o_ins, e_ins, minsc, max_sc),
+                Some(rel),
+            )
+        }
+        _ => (
+            prune_params(m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc),
+            None,
+        ),
+    };
     // `BWA4_RESCUE_DUMP=path`: append every rescue job (u32 target length, u32 query length,
     // target bytes, query bytes, little-endian) to `path`, the input of `rescue_prune`'s offline
     // bench. A debugging aid; off unless set.
@@ -543,7 +578,7 @@ pub fn batched_mate_rescue(
         }
     }
     batched_align(
-        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, prune,
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, prune, rel,
     )
 }
 
@@ -594,6 +629,8 @@ pub(crate) fn batched_align(
     minsc: i32,
     max_sc: i32,
     prune: Option<rescue_prune::Params>,
+    // The relation the prune decides under (`--meth`, see `rescue_prune::decide_rel`).
+    rel: Option<(u8, u8)>,
 ) -> Vec<KswAlignResult> {
     // `Some(start instant)` only when BWA4_MATESW_TIME is set; `None` disables all accounting so the
     // stock path pays one cached bool load and nothing else.
@@ -678,7 +715,14 @@ pub(crate) fn batched_align(
         && !matches!(forced_rescue_tier(), RescueTier::Scalar)
         && crate::rescue_band::kernel_available()
         && crate::rescue_band::gaps_ok(o_del, e_del, o_ins, e_ins)
-        && mat_is_standard(m, mat)
+        && (mat_is_standard(m, mat) || {
+            // shortcut: x86's band kernels score the XOR form only; `--meth` there runs hulls.
+            #[cfg(target_arch = "aarch64")]
+            let mat5 = mat5_u8_ok(m, mat);
+            #[cfg(not(target_arch = "aarch64"))]
+            let mat5 = false;
+            mat5
+        })
         && u8_table_has_headroom(mat);
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let mut band = BAND.with(|c| c.take());
@@ -748,7 +792,7 @@ pub(crate) fn batched_align(
                     && j.query.len() < U8_SCORE_LIMIT as usize =>
             {
                 let quanta = ksw_padded_qlen(j.query.len(), max_sc);
-                let (d, t1) = band.decide(j.target, j.query, &p, prune_max_hits());
+                let (d, t1) = band.decide(j.target, j.query, &p, prune_max_hits(), rel);
                 if let Some((hb, n)) = kept(&d, j.target.len()) {
                     let fp = window_fp(&j.target[hb..hb + n]);
                     if let Some((src, sh)) = find(&group, j, hb, n, fp) {
@@ -770,7 +814,10 @@ pub(crate) fn batched_align(
                 }
             }
             Some(p) => {
-                let d = rescue_prune::decide(j.target, j.query, &p, prune_max_hits());
+                let d = match rel {
+                    Some(r) => rescue_prune::decide_rel(j.target, j.query, &p, prune_max_hits(), r),
+                    None => rescue_prune::decide(j.target, j.query, &p, prune_max_hits()),
+                };
                 if let Some((hb, n)) = kept(&d, j.target.len()) {
                     let fp = window_fp(&j.target[hb..hb + n]);
                     if let Some((src, sh)) = find(&group, j, hb, n, fp) {
@@ -1484,7 +1531,8 @@ pub(crate) fn fwd_local_sw_batch(
     #[cfg(target_arch = "aarch64")]
     {
         // avx2/avx512 forces have no aarch64 meaning; NEON is the only vector tier here.
-        if std::arch::is_aarch64_feature_detected!("neon") && mat_is_standard(m, mat) {
+        let standard = mat_is_standard(m, mat);
+        if std::arch::is_aarch64_feature_detected!("neon") && (standard || mat5_u8_ok(m, mat)) {
             // Max reachable score per job = min(len) * match. Only the SCORE cells (H/E/F) live in the
             // SIMD vector; positions/te/qe are scalar i32, so window length is unconstrained. If every
             // job's score ceiling fits u8, run 16 lanes; else the i16 kernel at 8 lanes. Mate-rescue
@@ -1504,9 +1552,11 @@ pub(crate) fn fwd_local_sw_batch(
                     fwd_local_sw_neon_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                 };
             }
-            if jobs.iter().all(|j| {
-                score_ceiling(j) < I16_SCORE_LIMIT && j.target.len() < I16_SCORE_LIMIT as usize
-            }) {
+            if standard
+                && jobs.iter().all(|j| {
+                    score_ceiling(j) < I16_SCORE_LIMIT && j.target.len() < I16_SCORE_LIMIT as usize
+                })
+            {
                 // SAFETY: neon detected; i16 range guaranteed; standard mat.
                 return unsafe {
                     fwd_local_sw_neon(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
@@ -1514,6 +1564,8 @@ pub(crate) fn fwd_local_sw_batch(
             }
         }
     }
+    // shortcut: a `--meth` matrix runs the scalar kernel on x86_64 (NEON alone has the 5x5 table
+    // form), port `MAT5` to the AVX2/AVX-512 u8 kernels when `--meth` speed on x86 matters.
     #[cfg(target_arch = "x86_64")]
     {
         if mat_is_standard(m, mat) {
@@ -1596,6 +1648,17 @@ pub(crate) fn fwd_local_sw_batch(
     fwd_local_sw_scalar(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
 }
 
+/// Whether the NEON u8 rescue kernel's 5x5 table form (`MAT5`) takes `mat`: a 5x5 matrix whose
+/// every cell lies between the mismatch `mat[1]` and the match `mat[0]`, with the byte headroom the
+/// standard form needs. `--meth`'s matrices are of this shape (the freed cell is 0 or `a`).
+#[cfg(target_arch = "aarch64")]
+fn mat5_u8_ok(m: usize, mat: &[i8]) -> bool {
+    m == 5
+        && mat[1] <= 0
+        && mat[..25].iter().all(|v| (mat[1]..=mat[0]).contains(v))
+        && u8_table_has_headroom(mat)
+}
+
 /// Whether `mat` is bwa's standard 5x5 form (uniform match on the diagonal, uniform mismatch
 /// off-diagonal for `0..4`, `-1` for any N row/col) so the NEON kernel can compute cell scores from
 /// three scalars instead of a per-cell table lookup.
@@ -1612,7 +1675,7 @@ pub(crate) fn fwd_local_sw_batch(
 /// Gated on aarch64/x86_64: its only callers are the NEON and AVX2 dispatches, so elsewhere it is
 /// dead code and `-D warnings` would reject it.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn mat_is_standard(m: usize, mat: &[i8]) -> bool {
+pub(crate) fn mat_is_standard(m: usize, mat: &[i8]) -> bool {
     if m != 5 {
         return false;
     }
@@ -2304,7 +2367,7 @@ const LANES16: usize = 16;
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
+unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, const MAT5: bool>(
     jobs: &[FwdJob],
     // Matrix dimension (5). No longer read now that dead-cell detection keys on the PAD byte's high
     // bit rather than `>= m`; kept in the signature for parity with the i16 and AVX2 kernels.
@@ -2390,6 +2453,25 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
         }
     }
     let score_tbl = vld1q_u8(tbl.as_ptr());
+    // `MAT5` (`--meth`'s matrices, whose freed C/T or G/A cell no `target XOR query` class can hold):
+    // the matrix itself as a 32-entry table indexed by `5 t + q`, `seq_t` holding `5 t` (N lands on
+    // 20). The index is a SATURATING add so a PAD byte (255) still reads past the table and scores
+    // 0, as it does in the XOR form; a ZPAD index is overridden by the zpad blend in both forms.
+    // Every cell lies in `[mat[1], mat[0]]` (`mat5_u8_ok`), so the biased entries stay >= 0.
+    let mut tbl5 = [0u8; 32];
+    for (e, &v) in tbl5.iter_mut().zip(&mat[..25]) {
+        *e = (i32::from(bias) + i32::from(v)) as u8;
+    }
+    let score_tbl5 = vld1q_u8_x2(tbl5.as_ptr());
+    macro_rules! score {
+        ($t:expr, $q:expr) => {
+            if MAT5 {
+                vqtbl2q_u8(score_tbl5, vqaddq_u8($t, $q))
+            } else {
+                vqtbl1q_u8(score_tbl, veorq_u8($t, $q))
+            }
+        };
+    }
     let bias_v = vdupq_n_u8(bias);
     let high_bit_v = vdupq_n_u8(0x80);
 
@@ -2477,7 +2559,13 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
             // The N re-encoding, applied once per target base here so the column loops never pay
             // for it. See the score-table comment above.
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES16 + l] = if b == 4 { N_TARGET } else { b };
+                seq_t[r * LANES16 + l] = if MAT5 {
+                    5 * b
+                } else if b == 4 {
+                    N_TARGET
+                } else {
+                    b
+                };
             }
         }
 
@@ -2620,7 +2708,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
 
                     // Row i. `e_v` is E(i, j), the only E that comes from memory.
-                    let s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
+                    let s0 = score!(t0_v, q_v);
                     let diag0 = diag!(d0, s0);
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(diag0, e_v);
@@ -2633,7 +2721,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
 
                     // Row i+1, whose diagonal H(i, j-1) is the previous column's `h0` and whose E
                     // carry row i just produced in a register.
-                    let s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
+                    let s1 = score!(t1_v, q_v);
                     let diag1 = diag!(d1, s1);
                     let mfe1 = vmaxq_u8(diag1, e1);
                     let h1 = vmaxq_u8(mfe1, f1);
@@ -2644,7 +2732,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     d1 = h0;
 
                     // Row i+2.
-                    let s2 = vqtbl1q_u8(score_tbl, veorq_u8(t2_v, q_v));
+                    let s2 = score!(t2_v, q_v);
                     let diag2 = diag!(d2, s2);
                     let mfe2 = vmaxq_u8(diag2, e2);
                     let h2 = vmaxq_u8(mfe2, f2);
@@ -2655,7 +2743,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     d2 = h1;
 
                     // Row i+3, the only one of the four whose H and E reach memory.
-                    let s3 = vqtbl1q_u8(score_tbl, veorq_u8(t3_v, q_v));
+                    let s3 = score!(t3_v, q_v);
                     let diag3 = diag!(d3, s3);
                     let mfe3 = vmaxq_u8(diag3, e3);
                     let h3 = vmaxq_u8(mfe3, f3);
@@ -2678,7 +2766,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     let zpad_mask = vceqq_u8(q_v, zpad_v);
                     let q_pad = vtstq_u8(q_v, high_bit_v);
 
-                    let s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
+                    let s0 = score!(t0_v, q_v);
                     let scored0 = diag!(d0, s0);
                     let pad0 = vorrq_u8(q_pad, vtstq_u8(t0_v, high_bit_v));
                     let mut diag0 = vbslq_u8(zpad_mask, d0, scored0);
@@ -2692,7 +2780,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     f0 = f0_next;
                     d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
 
-                    let s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
+                    let s1 = score!(t1_v, q_v);
                     let scored1 = diag!(d1, s1);
                     let pad1 = vorrq_u8(q_pad, vtstq_u8(t1_v, high_bit_v));
                     let mut diag1 = vbslq_u8(zpad_mask, d1, scored1);
@@ -2705,7 +2793,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     f1 = f1_next;
                     d1 = h0;
 
-                    let s2 = vqtbl1q_u8(score_tbl, veorq_u8(t2_v, q_v));
+                    let s2 = score!(t2_v, q_v);
                     let scored2 = diag!(d2, s2);
                     let pad2 = vorrq_u8(q_pad, vtstq_u8(t2_v, high_bit_v));
                     let mut diag2 = vbslq_u8(zpad_mask, d2, scored2);
@@ -2718,7 +2806,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     f2 = f2_next;
                     d2 = h1;
 
-                    let s3 = vqtbl1q_u8(score_tbl, veorq_u8(t3_v, q_v));
+                    let s3 = score!(t3_v, q_v);
                     let scored3 = diag!(d3, s3);
                     let pad3 = vorrq_u8(q_pad, vtstq_u8(t3_v, high_bit_v));
                     let mut diag3 = vbslq_u8(zpad_mask, d3, scored3);
@@ -2803,7 +2891,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
 
                     // Row i.
-                    let s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
+                    let s0 = score!(t0_v, q_v);
                     let diag0 = diag!(d0, s0);
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(diag0, e_v);
@@ -2817,7 +2905,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
 
                     // Row i+1, whose diagonal H(i, j-1) is the previous column's `h0`.
-                    let s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
+                    let s1 = score!(t1_v, q_v);
                     let diag1 = diag!(d1, s1);
                     let mfe1 = vmaxq_u8(diag1, e_mid);
                     let h1 = vmaxq_u8(mfe1, f1);
@@ -2836,7 +2924,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
                     let zpad_mask = vceqq_u8(q_v, zpad_v);
 
-                    let s0 = vqtbl1q_u8(score_tbl, veorq_u8(t0_v, q_v));
+                    let s0 = score!(t0_v, q_v);
                     let scored0 = diag!(d0, s0);
                     let pad0 = vtstq_u8(vorrq_u8(t0_v, q_v), high_bit_v);
                     let mut diag0 = vbslq_u8(zpad_mask, d0, scored0);
@@ -2850,7 +2938,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     f0 = f0_next;
                     d0 = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
 
-                    let s1 = vqtbl1q_u8(score_tbl, veorq_u8(t1_v, q_v));
+                    let s1 = score!(t1_v, q_v);
                     let scored1 = diag!(d1, s1);
                     let pad1 = vtstq_u8(vorrq_u8(t1_v, q_v), high_bit_v);
                     let mut diag1 = vbslq_u8(zpad_mask, d1, scored1);
@@ -2931,7 +3019,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                 // which WOULD read a false match at `xor == 0`, cannot occur below `n_fast`.
                 for j in 0..n_fast {
                     let q_v = vld1q_u8(seq_q.as_ptr().add(j * LANES16));
-                    let sbt = vqtbl1q_u8(score_tbl, veorq_u8(t_v, q_v));
+                    let sbt = score!(t_v, q_v);
                     let diag_v = diag!(h_diag_v, sbt);
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe = vmaxq_u8(diag_v, e_v);
@@ -2955,8 +3043,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool>(
                     // lookup on `target XOR query` (see `score_tbl`), biased so it applies as a
                     // single saturating add followed by a de-biasing saturating subtract. Both
                     // saturations floor the result at 0, so no explicit `max(0, .)` is needed.
-                    let xor_v = veorq_u8(t_v, q_v);
-                    let sbt = vqtbl1q_u8(score_tbl, xor_v);
+                    let sbt = score!(t_v, q_v);
                     // A target N (code 4) scores -1, including the both-N cell the table read as a
                     // match (XOR 0). Only the target can be a real code XOR-ing to 0 with an N, so
                     // `t == 4` alone catches every case the table gets wrong; a query-side N
@@ -3085,17 +3172,30 @@ unsafe fn fwd_local_sw_neon_u8(
 ) -> Vec<(i32, i32, i32, i32, i32)> {
     let usqadd = usqadd_enabled();
     let share_oe = shareoe_enabled() && (o_del + e_del) == (o_ins + e_ins);
+    // A non-standard matrix (`--meth`) takes the 5x5 table form, always with `USQADD`: two bodies
+    // rather than four, the toggle being an A/B aid for the standard path only.
+    if !mat_is_standard(m, mat) {
+        return if share_oe {
+            fwd_local_sw_neon_u8_impl::<true, true, true>(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc,
+            )
+        } else {
+            fwd_local_sw_neon_u8_impl::<true, false, true>(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc,
+            )
+        };
+    }
     match (usqadd, share_oe) {
-        (true, true) => fwd_local_sw_neon_u8_impl::<true, true>(
+        (true, true) => fwd_local_sw_neon_u8_impl::<true, true, false>(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc,
         ),
-        (true, false) => fwd_local_sw_neon_u8_impl::<true, false>(
+        (true, false) => fwd_local_sw_neon_u8_impl::<true, false, false>(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc,
         ),
-        (false, true) => fwd_local_sw_neon_u8_impl::<false, true>(
+        (false, true) => fwd_local_sw_neon_u8_impl::<false, true, false>(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc,
         ),
-        (false, false) => fwd_local_sw_neon_u8_impl::<false, false>(
+        (false, false) => fwd_local_sw_neon_u8_impl::<false, false, false>(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc,
         ),
     }
@@ -6282,7 +6382,7 @@ mod tests {
         // SAFETY: neon detected above; 147 bp queries and a score ceiling of 147 both under 250;
         // `scmat` is standard.
         let got = unsafe {
-            fwd_local_sw_neon_u8_impl::<true, true>(
+            fwd_local_sw_neon_u8_impl::<true, true, false>(
                 &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc,
             )
         };
@@ -6365,25 +6465,25 @@ mod tests {
             for (name, got) in [
                 (
                     "usqadd+shareoe",
-                    fwd_local_sw_neon_u8_impl::<true, true>(
+                    fwd_local_sw_neon_u8_impl::<true, true, false>(
                         &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc,
                     ),
                 ),
                 (
                     "usqadd",
-                    fwd_local_sw_neon_u8_impl::<true, false>(
+                    fwd_local_sw_neon_u8_impl::<true, false, false>(
                         &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc,
                     ),
                 ),
                 (
                     "shareoe",
-                    fwd_local_sw_neon_u8_impl::<false, true>(
+                    fwd_local_sw_neon_u8_impl::<false, true, false>(
                         &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc,
                     ),
                 ),
                 (
                     "baseline",
-                    fwd_local_sw_neon_u8_impl::<false, false>(
+                    fwd_local_sw_neon_u8_impl::<false, false, false>(
                         &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc,
                     ),
                 ),
@@ -6397,6 +6497,153 @@ mod tests {
                         j.target.len()
                     );
                 }
+            }
+        }
+    }
+
+    /// `--meth` neutral / genomic rescue (the `MAT5` kernel, the prune deciding under the
+    /// relation) against the unpruned `batched_ksw_align2`: equal on every job scoring `>= minsc`,
+    /// and `qb = tb = -1` below it, the contract `mem_matesw` reads. Windows hold a converted
+    /// mate, a random one, or a converted mate under heavy noise, so all three decisions occur.
+    #[test]
+    fn mate_rescue_meth_relation_prune_is_exact() {
+        let (o_del, e_del, o_ins, e_ins, minsc) = (6, 1, 6, 1, 19);
+        let mut state = 0x7a95_c0de_1357_9bdfu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for (r, q) in [(1usize, 3usize), (2, 0)] {
+            for conv in [0i8, 1] {
+                let mut mat = scmat(1, 4);
+                mat[r * 5 + q] = conv;
+                assert!(matches!(
+                    crate::merged_pair(5, &mat),
+                    Some((_, _, _, false))
+                ));
+                let (mut qbufs, mut tbufs) = (Vec::new(), Vec::new());
+                for k in 0..300usize {
+                    let qlen = 60 + (next() % 91) as usize;
+                    let tlen = qlen + 50 + (next() % 900) as usize;
+                    let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+                    let qv: Vec<u8> = if k % 3 == 1 {
+                        (0..qlen).map(|_| (next() % 4) as u8).collect()
+                    } else {
+                        let at = next() as usize % (tlen - qlen);
+                        let noise = if k % 3 == 2 { 4 } else { 40 };
+                        t[at..at + qlen]
+                            .iter()
+                            .map(|&b| match next() % noise {
+                                0 => (next() % 4) as u8,
+                                _ if b as usize == r && next() % 2 == 0 => q as u8,
+                                _ => b,
+                            })
+                            .collect()
+                    };
+                    if k % 50 == 0 {
+                        t[next() as usize % tlen] = 4;
+                    }
+                    qbufs.push(qv);
+                    tbufs.push(t);
+                }
+                let jobs: Vec<KswJob> = qbufs
+                    .iter()
+                    .zip(&tbufs)
+                    .map(|(q, t)| KswJob {
+                        query: q,
+                        target: t,
+                    })
+                    .collect();
+                let want = batched_ksw_align2(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, 1);
+                let got = batched_mate_rescue(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, minsc, 1);
+                let mut low = 0;
+                for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                    if w.score >= minsc {
+                        assert_eq!(g, w, "freed ({r},{q}) conv {conv} job {k}");
+                    } else {
+                        low += 1;
+                        assert!(
+                            g.score < minsc && g.qb == -1 && g.tb == -1,
+                            "job {k}: {g:?}"
+                        );
+                    }
+                }
+                assert!((50..=250).contains(&low), "low {low}");
+            }
+        }
+    }
+
+    /// The 5x5 table form (`MAT5`, `--meth`'s matrices) against the scalar kernel: OT and OB, with
+    /// the freed cell neutral (0) and collapsed (`a`, mirrored), N on both sides, ragged windows,
+    /// and queries planted with their C (or G) bisulfite-converted so the freed cell decides scores.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn matesw_mat5_meth_equals_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let (o_del, e_del, o_ins, e_ins) = (6, 1, 6, 1);
+        let mut state = 0x5eed_0f_c0ffee_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        // (ref base, read base) of the freed cell: OT C->T, OB G->A.
+        for (r, q) in [(1usize, 3usize), (2, 0)] {
+            for collapsed in [false, true] {
+                let mut mat = scmat(1, 4);
+                mat[r * 5 + q] = if collapsed { 1 } else { 0 };
+                if collapsed {
+                    mat[q * 5 + r] = 1;
+                }
+                assert!(!mat_is_standard(5, &mat) && mat5_u8_ok(5, &mat));
+                let mut qbufs: Vec<Vec<u8>> = Vec::new();
+                let mut tbufs: Vec<Vec<u8>> = Vec::new();
+                for k in 1..=40usize {
+                    let tlen = 150 + k * 37;
+                    let qlen = (40 + (next() % 111) as usize).min(tlen / 2);
+                    let t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+                    let at = next() as usize % (tlen - qlen);
+                    let qv: Vec<u8> = t[at..at + qlen]
+                        .iter()
+                        .map(|&b| {
+                            if b as usize == r && next() % 2 == 0 {
+                                q as u8
+                            } else {
+                                b
+                            }
+                        })
+                        .collect();
+                    qbufs.push(qv);
+                    tbufs.push(t);
+                }
+                let jobs: Vec<FwdJob> = qbufs
+                    .iter()
+                    .zip(&tbufs)
+                    .map(|(q, t)| FwdJob {
+                        query: q,
+                        target: t,
+                        minsc: 19,
+                        endsc: i32::MAX,
+                    })
+                    .collect();
+                let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 1);
+                assert_eq!(
+                    fwd_local_sw_batch(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 1),
+                    want
+                );
+                // SAFETY: neon detected; queries and score ceilings under 250; `mat5_u8_ok`.
+                let split = unsafe {
+                    fwd_local_sw_neon_u8_impl::<true, false, true>(
+                        &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 1,
+                    )
+                };
+                assert_eq!(split, want);
+                assert!(want.iter().filter(|w| w.0 >= 19).count() >= 30);
             }
         }
     }
