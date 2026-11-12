@@ -317,6 +317,10 @@ jobs:
                      'bwa_mem4_mem::cigar::gen_cigar2::{{closure}}' \
                      'bwa_mem4_extend::sw::ksw_global2' \
                      '_mi_theap_malloc_zero' \
+                     'bwa_mem4_chain::chain_seeds' \
+                     'bwa_mem4_chain::sa_positions_for_read' \
+                     'bwa_mem4_chain::flt_ranked' \
+                     'alloc::vec::in_place_collect::.*from_iter' \
                      'mi_free'; do
           sym=$("$PERF" report -i ours.data --stdio --no-children 2>/dev/null \
             | grep -o "$pat" | head -1 || true)
@@ -328,6 +332,17 @@ jobs:
             "$PERF" annotate -i ours.data --stdio --no-source "$sym" 2>/dev/null \
               | grep -E '^\s+[0-9]+\.[0-9]+ +:' | sort -rn | head -60 || true
           fi
+          done
+
+          # The fork's round 3 + chain filter (mem_kernel1_core) and chaining, by source line: what
+          # our seeding drivers and bwa-chain are measured against.
+          for pat in 'mem_kernel1_core' 'mem_chain_seeds'; do
+            sym=$("$PERF" report -i fork.data --stdio --no-children 2>/dev/null \
+              | grep -o "${pat}([^)]*)" | head -1 || true)
+            [ -n "$sym" ] || continue
+            echo "===== fork: hottest source lines of $pat ====="
+            "$PERF" annotate -i fork.data --stdio -l "$sym" 2>/dev/null \
+              | grep -E '^\s+[0-9]+\.[0-9]+ ' | sort -rn | head -80 || true
           done
 
           # The fork's extension kernel, every sampled instruction in address order, beside ours:
@@ -612,11 +627,14 @@ jobs:
           for (f, ln), ir in c.most_common(100):
               print(f"{ir:14d} {f.split('/bwa-mem4/bwa-mem4/')[-1]}:{ln}")
           PY
-            # The same per line, inside the seeding drivers only (their inlined code included).
-            echo "===== $arm: instructions by source line in the seeding drivers ====="
-            python3 - "$arm.cg" <<'PY'
+            # The same per line, inside the seeding drivers, then inside chaining (their inlined code
+            # included). The fork's mem_kernel1_core holds round 3 and the chain filter, so it is in both.
+            for sel in "seeding drivers|mem_collect_smem_batched|getSMEMs|bwtSeedStrategy|mem_kernel1_core|ls_advance|bsd_" \
+                       "chaining|chain_seeds|sa_positions_for_read|flt_ranked|in_place_collect|build_filtered|mem_chain_seeds|mem_chain_flt|mem_kernel1_core"; do
+            echo "===== $arm: instructions by source line in the ${sel%%|*} ====="
+            python3 - "$arm.cg" "${sel#*|}" <<'PY'
           import sys, collections, re
-          want = re.compile(r"mem_collect_smem_batched|getSMEMs|bwtSeedStrategy|mem_kernel1_core|ls_advance|bsd_")
+          want = re.compile(sys.argv[2])
           c = collections.Counter(); fn = collections.Counter(); fl = f = g = "?"; skip = False
           for l in open(sys.argv[1]):
               if l[:1].isdigit():
@@ -639,6 +657,7 @@ jobs:
           for (f, ln), ir in c.most_common(150):
               print(f"{ir:14d} {f.split('/bwa-mem4/bwa-mem4/')[-1]}:{ln}")
           PY
+            done
             # Under CG_FLAGS' simulators: each miss event (branch mispredicts Bcm/Bim, cache misses
             # D1mr/DLmr...) per function, then per source line inside the seeding drivers.
             if [ -n "$CG_FLAGS" ]; then python3 - "$arm.cg" <<'PY'
