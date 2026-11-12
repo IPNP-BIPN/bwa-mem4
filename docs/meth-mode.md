@@ -166,10 +166,7 @@ FORK=/path/to/bwa-mem3 GENOME=/path/to/GRCh38.fa scripts/meth_oracle_diff.sh
 Current result: `PASS: every configuration identical`.
 
 The 200,000-pair sets of [Speed](#speed) are also compared, at `-K 10000000`. bwa-mem3 sizes its
-batches by `-t`, and the insert-size model is per batch. EM-seq is identical. TAPS differs on 15
-pairs of 200,000, the same 15 before the speed work (commit 9f2a0df). In each, bwa-mem3 rescues
-a mate from a read-1 region that bwa-mem4 does not list, on a low-complexity read
-(`sim13347` reproduces it alone with `-I 298.36877747837184,49.874227483371115,533,64`).
+batches by `-t`, and the insert-size model is per batch. Both sets are identical.
 
 The script needs the bwa-mem3 binary and a GRCh38 FASTA, so it does not run in CI. CI runs the
 unit tests:
@@ -188,8 +185,9 @@ reach those kernels in three ways:
 - **Collapsed scoring** (the EM-seq default) frees C/T in both directions at the match score. It
   is exactly the uniform matrix on copies of both sequences with T rewritten as C (A as G for OB),
   so extension and rescue run the plain kernels on those copies.
-- **Genomic and neutral scoring** (the TAPS and 5-base default) go through a 5×5 table. The NEON
-  u8 extension, rescue and band kernels look up `5 × reference + read` with a two-register `TBL`.
+- **Genomic and neutral scoring** (the TAPS and 5-base default) go through a 5×5 table. The u8
+  extension, rescue and band kernels look up `5 × reference + read`: a two-register `TBL` on
+  NEON, two `PSHUFB` on SSE4.1, AVX2 and AVX-512.
 - **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
   also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
   cell scores at most the match score, so the bound holds.
@@ -211,9 +209,8 @@ Each cell is bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each.
 The machine was loaded (load average 6 to 9) during these runs. Cycles and instructions are the
 steadier comparison.
 
-On x86, the genomic and neutral matrices (TAPS, 5-base) still extend and rescue with the scalar
-kernels, and the x86 band kernels score the uniform matrix only. EM-seq (collapsed) uses the AVX2
-and AVX-512 kernels. Neither case is measured on x86.
+On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` times both binaries on
+200,000 pairs simulated from chr21, on the runner's CPU.
 
 ## Differences from bwa-mem3 0.16
 
@@ -232,8 +229,6 @@ None of these differences shows up on the test set.
 - **`-x` presets** cannot be combined with `--meth`.
 - **bwa-mem3's `--bam` option** (uncompressed BAM output) is not available. Use `-o out.bam` in a
   build with the `hts-output` feature, or pipe the SAM into samtools.
-- **15 TAPS pairs in 200,000** differ (see [Validation](#validation)). The 5,000-pair test set
-  does not hit them.
 
 ## What Bismark needs
 

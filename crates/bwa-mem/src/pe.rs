@@ -2035,7 +2035,7 @@ fn mem_pair_in(
             // low half of `x` is a within-contig offset and always fits in 32 bits.
             let off = bns.contigs[reg.rid as usize].offset;
             let x = (u64::from(reg.rid as u32) << 32) | (fpos - off) as u64;
-            // `reg.score` is a positive i32 well under 2^31, so the `as u64` shift matches C's
+            // `reg.score` is an i32 (negative only under --meth), so the `as u64` shift matches C's
             // `(uint64_t)e->score << 32`. `i << 2` leaves the two low bits for strand and read,
             // which caps the region index at 2^30 (never approached).
             let y = ((reg.score as u64) << 32)
@@ -2112,10 +2112,17 @@ fn mem_pair_in(
                 let erfc_term = unsafe { erfc(ns.abs() * M_SQRT1_2) };
                 // `v[..].1 >> 32` recovers each end's alignment score from the packed `y`. The
                 // `+ 0.499` is C's round-half-up, applied once to the whole sum, not per term.
-                let q = ((v[i].1 >> 32) as f64
-                    + (v[ku].1 >> 32) as f64
-                    + INV_LOG4 * (2.0 * erfc_term).ln() * f64::from(opt.a)
-                    + 0.499) as i64;
+                // Read the scores back signed: only --meth regions score below zero, and the fork
+                // gives such a pair q = 0 (still pushed, so it counts toward `sub` / `n_sub`).
+                let (sc_i, sc_k) = ((v[i].1 >> 32) as u32 as i32, (v[ku].1 >> 32) as u32 as i32);
+                let q = if sc_i < 0 || sc_k < 0 {
+                    0
+                } else {
+                    (f64::from(sc_i)
+                        + f64::from(sc_k)
+                        + INV_LOG4 * (2.0 * erfc_term).ln() * f64::from(opt.a)
+                        + 0.499) as i64
+                };
                 // A pair whose insert penalty exceeds its alignment scores floors at 0 rather than
                 // going negative, so it can still be selected if nothing better exists.
                 let q = q.max(0) as u64;
@@ -3753,5 +3760,53 @@ mod matesw_apply_tests {
         let (mut ma, mut view) = (ma0, RegionView::default());
         matesw_apply(&fm, &bns, &opt, &call, &[miss], &mut ma, &mut view);
         assert_eq!(format!("{ma:?}"), format!("{want:?}"));
+    }
+
+    /// Under --meth a region can score below zero. The fork scores a pair with such an end q = 0
+    /// (bwamem_pair.cpp, mem_pair); reading the packed score back unsigned made it the best pair.
+    #[test]
+    fn negative_score_end_pairs_at_zero() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let bns = BntSeq::load(std::path::Path::new(prefix)).unwrap();
+        let opt = MemOpt::default();
+        let reg = |rb: i64, score: i32| MemAlnReg {
+            rb,
+            re: rb + 150,
+            qb: 0,
+            qe: 150,
+            rid: 0,
+            score,
+            truesc: score,
+            sub: 0,
+            csub: 0,
+            sub_n: 0,
+            seedcov: 50,
+            seedlen0: 0,
+            secondary: -1,
+            secondary_all: 0,
+            w: 0,
+            frac_rep: 0.0,
+            is_alt: false,
+            alt_sc: 0,
+            hash: 0,
+        };
+        let pes = [PeStat {
+            low: 1,
+            high: 10_000,
+            failed: false,
+            avg: 300.0,
+            std: 50.0,
+        }; 4];
+        // read 1 forward at 100, read 2 reverse ending at forward 400: one FR candidate.
+        let rev = 2 * bns.l_pac - 400;
+        let score = |sc2| {
+            let (a0, a1) = ([reg(100, 20)], [reg(rev, sc2)]);
+            mem_pair(&bns, &opt, &pes, &[&a0, &a1], 7).map(|p| p.score)
+        };
+        assert!(
+            score(5).is_some_and(|q| q > 0),
+            "the setup must form a pair"
+        );
+        assert_eq!(score(-5), Some(0));
     }
 }

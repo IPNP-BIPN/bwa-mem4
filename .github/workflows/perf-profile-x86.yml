@@ -743,6 +743,18 @@ jobs:
       - if: steps.host.outputs.ok == '1'
         uses: Swatinem/rust-cache@v2
 
+      - name: Install perf
+        if: steps.host.outputs.ok == '1'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic || true
+          PERF=$(ls /usr/lib/linux-tools*/perf 2>/dev/null | head -1)
+          [ -n "$PERF" ] || { echo "::error::no perf binary found"; exit 1; }
+          echo "PERF=$PERF" >> "$GITHUB_ENV"
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+          sudo sysctl -w kernel.kptr_restrict=0
+
       - name: Fetch micromamba (retried; its CDN returns 504s)
         if: steps.host.outputs.ok == '1'
         shell: bash
@@ -835,3 +847,28 @@ jobs:
                        f = a[1] "," a[2] ",fork"
                        printf "%-5s %3s  %7.2f/%-7.2f  %7.2f/%-7.2f  %6d/%-6d  %.3f %.3f %.3f\n", a[1], a[2],
                          w[k], w[f], cpu[k], cpu[f], r[k] / 1024, r[f] / 1024, w[k] / w[f], cpu[k] / cpu[f], r[k] / r[f] } }' "$rows" | sort
+
+      - name: Where the time goes (-t 1)
+        if: steps.host.outputs.ok == '1'
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          cd work
+          for lib in em taps; do
+            mode=--meth; [ "$lib" = taps ] && mode=--meth=taps
+            reads=("${lib}_1.fq" "${lib}_2.fq")
+            echo "===== $lib ours: BWA4_STAGE_TIME (wall per stage) ====="
+            BWA4_STAGE_TIME=1 ../mem4-v3 mem "$mode" -K 10000000 -t 1 ours/chr21.fa "${reads[@]}" 2>&1 >/dev/null | grep -vE '^\[M::' | tail -25 || true
+            for arm in ours fork; do
+              if [ "$arm" = ours ]; then cmd=(../mem4-v3 mem "$mode" -K 10000000 -t 1 ours/chr21.fa "${reads[@]}")
+              else cmd=(bwa-mem3 mem "$mode" -K 10000000 -t 1 fork/chr21.fa "${reads[@]}"); fi
+              echo "===== $lib $arm: perf stat ====="
+              "$PERF" stat -x, -e cycles,instructions,branch-misses,L1-dcache-load-misses -- "${cmd[@]}" \
+                2>&1 > /dev/null | grep -E ',(cycles|instructions|branch-misses|L1-dcache-load-misses),' || true
+              # Sample counts at a fixed rate, so the two arms' symbols compare in CPU time.
+              "$PERF" record -F 999 -o "$lib.$arm.data" -- "${cmd[@]}" > /dev/null 2>/dev/null || true
+              echo "===== $lib $arm: top symbols by self time ====="
+              "$PERF" report -i "$lib.$arm.data" --stdio --no-children --show-nr-samples --percent-limit 0.3 2>/dev/null \
+                | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -60 || true
+            done
+          done
