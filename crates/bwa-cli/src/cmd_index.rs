@@ -40,6 +40,11 @@ pub struct IndexArgs {
     /// Repeatable. Without this, `mem -x ont2d`/`pacbio` builds and caches one on first use.
     #[arg(long = "mmi", value_name = "PRESET")]
     pub mmi: Vec<String>,
+    // fg-labs/bwa-mem3 0.16's `index --meth`, same files, so its indexes and ours interchange.
+    /// Also build the bisulfite seed index for `mem --meth`: `<prefix>.meth.fa` (each contig
+    /// G->A as `r<name>`, then C->T as `f<name>`) and its index `<prefix>.meth.*`.
+    #[arg(long = "meth")]
+    pub meth: bool,
 }
 
 /// Build the index and report elapsed time on stderr.
@@ -69,6 +74,12 @@ pub fn run(args: IndexArgs) -> anyhow::Result<()> {
     // why a bare path can be passed to both `index` and `mem`.
     let prefix = args.prefix.clone().unwrap_or_else(|| args.fasta.clone());
     bwa_index::build_index_with_prefix(&args.fasta, &prefix)?;
+    if args.meth {
+        let meth_prefix = PathBuf::from(format!("{}.meth", prefix.display()));
+        let meth_fa = PathBuf::from(format!("{}.fa", meth_prefix.display()));
+        bwa_index::write_meth_fasta(&args.fasta, &meth_fa)?;
+        bwa_index::build_index_with_prefix(&meth_fa, &meth_prefix)?;
+    }
     eprintln!(
         "[bwa-mem4 index] built index for {} in {:.3}s",
         args.fasta.display(),

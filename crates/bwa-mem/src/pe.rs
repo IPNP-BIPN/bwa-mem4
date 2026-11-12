@@ -73,6 +73,7 @@ use bwa_neon::{batched_mate_rescue, KswJob};
 
 use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
+use crate::meth::MethEmit;
 use crate::primary::{
     hash_64, insert_into_settled, mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch,
     same_region,
@@ -325,6 +326,7 @@ pub(crate) fn bns_fetch_seq_into(
 /// INVARIANT: `ma` is kept sorted by score descending throughout, both by the manual insertion
 /// below and by `mem_sort_dedup_patch`. Later anchors' skip test therefore sees earlier inserts,
 /// which is what forces the round-by-round structure of [`batch_mate_rescue`].
+#[allow(clippy::too_many_arguments)]
 fn mem_matesw(
     fm: &FmIndex,
     bns: &BntSeq,
@@ -333,6 +335,8 @@ fn mem_matesw(
     a: &MemAlnReg,
     ms: &[u8],
     ma: &mut Vec<MemAlnReg>,
+    // `--meth`: the mate's chemistry (read 1 = C->T); unused otherwise.
+    mate_ot: bool,
 ) -> i32 {
     // `l_pac`: packed reference length, so the doubled coordinate space is [0, 2*l_pac).
     // `l_ms`: the mate's length in bases, the length of every query built below and the amount by
@@ -457,8 +461,14 @@ fn mem_matesw(
                 // `aln`: ksw's verdict for this orientation. `score`/`score2` are the best and
                 // second-best local scores, `qb`/`qe` and `tb`/`te` the CLOSED start/end offsets
                 // into `seq` and `refseq`, and `qb < 0` means "nothing scored above `minsc`".
+                // `--meth`: a mate aligned reverse-complemented reads its conversion on the other
+                // strand, so it takes the other chemistry's matrix.
+                let mat = match &opt.meth {
+                    Some(meth) => &meth.mats[usize::from(mate_ot ^ is_rev)],
+                    None => &opt.mat,
+                };
                 let aln = ksw_align2(
-                    &seq, &refseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc,
+                    &seq, &refseq, 5, mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc,
                     opt.a, lanes,
                 );
                 if dump_pestat() {
@@ -2287,6 +2297,8 @@ fn mem_aln2sam(
     // `-V` (MEM_F_REF_HDR): close the record with the contig's FASTA comment. Passed in for the same
     // reason as `softclip`.
     ref_hdr: bool,
+    // `--meth`: the read's chemistry and what XM:Z needs; `None` for every other run.
+    meth: Option<&MethEmit>,
     out: &mut Vec<u8>,
 ) {
     // `p`: the alignment being printed, and `m` the mate's. bwa works on private copies
@@ -2347,6 +2359,13 @@ fn mem_aln2sam(
     if m.is_some() && m_is_rev {
         p_flag |= 0x20;
     }
+    // `--meth`: a mapped record's conversion strand (XG:Z:CT when `top`), and the QC rules that
+    // may change its FLAG and MAPQ before they are printed.
+    let mut mapq = p.mapq;
+    let top = meth.filter(|_| p.rid >= 0).map(|e| e.ot ^ p.is_rev);
+    if let (Some(e), Some(top)) = (meth, top) {
+        e.qc(top, &p.cigar, seq.len(), &mut p_flag, &mut mapq);
+    }
 
     // ---- step 2: QNAME, FLAG ----
     out.extend_from_slice(name.as_bytes());
@@ -2367,7 +2386,7 @@ fn mem_aln2sam(
         out.push(b'\t');
         crate::emit::push_int(out, p_pos + 1);
         out.push(b'\t');
-        crate::emit::push_int(out, i64::from(p.mapq));
+        crate::emit::push_int(out, i64::from(mapq));
         out.push(b'\t');
         add_cigar(p_cigar, which != 0 && !softclip && !p.is_alt, out);
     } else {
@@ -2421,6 +2440,8 @@ fn mem_aln2sam(
     // ---- step 5: SEQ, QUAL ----
     // Secondary records (0x100) omit both, per SAM convention and to keep file size
     // sane; the read's bases are already on its primary record.
+    // Where SEQ lands in `out`, for XM:Z. Empty when SEQ is `*`.
+    let mut seq_span = 0..0;
     if p_flag & 0x100 != 0 {
         out.extend_from_slice(b"*\t*");
     } else {
@@ -2464,6 +2485,7 @@ fn mem_aln2sam(
         // Written a block at a time rather than a base at a time: see `crate::emit`, and the x86
         // profile that motivated it (`sam_emit` is 5.15x slower per pair there than on an M4, the
         // worst-scaling stage we have). Same bytes, same alphabets, same order.
+        seq_span = out.len()..out.len() + (qe - qb);
         if !p_is_rev {
             crate::emit::push_seq_fwd(out, &seq[qb..qe]);
             out.push(b'\t');
@@ -2500,6 +2522,10 @@ fn mem_aln2sam(
         if !m_cigar.is_empty() {
             out.extend_from_slice(b"\tMC:Z:");
             add_cigar(m_cigar, which != 0 && !softclip && !mate.is_alt, out);
+        }
+        if meth.is_some() {
+            out.extend_from_slice(b"\tMQ:i:");
+            crate::emit::push_int(out, i64::from(mate.mapq));
         }
     }
     // AS/XS are gated on `>= 0`, not on `> 0`, which is why an unmapped record (built from a zeroed
@@ -2562,6 +2588,27 @@ fn mem_aln2sam(
         out.extend_from_slice(b"\tXA:Z:");
         out.extend_from_slice(xa.as_bytes());
     }
+    if let Some(e) = meth {
+        if p.hn >= 0 {
+            out.extend_from_slice(b"\tHN:i:");
+            crate::emit::push_int(out, i64::from(p.hn));
+        }
+        let emitted_seq = out[seq_span].to_vec();
+        let hard = which != 0 && !softclip && !p.is_alt;
+        e.push_tags(
+            bns,
+            out,
+            top,
+            p.rid,
+            p.pos,
+            &p.cigar,
+            hard,
+            &emitted_seq,
+            comment,
+        );
+        out.push(b'\n');
+        return;
+    }
     // `-C`: the FASTQ comment closes the record, after every tag.
     bwa_core::rg::append_comment(out, comment);
     // `-V`, after even the comment (`bwamem.cpp:1721`). Tested on the rewritten `rid`, so an unmapped
@@ -2588,8 +2635,11 @@ fn mem_aln2sam(
 /// records. `extra_flag` is OR-ed into every record's FLAG (0x1 plus 0x40/0x80, and 0x2 when the
 /// caller inferred a proper pair). `m` is the mate's chosen alignment for RNEXT/PNEXT/TLEN, or
 /// `None`. `out` receives one or more complete records, appended.
+///
+/// `meth` is the `--meth` record context (`None` otherwise); `opt` must then carry the read's
+/// chemistry matrix ([`crate::meth::read_opt`]).
 #[allow(clippy::too_many_arguments)]
-fn mem_reg2sam(
+pub fn mem_reg2sam(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
@@ -2600,6 +2650,7 @@ fn mem_reg2sam(
     a: &[MemAlnReg],
     extra_flag: u32,
     m: Option<&MemAln>,
+    meth: Option<&MethEmit>,
     out: &mut Vec<u8>,
 ) {
     // `-Y` and `-V`, read once here and threaded into every `mem_aln2sam` call below.
@@ -2624,6 +2675,12 @@ fn mem_reg2sam(
         crate::alt::XaTags::default()
     } else {
         mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq)
+    };
+    // `--meth` only: HN:i per region, absent under `-a` like XA.
+    let hn = if meth.is_some() && !all {
+        crate::alt::hit_counts(opt, a)
+    } else {
+        vec![-1; a.len()]
     };
     // ---- step 1: turn the surviving regions into records ----
     // `emitted` is bwa's `aa`, the records to emit; `n_emitted` is its `l`, the count accepted so
@@ -2660,6 +2717,7 @@ fn mem_reg2sam(
         // The printable form of region `p`: CIGAR, POS, MAPQ, NM and MD, all derived here.
         let mut aln = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
         aln.xa = xa.get(k);
+        aln.hn = hn[k];
         aln.flag |= extra_flag;
         // Suppress XS on a secondary (`sub < 0` gates the tag in `mem_aln2sam`). Unreachable here
         // for the same reason as the drop-ratio test above.
@@ -2716,12 +2774,13 @@ fn mem_reg2sam(
             m,
             softclip,
             ref_hdr,
+            meth,
             out,
         );
     } else {
         for k in 0..emitted.len() {
             mem_aln2sam(
-                bns, name, seq, qual, comment, &emitted, k, m, softclip, ref_hdr, out,
+                bns, name, seq, qual, comment, &emitted, k, m, softclip, ref_hdr, meth, out,
             );
         }
     }
@@ -2795,6 +2854,15 @@ pub fn mem_sam_pe<W: Write>(
     // MATE_SORT rescue block in mem_sam_pe (bwamem_pair.cpp lines 378-414). Skipped when the caller
     // already ran it batched across the whole pair batch ([`batch_mate_rescue`]).
     // ---- stage 1: mate rescue ----
+    // `--meth`: each end's own chemistry matrix (read 1 C->T, read 2 G->A) and record context.
+    // Plain runs borrow `opt` and carry no context.
+    let ropt = [
+        crate::meth::read_opt(opt, true),
+        crate::meth::read_opt(opt, false),
+    ];
+    let emit = opt.meth.as_ref().map_or([None, None], |meth| {
+        [true, false].map(|ot| Some(MethEmit { fm, meth, ot }))
+    });
     if !rescue_done {
         // `-U`: any region within this of the best is a plausible anchor. `-m`: anchor cap.
         let pen = opt.pen_unpaired;
@@ -2817,10 +2885,10 @@ pub fn mem_sam_pe<W: Write>(
         let b0 = near_best(a0);
         let b1 = near_best(a1);
         for anchor in b0.iter().take(anchor_cap) {
-            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1);
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1, false);
         }
         for anchor in b1.iter().take(anchor_cap) {
-            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0);
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0, true);
         }
     }
 
@@ -2888,7 +2956,16 @@ pub fn mem_sam_pe<W: Write>(
                 // pair and the unpaired alternative. `q_pe`: the pair-level MAPQ, still unclamped
                 // and undamped at this point, shared by both ends.
                 let subo = pr.sub.max(score_un);
-                let mut q_pe = raw_mapq(pr.score - subo, opt.a);
+                let mut qdiff = pr.score - subo;
+                // `--meth`: each end's second-best primary also caps the pair's margin, so a
+                // repeat on either end deflates the pair MAPQ (fg-labs/bwa-mem3 0.16).
+                if opt.meth.is_some() {
+                    let second =
+                        |a: &[MemAlnReg], n_pri: usize| if n_pri > 1 { a[1].score } else { 0 };
+                    let cap = pr.score + 4 * opt.a - (second(a0, n_pri0) + second(a1, n_pri1));
+                    qdiff = qdiff.min(cap).max(0);
+                }
+                let mut q_pe = raw_mapq(qdiff, opt.a);
                 // Crowded runner-up field discounts the MAPQ, by `10*log10(n_sub+1)` phred units
                 // (see [`DECIBANS_PER_NAT`]).
                 if pr.n_sub > 0 {
@@ -3018,12 +3095,12 @@ pub fn mem_sam_pe<W: Write>(
                         crate::emit_split::measure(
                             &crate::emit_split::ALT_NS,
                             &crate::emit_split::ALT_CALLS,
-                            || mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]),
+                            || mem_gen_alt(fm, bns, &ropt[0], a0, seqs[0].len() as i32, seqs[0]),
                         ),
                         crate::emit_split::measure(
                             &crate::emit_split::ALT_NS,
                             &crate::emit_split::ALT_CALLS,
-                            || mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]),
+                            || mem_gen_alt(fm, bns, &ropt[1], a1, seqs[1].len() as i32, seqs[1]),
                         ),
                     )
                 };
@@ -3041,20 +3118,32 @@ pub fn mem_sam_pe<W: Write>(
                 // and what bwa prints when it does, has not been checked against a real run.
                 // `h0`/`h1`: the single record emitted for read 1 and read 2. Each is also handed to
                 // the other's `mem_aln2sam` call as the mate.
+                // `--meth` only: HN:i per region, absent under `-a` like XA.
+                let hn = [&*a0, &*a1].map(|a| {
+                    if opt.meth.is_some() && !all {
+                        crate::alt::hit_counts(opt, a)
+                    } else {
+                        vec![-1; a.len()]
+                    }
+                });
                 let h0 = {
-                    let mut h = reg2aln(fm, bns, opt, seqs[0].len() as i32, seqs[0], &a0[z[0]]);
+                    let mut h =
+                        reg2aln(fm, bns, &ropt[0], seqs[0].len() as i32, seqs[0], &a0[z[0]]);
                     h.mapq = q_se[0].max(0) as u32;
                     h.flag |= 0x40 | extra_flag;
                     // Moved, not cloned: `z[0] < n_pri0`, and `alt_extra` reads only `xa0[n_pri0]`.
                     h.xa = xa0.take(z[0]);
+                    h.hn = hn[0][z[0]];
                     h
                 };
                 let h1 = {
-                    let mut h = reg2aln(fm, bns, opt, seqs[1].len() as i32, seqs[1], &a1[z[1]]);
+                    let mut h =
+                        reg2aln(fm, bns, &ropt[1], seqs[1].len() as i32, seqs[1], &a1[z[1]]);
                     h.mapq = q_se[1].max(0) as u32;
                     h.flag |= 0x80 | extra_flag;
                     // Moved, not cloned: `z[1] < n_pri1`, and `alt_extra` reads only `xa1[n_pri1]`.
                     h.xa = xa1.take(z[1]);
+                    h.hn = hn[1][z[1]];
                     h
                 };
                 // ---- The ALT hit, if this end has one worth reporting (`bwamem_pair.cpp:496`) --
@@ -3067,7 +3156,8 @@ pub fn mem_sam_pe<W: Write>(
                 // primary-assembly prefix, i.e. the best-scoring ALT hit. It is dropped unless it
                 // clears `-T`, is unshadowed, and really is ALT. Nothing is emitted at all when the
                 // index has no ALT contigs, since then `n_pri == a.len()`.
-                let alt_extra = |a: &[MemAlnReg],
+                let alt_extra = |i: usize,
+                                 a: &[MemAlnReg],
                                  n_pri: usize,
                                  xa: &crate::alt::XaTags,
                                  seq: &[u8],
@@ -3080,16 +3170,17 @@ pub fn mem_sam_pe<W: Write>(
                     if p.score < opt.t || p.secondary >= 0 || !p.is_alt {
                         return None;
                     }
-                    let mut g = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
+                    let mut g = reg2aln(fm, bns, &ropt[i], seq.len() as i32, seq, p);
                     g.flag |= 0x800 | flag_bit | extra_flag;
                     g.xa = xa.get(n_pri);
+                    g.hn = hn[i][n_pri];
                     Some(g)
                 };
                 // bwa's `aa[i]`: every record emitted for this end, primary first. Its LENGTH is
                 // what makes the difference downstream, because `mem_aln2sam` uses it to decide
                 // whether an `SA:Z` is owed and how to clip.
-                let extra0 = alt_extra(a0, n_pri0, &xa0, seqs[0], 0x40);
-                let extra1 = alt_extra(a1, n_pri1, &xa1, seqs[1], 0x80);
+                let extra0 = alt_extra(0, a0, n_pri0, &xa0, seqs[0], 0x40);
+                let extra1 = alt_extra(1, a1, n_pri1, &xa1, seqs[1], 0x80);
                 // Backing storage for the TWO-record case only. On an index with no ALT contigs
                 // `alt_extra` returns `None` for every read, so `aa0`/`aa1` borrow `h0`/`h1` in
                 // place and nothing is allocated or copied. They used to be
@@ -3134,6 +3225,7 @@ pub fn mem_sam_pe<W: Write>(
                         Some(&h1),
                         softclip,
                         ref_hdr,
+                        emit[0].as_ref(),
                         &mut buf,
                     );
                 }
@@ -3149,8 +3241,12 @@ pub fn mem_sam_pe<W: Write>(
                         Some(&h0),
                         softclip,
                         ref_hdr,
+                        emit[1].as_ref(),
                         &mut buf,
                     );
+                }
+                if opt.meth.is_some() {
+                    crate::meth::propagate_qcfail(&mut buf);
                 }
                 let wrote = w.write_all(&buf);
                 SCRATCH_SAM.with(|c| *c.borrow_mut() = buf);
@@ -3188,7 +3284,7 @@ pub fn mem_sam_pe<W: Write>(
         reg2aln(
             fm,
             bns,
-            opt,
+            &ropt[0],
             seqs[0].len() as i32,
             seqs[0],
             &a0[w0 as usize],
@@ -3200,7 +3296,7 @@ pub fn mem_sam_pe<W: Write>(
         reg2aln(
             fm,
             bns,
-            opt,
+            &ropt[1],
             seqs[1].len() as i32,
             seqs[1],
             &a1[w1 as usize],
@@ -3235,7 +3331,7 @@ pub fn mem_sam_pe<W: Write>(
     mem_reg2sam(
         fm,
         bns,
-        opt,
+        &ropt[0],
         names[0],
         seqs[0],
         quals[0],
@@ -3243,12 +3339,13 @@ pub fn mem_sam_pe<W: Write>(
         a0,
         0x41 | extra_flag,
         Some(&h1),
+        emit[0].as_ref(),
         &mut buf,
     );
     mem_reg2sam(
         fm,
         bns,
-        opt,
+        &ropt[1],
         names[1],
         seqs[1],
         quals[1],
@@ -3256,8 +3353,12 @@ pub fn mem_sam_pe<W: Write>(
         a1,
         0x81 | extra_flag,
         Some(&h0),
+        emit[1].as_ref(),
         &mut buf,
     );
+    if opt.meth.is_some() {
+        crate::meth::propagate_qcfail(&mut buf);
+    }
     let wrote = w.write_all(&buf);
     SCRATCH_SAM.with(|c| *c.borrow_mut() = buf);
     wrote

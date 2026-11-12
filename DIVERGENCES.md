@@ -4,6 +4,10 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## Acceptees (par conception)
 
+- **Mode `--meth` : l'oracle est bwa-mem3 0.16, pas bwa-mem2.** bwa-mem2 n'a pas de mode
+  methylation. Parite octet a octet avec bwa-mem3 0.16 via `scripts/meth_oracle_diff.sh` ; les
+  ecarts restants (hors jeu de test) sont listes dans `docs/meth-mode.md`.
+
 - **Scoring non defaut (`-A 2`) : bwa-mem2 ne s'accorde pas avec lui-meme, et nous suivons son build
   arm64. FIGE (2026-08-18).** Sous un score de match non defaut, les builds x86_64 et arm64 de
   bwa-mem2 2.3 produisent des alignements differents sur les memes reads. Ce n'est pas une

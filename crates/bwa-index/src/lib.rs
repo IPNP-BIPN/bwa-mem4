@@ -94,6 +94,6 @@ pub mod sais;
 // Re-exports: the types callers outside this crate actually touch. `FmIndex` + `BntSeq` together
 // are what the aligner needs to turn a read into a reference coordinate.
 pub use bntseq::{Amb, BntSeq, Contig};
-pub use build::{build_index, build_index_with_prefix};
+pub use build::{build_index, build_index_with_prefix, write_meth_fasta};
 pub use fmindex::{traffic, FmIndex, SeedJump, Smem, SEED_JUMP_DEPTH};
 pub use lisa::LearnedSa;

@@ -157,6 +157,19 @@ fn get_pri_idx(xa_drop_ratio: f64, regs: &[MemAlnReg], i: usize) -> Option<usize
 /// One entry per region, indexed identically to `regs`: `groups[p]` is the ascending list of region
 /// indices to emit as `XA` hits under primary `p`, and is empty for every region that is not an XA
 /// primary or whose group blew the cap.
+/// `HN:i` of each region under `--meth`: how many alternative hits fall within `xa_drop_ratio` of
+/// it, counted before the `-h` cap drops them from XA (fg-labs/bwa-mem3 `mem_gen_alt`'s `cnt`).
+pub fn hit_counts(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<i32> {
+    let ratio = f64::from(opt.xa_drop_ratio);
+    let mut cnt = vec![0i32; regs.len()];
+    for i in 0..regs.len() {
+        if let Some(primary_idx) = get_pri_idx(ratio, regs, i) {
+            cnt[primary_idx] += 1;
+        }
+    }
+    cnt
+}
+
 pub fn xa_group(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<Vec<usize>> {
     // Score-drop threshold, widened once here so both passes hand `get_pri_idx` the identical
     // `f64` and cannot disagree about a boundary case. `n_regs` is the region count, which is also

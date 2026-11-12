@@ -217,7 +217,8 @@ pub fn ksw_extend2(
     // Sequence lengths in bases: `qlen` is the number of DP columns, `tlen` the number of rows.
     let qlen = query.len();
     let tlen = target.len();
-    debug_assert!(h0 > 0);
+    // No `h0 > 0` assert: bwa asserts it, but `--meth` re-scores a seed against the original
+    // genome and can start at h0 <= 0, which the recurrence handles (fg-labs/bwa-mem3 dropped it too).
     // Cost of the *first* base of a gap, open plus one extend. Precomputed because the inner loop
     // subtracts it once per cell; `oe_del` for deletions (consuming target), `oe_ins` for
     // insertions (consuming query).

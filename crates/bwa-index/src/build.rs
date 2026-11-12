@@ -531,6 +531,23 @@ fn sibling(prefix: &Path, ext: &str) -> PathBuf {
 /// forward offset. Sequence lines appearing before any header are silently dropped (there is no
 /// `contigs.last_mut()` to append to). An empty or headerless file yields an empty vector, which
 /// [`build_index`] rejects. Records with a header but no sequence lines are kept with `seq` empty.
+/// `index --meth`'s seed FASTA (`meth_index_build` in fg-labs/bwa-mem3 0.16, MIT): every contig
+/// of `fasta` twice, `r<name>` with G->A then `f<name>` with C->T, uppercased first, 100 bases a
+/// line. Its index (`<ref>.meth.*`) is what `mem --meth` seeds on.
+pub fn write_meth_fasta(fasta: &Path, out: &Path) -> Result<()> {
+    let contigs = read_fasta(fasta)?;
+    if contigs.is_empty() {
+        return Err(Error::Other("empty FASTA".into()));
+    }
+    let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+    for c in &contigs {
+        bwa_core::meth::write_converted(&mut w, 'r', &c.name, &c.seq, b'G', b'A')?;
+        bwa_core::meth::write_converted(&mut w, 'f', &c.name, &c.seq, b'C', b'T')?;
+    }
+    std::io::Write::flush(&mut w)?;
+    Ok(())
+}
+
 fn read_fasta(path: &Path) -> Result<Vec<FastaContig>> {
     let text = std::fs::read(path)?;
     let mut contigs: Vec<FastaContig> = Vec::new();

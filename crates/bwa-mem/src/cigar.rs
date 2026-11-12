@@ -163,6 +163,8 @@ pub struct MemAln {
     /// Alternate hits (`XA:Z:`), pre-formatted `rname,±pos,cigar,NM;`... or `None`. Set by the
     /// caller via `mem_gen_alt`; `reg2aln` leaves it `None`.
     pub xa: Option<String>,
+    /// `HN:i`, emitted under `--meth` only, when >= 0 (see `alt::hit_counts`). -1 otherwise.
+    pub hn: i32,
 }
 
 /// Format the `pa:f` payload the way C's `printf("%.3f", (double)score / alt_sc)` does
@@ -225,6 +227,7 @@ impl MemAln {
             alt_sc: 0,
             is_alt: false,
             xa: None,
+            hn: -1,
         }
     }
 }
@@ -620,7 +623,11 @@ pub(crate) fn gen_cigar2(
                 }
                 crate::emit::push_int_str(&mut md, i64::from(match_run));
                 md.push(base_char(r[i]));
-                n_mm += 1;
+                // `--meth`: MD stays literal, but NM counts only what the read's matrix
+                // penalises, so a conversion is not an edit (fg-labs/bwa-mem3 `nm_from_mat`).
+                if opt.meth.is_none() || opt.mat[r[i] as usize * 5 + q[i] as usize] < 0 {
+                    n_mm += 1;
+                }
                 match_run = 0;
                 i += 1;
             }
@@ -941,6 +948,7 @@ pub fn reg2aln(
         // Filled in by the caller from `mem_gen_alt`; `reg2aln` never produces XA itself, because
         // XA generation calls back into `reg2aln` and would recurse.
         xa: None,
+        hn: -1,
     }
 }
 

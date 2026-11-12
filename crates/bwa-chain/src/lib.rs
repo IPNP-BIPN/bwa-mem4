@@ -99,6 +99,7 @@
 
 mod kbtree;
 
+use bwa_core::meth::MethOpt;
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 use bwa_seed::{mem_collect_smem, MemSeed};
@@ -468,6 +469,11 @@ pub fn sa_positions_for_read(
     // multi-field sort out of a single-key sort, and it is exact rather than approximate because
     // both fields are known to fit in 32 bits.
     smems.sort_by_key(|s| (u64::from(s.m) << 32) | u64::from(s.n));
+    // `--meth`: prune the converted alphabet's short repetitive SMEMs before any SA work, and so
+    // before the caller's `frac_rep`, which is computed from what is left.
+    if let Some(meth) = &opt.meth {
+        meth_prune(meth, smems);
+    }
     // `BWA4_SMEM_DUP=1`: how many of this read's SMEMs are EXACT duplicates of the one before them,
     // now that they are sorted. fg-labs/bwa-mem3 compacts those away in `smem_dedup.cpp` before the
     // position walk, on the grounds that they enumerate the same suffix-array rows twice; the
@@ -870,6 +876,102 @@ pub mod smem_dedup {
     }
 }
 
+/// `meth_prune_smems` (fg-labs/bwa-mem3 0.16, MIT) on one read's sorted SMEMs: the first SMEM of
+/// maximal length always survives, every other one by [`MethOpt::prune_keeps`].
+fn meth_prune(meth: &MethOpt, smems: &mut Vec<bwa_index::Smem>) {
+    let len = |s: &bwa_index::Smem| (s.n + 1 - s.m) as i32;
+    let Some(max_len) = smems.iter().map(len).max() else {
+        return;
+    };
+    let imax = smems.iter().position(|s| len(s) == max_len);
+    let mut i = 0;
+    smems.retain(|s| {
+        let keep = Some(i) == imax || meth.prune_keeps(len(s), s.s, max_len);
+        i += 1;
+        keep
+    });
+}
+
+/// `meth_seed_to_orig` (fg-labs/bwa-mem3 0.16, MIT): map a hit `rbeg` of a `len`-base seed in the
+/// `--meth` seed index back to the original genome `bns`. `None` when the seed straddles a contig
+/// end, or when its chemistry is not the read's (`ot`: read 1 / single-end, C->T): the converted
+/// copy (f = C->T, r = G->A) XOR the strand must equal the read's chemistry.
+///
+/// The seed index's contig table is implied by the original one, so it is never loaded: copy `2k`
+/// (`r<name>`) starts at `2 * offset_k` and copy `2k + 1` (`f<name>`) right after it, both `len_k`
+/// long, `2 * l_pac` bases in all.
+pub fn meth_seed_to_orig(bns: &BntSeq, rbeg: i64, len: i32, ot: bool) -> Option<i64> {
+    let l_seed = bns.l_pac << 1;
+    if rbeg < 0 || rbeg >= l_seed << 1 {
+        return None;
+    }
+    let is_rev = rbeg >= l_seed;
+    let fwd = if is_rev {
+        (l_seed << 1) - 1 - rbeg
+    } else {
+        rbeg
+    };
+    let rid = bns.pos2rid(fwd >> 1);
+    if rid < 0 {
+        return None;
+    }
+    let contig = &bns.contigs[rid as usize];
+    let contig_len = i64::from(contig.len);
+    let mut local = fwd - 2 * contig.offset;
+    let f_copy = local >= contig_len;
+    if f_copy {
+        local -= contig_len;
+    }
+    if (f_copy ^ is_rev) != ot {
+        return None;
+    }
+    // A reverse hit's forward coordinate is the seed's rightmost base.
+    let span = i64::from(len.max(1));
+    let (lo, hi) = if is_rev {
+        (local - span + 1, local + 1)
+    } else {
+        (local, local + span)
+    };
+    if lo < 0 || hi > contig_len {
+        return None;
+    }
+    let orig_fwd = contig.offset + local;
+    Some(if is_rev {
+        (bns.l_pac << 1) - 1 - orig_fwd
+    } else {
+        orig_fwd
+    })
+}
+
+/// [`build_chains`] for a `--meth` read. `conv` is the read's converted copy and `fm` the
+/// `--meth` index ([`FmIndex::load_meth`]); `ot` is the read's chemistry (read 1 / single-end).
+/// Hits are mapped back to the original genome `bns` by [`meth_seed_to_orig`], the dropped ones
+/// marked `-1`, and the rest chained exactly like plain seeds.
+pub fn build_chains_meth(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    conv: &[u8],
+    ot: bool,
+) -> Vec<MemChain> {
+    let mut smems = mem_collect_smem(fm, conv, opt);
+    let mut positions: Vec<i64> = Vec::new();
+    let mut repeats: Vec<RepeatedRun> = Vec::new();
+    let mut counts: Vec<i64> = Vec::new();
+    sa_positions_for_read(opt, &mut smems, &mut positions, &mut repeats, &mut counts);
+    let mut rbegs = vec![0i64; positions.len()];
+    fm.get_sa_batch(&positions, &mut rbegs);
+    let mut cursor = 0usize;
+    for (smem, &n) in smems.iter().zip(&counts) {
+        let len = (smem.n + 1 - smem.m) as i32;
+        for rb in &mut rbegs[cursor..cursor + n as usize] {
+            *rb = meth_seed_to_orig(bns, *rb, len, ot).unwrap_or(-1);
+        }
+        cursor += n as usize;
+    }
+    build_chains_from_resolved(bns, opt, conv, 0, &smems, &counts, &rbegs)
+}
+
 /// Build chains from **pre-computed** SMEMs (e.g. from batched lockstep seeding). Identical to
 /// [`build_chains`] given the same seed set; only the SMEM source differs.
 ///
@@ -974,6 +1076,10 @@ fn chain_seeds(
                 len: slen,
                 score: slen,
             };
+            // `rbeg < 0` only under `--meth`: a hit `build_chains_meth` could not map back.
+            if rbeg < 0 {
+                continue;
+            }
             let rid = bns.intv2rid(rbeg, rbeg + i64::from(slen));
             if rid < 0 {
                 continue;
@@ -2032,6 +2138,49 @@ mod tests {
     /// # Returns
     /// The FM index and `BntSeq` for that reference. Panics if the index files are missing, which
     /// means the testdata was not generated.
+    /// Two contigs of 100 and 50 bases. The `--meth` seed index then holds r0 [0,100), f0 [100,200),
+    /// r1 [200,250), f1 [250,300), and their reverse complements in [300,600).
+    fn two_contigs() -> BntSeq {
+        let contig = |name: &str, offset, len| bwa_index::Contig {
+            gi: 0,
+            name: name.into(),
+            anno: b"(null)".to_vec(),
+            offset,
+            len,
+            n_ambs: 0,
+            is_alt: false,
+        };
+        BntSeq {
+            l_pac: 150,
+            n_seqs: 2,
+            seed: 11,
+            contigs: vec![contig("a", 0, 100), contig("b", 100, 50)],
+            n_holes: 0,
+            ambs: vec![],
+        }
+    }
+
+    #[test]
+    fn meth_seed_maps_back_and_filters_by_chemistry() {
+        let bns = two_contigs();
+        // Forward hit on b's C->T copy at 10: an OT (read 1) seed at original 110.
+        assert_eq!(meth_seed_to_orig(&bns, 260, 20, true), Some(110));
+        assert_eq!(meth_seed_to_orig(&bns, 260, 20, false), None);
+        // Forward hit on a's G->A copy: the OB chemistry.
+        assert_eq!(meth_seed_to_orig(&bns, 30, 20, false), Some(30));
+        assert_eq!(meth_seed_to_orig(&bns, 30, 20, true), None);
+        // Reverse hit whose rightmost base is a's G->A copy at 30: OT, original reverse 299 - 30.
+        assert_eq!(meth_seed_to_orig(&bns, 599 - 30, 20, true), Some(269));
+        // Reverse hit on b's C->T copy at 40 (forward 290): OB, original reverse 299 - 140.
+        assert_eq!(meth_seed_to_orig(&bns, 599 - 290, 20, false), Some(159));
+        // A seed running off its copy (a's C->T copy ends at 200) is dropped, so is one leaving
+        // the index.
+        assert_eq!(meth_seed_to_orig(&bns, 190, 20, true), None);
+        assert_eq!(meth_seed_to_orig(&bns, 180, 20, true), Some(80));
+        assert_eq!(meth_seed_to_orig(&bns, 600, 20, true), None);
+        assert_eq!(meth_seed_to_orig(&bns, -1, 20, true), None);
+    }
+
     fn tiny() -> (FmIndex, BntSeq) {
         // Index basename, not a file that exists: the loaders append the `.bwt`/`.ann`/... suffixes.
         let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");

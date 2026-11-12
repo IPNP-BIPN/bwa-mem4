@@ -251,6 +251,10 @@ pub struct FmIndex {
     /// steps here instead of stepping the FM index (fg-labs/bwa-mem3's `seed_jump`). Built by
     /// [`Self::load`]; empty on the test indices, which [`Self::seed_jump_depth`] reports as 0.
     seed_jump: Vec<SeedJump>,
+    /// Forward length of the genome `pac` packs, i.e. [`FmIndex::l_pac`]. `(ref_seq_len - 1) / 2`
+    /// for a plain index; the original genome's length for [`FmIndex::load_meth`], whose BWT
+    /// covers a converted text twice as long.
+    pac_l: i64,
 }
 
 /// One [`FmIndex::seed_jump`] entry: the forward interval `(k, l, s)` of a string, as
@@ -1176,6 +1180,7 @@ impl FmIndex {
         unsafe { crate::hugepage::advise_hugepage(pac.as_ptr(), pac.len()) };
 
         let mut fm = FmIndex {
+            pac_l: (ref_seq_len - 1) / 2,
             ref_seq_len,
             count,
             cp_occ,
@@ -2662,17 +2667,32 @@ impl FmIndex {
         (0..2 * self.l_pac()).map(|p| self.base(p)).collect()
     }
 
-    /// Length of the forward reference `L` (`ref_seq_len` is `2L + 1`).
+    /// Length of the forward reference `L` that `base`/`bases` read (`ref_seq_len` is `2L + 1` for
+    /// a plain index).
     ///
-    /// Recomputed rather than read from `.ann`, so the FM index can be used without a `BntSeq`.
-    /// The division is exact because `ref_seq_len - 1 == 2L` by construction.
+    /// Derived from the BWT at load, so the FM index can be used without a `BntSeq`. Under
+    /// [`FmIndex::load_meth`] it is the ORIGINAL genome's length, not half the seed BWT's.
     ///
     /// # Returns
     /// `L`, the forward-strand length in bases. This is the strand boundary: a 2L-space position
     /// below it is a forward hit, at or above it a reverse-complement hit.
     #[inline]
     pub fn l_pac(&self) -> i64 {
-        (self.ref_seq_len - 1) / 2
+        self.pac_l
+    }
+
+    /// The `--meth` index: BWT and suffix array from `seed_prefix` (the C->T/G->A converted
+    /// genome, `<ref>.meth`), packed bases from `pac_prefix` (the original `<ref>`), so seeding
+    /// runs on the converted text and extension on the real genome.
+    ///
+    /// `l_pac` is the original genome's forward length (`BntSeq::l_pac` of `pac_prefix`). Seed
+    /// hits come back in the converted index's coordinates; `bwa_chain::meth` maps them back.
+    pub fn load_meth(seed_prefix: &Path, pac_prefix: &Path, l_pac: i64) -> Result<Self> {
+        let mut fm = Self::load(seed_prefix)?;
+        let pac_file = std::fs::File::open(sibling(pac_prefix, "pac"))?;
+        fm.pac = unsafe { Mmap::map(&pac_file)? };
+        fm.pac_l = l_pac;
+        Ok(fm)
     }
 }
 
@@ -3143,6 +3163,7 @@ mod tests {
                 .make_read_only()
                 .unwrap(),
             seed_jump: Vec::new(),
+            pac_l: 0,
         };
         for block in 0..n_blocks {
             for y in [0i64, 1, 17, 63] {

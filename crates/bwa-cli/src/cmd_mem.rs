@@ -521,6 +521,34 @@ pub struct MemArgs {
     /// Print help.
     #[arg(long = "help", action = clap::ArgAction::Help)]
     pub help: Option<bool>,
+
+    // ---- Methylation mode, ported from fg-labs/bwa-mem3 0.16 (see `docs/meth-mode.md`) ----
+    // Long-only, spelled as in the fork so a Bismark command line runs unchanged. The value of
+    // `--meth` binds only with `=`, as in the fork: `--meth taps` would make `taps` the index.
+    /// Bisulfite/EM-seq/TAPS mode: emseq (default; bisulfite, em-seq), taps, 5base (5-base).
+    /// Needs an index built with `index --meth`.
+    #[arg(long = "meth", value_name = "CHEM", num_args = 0..=1, require_equals = true,
+          default_missing_value = "emseq")]
+    pub meth: Option<String>,
+    /// Where a conversion is free: all [all]. `cpg` is not supported by this port.
+    #[arg(long = "meth-context", value_name = "all|cpg")]
+    pub meth_context: Option<String>,
+    /// collapsed (EM-seq default, sets -B 2), genomic, or neutral (TAPS default).
+    #[arg(long = "meth-scoring", value_name = "MODE")]
+    pub meth_scoring: Option<String>,
+    /// Bismark tags to emit: all [all], none, XR,XG,... or exclusions ^XM / -XM.
+    #[arg(long = "meth-tags", value_name = "SPEC", allow_hyphen_values = true)]
+    pub meth_tags: Option<String>,
+    /// Prune short repetitive seeds before SA lookup: spec30 [spec30 under --meth], baseline, off.
+    #[arg(long = "meth-seed-prune", value_name = "MODE", num_args = 0..=1, require_equals = true,
+          default_missing_value = "spec30")]
+    pub meth_seed_prune: Option<String>,
+    /// Flag alignments of conversion strand f (XG:Z:CT) or r (XG:Z:GA) as QC-fail (0x200).
+    #[arg(long = "set-as-failed", value_name = "f|r")]
+    pub set_as_failed: Option<String>,
+    /// bwameth's chimera rule: longest M < 44% of the read sets 0x200, clears 0x2, caps MAPQ at 1.
+    #[arg(long = "chimera-qc")]
+    pub chimera_qc: bool,
 }
 
 /// Parse bwa's `INT[,INT]` pair syntax. bwa reads the first integer with `strtol`, then takes a
@@ -1055,9 +1083,87 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     //
     // From the POST-rescale a/b. Doing this earlier would leave the SIMD kernel scoring with
     // pre-rescale values while the gap logic used post-rescale scalars.
+    let meth = build_meth(args, &mut opt)?;
     opt.fill_scmat();
+    if let Some(mut meth) = meth {
+        meth.fill_mats(&opt.mat, opt.a);
+        opt.meth = Some(meth);
+    }
     validate_scoring(&opt)?;
     Ok(opt)
+}
+
+/// The `--meth*` options (`meth_opts_parse` + `meth_opts_finalize` + `mem_opt_apply_meth_defaults`
+/// in fg-labs/bwa-mem3 0.16). Applies the meth defaults to `opt` where the user gave no value and
+/// returns the mode, its matrices still unfilled; `None` without `--meth`.
+fn build_meth(args: &MemArgs, opt: &mut MemOpt) -> anyhow::Result<Option<bwa_core::meth::MethOpt>> {
+    use bwa_core::meth;
+    let Some(chem) = &args.meth else {
+        let stray = [
+            (args.meth_context.is_some(), "--meth-context"),
+            (args.meth_scoring.is_some(), "--meth-scoring"),
+            (args.meth_tags.is_some(), "--meth-tags"),
+            (args.meth_seed_prune.is_some(), "--meth-seed-prune"),
+            (args.set_as_failed.is_some(), "--set-as-failed"),
+            (args.chimera_qc, "--chimera-qc"),
+        ];
+        if let Some((_, flag)) = stray.iter().find(|(given, _)| *given) {
+            anyhow::bail!("{flag} requires --meth");
+        }
+        return Ok(None);
+    };
+    let mut m = meth::MethOpt::new(meth::parse_chem(chem).map_err(anyhow::Error::msg)?);
+    if let Some(s) = &args.meth_scoring {
+        m.scoring = meth::parse_scoring(s).map_err(anyhow::Error::msg)?;
+    }
+    match args.meth_context.as_deref() {
+        None | Some("all") => {}
+        // shortcut: the CpG-only 7-code model is not ported (Bismark runs `all`); port
+        // `meth_model.cpp` if someone needs TAPS CpG-context scoring.
+        Some("cpg") => anyhow::bail!("--meth-context cpg is not supported by bwa-mem4"),
+        Some(other) => {
+            anyhow::bail!("--meth-context accepts 'all' (default) or 'cpg', got '{other}'")
+        }
+    }
+    if let Some(s) = &args.meth_tags {
+        m.tags = meth::parse_tags(s).map_err(|e| anyhow::anyhow!("--meth-tags '{s}': {e}"))?;
+    }
+    if let Some(s) = &args.meth_seed_prune {
+        m.prune = meth::parse_prune(s).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(s) = &args.set_as_failed {
+        m.set_as_failed = match s.as_str() {
+            "f" => Some(b'f'),
+            "r" => Some(b'r'),
+            _ => anyhow::bail!("--set-as-failed requires 'f' or 'r'"),
+        };
+    }
+    m.chimera_qc = args.chimera_qc;
+    if args.read_type.is_some() {
+        anyhow::bail!("--meth cannot be combined with -x");
+    }
+    // `mem_opt_apply_meth_defaults`: bwameth's penalties, scaled by `-A` like any default.
+    if args.clip_penalty.is_none() {
+        opt.pen_clip5 = 10 * opt.a;
+        opt.pen_clip3 = 10 * opt.a;
+    }
+    if args.pen_unpaired.is_none() {
+        opt.pen_unpaired = 100 * opt.a;
+    }
+    if args.min_score.is_none() {
+        opt.t = 40 * opt.a;
+    }
+    opt.flag |= flags::NO_MULTI;
+    if m.scoring == meth::Scoring::Collapsed && args.mismatch.is_none() {
+        opt.b = 2 * opt.a;
+    }
+    if opt.b <= 0 {
+        anyhow::bail!(
+            "--meth requires a positive mismatch penalty, but the effective penalty is {}",
+            opt.b
+        );
+    }
+    Ok(Some(m))
 }
 
 /// Refuse gap and clipping penalties the aligner cannot run with. Checked on the FINAL options,
@@ -2164,17 +2270,22 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // extension and for turning a concatenated-genome offset back into (contig, position).
     // Both are loaded once, live for the whole run, and are shared immutably with every worker.
     // Together they are several GB for a human genome (memory-mapped where possible).
-    let fm = FmIndex::load(&args.index_prefix)?;
-    let mut bns = BntSeq::load(&args.index_prefix)?;
-    // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
-    anyhow::ensure!(
-        fm.l_pac() == bns.l_pac,
-        "{}: the .ann describes a {}-base reference but the .bwt.2bit.64 a {}-base one \
-         (mixed index from two builds; rebuild it)",
-        args.index_prefix.display(),
-        bns.l_pac,
-        fm.l_pac()
-    );
+    let (fm, mut bns) = if opt.meth.is_some() {
+        load_meth_index(&args.index_prefix)?
+    } else {
+        let fm = FmIndex::load(&args.index_prefix)?;
+        let bns = BntSeq::load(&args.index_prefix)?;
+        // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
+        anyhow::ensure!(
+            fm.l_pac() == bns.l_pac,
+            "{}: the .ann describes a {}-base reference but the .bwt.2bit.64 a {}-base one \
+             (mixed index from two builds; rebuild it)",
+            args.index_prefix.display(),
+            bns.l_pac,
+            fm.l_pac()
+        );
+        (fm, bns)
+    };
     // `-j`: clear the ALT flags the loader just read from `<prefix>.alt`, so every contig counts as
     // primary assembly. Done here, after loading, exactly as `fastmap.cpp:907` does it.
     if args.ignore_alt {
@@ -2275,6 +2386,11 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // be pasted back. This costs no byte-identity: `@PG` is excluded from every parity gate in this
     // project precisely because it legitimately differs between the two tools.
     let command_line = argv.join(" ").replace('\t', "\\t");
+    // `--meth` writes its header through htslib in the fork, which puts this `@HD` first unless
+    // `-H` brought one.
+    if opt.meth.is_some() && !hdr_parts.iter().any(|l| l.starts_with("@HD\t")) {
+        out.write_all(b"@HD\tVN:1.5\tSO:unsorted\tGO:query\n")?;
+    }
     sam::write_header(
         &mut out,
         &sqs,
@@ -2358,7 +2474,11 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         }
         // Per-read alignments after dedup and before primary marking, also parallel to `batch`.
         let regs_all = stage_time::measure(Stage::Align, || {
-            batched_regs(&fm, &bns, &opt, &all_codes, dump_regs_enabled())
+            if opt.meth.is_some() {
+                meth_regs(&fm, &bns, &opt, &all_codes, false)
+            } else {
+                batched_regs(&fm, &bns, &opt, &all_codes, dump_regs_enabled())
+            }
         });
         // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
         // `into_par_iter` yields the owned `Vec<MemAlnReg>`, dropping a per-read Vec allocation+copy.
@@ -2371,6 +2491,17 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
                 .zip(regs_all.into_par_iter())
                 .enumerate()
                 .map(|(read_in_batch, ((rec, codes), regs))| {
+                    if opt.meth.is_some() {
+                        return finish_se_meth(
+                            &fm,
+                            &bns,
+                            &opt,
+                            rec,
+                            codes,
+                            regs,
+                            base_id + read_in_batch as u64,
+                        );
+                    }
                     finish_se(
                         &fm,
                         &bns,
@@ -2488,6 +2619,93 @@ fn batched_regs(
         .flatten()
         .collect()
     })
+}
+
+/// The `--meth` index: `<prefix>.ann/.amb/.pac` of the original genome and the converted seed
+/// index `<prefix>.meth.bwt.2bit.64` (`index --meth`). A prefix given as `<ref>.meth` is taken to
+/// mean `<ref>`, as in the fork.
+fn load_meth_index(prefix: &std::path::Path) -> anyhow::Result<(FmIndex, BntSeq)> {
+    let text = prefix.to_string_lossy();
+    let orig = std::path::PathBuf::from(text.strip_suffix(".meth").unwrap_or(&text));
+    let seed = std::path::PathBuf::from(format!("{}.meth", orig.display()));
+    let bns = BntSeq::load(&orig)?;
+    let fm = FmIndex::load_meth(&seed, &orig, bns.l_pac).map_err(|e| {
+        anyhow::anyhow!(
+            "--meth: cannot load the seed index {}: {e}; build it with `bwa-mem4 index --meth`",
+            seed.display()
+        )
+    })?;
+    // The seed index is the genome converted both ways, so exactly twice as long.
+    if fm.ref_seq_len != 4 * bns.l_pac + 1 {
+        anyhow::bail!(
+            "--meth: {} is not the seed index of {} (rebuild with `bwa-mem4 index --meth`)",
+            seed.display(),
+            orig.display()
+        );
+    }
+    Ok((fm, bns))
+}
+
+/// [`batched_regs`] under `--meth`: each read seeded from its converted copy and extended, deduped,
+/// with its own chemistry's matrix. `paired`: `codes` interleaves read 1 and read 2.
+// shortcut: per-read scalar seeding and extension (and scalar mate rescue in run_pe), without the
+// lockstep batching or the NEON kernels, which score bwa's uniform matrix only: ~5.5x bwa-mem3's
+// CPU on EM-seq PE (54% rescue, 26% extension). Batch it if `--meth` throughput matters.
+fn meth_regs(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[&[u8]],
+    paired: bool,
+) -> Vec<Vec<MemAlnReg>> {
+    codes
+        .par_iter()
+        .enumerate()
+        .map(|(i, read)| {
+            let ot = !paired || i % 2 == 0;
+            let ropt = bwa_mem::meth::read_opt(opt, ot);
+            let regs = bwa_mem::align_read_meth(fm, bns, &ropt, read, ot);
+            let mut kept = mem_sort_dedup_patch(fm, &ropt, read, regs);
+            bwa_mem::stamp_is_alt(bns, &mut kept);
+            kept
+        })
+        .collect()
+}
+
+/// [`finish_se`] under `--meth`: bwa's own `mem_reg2sam` (which `finish_se` mirrors) with the
+/// meth record extras, then the QC-fail rule over the read's records.
+fn finish_se_meth(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    rec: &Record,
+    codes: &[u8],
+    mut regs: Vec<MemAlnReg>,
+    read_id: u64,
+) -> Vec<u8> {
+    mem_mark_primary_se(opt, &mut regs, read_id);
+    if opt.flag & flags::PRIMARY5 != 0 {
+        bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);
+    }
+    let meth = opt.meth.as_ref().expect("finish_se_meth runs under --meth");
+    let emit = bwa_mem::meth::MethEmit { fm, meth, ot: true };
+    let mut buf = Vec::new();
+    bwa_mem::pe::mem_reg2sam(
+        fm,
+        bns,
+        &bwa_mem::meth::read_opt(opt, true),
+        rec.name(),
+        codes,
+        rec.qual(),
+        rec.comment(),
+        &regs,
+        0,
+        None,
+        Some(&emit),
+        &mut buf,
+    );
+    bwa_mem::meth::propagate_qcfail(&mut buf);
+    buf
 }
 
 /// Env-gated (`BWA4_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
@@ -3057,7 +3275,11 @@ fn run_pe(
         }
         // Deduped regions, in the same interleaved order as `all_codes`.
         let regs_all = stage_time::measure(Stage::Align, || {
-            batched_regs(fm, bns, opt, &all_codes, false)
+            if opt.meth.is_some() {
+                meth_regs(fm, bns, opt, &all_codes, true)
+            } else {
+                batched_regs(fm, bns, opt, &all_codes, false)
+            }
         });
         drop(all_codes);
 
@@ -3113,7 +3335,9 @@ fn run_pe(
         // `BWA4_SCALAR_RESCUE`: set to any value (presence only, content ignored) to skip the
         // batched pass here and let `mem_sam_pe` do its original per-pair rescue instead. Default
         // off. An A/B verification switch: both paths are byte-identical, only the speed differs.
-        let scalar_rescue = std::env::var_os("BWA4_SCALAR_RESCUE").is_some();
+        // `--meth` rescues on the scalar path, which picks each mate's chemistry matrix: the
+        // batched kernels and their K-mer pruning assume bwa's uniform matrix.
+        let scalar_rescue = std::env::var_os("BWA4_SCALAR_RESCUE").is_some() || opt.meth.is_some();
         // `BWA4_NO_RESCUE=1` skips mate rescue entirely, the analogue of bwa-mem2's `-S`. It is a
         // MEASUREMENT gate, not a lever: it changes the output by design, exactly as `-S` does. It
         // exists so our rescue cost can be measured DIRECTLY and compared like-for-like against
