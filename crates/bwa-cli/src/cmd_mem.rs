@@ -2699,6 +2699,10 @@ fn finish_se_meth(
     mut regs: Vec<MemAlnReg>,
     read_id: u64,
 ) -> Vec<u8> {
+    if dump_regs_enabled() {
+        eprintln!("=== read {} ===", rec.name());
+        bwa_mem::dump_regs(bns, "meth pre-mark", &regs);
+    }
     mem_mark_primary_se(opt, &mut regs, read_id);
     if opt.flag & flags::PRIMARY5 != 0 {
         bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);

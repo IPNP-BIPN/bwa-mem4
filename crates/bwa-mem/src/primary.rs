@@ -259,8 +259,11 @@ fn mem_patch_reg(
         * f64::from(right.score + left.score)
         + ROUND_BIAS) as i32;
     // Accept only if the actual global score reaches 90% of the more optimistic prediction. Falling
-    // short means the two regions do not in fact align through the interval between them.
-    if f64::from(score) / f64::from(q_s.max(r_s)) < f64::from(PATCH_MIN_SC_RATIO) {
+    // short means the two regions do not in fact align through the interval between them. And never
+    // on a score of 0 or below: the C returns the score and its callers merge only on `> 0`. Two
+    // regions from `--meth` seeds that score under 0 in the original alphabet predict a negative
+    // score, which a negative global score passes the ratio against (fork 0.16 parity).
+    if score <= 0 || f64::from(score) / f64::from(q_s.max(r_s)) < f64::from(PATCH_MIN_SC_RATIO) {
         return None;
     }
     Some((score, w))
@@ -1377,6 +1380,30 @@ mod tests {
             let ib: Vec<i64> = b.iter().map(|r| r.rb).collect();
             assert_eq!(ia, ib, "round {round}, n {n}");
         }
+    }
+
+    /// A merge whose global score is not positive is no merge: two negative regions (`--meth` seeds
+    /// can score under 0) predict a negative score, which a negative global score passed the ratio
+    /// test against. The same pair on the reference's own bases still merges.
+    #[test]
+    fn patch_needs_a_positive_global_score() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let fm = FmIndex::load(std::path::Path::new(prefix)).unwrap();
+        let opt = MemOpt::default();
+        let rb = 1000i64;
+        let refb = fm.bases(rb, rb + 60);
+        assert!(refb.iter().all(|&b| b < 4));
+        let span = |score: i32, at: i64| {
+            let mut r = reg(score, 0, 0, 0, 20);
+            (r.rb, r.re, r.qb, r.qe) = (rb + at, rb + at + 20, at as i32, at as i32 + 20);
+            r
+        };
+        let mismatched: Vec<u8> = refb.iter().map(|&b| 3 - b).collect();
+        assert_eq!(
+            mem_patch_reg(&fm, &opt, &mismatched, &span(-10, 0), &span(-10, 40)),
+            None
+        );
+        assert!(mem_patch_reg(&fm, &opt, &refb, &span(20, 0), &span(20, 40)).is_some());
     }
 
     /// The incremental insert against the pass it stands in for, on lists built to hit every case its
