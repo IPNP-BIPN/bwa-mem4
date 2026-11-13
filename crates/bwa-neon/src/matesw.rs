@@ -2783,6 +2783,24 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
         for l in 0..n_lanes {
             limit[l] = tlen[l] as i32 - 1;
         }
+        // `finish_row`'s state as lanes (bwa-mem3's row epilogue): the global max and its column
+        // in bytes, its row in two u16 halves (-1 = none yet), the freeze mask, and the per-lane
+        // bounds. A lane past the group has `tlen` 0 and is never live. `endsc` clamped to a byte
+        // freezes the same lanes: an improved `gmax` is at least 1 and at most 254 (`u8_job_fits`).
+        assert!(
+            tmax < usize::from(u16::MAX),
+            "u8 rescue window too long for u16 rows"
+        );
+        let (tl_lo, tl_hi) = {
+            let t16: [u16; LANES16] = std::array::from_fn(|l| tlen[l] as u16);
+            (vld1q_u16(t16.as_ptr()), vld1q_u16(t16.as_ptr().add(8)))
+        };
+        let endsc_v = {
+            let e8: [u8; LANES16] = std::array::from_fn(|l| endsc[l].clamp(0, 255) as u8);
+            vld1q_u8(e8.as_ptr())
+        };
+        let (mut gmax_v, mut qe_v, mut frozen_v) = (zero, zero, zero);
+        let (mut te_lo, mut te_hi) = (vdupq_n_u16(u16::MAX), vdupq_n_u16(u16::MAX));
         // Columns below the shortest live query: no lane can be showing ZPAD or PAD there, which is
         // what the fast body in the row loop relies on. Mate-rescue batches are whole reads of one
         // run, so in practice this covers ~92% of the padded columns (148 real of 160 padded).
@@ -2842,26 +2860,34 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
         macro_rules! finish_row {
             ($row:expr, $imax:expr, $col:expr) => {{
                 let row = $row;
-                let mut imax_arr = [0u8; LANES16];
-                let mut col_arr = [0u8; LANES16];
-                vst1q_u8(imax_arr.as_mut_ptr(), $imax);
-                vst1q_u8(col_arr.as_mut_ptr(), $col);
+                let imax = $imax;
                 // Publish the row in one store. Lanes that are out of target or already frozen get
                 // a value written that the old code left untouched, and that is safe: a lane's row
                 // maxima are read only for rows `0..=limit[l]`, and `limit[l]` is `tlen[l] - 1` or
                 // the freeze row, so every slot this writes beyond the guard is one nothing reads.
-                vst1q_u8(rowmax.as_mut_ptr().add(row * LANES16), $imax);
-                for l in 0..n_lanes {
-                    if row >= tlen[l] || frozen[l] {
-                        continue;
-                    }
-                    // Job `l`'s best H anywhere in target row `row`, widened out of the lane.
-                    let row_max = imax_arr[l] as i32;
-                    if row_max > gmax[l] {
-                        gmax[l] = row_max;
-                        te[l] = row as i32;
-                        qe[l] = col_arr[l] as i32;
-                        if gmax[l] >= endsc[l] {
+                vst1q_u8(rowmax.as_mut_ptr().add(row * LANES16), imax);
+                // A lane is live while `row < tlen` and not frozen; a live lane whose row max beats
+                // its `gmax` takes this row's max, row and column. Branch-free: the scalar form's
+                // per-lane `row_max > gmax` test was a data-dependent branch, ~10% of this kernel.
+                let rv = vdupq_n_u16(row as u16);
+                let inside = vcombine_u8(
+                    vmovn_u16(vcltq_u16(rv, tl_lo)),
+                    vmovn_u16(vcltq_u16(rv, tl_hi)),
+                );
+                let imp = vandq_u8(vcgtq_u8(imax, gmax_v), vbicq_u8(inside, frozen_v));
+                gmax_v = vbslq_u8(imp, imax, gmax_v);
+                qe_v = vbslq_u8(imp, $col, qe_v);
+                te_lo = vbslq_u16(vreinterpretq_u16_u8(vzip1q_u8(imp, imp)), rv, te_lo);
+                te_hi = vbslq_u16(vreinterpretq_u16_u8(vzip2q_u8(imp, imp)), rv, te_hi);
+                // Freezing is rare (the reverse pass's stop score): lanes, then the arrays the
+                // early exit and `extract_group` read.
+                let newly = vandq_u8(imp, vcgeq_u8(gmax_v, endsc_v));
+                if vmaxvq_u8(newly) != 0 {
+                    frozen_v = vorrq_u8(frozen_v, newly);
+                    let mut nw = [0u8; LANES16];
+                    vst1q_u8(nw.as_mut_ptr(), newly);
+                    for l in 0..n_lanes {
+                        if nw[l] != 0 {
                             frozen[l] = true;
                             limit[l] = row as i32;
                         }
@@ -3312,6 +3338,16 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
             i += rows;
         }
 
+        {
+            let (mut g, mut q, mut t) = ([0u8; LANES16], [0u8; LANES16], [0u16; LANES16]);
+            vst1q_u8(g.as_mut_ptr(), gmax_v);
+            vst1q_u8(q.as_mut_ptr(), qe_v);
+            vst1q_u16(t.as_mut_ptr(), te_lo);
+            vst1q_u16(t.as_mut_ptr().add(8), te_hi);
+            for l in 0..n_lanes {
+                (gmax[l], qe[l], te[l]) = (i32::from(g[l]), i32::from(q[l]), t[l] as i16 as i32);
+            }
+        }
         extract_group(
             n_lanes, group_idx, LANES16, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
         );
