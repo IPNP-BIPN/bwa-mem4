@@ -1686,6 +1686,27 @@ fn mat5_u8_ok(m: usize, mat: &[i8]) -> bool {
 /// changes nothing.
 #[cfg(target_arch = "x86_64")]
 fn mat5_add_code(mat: &[i8]) -> Option<([u8; 5], [u8; 5], [i8; 16])> {
+    type Code = Option<([u8; 5], [u8; 5], [i8; 16])>;
+    // The dispatch and every kernel call ask again for the same two or four `--meth` matrices; the
+    // search each time was 3.7% of a 7763 TAPS run.
+    thread_local! {
+        static MEMO: std::cell::RefCell<Vec<(Vec<i8>, Code)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    MEMO.with_borrow_mut(|memo| {
+        if let Some(&(_, code)) = memo.iter().find(|(k, _)| k == mat) {
+            return code;
+        }
+        if memo.len() >= 16 {
+            memo.clear();
+        }
+        let code = mat5_add_code_search(mat);
+        memo.push((mat.to_vec(), code));
+        code
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn mat5_add_code_search(mat: &[i8]) -> Option<([u8; 5], [u8; 5], [i8; 16])> {
     struct Search<'a> {
         mat: &'a [i8],
         t: [u8; 5],
