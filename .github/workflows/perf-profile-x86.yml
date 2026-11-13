@@ -872,3 +872,15 @@ jobs:
                 | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -60 || true
             done
           done
+          # The rescue kernel of each arm, instruction by instruction, in address order: the hot
+          # loop bodies and their weights, to set the two cells side by side.
+          for lib in em taps; do
+            for arm in ours fork; do
+              pat='bwa_neon::matesw::fwd_local_sw_[a-z0-9_]+'; [ "$arm" = fork ] && pat='kswv_[a-z0-9]+::kswv[0-9]+_u8'
+              sym=$("$PERF" report -i "$lib.$arm.data" --stdio --no-children 2>/dev/null \
+                | grep -E "\] $pat" | head -1 | sed 's/.*\[\.\] //; s/ *$//') || true
+              echo "===== $lib $arm: annotate $sym ====="
+              [ -n "$sym" ] && "$PERF" annotate -i "$lib.$arm.data" --stdio -s "$sym" 2>/dev/null \
+                | awk '$1 + 0 >= 0.25' | head -160 || true
+            done
+          done
