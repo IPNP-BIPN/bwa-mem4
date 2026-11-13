@@ -872,3 +872,28 @@ jobs:
                 | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -60 || true
             done
           done
+
+      # Whether TAPS mate rescue is cheaper with its relation prune (`rescue_prune::decide_rel`, a
+      # scalar K-mer count, then the band kernel) or with every job on the full u8 forward kernel,
+      # as EM-seq always runs. Both arms are byte-identical by construction; the md5 checks it.
+      - name: "A/B: TAPS rescue with and without the relation prune"
+        if: steps.host.outputs.ok == '1'
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          cd work
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          cmd=(../mem4-v3 mem --meth=taps -K 10000000 ours/chr21.fa taps_1.fq taps_2.fq)
+          a=$("${cmd[@]}" -t "$T" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+          b=$(BWA4_RESCUE_PRUNE=0 "${cmd[@]}" -t "$T" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+          echo "===== taps md5: prune $a no-prune $b $([ "$a" = "$b" ] && echo identical || echo DIFFER) ====="
+          for t in 1 "$T"; do
+            for rep in 1 2; do
+              for arm in prune noprune; do
+                env=(); [ "$arm" = noprune ] && env=(BWA4_RESCUE_PRUNE=0)
+                env "${env[@]}" /usr/bin/time -f '%e %U %S %M' -o t.txt "${cmd[@]}" -t "$t" > /dev/null 2> /dev/null
+                read -r e u sy m < t.txt
+                echo "taps -t$t $arm rep$rep: wall $e cpu $(awk "BEGIN{print $u + $sy}") rss $((m / 1024)) MB"
+              done
+            done
+          done
