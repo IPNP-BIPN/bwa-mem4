@@ -1550,8 +1550,9 @@ pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
     // bounded by the recursion depth of repeated halving, i.e. `log2(usize::MAX)`.
     //
     // Pure implementation detail: the comparison and swap sequence is untouched, so the permutation
-    // is identical, which is the only property this port has to preserve.
-    let mut stack = [(0usize, 0usize, 0i64); 64];
+    // is identical, which is the only property this port has to preserve. Left uninitialised: a
+    // zeroed one was a 1.5 KB memset per call, and a call on 17 or fewer elements never pushes.
+    let mut stack = [const { std::mem::MaybeUninit::<(usize, usize, i64)>::uninit() }; 64];
     // Number of occupied `stack` slots; `stack[top - 1]` is the most recently pushed partition.
     let mut top = 0usize;
     // `s`/`t`: inclusive lo/hi array indices of the partition currently being worked on. Invariant at
@@ -1629,21 +1630,22 @@ pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
             if is > ti {
                 if is > 16 {
                     debug_assert!(top < stack.len(), "introsort stack overflow");
-                    stack[top] = (s, i - 1, d);
+                    stack[top].write((s, i - 1, d));
                     top += 1;
                 }
                 s = if ti > 16 { i + 1 } else { t };
             } else {
                 if ti > 16 {
                     debug_assert!(top < stack.len(), "introsort stack overflow");
-                    stack[top] = (i + 1, t, d);
+                    stack[top].write((i + 1, t, d));
                     top += 1;
                 }
                 t = if is > 16 { i - 1 } else { s };
             }
         } else if top > 0 {
             top -= 1;
-            let (l, r, dep) = stack[top];
+            // SAFETY: every slot below `top` was written by a push above.
+            let (l, r, dep) = unsafe { stack[top].assume_init() };
             s = l;
             t = r;
             d = dep;
