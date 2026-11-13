@@ -916,14 +916,18 @@ const FLAT_CI_BITS: u32 = 20;
 /// than the longer memmoves: 2M GIAB pairs -t8, 512 -> 630G cycles, 1024 -> 624G, 2048 -> 624G,
 /// 4096 -> 625G; 64 and 192 were worse.
 const FLAT_CAP: usize = 2048;
-/// New flat keys collect in a sorted side run this long before merging into the main index, so a
-/// new chain shifts at most this many keys instead of half the index: on a repeat's hundreds of
-/// chains those shifts were 2/3 of the run's memmove bytes (chr21, 200k pairs: 6.4 of 9.5 GB).
-#[cfg(not(bwa4_flat_shift))]
+/// Up to this many chains a new flat key is shifted straight into the sorted index; past it, new
+/// keys collect in a sorted side run of [`FLAT_RECENT`] that merges in when full. A repeat's
+/// hundreds of chains made those shifts 2/3 of the memmove bytes on simulated chr21 (6.4 of 9.5 GB
+/// per 200k pairs), but a side run on every read cost real-read chaining 5% (x86, 2026-11-13).
+/// `--cfg bwa4_flat_shift` (perf CI A/B) never splits: the code before the side run.
+const FLAT_SPLIT: usize = if cfg!(bwa4_flat_shift) {
+    usize::MAX / 2
+} else {
+    64
+};
+/// Length of the side run past [`FLAT_SPLIT`]: a new chain shifts at most this many keys.
 const FLAT_RECENT: usize = 32;
-/// `--cfg bwa4_flat_shift` (perf CI A/B): no side run, each new key shifted into the index.
-#[cfg(bwa4_flat_shift)]
-const FLAT_RECENT: usize = usize::MAX;
 
 /// Chain the resolved seeds of one read: each seed joins the chain with the largest `pos <= rbeg`
 /// when [`test_and_merge`] accepts it, else opens a chain. Leaves the chains in `chains` (cleared
@@ -958,7 +962,7 @@ fn chain_seeds(
     let mut tree = (!flat).then(crate::kbtree::KbTree::new);
     // The flat index, the thread's allocation like `ends`: a fresh one per read regrew by
     // doubling, a realloc and a copy each time.
-    // `keys` sorted, plus the newest keys sorted apart in `recent` (see [`FLAT_RECENT`]).
+    // `keys` sorted, plus past [`FLAT_SPLIT`] the newest keys sorted apart in `recent`.
     let (mut keys, mut recent) = KEYS.take();
     keys.clear();
     recent.clear();
@@ -988,8 +992,8 @@ fn chain_seeds(
             if rid < 0 {
                 continue;
             }
-            // The chain with the largest `pos <= rbeg`; on the flat index also the number of
-            // `recent` keys at or below `rbeg` (where a new key goes) and whether a chain already
+            // The chain with the largest `pos <= rbeg`; on the flat index also where a new key goes
+            // (its rank in `keys`, or in `recent` past the split) and whether a chain already
             // starts at `rbeg`.
             let (lower, rank, taken) = match &tree {
                 None => {
@@ -997,9 +1001,12 @@ fn chain_seeds(
                         let r = v.partition_point(|&k| (k >> FLAT_CI_BITS) as i64 <= rbeg);
                         (r, r.checked_sub(1).map(|x| v[x]))
                     };
-                    let (rank, near) = below(&recent);
-                    // Positions are distinct across both runs, so the larger key has the larger pos.
-                    let best = below(&keys).1.max(near);
+                    let (mut rank, mut best) = below(&keys);
+                    if keys.len() >= FLAT_SPLIT {
+                        // Positions are distinct across both runs: the larger key has the larger pos.
+                        let (r, near) = below(&recent);
+                        (rank, best) = (r, best.max(near));
+                    }
                     let taken = best.is_some_and(|k| (k >> FLAT_CI_BITS) as i64 == rbeg);
                     (best.map(|k| (k & ci_mask) as usize), rank, taken)
                 }
@@ -1047,13 +1054,14 @@ fn chain_seeds(
             n_seeds.push(1);
             match &mut tree {
                 None => {
-                    insert_inline(
-                        &mut recent,
-                        rank,
-                        (rbeg as u64) << FLAT_CI_BITS | idx as u64,
-                    );
-                    if recent.len() == FLAT_RECENT {
-                        merge_recent(&mut keys, &mut recent);
+                    let key = (rbeg as u64) << FLAT_CI_BITS | idx as u64;
+                    if keys.len() < FLAT_SPLIT {
+                        insert_inline(&mut keys, rank, key);
+                    } else {
+                        insert_inline(&mut recent, rank, key);
+                        if recent.len() == FLAT_RECENT {
+                            merge_recent(&mut keys, &mut recent);
+                        }
                     }
                 }
                 // bwa keys chains by `pos` in a kbtree, which *permits duplicates*: when several
@@ -1069,7 +1077,9 @@ fn chain_seeds(
     let order: Vec<usize> = match tree {
         // The thread's allocation, which `build_filtered_chains` hands back.
         None => {
-            merge_recent(&mut keys, &mut recent);
+            if !recent.is_empty() {
+                merge_recent(&mut keys, &mut recent);
+            }
             let mut order = ORDER.take();
             order.clear();
             order.extend(keys.iter().map(|&k| (k & ci_mask) as usize));
@@ -1100,7 +1110,7 @@ fn merge_recent(keys: &mut Vec<u64>, recent: &mut Vec<u64>) {
 
 /// `v.insert(at, x)`, a short tail shifted in place 16 bytes a step from the end: `Vec::insert`
 /// calls libc `memmove` even for a tail of a few keys, and on x86 that call was 0.6% of the run.
-/// A longer tail than [`FLAT_RECENT`] (none in [`chain_seeds`]) still goes to `memmove`.
+/// A longer tail (only below [`FLAT_SPLIT`] in [`chain_seeds`]) still goes to `memmove`.
 fn insert_inline(v: &mut Vec<u64>, at: usize, x: u64) {
     // The pre-side-run threshold under `bwa4_flat_shift`, so that arm is the old code.
     const INLINE_TAIL: usize = if cfg!(bwa4_flat_shift) {
@@ -2438,7 +2448,7 @@ mod tests {
             let order = chain_seeds(&bns, &opt, 7, &smems, &counts, &rbegs, true, &mut chains);
             if let Some(order) = order {
                 accepted += 1;
-                merged += usize::from(chains.len() > 2 * FLAT_RECENT);
+                merged += usize::from(chains.len() > FLAT_SPLIT + FLAT_RECENT);
                 assert_eq!(emit(&chains, order), tree);
             }
             // Chaining and filtering fused: the same kept chains as the two steps in turn.
