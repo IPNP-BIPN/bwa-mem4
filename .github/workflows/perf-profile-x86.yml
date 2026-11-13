@@ -785,6 +785,8 @@ jobs:
       - name: Build ours at the tier we ship
         if: steps.host.outputs.ok == '1'
         run: |
+          # Line tables (no codegen change) so the profile step can name our kernel's source lines.
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
           RUSTFLAGS="-C target-cpu=x86-64-v3 ${{ github.event.inputs.extra_rustflags }}" \
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-meth
           cp target-meth/release/bwa-mem4 ./mem4-v3
@@ -882,5 +884,18 @@ jobs:
               echo "===== $lib $arm: annotate $sym ====="
               [ -n "$sym" ] && "$PERF" annotate -i "$lib.$arm.data" --stdio -s "$sym" 2>/dev/null \
                 | awk '$1 + 0 >= 0.25' | head -160 || true
+              [ "$arm" = ours ] && [ -n "$sym" ] || continue
+              # Every sampled address of our kernel, summed by its innermost bwa-neon source line
+              # (addr2line -i walks the inlined frames out of core::arch).
+              echo "===== $lib ours: kernel self time by source line ====="
+              "$PERF" annotate -i "$lib.$arm.data" --stdio --no-source -s "$sym" 2>/dev/null \
+                | awk '$1 ~ /^[0-9]+\.[0-9]+$/ && $2 == ":" {a = $3; sub(/:$/, "", a); print $1, a}' \
+                > ann.txt || true
+              addr2line -i -a -e ../mem4-v3 $(awk '{print "0x" $2}' ann.txt) 2>/dev/null \
+                | awk 'NR == FNR {p[$2] = $1; next}
+                       /^0x/ {a = $1; sub(/^0x0*/, "", a); want = 1; next}
+                       want && /bwa-neon\/src\// {sub(/.*bwa-neon\/src\//, ""); sub(/ .*/, ""); s[$0] += p[a]; want = 0}
+                       END {for (l in s) printf "%7.2f %s\n", s[l], l}' ann.txt - \
+                | sort -rn | head -70 || true
             done
           done
