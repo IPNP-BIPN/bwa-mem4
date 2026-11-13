@@ -859,11 +859,11 @@ fn simd_dispatch(
     // staying byte-identical (see `ungapped_hit`). Non-HIT jobs fall through to the kernel binning.
     let mut out = vec![default_result(); jobs.len()];
     // Indices of the jobs the fast path declined, i.e. the ones that still need the real DP.
-    let mut needs_dp: Vec<usize> = Vec::new();
+    let mut needs_dp: Vec<usize> = Vec::with_capacity(jobs.len());
     // Dedup fingerprints of the declined jobs, taken here while the scan has their bytes in cache:
     // a pass of its own reloaded every job cold (on EPYC 9V45 the fold took 1.6x its Zen 4 time).
     let dedup_on = job_dedup_enabled();
-    let mut fps: Vec<u64> = Vec::new();
+    let mut fps: Vec<u64> = Vec::with_capacity(if dedup_on { jobs.len() } else { 0 });
     for (k, job) in jobs.iter().enumerate() {
         prefetch_job(jobs, k + PF_AHEAD);
         match ungapped_hit(job, a, b, x_threshold, zdrop) {
@@ -1164,7 +1164,9 @@ fn dispatch_bins(
         None => (jobs, None),
     };
     // Job indices per bin, in ascending order, partitioning `0..jobs.len()` exactly once.
-    let (mut u8_idx, mut i16_idx, mut sc_idx) = (Vec::new(), Vec::new(), Vec::new());
+    // Most jobs land in the u8 bin: sized for all of them, it never regrows.
+    let (mut u8_idx, mut i16_idx, mut sc_idx) =
+        (Vec::with_capacity(jobs.len()), Vec::new(), Vec::new());
     for (k, job) in jobs.iter().enumerate() {
         // Upper bound on every DP value this job can reach; must fit the lane type, as must both
         // lengths (column and row indices are stored in lanes too).

@@ -533,7 +533,8 @@ fn run_staged<B: SwBackend>(
     let mut ix = KEPT_INDEX.with(|c| std::mem::take(&mut *c.borrow_mut()));
     let mut blocking = KeptIndex::default();
     // This wave's extending slots, as (read, slot within the read).
-    let mut pending: Vec<(usize, usize)> = Vec::new();
+    // At most every slot once per wave: sized for that, it never regrows.
+    let mut pending: Vec<(usize, usize)> = Vec::with_capacity(st.len());
     let (mut wl, mut wr): (Vec<SideJob>, Vec<SideJob>) = (Vec::new(), Vec::new());
     // Reads with a slot still undecided, and each read's first undecided slot.
     let mut todo: Vec<usize> = (0..reads.len()).collect();
@@ -964,6 +965,11 @@ thread_local! {
     /// memory mimalloc had recycled zeroed it again (`rep stosb`, 0.3% of samples on EPYC 9V45).
     static SA_BUFS: std::cell::Cell<(Vec<i64>, Vec<i64>)> =
         const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+    /// `all_positions`, `all_counts` and the repeated runs, kept between chunks: grown from empty
+    /// per chunk they were a fifth of the run's realloc copies (chr21, 200k pairs: 0.26 of 1.29 GB).
+    #[allow(clippy::type_complexity)]
+    static POS_BUFS: std::cell::Cell<(Vec<i64>, Vec<i64>, Vec<bwa_chain::RepeatedRun>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new())) };
     /// `reg_meta` and `reg_preskip`, kept between chunks for the same reason: every pushed region
     /// writes its own slot before any pass reads it, and nothing reads past `regs[r].len()`.
     static META_BUFS: std::cell::Cell<(Vec<RegMeta>, Vec<bool>)> =
@@ -1293,11 +1299,13 @@ fn align_reads_batched_inner<B: SwBackend>(
     let (all_positions, all_counts): (Vec<i64>, Vec<i64>) = if batched_sa {
         #[cfg(feature = "stage-alloc")]
         let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SA);
-        let mut pos = Vec::new();
-        // Runs of rows that repeat an earlier run exactly, because two adjacent SMEMs are identical
-        // after the sort. Collected here and consumed by the resolution below; see `RepeatedRun`.
-        let mut repeats = Vec::new();
-        let mut counts = Vec::new();
+        // `repeats`: runs of rows that repeat an earlier run exactly, because two adjacent SMEMs are
+        // identical after the sort. Collected here and consumed by the resolution below; see
+        // `RepeatedRun`.
+        let (mut pos, mut counts, mut repeats) = POS_BUFS.take();
+        pos.clear();
+        counts.clear();
+        repeats.clear();
         for ri in 0..per_read_smems.len() {
             prefetch_smems(per_read_smems.get(ri + 1));
             let smems = &mut per_read_smems[ri];
@@ -1545,6 +1553,7 @@ fn align_reads_batched_inner<B: SwBackend>(
         let (_, walked) = b.take();
         b.set((all_rbegs, walked));
     });
+    POS_BUFS.set((all_positions, all_counts, sa_repeats));
 
     // Chaining is over; everything from the region skeleton to the final compaction is extension.
     #[cfg(feature = "stage-alloc")]

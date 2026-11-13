@@ -2131,7 +2131,8 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
     let split_len = (opt.min_seed_len as f32 * opt.split_factor + SPLIT_LEN_ROUNDING) as i32;
 
     // Enumerate the re-seed jobs, preserving per-read append order (round-1 SMEM index ascending).
-    let mut jobs: Vec<ReseedJob> = Vec::new();
+    // At most one job per SMEM: sized for that, it never regrows.
+    let mut jobs: Vec<ReseedJob> = Vec::with_capacity(per_read.iter().map(Vec::len).sum());
     for (ridx, smems) in per_read.iter().enumerate() {
         for p in smems.iter() {
             // Parent SMEM's READ span as a half-open interval `[start, end)`.
