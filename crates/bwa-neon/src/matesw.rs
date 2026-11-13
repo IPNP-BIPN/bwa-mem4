@@ -1991,6 +1991,27 @@ fn extract_group<R: Copy + Into<i32>>(
     rowmax: &[R],
     out: &mut [(i32, i32, i32, i32, i32)],
 ) {
+    let walks = |l: usize| limit[l] >= 0 && gmax[l] >= minsc[l];
+    // The rows of each lane that clear its `minsc`, as `bits[blk * n_lanes + l]` bit `k` for row
+    // `8 blk + k`: built with whole-row compares (all lanes of a row at once, the lane loop
+    // vectorises), so each lane below visits only its own candidate rows instead of a strided load,
+    // compare and branch per row. bwa-mem3's `kswv_score2_row_bits_u8`. Every visited row is
+    // re-tested by `push_row`, and the rows skipped are exactly those it would drop, so `b` is
+    // filled with the same entries in the same order.
+    let nrows = (0..n_lanes)
+        .filter(|&l| walks(l))
+        .map(|l| limit[l] as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut bits = vec![0u8; nrows.div_ceil(8) * n_lanes];
+    for (blk, acc) in bits.chunks_exact_mut(n_lanes.max(1)).enumerate() {
+        for k in 0..(nrows - 8 * blk).min(8) {
+            let row = &rowmax[(8 * blk + k) * lanes..][..n_lanes];
+            for ((a, &v), &m) in acc.iter_mut().zip(row).zip(minsc) {
+                *a |= u8::from(v.into() >= m) << k;
+            }
+        }
+    }
     for l in 0..n_lanes {
         let best_score = gmax[l];
         let best_te = te[l];
@@ -2011,11 +2032,20 @@ fn extract_group<R: Copy + Into<i32>>(
         //
         // Provable rather than measured: the test is on the same `minsc` the pushes use, and the
         // skipped work has no effect other than filling `b`.
-        if limit[l] >= 0 && best_score >= minsc[l] {
-            for i in 0..=limit[l] {
-                // Best H anywhere in target row `i` for this lane. Rows past `limit[l]` were never
-                // processed by this lane, so they are not offered as candidates.
-                b.push_row(i, rowmax[i as usize * lanes + l].into(), minsc[l]);
+        if walks(l) {
+            let last = limit[l] as usize;
+            for blk in 0..=last / 8 {
+                let mut m = bits[blk * n_lanes + l];
+                while m != 0 {
+                    let i = 8 * blk + m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    // Best H anywhere in target row `i` for this lane. Rows past `limit[l]` were
+                    // never processed by this lane, so they are not offered as candidates.
+                    if i > last {
+                        break;
+                    }
+                    b.push_row(i as i32, rowmax[i * lanes + l].into(), minsc[l]);
+                }
             }
         }
         b.record_shape(if limit[l] >= 0 {
