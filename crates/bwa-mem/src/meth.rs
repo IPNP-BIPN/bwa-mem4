@@ -131,7 +131,7 @@ pub fn build_xm(
 }
 
 /// [`build_xm`] on a reference slice already cut: `refs` holds the forward bases from two before
-/// the alignment start to two past its end.
+/// the alignment start to two past its end (`N` past a shorter slice's end).
 fn xm_calls(refs: &[u8], top: bool, cigar: &[u32], hard: bool, seq: &[u8], chem: Chem) -> Vec<u8> {
     let (c_marker, cpg_marker) = if top { (b'C', b'G') } else { (b'G', b'C') };
     // (methylated, unmethylated) read base: EM-seq keeps a methylated C, TAPS converts it.
@@ -141,60 +141,59 @@ fn xm_calls(refs: &[u8], top: bool, cigar: &[u32], hard: bool, seq: &[u8], chem:
         (Chem::Taps, true) => (b'T', b'C'),
         (Chem::Taps, false) => (b'A', b'G'),
     };
-    let at = |i: i64| {
-        refs.get(i as usize)
-            .copied()
-            .filter(|_| i >= 0)
-            .unwrap_or(b'N')
+    // The M runs read `refs` as slices, so they need it whole: two bases of context either side.
+    let rlen: usize = cigar
+        .iter()
+        .filter(|&&c| c & 0xf == 0 || c & 0xf == 2)
+        .map(|&c| (c >> 4) as usize)
+        .sum();
+    let padded;
+    let refs = if refs.len() < rlen + 4 {
+        padded = [refs, &vec![b'N'; rlen + 4 - refs.len()]].concat();
+        &padded[..]
+    } else {
+        refs
     };
     let mut xm = Vec::with_capacity(seq.len());
-    let mut t = 0i64;
+    let mut t = 0usize;
     for &c in cigar {
         let (op, len) = (c & 0xf, (c >> 4) as usize);
         match op {
             0 => {
-                for _ in 0..len {
-                    if xm.len() >= seq.len() {
-                        break;
-                    }
-                    let ri = t + 2;
-                    let read_b = seq[xm.len()];
-                    let methylated = if read_b == meth_b {
-                        Some(true)
-                    } else if read_b == unmeth_b {
-                        Some(false)
+                let s0 = xm.len();
+                let n = len.min(seq.len().saturating_sub(s0));
+                xm.resize(s0 + n, b'.');
+                // Reference base, then its two context bases (rightwards on the top strand,
+                // leftwards on the bottom one), all aligned with the run's read bases.
+                let ri = t + 2;
+                let (x1, x2) = if top {
+                    (&refs[ri + 1..][..n], &refs[ri + 2..][..n])
+                } else {
+                    (&refs[ri - 1..][..n], &refs[ri - 2..][..n])
+                };
+                // Selects only, no branch, so the run vectorises.
+                let calls = xm[s0..]
+                    .iter_mut()
+                    .zip(&seq[s0..s0 + n])
+                    .zip(&refs[ri..][..n]);
+                for (((o, &rb), &r), (&c1, &c2)) in calls.zip(x1.iter().zip(x2)) {
+                    let letter = if c1 == b'N' {
+                        b'U'
+                    } else if c1 == cpg_marker {
+                        b'Z'
+                    } else if c2 == b'N' {
+                        b'U'
+                    } else if c2 == cpg_marker {
+                        b'X'
                     } else {
-                        None
+                        b'H'
                     };
-                    let call = match methylated {
-                        Some(m) if at(ri) == c_marker => {
-                            let (ctx1, ctx2) = if top {
-                                (at(ri + 1), at(ri + 2))
-                            } else {
-                                (at(ri - 1), at(ri - 2))
-                            };
-                            let letter = if ctx1 == b'N' {
-                                b'U'
-                            } else if ctx1 == cpg_marker {
-                                b'Z'
-                            } else if ctx2 == b'N' {
-                                b'U'
-                            } else if ctx2 == cpg_marker {
-                                b'X'
-                            } else {
-                                b'H'
-                            };
-                            if m {
-                                letter
-                            } else {
-                                letter.to_ascii_lowercase()
-                            }
-                        }
-                        _ => b'.',
-                    };
-                    xm.push(call);
-                    t += 1;
+                    // Upper case methylated; `| 0x20` lowers these four letters.
+                    let call = if rb == meth_b { letter } else { letter | 0x20 };
+                    let hit = r == c_marker && (rb == meth_b || rb == unmeth_b);
+                    *o = if hit { call } else { b'.' };
                 }
+                t += n;
             }
             1 => xm.extend(std::iter::repeat_n(
                 b'.',
@@ -204,7 +203,7 @@ fn xm_calls(refs: &[u8], top: bool, cigar: &[u32], hard: bool, seq: &[u8], chem:
                 b'.',
                 len.min(seq.len().saturating_sub(xm.len())),
             )),
-            2 => t += len as i64,
+            2 => t += len,
             _ => {}
         }
     }
@@ -217,15 +216,18 @@ fn xm_calls(refs: &[u8], top: bool, cigar: &[u32], hard: bool, seq: &[u8], chem:
 fn ref_slice(fm: &FmIndex, bns: &BntSeq, rid: i32, st: i64, en: i64) -> Vec<u8> {
     let contig = &bns.contigs[rid as usize];
     let (off, len) = (contig.offset, i64::from(contig.len));
-    let mut out: Vec<u8> = (st..en)
-        .map(|p| {
-            if p < 0 || p >= len {
-                b'N'
-            } else {
-                b"ACGT"[fm.base(off + p) as usize & 3]
-            }
-        })
-        .collect();
+    // `N` outside the contig, its bases unpacked as one range inside it.
+    let n = (en - st).max(0) as usize;
+    let (a, b) = (st.max(0), en.min(len));
+    let mut out = Vec::with_capacity(n + 16);
+    if a < b {
+        out.resize((a - st) as usize, b'N');
+        fm.bases_append(off + a, off + b, &mut out);
+        for x in &mut out[(a - st) as usize..] {
+            *x = b"ACGT"[*x as usize & 3];
+        }
+    }
+    out.resize(n, b'N');
     let (lo, hi) = (off + st.max(0), off + en.min(len));
     for amb in &bns.ambs {
         let (a, b) = (amb.offset, amb.offset + i64::from(amb.len));
