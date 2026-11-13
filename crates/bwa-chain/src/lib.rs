@@ -919,7 +919,11 @@ const FLAT_CAP: usize = 2048;
 /// New flat keys collect in a sorted side run this long before merging into the main index, so a
 /// new chain shifts at most this many keys instead of half the index: on a repeat's hundreds of
 /// chains those shifts were 2/3 of the run's memmove bytes (chr21, 200k pairs: 6.4 of 9.5 GB).
+#[cfg(not(bwa4_flat_shift))]
 const FLAT_RECENT: usize = 32;
+/// `--cfg bwa4_flat_shift` (perf CI A/B): no side run, each new key shifted into the index.
+#[cfg(bwa4_flat_shift)]
+const FLAT_RECENT: usize = usize::MAX;
 
 /// Chain the resolved seeds of one read: each seed joins the chain with the largest `pos <= rbeg`
 /// when [`test_and_merge`] accepts it, else opens a chain. Leaves the chains in `chains` (cleared
@@ -1098,7 +1102,13 @@ fn merge_recent(keys: &mut Vec<u64>, recent: &mut Vec<u64>) {
 /// calls libc `memmove` even for a tail of a few keys, and on x86 that call was 0.6% of the run.
 /// A longer tail than [`FLAT_RECENT`] (none in [`chain_seeds`]) still goes to `memmove`.
 fn insert_inline(v: &mut Vec<u64>, at: usize, x: u64) {
-    if v.len() - at > FLAT_RECENT {
+    // The pre-side-run threshold under `bwa4_flat_shift`, so that arm is the old code.
+    const INLINE_TAIL: usize = if cfg!(bwa4_flat_shift) {
+        16
+    } else {
+        FLAT_RECENT
+    };
+    if v.len() - at > INLINE_TAIL {
         v.insert(at, x);
         return;
     }

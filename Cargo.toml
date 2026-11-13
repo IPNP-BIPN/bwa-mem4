@@ -22,9 +22,10 @@ repository = "https://github.com/IPNP-BIPN/bwa-mem4"
 # currently satisfy. They are allowed EXPLICITLY, not silenced globally, so a NEW lint of any other
 # kind still fails the build. Burn these down rather than adding to them.
 [workspace.lints.rust]
+# `--cfg bwa4_flat_shift` (perf CI alt_rustflags) shifts each new flat chaining key into the index.
 # `--cfg bwa4_r3_outline` (perf CI alt_rustflags) keeps round 3's step out of line, so icount
 # counts it apart.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bwa4_r3_outline)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bwa4_r3_outline)', 'cfg(bwa4_flat_shift)'] }
 
 [workspace.lints.clippy]
 # Doc-comment formatting in the module headers written during the documentation pass. Cosmetic,
