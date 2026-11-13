@@ -44,7 +44,7 @@ on:
         default: "false"
         required: false
       ours_env:
-        description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4. In the meth job, set for both arms instead (BWA4_* reach ours, BWAMEM3_* the fork)"
+        description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4. In the meth job, set for both arms instead (BWA4_* reach ours, BWAMEM3_* the fork), or prefixed ab: a third arm, ours under them"
         default: ""
         required: false
       alt_rustflags:
@@ -830,8 +830,14 @@ jobs:
           set -euo pipefail
           cd work
           # ours_env, e.g. BWA4_RESCUE_TIER=sse41 BWAMEM3_FORCE_TIER=avx2: both arms see it, and
-          # each tool reads only its own variables.
-          [ -z "$OURS_ENV" ] || { export $OURS_ENV; echo "env: $OURS_ENV"; }
+          # each tool reads only its own variables. `ab:` first instead: a third arm, `ab`, runs
+          # ours under the rest (same-host A/B).
+          AB=; arms="ours fork"
+          case "$OURS_ENV" in
+            "") ;;
+            ab:*) AB="${OURS_ENV#ab:}"; arms="ours ab fork"; echo "ab arm: $AB" ;;
+            *) export $OURS_ENV; echo "env: $OURS_ENV" ;;
+          esac
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
           rows=rows.csv; : > "$rows"
           for lib in em taps; do
@@ -839,16 +845,23 @@ jobs:
             reads=("${lib}_1.fq" "${lib}_2.fq")
             # The command line of one arm at `-t $2`, options before the index and reads.
             line() {
-              if [ "$1" = ours ]; then cmd=(../mem4-v3 mem "$mode" -K 10000000 -t "$2" ours/chr21.fa "${reads[@]}")
-              else cmd=(bwa-mem3 mem "$mode" -K 10000000 -t "$2" fork/chr21.fa "${reads[@]}"); fi
+              case "$1" in
+                ours) cmd=(../mem4-v3 mem "$mode" -K 10000000 -t "$2" ours/chr21.fa "${reads[@]}") ;;
+                ab) cmd=(env $AB ../mem4-v3 mem "$mode" -K 10000000 -t "$2" ours/chr21.fa "${reads[@]}") ;;
+                *) cmd=(bwa-mem3 mem "$mode" -K 10000000 -t "$2" fork/chr21.fa "${reads[@]}") ;;
+              esac
             }
             # Also warms the page cache for both.
             line ours "$T"; m4=$("${cmd[@]}" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
             line fork "$T"; m3=$("${cmd[@]}" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
             echo "===== $lib output md5: ours $m4 fork $m3 $([ "$m4" = "$m3" ] && echo identical || echo DIFFER) ====="
+            if [ -n "$AB" ]; then
+              line ab "$T"; ma=$("${cmd[@]}" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+              echo "===== $lib ab md5: $ma $([ "$ma" = "$m4" ] && echo identical || echo DIFFER) ====="
+            fi
             for t in 1 "$T"; do
               for rep in 1 2; do
-                for arm in ours fork; do
+                for arm in $arms; do
                   line "$arm" "$t"
                   /usr/bin/time -f '%e %U %S %M' -o t.txt "${cmd[@]}" > /dev/null 2> /dev/null
                   read -r e u sy m < t.txt
@@ -858,14 +871,14 @@ jobs:
             done
           done
           echo "===== meth summary: faster of 2 runs per arm (wall s, cpu s = user + sys, rss MB) ====="
-          printf "%-5s %3s  %15s  %15s  %13s  %s\n" lib -t "wall ours/fork" "cpu ours/fork" "rss ours/fork" "ratio wall cpu rss"
+          printf "%-8s %3s  %15s  %15s  %13s  %s\n" lib -t "wall ours/fork" "cpu ours/fork" "rss ours/fork" "ratio wall cpu rss"
           awk -F, '{ k = $1 "," $2 "," $3; c = $6 + $7
                      if (!(k in w) || $5 < w[k]) w[k] = $5
                      if (!(k in cpu) || c < cpu[k]) cpu[k] = c
                      if (!(k in r) || $8 < r[k]) r[k] = $8 }
-               END { for (k in w) { split(k, a, ","); if (a[3] != "ours") continue
+               END { for (k in w) { split(k, a, ","); if (a[3] == "fork") continue
                        f = a[1] "," a[2] ",fork"
-                       printf "%-5s %3s  %7.2f/%-7.2f  %7.2f/%-7.2f  %6d/%-6d  %.3f %.3f %.3f\n", a[1], a[2],
+                       printf "%-8s %3s  %7.2f/%-7.2f  %7.2f/%-7.2f  %6d/%-6d  %.3f %.3f %.3f\n", a[1] (a[3] == "ab" ? "/ab" : ""), a[2],
                          w[k], w[f], cpu[k], cpu[f], r[k] / 1024, r[f] / 1024, w[k] / w[f], cpu[k] / cpu[f], r[k] / r[f] } }' "$rows" | sort
 
       - name: Where the time goes (-t 1)
@@ -877,8 +890,8 @@ jobs:
           set -euo pipefail
           cd work
           # ours_env, e.g. BWA4_RESCUE_TIER=sse41 BWAMEM3_FORCE_TIER=avx2: both arms see it, and
-          # each tool reads only its own variables.
-          [ -z "$OURS_ENV" ] || { export $OURS_ENV; echo "env: $OURS_ENV"; }
+          # each tool reads only its own variables (an `ab:` arm is timed above only).
+          case "$OURS_ENV" in ""|ab:*) ;; *) export $OURS_ENV; echo "env: $OURS_ENV" ;; esac
           for lib in em taps; do
             mode=--meth; [ "$lib" = taps ] && mode=--meth=taps
             reads=("${lib}_1.fq" "${lib}_2.fq")
