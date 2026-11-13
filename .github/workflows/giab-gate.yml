@@ -94,7 +94,7 @@ jobs:
         run: |
           mkdir -p work/gate && cd work/gate
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           # Ensembl calls it `21`, the GIAB benchmark calls it `chr21`. Same assembly, same
           # coordinates, different naming convention, and a caller will silently produce nothing if
           # the two disagree. Renaming the single header is the whole fix.

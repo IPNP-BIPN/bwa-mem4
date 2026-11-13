@@ -200,7 +200,7 @@ jobs:
           set -euo pipefail
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           sed -i '1s/.*/>chr21/' chr21.fa
           bwa-mem2 index chr21.fa
           n="${{ github.event.inputs.read_pairs || '1000000' }}"
@@ -457,7 +457,7 @@ jobs:
           set -euo pipefail
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           sed -i '1s/.*/>chr21/' chr21.fa
           bwa-mem2 index chr21.fa
           wgsim -S 11 -N "${{ github.event.inputs.read_pairs || '1000000' }}" -1 150 -2 150 \
@@ -559,7 +559,7 @@ jobs:
           set -euo pipefail
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           sed -i '1s/.*/>chr21/' chr21.fa
           bwa-mem2 index chr21.fa
           n="${{ github.event.inputs.read_pairs || '50000' }}"

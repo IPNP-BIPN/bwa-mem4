@@ -177,7 +177,7 @@ jobs:
           set -euo pipefail
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           # The benchmark's contig must be named as the GIAB BAM names it, or the slice below has
           # nothing to fetch; bwa-mem2's indexer is what all four binaries read.
           sed -i '1s/.*/>chr21/' chr21.fa

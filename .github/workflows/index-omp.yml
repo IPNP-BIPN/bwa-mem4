@@ -117,7 +117,7 @@ jobs:
           # measured on a machine that fits it; this job is about the LINK, and the timing here is a
           # sanity check that the parallel path is actually taken.
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           for b in plain omp; do
             rm -f chr21.fa.{pac,ann,amb,0123} chr21.fa.bwt.2bit.64
             s=$( { /usr/bin/time -f '%e' -o t.txt "./bwa-mem4-$b" index chr21.fa >/dev/null; } 2>&1; cat t.txt)
