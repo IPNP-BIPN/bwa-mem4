@@ -2577,10 +2577,8 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
     let mut out = vec![(0i32, -1i32, -1i32, -1i32, -1i32); jobs.len()];
 
     // Broadcast constants, one scalar replicated across all 16 lanes. Note the scores are stored as
-    // *magnitudes* here, not signed values: `mispen_v` and `one_v` are subtracted rather than added,
-    // which is what lets the whole kernel stay unsigned.
+    // *magnitudes* here, not signed values, which is what lets the whole kernel stay unsigned.
     let zero = vdupq_n_u8(0);
-    let one_v = vdupq_n_u8(1);
     let zpad_v = vdupq_n_u8(ZPAD);
     let e_del_v = vdupq_n_u8(e_del as u8);
     let oe_del_v = vdupq_n_u8(oe_del as u8);
@@ -2770,6 +2768,15 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
         let mut h_prev = vec![0u8; qmax * LANES16];
         let mut h_cur = vec![0u8; qmax * LANES16];
         let mut e = vec![0u8; qmax * LANES16];
+        // LazyQE (bwa-mem3): the column of a row's max is recovered after the row, not tracked per
+        // cell. `hq` holds the rows a quad or pair otherwise keeps only in registers (its last row
+        // is `h_cur`), `ck[r]` row `r`-of-the-iteration's running max at the end of each 16-column
+        // block. Each is ONE buffer, rows interleaved per column (per block), so the quad body
+        // addresses all of them off one register: separate buffers spilled the loop's constants.
+        let nblk = qmax.div_ceil(16);
+        let mut hq = vec![0u8; qmax * 3 * LANES16];
+        let mut ck = vec![0u8; nblk * 4 * LANES16];
+        let (hq_p, ck_p) = (hq.as_mut_ptr(), ck.as_mut_ptr());
         // Row maxima kept in the LANE's own width, not widened to i32. Two reasons, both measured:
         // the whole row can then be published with ONE `vst1q_u8` instead of 16 scalar stores inside
         // the per-lane epilogue, and the buffer shrinks 4x (22 KB instead of 89 KB for a 1400-row
@@ -2791,16 +2798,37 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
             tmax < usize::from(u16::MAX),
             "u8 rescue window too long for u16 rows"
         );
-        let (tl_lo, tl_hi) = {
+        //
+        // Kept in memory, `ep[EP_*]`, and moved in and out once per row by volatile accesses so
+        // LLVM cannot promote it: held in registers across the column loops, these eight vectors
+        // pushed the quad body's own constants out to the stack (5 reloads a column).
+        const EP_GMAX: usize = 0;
+        const EP_QE: usize = 1;
+        const EP_FROZEN: usize = 2;
+        const EP_TE: usize = 3; // and 4: the u16 row, low then high half
+        const EP_TLEN: usize = 5; // and 6: likewise
+        const EP_ENDSC: usize = 7;
+        let mut ep = [zero; 8];
+        {
             let t16: [u16; LANES16] = std::array::from_fn(|l| tlen[l] as u16);
-            (vld1q_u16(t16.as_ptr()), vld1q_u16(t16.as_ptr().add(8)))
-        };
-        let endsc_v = {
+            ep[EP_TLEN] = vreinterpretq_u8_u16(vld1q_u16(t16.as_ptr()));
+            ep[EP_TLEN + 1] = vreinterpretq_u8_u16(vld1q_u16(t16.as_ptr().add(8)));
             let e8: [u8; LANES16] = std::array::from_fn(|l| endsc[l].clamp(0, 255) as u8);
-            vld1q_u8(e8.as_ptr())
-        };
-        let (mut gmax_v, mut qe_v, mut frozen_v) = (zero, zero, zero);
-        let (mut te_lo, mut te_hi) = (vdupq_n_u16(u16::MAX), vdupq_n_u16(u16::MAX));
+            ep[EP_ENDSC] = vld1q_u8(e8.as_ptr());
+            ep[EP_TE] = vdupq_n_u8(0xff);
+            ep[EP_TE + 1] = vdupq_n_u8(0xff);
+        }
+        let ep_p = ep.as_mut_ptr();
+        macro_rules! ep_ld {
+            ($k:expr) => {
+                std::ptr::read_volatile(ep_p.add($k))
+            };
+        }
+        macro_rules! ep_st {
+            ($k:expr, $v:expr) => {
+                std::ptr::write_volatile(ep_p.add($k), $v)
+            };
+        }
         // Columns below the shortest live query: no lane can be showing ZPAD or PAD there, which is
         // what the fast body in the row loop relies on. Mate-rescue batches are whole reads of one
         // run, so in practice this covers ~92% of the padded columns (148 real of 160 padded).
@@ -2858,7 +2886,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
         // Per-row bookkeeping, identical in both paths: publish this row's max for `score2`, and
         // update the lane's global max / end coordinates / freeze state.
         macro_rules! finish_row {
-            ($row:expr, $imax:expr, $col:expr) => {{
+            ($row:expr, $imax:expr, $h:expr, $hs:expr, $r:expr) => {{
                 let row = $row;
                 let imax = $imax;
                 // Publish the row in one store. Lanes that are out of target or already frozen get
@@ -2871,19 +2899,55 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                 // per-lane `row_max > gmax` test was a data-dependent branch, ~10% of this kernel.
                 let rv = vdupq_n_u16(row as u16);
                 let inside = vcombine_u8(
-                    vmovn_u16(vcltq_u16(rv, tl_lo)),
-                    vmovn_u16(vcltq_u16(rv, tl_hi)),
+                    vmovn_u16(vcltq_u16(rv, vreinterpretq_u16_u8(ep_ld!(EP_TLEN)))),
+                    vmovn_u16(vcltq_u16(rv, vreinterpretq_u16_u8(ep_ld!(EP_TLEN + 1)))),
                 );
-                let imp = vandq_u8(vcgtq_u8(imax, gmax_v), vbicq_u8(inside, frozen_v));
-                gmax_v = vbslq_u8(imp, imax, gmax_v);
-                qe_v = vbslq_u8(imp, $col, qe_v);
-                te_lo = vbslq_u16(vreinterpretq_u16_u8(vzip1q_u8(imp, imp)), rv, te_lo);
-                te_hi = vbslq_u16(vreinterpretq_u16_u8(vzip2q_u8(imp, imp)), rv, te_hi);
+                let frozen_v = ep_ld!(EP_FROZEN);
+                let gmax_old = ep_ld!(EP_GMAX);
+                let imp = vandq_u8(vcgtq_u8(imax, gmax_old), vbicq_u8(inside, frozen_v));
+                let gmax_v = vbslq_u8(imp, imax, gmax_old);
+                ep_st!(EP_GMAX, gmax_v);
+                // The column, for improved lanes only (~44% of rows have one): the first column
+                // holding the row max is in the first block whose running max reached it, so
+                // find that block per lane from the checkpoints (the last block has none and is
+                // reached by every lane still pending), then scan it backwards so the smallest
+                // column wins. Same column as the per-cell strict `>` argmax it replaces.
+                if vmaxvq_u8(imp) != 0 {
+                    let (h, hs): (*const u8, usize) = ($h, $hs);
+                    let (mut pending, mut col) = (imp, zero);
+                    for blk in 0..nblk {
+                        let reached = if blk + 1 < nblk {
+                            vceqq_u8(vld1q_u8(ck_p.add((blk * 4 + $r) * LANES16)), imax)
+                        } else {
+                            vdupq_n_u8(0xff)
+                        };
+                        let here = vandq_u8(reached, pending);
+                        if vmaxvq_u8(here) == 0 {
+                            continue;
+                        }
+                        for j in (blk * 16..qmax.min(blk * 16 + 16)).rev() {
+                            let eq =
+                                vandq_u8(vceqq_u8(vld1q_u8(h.add(j * hs * LANES16)), imax), here);
+                            col = vbslq_u8(eq, vdupq_n_u8(j as u8), col);
+                        }
+                        pending = vbicq_u8(pending, here);
+                        if vmaxvq_u8(pending) == 0 {
+                            break;
+                        }
+                    }
+                    ep_st!(EP_QE, vbslq_u8(imp, col, ep_ld!(EP_QE)));
+                }
+                let rv8 = vreinterpretq_u8_u16(rv);
+                ep_st!(EP_TE, vbslq_u8(vzip1q_u8(imp, imp), rv8, ep_ld!(EP_TE)));
+                ep_st!(
+                    EP_TE + 1,
+                    vbslq_u8(vzip2q_u8(imp, imp), rv8, ep_ld!(EP_TE + 1))
+                );
                 // Freezing is rare (the reverse pass's stop score): lanes, then the arrays the
                 // early exit and `extract_group` read.
-                let newly = vandq_u8(imp, vcgeq_u8(gmax_v, endsc_v));
+                let newly = vandq_u8(imp, vcgeq_u8(gmax_v, ep_ld!(EP_ENDSC)));
                 if vmaxvq_u8(newly) != 0 {
-                    frozen_v = vorrq_u8(frozen_v, newly);
+                    ep_st!(EP_FROZEN, vorrq_u8(frozen_v, newly));
                     let mut nw = [0u8; LANES16];
                     vst1q_u8(nw.as_mut_ptr(), newly);
                     for l in 0..n_lanes {
@@ -2920,8 +2984,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                 let (mut f0, mut f1, mut f2, mut f3) = (zero, zero, zero, zero);
                 let (mut d0, mut d1, mut d2, mut d3) = (zero, zero, zero, zero);
                 let (mut imax0, mut imax1, mut imax2, mut imax3) = (zero, zero, zero, zero);
-                let (mut col0, mut col1, mut col2, mut col3) = (zero, zero, zero, zero);
-                let mut j_v = zero;
 
                 // ---- Fast column range: no ZPAD, no PAD (see the one-row body below) ----------
                 for j in 0..n_fast {
@@ -2934,7 +2996,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(diag0, e_v);
                     let h0 = vmaxq_u8(mfe0, f0);
-                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
                     imax0 = vmaxq_u8(imax0, h0);
                     let (e1, f0_next) = ef!(e_v, f0, mfe0, h0);
                     f0 = f0_next;
@@ -2946,7 +3007,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let diag1 = diag!(d1, s1);
                     let mfe1 = vmaxq_u8(diag1, e1);
                     let h1 = vmaxq_u8(mfe1, f1);
-                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
                     imax1 = vmaxq_u8(imax1, h1);
                     let (e2, f1_next) = ef!(e1, f1, mfe1, h1);
                     f1 = f1_next;
@@ -2957,7 +3017,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let diag2 = diag!(d2, s2);
                     let mfe2 = vmaxq_u8(diag2, e2);
                     let h2 = vmaxq_u8(mfe2, f2);
-                    col2 = vbslq_u8(vcgtq_u8(h2, imax2), j_v, col2);
                     imax2 = vmaxq_u8(imax2, h2);
                     let (e3, f2_next) = ef!(e2, f2, mfe2, h2);
                     f2 = f2_next;
@@ -2968,14 +3027,21 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let diag3 = diag!(d3, s3);
                     let mfe3 = vmaxq_u8(diag3, e3);
                     let h3 = vmaxq_u8(mfe3, f3);
-                    col3 = vbslq_u8(vcgtq_u8(h3, imax3), j_v, col3);
                     imax3 = vmaxq_u8(imax3, h3);
                     let (e_out, f3_next) = ef!(e3, f3, mfe3, h3);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_out);
                     f3 = f3_next;
                     d3 = h2;
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h3);
-                    j_v = vaddq_u8(j_v, one_v);
+                    vst1q_u8(hq_p.add(3 * j * LANES16), h0);
+                    vst1q_u8(hq_p.add((3 * j + 1) * LANES16), h1);
+                    vst1q_u8(hq_p.add((3 * j + 2) * LANES16), h2);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax0);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 1) * LANES16), imax1);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 2) * LANES16), imax2);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 3) * LANES16), imax3);
+                    }
                 }
 
                 // ---- Tail: ZPAD / PAD possible, full logic, still four rows at a time ----------
@@ -2995,7 +3061,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(diag0, e_v);
                     let h0 = vmaxq_u8(mfe0, f0);
-                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
                     imax0 = vmaxq_u8(imax0, h0);
                     let (e1, f0_next) = ef!(e_v, f0, mfe0, h0);
                     f0 = f0_next;
@@ -3008,7 +3073,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     diag1 = vbslq_u8(pad1, zero, diag1);
                     let mfe1 = vmaxq_u8(diag1, e1);
                     let h1 = vmaxq_u8(mfe1, f1);
-                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
                     imax1 = vmaxq_u8(imax1, h1);
                     let (e2, f1_next) = ef!(e1, f1, mfe1, h1);
                     f1 = f1_next;
@@ -3021,7 +3085,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     diag2 = vbslq_u8(pad2, zero, diag2);
                     let mfe2 = vmaxq_u8(diag2, e2);
                     let h2 = vmaxq_u8(mfe2, f2);
-                    col2 = vbslq_u8(vcgtq_u8(h2, imax2), j_v, col2);
                     imax2 = vmaxq_u8(imax2, h2);
                     let (e3, f2_next) = ef!(e2, f2, mfe2, h2);
                     f2 = f2_next;
@@ -3034,14 +3097,21 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     diag3 = vbslq_u8(pad3, zero, diag3);
                     let mfe3 = vmaxq_u8(diag3, e3);
                     let h3 = vmaxq_u8(mfe3, f3);
-                    col3 = vbslq_u8(vcgtq_u8(h3, imax3), j_v, col3);
                     imax3 = vmaxq_u8(imax3, h3);
                     let (e_out, f3_next) = ef!(e3, f3, mfe3, h3);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_out);
                     f3 = f3_next;
                     d3 = h2;
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h3);
-                    j_v = vaddq_u8(j_v, one_v);
+                    vst1q_u8(hq_p.add(3 * j * LANES16), h0);
+                    vst1q_u8(hq_p.add((3 * j + 1) * LANES16), h1);
+                    vst1q_u8(hq_p.add((3 * j + 2) * LANES16), h2);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax0);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 1) * LANES16), imax1);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 2) * LANES16), imax2);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 3) * LANES16), imax3);
+                    }
                 }
 
                 // ---- ksw profile padding: every live lane is ZPAD, so `diag = d` ---------------
@@ -3056,7 +3126,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(d0, e_v);
                     let h0 = vmaxq_u8(mfe0, f0);
-                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
                     imax0 = vmaxq_u8(imax0, h0);
                     let (e1, f0_next) = ef!(e_v, f0, mfe0, h0);
                     f0 = f0_next;
@@ -3064,7 +3133,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
 
                     let mfe1 = vmaxq_u8(d1, e1);
                     let h1 = vmaxq_u8(mfe1, f1);
-                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
                     imax1 = vmaxq_u8(imax1, h1);
                     let (e2, f1_next) = ef!(e1, f1, mfe1, h1);
                     f1 = f1_next;
@@ -3072,7 +3140,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
 
                     let mfe2 = vmaxq_u8(d2, e2);
                     let h2 = vmaxq_u8(mfe2, f2);
-                    col2 = vbslq_u8(vcgtq_u8(h2, imax2), j_v, col2);
                     imax2 = vmaxq_u8(imax2, h2);
                     let (e3, f2_next) = ef!(e2, f2, mfe2, h2);
                     f2 = f2_next;
@@ -3080,21 +3147,28 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
 
                     let mfe3 = vmaxq_u8(d3, e3);
                     let h3 = vmaxq_u8(mfe3, f3);
-                    col3 = vbslq_u8(vcgtq_u8(h3, imax3), j_v, col3);
                     imax3 = vmaxq_u8(imax3, h3);
                     let (e_out, f3_next) = ef!(e3, f3, mfe3, h3);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_out);
                     f3 = f3_next;
                     d3 = h2;
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h3);
-                    j_v = vaddq_u8(j_v, one_v);
+                    vst1q_u8(hq_p.add(3 * j * LANES16), h0);
+                    vst1q_u8(hq_p.add((3 * j + 1) * LANES16), h1);
+                    vst1q_u8(hq_p.add((3 * j + 2) * LANES16), h2);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax0);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 1) * LANES16), imax1);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 2) * LANES16), imax2);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 3) * LANES16), imax3);
+                    }
                 }
 
                 // Row order matters here: freezing at row `i` must suppress rows `i+1..=i+3`.
-                finish_row!(i, imax0, col0);
-                finish_row!(i + 1, imax1, col1);
-                finish_row!(i + 2, imax2, col2);
-                finish_row!(i + 3, imax3, col3);
+                finish_row!(i, imax0, hq_p, 3, 0);
+                finish_row!(i + 1, imax1, hq_p.add(LANES16), 3, 1);
+                finish_row!(i + 2, imax2, hq_p.add(2 * LANES16), 3, 2);
+                finish_row!(i + 3, imax3, h_cur.as_ptr(), 1, 3);
             } else if rows == 2 {
                 let t0_v = vld1q_u8(seq_t.as_ptr().add(i * LANES16));
                 let t1_v = vld1q_u8(seq_t.as_ptr().add((i + 1) * LANES16));
@@ -3103,8 +3177,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                 let (mut f0, mut f1) = (zero, zero);
                 let (mut d0, mut d1) = (zero, zero);
                 let (mut imax0, mut imax1) = (zero, zero);
-                let (mut col0, mut col1) = (zero, zero);
-                let mut j_v = zero;
 
                 // ---- Fast column range: no ZPAD, no PAD (see the one-row body below) ----------
                 for j in 0..n_fast {
@@ -3117,7 +3189,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(diag0, e_v);
                     let h0 = vmaxq_u8(mfe0, f0);
-                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
                     imax0 = vmaxq_u8(imax0, h0);
                     // E(i+1, j). Handed straight to row i+1 in a register instead of being stored
                     // and reloaded, which is one of the two memory ops this pairing removes.
@@ -3130,14 +3201,17 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let diag1 = diag!(d1, s1);
                     let mfe1 = vmaxq_u8(diag1, e_mid);
                     let h1 = vmaxq_u8(mfe1, f1);
-                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
                     imax1 = vmaxq_u8(imax1, h1);
                     let (e_out, f1_next) = ef!(e_mid, f1, mfe1, h1);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_out);
                     f1 = f1_next;
                     d1 = h0;
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h1);
-                    j_v = vaddq_u8(j_v, one_v);
+                    vst1q_u8(hq_p.add(3 * j * LANES16), h0);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax0);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 1) * LANES16), imax1);
+                    }
                 }
 
                 // ---- Tail: ZPAD / PAD possible, full logic, still two rows at a time -----------
@@ -3153,7 +3227,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(diag0, e_v);
                     let h0 = vmaxq_u8(mfe0, f0);
-                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
                     imax0 = vmaxq_u8(imax0, h0);
                     let (e_mid, f0_next) = ef!(e_v, f0, mfe0, h0);
                     f0 = f0_next;
@@ -3166,14 +3239,17 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     diag1 = vbslq_u8(pad1, zero, diag1);
                     let mfe1 = vmaxq_u8(diag1, e_mid);
                     let h1 = vmaxq_u8(mfe1, f1);
-                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
                     imax1 = vmaxq_u8(imax1, h1);
                     let (e_out, f1_next) = ef!(e_mid, f1, mfe1, h1);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_out);
                     f1 = f1_next;
                     d1 = h0;
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h1);
-                    j_v = vaddq_u8(j_v, one_v);
+                    vst1q_u8(hq_p.add(3 * j * LANES16), h0);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax0);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 1) * LANES16), imax1);
+                    }
                 }
 
                 // ---- ksw profile padding: every live lane is ZPAD, so `diag = d` ---------------
@@ -3183,7 +3259,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe0 = vmaxq_u8(d0, e_v);
                     let h0 = vmaxq_u8(mfe0, f0);
-                    col0 = vbslq_u8(vcgtq_u8(h0, imax0), j_v, col0);
                     imax0 = vmaxq_u8(imax0, h0);
                     let (e_mid, f0_next) = ef!(e_v, f0, mfe0, h0);
                     f0 = f0_next;
@@ -3191,39 +3266,33 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
 
                     let mfe1 = vmaxq_u8(d1, e_mid);
                     let h1 = vmaxq_u8(mfe1, f1);
-                    col1 = vbslq_u8(vcgtq_u8(h1, imax1), j_v, col1);
                     imax1 = vmaxq_u8(imax1, h1);
                     let (e_out, f1_next) = ef!(e_mid, f1, mfe1, h1);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_out);
                     f1 = f1_next;
                     d1 = h0;
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h1);
-                    j_v = vaddq_u8(j_v, one_v);
+                    vst1q_u8(hq_p.add(3 * j * LANES16), h0);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax0);
+                        vst1q_u8(ck_p.add(((j >> 4) * 4 + 1) * LANES16), imax1);
+                    }
                 }
 
                 // Row order matters here: freezing at row `i` must suppress row `i+1`.
-                finish_row!(i, imax0, col0);
-                finish_row!(i + 1, imax1, col1);
+                finish_row!(i, imax0, hq_p, 3, 0);
+                finish_row!(i + 1, imax1, h_cur.as_ptr(), 1, 1);
             } else {
                 // Lane `l` = target base at row `i` of job `l`.
                 let t_v = vld1q_u8(seq_t.as_ptr().add(i * LANES16));
                 // Row accumulators, one lane per job, same invariant as the scalar version at the
-                // top of column `j`: F(i, j), H(i-1, j-1), max H(i, 0..j), and its smallest
-                // attaining column.
+                // top of column `j`: F(i, j), H(i-1, j-1), max H(i, 0..j). The column of the max is
+                // recovered by `finish_row` (LazyQE). A per-lane strided scalar scan of `h_cur` was
+                // measured 18% slower; the counts that make the vector form pay are 44% of rows
+                // with an improved lane and ~1.4 distinct 16-column blocks to scan per such row.
                 let mut f_v = zero;
                 let mut h_diag_v = zero;
                 let mut imax_v = zero;
-                // Min query column achieving this row's max, tracked per cell. Recovering it lazily
-                // instead (scan `h_cur` for the first cell equal to the row max, only in rows that
-                // raise the lane's global max) was MEASURED and is 18% SLOWER: the global max climbs
-                // in far more rows than the "few dozen" the idea assumed, and each recovery is a
-                // 160-element strided scalar scan. Do not retry without first counting the rows
-                // that improve `gmax`.
-                let mut imax_col_v = zero;
-                // Current query column, broadcast. Carried as a vector and incremented rather than
-                // rebuilt with `vdupq_n_u8(j as u8)` per cell: the dup is a GPR-to-vector transfer
-                // on the critical path of the argmax blend, the add is not.
-                let mut j_v = zero;
                 // Hoisted out of the column loop: "is this row's target base an N", which depends
                 // only on `i`. It was recomputed for all `qmax` columns of every row.
 
@@ -3245,15 +3314,15 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe = vmaxq_u8(diag_v, e_v);
                     let h_v = vmaxq_u8(mfe, f_v);
-                    let is_new_row_max = vcgtq_u8(h_v, imax_v);
-                    imax_col_v = vbslq_u8(is_new_row_max, j_v, imax_col_v);
                     imax_v = vmaxq_u8(imax_v, h_v);
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h_v);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax_v);
+                    }
                     let (e_new, f_next) = ef!(e_v, f_v, mfe, h_v);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_new);
                     f_v = f_next;
                     h_diag_v = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
-                    j_v = vaddq_u8(j_v, one_v);
                 }
 
                 // ---- Tail: the columns where ZPAD / PAD can appear, full logic ----------------
@@ -3287,13 +3356,11 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     // recurrence below never waits on H.
                     let mfe = vmaxq_u8(diag_v, e_v);
                     let h_v = vmaxq_u8(mfe, f_v);
-                    // Strict `>`, so a tie keeps the earlier column. `j as u8` is why the caller
-                    // caps the query at 250 bases: the column index shares the lane width with the
-                    // scores.
-                    let is_new_row_max = vcgtq_u8(h_v, imax_v);
-                    imax_col_v = vbslq_u8(is_new_row_max, j_v, imax_col_v);
                     imax_v = vmaxq_u8(imax_v, h_v);
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h_v);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax_v);
+                    }
 
                     // e = max(0, e-e_del, h-oe_del); the saturating subs supply both inner clamps.
                     // F, the row's serial carry, reassociated off `mfe` instead of `h_v`.
@@ -3305,7 +3372,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_new);
                     f_v = f_next;
                     h_diag_v = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
-                    j_v = vaddq_u8(j_v, one_v);
                 }
 
                 // ---- ksw profile padding: every live lane is ZPAD, so `diag = h_diag` ----------
@@ -3315,18 +3381,18 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     let e_v = vld1q_u8(e.as_ptr().add(j * LANES16));
                     let mfe = vmaxq_u8(h_diag_v, e_v);
                     let h_v = vmaxq_u8(mfe, f_v);
-                    let is_new_row_max = vcgtq_u8(h_v, imax_v);
-                    imax_col_v = vbslq_u8(is_new_row_max, j_v, imax_col_v);
                     imax_v = vmaxq_u8(imax_v, h_v);
                     vst1q_u8(h_cur.as_mut_ptr().add(j * LANES16), h_v);
+                    if j & 15 == 15 {
+                        vst1q_u8(ck_p.add((j >> 4) * 4 * LANES16), imax_v);
+                    }
                     let (e_new2, f_next2) = ef!(e_v, f_v, mfe, h_v);
                     vst1q_u8(e.as_mut_ptr().add(j * LANES16), e_new2);
                     f_v = f_next2;
                     h_diag_v = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
-                    j_v = vaddq_u8(j_v, one_v);
                 }
 
-                finish_row!(i, imax_v, imax_col_v);
+                finish_row!(i, imax_v, h_cur.as_ptr(), 1, 0);
             }
             std::mem::swap(&mut h_prev, &mut h_cur);
 
@@ -3340,10 +3406,13 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
 
         {
             let (mut g, mut q, mut t) = ([0u8; LANES16], [0u8; LANES16], [0u16; LANES16]);
-            vst1q_u8(g.as_mut_ptr(), gmax_v);
-            vst1q_u8(q.as_mut_ptr(), qe_v);
-            vst1q_u16(t.as_mut_ptr(), te_lo);
-            vst1q_u16(t.as_mut_ptr().add(8), te_hi);
+            vst1q_u8(g.as_mut_ptr(), ep_ld!(EP_GMAX));
+            vst1q_u8(q.as_mut_ptr(), ep_ld!(EP_QE));
+            vst1q_u16(t.as_mut_ptr(), vreinterpretq_u16_u8(ep_ld!(EP_TE)));
+            vst1q_u16(
+                t.as_mut_ptr().add(8),
+                vreinterpretq_u16_u8(ep_ld!(EP_TE + 1)),
+            );
             for l in 0..n_lanes {
                 (gmax[l], qe[l], te[l]) = (i32::from(g[l]), i32::from(q[l]), t[l] as i16 as i32);
             }
