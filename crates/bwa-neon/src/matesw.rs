@@ -546,15 +546,10 @@ pub fn batched_mate_rescue(
             } else {
                 (y, x)
             };
-            // shortcut: the relation's K-mer count is scalar, and on x86 it plus the band kernel
-            // costs more than the 32/64-lane full SW it saves (TAPS -t4, EPYC 9V45: 3.81 s without,
-            // 4.09-4.17 s with; 7763: equal, -2.5% at -t1), so x86 runs every job in full. Drop
-            // the cfg once the relation count has an SSE form like `rescue_prune::sse::count_hits`.
-            let prune = if cfg!(target_arch = "x86_64") {
-                None
-            } else {
-                prune_params(m, &uni, o_del, e_del, o_ins, e_ins, minsc, max_sc)
-            };
+            // The relation's K-mer count has its NEON and SSE forms (`rescue_prune::count_hits`);
+            // in scalar it cost x86 more than the full SW it saved (EPYC 9V45 TAPS -t4: 3.81 s
+            // unpruned, 4.09-4.17 s pruned).
+            let prune = prune_params(m, &uni, o_del, e_del, o_ins, e_ins, minsc, max_sc);
             (prune, Some(rel))
         }
         _ => (

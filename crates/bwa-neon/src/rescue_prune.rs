@@ -462,12 +462,10 @@ fn count_hits(
         // SAFETY: NEON is part of the aarch64 baseline.
         return unsafe { neon::count_hits(s, t, q, p, max_hits, rel) };
     }
-    // shortcut: the SSE counter has no relation form, so x86 counts a relation in scalar; port
-    // `neon`'s entry chains to it before x86 filters under a relation (matesw.rs runs it in full).
     #[cfg(target_arch = "x86_64")]
-    if p.k == 5 && rel.is_none() && sse::available() {
+    if p.k == 5 && sse::available() {
         // SAFETY: SSSE3 and SSE4.1 were just detected.
-        return unsafe { sse::count_hits(s, t, q, p, max_hits) };
+        return unsafe { sse::count_hits(s, t, q, p, max_hits, rel) };
     }
     count_hits_scalar(s, t, q, p, max_hits, rel)
 }
@@ -1138,7 +1136,8 @@ mod sse {
         _mm_alignr_epi8::<14>(cur, prev)
     }
 
-    /// See [`super::neon::count_hits`]; same results.
+    /// See [`super::neon::count_hits`]; same results, under a relation too (the same entry
+    /// chains: layer 1 packs codes, layers >= 2 gather `ent_j` / `ent_nxt`).
     ///
     /// # Safety
     /// SSSE3 and SSE4.1.
@@ -1149,10 +1148,14 @@ mod sse {
         q: &[u8],
         p: &Params,
         max_hits: usize,
+        rel: Option<(u8, u8)>,
     ) -> Option<usize> {
         const K: usize = 5;
         let (len1, len2) = (t.len(), q.len());
-        s.load_query(q, K);
+        match rel {
+            Some(r) => s.load_query_rel(q, K, r),
+            None => s.load_query(q, K),
+        }
         // ---- 1. N check while copying the window into a zero-padded buffer ----
         if s.rbuf.len() < len1 + 32 {
             s.rbuf.resize(len1 + 32, 0);
@@ -1314,7 +1317,13 @@ mod sse {
                 pack(&mut s.rb_d, nb, d, mb);
                 nb = pack(&mut s.rb_r, nb, r, mb);
                 pack(&mut s.mrow, nm, r, mm);
-                nm = pack(&mut s.mj, nm, j, mm);
+                // Under a relation the code: its entry chain starts at `ehead` (below).
+                let mv = if rel.is_some() {
+                    ld(s.hcode.as_ptr().add(k0) as *const u8)
+                } else {
+                    j
+                };
+                nm = pack(&mut s.mj, nm, mv, mm);
                 idx = _mm_add_epi16(idx, k8);
                 k0 += 8;
             }
@@ -1350,8 +1359,23 @@ mod sse {
             let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
             e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
         };
-        for x in 0..nm {
-            s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+        // Under a relation `js` holds entries: position `ent_j[e]`, next `ent_nxt[e]`. Past the
+        // list's end the lanes are stale, clamped to stay in the entry arrays.
+        let (ej, en) = (s.ent_j.as_ptr(), s.ent_nxt.as_ptr());
+        let elast = s.ent_j.len().saturating_sub(1) as u64;
+        let gather4 = |a: *const i16, e: *const u16| -> u64 {
+            let x = (e as *const u64).read_unaligned();
+            let g = |sh: u32| u64::from(*a.add(((x >> sh) & 0xFFFF).min(elast) as usize) as u16);
+            g(0) | g(16) << 16 | g(32) << 32 | g(48) << 48
+        };
+        if rel.is_some() {
+            for x in 0..nm {
+                s.mj[x] = s.ent_nxt[s.ehead[s.mj[x] as usize] as usize] as u16;
+            }
+        } else {
+            for x in 0..nm {
+                s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+            }
         }
         let mut n = nm;
         grow(&mut s.hrow, n + 16);
@@ -1370,8 +1394,15 @@ mod sse {
                 let mut k0 = 0usize;
                 while k0 < n {
                     let r = ld(rows.as_ptr().add(k0) as *const u8);
-                    let j = ld(js.as_ptr().add(k0) as *const u8);
-                    let jn = from2(nxt4(js.as_ptr().add(k0)), nxt4(js.as_ptr().add(k0 + 4)));
+                    let (e0, e1) = (js.as_ptr().add(k0), js.as_ptr().add(k0 + 4));
+                    let (j, jn) = if rel.is_some() {
+                        (
+                            from2(gather4(ej, e0), gather4(ej, e1)),
+                            from2(gather4(en, e0), gather4(en, e1)),
+                        )
+                    } else {
+                        (ld(e0 as *const u8), from2(nxt4(e0), nxt4(e1)))
+                    };
                     let d = _mm_sub_epi16(_mm_add_epi16(r, koff), j);
                     let rp = shift_in(prev_r, r);
                     let dp = shift_in(prev_d, d);
@@ -2767,9 +2798,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// The NEON counter against the scalar one: same verdict, same `cnt`, same `minrow` wherever
-    /// `cnt != 0`, same `occ_bits`, on generated jobs (many repeats, poly-A, tiny lengths) and on
-    /// the real dump when `BWA4_PRUNE_BENCH` names one.
+    /// The NEON (or SSE) counter against the scalar one, under no relation, C/T and G/A: same
+    /// verdict, same `cnt`, same `minrow` wherever `cnt != 0`, same `occ_bits`, on generated jobs
+    /// (many repeats, poly-A, tiny lengths) and on the real dump when `BWA4_PRUNE_BENCH` names one.
     #[test]
     fn neon_counts_equal_scalar_counts() {
         let mut state = 0x5eed_1234_abcd_0001u64;
