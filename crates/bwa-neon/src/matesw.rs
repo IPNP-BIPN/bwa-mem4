@@ -3506,13 +3506,16 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
         q_v: __m256i,
         d: __m256i,
     ) -> __m256i {
-        // `M5`: `i = 5 t + q` saturating, so a PAD (bit 7) stays one and both shuffles read 0;
-        // `i - 16` (signed, saturating) keeps that sign bit and takes it for every `i < 16` too.
+        // `M5`: `i = 5 t + q <= 24` in every cell a live lane keeps; `i - 16` has bit 7 set, and the
+        // high shuffle reads 0, for every `i < 16`. Plain (wrapping) adds, not saturating ones,
+        // which are p0-only at 512 bits on Golden Cove: a `PAD` row is past the lane's target
+        // (`finish_row` and `extract_group` stop at `tlen`) and a `ZPAD` / `PAD` column is
+        // overridden by the pad blend, so what they read does not matter.
         let s = if M5 {
-            let i = _mm256_adds_epu8(t_v, q_v);
+            let i = _mm256_add_epi8(t_v, q_v);
             _mm256_xor_si256(
                 _mm256_shuffle_epi8(tbl, i),
-                _mm256_shuffle_epi8(hi, _mm256_subs_epi8(i, _mm256_set1_epi8(16))),
+                _mm256_shuffle_epi8(hi, _mm256_sub_epi8(i, _mm256_set1_epi8(16))),
             )
         } else {
             _mm256_shuffle_epi8(tbl, _mm256_xor_si256(t_v, q_v))
@@ -4467,13 +4470,16 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
         q_v: __m128i,
         d: __m128i,
     ) -> __m128i {
-        // `M5`: `i = 5 t + q` saturating, so a PAD (bit 7) stays one and both shuffles read 0;
-        // `i - 16` (signed, saturating) keeps that sign bit and takes it for every `i < 16` too.
+        // `M5`: `i = 5 t + q <= 24` in every cell a live lane keeps; `i - 16` has bit 7 set, and the
+        // high shuffle reads 0, for every `i < 16`. Plain (wrapping) adds, not saturating ones,
+        // which are p0-only at 512 bits on Golden Cove: a `PAD` row is past the lane's target
+        // (`finish_row` and `extract_group` stop at `tlen`) and a `ZPAD` / `PAD` column is
+        // overridden by the pad blend, so what they read does not matter.
         let s = if M5 {
-            let i = _mm_adds_epu8(t_v, q_v);
+            let i = _mm_add_epi8(t_v, q_v);
             _mm_xor_si128(
                 _mm_shuffle_epi8(tbl, i),
-                _mm_shuffle_epi8(hi, _mm_subs_epi8(i, _mm_set1_epi8(16))),
+                _mm_shuffle_epi8(hi, _mm_sub_epi8(i, _mm_set1_epi8(16))),
             )
         } else {
             _mm_shuffle_epi8(tbl, _mm_xor_si128(t_v, q_v))
@@ -5253,12 +5259,14 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
         q_v: __m512i,
         d: __m512i,
     ) -> __m512i {
-        // `M5`: `i = 5 t + q` saturating, so a PAD (bit 7) stays one and both shuffles read 0;
-        // `i - 16` (signed, saturating) keeps that sign bit and takes it for every `i < 16` too.
+        // `M5`: `i = 5 t + q <= 24` in every cell a live lane keeps; `i - 16` has bit 7 set, and the
+        // high shuffle reads 0, for every `i < 16`. Plain (wrapping) adds, not saturating ones,
+        // which are p0-only at 512 bits on Golden Cove: a `PAD` row is past the lane's target
+        // (`finish_row` and `extract_group` stop at `tlen`) and a `ZPAD` / `PAD` column is
+        // overridden by the pad blend, so what they read does not matter.
         let s = if M5 && VB {
-            // `vpermb` reads `i & 63`: a PAD row (bit 7) reads some entry, a lane already past its
-            // target, whose cells nothing reads (`finish_row` and `extract_group` stop at `tlen`).
-            let i = _mm512_adds_epu8(t_v, q_v);
+            // `vpermb` reads `i & 63`; `i` as above.
+            let i = _mm512_add_epi8(t_v, q_v);
             let s: __m512i;
             // SAFETY: the caller dispatched `VBMI` only where `avx512vbmi` was detected. Inline
             // asm because `target_feature` is per function: enabling VBMI on this impl would let
@@ -5267,10 +5275,10 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                  t = in(zmm_reg) tbl, options(pure, nomem, nostack));
             s
         } else if M5 {
-            let i = _mm512_adds_epu8(t_v, q_v);
+            let i = _mm512_add_epi8(t_v, q_v);
             _mm512_xor_si512(
                 _mm512_shuffle_epi8(tbl, i),
-                _mm512_shuffle_epi8(hi, _mm512_subs_epi8(i, _mm512_set1_epi8(16))),
+                _mm512_shuffle_epi8(hi, _mm512_sub_epi8(i, _mm512_set1_epi8(16))),
             )
         } else {
             _mm512_shuffle_epi8(tbl, _mm512_xor_si512(t_v, q_v))
