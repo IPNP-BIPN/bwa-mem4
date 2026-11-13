@@ -3447,29 +3447,52 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
 /// store per base cost ~12% of the AVX-512 kernel on Zen 5 (bwa-mem3's `x86_soa_pack`, ~2%). The
 /// row counts are rounded up to 16 with PAD rows, which nothing reads.
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
 fn soa_group(
     group: &[FwdJob],
     lanes: usize,
     qmax: usize,
     tmax: usize,
     max_sc: i32,
-    enc_t: impl Fn(u8) -> u8,
-    enc_q: impl Fn(u8) -> u8,
+    enc_t: [u8; 5],
+    enc_q: [u8; 5],
 ) -> (Vec<u8>, Vec<u8>) {
     debug_assert!(lanes.is_multiple_of(16) && group.len() <= lanes);
     let (ql, tl) = (qmax.next_multiple_of(16), tmax.next_multiple_of(16));
     let (mut q, mut t) = (vec![PAD; lanes * ql], vec![PAD; lanes * tl]);
     for (l, j) in group.iter().enumerate() {
         let (qr, tr) = (&mut q[l * ql..][..ql], &mut t[l * tl..][..tl]);
-        for (d, &b) in qr.iter_mut().zip(j.query) {
-            *d = enc_q(b);
-        }
+        enc_bases(qr, j.query, enc_q);
         qr[j.query.len()..ksw_padded_qlen(j.query.len(), max_sc)].fill(ZPAD);
-        for (d, &b) in tr.iter_mut().zip(j.target) {
-            *d = enc_t(b);
-        }
+        enc_bases(tr, j.target, enc_t);
     }
     (transpose16(&q, lanes, ql), transpose16(&t, lanes, tl))
+}
+
+/// `dst[k] = enc[src[k]]` over the common length, one `PSHUFB` per 16 bases (codes 0..=4): the
+/// scalar map was ~8% of the AVX2 rescue kernel on Zen 3.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+fn enc_bases(dst: &mut [u8], src: &[u8], enc: [u8; 5]) {
+    use std::arch::x86_64::*;
+    let n = dst.len().min(src.len());
+    let mut tbl = [0u8; 16];
+    tbl[..5].copy_from_slice(&enc);
+    let mut k = 0;
+    // SAFETY: every load reads `src[k..k + 16]` and every store writes `dst[k..k + 16]`, inside
+    // both (`k + 16 <= n`).
+    unsafe {
+        let tbl = _mm_loadu_si128(tbl.as_ptr().cast());
+        while k + 16 <= n {
+            let v = _mm_loadu_si128(src.as_ptr().add(k).cast());
+            debug_assert!(src[k..k + 16].iter().all(|&b| b < 5));
+            _mm_storeu_si128(dst.as_mut_ptr().add(k).cast(), _mm_shuffle_epi8(tbl, v));
+            k += 16;
+        }
+    }
+    for (d, &b) in dst[k..n].iter_mut().zip(&src[k..n]) {
+        *d = enc[b as usize];
+    }
 }
 
 /// `out[r * lanes + l] = src[l * rows + r]`: `lanes` rows of `rows` bytes to `rows` rows of `lanes`,
@@ -3793,15 +3816,7 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
 
         // The N re-encoding (or `MAT5`'s add code), applied once per base so the column loops
         // never pay for it (issues #43, #44).
-        let (seq_q, seq_t) = soa_group(
-            group,
-            LANES32,
-            qmax,
-            tmax,
-            max_sc,
-            |b| enc_t[b as usize],
-            |b| enc_q[b as usize],
-        );
+        let (seq_q, seq_t) = soa_group(group, LANES32, qmax, tmax, max_sc, enc_t, enc_q);
         let (mut qlen, mut tlen, mut minsc, mut endsc) = (
             [0usize; LANES32],
             [0usize; LANES32],
@@ -5659,15 +5674,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
 
         // The N re-encoding (or `MAT5`'s codes), applied once per base so the column loops never
         // pay for it (issues #43, #44).
-        let (seq_q, seq_t) = soa_group(
-            group,
-            LANES64,
-            qmax,
-            tmax,
-            max_sc,
-            |b| enc_t[b as usize],
-            |b| enc_q[b as usize],
-        );
+        let (seq_q, seq_t) = soa_group(group, LANES64, qmax, tmax, max_sc, enc_t, enc_q);
         let (mut qlen, mut tlen, mut minsc, mut endsc) = (
             [0usize; LANES64],
             [0usize; LANES64],
