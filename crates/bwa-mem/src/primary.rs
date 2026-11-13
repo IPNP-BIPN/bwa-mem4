@@ -950,52 +950,68 @@ fn sort_hlt(a: &mut [MemAlnReg]) {
     } else {
         // Indirect, as in `mem_sort_dedup_patch`: a region is 96 bytes, a key and index 24.
         sort_scratch::PERM_PRI.with_borrow_mut(|perm| {
-            sort_scratch::SPARE.with_borrow_mut(|spare| {
-                perm.clear();
-                // Off x86-64 the key and a 31-bit index are one u128 (`!score` biased to unsigned,
-                // ALT bit, hash, index), compared in two instructions instead of a tuple chain.
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    assert!(a.len() < 1 << 31);
-                    perm.extend(a.iter().enumerate().map(|(i, r)| {
-                        u128::from(!(r.score as u32 ^ 0x8000_0000)) << 96
-                            | u128::from(r.is_alt) << 95
-                            | u128::from(r.hash) << 31
-                            | i as u128
-                    }));
-                    perm.sort_unstable();
-                    spare.clear();
-                    spare.extend(
-                        perm.iter()
-                            .map(|&k| a[(k as u32 & 0x7fff_ffff) as usize].clone()),
-                    );
-                }
-                // x86-64: fg-labs/bwa-mem3's `primary_pair`, `(!score << 1 | alt, hash)` compared
-                // bitwise. The pair is distinct per region, so the index never breaks a tie.
-                #[cfg(target_arch = "x86_64")]
-                {
-                    perm.extend(a.iter().enumerate().map(|(i, r)| {
-                        let k0 =
-                            u64::from(!(r.score as u32 ^ 0x8000_0000)) << 1 | u64::from(r.is_alt);
-                        ((k0, r.hash), i as u32)
-                    }));
-                    perm.sort_unstable_by(|x, y| {
-                        let (a, b) = (x.0, y.0);
-                        let lt = (a.0 < b.0) | ((a.0 == b.0) & (a.1 < b.1));
-                        if lt {
-                            std::cmp::Ordering::Less
-                        } else if a == b {
-                            std::cmp::Ordering::Equal
-                        } else {
-                            std::cmp::Ordering::Greater
-                        }
-                    });
-                    spare.clear();
-                    spare.extend(perm.iter().map(|&(_, i)| a[i as usize].clone()));
-                }
-                a.clone_from_slice(spare);
-            });
+            perm.clear();
+            // Off x86-64 the key and a 31-bit index are one u128 (`!score` biased to unsigned,
+            // ALT bit, hash, index), compared in two instructions instead of a tuple chain.
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                assert!(a.len() < 1 << 31);
+                perm.extend(a.iter().enumerate().map(|(i, r)| {
+                    u128::from(!(r.score as u32 ^ 0x8000_0000)) << 96
+                        | u128::from(r.is_alt) << 95
+                        | u128::from(r.hash) << 31
+                        | i as u128
+                }));
+                perm.sort_unstable();
+                permute(a, |j| {
+                    let src = (perm[j] as u32 & 0x7fff_ffff) as usize;
+                    perm[j] = perm[j] & !0x7fff_ffff | j as u128;
+                    src
+                });
+            }
+            // x86-64: fg-labs/bwa-mem3's `primary_pair`, `(!score << 1 | alt, hash)` compared
+            // bitwise. The pair is distinct per region, so the index never breaks a tie.
+            #[cfg(target_arch = "x86_64")]
+            {
+                perm.extend(a.iter().enumerate().map(|(i, r)| {
+                    let k0 = u64::from(!(r.score as u32 ^ 0x8000_0000)) << 1 | u64::from(r.is_alt);
+                    ((k0, r.hash), i as u32)
+                }));
+                perm.sort_unstable_by(|x, y| {
+                    let (a, b) = (x.0, y.0);
+                    let lt = (a.0 < b.0) | ((a.0 == b.0) & (a.1 < b.1));
+                    if lt {
+                        std::cmp::Ordering::Less
+                    } else if a == b {
+                        std::cmp::Ordering::Equal
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                });
+                permute(a, |j| std::mem::replace(&mut perm[j].1, j as u32) as usize);
+            }
         });
+    }
+}
+
+/// Puts the region from `a[src(j)]` at `a[j]` for every `j`, cycle by cycle through one temporary:
+/// each region moves once, where gathering into a spare and copying it back moved every one twice
+/// (the copy back was 13% of real reads' memmove bytes). `src(j)` returns `j`'s source and marks
+/// `j` placed, so a later `src(j)` returns `j` itself.
+fn permute(a: &mut [MemAlnReg], mut src: impl FnMut(usize) -> usize) {
+    for i in 0..a.len() {
+        let mut k = src(i);
+        if k == i {
+            continue;
+        }
+        let first = a[i].clone();
+        let mut j = i;
+        while k != i {
+            a[j] = a[k].clone();
+            j = k;
+            k = src(j);
+        }
+        a[j] = first;
     }
 }
 
