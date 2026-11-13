@@ -110,6 +110,12 @@ impl MethOpt {
         self.mats = [ob, ot];
     }
 
+    /// Whether a record can be QC-fail (0x200): only `--set-as-failed` and `--chimera-qc` set it,
+    /// so without them the per-pair propagation pass has nothing to do.
+    pub fn may_qcfail(&self) -> bool {
+        self.set_as_failed.is_some() || self.chimera_qc
+    }
+
     /// `meth_prune_smems` keep rule for one SMEM of a read whose longest SMEM is `max_len`.
     /// The caller always keeps the first SMEM of that maximal length.
     pub fn prune_keeps(&self, len: i32, occ: i64, max_len: i32) -> bool {

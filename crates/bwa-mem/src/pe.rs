@@ -3278,7 +3278,7 @@ pub fn mem_sam_pe<W: Write>(
                         &mut buf,
                     );
                 }
-                if opt.meth.is_some() {
+                if opt.meth.as_ref().is_some_and(|m| m.may_qcfail()) {
                     crate::meth::propagate_qcfail(&mut buf);
                 }
                 let wrote = w.write_all(&buf);
@@ -3389,7 +3389,7 @@ pub fn mem_sam_pe<W: Write>(
         emit[1].as_ref(),
         &mut buf,
     );
-    if opt.meth.is_some() {
+    if opt.meth.as_ref().is_some_and(|m| m.may_qcfail()) {
         crate::meth::propagate_qcfail(&mut buf);
     }
     let wrote = w.write_all(&buf);

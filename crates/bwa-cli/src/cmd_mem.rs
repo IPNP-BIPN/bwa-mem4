@@ -2720,7 +2720,9 @@ fn finish_se_meth(
         Some(&emit),
         &mut buf,
     );
-    bwa_mem::meth::propagate_qcfail(&mut buf);
+    if meth.may_qcfail() {
+        bwa_mem::meth::propagate_qcfail(&mut buf);
+    }
     buf
 }
 
