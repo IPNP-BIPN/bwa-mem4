@@ -192,7 +192,8 @@ reach those kernels in three ways:
 - **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
   also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
   cell scores at most the match score, so the bound holds. The relation count is scalar, so x86
-  skips it: there the full 32- or 64-lane SW is cheaper than counting.
+  skips it: there the full 32- or 64-lane SW is cheaper than counting. bwa-mem3 does not prune
+  `--meth` on x86 either.
 
 A seed that scores 0 or less under the read's matrix (a pair it matched only in converted space)
 extends on the scalar kernel, as in bwa-mem3.
@@ -212,7 +213,24 @@ The machine was loaded (load average 6 to 9) during these runs. Cycles and instr
 steadier comparison.
 
 On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` times both binaries on
-200,000 pairs simulated from chr21, on the runner's CPU.
+200,000 pairs simulated from chr21, on the runner's CPU. Each cell is the wall-time ratio
+bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each, both binaries in the same job (commit
+ff41fc5). A range covers several jobs that drew the same CPU. The SAM output was byte-identical in
+every job.
+
+| CPU (rescue kernel) | Jobs | EM-seq `-t1` | EM-seq `-t4` | TAPS `-t1` | TAPS `-t4` |
+|---|---|---|---|---|---|
+| Xeon Platinum 8573C (AVX-512, VBMI) | 1 | 0.900 | 0.931 | 0.889 | 0.925 |
+| Xeon Platinum 8370C (AVX-512, VBMI) | 1 | 0.920 | 0.930 | 0.906 | 0.912 |
+| Xeon 6973P-C (AVX-512, VBMI) | 1 | 0.892 | 0.902 | 0.879 | 0.900 |
+| EPYC 7763, Zen 3 (AVX2) | 7 | 0.850-0.855 | 0.822-0.828 | 0.910-0.928 | 0.905-0.912 |
+| EPYC 9V74, Zen 4 (AVX-512, VBMI) | 2 | 0.838-0.870 | 0.827-0.869 | 0.855-0.933 | 0.880-0.900 |
+| EPYC 9V45, Zen 5 (AVX-512, VBMI) | 2 | 0.950-0.953 | 0.892-0.895 | 0.958-0.977 | 0.898-0.909 |
+
+The user + sys CPU ratios are within 1.5% of the wall ratios. The max RSS ratio is 0.86 to 0.97
+at `-t1` and 0.62 to 0.79 at `-t4`. On the 9V45 the run-to-run noise is about 4%: over five jobs
+on the same EM-seq code, its `-t1` ratio was 0.94 to 1.00. On that CPU, bwa-mem4's seeding takes
+more perf samples than bwa-mem3's; extension makes up for it.
 
 ## Differences from bwa-mem3 0.16
 
