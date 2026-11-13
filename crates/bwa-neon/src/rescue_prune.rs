@@ -355,6 +355,7 @@ impl Scratch {
         self.touched.clear();
         self.ent_j.clear();
         self.ent_nxt.clear();
+        self.pres = [0; 128];
         self.q_has_n = q.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0;
         if self.q_has_n {
             return;
@@ -381,6 +382,9 @@ impl Scratch {
                 self.ehead[c] = e as i16;
                 if v == 0 {
                     self.touched.push(c as u16);
+                }
+                if k == 5 {
+                    self.pres[c >> 3] |= 1 << (c & 7);
                 }
                 self.tab[c] = ((v >> 16) + 1) << 16 | if v != 0 { TAB_MULTI } else { 0 } | j as u32;
                 if sub == 0 {
@@ -411,7 +415,7 @@ pub(crate) fn decide(t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Decisio
     }
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        match count_hits(s, t, q, p, max_hits) {
+        match count_hits(s, t, q, p, max_hits, None) {
             Some(nd) => decide_counts(s, p, len1, nd),
             None => Decision::Full,
         }
@@ -435,7 +439,7 @@ pub(crate) fn decide_rel(
     }
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        match count_hits_scalar(s, t, q, p, max_hits, Some((x, y))) {
+        match count_hits(s, t, q, p, max_hits, Some((x, y))) {
             Some(nd) => decide_counts(s, p, len1, nd),
             None => Decision::Full,
         }
@@ -445,18 +449,27 @@ pub(crate) fn decide_rel(
 /// The per-diagonal hit counts (`cnt`, `minrow` where `cnt != 0`, `occ_bits`). Returns the number of
 /// diagonal slots, or `None` when the job is not filtered (an N in either sequence, or more hits than
 /// `max_hits`). A job proven to fail by the hit total alone comes back with no diagonal occupied.
-fn count_hits(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Option<usize> {
+fn count_hits(
+    s: &mut Scratch,
+    t: &[u8],
+    q: &[u8],
+    p: &Params,
+    max_hits: usize,
+    rel: Option<(u8, u8)>,
+) -> Option<usize> {
     #[cfg(target_arch = "aarch64")]
     if p.k == 5 {
         // SAFETY: NEON is part of the aarch64 baseline.
-        return unsafe { neon::count_hits(s, t, q, p, max_hits) };
+        return unsafe { neon::count_hits(s, t, q, p, max_hits, rel) };
     }
+    // shortcut: the SSE counter has no relation form, so x86 counts a relation in scalar; port
+    // `neon`'s entry chains to it before x86 filters under a relation (matesw.rs runs it in full).
     #[cfg(target_arch = "x86_64")]
-    if p.k == 5 && sse::available() {
+    if p.k == 5 && rel.is_none() && sse::available() {
         // SAFETY: SSSE3 and SSE4.1 were just detected.
         return unsafe { sse::count_hits(s, t, q, p, max_hits) };
     }
-    count_hits_scalar(s, t, q, p, max_hits, None)
+    count_hits_scalar(s, t, q, p, max_hits, rel)
 }
 
 /// [`count_hits`] in portable code: the reference the NEON counter is checked against, and the
@@ -691,16 +704,24 @@ mod neon {
         }
     }
 
+    /// Under a relation (`rel`, see [`Scratch::load_query_rel`]) the same passes run on the
+    /// relation's table, whose count and latest position per code read like the equality one's;
+    /// only the chain to a code's earlier occurrences differs (entries, not positions), so layers
+    /// >= 2 carry entry indices and gather their positions.
     pub(super) unsafe fn count_hits(
         s: &mut Scratch,
         t: &[u8],
         q: &[u8],
         p: &Params,
         max_hits: usize,
+        rel: Option<(u8, u8)>,
     ) -> Option<usize> {
         const K: usize = 5;
         let (len1, len2) = (t.len(), q.len());
-        s.load_query(q, K);
+        match rel {
+            Some(r) => s.load_query_rel(q, K, r),
+            None => s.load_query(q, K),
+        }
         // ---- 1. N check while copying the window into a zero-padded buffer, so the 16-row code
         //      blocks never read past it ----
         // One pass: copy 16 bytes, OR them in. `rbuf` keeps `len1 + 32` bytes, the last 32 zero.
@@ -861,7 +882,13 @@ mod neon {
                 pack(&mut s.rb_d, nb, d, mb);
                 nb = pack(&mut s.rb_r, nb, r, mb);
                 pack(&mut s.mrow, nm, r, mm);
-                nm = pack(&mut s.mj, nm, j, mm);
+                // Under a relation the code: its entry chain starts at `ehead` (below).
+                let mv = if rel.is_some() {
+                    vld1q_u16(s.hcode.as_ptr().add(k0))
+                } else {
+                    j
+                };
+                nm = pack(&mut s.mj, nm, mv, mm);
                 idx = vaddq_u16(idx, k8);
                 k0 += 8;
             }
@@ -908,8 +935,23 @@ mod neon {
             let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
             e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
         };
-        for x in 0..nm {
-            s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+        // Under a relation `js` holds entries: position `ent_j[e]`, next `ent_nxt[e]`. Past the
+        // list's end the lanes are stale, clamped to stay in the entry arrays.
+        let (ej, en) = (s.ent_j.as_ptr(), s.ent_nxt.as_ptr());
+        let elast = s.ent_j.len().saturating_sub(1) as u64;
+        let gather4 = |a: *const i16, e: *const u16| -> u64 {
+            let x = (e as *const u64).read_unaligned();
+            let g = |sh: u32| u64::from(*a.add(((x >> sh) & 0xFFFF).min(elast) as usize) as u16);
+            g(0) | g(16) << 16 | g(32) << 32 | g(48) << 48
+        };
+        if rel.is_some() {
+            for x in 0..nm {
+                s.mj[x] = s.ent_nxt[s.ehead[s.mj[x] as usize] as usize] as u16;
+            }
+        } else {
+            for x in 0..nm {
+                s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+            }
         }
         let mut n = nm;
         grow(&mut s.hrow, n + 16);
@@ -931,11 +973,21 @@ mod neon {
                 let mut k0 = 0usize;
                 while k0 < n {
                     let r = vld1q_u16(rows.as_ptr().add(k0));
-                    let j = vld1q_u16(js.as_ptr().add(k0));
-                    let jn = vreinterpretq_s16_u64(vcombine_u64(
-                        vcreate_u64(nxt4(js.as_ptr().add(k0))),
-                        vcreate_u64(nxt4(js.as_ptr().add(k0 + 4))),
-                    ));
+                    let (e0, e1) = (js.as_ptr().add(k0), js.as_ptr().add(k0 + 4));
+                    let (j, jn) = if rel.is_some() {
+                        let j = vcombine_u64(
+                            vcreate_u64(gather4(ej, e0)),
+                            vcreate_u64(gather4(ej, e1)),
+                        );
+                        let jn = vcombine_u64(
+                            vcreate_u64(gather4(en, e0)),
+                            vcreate_u64(gather4(en, e1)),
+                        );
+                        (vreinterpretq_u16_u64(j), vreinterpretq_s16_u64(jn))
+                    } else {
+                        let jn = vcombine_u64(vcreate_u64(nxt4(e0)), vcreate_u64(nxt4(e1)));
+                        (vld1q_u16(e0), vreinterpretq_s16_u64(jn))
+                    };
                     let d = vsubq_u16(vaddq_u16(r, koff), j);
                     let rp = vextq_u16::<7>(prev_r, r);
                     let dp = vextq_u16::<7>(prev_d, d);
@@ -2226,10 +2278,7 @@ pub(crate) fn decide_bands(
     }
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        let counted = match rel {
-            Some(_) => count_hits_scalar(s, t, q, p, max_hits, rel),
-            None => count_hits(s, t, q, p, max_hits),
-        };
+        let counted = count_hits(s, t, q, p, max_hits, rel);
         let Some(nd) = counted else {
             return (Decision::Full, 0);
         };
@@ -2305,8 +2354,9 @@ pub(crate) mod tests {
         q: &[u8],
         p: &Params,
         max_hits: usize,
+        rel: Option<(u8, u8)>,
     ) -> Option<usize> {
-        let nd = super::count_hits(s, t, q, p, max_hits)?;
+        let nd = super::count_hits(s, t, q, p, max_hits, rel)?;
         occ_ready(s);
         s.cnt.resize(s.cnt.len().max(nd), 0);
         for d in 0..nd {
@@ -2422,7 +2472,7 @@ pub(crate) mod tests {
                 }
             }
             let p = &params[iter % params.len()];
-            if let Some(nd) = count_hits(&mut s, &t, &q, p, usize::MAX) {
+            if let Some(nd) = count_hits(&mut s, &t, &q, p, usize::MAX, None) {
                 let want = dense_decision(&s, p, tlen, nd);
                 assert_eq!(sparse_decision(&mut s, p, tlen, nd), want, "iter {iter}");
                 match want {
@@ -2437,7 +2487,7 @@ pub(crate) mod tests {
         if let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") {
             let p = &params[0];
             for (n, (t, q)) in load_dump(&path).iter().enumerate() {
-                if let Some(nd) = count_hits(&mut s, t, q, p, usize::MAX) {
+                if let Some(nd) = count_hits(&mut s, t, q, p, usize::MAX, None) {
                     let want = dense_decision(&s, p, t.len(), nd);
                     assert_eq!(sparse_decision(&mut s, p, t.len(), nd), want, "job {n}");
                 }
@@ -2470,7 +2520,7 @@ pub(crate) mod tests {
         let key = |c: &Comp| (c.ub, c.i0, c.dlo, c.dhi, c.dmaxhit);
         let mut s = Scratch::new();
         let check = |s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, what: &str| -> u32 {
-            let Some(nd) = count_hits(s, t, q, p, usize::MAX) else {
+            let Some(nd) = count_hits(s, t, q, p, usize::MAX, None) else {
                 return 0;
             };
             if s.occ_bits.iter().all(|&w| w == 0) {
@@ -2632,7 +2682,7 @@ pub(crate) mod tests {
                 }
                 // A threshold of 1 so the early fail never skips the enumeration.
                 let p = Params { minsc: 1, ..p };
-                let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX) else {
+                let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX, None) else {
                     continue;
                 };
                 let (cnt, minrow) = naive_counts(t, q, k);
@@ -2761,19 +2811,22 @@ pub(crate) mod tests {
                     if t.len() < 5 || q.len() < 5 || t.len() > WCAP || q.len() > QCAP {
                         continue;
                     }
-                    let x = count_hits(&mut a, t, q, &p, mh);
-                    let y = count_hits_scalar(&mut b, t, q, &p, mh, None);
-                    assert_eq!(x, y, "job {n} minsc {minsc} mh {mh}: verdict");
-                    let Some(nd) = x else { continue };
-                    let nw = nd.div_ceil(64);
-                    assert_eq!(a.occ_bits[..nw], b.occ_bits[..nw], "job {n}: occ_bits");
-                    if a.occ_bits.iter().all(|&w| w == 0) {
-                        continue;
-                    }
-                    assert_eq!(a.cnt[..nd], b.cnt[..nd], "job {n}: cnt");
-                    for d in 0..nd {
-                        if a.cnt[d] != 0 {
-                            assert_eq!(a.minrow[d], b.minrow[d], "job {n}: minrow {d}");
+                    for rel in [None, Some((1u8, 3u8)), Some((2, 0))] {
+                        let x = count_hits(&mut a, t, q, &p, mh, rel);
+                        let y = count_hits_scalar(&mut b, t, q, &p, mh, rel);
+                        assert_eq!(x, y, "job {n} minsc {minsc} mh {mh} {rel:?}: verdict");
+                        let Some(nd) = x else { continue };
+                        let nw = nd.div_ceil(64);
+                        assert_eq!(a.occ_bits[..nw], b.occ_bits[..nw], "job {n} {rel:?}: occ");
+                        if a.occ_bits.iter().all(|&w| w == 0) {
+                            continue;
+                        }
+                        assert_eq!(a.nhits, b.nhits, "job {n} {rel:?}: nhits");
+                        assert_eq!(a.cnt[..nd], b.cnt[..nd], "job {n} {rel:?}: cnt");
+                        for d in 0..nd {
+                            if a.cnt[d] != 0 {
+                                assert_eq!(a.minrow[d], b.minrow[d], "job {n} {rel:?}: minrow {d}");
+                            }
                         }
                     }
                 }
@@ -3048,7 +3101,7 @@ pub(crate) mod tests {
                 continue;
             }
             let off = q.len().div_ceil(16) * 16;
-            let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX) else {
+            let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX, None) else {
                 continue;
             };
             let bnd = dense_bound(&s, &p, nd);
@@ -3181,7 +3234,7 @@ pub(crate) mod tests {
             let hull = (he + 1 - hb) as u64 * ql;
             c_now += hull;
             // Rebuild the counts and Kadane sums (decide's scratch is thread-local, not `s`).
-            let nd = count_hits(&mut s, t, q, &p, usize::MAX).unwrap();
+            let nd = count_hits(&mut s, t, q, &p, usize::MAX, None).unwrap();
             let c0 = components_at(&s, &p, nd, p.minsc);
             let mut ubs: Vec<i32> = c0.iter().map(|c| c.0).collect();
             ubs.sort_unstable_by(|a, b| b.cmp(a));
@@ -3356,12 +3409,12 @@ pub(crate) mod tests {
         let t0 = std::time::Instant::now();
         let mut nds = Vec::with_capacity(jobs.len());
         for (t, q) in &jobs {
-            nds.push(super::count_hits(&mut s, t, q, &p, 100_000));
+            nds.push(super::count_hits(&mut s, t, q, &p, 100_000, None));
         }
         let count_ns = t0.elapsed().as_nanos() as f64 / jobs.len() as f64;
         let t0 = std::time::Instant::now();
         for ((t, q), _) in jobs.iter().zip(&nds) {
-            if let Some(nd) = super::count_hits(&mut s, t, q, &p, 100_000) {
+            if let Some(nd) = super::count_hits(&mut s, t, q, &p, 100_000, None) {
                 std::hint::black_box(sparse_decision(&mut s, &p, t.len(), nd));
             }
         }
