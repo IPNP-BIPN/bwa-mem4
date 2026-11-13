@@ -3481,10 +3481,23 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
         let mut te = [-1i32; LANES32];
         let mut qe = [0i32; LANES32];
         let mut limit = [-1i32; LANES32];
-        let mut frozen = [false; LANES32];
         for l in 0..n_lanes {
             limit[l] = tlen[l] as i32 - 1;
         }
+        // The row epilogue's per-lane state as vectors, so a row costs a few vector ops instead
+        // of a branchy pass over 32 lanes (bwa-mem3's vector epilogue): `gmax_v` is the best row
+        // max so far and `endsc_v` the freeze threshold clamped to a byte, both in the `H - 128`
+        // domain (scores stay below `U8_SCORE_LIMIT`, so 255 is never reached), and `frozen_v`
+        // the lanes that reached it.
+        let mut gmax_v = hz;
+        let mut frozen_v = zero;
+        let endsc_v = {
+            let mut a = [i8::MAX; LANES32];
+            for l in 0..n_lanes {
+                a[l] = (endsc[l].clamp(0, 255) - 128) as i8;
+            }
+            _mm256_loadu_si256(a.as_ptr() as *const __m256i)
+        };
         // Columns below the shortest live query: no live lane can be showing ZPAD or PAD there.
         let n_fast = if fastcol_enabled() {
             qlen[..n_lanes].iter().copied().min().unwrap_or(0).min(qmax)
@@ -3499,32 +3512,39 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
         // diagonal is row `i`'s previous-column H and its E carry is what row `i` just produced.
         // =====================================================================================
         macro_rules! finish_row {
-            ($row:expr, $imax:expr, $col:expr) => {{
+            ($row:expr, $imax:expr, $col:expr, $t:expr) => {{
                 let row = $row;
-                let mut imax_arr = [0u8; LANES32];
-                let mut col_arr = [0u8; LANES32];
                 let imax_u = _mm256_xor_si256($imax, hz);
-                _mm256_storeu_si256(imax_arr.as_mut_ptr() as *mut __m256i, imax_u);
-                _mm256_storeu_si256(col_arr.as_mut_ptr() as *mut __m256i, $col);
                 // The whole row, all lanes, one store. See the note on `rowmax`.
                 _mm256_storeu_si256(
                     rowmax.as_mut_ptr().add(row * LANES32) as *mut __m256i,
                     imax_u,
                 );
-                for l in 0..n_lanes {
-                    if row >= tlen[l] || frozen[l] {
-                        continue;
-                    }
-                    // Job `l`'s best H anywhere in target row `row`, widened out of the lane.
-                    let row_max = imax_arr[l] as i32;
-                    if row_max > gmax[l] {
-                        gmax[l] = row_max;
+                // The lanes this row improves: in their target (the row's base is not `PAD`,
+                // which also leaves out the lanes past `n_lanes`), not frozen, strictly above.
+                let need_v = _mm256_andnot_si256(
+                    _mm256_or_si256(frozen_v, $t),
+                    _mm256_cmpgt_epi8($imax, gmax_v),
+                );
+                let need = _mm256_movemask_epi8(need_v) as u32;
+                if need != 0 {
+                    gmax_v = bsl(need_v, $imax, gmax_v);
+                    let froze_v = _mm256_andnot_si256(_mm256_cmpgt_epi8(endsc_v, gmax_v), need_v);
+                    frozen_v = _mm256_or_si256(frozen_v, froze_v);
+                    let mut col_arr = [0u8; LANES32];
+                    _mm256_storeu_si256(col_arr.as_mut_ptr() as *mut __m256i, $col);
+                    let mut m = need;
+                    while m != 0 {
+                        let l = m.trailing_zeros() as usize;
+                        m &= m - 1;
                         te[l] = row as i32;
                         qe[l] = col_arr[l] as i32;
-                        if gmax[l] >= endsc[l] {
-                            frozen[l] = true;
-                            limit[l] = row as i32;
-                        }
+                    }
+                    let mut m = _mm256_movemask_epi8(froze_v) as u32;
+                    while m != 0 {
+                        let l = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        limit[l] = row as i32;
                     }
                 }
             }};
@@ -3659,8 +3679,8 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                 }
 
                 // Row order matters: freezing at row `i` must suppress row `i+1`.
-                finish_row!(i, imax0, col0);
-                finish_row!(i + 1, imax1, col1);
+                finish_row!(i, imax0, col0, t0_v);
+                finish_row!(i + 1, imax1, col1, t1_v);
             } else {
                 // Lane `l` = target base at row `i` of job `l`.
                 let t_v = _mm256_loadu_si256(seq_t.as_ptr().add(i * LANES32) as *const __m256i);
@@ -3759,16 +3779,30 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                         _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES32) as *const __m256i);
                     j_v = _mm256_add_epi8(j_v, one_v);
                 }
-                finish_row!(i, imax_v, imax_col_v);
+                finish_row!(i, imax_v, imax_col_v, t_v);
             }
             std::mem::swap(&mut h_prev, &mut h_cur);
 
             // Early exit once every live lane is either frozen or out of target: purely a speed win,
-            // as in the NEON kernels. See the longer note in `fwd_local_sw_neon`.
-            if (0..n_lanes).all(|l| frozen[l] || i + rows >= tlen[l]) {
+            // as in the NEON kernels. See the longer note in `fwd_local_sw_neon`. A target ends where
+            // its bytes turn `PAD`, so the next row's bases say which lanes still run.
+            i += rows;
+            if i >= tmax
+                || _mm256_movemask_epi8(_mm256_or_si256(
+                    frozen_v,
+                    _mm256_loadu_si256(seq_t.as_ptr().add(i * LANES32) as *const __m256i),
+                )) == -1
+            {
                 break;
             }
-            i += rows;
+        }
+        let mut gmax_arr = [0u8; LANES32];
+        _mm256_storeu_si256(
+            gmax_arr.as_mut_ptr() as *mut __m256i,
+            _mm256_xor_si256(gmax_v, hz),
+        );
+        for (g, &v) in gmax.iter_mut().zip(&gmax_arr) {
+            *g = i32::from(v);
         }
 
         extract_group(
@@ -5137,10 +5171,22 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
         let mut te = [-1i32; LANES64];
         let mut qe = [0i32; LANES64];
         let mut limit = [-1i32; LANES64];
-        let mut frozen = [false; LANES64];
         for l in 0..n_lanes {
             limit[l] = tlen[l] as i32 - 1;
         }
+        // The row epilogue's per-lane state as one vector and one mask, so a row costs a few mask
+        // ops instead of a branchy pass over 64 lanes (bwa-mem3's vector epilogue): `gmax_v` is the
+        // best row max so far (unsigned), `frozen` the lanes that reached `endsc`, `endsc_v` that
+        // threshold clamped to a byte (scores stay below `U8_SCORE_LIMIT`, so 255 is never reached).
+        let mut gmax_v = zero;
+        let mut frozen = 0u64;
+        let endsc_v = {
+            let mut a = [u8::MAX; LANES64];
+            for l in 0..n_lanes {
+                a[l] = endsc[l].clamp(0, 255) as u8;
+            }
+            _mm512_loadu_si512(a.as_ptr() as *const __m512i)
+        };
         // Columns below the shortest live query: no live lane can be showing ZPAD or PAD there.
         let n_fast = if fastcol_enabled() {
             qlen[..n_lanes].iter().copied().min().unwrap_or(0).min(qmax)
@@ -5151,23 +5197,19 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
         // Two target rows per iteration when two are left; see `fwd_local_sw_neon_u8` for the
         // memory-traffic argument and the byte-identity argument.
         macro_rules! finish_row {
-            ($row:expr, $imax:expr, $hrow:expr, $blk:expr) => {{
+            ($row:expr, $imax:expr, $t:expr, $hrow:expr, $blk:expr) => {{
                 let row = $row;
-                let mut imax_arr = [0u8; LANES64];
                 let imax_u = _mm512_xor_si512($imax, hz);
-                _mm512_storeu_si512(imax_arr.as_mut_ptr() as *mut __m512i, imax_u);
                 // The whole row, all lanes, one store. See the note on `rowmax`.
                 _mm512_storeu_si512(
                     rowmax.as_mut_ptr().add(row * LANES64) as *mut __m512i,
                     imax_u,
                 );
-                // The lanes this row improves are the only ones that need its query end.
-                let mut need = 0u64;
-                for l in 0..n_lanes {
-                    if row < tlen[l] && !frozen[l] && imax_arr[l] as i32 > gmax[l] {
-                        need |= 1 << l;
-                    }
-                }
+                // The lanes this row improves are the only ones that need its query end. A lane
+                // is in its target while the row's base is not `PAD` (bit 7), which also leaves
+                // out the lanes past `n_lanes`.
+                let need =
+                    !_mm512_movepi8_mask($t) & !frozen & _mm512_cmpgt_epu8_mask(imax_u, gmax_v);
                 if need != 0 {
                     // The query end, recovered lazily (bwa-mem3's LazyQE): the smallest column
                     // whose stored H equals the row max, the column the inline strict `>` kept.
@@ -5193,18 +5235,23 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                             break;
                         }
                     }
+                    gmax_v = _mm512_mask_blend_epi8(need, gmax_v, imax_u);
+                    let froze = _mm512_mask_cmpge_epu8_mask(need, gmax_v, endsc_v);
+                    frozen |= froze;
                     let mut col_arr = [0u8; LANES64];
                     _mm512_storeu_si512(col_arr.as_mut_ptr() as *mut __m512i, col);
-                    for l in 0..n_lanes {
-                        if need >> l & 1 != 0 {
-                            gmax[l] = imax_arr[l] as i32;
-                            te[l] = row as i32;
-                            qe[l] = col_arr[l] as i32;
-                            if gmax[l] >= endsc[l] {
-                                frozen[l] = true;
-                                limit[l] = row as i32;
-                            }
-                        }
+                    let mut m = need;
+                    while m != 0 {
+                        let l = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        te[l] = row as i32;
+                        qe[l] = col_arr[l] as i32;
+                    }
+                    let mut m = froze;
+                    while m != 0 {
+                        let l = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        limit[l] = row as i32;
                     }
                 }
             }};
@@ -5356,8 +5403,8 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     blk1.as_mut_ptr().add((qmax - 1) / QE_BLK * LANES64) as *mut __m512i,
                     imax1,
                 );
-                finish_row!(i, imax0, h_prev.as_ptr(), blk0.as_ptr());
-                finish_row!(i + 1, imax1, h_cur.as_ptr(), blk1.as_ptr());
+                finish_row!(i, imax0, t0_v, h_prev.as_ptr(), blk0.as_ptr());
+                finish_row!(i + 1, imax1, t1_v, h_cur.as_ptr(), blk1.as_ptr());
             } else {
                 let t_v = _mm512_loadu_si512(seq_t.as_ptr().add(i * LANES64) as *const __m512i);
                 let mut f_v = hz;
@@ -5445,14 +5492,26 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     blk0.as_mut_ptr().add((qmax - 1) / QE_BLK * LANES64) as *mut __m512i,
                     imax_v,
                 );
-                finish_row!(i, imax_v, h_cur.as_ptr(), blk0.as_ptr());
+                finish_row!(i, imax_v, t_v, h_cur.as_ptr(), blk0.as_ptr());
             }
             std::mem::swap(&mut h_prev, &mut h_cur);
 
-            if (0..n_lanes).all(|l| frozen[l] || i + rows >= tlen[l]) {
+            // Every lane frozen or out of target from the next row on: a target ends where its
+            // bytes turn `PAD`, so the next row's bases say which lanes still run.
+            i += rows;
+            if i >= tmax
+                || !_mm512_movepi8_mask(_mm512_loadu_si512(
+                    seq_t.as_ptr().add(i * LANES64) as *const __m512i
+                )) & !frozen
+                    == 0
+            {
                 break;
             }
-            i += rows;
+        }
+        let mut gmax_arr = [0u8; LANES64];
+        _mm512_storeu_si512(gmax_arr.as_mut_ptr() as *mut __m512i, gmax_v);
+        for (g, &v) in gmax.iter_mut().zip(&gmax_arr) {
+            *g = i32::from(v);
         }
 
         extract_group(
