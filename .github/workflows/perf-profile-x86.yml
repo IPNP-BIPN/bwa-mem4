@@ -24,7 +24,7 @@ on:
         default: "1000000"
         required: false
       read_set:
-        description: "sim | real | meth (the meth job: --meth EM-seq and TAPS, ours vs the fork)"
+        description: "sim | real | meth (the meth job: --meth EM-seq and TAPS, ours vs the fork; meth:250 for 250 bp reads)"
         default: "sim"
         required: false
       runner:
@@ -44,7 +44,7 @@ on:
         default: "false"
         required: false
       ours_env:
-        description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4"
+        description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4. In the meth job, set for both arms instead (BWA4_* reach ours, BWAMEM3_* the fork)"
         default: ""
         required: false
       alt_rustflags:
@@ -73,7 +73,7 @@ env:
 
 jobs:
   profile:
-    if: github.event.inputs.icount != 'true' && github.event.inputs.read_set != 'meth'
+    if: github.event.inputs.icount != 'true' && !startsWith(github.event.inputs.read_set, 'meth')
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 90
     steps:
@@ -714,7 +714,7 @@ jobs:
   # interleaved and each run twice; the summary keeps each arm's faster run. `-K` is fixed so the
   # fork's batches, hence its output, do not depend on -t, and the outputs are compared first.
   meth:
-    if: github.event.inputs.read_set == 'meth'
+    if: startsWith(github.event.inputs.read_set, 'meth')
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 90
     steps:
@@ -791,6 +791,17 @@ jobs:
             cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-meth
           cp target-meth/release/bwa-mem4 ./mem4-v3
 
+      - name: Kernel tests on this CPU
+        if: steps.host.outputs.ok == '1'
+        run: |
+          # The SIMD kernels against scalar on real hardware: avx512-check runs the AVX-512 ones
+          # under SDE only, and these runners draw Intel (VBMI) and Zen 4 / Zen 5 AVX-512 hosts.
+          grep -o -E 'avx512(bw|vbmi)' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+          RUSTFLAGS="-C target-cpu=x86-64-v3 ${{ github.event.inputs.extra_rustflags }}" \
+            cargo test --release --locked -p bwa-mem4-neon --jobs 2 --target-dir target-meth 2>&1 \
+            | grep -E '^test result|FAILED|panicked|skipping'
+
       - name: Reference, indexes and reads
         if: steps.host.outputs.ok == '1'
         shell: bash -el {0}
@@ -804,16 +815,23 @@ jobs:
           bwa-mem3 index --meth fork/chr21.fa > /dev/null 2>&1
           ../mem4-v3 index --meth ours/chr21.fa 2> /dev/null
           n="${{ github.event.inputs.read_pairs || '200000' }}"
-          python3 ../scripts/meth_sim.py chr21.fa em --pairs "$n" --seed 11
-          python3 ../scripts/meth_sim.py chr21.fa taps --pairs "$n" --seed 7 --taps
-          echo "simulated: $n EM-seq pairs, $n TAPS pairs"
+          # `read_set=meth:250` simulates 250 bp reads (the inputs are at GitHub's limit of ten).
+          len="${{ github.event.inputs.read_set }}"; len="${len#meth}"; len="${len#:}"; len="${len:-150}"
+          python3 ../scripts/meth_sim.py chr21.fa em --pairs "$n" --len "$len" --seed 11
+          python3 ../scripts/meth_sim.py chr21.fa taps --pairs "$n" --len "$len" --seed 7 --taps
+          echo "simulated: $n EM-seq pairs, $n TAPS pairs, $len bp"
 
       - name: Time both
         if: steps.host.outputs.ok == '1'
         shell: bash -el {0}
+        env:
+          OURS_ENV: ${{ github.event.inputs.ours_env || '' }}
         run: |
           set -euo pipefail
           cd work
+          # ours_env, e.g. BWA4_RESCUE_TIER=sse41 BWAMEM3_FORCE_TIER=avx2: both arms see it, and
+          # each tool reads only its own variables.
+          [ -z "$OURS_ENV" ] || { export $OURS_ENV; echo "env: $OURS_ENV"; }
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
           rows=rows.csv; : > "$rows"
           for lib in em taps; do
@@ -853,9 +871,14 @@ jobs:
       - name: Where the time goes (-t 1)
         if: steps.host.outputs.ok == '1'
         shell: bash -el {0}
+        env:
+          OURS_ENV: ${{ github.event.inputs.ours_env || '' }}
         run: |
           set -euo pipefail
           cd work
+          # ours_env, e.g. BWA4_RESCUE_TIER=sse41 BWAMEM3_FORCE_TIER=avx2: both arms see it, and
+          # each tool reads only its own variables.
+          [ -z "$OURS_ENV" ] || { export $OURS_ENV; echo "env: $OURS_ENV"; }
           for lib in em taps; do
             mode=--meth; [ "$lib" = taps ] && mode=--meth=taps
             reads=("${lib}_1.fq" "${lib}_2.fq")

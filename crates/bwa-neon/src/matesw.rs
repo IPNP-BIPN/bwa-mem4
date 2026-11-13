@@ -1567,8 +1567,10 @@ pub(crate) fn fwd_local_sw_batch(
     #[cfg(target_arch = "x86_64")]
     {
         // A `--meth` matrix (`mat5_u8_ok`) takes the u8 kernels' `MAT5` form; i16 is standard-only.
+        // shortcut: a `MAT5` matrix without an add code (every `--meth` matrix has one) runs scalar,
+        // AVX-512 with VBMI included, which would not need it; gate VBMI apart if one ever matters.
         let standard = mat_is_standard(m, mat);
-        if standard || mat5_u8_ok(m, mat) {
+        if standard || (mat5_u8_ok(m, mat) && mat5_add_code(mat).is_some()) {
             // Same score-ceiling test as the aarch64 arm above, verbatim: the threshold is bwa's
             // (`bwamem_pair.cpp:208`), not a property of the register we happen to run on, so it does
             // not change when the vector gets twice or four times as wide. See `ksw_padded_qlen` for
@@ -1662,6 +1664,102 @@ fn mat5_u8_ok(m: usize, mat: &[i8]) -> bool {
         && mat[1] <= 0
         && mat[..25].iter().all(|v| (mat[1]..=mat[0]).contains(v))
         && u8_table_has_headroom(mat)
+}
+
+/// A code that scores a 5x5 `mat` with one 16-entry `pshufb` at `(t + q) & 15`: target base `b`
+/// packs as `t[b]`, query base `b` as `q[b]`, and `tbl[(t[x] + q[y]) & 15] == mat[5 x + y]` for
+/// every pair. So the x86 u8 kernels score a `--meth` matrix with one lookup per cell, as they do the
+/// standard XOR table, instead of `5 t + q` over 25 entries (two lookups, a subtract and an xor).
+/// Every code is below 16 (bit 7 stays `PAD`'s), and no query code is `ZPAD`.
+///
+/// XOR cannot do it: the nine N cells need nine slots of their own, and in GF(2)^4 no 4x4 block in
+/// the seven left has a sum with one representation, which the freed cell needs. Addition mod 16
+/// has a code for every `--meth` matrix (`mat5_add_code_covers_meth_matrices`). Depth-first over the
+/// ten codes with `t[A] = 0`: adding a constant to every `t` and subtracting it from every `q`
+/// changes nothing.
+#[cfg(target_arch = "x86_64")]
+fn mat5_add_code(mat: &[i8]) -> Option<([u8; 5], [u8; 5], [i8; 16])> {
+    struct Search<'a> {
+        mat: &'a [i8],
+        t: [u8; 5],
+        q: [u8; 5],
+        val: [i8; 16],
+        refs: [u8; 16],
+        budget: u32,
+    }
+    // Level `k` sets `t[k / 2]` (even `k`) or `q[k / 2]` (odd) and places the cells it completes:
+    // row `i` against `q[..i]`, or column `i` against `t[..=i]`.
+    fn go(s: &mut Search, k: usize) -> bool {
+        if k == 10 {
+            return true;
+        }
+        let (is_t, i) = (k.is_multiple_of(2), k / 2);
+        for c in 0..16u8 {
+            // shortcut: a matrix the budget does not settle runs on the scalar kernel; no `--meth`
+            // matrix comes near it (the search ends within a few hundred steps).
+            if s.budget == 0 {
+                return false;
+            }
+            s.budget -= 1;
+            let taken = if is_t {
+                s.t[..i].contains(&c)
+            } else {
+                s.q[..i].contains(&c)
+            };
+            if taken || (is_t && i == 0 && c != 0) || (!is_t && c == ZPAD) {
+                continue;
+            }
+            let n = if is_t { i } else { i + 1 };
+            let (mut slots, mut placed) = ([0usize; 5], 0);
+            for o in 0..n {
+                let (x, y, sum) = if is_t {
+                    (i, o, c + s.q[o])
+                } else {
+                    (o, i, s.t[o] + c)
+                };
+                let (slot, v) = ((sum & 15) as usize, s.mat[5 * x + y]);
+                if s.refs[slot] > 0 && s.val[slot] != v {
+                    break;
+                }
+                s.val[slot] = v;
+                s.refs[slot] += 1;
+                slots[placed] = slot;
+                placed += 1;
+            }
+            if placed == n {
+                if is_t {
+                    s.t[i] = c;
+                } else {
+                    s.q[i] = c;
+                }
+                if go(s, k + 1) {
+                    return true;
+                }
+            }
+            for &slot in &slots[..placed] {
+                s.refs[slot] -= 1;
+            }
+        }
+        false
+    }
+    let mut s = Search {
+        mat,
+        t: [0; 5],
+        q: [0; 5],
+        val: [0; 16],
+        refs: [0; 16],
+        budget: 1 << 20,
+    };
+    if !go(&mut s, 0) {
+        return None;
+    }
+    let mut tbl = [0i8; 16];
+    for (k, e) in tbl.iter_mut().enumerate() {
+        if s.refs[k] > 0 {
+            *e = s.val[k];
+        }
+    }
+    Some((s.t, s.q, tbl))
 }
 
 /// Whether `mat` is bwa's standard 5x5 form (uniform match on the diagonal, uniform mismatch
@@ -3194,17 +3292,20 @@ fn soa_group(
     qmax: usize,
     tmax: usize,
     max_sc: i32,
-    enc: impl Fn(u8) -> u8,
+    enc_t: impl Fn(u8) -> u8,
+    enc_q: impl Fn(u8) -> u8,
 ) -> (Vec<u8>, Vec<u8>) {
     debug_assert!(lanes.is_multiple_of(16) && group.len() <= lanes);
     let (ql, tl) = (qmax.next_multiple_of(16), tmax.next_multiple_of(16));
     let (mut q, mut t) = (vec![PAD; lanes * ql], vec![PAD; lanes * tl]);
     for (l, j) in group.iter().enumerate() {
         let (qr, tr) = (&mut q[l * ql..][..ql], &mut t[l * tl..][..tl]);
-        qr[..j.query.len()].copy_from_slice(j.query);
+        for (d, &b) in qr.iter_mut().zip(j.query) {
+            *d = enc_q(b);
+        }
         qr[j.query.len()..ksw_padded_qlen(j.query.len(), max_sc)].fill(ZPAD);
         for (d, &b) in tr.iter_mut().zip(j.target) {
-            *d = enc(b);
+            *d = enc_t(b);
         }
     }
     (transpose16(&q, lanes, ql), transpose16(&t, lanes, tl))
@@ -3471,22 +3572,15 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
     }
     let score_tbl = _mm256_loadu_si256(tbl.as_ptr() as *const __m256i);
     let bias_v = _mm256_set1_epi8(bias as i8);
-    // `MAT5` (`--meth`'s matrices, `mat5_u8_ok`): the 5x5 matrix at `5 t + q` (`seq_t` holds
-    // `5 t`, N as 20), as its low 16 entries and `low ^ high`; see `score_diag`. Every cell lies in
-    // `[mat[1], mat[0]]`, a signed byte added straight to the `H - 128` domain.
-    let (score_tbl, score_hi) = if MAT5 {
-        let mut t5 = [0u8; 32];
-        for (e, &v) in t5.iter_mut().zip(&mat[..25]) {
-            *e = v as u8;
-        }
-        let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
-        let hi = _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i);
-        (
-            _mm256_broadcastsi128_si256(lo),
-            _mm256_broadcastsi128_si256(_mm_xor_si128(lo, hi)),
-        )
+    // `MAT5` (`--meth`'s matrices, `mat5_u8_ok`): one lookup at `(t + q) & 15` through
+    // `mat5_add_code` (which the dispatch checked exists), `seq_t` / `seq_q` holding its codes.
+    // Every cell lies in `[mat[1], mat[0]]`, a signed byte added straight to the `H - 128` domain.
+    let (score_tbl, enc_t, enc_q) = if MAT5 {
+        let (t, q, t16) = mat5_add_code(mat).expect("the dispatch checks mat5_add_code");
+        let lo = _mm_loadu_si128(t16.as_ptr() as *const __m128i);
+        (_mm256_broadcastsi128_si256(lo), t, q)
     } else {
-        (score_tbl, zero)
+        (score_tbl, [0, 1, 2, 3, N_TARGET], [0, 1, 2, 3, 4])
     };
     // `vpshufb` zeroes a lane whose index has bit 7 set and otherwise reads `tbl[idx & 15]`, where
     // `vqtbl1q_u8` zeroes every index >= 16. They differ only on indices 16..127, and that range is
@@ -3500,27 +3594,21 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
     #[inline]
     unsafe fn score_diag<const M5: bool>(
         tbl: __m256i,
-        hi: __m256i,
         _bias_v: __m256i,
         t_v: __m256i,
         q_v: __m256i,
         d: __m256i,
     ) -> __m256i {
-        // `M5`: `i = 5 t + q <= 24` in every cell a live lane keeps; `i - 16` has bit 7 set, and the
-        // high shuffle reads 0, for every `i < 16`. Plain (wrapping) adds, not saturating ones,
-        // which are p0-only at 512 bits on Golden Cove: a `PAD` row is past the lane's target
-        // (`finish_row` and `extract_group` stop at `tlen`) and a `ZPAD` / `PAD` column is
-        // overridden by the pad blend, so what they read does not matter.
-        let s = if M5 {
-            let i = _mm256_add_epi8(t_v, q_v);
-            _mm256_xor_si256(
-                _mm256_shuffle_epi8(tbl, i),
-                _mm256_shuffle_epi8(hi, _mm256_sub_epi8(i, _mm256_set1_epi8(16))),
-            )
+        // `M5`: `t + q < 32` in every cell a live lane keeps, so bit 7 is clear and `vpshufb`
+        // reads slot `(t + q) & 15`. A `PAD` row is past the lane's target (`finish_row` and
+        // `extract_group` stop at `tlen`) and a `ZPAD` / `PAD` column is overridden by the pad
+        // blend, so what they read does not matter.
+        let i = if M5 {
+            _mm256_add_epi8(t_v, q_v)
         } else {
-            _mm256_shuffle_epi8(tbl, _mm256_xor_si256(t_v, q_v))
+            _mm256_xor_si256(t_v, q_v)
         };
-        _mm256_adds_epi8(d, s)
+        _mm256_adds_epi8(d, _mm256_shuffle_epi8(tbl, i))
     }
     let one_v = _mm256_set1_epi8(1); // N penalty
     let zpad_v = _mm256_set1_epi8(ZPAD as i8);
@@ -3542,17 +3630,17 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
             continue;
         }
 
-        // The N re-encoding (or `MAT5`'s `5 t`), applied once per target base so the column loops
+        // The N re-encoding (or `MAT5`'s add code), applied once per base so the column loops
         // never pay for it (issues #43, #44).
-        let (seq_q, seq_t) = soa_group(group, LANES32, qmax, tmax, max_sc, |b| {
-            if MAT5 {
-                5 * b
-            } else if b == 4 {
-                N_TARGET
-            } else {
-                b
-            }
-        });
+        let (seq_q, seq_t) = soa_group(
+            group,
+            LANES32,
+            qmax,
+            tmax,
+            max_sc,
+            |b| enc_t[b as usize],
+            |b| enc_q[b as usize],
+        );
         let (mut qlen, mut tlen, mut minsc, mut endsc) = (
             [0usize; LANES32],
             [0usize; LANES32],
@@ -3699,7 +3787,7 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                 for j in 0..n_fast {
                     let q_v = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
 
-                    let diag0 = score_diag::<MAT5>(score_tbl, score_hi, bias_v, t0_v, q_v, d0);
+                    let diag0 = score_diag::<MAT5>(score_tbl, bias_v, t0_v, q_v, d0);
                     let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES32) as *const __m256i);
                     let mfe0 = _mm256_max_epi8(diag0, e_v);
                     let h0 = _mm256_max_epi8(mfe0, f0);
@@ -3720,7 +3808,7 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                     );
                     d0 = _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES32) as *const __m256i);
 
-                    let diag1 = score_diag::<MAT5>(score_tbl, score_hi, bias_v, t1_v, q_v, d1);
+                    let diag1 = score_diag::<MAT5>(score_tbl, bias_v, t1_v, q_v, d1);
                     let mfe1 = _mm256_max_epi8(diag1, e_mid);
                     let h1 = _mm256_max_epi8(mfe1, f1);
                     col1 = bsl(_mm256_cmpgt_epi8(h1, imax1), j_v, col1);
@@ -3752,7 +3840,7 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                     // instruction instead of three (issue #43).
                     let q_pad = _mm256_cmpgt_epi8(zero, q_v);
 
-                    let mut diag0 = score_diag::<MAT5>(score_tbl, score_hi, bias_v, t0_v, q_v, d0);
+                    let mut diag0 = score_diag::<MAT5>(score_tbl, bias_v, t0_v, q_v, d0);
                     diag0 = bsl(zpad_mask, d0, diag0);
                     diag0 = bsl(
                         _mm256_or_si256(_mm256_cmpgt_epi8(zero, t0_v), q_pad),
@@ -3778,7 +3866,7 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                     );
                     d0 = _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES32) as *const __m256i);
 
-                    let mut diag1 = score_diag::<MAT5>(score_tbl, score_hi, bias_v, t1_v, q_v, d1);
+                    let mut diag1 = score_diag::<MAT5>(score_tbl, bias_v, t1_v, q_v, d1);
                     diag1 = bsl(zpad_mask, d1, diag1);
                     diag1 = bsl(
                         _mm256_or_si256(_mm256_cmpgt_epi8(zero, t1_v), q_pad),
@@ -3876,8 +3964,7 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                 // kernel, including why a dead target row may be left un-killed here.
                 for j in 0..n_fast {
                     let q_v = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
-                    let diag_v =
-                        score_diag::<MAT5>(score_tbl, score_hi, bias_v, t_v, q_v, h_diag_v);
+                    let diag_v = score_diag::<MAT5>(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES32) as *const __m256i);
                     let mfe = _mm256_max_epi8(diag_v, e_v);
                     let h_v = _mm256_max_epi8(mfe, f_v);
@@ -3914,8 +4001,7 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                     let zpad_mask = _mm256_cmpeq_epi8(q_v, zpad_v);
                     let pad_mask =
                         _mm256_or_si256(_mm256_cmpgt_epi8(zero, t_v), _mm256_cmpgt_epi8(zero, q_v));
-                    let mut diag_v =
-                        score_diag::<MAT5>(score_tbl, score_hi, bias_v, t_v, q_v, h_diag_v);
+                    let mut diag_v = score_diag::<MAT5>(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     diag_v = bsl(zpad_mask, h_diag_v, diag_v); // score 0: diagonal passes through
                                                                // Dead padding: force 0 outright, as in the NEON u8 kernel.
                     diag_v = bsl(pad_mask, hz, diag_v);
@@ -4438,19 +4524,14 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
     }
     let score_tbl = _mm_loadu_si128(tbl.as_ptr() as *const __m128i);
     let bias_v = _mm_set1_epi8(bias as i8);
-    // `MAT5` (`--meth`'s matrices, `mat5_u8_ok`): the 5x5 matrix at `5 t + q` (`seq_t` holds
-    // `5 t`, N as 20), as its low 16 entries and `low ^ high`; see `score_diag`. Every cell lies in
-    // `[mat[1], mat[0]]`, a signed byte added straight to the `H - 128` domain.
-    let (score_tbl, score_hi) = if MAT5 {
-        let mut t5 = [0u8; 32];
-        for (e, &v) in t5.iter_mut().zip(&mat[..25]) {
-            *e = v as u8;
-        }
-        let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
-        let hi = _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i);
-        (lo, _mm_xor_si128(lo, hi))
+    // `MAT5` (`--meth`'s matrices, `mat5_u8_ok`): one lookup at `(t + q) & 15` through
+    // `mat5_add_code` (which the dispatch checked exists), `seq_t` / `seq_q` holding its codes.
+    // Every cell lies in `[mat[1], mat[0]]`, a signed byte added straight to the `H - 128` domain.
+    let (score_tbl, enc_t, enc_q) = if MAT5 {
+        let (t, q, t16) = mat5_add_code(mat).expect("the dispatch checks mat5_add_code");
+        (_mm_loadu_si128(t16.as_ptr() as *const __m128i), t, q)
     } else {
-        (score_tbl, zero)
+        (score_tbl, [0, 1, 2, 3, N_TARGET], [0, 1, 2, 3, 4])
     };
     // `vpshufb` zeroes a lane whose index has bit 7 set and otherwise reads `tbl[idx & 15]`, where
     // `vqtbl1q_u8` zeroes every index >= 16. They differ only on indices 16..127, and that range is
@@ -4464,27 +4545,18 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
     #[inline]
     unsafe fn score_diag<const M5: bool>(
         tbl: __m128i,
-        hi: __m128i,
         _bias_v: __m128i,
         t_v: __m128i,
         q_v: __m128i,
         d: __m128i,
     ) -> __m128i {
-        // `M5`: `i = 5 t + q <= 24` in every cell a live lane keeps; `i - 16` has bit 7 set, and the
-        // high shuffle reads 0, for every `i < 16`. Plain (wrapping) adds, not saturating ones,
-        // which are p0-only at 512 bits on Golden Cove: a `PAD` row is past the lane's target
-        // (`finish_row` and `extract_group` stop at `tlen`) and a `ZPAD` / `PAD` column is
-        // overridden by the pad blend, so what they read does not matter.
-        let s = if M5 {
-            let i = _mm_add_epi8(t_v, q_v);
-            _mm_xor_si128(
-                _mm_shuffle_epi8(tbl, i),
-                _mm_shuffle_epi8(hi, _mm_sub_epi8(i, _mm_set1_epi8(16))),
-            )
+        // `M5`: the add code's slot `(t + q) & 15`; see the AVX2 kernel's `score_diag`.
+        let i = if M5 {
+            _mm_add_epi8(t_v, q_v)
         } else {
-            _mm_shuffle_epi8(tbl, _mm_xor_si128(t_v, q_v))
+            _mm_xor_si128(t_v, q_v)
         };
-        _mm_adds_epi8(d, s)
+        _mm_adds_epi8(d, _mm_shuffle_epi8(tbl, i))
     }
     let one_v = _mm_set1_epi8(1); // N penalty
     let zpad_v = _mm_set1_epi8(ZPAD as i8);
@@ -4520,21 +4592,15 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
             minsc[l] = j.minsc;
             endsc[l] = j.endsc;
             for (c, &b) in j.query.iter().enumerate() {
-                seq_q[c * LANES16 + l] = b;
+                seq_q[c * LANES16 + l] = enc_q[b as usize];
             }
             for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
                 seq_q[c * LANES16 + l] = ZPAD;
             }
-            // The N re-encoding, applied once per target base so the column loops never pay for
-            // it (issue #43). See `fwd_local_sw_neon_u8`'s score-table comment.
+            // The N re-encoding (or `MAT5`'s add code), applied once per base so the column loops
+            // never pay for it (issue #43). See `fwd_local_sw_neon_u8`'s score-table comment.
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES16 + l] = if MAT5 {
-                    5 * b
-                } else if b == 4 {
-                    N_TARGET
-                } else {
-                    b
-                };
+                seq_t[r * LANES16 + l] = enc_t[b as usize];
             }
         }
 
@@ -4630,7 +4696,7 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
                 for j in 0..n_fast {
                     let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
 
-                    let diag0 = score_diag::<MAT5>(score_tbl, score_hi, bias_v, t0_v, q_v, d0);
+                    let diag0 = score_diag::<MAT5>(score_tbl, bias_v, t0_v, q_v, d0);
                     let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
                     let mfe0 = _mm_max_epi8(diag0, e_v);
                     let h0 = _mm_max_epi8(mfe0, f0);
@@ -4649,7 +4715,7 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
                     );
                     d0 = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES16) as *const __m128i);
 
-                    let diag1 = score_diag::<MAT5>(score_tbl, score_hi, bias_v, t1_v, q_v, d1);
+                    let diag1 = score_diag::<MAT5>(score_tbl, bias_v, t1_v, q_v, d1);
                     let mfe1 = _mm_max_epi8(diag1, e_mid);
                     let h1 = _mm_max_epi8(mfe1, f1);
                     col1 = bsl(_mm_cmpgt_epi8(h1, imax1), j_v, col1);
@@ -4678,7 +4744,7 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
                     // instruction instead of three (issue #43).
                     let q_pad = _mm_cmpgt_epi8(zero, q_v);
 
-                    let mut diag0 = score_diag::<MAT5>(score_tbl, score_hi, bias_v, t0_v, q_v, d0);
+                    let mut diag0 = score_diag::<MAT5>(score_tbl, bias_v, t0_v, q_v, d0);
                     diag0 = bsl(zpad_mask, d0, diag0);
                     diag0 = bsl(_mm_or_si128(_mm_cmpgt_epi8(zero, t0_v), q_pad), hz, diag0);
                     let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
@@ -4698,7 +4764,7 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
                     );
                     d0 = _mm_loadu_si128(h_prev.as_ptr().add(j * LANES16) as *const __m128i);
 
-                    let mut diag1 = score_diag::<MAT5>(score_tbl, score_hi, bias_v, t1_v, q_v, d1);
+                    let mut diag1 = score_diag::<MAT5>(score_tbl, bias_v, t1_v, q_v, d1);
                     diag1 = bsl(zpad_mask, d1, diag1);
                     diag1 = bsl(_mm_or_si128(_mm_cmpgt_epi8(zero, t1_v), q_pad), hz, diag1);
                     let mfe1 = _mm_max_epi8(diag1, e_mid);
@@ -4743,8 +4809,7 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
                 // kernel, including why a dead target row may be left un-killed here.
                 for j in 0..n_fast {
                     let q_v = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
-                    let diag_v =
-                        score_diag::<MAT5>(score_tbl, score_hi, bias_v, t_v, q_v, h_diag_v);
+                    let diag_v = score_diag::<MAT5>(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES16) as *const __m128i);
                     let mfe = _mm_max_epi8(diag_v, e_v);
                     let h_v = _mm_max_epi8(mfe, f_v);
@@ -4778,8 +4843,7 @@ unsafe fn fwd_local_sw_sse41_u8_impl<const MAT5: bool, const SHARE: bool>(
                     let zpad_mask = _mm_cmpeq_epi8(q_v, zpad_v);
                     let pad_mask =
                         _mm_or_si128(_mm_cmpgt_epi8(zero, t_v), _mm_cmpgt_epi8(zero, q_v));
-                    let mut diag_v =
-                        score_diag::<MAT5>(score_tbl, score_hi, bias_v, t_v, q_v, h_diag_v);
+                    let mut diag_v = score_diag::<MAT5>(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     diag_v = bsl(zpad_mask, h_diag_v, diag_v); // score 0: diagonal passes through
                                                                // Dead padding: force 0 outright, as in the NEON u8 kernel.
                     diag_v = bsl(pad_mask, hz, diag_v);
@@ -5223,29 +5287,23 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
     }
     let score_tbl = _mm512_broadcast_i32x4(_mm_loadu_si128(tbl.as_ptr() as *const __m128i));
     let bias_v = _mm512_set1_epi8(bias as i8);
-    // `MAT5` (`--meth`'s matrices, `mat5_u8_ok`): the 5x5 matrix at `5 t + q` (`seq_t` holds
-    // `5 t`, N as 20), as its low 16 entries and `low ^ high`; see `score_diag`. Every cell lies in
+    // `MAT5` (`--meth`'s matrices, `mat5_u8_ok`): with VBMI the whole 5x5 matrix is one 64-byte
+    // `vpermb` table at `5 t + q` (`seq_t` holds `5 t`, N as 20); without it, one `vpshufb` at
+    // `(t + q) & 15` through `mat5_add_code`, as in the AVX2 kernel. Every cell lies in
     // `[mat[1], mat[0]]`, a signed byte added straight to the `H - 128` domain.
-    let (score_tbl, score_hi) = if MAT5 && VBMI {
-        // With VBMI the whole 5x5 matrix is one 64-byte `vpermb` table at `5 t + q`.
+    let (score_tbl, enc_t, enc_q) = if MAT5 && VBMI {
         let mut t64 = [0u8; 64];
         for (e, &v) in t64.iter_mut().zip(&mat[..25]) {
             *e = v as u8;
         }
-        (_mm512_loadu_si512(t64.as_ptr() as *const __m512i), zero)
+        let t64 = _mm512_loadu_si512(t64.as_ptr() as *const __m512i);
+        (t64, [0, 5, 10, 15, 20], [0, 1, 2, 3, 4])
     } else if MAT5 {
-        let mut t5 = [0u8; 32];
-        for (e, &v) in t5.iter_mut().zip(&mat[..25]) {
-            *e = v as u8;
-        }
-        let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
-        let hi = _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i);
-        (
-            _mm512_broadcast_i32x4(lo),
-            _mm512_broadcast_i32x4(_mm_xor_si128(lo, hi)),
-        )
+        let (t, q, t16) = mat5_add_code(mat).expect("the dispatch checks mat5_add_code");
+        let lo = _mm_loadu_si128(t16.as_ptr() as *const __m128i);
+        (_mm512_broadcast_i32x4(lo), t, q)
     } else {
-        (score_tbl, zero)
+        (score_tbl, [0, 1, 2, 3, N_TARGET], [0, 1, 2, 3, 4])
     };
     // The `vpshufb` / `vqtbl1q_u8` reachable-index argument is the one spelled out in
     // `fwd_local_sw_avx2_u8`; the encoding and therefore the argument are the same.
@@ -5253,19 +5311,18 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
     #[inline]
     unsafe fn score_diag<const M5: bool, const VB: bool>(
         tbl: __m512i,
-        hi: __m512i,
         _bias_v: __m512i,
         t_v: __m512i,
         q_v: __m512i,
         d: __m512i,
     ) -> __m512i {
-        // `M5`: `i = 5 t + q <= 24` in every cell a live lane keeps; `i - 16` has bit 7 set, and the
-        // high shuffle reads 0, for every `i < 16`. Plain (wrapping) adds, not saturating ones,
-        // which are p0-only at 512 bits on Golden Cove: a `PAD` row is past the lane's target
-        // (`finish_row` and `extract_group` stop at `tlen`) and a `ZPAD` / `PAD` column is
-        // overridden by the pad blend, so what they read does not matter.
+        // `M5`: `i = 5 t + q <= 24` (VBMI) or the add code's `t + q < 32` in every cell a live lane
+        // keeps. Plain (wrapping) adds, not saturating ones, which are p0-only at 512 bits on Golden
+        // Cove: a `PAD` row is past the lane's target (`finish_row` and `extract_group` stop at
+        // `tlen`) and a `ZPAD` / `PAD` column is overridden by the pad blend, so what they read
+        // does not matter.
         let s = if M5 && VB {
-            // `vpermb` reads `i & 63`; `i` as above.
+            // `vpermb` reads `i & 63`.
             let i = _mm512_add_epi8(t_v, q_v);
             let s: __m512i;
             // SAFETY: the caller dispatched `VBMI` only where `avx512vbmi` was detected. Inline
@@ -5275,11 +5332,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                  t = in(zmm_reg) tbl, options(pure, nomem, nostack));
             s
         } else if M5 {
-            let i = _mm512_add_epi8(t_v, q_v);
-            _mm512_xor_si512(
-                _mm512_shuffle_epi8(tbl, i),
-                _mm512_shuffle_epi8(hi, _mm512_sub_epi8(i, _mm512_set1_epi8(16))),
-            )
+            _mm512_shuffle_epi8(tbl, _mm512_add_epi8(t_v, q_v))
         } else {
             _mm512_shuffle_epi8(tbl, _mm512_xor_si512(t_v, q_v))
         };
@@ -5303,17 +5356,17 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
             continue;
         }
 
-        // The N re-encoding (or `MAT5`'s `5 t`), applied once per target base so the column loops
-        // never pay for it (issues #43, #44).
-        let (seq_q, seq_t) = soa_group(group, LANES64, qmax, tmax, max_sc, |b| {
-            if MAT5 {
-                5 * b
-            } else if b == 4 {
-                N_TARGET
-            } else {
-                b
-            }
-        });
+        // The N re-encoding (or `MAT5`'s codes), applied once per base so the column loops never
+        // pay for it (issues #43, #44).
+        let (seq_q, seq_t) = soa_group(
+            group,
+            LANES64,
+            qmax,
+            tmax,
+            max_sc,
+            |b| enc_t[b as usize],
+            |b| enc_q[b as usize],
+        );
         let (mut qlen, mut tlen, mut minsc, mut endsc) = (
             [0usize; LANES64],
             [0usize; LANES64],
@@ -5482,8 +5535,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                 for j in 0..n_fast {
                     let q_v = _mm512_loadu_si512(seq_q.as_ptr().add(j * LANES64) as *const __m512i);
 
-                    let diag0 =
-                        score_diag::<MAT5, VBMI>(score_tbl, score_hi, bias_v, t0_v, q_v, d0);
+                    let diag0 = score_diag::<MAT5, VBMI>(score_tbl, bias_v, t0_v, q_v, d0);
                     let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES64) as *const __m512i);
                     let mfe0 = _mm512_max_epi8(diag0, e_v);
                     let h0 = _mm512_max_epi8(mfe0, f0);
@@ -5505,8 +5557,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     // Row i's H, into the slot its diagonal just left (read by `finish_row`).
                     _mm512_storeu_si512(h_prev.as_mut_ptr().add(j * LANES64) as *mut __m512i, h0);
 
-                    let diag1 =
-                        score_diag::<MAT5, VBMI>(score_tbl, score_hi, bias_v, t1_v, q_v, d1);
+                    let diag1 = score_diag::<MAT5, VBMI>(score_tbl, bias_v, t1_v, q_v, d1);
                     let mfe1 = _mm512_max_epi8(diag1, e_mid);
                     let h1 = _mm512_max_epi8(mfe1, f1);
                     imax1 = _mm512_max_epi8(imax1, h1);
@@ -5545,8 +5596,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     // `q > ZPAD` is true only for `PAD`, so the high-bit test is the same mask.
                     let q_pad = _mm512_movepi8_mask(q_v);
 
-                    let mut diag0 =
-                        score_diag::<MAT5, VBMI>(score_tbl, score_hi, bias_v, t0_v, q_v, d0);
+                    let mut diag0 = score_diag::<MAT5, VBMI>(score_tbl, bias_v, t0_v, q_v, d0);
                     diag0 = _mm512_mask_blend_epi8(zpad_mask, diag0, d0);
                     diag0 = _mm512_mask_blend_epi8(_mm512_movepi8_mask(t0_v) | q_pad, diag0, hz);
                     let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES64) as *const __m512i);
@@ -5569,8 +5619,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     // Row i's H, into the slot its diagonal just left (read by `finish_row`).
                     _mm512_storeu_si512(h_prev.as_mut_ptr().add(j * LANES64) as *mut __m512i, h0);
 
-                    let mut diag1 =
-                        score_diag::<MAT5, VBMI>(score_tbl, score_hi, bias_v, t1_v, q_v, d1);
+                    let mut diag1 = score_diag::<MAT5, VBMI>(score_tbl, bias_v, t1_v, q_v, d1);
                     diag1 = _mm512_mask_blend_epi8(zpad_mask, diag1, d1);
                     diag1 = _mm512_mask_blend_epi8(_mm512_movepi8_mask(t1_v) | q_pad, diag1, hz);
                     let mfe1 = _mm512_max_epi8(diag1, e_mid);
@@ -5681,8 +5730,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                 // Padding-free column range, same argument as every other kernel here.
                 for j in 0..n_fast {
                     let q_v = _mm512_loadu_si512(seq_q.as_ptr().add(j * LANES64) as *const __m512i);
-                    let diag_v =
-                        score_diag::<MAT5, VBMI>(score_tbl, score_hi, bias_v, t_v, q_v, h_diag_v);
+                    let diag_v = score_diag::<MAT5, VBMI>(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES64) as *const __m512i);
                     let mfe = _mm512_max_epi8(diag_v, e_v);
                     let h_v = _mm512_max_epi8(mfe, f_v);
@@ -5722,7 +5770,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     // `q > ZPAD`.
                     let pad_mask = _mm512_movepi8_mask(t_v) | _mm512_movepi8_mask(q_v);
                     let mut diag_v =
-                        score_diag::<MAT5, VBMI>(score_tbl, score_hi, bias_v, t_v, q_v, h_diag_v);
+                        score_diag::<MAT5, VBMI>(score_tbl, bias_v, t_v, q_v, h_diag_v);
                     diag_v = _mm512_mask_blend_epi8(zpad_mask, diag_v, h_diag_v);
                     diag_v = _mm512_mask_blend_epi8(pad_mask, diag_v, hz);
 
@@ -7076,6 +7124,34 @@ mod tests {
         }
     }
 
+    /// Every `--meth` matrix (`MethOpt::fill_mats` at `-A 1..=10`, `-B 1..=20`: OT and OB, neutral,
+    /// genomic and collapsed) has an add code, and the code gives back every cell.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn mat5_add_code_covers_meth_matrices() {
+        for a in 1..=10i8 {
+            for b in 1..=20i8 {
+                for (r, q) in [(1usize, 3usize), (2, 0)] {
+                    for (v, mirror) in [(0, false), (a, false), (a, true)] {
+                        let mut mat = scmat(a, b);
+                        mat[r * 5 + q] = v;
+                        if mirror {
+                            mat[q * 5 + r] = a;
+                        }
+                        let (t, qc, tbl) = mat5_add_code(&mat)
+                            .unwrap_or_else(|| panic!("no add code: a {a} b {b} cell {r}{q} {v}"));
+                        assert!(t.iter().chain(&qc).all(|&c| c < 16) && !qc.contains(&ZPAD));
+                        for x in 0..5 {
+                            for y in 0..5 {
+                                assert_eq!(tbl[((t[x] + qc[y]) & 15) as usize], mat[5 * x + y]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// The 16x16 block transpose against the plain index map, on 3 x 2 blocks: each byte's index
     /// goes through as its low and its high byte, so every position is told apart.
     #[test]
@@ -7093,10 +7169,22 @@ mod tests {
         }
     }
 
-    /// `n` jobs of one query length `qlen` and ragged windows (290 bp and up), each query planted
-    /// at the very end of its window, so the best alignment ends on the last real row and its H
-    /// then walks diagonally through the padded columns. The shape of the all-ZPAD column regime.
-    fn uniform_qlen_jobs(qlen: usize, n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    /// `n` jobs `(query, target, minsc)` of one query length `qlen` and ragged windows (290 bp and
+    /// up), each query planted at the very end of its window, so the best alignment ends on the last
+    /// real row and its H then walks diagonally through the padded columns. The shape of the all-ZPAD
+    /// column regime.
+    ///
+    /// The even jobs are the case where that walk decides `score2`, at `minsc` 10 and with an N-free
+    /// query (so `score` is `qlen`): the query's last 14 bases end on the last row `score2` excludes
+    /// below `te`, `te + qlen`. The padded columns carry that 14 down the next rows, and bwa's
+    /// candidate list keeps a plateau's first row, so the carry starts a new candidate two rows
+    /// down, just past the excluded rows, and it is `score2`. A kernel that drops or misplaces the
+    /// carry has no candidate there (the deletion path, 14 - 7, misses `minsc`). Those two rows
+    /// end the window, and the windows are `200 + 90 k` plus 0 to 3, so they fall on every row of
+    /// a NEON quad or an x86 pair, and the longest lane of a group puts them in the row-pair and
+    /// single-row tails too (NEON's groups of 16 end 1 and 2 rows past a quad, the x86 groups of 32
+    /// and 64 on odd rows).
+    fn uniform_qlen_jobs(qlen: usize, n: usize) -> Vec<(Vec<u8>, Vec<u8>, i32)> {
         let mut state = 0xfeed_face_1234_5678u64;
         let mut next = move || {
             state = state
@@ -7104,16 +7192,43 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             state >> 33
         };
-        let (mut qbufs, mut tbufs) = (Vec::new(), Vec::new());
+        let mut jobs = Vec::new();
         for k in 1..=n {
-            let tlen = 200 + k * 90;
+            let tlen = 200 + k * 90 + (k / 2 + k / 16 + k / 64) % 4;
             let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
-            let q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
-            t[tlen - qlen..].copy_from_slice(&q);
-            qbufs.push(q);
-            tbufs.push(t);
+            let q: Vec<u8> = (0..qlen)
+                .map(|_| (next() % (4 + k as u64 % 2)) as u8)
+                .collect();
+            let minsc = if k % 2 == 0 {
+                // Main alignment, `qlen - 14` random rows, the stray 14, the two carry rows.
+                let te = tlen - 3 - qlen;
+                t[te + 1 - qlen..=te].copy_from_slice(&q);
+                t[te + qlen - 13..te + qlen + 1].copy_from_slice(&q[qlen - 14..]);
+                10
+            } else {
+                t[tlen - qlen..].copy_from_slice(&q);
+                19
+            };
+            jobs.push((q, t, minsc));
         }
-        (qbufs, tbufs)
+        jobs
+    }
+
+    /// The even jobs of `uniform_qlen_jobs` whose `score2` is the pad carry's, at `te + qlen + 2`.
+    /// Shows the test still reaches the carry.
+    fn pad_carry_decided(
+        bufs: &[(Vec<u8>, Vec<u8>, i32)],
+        want: &[(i32, i32, i32, i32, i32)],
+    ) -> usize {
+        bufs.iter()
+            .zip(want)
+            .filter(|((q, _, minsc), w)| {
+                *minsc == 10
+                    && w.0 == q.len() as i32
+                    && w.3 >= 14
+                    && w.4 == w.1 + q.len() as i32 + 2
+            })
+            .count()
     }
 
     /// The all-ZPAD third column regime of the AVX2 and AVX-512 u8 kernels' two-row body, on the
@@ -7125,7 +7240,7 @@ mod tests {
         let max_sc = 1i32;
         const QLEN: usize = 147;
         assert_eq!(ksw_padded_qlen(QLEN, max_sc), 160);
-        let (qbufs, tbufs) = uniform_qlen_jobs(QLEN, 128);
+        let bufs = uniform_qlen_jobs(QLEN, 128);
         for (&(o_del, e_del, o_ins, e_ins), meth) in [(6, 1, 6, 1), (5, 2, 7, 3)]
             .iter()
             .flat_map(|g| [(g, false), (g, true)])
@@ -7134,20 +7249,27 @@ mod tests {
             if meth {
                 mat[5 + 3] = 0;
             }
-            let jobs: Vec<FwdJob> = qbufs
+            let jobs: Vec<FwdJob> = bufs
                 .iter()
-                .zip(tbufs.iter())
-                .map(|(q, t)| FwdJob {
+                .map(|(q, t, minsc)| FwdJob {
                     query: q.as_slice(),
                     target: t.as_slice(),
-                    minsc: 19,
-                    endsc: if t.len() % 180 == 0 { 120 } else { i32::MAX },
+                    minsc: *minsc,
+                    endsc: if t.len() / 90 % 3 == 0 { 120 } else { i32::MAX },
                 })
                 .collect();
             let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
             assert!(
                 want.iter().filter(|r| r.3 >= 0).count() >= 8,
                 "score2 unpopulated"
+            );
+            assert!(
+                pad_carry_decided(&bufs, &want) >= 30,
+                "the pad carry decides no score2"
+            );
+            assert!(
+                want.iter().any(|r| r.0 >= 120 && r.0 < QLEN as i32),
+                "endsc never froze a job"
             );
             if std::arch::is_x86_feature_detected!("avx2") {
                 // SAFETY: AVX2 just detected; 147 bp queries keep the u8 ceiling under 250.
@@ -7203,19 +7325,22 @@ mod tests {
         const QLEN: usize = 147;
         assert_eq!(ksw_padded_qlen(QLEN, max_sc), 160);
 
-        let (qbufs, tbufs) = uniform_qlen_jobs(QLEN, 32);
-        let jobs: Vec<FwdJob> = qbufs
+        let bufs = uniform_qlen_jobs(QLEN, 32);
+        let jobs: Vec<FwdJob> = bufs
             .iter()
-            .zip(tbufs.iter())
-            .map(|(q, t)| FwdJob {
+            .map(|(q, t, minsc)| FwdJob {
                 query: q.as_slice(),
                 target: t.as_slice(),
-                minsc: 19,
+                minsc: *minsc,
                 endsc: i32::MAX,
             })
             .collect();
 
         let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+        assert!(
+            pad_carry_decided(&bufs, &want) >= 10,
+            "the pad carry decides no score2"
+        );
         // SAFETY: neon detected above; 147 bp queries and a score ceiling of 147 both under 250;
         // `scmat` is standard.
         let got = unsafe {
