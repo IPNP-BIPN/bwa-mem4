@@ -190,7 +190,8 @@ reach those kernels in three ways:
   NEON, two `PSHUFB` on SSE4.1, AVX2 and AVX-512.
 - **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
   also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
-  cell scores at most the match score, so the bound holds.
+  cell scores at most the match score, so the bound holds. The relation count is scalar, so x86
+  skips it: there the full 32- or 64-lane SW is cheaper than counting.
 
 A seed that scores 0 or less under the read's matrix (a pair it matched only in converted space)
 extends on the scalar kernel, as in bwa-mem3.
