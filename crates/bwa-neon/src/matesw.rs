@@ -785,11 +785,7 @@ pub(crate) fn batched_align(
         let decision = match prune {
             None => None,
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-            Some(p)
-                if band_ok
-                    && j.query.len().min(j.target.len()) as i32 * max_sc < U8_SCORE_LIMIT
-                    && j.query.len() < U8_SCORE_LIMIT as usize =>
-            {
+            Some(p) if band_ok && u8_job_fits(j.query.len(), j.target.len(), mat, max_sc) => {
                 let quanta = ksw_padded_qlen(j.query.len(), max_sc);
                 let (d, t1) = band.decide(j.target, j.query, &p, prune_max_hits(), rel);
                 if let Some((hb, n)) = kept(&d, j.target.len()) {
@@ -1440,6 +1436,17 @@ fn ksw_padded_qlen(qlen: usize, max_sc: i32) -> usize {
     qlen.div_ceil(lanes) * lanes
 }
 
+/// Whether a job of these lengths runs on the u8 rescue kernels (with [`u8_table_has_headroom`]):
+/// every cell under the score ceiling `min(qlen, tlen) * max_sc`, plus the biased table add's
+/// `mispen + mtch`, fits a byte, and the padded query's columns are at most 256. The fork's
+/// `matesw_use_u8` bound (`l a + shift <= 254`); at bwa's scores it admits the 250 bp mate the
+/// historical `ceiling < 250` sent to i16. Which kernel runs never moves the bytes; the padding
+/// stays [`ksw_padded_qlen`]'s, bwa's own.
+fn u8_job_fits(qlen: usize, tlen: usize, mat: &[i8], max_sc: i32) -> bool {
+    let ceiling = qlen.min(tlen) as i32 * max_sc;
+    ceiling - i32::from(mat[1]) + i32::from(mat[0]) <= 255 && ksw_padded_qlen(qlen, max_sc) <= 256
+}
+
 /// Batched forward local-SW pass: `out[i] = (score, te, qe, score2, te2)` for `jobs[i]`, each equal to
 /// [`ksw_local_fwd`]. Dispatches to the NEON i16 kernel where available, else the scalar lockstep.
 ///
@@ -1542,31 +1549,33 @@ pub(crate) fn fwd_local_sw_batch(
             let score_ceiling = |j: &FwdJob| j.query.len().min(j.target.len()) as i32 * max_sc;
             // u8 also holds the argmax query column, so the query must be < 256 too.
             if u8_table_has_headroom(mat)
-                && jobs.iter().all(|j| {
-                    score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
-                })
+                && jobs
+                    .iter()
+                    .all(|j| u8_job_fits(j.query.len(), j.target.len(), mat, max_sc))
             {
-                // SAFETY: neon detected; every H/E/F cell and query column < 250 fits u8; standard
+                // SAFETY: neon detected; every job passes `u8_job_fits`; standard
                 // mat; and the biased substitution table has byte headroom for it.
                 return unsafe {
                     fwd_local_sw_neon_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                 };
             }
-            if standard
-                && jobs.iter().all(|j| {
-                    score_ceiling(j) < I16_SCORE_LIMIT && j.target.len() < I16_SCORE_LIMIT as usize
-                })
-            {
-                // SAFETY: neon detected; i16 range guaranteed; standard mat.
+            if jobs.iter().all(|j| {
+                score_ceiling(j) < I16_SCORE_LIMIT && j.target.len() < I16_SCORE_LIMIT as usize
+            }) {
+                // SAFETY: neon detected; i16 range guaranteed; standard or MAT5 mat.
                 return unsafe {
-                    fwd_local_sw_neon(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    if standard {
+                        fwd_local_sw_neon::<false>(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    } else {
+                        fwd_local_sw_neon::<true>(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    }
                 };
             }
         }
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // A `--meth` matrix (`mat5_u8_ok`) takes the u8 kernels' `MAT5` form; i16 is standard-only.
+        // A `--meth` matrix (`mat5_u8_ok`) takes the u8 and i16 kernels' `MAT5` form.
         // shortcut: a `MAT5` matrix without an add code (every `--meth` matrix has one) runs scalar,
         // AVX-512 with VBMI included, which would not need it; gate VBMI apart if one ever matters.
         let standard = mat_is_standard(m, mat);
@@ -1581,13 +1590,22 @@ pub(crate) fn fwd_local_sw_batch(
             let fits_u8 = u8_table_has_headroom(mat)
                 && o_del + e_del <= 127
                 && o_ins + e_ins <= 127
-                && jobs.iter().all(|j| {
-                    score_ceiling(j) < U8_SCORE_LIMIT && j.query.len() < U8_SCORE_LIMIT as usize
-                });
-            let fits_i16 = standard
-                && jobs.iter().all(|j| {
-                    score_ceiling(j) < I16_SCORE_LIMIT && j.target.len() < I16_SCORE_LIMIT as usize
-                });
+                && jobs
+                    .iter()
+                    .all(|j| u8_job_fits(j.query.len(), j.target.len(), mat, max_sc));
+            let fits_i16 = jobs.iter().all(|j| {
+                score_ceiling(j) < I16_SCORE_LIMIT && j.target.len() < I16_SCORE_LIMIT as usize
+            });
+            // The i16 kernels' standard or `MAT5` form.
+            macro_rules! i16_kernel {
+                ($k:ident) => {
+                    if standard {
+                        $k::<false>(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    } else {
+                        $k::<true>(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
+                    }
+                };
+            }
             // Prefer the widest legal vector: AVX-512BW (64 u8 / 32 i16 lanes) when the CPU has it,
             // else AVX2 (32 / 16). The width is purely a throughput choice; every kernel is
             // byte-identical, so the only thing the branch decides is how many lanes run at once.
@@ -1616,24 +1634,20 @@ pub(crate) fn fwd_local_sw_batch(
                     };
                 }
                 if fits_i16 {
-                    // SAFETY: AVX-512 BW/VL/DQ detected; i16 range guaranteed; standard mat.
-                    return unsafe {
-                        fwd_local_sw_avx512_i16(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
-                    };
+                    // SAFETY: AVX-512 BW/VL/DQ detected; i16 range guaranteed; standard or MAT5 mat.
+                    return unsafe { i16_kernel!(fwd_local_sw_avx512_i16) };
                 }
             }
             if want_avx2 && std::arch::is_x86_feature_detected!("avx2") {
                 if fits_u8 {
-                    // SAFETY: avx2 detected; every H/E/F cell and query column < 250 fits u8; standard or MAT5 mat.
+                    // SAFETY: avx2 detected; every job passes `u8_job_fits`; standard or MAT5 mat.
                     return unsafe {
                         fwd_local_sw_avx2_u8(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
                     };
                 }
                 if fits_i16 {
-                    // SAFETY: avx2 detected; i16 range guaranteed; standard mat.
-                    return unsafe {
-                        fwd_local_sw_avx2_i16(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
-                    };
+                    // SAFETY: avx2 detected; i16 range guaranteed; standard or MAT5 mat.
+                    return unsafe { i16_kernel!(fwd_local_sw_avx2_i16) };
                 }
             }
             if want_sse41 && std::arch::is_x86_feature_detected!("sse4.1") {
@@ -1644,10 +1658,8 @@ pub(crate) fn fwd_local_sw_batch(
                     };
                 }
                 if fits_i16 {
-                    // SAFETY: sse4.1 detected; i16 range guaranteed; standard mat.
-                    return unsafe {
-                        fwd_local_sw_sse41_i16(jobs, m, mat, o_del, e_del, o_ins, e_ins, max_sc)
-                    };
+                    // SAFETY: sse4.1 detected; i16 range guaranteed; standard or MAT5 mat.
+                    return unsafe { i16_kernel!(fwd_local_sw_sse41_i16) };
                 }
             }
         }
@@ -2187,8 +2199,9 @@ fn extract_group<R: Copy + Into<i32>>(
 
 /// NEON i16x8 forward local-SW. Vectorizes the [`fwd_local_sw_scalar`] control flow across `LANES`
 /// jobs: the inner cell recurrence runs on `int16x8` (one lane per job), the per-row bookkeeping and
-/// [`extract_group`] stay scalar. Requires the standard 5x5 `mat` (checked by the caller) so a cell
-/// score is `match`/`mismatch`/`-1(N)` chosen by compares. Every value must fit i16 (caller-guarded).
+/// [`extract_group`] stay scalar. With the standard 5x5 `mat` a cell score is `match`/`mismatch`/
+/// `-1(N)` chosen by compares; with `MAT5` (a `--meth` matrix, `mat5_u8_ok`) it is `mat[5t + q]`,
+/// one table lookup on the byte codes. Every value must fit i16 (caller-guarded).
 ///
 /// # Parameters
 /// As [`fwd_local_sw_batch`]. Two extra preconditions the caller must have checked, because nothing
@@ -2204,7 +2217,7 @@ fn extract_group<R: Copy + Into<i32>>(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fwd_local_sw_neon(
+unsafe fn fwd_local_sw_neon<const MAT5: bool>(
     jobs: &[FwdJob],
     m: usize,
     mat: &[i8],
@@ -2243,6 +2256,11 @@ unsafe fn fwd_local_sw_neon(
     let oe_del_v = vdupq_n_s16(oe_del as i16);
     let e_ins_v = vdupq_n_s16(e_ins as i16);
     let oe_ins_v = vdupq_n_s16(oe_ins as i16);
+    // `MAT5`: the 25 cells, then zeros; the index `5t + q` of a real pair is under 25, N included.
+    let mut tab = [0i8; 32];
+    tab[..25].copy_from_slice(&mat[..25]);
+    let tbl = int8x16x2_t(vld1q_s8(tab.as_ptr()), vld1q_s8(tab.as_ptr().add(16)));
+    let five = vdup_n_u8(5);
 
     // Group setup is identical to `fwd_local_sw_scalar`; see there for what each variable holds.
     for (group_idx, group) in jobs.chunks(LANES).enumerate() {
@@ -2314,6 +2332,14 @@ unsafe fn fwd_local_sw_neon(
         let load_codes = |buf: &[u8], off: usize| -> int16x8_t {
             vreinterpretq_s16_u16(vmovl_u8(vld1_u8(buf.as_ptr().add(off))))
         };
+        // `MAT5`'s cell score at column `j` from the row's `5t`. ZPAD and PAD index garbage (in the
+        // table or out of it, which reads 0); the tail's selects override both.
+        let mat5_sc = |t5: uint8x8_t, j: usize| -> int16x8_t {
+            vmovl_s8(vqtbl2_s8(
+                tbl,
+                vadd_u8(t5, vld1_u8(seq_q.as_ptr().add(j * LANES))),
+            ))
+        };
 
         // =====================================================================================
         // Main DP, one target row per iteration. Reminder: H = best score ending at this cell,
@@ -2335,16 +2361,20 @@ unsafe fn fwd_local_sw_neon(
                                        // reasons as in `fwd_local_sw_neon_u8`.
             let mut j_v = zero;
             let t_is_n = vceqq_s16(t_v, four_v);
+            let t5 = vmul_u8(vld1_u8(seq_t.as_ptr().add(i * LANES)), five);
 
             // Padding-free column range; see `fwd_local_sw_neon_u8` for why dropping the ZPAD and
             // PAD blends below `n_fast` is exact (no live lane shows either code there, and a dead
             // target row's cells stay inside their own lane, where nothing reads them).
             for j in 0..n_fast {
-                let q_v = load_codes(&seq_q, j * LANES);
-                let eq = vceqq_s16(t_v, q_v);
-                let n_mask = vorrq_u16(t_is_n, vceqq_s16(q_v, four_v));
-                let mut sc = vbslq_s16(eq, mtch_v, mis_v);
-                sc = vbslq_s16(n_mask, n_v, sc);
+                let sc = if MAT5 {
+                    mat5_sc(t5, j)
+                } else {
+                    let q_v = load_codes(&seq_q, j * LANES);
+                    let eq = vceqq_s16(t_v, q_v);
+                    let n_mask = vorrq_u16(t_is_n, vceqq_s16(q_v, four_v));
+                    vbslq_s16(n_mask, n_v, vbslq_s16(eq, mtch_v, mis_v))
+                };
                 let e_v = vld1q_s16(e.as_ptr().add(j * LANES));
                 let mut h_v = vaddq_s16(h_diag_v, sc);
                 h_v = vmaxq_s16(h_v, zero);
@@ -2384,9 +2414,12 @@ unsafe fn fwd_local_sw_neon(
                 let pad_mask = vorrq_u16(vcgeq_s16(t_v, m_v), vcgtq_s16(q_v, zpad_v));
                 // `sc` lane `l` = S(target[i], query[j]) for job `l`, built by four selects in
                 // increasing priority; only the last write to a lane survives.
-                let mut sc = vbslq_s16(eq, mtch_v, mis_v);
-                // Either base is N: fixed -1 in bwa's matrix, not the mismatch penalty.
-                sc = vbslq_s16(n_mask, n_v, sc);
+                let mut sc = if MAT5 {
+                    mat5_sc(t5, j)
+                } else {
+                    // Either base is N: fixed -1 in bwa's matrix, not the mismatch penalty.
+                    vbslq_s16(n_mask, n_v, vbslq_s16(eq, mtch_v, mis_v))
+                };
                 sc = vbslq_s16(zpad_mask, zero, sc); // ksw profile padding scores 0
                 sc = vbslq_s16(pad_mask, dead_v, sc); // dead padding: kill the cell outright
 
@@ -4157,7 +4190,7 @@ const LANES16: usize = 16;
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fwd_local_sw_avx2_i16(
+unsafe fn fwd_local_sw_avx2_i16<const MAT5: bool>(
     jobs: &[FwdJob],
     m: usize,
     mat: &[i8],
@@ -4200,8 +4233,19 @@ unsafe fn fwd_local_sw_avx2_i16(
     let n_v = _mm256_set1_epi16(-1);
     let dead_v = _mm256_set1_epi16(DEAD_CELL_SCORE as i16);
     let four_v = _mm256_set1_epi16(4);
-    let m_v = _mm256_set1_epi16(m as i16);
+    // `MAT5` codes run to 15 (`mat5_add_code`), so the dead tests move above them.
+    let m_v = _mm256_set1_epi16(if MAT5 { 16 } else { m as i16 });
     let zpad_v = _mm256_set1_epi16(ZPAD as i16);
+    let qdead_v = _mm256_set1_epi16(if MAT5 { 15 } else { ZPAD as i16 });
+    // `MAT5` (a `--meth` matrix): the cell score is one `pshufb` at `(t + q) & 15` on the encoded
+    // byte codes, as in the u8 kernels; ZPAD (5, never an encoded query code) and PAD keep the
+    // tail's selects.
+    let (tbl, enc_t, enc_q) = if MAT5 {
+        let (t, q, t16) = mat5_add_code(mat).expect("the dispatch checks mat5_add_code");
+        (_mm_loadu_si128(t16.as_ptr() as *const __m128i), t, q)
+    } else {
+        (_mm_setzero_si128(), [0, 1, 2, 3, 4], [0, 1, 2, 3, 4])
+    };
     let e_del_v = _mm256_set1_epi16(e_del as i16);
     let oe_del_v = _mm256_set1_epi16(oe_del as i16);
     let e_ins_v = _mm256_set1_epi16(e_ins as i16);
@@ -4233,13 +4277,13 @@ unsafe fn fwd_local_sw_avx2_i16(
             minsc[l] = j.minsc;
             endsc[l] = j.endsc;
             for (c, &b) in j.query.iter().enumerate() {
-                seq_q[c * LANES16 + l] = b;
+                seq_q[c * LANES16 + l] = if MAT5 { enc_q[b as usize] } else { b };
             }
             for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
                 seq_q[c * LANES16 + l] = ZPAD;
             }
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES16 + l] = b;
+                seq_t[r * LANES16 + l] = if MAT5 { enc_t[b as usize] } else { b };
             }
         }
 
@@ -4270,6 +4314,11 @@ unsafe fn fwd_local_sw_avx2_i16(
         let load_codes = |buf: &[u8], off: usize| -> __m256i {
             _mm256_cvtepu8_epi16(_mm_loadu_si128(buf.as_ptr().add(off) as *const __m128i))
         };
+        // `MAT5`'s cell score at column `j`, from the row's byte codes `t_b`.
+        let mat5_sc = |t_b: __m128i, j: usize| -> __m256i {
+            let q_b = _mm_loadu_si128(seq_q.as_ptr().add(j * LANES16) as *const __m128i);
+            _mm256_cvtepi8_epi16(_mm_shuffle_epi8(tbl, _mm_add_epi8(t_b, q_b)))
+        };
 
         // =====================================================================================
         // Main DP, one target row per iteration. Structurally identical to `fwd_local_sw_neon`, at
@@ -4277,6 +4326,7 @@ unsafe fn fwd_local_sw_avx2_i16(
         // =====================================================================================
         for i in 0..tmax {
             let t_v = load_codes(&seq_t, i * LANES16);
+            let t_b = _mm_loadu_si128(seq_t.as_ptr().add(i * LANES16) as *const __m128i);
             let mut f_v = zero;
             let mut h_diag_v = zero;
             let mut imax_v = zero;
@@ -4287,11 +4337,14 @@ unsafe fn fwd_local_sw_avx2_i16(
 
             // Padding-free column range, same argument as every other kernel here.
             for j in 0..n_fast {
-                let q_v = load_codes(&seq_q, j * LANES16);
-                let eq = _mm256_cmpeq_epi16(t_v, q_v);
-                let n_mask = _mm256_or_si256(t_is_n, _mm256_cmpeq_epi16(q_v, four_v));
-                let mut sc = bsl(eq, mtch_v, mis_v);
-                sc = bsl(n_mask, n_v, sc);
+                let sc = if MAT5 {
+                    mat5_sc(t_b, j)
+                } else {
+                    let q_v = load_codes(&seq_q, j * LANES16);
+                    let eq = _mm256_cmpeq_epi16(t_v, q_v);
+                    let n_mask = _mm256_or_si256(t_is_n, _mm256_cmpeq_epi16(q_v, four_v));
+                    bsl(n_mask, n_v, bsl(eq, mtch_v, mis_v))
+                };
                 let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES16) as *const __m256i);
                 let mut h_v = _mm256_add_epi16(h_diag_v, sc);
                 h_v = _mm256_max_epi16(h_v, zero);
@@ -4329,9 +4382,12 @@ unsafe fn fwd_local_sw_avx2_i16(
                 let n_mask = _mm256_or_si256(t_is_n, _mm256_cmpeq_epi16(q_v, four_v));
                 let zpad_mask = _mm256_cmpeq_epi16(q_v, zpad_v);
                 let pad_mask =
-                    _mm256_or_si256(cge_epi16(t_v, m_v), _mm256_cmpgt_epi16(q_v, zpad_v));
-                let mut sc = bsl(eq, mtch_v, mis_v);
-                sc = bsl(n_mask, n_v, sc);
+                    _mm256_or_si256(cge_epi16(t_v, m_v), _mm256_cmpgt_epi16(q_v, qdead_v));
+                let mut sc = if MAT5 {
+                    mat5_sc(t_b, j)
+                } else {
+                    bsl(n_mask, n_v, bsl(eq, mtch_v, mis_v))
+                };
                 sc = bsl(zpad_mask, zero, sc); // ksw profile padding scores 0
                 sc = bsl(pad_mask, dead_v, sc); // dead padding: kill the cell outright
 
@@ -4967,7 +5023,7 @@ unsafe fn fwd_local_sw_sse41_u8(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fwd_local_sw_sse41_i16(
+unsafe fn fwd_local_sw_sse41_i16<const MAT5: bool>(
     jobs: &[FwdJob],
     m: usize,
     mat: &[i8],
@@ -5010,8 +5066,19 @@ unsafe fn fwd_local_sw_sse41_i16(
     let n_v = _mm_set1_epi16(-1);
     let dead_v = _mm_set1_epi16(DEAD_CELL_SCORE as i16);
     let four_v = _mm_set1_epi16(4);
-    let m_v = _mm_set1_epi16(m as i16);
+    // `MAT5` codes run to 15 (`mat5_add_code`), so the dead tests move above them.
+    let m_v = _mm_set1_epi16(if MAT5 { 16 } else { m as i16 });
     let zpad_v = _mm_set1_epi16(ZPAD as i16);
+    let qdead_v = _mm_set1_epi16(if MAT5 { 15 } else { ZPAD as i16 });
+    // `MAT5` (a `--meth` matrix): the cell score is one `pshufb` at `(t + q) & 15` on the encoded
+    // byte codes, as in the u8 kernels; ZPAD (5, never an encoded query code) and PAD keep the
+    // tail's selects.
+    let (tbl, enc_t, enc_q) = if MAT5 {
+        let (t, q, t16) = mat5_add_code(mat).expect("the dispatch checks mat5_add_code");
+        (_mm_loadu_si128(t16.as_ptr() as *const __m128i), t, q)
+    } else {
+        (_mm_setzero_si128(), [0, 1, 2, 3, 4], [0, 1, 2, 3, 4])
+    };
     let e_del_v = _mm_set1_epi16(e_del as i16);
     let oe_del_v = _mm_set1_epi16(oe_del as i16);
     let e_ins_v = _mm_set1_epi16(e_ins as i16);
@@ -5043,13 +5110,13 @@ unsafe fn fwd_local_sw_sse41_i16(
             minsc[l] = j.minsc;
             endsc[l] = j.endsc;
             for (c, &b) in j.query.iter().enumerate() {
-                seq_q[c * LANES + l] = b;
+                seq_q[c * LANES + l] = if MAT5 { enc_q[b as usize] } else { b };
             }
             for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
                 seq_q[c * LANES + l] = ZPAD;
             }
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES + l] = b;
+                seq_t[r * LANES + l] = if MAT5 { enc_t[b as usize] } else { b };
             }
         }
 
@@ -5080,6 +5147,11 @@ unsafe fn fwd_local_sw_sse41_i16(
         let load_codes = |buf: &[u8], off: usize| -> __m128i {
             _mm_cvtepu8_epi16(_mm_loadl_epi64(buf.as_ptr().add(off) as *const __m128i))
         };
+        // `MAT5`'s cell score at column `j`, from the row's byte codes `t_b`.
+        let mat5_sc = |t_b: __m128i, j: usize| -> __m128i {
+            let q_b = _mm_loadl_epi64(seq_q.as_ptr().add(j * LANES) as *const __m128i);
+            _mm_cvtepi8_epi16(_mm_shuffle_epi8(tbl, _mm_add_epi8(t_b, q_b)))
+        };
 
         // =====================================================================================
         // Main DP, one target row per iteration. Structurally identical to `fwd_local_sw_neon`, at
@@ -5087,6 +5159,7 @@ unsafe fn fwd_local_sw_sse41_i16(
         // =====================================================================================
         for i in 0..tmax {
             let t_v = load_codes(&seq_t, i * LANES);
+            let t_b = _mm_loadl_epi64(seq_t.as_ptr().add(i * LANES) as *const __m128i);
             let mut f_v = zero;
             let mut h_diag_v = zero;
             let mut imax_v = zero;
@@ -5097,11 +5170,14 @@ unsafe fn fwd_local_sw_sse41_i16(
 
             // Padding-free column range, same argument as every other kernel here.
             for j in 0..n_fast {
-                let q_v = load_codes(&seq_q, j * LANES);
-                let eq = _mm_cmpeq_epi16(t_v, q_v);
-                let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi16(q_v, four_v));
-                let mut sc = bsl(eq, mtch_v, mis_v);
-                sc = bsl(n_mask, n_v, sc);
+                let sc = if MAT5 {
+                    mat5_sc(t_b, j)
+                } else {
+                    let q_v = load_codes(&seq_q, j * LANES);
+                    let eq = _mm_cmpeq_epi16(t_v, q_v);
+                    let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi16(q_v, four_v));
+                    bsl(n_mask, n_v, bsl(eq, mtch_v, mis_v))
+                };
                 let e_v = _mm_loadu_si128(e.as_ptr().add(j * LANES) as *const __m128i);
                 let mut h_v = _mm_add_epi16(h_diag_v, sc);
                 h_v = _mm_max_epi16(h_v, zero);
@@ -5134,9 +5210,12 @@ unsafe fn fwd_local_sw_sse41_i16(
                 let eq = _mm_cmpeq_epi16(t_v, q_v);
                 let n_mask = _mm_or_si128(t_is_n, _mm_cmpeq_epi16(q_v, four_v));
                 let zpad_mask = _mm_cmpeq_epi16(q_v, zpad_v);
-                let pad_mask = _mm_or_si128(cge_epi16(t_v, m_v), _mm_cmpgt_epi16(q_v, zpad_v));
-                let mut sc = bsl(eq, mtch_v, mis_v);
-                sc = bsl(n_mask, n_v, sc);
+                let pad_mask = _mm_or_si128(cge_epi16(t_v, m_v), _mm_cmpgt_epi16(q_v, qdead_v));
+                let mut sc = if MAT5 {
+                    mat5_sc(t_b, j)
+                } else {
+                    bsl(n_mask, n_v, bsl(eq, mtch_v, mis_v))
+                };
                 sc = bsl(zpad_mask, zero, sc); // ksw profile padding scores 0
                 sc = bsl(pad_mask, dead_v, sc); // dead padding: kill the cell outright
 
@@ -5902,7 +5981,7 @@ unsafe fn fwd_local_sw_avx512_u8(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fwd_local_sw_avx512_i16(
+unsafe fn fwd_local_sw_avx512_i16<const MAT5: bool>(
     jobs: &[FwdJob],
     m: usize,
     mat: &[i8],
@@ -5928,8 +6007,23 @@ unsafe fn fwd_local_sw_avx512_i16(
     let n_v = _mm512_set1_epi16(-1);
     let dead_v = _mm512_set1_epi16(DEAD_CELL_SCORE as i16);
     let four_v = _mm512_set1_epi16(4);
-    let m_v = _mm512_set1_epi16(m as i16);
+    // `MAT5` codes run to 15 (`mat5_add_code`), so the dead tests move above them.
+    let m_v = _mm512_set1_epi16(if MAT5 { 16 } else { m as i16 });
     let zpad_v = _mm512_set1_epi16(ZPAD as i16);
+    let qdead_v = _mm512_set1_epi16(if MAT5 { 15 } else { ZPAD as i16 });
+    // `MAT5` (a `--meth` matrix): the cell score is one `pshufb` at `(t + q) & 15` on the encoded
+    // byte codes, as in the u8 kernels; ZPAD (5, never an encoded query code) and PAD keep the
+    // tail's selects.
+    let (tbl, enc_t, enc_q) = if MAT5 {
+        let (t, q, t16) = mat5_add_code(mat).expect("the dispatch checks mat5_add_code");
+        (
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(t16.as_ptr() as *const __m128i)),
+            t,
+            q,
+        )
+    } else {
+        (_mm256_setzero_si256(), [0, 1, 2, 3, 4], [0, 1, 2, 3, 4])
+    };
     let e_del_v = _mm512_set1_epi16(e_del as i16);
     let oe_del_v = _mm512_set1_epi16(oe_del as i16);
     let e_ins_v = _mm512_set1_epi16(e_ins as i16);
@@ -5961,13 +6055,13 @@ unsafe fn fwd_local_sw_avx512_i16(
             minsc[l] = j.minsc;
             endsc[l] = j.endsc;
             for (c, &b) in j.query.iter().enumerate() {
-                seq_q[c * LANES32 + l] = b;
+                seq_q[c * LANES32 + l] = if MAT5 { enc_q[b as usize] } else { b };
             }
             for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
                 seq_q[c * LANES32 + l] = ZPAD;
             }
             for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES32 + l] = b;
+                seq_t[r * LANES32 + l] = if MAT5 { enc_t[b as usize] } else { b };
             }
         }
 
@@ -5995,9 +6089,15 @@ unsafe fn fwd_local_sw_avx512_i16(
         let load_codes = |buf: &[u8], off: usize| -> __m512i {
             _mm512_cvtepu8_epi16(_mm256_loadu_si256(buf.as_ptr().add(off) as *const __m256i))
         };
+        // `MAT5`'s cell score at column `j`, from the row's byte codes `t_b`.
+        let mat5_sc = |t_b: __m256i, j: usize| -> __m512i {
+            let q_b = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
+            _mm512_cvtepi8_epi16(_mm256_shuffle_epi8(tbl, _mm256_add_epi8(t_b, q_b)))
+        };
 
         for i in 0..tmax {
             let t_v = load_codes(&seq_t, i * LANES32);
+            let t_b = _mm256_loadu_si256(seq_t.as_ptr().add(i * LANES32) as *const __m256i);
             let mut f_v = zero;
             let mut h_diag_v = zero;
             let mut imax_v = zero;
@@ -6008,11 +6108,14 @@ unsafe fn fwd_local_sw_avx512_i16(
 
             // Padding-free column range, same argument as every other kernel here.
             for j in 0..n_fast {
-                let q_v = load_codes(&seq_q, j * LANES32);
-                let eq = _mm512_cmpeq_epi16_mask(t_v, q_v);
-                let n_mask = t_is_n | _mm512_cmpeq_epi16_mask(q_v, four_v);
-                let mut sc = _mm512_mask_blend_epi16(eq, mis_v, mtch_v);
-                sc = _mm512_mask_blend_epi16(n_mask, sc, n_v);
+                let sc = if MAT5 {
+                    mat5_sc(t_b, j)
+                } else {
+                    let q_v = load_codes(&seq_q, j * LANES32);
+                    let eq = _mm512_cmpeq_epi16_mask(t_v, q_v);
+                    let n_mask = t_is_n | _mm512_cmpeq_epi16_mask(q_v, four_v);
+                    _mm512_mask_blend_epi16(n_mask, _mm512_mask_blend_epi16(eq, mis_v, mtch_v), n_v)
+                };
                 let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES32) as *const __m512i);
                 let mut h_v = _mm512_add_epi16(h_diag_v, sc);
                 h_v = _mm512_max_epi16(h_v, zero);
@@ -6047,10 +6150,13 @@ unsafe fn fwd_local_sw_avx512_i16(
                 let n_mask = t_is_n | _mm512_cmpeq_epi16_mask(q_v, four_v);
                 let zpad_mask = _mm512_cmpeq_epi16_mask(q_v, zpad_v);
                 let pad_mask =
-                    _mm512_cmpge_epi16_mask(t_v, m_v) | _mm512_cmpgt_epi16_mask(q_v, zpad_v);
+                    _mm512_cmpge_epi16_mask(t_v, m_v) | _mm512_cmpgt_epi16_mask(q_v, qdead_v);
                 // `mask ? a : b` = `mask_blend(mask, b, a)`, increasing priority.
-                let mut sc = _mm512_mask_blend_epi16(eq, mis_v, mtch_v);
-                sc = _mm512_mask_blend_epi16(n_mask, sc, n_v);
+                let mut sc = if MAT5 {
+                    mat5_sc(t_b, j)
+                } else {
+                    _mm512_mask_blend_epi16(n_mask, _mm512_mask_blend_epi16(eq, mis_v, mtch_v), n_v)
+                };
                 sc = _mm512_mask_blend_epi16(zpad_mask, sc, zero);
                 sc = _mm512_mask_blend_epi16(pad_mask, sc, dead_v);
 
@@ -6358,8 +6464,9 @@ mod avx2_verify {
         let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
         // SAFETY: standard mat and every ceiling under I16_SCORE_LIMIT; AVX2 is assumed, not detected
         // (Rosetta lies), so the kernel is exercised on this Apple-Silicon host as well as native x86.
-        let got =
-            unsafe { fwd_local_sw_avx2_i16(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
+        let got = unsafe {
+            fwd_local_sw_avx2_i16::<false>(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+        };
         for i in 0..jobs.len() {
             assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
         }
@@ -6451,8 +6558,9 @@ mod sse41_verify {
             .collect();
         let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
         // SAFETY: standard mat, every ceiling under I16_SCORE_LIMIT; SSE4.1 assumed as above.
-        let got =
-            unsafe { fwd_local_sw_sse41_i16(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
+        let got = unsafe {
+            fwd_local_sw_sse41_i16::<false>(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+        };
         for i in 0..jobs.len() {
             assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
         }
@@ -6607,8 +6715,9 @@ mod avx512_verify {
             .collect();
         let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
         // SAFETY: AVX-512 BW/VL/DQ just confirmed; every ceiling is under I16_SCORE_LIMIT and mat is standard.
-        let got =
-            unsafe { fwd_local_sw_avx512_i16(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc) };
+        let got = unsafe {
+            fwd_local_sw_avx512_i16::<false>(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+        };
         for i in 0..jobs.len() {
             assert_eq!(got[i], want[i], "job {i} (qlen {})", jobs[i].query.len());
         }
@@ -7537,9 +7646,113 @@ mod tests {
         }
     }
 
+    /// The u8 admission at its edge (`u8_job_fits`): 250 bp mates at bwa's scores, ceiling 250 and
+    /// a third reaching it, some frozen there by `endsc`, under the standard and a `--meth` matrix,
+    /// against the scalar kernel on every u8 kernel.
+    #[test]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn matesw_u8_admission_edge_equals_scalar() {
+        #[cfg(target_arch = "aarch64")]
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let (a, b, c, d) = (6, 1, 6, 1);
+        let mut state = 0x0bad_5eed_1234_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut meth = scmat(1, 4);
+        (meth[5 + 3], meth[3 * 5 + 1]) = (1, 1);
+        for mat in [scmat(1, 4), meth] {
+            let bufs: Vec<(Vec<u8>, Vec<u8>)> = (0..48usize)
+                .map(|k| {
+                    let tlen = 250 + k * 13;
+                    let t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+                    let at = next() as usize % (tlen - 249);
+                    let mut q = t[at..at + 250].to_vec();
+                    if k % 3 != 0 {
+                        for _ in 0..k % 5 {
+                            let p = next() as usize % 250;
+                            q[p] = (next() % 5) as u8;
+                        }
+                    }
+                    (q, t)
+                })
+                .collect();
+            let jobs: Vec<FwdJob> = bufs
+                .iter()
+                .enumerate()
+                .map(|(k, (q, t))| FwdJob {
+                    query: q,
+                    target: t,
+                    minsc: 30,
+                    endsc: if k % 4 == 3 { 250 } else { i32::MAX },
+                })
+                .collect();
+            assert!(u8_table_has_headroom(&mat));
+            assert!(jobs
+                .iter()
+                .all(|j| u8_job_fits(j.query.len(), j.target.len(), &mat, 1)));
+            let want = fwd_local_sw_scalar(&jobs, 5, &mat, a, b, c, d, 1);
+            assert!(want.iter().filter(|w| w.0 == 250).count() >= 10);
+            assert_eq!(fwd_local_sw_batch(&jobs, 5, &mat, a, b, c, d, 1), want);
+            let standard = mat_is_standard(5, &mat);
+            // SAFETY: neon detected; every job passes `u8_job_fits` and the table has headroom;
+            // standard or `mat5_u8_ok` mat (MAT5 only with USQADD, as the dispatch).
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                let mut got = vec![
+                    fwd_local_sw_neon_u8_impl::<true, true, true>(&jobs, 5, &mat, a, b, c, d, 1),
+                    fwd_local_sw_neon_u8_impl::<true, false, true>(&jobs, 5, &mat, a, b, c, d, 1),
+                ];
+                if standard {
+                    got = vec![
+                        fwd_local_sw_neon_u8_impl::<true, true, false>(
+                            &jobs, 5, &mat, a, b, c, d, 1,
+                        ),
+                        fwd_local_sw_neon_u8_impl::<true, false, false>(
+                            &jobs, 5, &mat, a, b, c, d, 1,
+                        ),
+                        fwd_local_sw_neon_u8_impl::<false, true, false>(
+                            &jobs, 5, &mat, a, b, c, d, 1,
+                        ),
+                        fwd_local_sw_neon_u8_impl::<false, false, false>(
+                            &jobs, 5, &mat, a, b, c, d, 1,
+                        ),
+                    ];
+                }
+                for (v, g) in got.iter().enumerate() {
+                    assert_eq!(g, &want, "neon variant {v}, standard {standard}");
+                }
+            }
+            // SAFETY: as in `matesw_mat5_meth_equals_scalar`, at the same u8 preconditions.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                assert_eq!(
+                    fwd_local_sw_sse41_u8(&jobs, 5, &mat, a, b, c, d, 1),
+                    want,
+                    "sse41"
+                );
+                assert_eq!(
+                    fwd_local_sw_avx2_u8(&jobs, 5, &mat, a, b, c, d, 1),
+                    want,
+                    "avx2"
+                );
+                if bwa_extend::has_avx512() {
+                    let got = fwd_local_sw_avx512_u8(&jobs, 5, &mat, a, b, c, d, 1);
+                    assert_eq!(got, want, "avx512 standard {standard}");
+                }
+            }
+        }
+    }
+
     /// The 5x5 table form (`MAT5`, `--meth`'s matrices) against the scalar kernel: OT and OB, with
     /// the freed cell neutral (0) and collapsed (`a`, mirrored), N on both sides, ragged windows,
     /// and queries planted with their C (or G) bisulfite-converted so the freed cell decides scores.
+    /// `long` queries (250 bp and more) take the i16 kernels.
     #[test]
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn matesw_mat5_meth_equals_scalar() {
@@ -7556,7 +7769,12 @@ mod tests {
             state >> 33
         };
         // (ref base, read base) of the freed cell: OT C->T, OB G->A.
-        for (r, q) in [(1usize, 3usize), (2, 0)] {
+        for (r, q, long) in [
+            (1usize, 3usize, false),
+            (2, 0, false),
+            (1, 3, true),
+            (2, 0, true),
+        ] {
             for collapsed in [false, true] {
                 let mut mat = scmat(1, 4);
                 mat[r * 5 + q] = if collapsed { 1 } else { 0 };
@@ -7567,8 +7785,12 @@ mod tests {
                 let mut qbufs: Vec<Vec<u8>> = Vec::new();
                 let mut tbufs: Vec<Vec<u8>> = Vec::new();
                 for k in 1..=40usize {
-                    let tlen = 150 + k * 37;
-                    let qlen = (40 + (next() % 111) as usize).min(tlen / 2);
+                    let (tlen, qlen) = if long {
+                        (600 + k * 37, 250 + (next() % 151) as usize)
+                    } else {
+                        let tlen = 150 + k * 37;
+                        (tlen, (40 + (next() % 111) as usize).min(tlen / 2))
+                    };
                     let t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
                     let at = next() as usize % (tlen - qlen);
                     let qv: Vec<u8> = t[at..at + qlen]
@@ -7599,6 +7821,37 @@ mod tests {
                     fwd_local_sw_batch(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 1),
                     want
                 );
+                assert!(want.iter().filter(|w| w.0 >= 19).count() >= 30);
+                let (a, b, c, d) = (o_del, e_del, o_ins, e_ins);
+                if long {
+                    // SAFETY: neon detected; i16 ceilings (queries under 401 at match 1);
+                    // `mat5_u8_ok`.
+                    #[cfg(target_arch = "aarch64")]
+                    assert_eq!(
+                        unsafe { fwd_local_sw_neon::<true>(&jobs, 5, &mat, a, b, c, d, 1) },
+                        want
+                    );
+                    // Every x86 i16 tier. SAFETY: as for the u8 tiers below, with i16 ceilings.
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        assert_eq!(
+                            fwd_local_sw_sse41_i16::<true>(&jobs, 5, &mat, a, b, c, d, 1),
+                            want,
+                            "sse41 i16"
+                        );
+                        assert_eq!(
+                            fwd_local_sw_avx2_i16::<true>(&jobs, 5, &mat, a, b, c, d, 1),
+                            want,
+                            "avx2 i16"
+                        );
+                        if bwa_extend::has_avx512() {
+                            let got =
+                                fwd_local_sw_avx512_i16::<true>(&jobs, 5, &mat, a, b, c, d, 1);
+                            assert_eq!(got, want, "avx512 i16");
+                        }
+                    }
+                    continue;
+                }
                 // SAFETY: neon detected; queries and score ceilings under 250; `mat5_u8_ok`.
                 #[cfg(target_arch = "aarch64")]
                 let split = unsafe {
@@ -7613,8 +7866,6 @@ mod tests {
                 // preconditions as above.
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    let args = (o_del, e_del, o_ins, e_ins);
-                    let (a, b, c, d) = args;
                     assert_eq!(
                         fwd_local_sw_sse41_u8(&jobs, 5, &mat, a, b, c, d, 1),
                         want,
@@ -7630,7 +7881,6 @@ mod tests {
                         assert_eq!(got, want, "avx512");
                     }
                 }
-                assert!(want.iter().filter(|w| w.0 >= 19).count() >= 30);
             }
         }
     }

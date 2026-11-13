@@ -185,10 +185,18 @@ reach those kernels in three ways:
 - **Collapsed scoring** (the EM-seq default) frees C/T in both directions at the match score. It
   is exactly the uniform matrix on copies of both sequences with T rewritten as C (A as G for OB),
   so extension and rescue run the plain kernels on those copies.
-- **Genomic and neutral scoring** (the TAPS and 5-base default) go through a 5×5 table. The u8
-  extension, rescue and band kernels look up `5 × reference + read`: a two-register `TBL` on
-  NEON, two `PSHUFB` on SSE4.1, AVX2 and AVX-512. The AVX-512 rescue kernel uses one `VPERMB`
-  instead when the CPU has VBMI (Ice Lake and later, Zen 4 and later).
+- **Genomic and neutral scoring** (the TAPS and 5-base default) go through a 5×5 table. The
+  extension and band kernels look up `5 × reference + read`: a two-register `TBL` on NEON, two
+  `PSHUFB` on SSE4.1, AVX2 and AVX-512 (one `VPERMW` in the AVX-512 i16 extension kernel). The
+  NEON rescue kernels do the same. The x86 rescue kernels give each base a 4-bit code such that
+  `(reference code + read code) mod 16` indexes the matrix, so one `PSHUFB` reads it. Such codes
+  exist for every `--meth` matrix; codes combined by XOR do not. With VBMI (Ice Lake and later,
+  Zen 4 and later) the AVX-512 rescue kernel uses one `VPERMB` at `5 × reference + read`.
+  Every kernel has an i16 form, which reads of more than 250 bp need.
+- **Mate rescue on the u8 kernel** takes a job whenever its score ceiling plus the table's bias
+  fits a byte, as bwa-mem3 0.16 does (`matesw_use_u8`). At the default scoring that includes the
+  250 bp mate, which bwa sends to its i16 kernel. The query padding stays bwa's, so the output
+  does not change.
 - **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
   also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
   cell scores at most the match score, so the bound holds. The relation count is scalar, so x86

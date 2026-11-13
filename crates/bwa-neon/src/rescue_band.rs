@@ -2706,8 +2706,8 @@ mod tests {
 
     /// The batched path (which bands every eligible pruned job) against `ksw_align2` on the full
     /// window: every consumed result (`score >= minsc`) must be identical, on generated jobs with
-    /// planted copies, repeats and indels, and on every `STRIDE`-th dumped real job when
-    /// `BWA4_PRUNE_BENCH` names a dump.
+    /// planted copies, repeats and indels (one in 50 a 250 bp mate, at the u8 bound), and on every
+    /// `STRIDE`-th dumped real job when `BWA4_PRUNE_BENCH` names a dump.
     #[test]
     fn bands_reproduce_ksw_align2() {
         let mut state = 0x7a3d_19c4_e5b2_0f61u64;
@@ -2718,8 +2718,8 @@ mod tests {
             (state >> 33) as usize
         };
         let mut gen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for _ in 0..8000 {
-            let qlen = 20 + next() % 160;
+        for k in 0..8000 {
+            let qlen = if k % 50 == 0 { 250 } else { 20 + next() % 160 };
             let tlen = qlen + next() % 1400;
             let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
             if next() % 6 == 0 {
@@ -2765,7 +2765,7 @@ mod tests {
         }
         let mat = scmat(1, 4);
         let p = Params::from(1, 4, 6, 1, 6, 1, 19).unwrap();
-        let (mut banded, mut checked) = (0usize, 0usize);
+        let (mut banded, mut checked, mut long) = (0usize, 0usize, 0usize);
         for (set, minsc) in &sets {
             for chunk in set.chunks(1000) {
                 let jobs: Vec<KswJob> = chunk
@@ -2787,13 +2787,15 @@ mod tests {
                 let mut b = Batch::default();
                 for (i, (t, q)) in chunk.iter().enumerate() {
                     let quanta = q.len().div_ceil(16) * 16;
-                    if q.len() < 250 && b.plan(i, t, q, &p, usize::MAX, quanta).is_none() {
+                    if q.len() <= 250 && b.plan(i, t, q, &p, usize::MAX, quanta).is_none() {
                         banded += 1;
+                        long += usize::from(q.len() == 250);
                     }
                 }
             }
         }
-        eprintln!("bands: {banded} banded of {checked}");
+        eprintln!("bands: {banded} banded of {checked}, {long} of them 250 bp");
+        assert!(long >= 20, "too few banded 250 bp mates: {long}");
         assert!(
             banded > checked / 20,
             "too few banded jobs: {banded} of {checked}"
