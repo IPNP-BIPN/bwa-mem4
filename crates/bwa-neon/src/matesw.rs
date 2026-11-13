@@ -1262,7 +1262,8 @@ fn rowquad_enabled() -> bool {
 ///
 /// Unlike the `USQADD` and `SHARE_OE` levers this is not a const parameter: it only moves the
 /// `n_pad` boundary, computed once per group outside every loop, exactly as `n_fast` already is.
-#[cfg(target_arch = "aarch64")]
+/// The AVX2 and AVX-512 u8 kernels read it too, for their two-row body.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn zpadcol_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -3180,6 +3181,99 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
     out
 }
 
+/// The x86 u8 kernels' lane-major sequences of one group: `(seq_q, seq_t)`, `seq_q[c * lanes + l]`
+/// the query byte (ZPAD from its length to its padded one, PAD after) and `seq_t[r * lanes + l]`
+/// the target byte through `enc`, PAD past its length and in the lanes past the group. Each lane is
+/// written contiguous and the whole is transposed in 16x16 blocks (SSE2), where one strided byte
+/// store per base cost ~12% of the AVX-512 kernel on Zen 5 (bwa-mem3's `x86_soa_pack`, ~2%). The
+/// row counts are rounded up to 16 with PAD rows, which nothing reads.
+#[cfg(target_arch = "x86_64")]
+fn soa_group(
+    group: &[FwdJob],
+    lanes: usize,
+    qmax: usize,
+    tmax: usize,
+    max_sc: i32,
+    enc: impl Fn(u8) -> u8,
+) -> (Vec<u8>, Vec<u8>) {
+    debug_assert!(lanes.is_multiple_of(16) && group.len() <= lanes);
+    let (ql, tl) = (qmax.next_multiple_of(16), tmax.next_multiple_of(16));
+    let (mut q, mut t) = (vec![PAD; lanes * ql], vec![PAD; lanes * tl]);
+    for (l, j) in group.iter().enumerate() {
+        let (qr, tr) = (&mut q[l * ql..][..ql], &mut t[l * tl..][..tl]);
+        qr[..j.query.len()].copy_from_slice(j.query);
+        qr[j.query.len()..ksw_padded_qlen(j.query.len(), max_sc)].fill(ZPAD);
+        for (d, &b) in tr.iter_mut().zip(j.target) {
+            *d = enc(b);
+        }
+    }
+    (transpose16(&q, lanes, ql), transpose16(&t, lanes, tl))
+}
+
+/// `out[r * lanes + l] = src[l * rows + r]`: `lanes` rows of `rows` bytes to `rows` rows of `lanes`,
+/// both multiples of 16, one 16x16 block at a time in four rounds of SSE2 unpacks.
+#[cfg(target_arch = "x86_64")]
+fn transpose16(src: &[u8], lanes: usize, rows: usize) -> Vec<u8> {
+    use std::arch::x86_64::*;
+    assert!(lanes.is_multiple_of(16) && rows.is_multiple_of(16) && src.len() == lanes * rows);
+    let mut out = vec![0u8; src.len()];
+    for l0 in (0..lanes).step_by(16) {
+        for r0 in (0..rows).step_by(16) {
+            // SAFETY: SSE2 is x86_64's baseline; every load reads 16 bytes of lane `l0 + k`'s row
+            // inside `src` (`r0 + 16 <= rows`), every store 16 bytes of row `r0 + c` inside `out`.
+            unsafe {
+                let v: [__m128i; 16] = std::array::from_fn(|k| {
+                    _mm_loadu_si128(src.as_ptr().add((l0 + k) * rows + r0) as *const __m128i)
+                });
+                // Round 1: `a[i]` / `a[i + 8]` interleave lanes 2i, 2i+1, columns 0-7 / 8-15.
+                let a: [__m128i; 16] = std::array::from_fn(|i| {
+                    let (x, y) = (v[2 * (i % 8)], v[2 * (i % 8) + 1]);
+                    if i < 8 {
+                        _mm_unpacklo_epi8(x, y)
+                    } else {
+                        _mm_unpackhi_epi8(x, y)
+                    }
+                });
+                // Round 2: `b[h * 8 + g * 4 + i]` = lanes 4i..4i+3, columns 8h + 4g .. + 3.
+                let b: [__m128i; 16] = std::array::from_fn(|n| {
+                    let (h, g, i) = (n / 8, n / 4 % 2, n % 4);
+                    let (x, y) = (a[h * 8 + 2 * i], a[h * 8 + 2 * i + 1]);
+                    if g == 0 {
+                        _mm_unpacklo_epi16(x, y)
+                    } else {
+                        _mm_unpackhi_epi16(x, y)
+                    }
+                });
+                // Round 3: `c[n * 4 + m]`, `n` = column quad, `m` = (lane half, column pair).
+                let c: [__m128i; 16] = std::array::from_fn(|n| {
+                    let (quad, half, pair) = (n / 4, n / 2 % 2, n % 2);
+                    let (x, y) = (b[quad * 4 + 2 * half], b[quad * 4 + 2 * half + 1]);
+                    if pair == 0 {
+                        _mm_unpacklo_epi32(x, y)
+                    } else {
+                        _mm_unpackhi_epi32(x, y)
+                    }
+                });
+                // Round 4: column `4 quad + 2 pair + odd`, lanes 0-7 then 8-15.
+                for col in 0..16 {
+                    let (quad, pair, odd) = (col / 4, col / 2 % 2, col % 2);
+                    let (x, y) = (c[quad * 4 + pair], c[quad * 4 + 2 + pair]);
+                    let o = if odd == 0 {
+                        _mm_unpacklo_epi64(x, y)
+                    } else {
+                        _mm_unpackhi_epi64(x, y)
+                    };
+                    _mm_storeu_si128(
+                        out.as_mut_ptr().add((r0 + col) * lanes + l0) as *mut __m128i,
+                        o,
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The u8 kernels' signed substitution table, indexed by `target XOR query` (see the score-table
 /// note in [`fwd_local_sw_neon_u8_impl`]): match `+a`, mismatch `-b`, any N `-1`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -3445,8 +3539,17 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
             continue;
         }
 
-        let mut seq_q = vec![PAD; qmax * LANES32];
-        let mut seq_t = vec![PAD; tmax * LANES32];
+        // The N re-encoding (or `MAT5`'s `5 t`), applied once per target base so the column loops
+        // never pay for it (issues #43, #44).
+        let (seq_q, seq_t) = soa_group(group, LANES32, qmax, tmax, max_sc, |b| {
+            if MAT5 {
+                5 * b
+            } else if b == 4 {
+                N_TARGET
+            } else {
+                b
+            }
+        });
         let (mut qlen, mut tlen, mut minsc, mut endsc) = (
             [0usize; LANES32],
             [0usize; LANES32],
@@ -3458,23 +3561,6 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
             tlen[l] = j.target.len();
             minsc[l] = j.minsc;
             endsc[l] = j.endsc;
-            for (c, &b) in j.query.iter().enumerate() {
-                seq_q[c * LANES32 + l] = b;
-            }
-            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
-                seq_q[c * LANES32 + l] = ZPAD;
-            }
-            // The N re-encoding, applied once per target base so the column loops never pay for
-            // it (issue #43). See `fwd_local_sw_neon_u8`'s score-table comment.
-            for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES32 + l] = if MAT5 {
-                    5 * b
-                } else if b == 4 {
-                    N_TARGET
-                } else {
-                    b
-                };
-            }
         }
 
         // Same DP state as the scalar path, narrowed to u8 so a column of all 32 lanes is one
@@ -3500,8 +3586,10 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
         // the caller proved the score ceiling is under `U8_SCORE_LIMIT`.
         let mut rowmax = vec![0u8; tmax * LANES32];
         let mut gmax = [0i32; LANES32];
-        let mut te = [-1i32; LANES32];
-        let mut qe = [0i32; LANES32];
+        // `te` as four vectors of eight i32 rows and `qe` as one of 32 columns, blended under the
+        // row's improving lanes instead of written lane by lane.
+        let mut te_v = [_mm256_set1_epi32(-1); 4];
+        let mut qe_v = zero;
         let mut limit = [-1i32; LANES32];
         for l in 0..n_lanes {
             limit[l] = tlen[l] as i32 - 1;
@@ -3525,6 +3613,23 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
             qlen[..n_lanes].iter().copied().min().unwrap_or(0).min(qmax)
         } else {
             0
+        };
+        // From here every live lane holds ZPAD (the ksw profile padding): `diag = d`, no score and
+        // no pad blend. Same third regime, and the same argument, as `fwd_local_sw_neon_u8`'s.
+        let n_pad = if zpadcol_enabled()
+            && group
+                .iter()
+                .all(|j| ksw_padded_qlen(j.query.len(), max_sc) == qmax)
+        {
+            qlen[..n_lanes]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(qmax)
+                .max(n_fast)
+                .min(qmax)
+        } else {
+            qmax
         };
 
         // =====================================================================================
@@ -3553,14 +3658,15 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                     gmax_v = bsl(need_v, $imax, gmax_v);
                     let froze_v = _mm256_andnot_si256(_mm256_cmpgt_epi8(endsc_v, gmax_v), need_v);
                     frozen_v = _mm256_or_si256(frozen_v, froze_v);
-                    let mut col_arr = [0u8; LANES32];
-                    _mm256_storeu_si256(col_arr.as_mut_ptr() as *mut __m256i, $col);
-                    let mut m = need;
-                    while m != 0 {
-                        let l = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        te[l] = row as i32;
-                        qe[l] = col_arr[l] as i32;
+                    qe_v = bsl(need_v, $col, qe_v);
+                    // Each 8-lane quarter of the byte mask, sign-extended to i32 (bit 7 is the
+                    // mask, and the extension carries it into every byte of the word).
+                    let row_v = _mm256_set1_epi32(row as i32);
+                    for (k, t) in te_v.iter_mut().enumerate() {
+                        let m = _mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            (&need_v as *const __m256i as *const u8).add(8 * k) as *const __m128i,
+                        ));
+                        *t = bsl(m, row_v, *t);
                     }
                     let mut m = _mm256_movemask_epi8(froze_v) as u32;
                     while m != 0 {
@@ -3636,7 +3742,7 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                     j_v = _mm256_add_epi8(j_v, one_v);
                 }
 
-                for j in n_fast..qmax {
+                for j in n_fast..n_pad {
                     let q_v = _mm256_loadu_si256(seq_q.as_ptr().add(j * LANES32) as *const __m256i);
                     let zpad_mask = _mm256_cmpeq_epi8(q_v, zpad_v);
                     // `q > ZPAD` is true only for `PAD`, so the high-bit test is the same mask in one
@@ -3677,6 +3783,52 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
                         diag1,
                     );
                     let mfe1 = _mm256_max_epi8(diag1, e_mid);
+                    let h1 = _mm256_max_epi8(mfe1, f1);
+                    col1 = bsl(_mm256_cmpgt_epi8(h1, imax1), j_v, col1);
+                    imax1 = _mm256_max_epi8(imax1, h1);
+                    _mm256_storeu_si256(
+                        e.as_mut_ptr().add(j * LANES32) as *mut __m256i,
+                        _mm256_max_epi8(
+                            _mm256_subs_epi8(e_mid, e_del_v),
+                            _mm256_subs_epi8(h1, oe_del_v),
+                        ),
+                    );
+                    f1 = _mm256_max_epi8(
+                        _mm256_subs_epi8(f1, e_ins_v),
+                        if SHARE {
+                            _mm256_subs_epi8(h1, oe_del_v)
+                        } else {
+                            _mm256_subs_epi8(mfe1, oe_ins_v)
+                        },
+                    );
+                    d1 = h0;
+                    _mm256_storeu_si256(h_cur.as_mut_ptr().add(j * LANES32) as *mut __m256i, h1);
+                    j_v = _mm256_add_epi8(j_v, one_v);
+                }
+
+                // Every live lane is ZPAD: `diag = d`, so no query load, score or pad blend. A lane
+                // past its target is left un-killed, as in the fast body: `finish_row` skips it.
+                for j in n_pad..qmax {
+                    let e_v = _mm256_loadu_si256(e.as_ptr().add(j * LANES32) as *const __m256i);
+                    let mfe0 = _mm256_max_epi8(d0, e_v);
+                    let h0 = _mm256_max_epi8(mfe0, f0);
+                    col0 = bsl(_mm256_cmpgt_epi8(h0, imax0), j_v, col0);
+                    imax0 = _mm256_max_epi8(imax0, h0);
+                    let e_mid = _mm256_max_epi8(
+                        _mm256_subs_epi8(e_v, e_del_v),
+                        _mm256_subs_epi8(h0, oe_del_v),
+                    );
+                    f0 = _mm256_max_epi8(
+                        _mm256_subs_epi8(f0, e_ins_v),
+                        if SHARE {
+                            _mm256_subs_epi8(h0, oe_del_v)
+                        } else {
+                            _mm256_subs_epi8(mfe0, oe_ins_v)
+                        },
+                    );
+                    d0 = _mm256_loadu_si256(h_prev.as_ptr().add(j * LANES32) as *const __m256i);
+
+                    let mfe1 = _mm256_max_epi8(d1, e_mid);
                     let h1 = _mm256_max_epi8(mfe1, f1);
                     col1 = bsl(_mm256_cmpgt_epi8(h1, imax1), j_v, col1);
                     imax1 = _mm256_max_epi8(imax1, h1);
@@ -3826,6 +3978,13 @@ unsafe fn fwd_local_sw_avx2_u8_impl<const MAT5: bool, const SHARE: bool>(
         for (g, &v) in gmax.iter_mut().zip(&gmax_arr) {
             *g = i32::from(v);
         }
+        let mut te = [-1i32; LANES32];
+        for (k, t) in te_v.iter().enumerate() {
+            _mm256_storeu_si256(te.as_mut_ptr().add(8 * k) as *mut __m256i, *t);
+        }
+        let mut qe_arr = [0u8; LANES32];
+        _mm256_storeu_si256(qe_arr.as_mut_ptr() as *mut __m256i, qe_v);
+        let qe = qe_arr.map(i32::from);
 
         extract_group(
             n_lanes, group_idx, LANES32, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
@@ -5136,8 +5295,17 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
             continue;
         }
 
-        let mut seq_q = vec![PAD; qmax * LANES64];
-        let mut seq_t = vec![PAD; tmax * LANES64];
+        // The N re-encoding (or `MAT5`'s `5 t`), applied once per target base so the column loops
+        // never pay for it (issues #43, #44).
+        let (seq_q, seq_t) = soa_group(group, LANES64, qmax, tmax, max_sc, |b| {
+            if MAT5 {
+                5 * b
+            } else if b == 4 {
+                N_TARGET
+            } else {
+                b
+            }
+        });
         let (mut qlen, mut tlen, mut minsc, mut endsc) = (
             [0usize; LANES64],
             [0usize; LANES64],
@@ -5149,22 +5317,6 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
             tlen[l] = j.target.len();
             minsc[l] = j.minsc;
             endsc[l] = j.endsc;
-            for (c, &b) in j.query.iter().enumerate() {
-                seq_q[c * LANES64 + l] = b;
-            }
-            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
-                seq_q[c * LANES64 + l] = ZPAD;
-            }
-            // The N re-encoding, once per target base (issue #44 part A).
-            for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES64 + l] = if MAT5 {
-                    5 * b
-                } else if b == 4 {
-                    N_TARGET
-                } else {
-                    b
-                };
-            }
         }
 
         let mut h_prev = vec![0x80u8; qmax * LANES64];
@@ -5190,8 +5342,10 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
         // the caller proved the score ceiling is under `U8_SCORE_LIMIT`.
         let mut rowmax = vec![0u8; tmax * LANES64];
         let mut gmax = [0i32; LANES64];
-        let mut te = [-1i32; LANES64];
-        let mut qe = [0i32; LANES64];
+        // `te` as four vectors of 16 i32 rows and `qe` as one of 64 columns, blended under the
+        // row's improving lanes instead of written lane by lane.
+        let mut te_v = [_mm512_set1_epi32(-1); 4];
+        let mut qe_v = zero;
         let mut limit = [-1i32; LANES64];
         for l in 0..n_lanes {
             limit[l] = tlen[l] as i32 - 1;
@@ -5215,11 +5369,33 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
         } else {
             0
         };
+        // From here every live lane holds ZPAD (the ksw profile padding): `diag = d`, no score and
+        // no pad blend. Same third regime, and the same argument, as `fwd_local_sw_neon_u8`'s.
+        let n_pad = if zpadcol_enabled()
+            && group
+                .iter()
+                .all(|j| ksw_padded_qlen(j.query.len(), max_sc) == qmax)
+        {
+            qlen[..n_lanes]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(qmax)
+                .max(n_fast)
+                .min(qmax)
+        } else {
+            qmax
+        };
 
         // Two target rows per iteration when two are left; see `fwd_local_sw_neon_u8` for the
         // memory-traffic argument and the byte-identity argument.
+        // The row epilogue, in two halves. `finish_row` folds the row into `rowmax`, `gmax`, `te`
+        // and the freeze, and returns the lanes it improves; `resolve_qe` recovers their query end.
+        // A pair resolves row `i` only for the lanes row `i+1` does not improve again: the lane's
+        // `qe` is only ever read at its last improving row, so the skipped rescans are never
+        // observed, and along an alignment that grows row by row they are most of them.
         macro_rules! finish_row {
-            ($row:expr, $imax:expr, $t:expr, $hrow:expr, $blk:expr) => {{
+            ($row:expr, $imax:expr, $t:expr) => {{
                 let row = $row;
                 let imax_u = _mm512_xor_si512($imax, hz);
                 // The whole row, all lanes, one store. See the note on `rowmax`.
@@ -5232,6 +5408,27 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                 // out the lanes past `n_lanes`.
                 let need =
                     !_mm512_movepi8_mask($t) & !frozen & _mm512_cmpgt_epu8_mask(imax_u, gmax_v);
+                if need != 0 {
+                    gmax_v = _mm512_mask_blend_epi8(need, gmax_v, imax_u);
+                    let froze = _mm512_mask_cmpge_epu8_mask(need, gmax_v, endsc_v);
+                    frozen |= froze;
+                    let row_v = _mm512_set1_epi32(row as i32);
+                    for (k, t) in te_v.iter_mut().enumerate() {
+                        *t = _mm512_mask_blend_epi32((need >> (16 * k)) as u16, *t, row_v);
+                    }
+                    let mut m = froze;
+                    while m != 0 {
+                        let l = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        limit[l] = row as i32;
+                    }
+                }
+                need
+            }};
+        }
+        macro_rules! resolve_qe {
+            ($imax:expr, $hrow:expr, $blk:expr, $need:expr) => {{
+                let need: u64 = $need;
                 if need != 0 {
                     // The query end, recovered lazily (bwa-mem3's LazyQE): the smallest column
                     // whose stored H equals the row max, the column the inline strict `>` kept.
@@ -5257,24 +5454,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                             break;
                         }
                     }
-                    gmax_v = _mm512_mask_blend_epi8(need, gmax_v, imax_u);
-                    let froze = _mm512_mask_cmpge_epu8_mask(need, gmax_v, endsc_v);
-                    frozen |= froze;
-                    let mut col_arr = [0u8; LANES64];
-                    _mm512_storeu_si512(col_arr.as_mut_ptr() as *mut __m512i, col);
-                    let mut m = need;
-                    while m != 0 {
-                        let l = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        te[l] = row as i32;
-                        qe[l] = col_arr[l] as i32;
-                    }
-                    let mut m = froze;
-                    while m != 0 {
-                        let l = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        limit[l] = row as i32;
-                    }
+                    qe_v = _mm512_mask_blend_epi8(need, qe_v, col);
                 }
             }};
         }
@@ -5351,7 +5531,7 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     }
                 }
 
-                for j in n_fast..qmax {
+                for j in n_fast..n_pad {
                     let q_v = _mm512_loadu_si512(seq_q.as_ptr().add(j * LANES64) as *const __m512i);
                     let zpad_mask = _mm512_cmpeq_epi8_mask(q_v, zpad_v);
                     // `q > ZPAD` is true only for `PAD`, so the high-bit test is the same mask.
@@ -5417,6 +5597,60 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     }
                 }
 
+                // Every live lane is ZPAD: `diag = d`, so no query load, score or pad blend. A lane
+                // past its target is left un-killed, as in the fast body: `finish_row` skips it.
+                for j in n_pad..qmax {
+                    let e_v = _mm512_loadu_si512(e.as_ptr().add(j * LANES64) as *const __m512i);
+                    let mfe0 = _mm512_max_epi8(d0, e_v);
+                    let h0 = _mm512_max_epi8(mfe0, f0);
+                    imax0 = _mm512_max_epi8(imax0, h0);
+                    let e_mid = _mm512_max_epi8(
+                        _mm512_subs_epi8(e_v, e_del_v),
+                        _mm512_subs_epi8(h0, oe_del_v),
+                    );
+                    f0 = _mm512_max_epi8(
+                        _mm512_subs_epi8(f0, e_ins_v),
+                        if SHARE {
+                            _mm512_subs_epi8(h0, oe_del_v)
+                        } else {
+                            _mm512_subs_epi8(mfe0, oe_ins_v)
+                        },
+                    );
+                    d0 = _mm512_loadu_si512(h_prev.as_ptr().add(j * LANES64) as *const __m512i);
+                    _mm512_storeu_si512(h_prev.as_mut_ptr().add(j * LANES64) as *mut __m512i, h0);
+
+                    let mfe1 = _mm512_max_epi8(d1, e_mid);
+                    let h1 = _mm512_max_epi8(mfe1, f1);
+                    imax1 = _mm512_max_epi8(imax1, h1);
+                    _mm512_storeu_si512(
+                        e.as_mut_ptr().add(j * LANES64) as *mut __m512i,
+                        _mm512_max_epi8(
+                            _mm512_subs_epi8(e_mid, e_del_v),
+                            _mm512_subs_epi8(h1, oe_del_v),
+                        ),
+                    );
+                    f1 = _mm512_max_epi8(
+                        _mm512_subs_epi8(f1, e_ins_v),
+                        if SHARE {
+                            _mm512_subs_epi8(h1, oe_del_v)
+                        } else {
+                            _mm512_subs_epi8(mfe1, oe_ins_v)
+                        },
+                    );
+                    d1 = h0;
+                    _mm512_storeu_si512(h_cur.as_mut_ptr().add(j * LANES64) as *mut __m512i, h1);
+                    if j % QE_BLK == QE_BLK - 1 {
+                        _mm512_storeu_si512(
+                            blk0.as_mut_ptr().add(j / QE_BLK * LANES64) as *mut __m512i,
+                            imax0,
+                        );
+                        _mm512_storeu_si512(
+                            blk1.as_mut_ptr().add(j / QE_BLK * LANES64) as *mut __m512i,
+                            imax1,
+                        );
+                    }
+                }
+
                 _mm512_storeu_si512(
                     blk0.as_mut_ptr().add((qmax - 1) / QE_BLK * LANES64) as *mut __m512i,
                     imax0,
@@ -5425,8 +5659,11 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     blk1.as_mut_ptr().add((qmax - 1) / QE_BLK * LANES64) as *mut __m512i,
                     imax1,
                 );
-                finish_row!(i, imax0, t0_v, h_prev.as_ptr(), blk0.as_ptr());
-                finish_row!(i + 1, imax1, t1_v, h_cur.as_ptr(), blk1.as_ptr());
+                // Row order matters: freezing at row `i` must suppress row `i+1`.
+                let need0 = finish_row!(i, imax0, t0_v);
+                let need1 = finish_row!(i + 1, imax1, t1_v);
+                resolve_qe!(imax0, h_prev.as_ptr(), blk0.as_ptr(), need0 & !need1);
+                resolve_qe!(imax1, h_cur.as_ptr(), blk1.as_ptr(), need1);
             } else {
                 let t_v = _mm512_loadu_si512(seq_t.as_ptr().add(i * LANES64) as *const __m512i);
                 let mut f_v = hz;
@@ -5514,7 +5751,8 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
                     blk0.as_mut_ptr().add((qmax - 1) / QE_BLK * LANES64) as *mut __m512i,
                     imax_v,
                 );
-                finish_row!(i, imax_v, t_v, h_cur.as_ptr(), blk0.as_ptr());
+                let need = finish_row!(i, imax_v, t_v);
+                resolve_qe!(imax_v, h_cur.as_ptr(), blk0.as_ptr(), need);
             }
             std::mem::swap(&mut h_prev, &mut h_cur);
 
@@ -5535,6 +5773,13 @@ unsafe fn fwd_local_sw_avx512_u8_impl<const MAT5: bool, const SHARE: bool, const
         for (g, &v) in gmax.iter_mut().zip(&gmax_arr) {
             *g = i32::from(v);
         }
+        let mut te = [-1i32; LANES64];
+        for (k, t) in te_v.iter().enumerate() {
+            _mm512_storeu_si512(te.as_mut_ptr().add(16 * k) as *mut __m512i, *t);
+        }
+        let mut qe_arr = [0u8; LANES64];
+        _mm512_storeu_si512(qe_arr.as_mut_ptr() as *mut __m512i, qe_v);
+        let qe = qe_arr.map(i32::from);
 
         extract_group(
             n_lanes, group_idx, LANES64, &minsc, max_sc, &gmax, &te, &qe, &limit, &rowmax, &mut out,
@@ -6823,6 +7068,104 @@ mod tests {
         }
     }
 
+    /// The 16x16 block transpose against the plain index map, on 3 x 2 blocks: each byte's index
+    /// goes through as its low and its high byte, so every position is told apart.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn transpose16_matches_index_map() {
+        let (lanes, rows) = (48, 32);
+        for shift in [0, 8] {
+            let src: Vec<u8> = (0..lanes * rows).map(|k| (k >> shift) as u8).collect();
+            let got = transpose16(&src, lanes, rows);
+            for l in 0..lanes {
+                for r in 0..rows {
+                    assert_eq!(got[r * lanes + l], src[l * rows + r], "lane {l} row {r}");
+                }
+            }
+        }
+    }
+
+    /// `n` jobs of one query length `qlen` and ragged windows (290 bp and up), each query planted
+    /// at the very end of its window, so the best alignment ends on the last real row and its H
+    /// then walks diagonally through the padded columns. The shape of the all-ZPAD column regime.
+    fn uniform_qlen_jobs(qlen: usize, n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut state = 0xfeed_face_1234_5678u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let (mut qbufs, mut tbufs) = (Vec::new(), Vec::new());
+        for k in 1..=n {
+            let tlen = 200 + k * 90;
+            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
+            let q: Vec<u8> = (0..qlen).map(|_| (next() % 5) as u8).collect();
+            t[tlen - qlen..].copy_from_slice(&q);
+            qbufs.push(q);
+            tbufs.push(t);
+        }
+        (qbufs, tbufs)
+    }
+
+    /// The all-ZPAD third column regime of the AVX2 and AVX-512 u8 kernels' two-row body, on the
+    /// shape of `matesw_uniform_qlen_pad_columns_equal_scalar`: 147 bp queries padded to 160, ragged
+    /// windows, an odd and an even endsc, standard and `--meth` matrices, shared and split gaps.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx512_avx2_matesw_uniform_qlen_pad_columns_equal_scalar() {
+        let max_sc = 1i32;
+        const QLEN: usize = 147;
+        assert_eq!(ksw_padded_qlen(QLEN, max_sc), 160);
+        let (qbufs, tbufs) = uniform_qlen_jobs(QLEN, 128);
+        for (&(o_del, e_del, o_ins, e_ins), meth) in [(6, 1, 6, 1), (5, 2, 7, 3)]
+            .iter()
+            .flat_map(|g| [(g, false), (g, true)])
+        {
+            let mut mat = scmat(1, 4);
+            if meth {
+                mat[5 + 3] = 0;
+            }
+            let jobs: Vec<FwdJob> = qbufs
+                .iter()
+                .zip(tbufs.iter())
+                .map(|(q, t)| FwdJob {
+                    query: q.as_slice(),
+                    target: t.as_slice(),
+                    minsc: 19,
+                    endsc: if t.len() % 180 == 0 { 120 } else { i32::MAX },
+                })
+                .collect();
+            let want = fwd_local_sw_scalar(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc);
+            assert!(
+                want.iter().filter(|r| r.3 >= 0).count() >= 8,
+                "score2 unpopulated"
+            );
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: AVX2 just detected; 147 bp queries keep the u8 ceiling under 250.
+                let got = unsafe {
+                    fwd_local_sw_avx2_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+                };
+                assert_eq!(
+                    got, want,
+                    "avx2 meth={meth} gaps {o_del},{e_del},{o_ins},{e_ins}"
+                );
+            }
+            if !crate::avx512_testable() {
+                eprintln!("skipping avx512 uniform-qlen pad columns: no avx512bw on this CPU");
+            } else {
+                // SAFETY: AVX-512 BW/VL/DQ just confirmed; same u8 preconditions.
+                let got = unsafe {
+                    fwd_local_sw_avx512_u8(&jobs, 5, &mat, o_del, e_del, o_ins, e_ins, max_sc)
+                };
+                assert_eq!(
+                    got, want,
+                    "avx512 meth={meth} gaps {o_del},{e_del},{o_ins},{e_ins}"
+                );
+            }
+        }
+    }
+
     /// The all-ZPAD third column regime (issue #47), on groups whose lanes have a UNIFORM query
     /// length, which is the only shape that opens it.
     ///
@@ -6852,27 +7195,7 @@ mod tests {
         const QLEN: usize = 147;
         assert_eq!(ksw_padded_qlen(QLEN, max_sc), 160);
 
-        let mut state = 0xfeed_face_1234_5678u64;
-        let mut next = move || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state >> 33
-        };
-
-        let mut qbufs: Vec<Vec<u8>> = Vec::new();
-        let mut tbufs: Vec<Vec<u8>> = Vec::new();
-        for k in 1..=32usize {
-            let tlen = 200 + k * 90; // ragged, 290 to 3080
-            let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 5) as u8).collect();
-            let q: Vec<u8> = (0..QLEN).map(|_| (next() % 5) as u8).collect();
-            // Plant the query at the very end of the window, so the best alignment ends on the last
-            // real row and its H then walks diagonally through the padded columns.
-            let at = tlen - QLEN;
-            t[at..].copy_from_slice(&q);
-            qbufs.push(q);
-            tbufs.push(t);
-        }
+        let (qbufs, tbufs) = uniform_qlen_jobs(QLEN, 32);
         let jobs: Vec<FwdJob> = qbufs
             .iter()
             .zip(tbufs.iter())
