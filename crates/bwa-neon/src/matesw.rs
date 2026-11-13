@@ -2023,6 +2023,28 @@ fn extract_group<R: Copy + Into<i32>>(
         let best_te = te[l];
         // No alignment found at all (te still -1) means there is no query end to report either.
         let best_qe = if best_te >= 0 { qe[l] } else { -1 };
+        // The tracker streamed, skipping the exclusion zone around `te` where nearly every row
+        // reaching `minsc` lies (`score2_lane`). The `BWA4_SUBOPT_SHAPE` probe counts the
+        // tracker's candidates, so it keeps the walk below.
+        if !bwa_extend::sw::subopt_shape::enabled() {
+            let (score2, te2) = if walks(l) {
+                crate::rescue_band::score2_lane(
+                    rowmax,
+                    lanes,
+                    l,
+                    limit[l] as usize + 1,
+                    &bits,
+                    n_lanes,
+                    (best_score, best_te),
+                    minsc[l],
+                    max_sc,
+                )
+            } else {
+                (-1, -1)
+            };
+            out[group_idx * lanes + l] = (best_score, best_te, best_qe, score2, te2);
+            continue;
+        }
         // score2: feed this lane's row maxima to ksw's `b` tracker, then take the best candidate
         // outside the exclusion window around `te`. The tracker is shared with the scalar
         // `ksw_local_fwd` precisely so the merge rule and the window cannot drift between them.

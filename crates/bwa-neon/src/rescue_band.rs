@@ -899,6 +899,102 @@ fn score2(rows: &[u8], row0: i32, s: i32, te: i32, minsc: i32, max_sc: i32) -> (
     }
 }
 
+/// [`score2`] on lane `lane` of row-major row maxima (`rowmax[row * lanes + lane]`, target rows
+/// `0..n`), the full rescue kernels' layout, where a per-lane copy would cost more than the walk.
+/// Outside the zone it visits only the rows `bits` marks (`bits[blk * nb + lane]` bit `k` for row
+/// `8 blk + k`, a superset of the rows reaching `minsc`), and pushes every row reaching `minsc`, as
+/// `SuboptimalTracker` does; the zone is handled as in [`score2`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score2_lane<R: Copy + Into<i32>>(
+    rowmax: &[R],
+    lanes: usize,
+    lane: usize,
+    n: usize,
+    bits: &[u8],
+    nb: usize,
+    (s, te): (i32, i32),
+    minsc: i32,
+    max_sc: i32,
+) -> (i32, i32) {
+    let half = (s + max_sc - 1) / max_sc;
+    let (low, high) = (te - half, te + half);
+    let mut t = Tracker {
+        s2: -1,
+        te2: -1,
+        cs: 0,
+        cr: i32::MIN,
+        low,
+        high,
+    };
+    let get = |i: usize| -> i32 { rowmax[i * lanes + lane].into() };
+    let p = |i: usize| get(i) >= minsc;
+    let idx = |row: i64| row.clamp(0, n as i64) as usize;
+    let (b0, b1) = if high - low >= 2 {
+        (idx(i64::from(low)), idx(i64::from(high) + 1))
+    } else {
+        (n, n)
+    };
+    // The marked rows of `[from, to)` in order, until `f` returns `false`; the row it stopped at.
+    let walk = |from: usize, to: usize, f: &mut dyn FnMut(usize) -> bool| -> Option<usize> {
+        let mut blk = from / 8;
+        while 8 * blk < to {
+            let mut m = u32::from(bits[blk * nb + lane]);
+            m &= !0u32 << from.saturating_sub(8 * blk);
+            m &= (1u32 << (to - 8 * blk).min(8)) - 1;
+            while m != 0 {
+                let i = 8 * blk + m.trailing_zeros() as usize;
+                m &= m - 1;
+                if !f(i) {
+                    return Some(i);
+                }
+            }
+            blk += 1;
+        }
+        None
+    };
+    walk(0, b0, &mut |i| {
+        if p(i) {
+            t.push(i as i32, get(i));
+        }
+        true
+    });
+    // Until the open candidate's row enters the zone (at most two pushed rows).
+    let x = walk(b0, b1, &mut |i| {
+        if p(i) {
+            t.push(i as i32, get(i));
+        }
+        !(low..=high).contains(&t.cr)
+    })
+    .map_or(b1, |i| i + 1);
+    if x < b1 {
+        let (h, known) = (b1 - 1, x - 1);
+        let raised = p(h) && {
+            let mut j = h;
+            while j > known && p(j - 1) && get(j - 1) >= get(j) {
+                j -= 1;
+            }
+            (h - j) % 2 == 0
+        };
+        (t.cs, t.cr) = if raised {
+            (get(h), h as i32)
+        } else {
+            (t.cs, low)
+        };
+    }
+    walk(b1, n, &mut |i| {
+        if p(i) {
+            t.push(i as i32, get(i));
+        }
+        true
+    });
+    t.close();
+    if s > 0 {
+        (t.s2, t.te2)
+    } else {
+        (-1, -1)
+    }
+}
+
 fn write(p: &Parent, o: &mut KswAlignResult) {
     *o = KswAlignResult {
         score: p.s,
@@ -2580,6 +2676,30 @@ mod tests {
                 score2(&rows, row0, s, te, minsc, max_sc),
                 tr.finish(s, te, max_sc),
                 "rows {rows:?} row0 {row0} te {te} minsc {minsc}"
+            );
+            // `score2_lane`: the rows as lane 1 of 3 (rows from 0), under the exact bitmap or a
+            // superset of it.
+            let (lanes, nb) = (3usize, 3usize);
+            let mut rm = vec![0u8; n * lanes];
+            for (i, &v) in rows.iter().enumerate() {
+                rm[i * lanes] = (next() % 256) as u8;
+                rm[i * lanes + 1] = v;
+            }
+            let extra = next() % 2 == 0;
+            let mut bits = vec![0u8; n.div_ceil(8) * nb];
+            for (i, &v) in rows.iter().enumerate() {
+                let set = i32::from(v) >= minsc || extra && next() % 3 == 0;
+                bits[i / 8 * nb + 1] |= u8::from(set) << (i % 8);
+            }
+            let te0 = te - row0;
+            let mut tr = bwa_extend::SuboptimalTracker::new();
+            for (i, &v) in rows.iter().enumerate() {
+                tr.push_row(i as i32, i32::from(v), minsc);
+            }
+            assert_eq!(
+                score2_lane(&rm, lanes, 1, n, &bits, nb, (s, te0), minsc, max_sc),
+                tr.finish(s, te0, max_sc),
+                "lane: rows {rows:?} te {te0} minsc {minsc} extra {extra}"
             );
         }
     }
