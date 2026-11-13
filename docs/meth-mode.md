@@ -187,7 +187,8 @@ reach those kernels in three ways:
   so extension and rescue run the plain kernels on those copies.
 - **Genomic and neutral scoring** (the TAPS and 5-base default) go through a 5×5 table. The u8
   extension, rescue and band kernels look up `5 × reference + read`: a two-register `TBL` on
-  NEON, two `PSHUFB` on SSE4.1, AVX2 and AVX-512.
+  NEON, two `PSHUFB` on SSE4.1, AVX2 and AVX-512. The AVX-512 rescue kernel uses one `VPERMB`
+  instead when the CPU has VBMI (Ice Lake and later, Zen 4 and later).
 - **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
   also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
   cell scores at most the match score, so the bound holds. The relation count is scalar, so x86
@@ -258,7 +259,7 @@ bwa-mem4:
   on both mates, and it reads RNAME, POS, FLAG and CIGAR. It computes its own XM, which is why it
   passes `--meth-tags none`. All of these are as in bwa-mem3.
 - **Speed.** See [Speed](#speed): on Apple Silicon bwa-mem4 is faster than bwa-mem3 0.16 and
-  uses less memory. On x86, TAPS / 5-base (neutral scoring) still runs scalar kernels.
+  uses less memory. On x86 see the per-CPU table there.
 
 Bismark itself was not run here. The above comes from reading #1209 and the Bismark
 documentation.
