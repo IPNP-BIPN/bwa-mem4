@@ -22,7 +22,7 @@ bwa-mem4 mem --meth genome.fa R1.fq.gz R2.fq.gz > out.sam
 
 | Library | Command |
 |---|---|
-| Bisulfite, EM-seq (unmethylated C reads as T) | `mem --meth` (= `--meth=emseq`, aliases `em-seq`, `bisulfite`) |
+| Bisulfite (WGBS, RRBS), EM-seq (unmethylated C reads as T) | `mem --meth` (= `--meth=emseq`, aliases `em-seq`, `bisulfite`, and bwa-mem4's own `wgbs`, `rrbs`) |
 | TAPS (methylated C reads as T) | `mem --meth=taps` |
 | Illumina 5-base | `mem --meth=5base` (alias `5-base`; TAPS chemistry) |
 
@@ -305,6 +305,8 @@ more perf samples than bwa-mem3's; extension makes up for it.
 
 None of these differences shows up on the test set.
 
+- **`--meth=wgbs` and `--meth=rrbs` are accepted** as aliases of `--meth=emseq`; bwa-mem3 refuses
+  them. RRBS-specific handling (MspI end-repair bases) belongs to the trimmer.
 - **`--meth-context cpg` is refused.** The CpG-only scoring model (`meth_model.cpp`) is not
   ported, because Bismark runs `all`.
 - **The `BWAMEM3_METH_*` environment variables are ignored.** These are `SEED_PRUNE`,

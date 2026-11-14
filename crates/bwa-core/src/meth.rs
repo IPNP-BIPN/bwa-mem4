@@ -130,11 +130,13 @@ impl MethOpt {
 /// `--meth[=CHEM]`. Case-sensitive, as in the fork.
 pub fn parse_chem(s: &str) -> Result<Chem, String> {
     match s {
-        "emseq" | "em-seq" | "bisulfite" => Ok(Chem::EmSeq),
+        // `wgbs` and `rrbs` are ours, not the fork's: both are bisulfite, which aligns as EM-seq
+        // (RRBS's MspI end-repair bases are a trimming matter, not an aligner one).
+        "emseq" | "em-seq" | "bisulfite" | "wgbs" | "rrbs" => Ok(Chem::EmSeq),
         "taps" | "5base" | "5-base" => Ok(Chem::Taps),
         _ => Err(format!(
-            "--meth accepts 'emseq' (default; aliases em-seq, bisulfite), 'taps', or '5base' \
-             (alias 5-base), got '{s}'"
+            "--meth accepts 'emseq' (default; aliases em-seq, bisulfite, wgbs, rrbs), 'taps', or \
+             '5base' (alias 5-base), got '{s}'"
         )),
     }
 }
@@ -277,6 +279,17 @@ mod tests {
         m.fill_mats(&mat, 1);
         assert_eq!((m.mats[1][5 + 3], m.mats[1][3 * 5 + 1]), (0, -4));
         assert_eq!(MethOpt::new(Chem::Taps).scoring, Scoring::Neutral);
+    }
+
+    #[test]
+    fn chem_names() {
+        for s in ["emseq", "em-seq", "bisulfite", "wgbs", "rrbs"] {
+            assert_eq!(parse_chem(s), Ok(Chem::EmSeq), "{s}");
+        }
+        for s in ["taps", "5base", "5-base"] {
+            assert_eq!(parse_chem(s), Ok(Chem::Taps), "{s}");
+        }
+        assert!(parse_chem("pbat").is_err());
     }
 
     #[test]
