@@ -534,7 +534,6 @@ fn mem_matesw(
                         is_alt: a.is_alt,
                         // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                         alt_sc: 0,
-                        hash: 0,
                     };
                     // ---- step 4: insert the accepted hit, keeping `ma` score-sorted ----
                     // Insert keeping `ma` sorted by score descending (bwa's manual insertion at
@@ -1166,7 +1165,6 @@ fn matesw_apply(
                     is_alt: call.is_alt,
                     // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                     alt_sc: 0,
-                    hash: 0,
                 };
                 // A settled list can often take the hit without the full pass. See the function.
                 let b = if view.settled {
@@ -3610,7 +3608,6 @@ mod region_view_tests {
             frac_rep: 0.0,
             is_alt: false,
             alt_sc: 0,
-            hash: 0,
         }
     }
 
@@ -3732,7 +3729,6 @@ mod matesw_apply_tests {
             frac_rep: 0.0,
             is_alt: false,
             alt_sc: 0,
-            hash: 0,
         };
         let ma0 = vec![region(90), region(80)];
         let want = mem_sort_dedup_patch(&fm, &opt, &[], ma0.clone());

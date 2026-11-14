@@ -367,10 +367,9 @@ pub struct MemAlnReg {
     /// `pa:f` tag (`bwamem.cpp:1714`, printed as `score / alt_sc`). Stays 0 on an index with no
     /// ALT contigs, which is why `pa:f` never appears without a `.alt` file.
     pub alt_sc: i32,
-    /// Per-region hash used purely as a deterministic tie-break when two regions compare equal
-    /// during primary marking, so that ordering does not depend on sort stability. Derived from
-    /// the read id, hence the `read_id` parameter threaded through `align_read_se`.
-    pub hash: u64,
+    // No `hash` (bwa's tie-break): only primary marking reads it, so `sort_hlt` derives it from
+    // the read id and the region's index there. The batch holds every region until SAM emit, and
+    // the 8 bytes took a region from 80 to 88.
 }
 
 /// Longest gap worth allowing for a `qlen`-base extension, i.e. how far the reference window must
@@ -794,7 +793,6 @@ pub(crate) fn mem_chain2aln_meta(
                 is_alt: chain.is_alt,
                 // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                 alt_sc: 0,
-                hash: 0,
             });
             continue;
         }
@@ -823,7 +821,6 @@ pub(crate) fn mem_chain2aln_meta(
             is_alt: chain.is_alt,
             // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
             alt_sc: 0,
-            hash: 0,
         };
 
         // ---------------------------- step 3a: extend leftwards ----------------------------

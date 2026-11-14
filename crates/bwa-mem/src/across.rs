@@ -1814,7 +1814,6 @@ fn align_reads_batched_inner<B: SwBackend>(
                         is_alt: chain.is_alt,
                         // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                         alt_sc: 0,
-                        hash: 0,
                     });
                     continue;
                 }
@@ -1847,7 +1846,6 @@ fn align_reads_batched_inner<B: SwBackend>(
                     is_alt: chain.is_alt,
                     // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                     alt_sc: 0,
-                    hash: 0,
                 };
 
                 // ---- left extension job, or seed-terminal left edge (`bwamem.cpp:2245-2322`) ----
