@@ -1000,6 +1000,16 @@ fn ungapped_hit_mat(job: &ExtendJob, mat: &[i8], gap_min: i32, zdrop: i32) -> Op
     })
 }
 
+/// Exclusive bound on the target length (the DP rows) of a u8 extension job: the i16 kernel's,
+/// since every row quantity (`max_i`, `max_ie`, `max_off`, the band edges before clamping, the
+/// z-drop distances) lives in the i16 row lanes (`trk = i16`), never in a u8 one. The u8 lanes hold
+/// scores and columns only, which the query length and the cell bound keep under 256; a live
+/// lane's band start never passes the query length either (the row after its band empties, the
+/// lane is done). At 250 bp most extension targets are past 256 (the read's rest plus the band),
+/// which sent them to the 8-lane i16 kernel: 23% of an M4 `--meth` 250 bp run.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const U8_TLEN: usize = 32768;
+
 /// Extension under a 5x5 matrix with diagonal `mat[0]` and every cell in `[mat[1], mat[0]]`
 /// (`--meth`'s neutral and genomic): [`ungapped_hit_mat`] first, then the u8 kernel's `tab5` form
 /// (NEON, or the calibrated x86 tier) for every job it can hold, the i16 one for every job within
@@ -1035,17 +1045,20 @@ fn mat5_extend(
             None => true,
         })
         .collect();
-    // The job fits lanes of `len` (both lengths and its cell bound, as in `dispatch_bins`).
-    let fits = |k: usize, len: usize| {
+    // The job fits lanes of `len` (query length and cell bound, as in `dispatch_bins`; the target
+    // within `tlen`).
+    let fits = |k: usize, len: usize, tlen: usize| {
         let j = &jobs[k];
         j.h0 > 0
             && j.query.len() < len
-            && j.target.len() < len
+            && j.target.len() < tlen
             && cell_bound(j, max_sc) + headroom < len as i32
     };
-    let (fit, rest): (Vec<usize>, Vec<usize>) = dp.into_iter().partition(|&k| fits(k, U8_LEN));
-    let (fit16, rest): (Vec<usize>, Vec<usize>) =
-        rest.into_iter().partition(|&k| fits(k, MAX_SEQ_LEN16));
+    let (fit, rest): (Vec<usize>, Vec<usize>) =
+        dp.into_iter().partition(|&k| fits(k, U8_LEN, U8_TLEN));
+    let (fit16, rest): (Vec<usize>, Vec<usize>) = rest
+        .into_iter()
+        .partition(|&k| fits(k, MAX_SEQ_LEN16, MAX_SEQ_LEN16));
     let pick = |idx: &[usize]| idx.iter().map(|&k| jobs[k]).collect::<Vec<_>>();
     let inl = inline_sbt_enabled();
     let (fit_jobs, fit16_jobs) = (pick(&fit), pick(&fit16));
@@ -1346,13 +1359,14 @@ fn dispatch_bins(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
-    // The 8-bit kernel is **unsigned u8** (values 0..=255, positions <256), so it takes any job whose
-    // score ceiling `minval` and both lengths fit under 256 — twice the reach of bwa-mem2's signed
+    // The 8-bit kernel is **unsigned u8** (values 0..=255, columns <256), so it takes any job whose
+    // score ceiling `minval` and query length fit under 256 — twice the reach of bwa-mem2's signed
     // `MAX_SEQ_LEN8=128`, hence far more jobs run in 16 lanes vs int16's 8. Both kernels are exact in
     // range, so this only changes which one runs, never the result.
-    // Exclusive limits, in the same units for both lengths (bases) and scores. Raising `U8_LEN`
-    // past 256 would let a score or a column index wrap in a u8 lane and silently corrupt results;
-    // `MAX_SEQ_LEN16` is bwa-mem2's own name and value (`bandedSWA.h`) for the signed-i16 ceiling.
+    // Exclusive limits, in the same units for lengths (bases) and scores. Raising `U8_LEN` past 256
+    // would let a score or a column index wrap in a u8 lane and silently corrupt results; the
+    // target (the rows) has the i16 kernel's bound, `MAX_SEQ_LEN16`, bwa-mem2's own name and value
+    // (`bandedSWA.h`) for the signed-i16 ceiling: [`U8_TLEN`] says why.
     const U8_LEN: usize = 256;
     const MAX_SEQ_LEN16: usize = 32768;
     // Largest single-cell score the matrix can award, feeding `cell_bound`'s worst case.
@@ -1407,11 +1421,11 @@ fn dispatch_bins(
             bin_split::record(
                 (qlen * tlen) as u64,
                 qlen >= U8_LEN,
-                tlen >= U8_LEN,
+                tlen >= U8_TLEN,
                 minval + sbt_headroom >= U8_LEN as i32,
             );
         }
-        if qlen < U8_LEN && tlen < U8_LEN && minval + sbt_headroom < U8_LEN as i32 {
+        if qlen < U8_LEN && tlen < U8_TLEN && minval + sbt_headroom < U8_LEN as i32 {
             u8_idx.push(k);
         } else if qlen < MAX_SEQ_LEN16
             && tlen < MAX_SEQ_LEN16
@@ -7599,6 +7613,80 @@ mod clamp_band_tests {
 #[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod mat5_tests {
     use bwa_extend::ExtendJob;
+
+    /// Targets of 256 to ~1300 bases on the u8 kernels (standard matrix through `dispatch_bins`,
+    /// a `--meth` genomic matrix through `mat5_extend`), every field against the scalar reference:
+    /// [`super::U8_TLEN`] lets them in. Queries of 100 to 249 bases with `h0` under the u8 cell
+    /// bound; the targets hold the query with a 20 to 90 base insertion, so the best cell and the
+    /// query end (`max_i`, `max_ie`) fall on rows past 255, and a random tail past that.
+    #[test]
+    fn u8_extend_takes_long_targets_exactly() {
+        super::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut genomic = vec![-4i8; 25];
+        for k in 0..5 {
+            genomic[k * 5 + 4] = -1;
+            genomic[20 + k] = -1;
+        }
+        for k in 0..4 {
+            genomic[k * 6] = 1;
+        }
+        genomic[5 + 3] = 1; // reference C, read T (OT, genomic)
+        let mut standard = genomic.clone();
+        standard[5 + 3] = -4;
+        let (mut long, mut deep) = (0usize, 0usize);
+        for (name, mat) in [("standard", &standard), ("genomic", &genomic)] {
+            for round in 0..24u32 {
+                let n = 1 + (next() % 40) as usize;
+                let mut seqs: Vec<(Vec<u8>, Vec<u8>, i32)> = Vec::new();
+                for _ in 0..n {
+                    let qlen = 100 + (next() % 150) as usize;
+                    let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                    let cut = (next() as usize) % qlen;
+                    let mut t: Vec<u8> = Vec::new();
+                    for (k, &b) in q.iter().enumerate() {
+                        if k == cut {
+                            t.extend((0..20 + next() % 70).map(|_| (next() % 4) as u8));
+                        }
+                        t.push(if next() % 30 == 0 {
+                            (next() % 4) as u8
+                        } else {
+                            b
+                        });
+                    }
+                    t.extend((0..next() % 1000).map(|_| (next() % 4) as u8));
+                    // `h0 + qlen` plus the matrix's headroom (4 + 1) stays under 256.
+                    let h0 = 1 + (next() % (250 - qlen as u64)) as i32;
+                    long += usize::from(t.len() >= 256);
+                    seqs.push((q, t, h0));
+                }
+                let jobs: Vec<ExtendJob> = seqs
+                    .iter()
+                    .map(|(q, t, h0)| ExtendJob {
+                        query: q,
+                        target: t,
+                        h0: *h0,
+                    })
+                    .collect();
+                let (w, eb, zd) = (
+                    [50, 100, 200][(next() % 3) as usize],
+                    (next() % 12) as i32,
+                    [0, 100, 300][(next() % 3) as usize],
+                );
+                let want = super::batched_extend_scalar(&jobs, 5, mat, 6, 1, 6, 1, w, eb, zd);
+                deep += want.iter().filter(|r| r.tle > 256 || r.gtle > 256).count();
+                let got = super::batched_extend(&jobs, 5, mat, 6, 1, 6, 1, w, eb, zd);
+                assert_eq!(got, want, "{name} round {round} w {w} zdrop {zd}");
+            }
+        }
+        assert!(long > 500 && deep > 100, "long {long} deep {deep}");
+    }
 
     /// `--meth`'s matrices (neutral and genomic through the `tab5` kernel, collapsed through the
     /// rewrite to the uniform matrix) against the scalar reference: noisy copies of the query with
