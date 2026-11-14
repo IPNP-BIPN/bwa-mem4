@@ -1059,6 +1059,7 @@ fn mat5_extend(
     let (fit16, rest): (Vec<usize>, Vec<usize>) = rest
         .into_iter()
         .partition(|&k| fits(k, MAX_SEQ_LEN16, MAX_SEQ_LEN16));
+    let (fit, fit_band) = band_order(jobs, fit, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus);
     let pick = |idx: &[usize]| idx.iter().map(|&k| jobs[k]).collect::<Vec<_>>();
     let inl = inline_sbt_enabled();
     let (fit_jobs, fit16_jobs) = (pick(&fit), pick(&fit16));
@@ -1079,6 +1080,9 @@ fn mat5_extend(
             }
         };
     }
+    if !fit_band.is_empty() {
+        BAND_HINT.with(|h| *h.borrow_mut() = fit_band);
+    }
     // SAFETY: the caller detected the ISA (NEON, or SSE4.1 at least on x86, whose tier names
     // only a feature the host has); every job passed the u8 bounds above; the matrix is the
     // `tab5` shape.
@@ -1097,6 +1101,7 @@ fn mat5_extend(
             ),
         }
     };
+    BAND_HINT.with(|h| h.borrow_mut().clear());
     for (&k, r) in fit.iter().zip(got) {
         out[k] = r;
     }
@@ -1472,65 +1477,9 @@ fn dispatch_bins(
     let n = jobs.len();
     // Band order of the u8 batch (see `band_split`); the bands go to the kernel through `BAND_HINT`.
     let split = band_split();
-    let mut u8_band: Vec<i32> = Vec::new();
-    if split != 0 && u8_idx.len() > 1 {
-        let band = |k: usize| {
-            let job = &jobs[k];
-            let mut wl = clamp_band(
-                w0,
-                job.query.len(),
-                max_sc,
-                end_bonus,
-                o_ins,
-                e_ins,
-                o_del,
-                e_del,
-            );
-            if tight_band_enabled() {
-                wl = wl.min(tight_band_bound(
-                    job.query,
-                    job.target,
-                    job.h0,
-                    i32::from(mat[0]),
-                    i32::from(mat[1]),
-                    (o_del.min(o_ins), e_del.min(e_ins)),
-                    end_bonus,
-                ));
-            }
-            wl
-        };
-        // At most 9 classes: a stable counting sort, the stable sort's permutation in O(n).
-        let class = |w: i32| {
-            if split > 0 {
-                usize::from(w >= split)
-            } else {
-                (w / -split).clamp(0, 8) as usize
-            }
-        };
-        let bands: Vec<i32> = (0..u8_idx.len())
-            .map(|i| {
-                if let Some(&n) = u8_idx.get(i + PF_AHEAD) {
-                    prefetch_job(jobs, n);
-                }
-                band(u8_idx[i])
-            })
-            .collect();
-        let mut start = [0usize; 10];
-        for &w in &bands {
-            start[class(w) + 1] += 1;
-        }
-        for c in 1..start.len() {
-            start[c] += start[c - 1];
-        }
-        let (mut idx, mut wb) = (vec![0usize; bands.len()], vec![0i32; bands.len()]);
-        for (&k, &w) in u8_idx.iter().zip(&bands) {
-            let c = class(w);
-            (idx[start[c]], wb[start[c]]) = (k, w);
-            start[c] += 1;
-        }
-        u8_idx = idx;
-        u8_band = wb;
-    }
+    let (u8_idx, u8_band) = band_order(
+        jobs, u8_idx, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus,
+    );
     // The three single-bin fast paths. Each has to go through `expand`, because with the dedup
     // above `jobs` is the DISTINCT batch and the caller is owed one result per ORIGINAL job. Missing
     // that on these paths is what the paired-end overlap test caught: they are the common case, so
@@ -1587,6 +1536,87 @@ fn dispatch_bins(
     // Expand back to one result per ORIGINAL job. `out` currently holds one per distinct job; every
     // repeat takes its representative's answer, which is the same answer it would have computed.
     expand(out, dup_map)
+}
+
+/// `idx`, the jobs of a u8 batch, in band order (see [`band_split`]), with each one's band as the
+/// kernel computes it, which it then takes from `BAND_HINT`; `idx` as given and no bands under
+/// `BWA4_BAND_SPLIT=0` or for one job.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn band_order(
+    jobs: &[ExtendJob],
+    idx: Vec<usize>,
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w0: i32,
+    end_bonus: i32,
+) -> (Vec<usize>, Vec<i32>) {
+    let split = band_split();
+    if split == 0 || idx.len() < 2 {
+        return (idx, Vec::new());
+    }
+    let u8_idx = idx;
+    // The kernel's own `max_sc`, so a hinted band is the one it would compute.
+    let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
+    let band = |k: usize| {
+        let job = &jobs[k];
+        let mut wl = clamp_band(
+            w0,
+            job.query.len(),
+            max_sc,
+            end_bonus,
+            o_ins,
+            e_ins,
+            o_del,
+            e_del,
+        );
+        if tight_band_enabled() {
+            wl = wl.min(tight_band_bound(
+                job.query,
+                job.target,
+                job.h0,
+                i32::from(mat[0]),
+                i32::from(mat[1]),
+                (o_del.min(o_ins), e_del.min(e_ins)),
+                end_bonus,
+            ));
+        }
+        wl
+    };
+    // At most 9 classes: a stable counting sort, the stable sort's permutation in O(n).
+    let class = |w: i32| {
+        if split > 0 {
+            usize::from(w >= split)
+        } else {
+            (w / -split).clamp(0, 8) as usize
+        }
+    };
+    let bands: Vec<i32> = (0..u8_idx.len())
+        .map(|i| {
+            if let Some(&n) = u8_idx.get(i + PF_AHEAD) {
+                prefetch_job(jobs, n);
+            }
+            band(u8_idx[i])
+        })
+        .collect();
+    let mut start = [0usize; 10];
+    for &w in &bands {
+        start[class(w) + 1] += 1;
+    }
+    for c in 1..start.len() {
+        start[c] += start[c - 1];
+    }
+    let (mut idx, mut wb) = (vec![0usize; bands.len()], vec![0i32; bands.len()]);
+    for (&k, &w) in u8_idx.iter().zip(&bands) {
+        let c = class(w);
+        (idx[start[c]], wb[start[c]]) = (k, w);
+        start[c] += 1;
+    }
+    (idx, wb)
 }
 
 /// Turn one result per DISTINCT job into one result per original job.

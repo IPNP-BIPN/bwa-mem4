@@ -197,7 +197,10 @@ reach those kernels in three ways:
   its target length (up to the i16 kernel's 32,767): the row quantities live in 16-bit lanes. At
   250 bp most extension targets (the rest of the read plus the band) are longer than 255 bases,
   and took the 8-lane i16 kernel until 818ddf9 (M4 250 bp: EM-seq -13% cycles, TAPS -11%).
-  bwa-mem3's 8-bit kernel goes to 1,088 bases the same way.
+  bwa-mem3's 8-bit kernel goes to 1,088 bases the same way. Under the 5×5 table (TAPS) the u8
+  batch is ordered by band class before it is cut into vectors, as the standard matrix's already
+  was, so a vector's narrow bands do not run its widest lane's columns (M4 TAPS 250 bp: executed
+  cells 1.62× the bands' → 1.37×, -3% instructions; 150 bp -1%).
 - **Mate rescue on the u8 kernel** takes a job whenever its score ceiling plus the table's bias
   fits a byte, as bwa-mem3 0.16 does (`matesw_use_u8`). At the default scoring that includes the
   250 bp mate, which bwa sends to its i16 kernel. The query padding stays bwa's, so the output
