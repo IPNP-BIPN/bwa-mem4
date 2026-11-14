@@ -527,7 +527,8 @@ pub struct MemArgs {
     // ---- Methylation mode, ported from fg-labs/bwa-mem3 0.16 (see `docs/meth-mode.md`) ----
     // Long-only, spelled as in the fork so a Bismark command line runs unchanged. The value of
     // `--meth` binds only with `=`, as in the fork: `--meth taps` would make `taps` the index.
-    /// Bisulfite/EM-seq/TAPS mode: emseq (default; bisulfite, em-seq), taps, 5base (5-base).
+    /// Bisulfite/EM-seq/TAPS mode: emseq (default; bisulfite, em-seq, wgbs, rrbs), taps, 5base
+    /// (5-base).
     /// Needs an index built with `index --meth`.
     #[arg(long = "meth", value_name = "CHEM", num_args = 0..=1, require_equals = true,
           default_missing_value = "emseq")]
