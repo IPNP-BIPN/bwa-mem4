@@ -46,20 +46,17 @@
 //! |-----------|---------------|
 //! | `Vec::reserve` | grows the buffer's capacity ONCE, up front, so the per-byte writes that follow cannot each trigger a reallocation. |
 //! | `extend_from_slice` | appends a whole slice in one `memcpy`, rather than a loop of pushes with a capacity check each. |
-//! | `[u8; N]` on the stack | a fixed-size array living in the function's frame. Used as a scratch buffer so formatting a number allocates nothing. |
+//! | `[u8; N]` on the stack | a fixed-size array living in the function's frame. Used as a scratch block the base encoders fill before one append. |
+//! | `spare_capacity_mut` + `set_len` | writes into the reserved bytes past the end, then declares them part of the vector: how a number's digits land in place with no copy. |
 //! | `const fn` | a function the compiler can evaluate at compile time, here to build a 256-entry lookup table as a constant rather than at startup. |
 //! | `chunks_exact(N)` | walks a slice in fixed-size pieces, with the remainder handed back separately. The fixed size is what lets the compiler unroll and vectorise the body. |
-
-/// Largest number of decimal digits an `i64` can need, plus its sign.
-///
-/// `i64::MIN` is 19 digits and a minus sign, so 20 bytes is exact rather than generous.
-const MAX_I64_DIGITS: usize = 20;
 
 /// Append `value`'s decimal representation to `out`, allocating nothing.
 ///
 /// The replacement for `out.extend_from_slice(value.to_string().as_bytes())`, which allocated a
-/// `String` per number. Digits are generated least-significant first into a stack buffer and then
-/// copied out in one `extend_from_slice`.
+/// `String` per number. The digit count comes first, so the digits are written straight into the
+/// spare capacity, least-significant last: a stack buffer copied out with `extend_from_slice` cost
+/// a `memcpy` call per integer (18 per pair, 44% of every copy call on a PE run).
 ///
 /// # Parameters
 ///
@@ -68,29 +65,25 @@ const MAX_I64_DIGITS: usize = 20;
 ///   requires.
 #[inline]
 pub fn push_int(out: &mut Vec<u8>, value: i64) {
-    // 0 has no digits under the loop below (it terminates on `n == 0`), so it is written directly.
-    if value == 0 {
-        out.push(b'0');
-        return;
-    }
-    let mut buf = [0u8; MAX_I64_DIGITS];
-    // Write position, walking BACKWARD from the end of the buffer: the loop produces the
-    // least-significant digit first, and this is what puts it last.
-    let mut i = MAX_I64_DIGITS;
     // `unsigned_abs`, not `abs`: `i64::MIN.abs()` overflows, and TLEN can legitimately be very
-    // negative. The sign is remembered separately and prepended below.
+    // negative. The sign is remembered separately and written first.
     let negative = value < 0;
     let mut n = value.unsigned_abs();
-    while n > 0 {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
+    let digits = n.checked_ilog10().map_or(1, |d| d as usize + 1);
+    let total = digits + usize::from(negative);
+    out.reserve(total);
+    let spare = &mut out.spare_capacity_mut()[..total];
+    if negative {
+        spare[0].write(b'-');
+    }
+    // Backward from the end: the loop produces the least-significant digit first. Zero writes one
+    // '0'.
+    for slot in spare[usize::from(negative)..].iter_mut().rev() {
+        slot.write(b'0' + (n % 10) as u8);
         n /= 10;
     }
-    if negative {
-        i -= 1;
-        buf[i] = b'-';
-    }
-    out.extend_from_slice(&buf[i..]);
+    // SAFETY: the `total` bytes past the old length were all written above.
+    unsafe { out.set_len(out.len() + total) };
 }
 
 /// Same as [`push_int`] for a `String`, which the MD:Z and CIGAR builders accumulate into.
@@ -101,26 +94,9 @@ pub fn push_int(out: &mut Vec<u8>, value: i64) {
 /// - `value`: the number to write.
 #[inline]
 pub fn push_int_str(out: &mut String, value: i64) {
-    if value == 0 {
-        out.push('0');
-        return;
-    }
-    let mut buf = [0u8; MAX_I64_DIGITS];
-    let mut i = MAX_I64_DIGITS;
-    let negative = value < 0;
-    let mut n = value.unsigned_abs();
-    while n > 0 {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    if negative {
-        i -= 1;
-        buf[i] = b'-';
-    }
-    // SAFETY: the buffer holds ASCII digits and an optional '-', so the string stays UTF-8. The
+    // SAFETY: `push_int` appends ASCII digits and an optional '-', so the string stays UTF-8. The
     // checked `from_utf8` cost 0.5G cycles per 2M pairs.
-    unsafe { out.as_mut_vec() }.extend_from_slice(&buf[i..]);
+    push_int(unsafe { out.as_mut_vec() }, value);
 }
 
 /// Build a 256-entry table mapping an nt4 code to its SAM character, so the encoders below need no
