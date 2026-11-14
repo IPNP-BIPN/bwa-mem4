@@ -1046,10 +1046,19 @@ pub(crate) fn ksw_global2_scalar(
 ///
 /// # Returns
 ///
-/// `(w, S)` with `w <= w_` the band to use. `w == 0` happens only for equal lengths and means the
-/// diagonal is the sole path scoring `S` or better, so the result is `S` and a single `M` run and
-/// the DP can be skipped. Returns `(w_, S)` unchanged for a matrix with no positive cell or negative
-/// gap penalties, where the bound's monotonicity does not hold.
+/// `(w, S)` with `w <= w_` the band to use. `w == 0` happens only for equal lengths and means no
+/// path scores above `S`, so the result is `S` and a single `M` run and the DP can be skipped.
+///
+/// That holds even when another path ties `S`. A path leaving the diagonal does so in excursions,
+/// each with at least one `I` and one `D` run; one spanning query `[p, r)` aligns at most `r - p - 1`
+/// pairs, so it gains at most `sum (a - s_k) - a - (o_ins + e_ins) - (o_del + e_del)` over that
+/// span, `s_k` the diagonal's cells. With `L * a - S` the sum over the whole diagonal, no path beats
+/// `S` once that sum is at most `a + o_ins + e_ins + o_del + e_del`. Then `H(L-1, L-1) = S`, which
+/// forces `H(k, k) = M(k, k)` all the way down the diagonal, and the traceback, preferring M on
+/// ties, walks it. Strictness would only matter if the traceback could prefer a tying gap.
+///
+/// Returns `(w_, S)` unchanged for a matrix with no positive cell or negative gap penalties, where
+/// the bound's monotonicity does not hold.
 ///
 /// # Parameters
 ///
@@ -1098,6 +1107,10 @@ pub fn tightened_global_band(
     let denom = a + e_del + e_ins;
     let budget = short_len as i32 * a - score - (o_del + o_ins) - gap * e_long;
     // `v_max`: the largest overshoot whose ceiling still reaches `score`.
+    // `budget <= denom` with no length difference is the tie case above: no path beats `S`.
+    if gap == 0 && budget <= denom {
+        return (0, score);
+    }
     let v_max = (budget / denom).max(0);
     ((gap + v_max).min(w_), score)
 }
@@ -1732,6 +1745,29 @@ mod tests {
         let mut odd = scmat(1, 4);
         odd[2] = -3;
         assert_eq!(uniform_cells(&odd, 5), None);
+    }
+
+    #[test]
+    fn diagonal_tied_by_a_gapped_path_is_still_the_cigar() {
+        // Shifting the middle by one turns its 3 mismatches into matches and pays exactly the 14 of
+        // the two gaps, so a gapped path ties the diagonal's score of 2.
+        let code = |s: &[u8]| -> Vec<u8> {
+            s.iter()
+                .map(|&c| b"ACGT".iter().position(|&x| x == c).unwrap() as u8)
+                .collect()
+        };
+        let (q, t) = (code(b"TTAAACCCCGGGGTTCA"), code(b"TTAAAACCCCGGGGTCA"));
+        let mat = scmat(1, 4);
+        assert_eq!(
+            tightened_global_band(&q, &t, 5, &mat, 6, 1, 6, 1, 5),
+            (0, 2)
+        );
+        assert_eq!(
+            ksw_global2(&q, &t, 5, &mat, 6, 1, 6, 1, 5),
+            (2, vec![17 << 4])
+        );
+        // One less per gap open and the gapped path wins outright: the tie above is real.
+        assert_eq!(ksw_global2(&q, &t, 5, &mat, 5, 1, 5, 1, 5).0, 4);
     }
 
     #[test]
