@@ -505,11 +505,34 @@ fn primary_hits(
 /// One bit per nonzero count, bit `x` for `cnt[x]`.
 #[inline]
 fn occupied_word(cnt: &[u16]) -> u64 {
-    let mut bits = 0u64;
-    for (x, &c) in cnt[..64].iter().enumerate() {
-        bits |= u64::from(c != 0) << x;
+    let cnt = &cnt[..64];
+    // SSE2 (x86-64 baseline): LLVM's own vectorisation widened every count to 64 bits, ~65
+    // instructions a word; compare, pack and movemask take 16 counts in four.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        let mut zero_bits = 0u64;
+        // SAFETY: SSE2 is part of x86-64; the eight unaligned 16-byte loads stay inside `cnt`.
+        unsafe {
+            let z = _mm_setzero_si128();
+            let p = cnt.as_ptr().cast::<__m128i>();
+            for g in 0..4 {
+                let a = _mm_cmpeq_epi16(_mm_loadu_si128(p.add(2 * g)), z);
+                let b = _mm_cmpeq_epi16(_mm_loadu_si128(p.add(2 * g + 1)), z);
+                let m = _mm_movemask_epi8(_mm_packs_epi16(a, b)) as u32;
+                zero_bits |= u64::from(m) << (16 * g);
+            }
+        }
+        !zero_bits
     }
-    bits
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut bits = 0u64;
+        for (x, &c) in cnt.iter().enumerate() {
+            bits |= u64::from(c != 0) << x;
+        }
+        bits
+    }
 }
 
 /// The K = 5 hit counter in NEON, after fg-labs/bwa-mem3's `lean_neon` (`src/rescue_prune_neon.h`,
@@ -2171,6 +2194,24 @@ fn gap_min(p: &Params, f_left: i32, b_right: i32, gap: u32) -> i32 {
 pub(crate) mod tests {
     use super::*;
     use bwa_extend::ksw_align2;
+
+    /// The SIMD [`occupied_word`] sets bit `x` exactly when `cnt[x] != 0`, counts up to `u16::MAX`.
+    #[test]
+    fn occupied_word_marks_nonzero_counts() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2000 {
+            let cnt: Vec<u16> = (0..64)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    [0, 0, 1, 255, 256, u16::MAX, x as u16][(x >> 32) as usize % 7]
+                })
+                .collect();
+            let want = (0..64).fold(0u64, |b, i| b | u64::from(cnt[i] != 0) << i);
+            assert_eq!(occupied_word(&cnt), want);
+        }
+    }
 
     /// [`super::count_hits`] with `cnt` made dense: the counter leaves `cnt` stale where no
     /// `occ_bits` bit is set (production reads it only under one), these tests read every slot.
