@@ -1077,6 +1077,12 @@ fn rescue_kernel(opt: &MemOpt, jobs: &[KswJob], group: &[bool]) -> Vec<KswAlignR
         .collect()
 }
 
+/// `--meth`: whether read `read` carries C->T (`MethOpt::read_ot`); read 1 outside `--meth`,
+/// where nothing reads it.
+fn read_ot(opt: &MemOpt, read: usize) -> bool {
+    opt.meth.as_ref().map_or(read == 0, |m| m.read_ot(read))
+}
+
 fn rescue_jobs<'a>(
     call: &'a RescueCall,
     ms: &'a [u8],
@@ -1576,7 +1582,7 @@ pub fn batch_mate_rescue(
                         });
                         head.insert(key, (seen.len() - 1) as u32);
                         jobs.push(job);
-                        group.push((at.1 == 1) ^ o.is_rev);
+                        group.push(read_ot(opt, 1 - at.1 as usize) ^ o.is_rev);
                         (jobs.len() - 1) as u32
                     }));
                 }
@@ -1638,7 +1644,7 @@ pub fn batch_mate_rescue(
                         .per_r
                         .iter()
                         .flatten()
-                        .map(|o| (dir == 1) ^ o.is_rev)
+                        .map(|o| read_ot(opt, 1 - dir) ^ o.is_rev)
                         .collect();
                     let alns = rescue_kernel(opt, &jobs, &group);
                     matesw_apply(fm, bns, opt, &call, &alns, target, view, None, 0);
@@ -3089,12 +3095,15 @@ pub fn mem_sam_pe<W: Write>(
     // ---- stage 1: mate rescue ----
     // `--meth`: each end's own chemistry matrix (read 1 C->T, read 2 G->A) and record context.
     // Plain runs borrow `opt` and carry no context.
-    let ropt = [
-        crate::meth::read_opt(opt, true),
-        crate::meth::read_opt(opt, false),
-    ];
+    let ropt = [0, 1].map(|r| crate::meth::read_opt(opt, read_ot(opt, r)));
     let emit = opt.meth.as_ref().map_or([None, None], |meth| {
-        [true, false].map(|ot| Some(MethEmit { fm, meth, ot }))
+        [0, 1].map(|r| {
+            Some(MethEmit {
+                fm,
+                meth,
+                ot: meth.read_ot(r),
+            })
+        })
     });
     if !rescue_done {
         // `-U`: any region within this of the best is a plausible anchor. `-m`: anchor cap.
@@ -3118,10 +3127,10 @@ pub fn mem_sam_pe<W: Write>(
         let b0 = near_best(a0);
         let b1 = near_best(a1);
         for anchor in b0.iter().take(anchor_cap) {
-            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1, false);
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1, read_ot(opt, 1));
         }
         for anchor in b1.iter().take(anchor_cap) {
-            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0, true);
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0, read_ot(opt, 0));
         }
     }
 

@@ -528,7 +528,7 @@ pub struct MemArgs {
     // Long-only, spelled as in the fork so a Bismark command line runs unchanged. The value of
     // `--meth` binds only with `=`, as in the fork: `--meth taps` would make `taps` the index.
     /// Bisulfite/EM-seq/TAPS mode: emseq (default; bisulfite, em-seq, wgbs, rrbs), taps, 5base
-    /// (5-base).
+    /// (5-base), pbat (emseq with --pbat).
     /// Needs an index built with `index --meth`.
     #[arg(long = "meth", value_name = "CHEM", num_args = 0..=1, require_equals = true,
           default_missing_value = "emseq")]
@@ -552,6 +552,10 @@ pub struct MemArgs {
     /// bwameth's chimera rule: longest M < 44% of the read sets 0x200, clears 0x2, caps MAPQ at 1.
     #[arg(long = "chimera-qc")]
     pub chimera_qc: bool,
+    /// PBAT library (Bismark's --pbat): read 1 is G->A (CTOT/CTOB), read 2 C->T. `--meth=pbat`
+    /// is `--meth --pbat`. Not in bwa-mem3.
+    #[arg(long = "pbat")]
+    pub pbat: bool,
 }
 
 /// Parse bwa's `INT[,INT]` pair syntax. bwa reads the first integer with `strtol`, then takes a
@@ -1109,13 +1113,20 @@ fn build_meth(args: &MemArgs, opt: &mut MemOpt) -> anyhow::Result<Option<bwa_cor
             (args.meth_seed_prune.is_some(), "--meth-seed-prune"),
             (args.set_as_failed.is_some(), "--set-as-failed"),
             (args.chimera_qc, "--chimera-qc"),
+            (args.pbat, "--pbat"),
         ];
         if let Some((_, flag)) = stray.iter().find(|(given, _)| *given) {
             anyhow::bail!("{flag} requires --meth");
         }
         return Ok(None);
     };
+    // `--meth=pbat`: bisulfite chemistry in a PBAT library, i.e. `--meth --pbat`.
+    let (chem, pbat) = match chem.as_str() {
+        "pbat" => ("emseq", true),
+        c => (c, args.pbat),
+    };
     let mut m = meth::MethOpt::new(meth::parse_chem(chem).map_err(anyhow::Error::msg)?);
+    m.pbat = pbat;
     if let Some(s) = &args.meth_scoring {
         m.scoring = meth::parse_scoring(s).map_err(anyhow::Error::msg)?;
     }
@@ -2728,15 +2739,17 @@ fn meth_regs(
     reads: &[&Record],
     paired: bool,
 ) -> Vec<Vec<MemAlnReg>> {
-    let ot_opt = bwa_mem::meth::read_opt(opt, true);
+    let meth = opt.meth.as_ref().expect("meth_regs runs under --meth");
+    let (ot1, ot2) = (meth.read_ot(0), meth.read_ot(1));
+    let opt1 = bwa_mem::meth::read_opt(opt, ot1);
     if !paired {
-        return batched_regs(fm, bns, &ot_opt, reads, false, Some(true));
+        return batched_regs(fm, bns, &opt1, reads, false, Some(ot1));
     }
     let r1: Vec<&Record> = reads.iter().step_by(2).copied().collect();
     let r2: Vec<&Record> = reads.iter().skip(1).step_by(2).copied().collect();
-    let ob_opt = bwa_mem::meth::read_opt(opt, false);
-    let a = batched_regs(fm, bns, &ot_opt, &r1, false, Some(true));
-    let b = batched_regs(fm, bns, &ob_opt, &r2, false, Some(false));
+    let opt2 = bwa_mem::meth::read_opt(opt, ot2);
+    let a = batched_regs(fm, bns, &opt1, &r1, false, Some(ot1));
+    let b = batched_regs(fm, bns, &opt2, &r2, false, Some(ot2));
     a.into_iter().zip(b).flat_map(|(x, y)| [x, y]).collect()
 }
 
@@ -2760,12 +2773,13 @@ fn finish_se_meth(
         bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);
     }
     let meth = opt.meth.as_ref().expect("finish_se_meth runs under --meth");
-    let emit = bwa_mem::meth::MethEmit { fm, meth, ot: true };
+    let ot = meth.read_ot(0);
+    let emit = bwa_mem::meth::MethEmit { fm, meth, ot };
     let mut buf = Vec::new();
     bwa_mem::pe::mem_reg2sam(
         fm,
         bns,
-        &bwa_mem::meth::read_opt(opt, true),
+        &bwa_mem::meth::read_opt(opt, ot),
         rec.name(),
         codes,
         rec.qual(),

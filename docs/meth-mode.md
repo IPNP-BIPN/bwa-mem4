@@ -25,13 +25,20 @@ bwa-mem4 mem --meth genome.fa R1.fq.gz R2.fq.gz > out.sam
 | Bisulfite (WGBS, RRBS), EM-seq (unmethylated C reads as T) | `mem --meth` (= `--meth=emseq`, aliases `em-seq`, `bisulfite`, and bwa-mem4's own `wgbs`, `rrbs`) |
 | TAPS (methylated C reads as T) | `mem --meth=taps` |
 | Illumina 5-base | `mem --meth=5base` (alias `5-base`; TAPS chemistry) |
+| PBAT (any of the above) | add `--pbat`; `--meth=pbat` is `--meth --pbat` |
 
 The chemistry binds only with `=`, as in bwa-mem3. In `--meth taps`, `taps` would be read as the
 index.
 
 The library must be directional: read 1 (or a single-end read) carries C→T and comes from the
-original top (OT) or original bottom (OB) strand, and read 2 carries G→A. Non-directional
-libraries (CTOT/CTOB) and PBAT are not aligned as such.
+original top (OT) or original bottom (OB) strand, and read 2 carries G→A. Under `--pbat` (Bismark's
+`--pbat`) it is the reverse: read 1 carries G→A and comes from the complementary strands (CTOT,
+CTOB; `XR:Z:GA`), read 2 carries C→T. Non-directional libraries, where either read can carry
+either conversion, are not aligned as such.
+
+A PBAT pair is a directional pair with its mates swapped. On simulated EM-seq and TAPS pairs (150
+and 250 bp), `--pbat` on (R2, R1) places as many reads correctly as the directional mode on (R1, R2),
+to 0.02%. The records differ only where bwa breaks a tie with a hash of the read's mate number.
 
 ### Index
 
@@ -305,6 +312,7 @@ more perf samples than bwa-mem3's; extension makes up for it.
 
 None of these differences shows up on the test set.
 
+- **`--pbat` and `--meth=pbat` are bwa-mem4's own**; bwa-mem3 has no PBAT mode.
 - **`--meth=wgbs` and `--meth=rrbs` are accepted** as aliases of `--meth=emseq`; bwa-mem3 refuses
   them. RRBS-specific handling (MspI end-repair bases) belongs to the trimmer.
 - **`--meth-context cpg` is refused.** The CpG-only scoring model (`meth_model.cpp`) is not
