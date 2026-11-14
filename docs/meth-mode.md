@@ -260,6 +260,22 @@ moves wall times by up to 2x, cycles much less. The SAM output was identical. Ma
 | EM-seq | 17.2 / 26.3 (0.65) | 24.1 / 45.0 (0.54) |
 | TAPS | 15.7 / 24.0 (0.66) | 20.5 / 38.0 (0.54) |
 
+At `-t10` the wall times are, at 150 and 250 bp: EM-seq 0.59 / 0.90 s (0.66) and 1.52 / 2.93 s
+(0.52), TAPS 0.54 / 0.84 s (0.64) and 0.74 / 1.29 s (0.57). The machine was loaded (load average
+20 to 33); the cycle ratios are 0.55 to 0.68.
+
+For scale, here is bwa-meth's route on the same pairs. bwa-mem2 aligns the converted reads (read 1
+C>T, read 2 G>A) to the converted genome with bwa-meth's options, `-T 40 -B 2 -L 10 -M -U 100`.
+bwa-meth's Python pass over its output is not counted. Homebrew's bwa-mem2 2.2.1 is not a
+NEON-native build. Wall time, bwa-mem2 / bwa-mem4 `--meth`, the faster of two runs:
+
+| Set | `-t1` | `-t10` |
+|---|---|---|
+| EM-seq 150 bp | 42.3 / 4.16 s (10.2x) | 5.51 / 0.52 s (10.6x) |
+| EM-seq 250 bp | 78.5 / 6.04 s (13.0x) | 9.84 / 0.74 s (13.3x) |
+| TAPS 150 bp | 42.0 / 4.03 s (10.4x) | 5.48 / 0.47 s (11.7x) |
+| TAPS 250 bp | 88.9 / 5.20 s (17.1x) | 12.5 / 0.82 s (15.2x) |
+
 On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` (150 bp) or `meth:250` times
 both binaries on 200,000 pairs simulated from chr21, on the runner's CPU. Each cell is the wall-time
 ratio bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each, both binaries in the same job. A
