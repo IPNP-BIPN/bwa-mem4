@@ -362,6 +362,15 @@ impl Scratch {
         }
         let (mask, flip) = ((ncode - 1) as u32, u32::from(x ^ y));
         let (mut code, mut ym) = (0u32, 0u32);
+        self.ent_j.reserve(ECAP);
+        self.ent_nxt.reserve(ECAP);
+        // One past the distinct codes: a seen code still writes (unused) at slot `nt`.
+        self.touched.reserve(ECAP.min(ncode) + 1);
+        debug_assert!(self.ehead.len() == ncode && self.tab.len() == ncode);
+        let (tab, eh) = (self.tab.as_mut_ptr(), self.ehead.as_mut_ptr());
+        let (ej, en) = (self.ent_j.as_mut_ptr(), self.ent_nxt.as_mut_ptr());
+        let touched = self.touched.as_mut_ptr();
+        let (mut ne, mut nt) = (0usize, 0usize);
         for (j, &b) in q.iter().enumerate() {
             code = (code << 2 | u32::from(b)) & mask;
             ym = (ym << 2 | if b == y { flip } else { 0 }) & mask;
@@ -369,29 +378,46 @@ impl Scratch {
                 continue;
             }
             // Every subset of the `y` positions read as `x`: `flip` is one bit per 2-bit slot.
+            // Branch-free and unchecked, as in `load_query`: whether a code was seen is data.
+            // `c <= mask < tab.len() == ehead.len()`, `ne < ECAP` before each write into the
+            // ECAP-reserved entry vectors, and `touched` holds at most one slot per code and per
+            // entry. SAFETY: those bounds.
             let mut sub = ym;
-            loop {
-                let c = (code ^ sub) as usize;
-                let (v, e) = (self.tab[c], self.ent_j.len());
-                if e == ECAP {
-                    self.q_has_n = true;
-                    return;
+            unsafe {
+                loop {
+                    let c = (code ^ sub) as usize;
+                    if ne == ECAP {
+                        self.ent_j.set_len(ne);
+                        self.ent_nxt.set_len(ne);
+                        self.touched.set_len(nt);
+                        self.q_has_n = true;
+                        return;
+                    }
+                    let v = *tab.add(c);
+                    let seen = v != 0;
+                    *ej.add(ne) = j as i16;
+                    *en.add(ne) = if seen { *eh.add(c) } else { -1 };
+                    *eh.add(c) = ne as i16;
+                    *touched.add(nt) = c as u16;
+                    nt += usize::from(!seen);
+                    if k == 5 {
+                        self.pres[c >> 3] |= 1 << (c & 7);
+                    }
+                    *tab.add(c) =
+                        ((v >> 16) + 1) << 16 | if seen { TAB_MULTI } else { 0 } | j as u32;
+                    ne += 1;
+                    if sub == 0 {
+                        break;
+                    }
+                    sub = (sub - 1) & ym;
                 }
-                self.ent_j.push(j as i16);
-                self.ent_nxt.push(if v != 0 { self.ehead[c] } else { -1 });
-                self.ehead[c] = e as i16;
-                if v == 0 {
-                    self.touched.push(c as u16);
-                }
-                if k == 5 {
-                    self.pres[c >> 3] |= 1 << (c & 7);
-                }
-                self.tab[c] = ((v >> 16) + 1) << 16 | if v != 0 { TAB_MULTI } else { 0 } | j as u32;
-                if sub == 0 {
-                    break;
-                }
-                sub = (sub - 1) & ym;
             }
+        }
+        // SAFETY: `ne` entries and `nt` codes were written above, within the reservations.
+        unsafe {
+            self.ent_j.set_len(ne);
+            self.ent_nxt.set_len(ne);
+            self.touched.set_len(nt);
         }
     }
 }
