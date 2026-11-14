@@ -2801,6 +2801,11 @@ mod tests {
         let (mut t_band, mut t_hull, mut t_plan) = (0u128, 0u128, 0u128);
         let (mut hull_cells, mut nband, mut nhull) = (0u64, 0u64, 0u64);
         let mut sink = 0i64;
+        // `BWA4_BAND_REPS=n` runs each chunk's bands n times and `BWA4_BAND_ONLY` skips the hulls:
+        // process cycle counts at two rep counts then isolate the bands' (wall time on a shared
+        // M4 swings 2x with frequency and core placement; cycles stay within 1%).
+        let reps: usize = std::env::var("BWA4_BAND_REPS").map_or(1, |v| v.parse().unwrap());
+        let band_only = std::env::var_os("BWA4_BAND_ONLY").is_some();
         for chunk in jobs.chunks(1000) {
             let kj: Vec<KswJob> = chunk
                 .iter()
@@ -2856,9 +2861,14 @@ mod tests {
             nband += b.parents.len() as u64;
             nhull += hulls.len() as u64;
             let t0 = std::time::Instant::now();
-            unsafe { b.run(&kj, &mat, 6, 1, 6, 1, 19, 1, &mut out) };
+            for _ in 0..reps {
+                unsafe { b.run(&kj, &mat, 6, 1, 6, 1, 19, 1, &mut out) };
+            }
             t_band += t0.elapsed().as_nanos();
             sink += out.iter().map(|o| o.score as i64).sum::<i64>();
+            if band_only {
+                continue;
+            }
             let t0 = std::time::Instant::now();
             let r = crate::matesw::fwd_local_sw_batch(&hull_of_banded, 5, &mat, 6, 1, 6, 1, 1);
             t_hull += t0.elapsed().as_nanos();
