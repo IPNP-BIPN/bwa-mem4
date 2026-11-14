@@ -712,14 +712,17 @@ pub(crate) fn batched_align(
     // early (`endsc = i32::MAX`) because the forward pass does not yet know what score to aim for.
     let mut fwd_jobs: Vec<FwdJob> = Vec::with_capacity(jobs.len());
     // Banded rescue (`rescue_band`): a pruned job whose bands are cheaper than its hull leaves
-    // `fwd_jobs` and is run after them, under the u8 kernel's own conditions.
+    // `fwd_jobs` and is run after them, under the u8 kernel's own conditions. The reverse pass
+    // bands without the prune (`band_avail`, fg-labs/bwa-mem3's `p1_band_any`): `--meth` EM's
+    // `-B 2` admits no K-mer bound, and x86 skips the prune where the full SW is cheaper.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    let band_ok = prune.is_some()
-        && !matches!(forced_rescue_tier(), RescueTier::Scalar)
+    let band_avail = !matches!(forced_rescue_tier(), RescueTier::Scalar)
         && crate::rescue_band::kernel_available()
         && crate::rescue_band::gaps_ok(o_del, e_del, o_ins, e_ins)
         && (mat_is_standard(m, mat) || mat5_u8_ok(m, mat))
         && u8_table_has_headroom(mat);
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let band_ok = prune.is_some() && band_avail;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let mut band = BAND.with(|c| c.take());
     // The filter caches its K-mer table per query (`Scratch::load_query`), and a batch holds ~17
@@ -1052,15 +1055,21 @@ pub(crate) fn batched_align(
             endsc: out[i].score,
         })
         .collect();
-    // The reverse pass: banded around the diagonal where the band kernel runs (every qualifying
-    // job is under the u8 ceiling, as its forward pass was), else the forward kernel on the whole
-    // reversed prefixes.
+    // The reverse pass: banded around the diagonal where the band kernel runs, else the forward
+    // kernel on the whole reversed prefixes. The band stops at the score as a byte, so a batch
+    // with a job over the u8 ceiling (a mate past ~250 bp) takes the forward kernel.
     #[allow(unused_mut)]
     let mut rev_results: Vec<(i32, i32, i32, i32, i32)> = Vec::new();
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let mut banded_rev = false;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if band_ok && !rev_jobs.is_empty() {
+    if band_avail
+        && !rev_jobs.is_empty()
+        // shortcut: all or nothing per batch; split it if mixed-length batches ever matter.
+        && rev_jobs
+            .iter()
+            .all(|j| u8_job_fits(j.query.len(), j.target.len(), mat, max_sc))
+    {
         let rj: Vec<(&[u8], &[u8], i32)> = rev_jobs
             .iter()
             .map(|j| (j.query, j.target, j.endsc))
@@ -8087,6 +8096,40 @@ mod tests {
                 }
                 assert!((50..=250).contains(&low), "low {low}");
             }
+        }
+    }
+
+    /// 300 bp mates (scores up to 300) through the pruned path, where the reverse pass is banded:
+    /// the band stops at the score as a byte, so these must take the forward kernel instead.
+    #[test]
+    fn mate_rescue_long_mate_start_is_exact() {
+        let mat = scmat(1, 4);
+        let mut state = 0x51ed_2701_9e37_79b9u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let (mut qs, mut ts) = (Vec::new(), Vec::new());
+        for _ in 0..40 {
+            let t: Vec<u8> = (0..900).map(|_| (next() % 4) as u8).collect();
+            let at = next() as usize % 600;
+            qs.push(t[at..at + 300].to_vec());
+            ts.push(t);
+        }
+        let jobs: Vec<KswJob> = qs
+            .iter()
+            .zip(&ts)
+            .map(|(q, t)| KswJob {
+                query: q,
+                target: t,
+            })
+            .collect();
+        let got = batched_mate_rescue(&jobs, 5, &mat, 6, 1, 6, 1, 19, 1);
+        for (k, (j, g)) in jobs.iter().zip(&got).enumerate() {
+            let w = bwa_extend::ksw_align2(j.query, j.target, 5, &mat, 6, 1, 6, 1, 19, 1, 8);
+            assert_eq!(*g, w, "job {k}");
         }
     }
 
