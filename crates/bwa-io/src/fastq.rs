@@ -615,14 +615,15 @@ fn gzip_threads() -> usize {
     })
 }
 
-/// Decompressed bytes handed over per channel message. 4 MiB is about 12 000 reads at 150 bp, so
-/// the channel is touched ~90 times for a 1 M-pair mate file, and three of them in flight cost
-/// 12 MiB, which is noise next to a batch of records.
-const INFLATE_BLOCK: usize = 4 << 20;
+/// Decompressed bytes handed over per channel message. 1 MiB is about 3 000 reads at 150 bp, so
+/// the channel is touched ~360 times for a 1 M-pair mate file. Behind a slow aligner every queue
+/// fills, so a file holds `INFLATE_DEPTH + 2` blocks: at 4 MiB and depth 3 that was 40 MiB per
+/// paired run, more than a whole `-t1` batch of records.
+const INFLATE_BLOCK: usize = 1 << 20;
 
 /// Blocks the inflater may run ahead. One in flight plus one being parsed is the double buffering
-/// that makes the overlap work; the third absorbs a slow parse without stalling the inflater.
-const INFLATE_DEPTH: usize = 3;
+/// that makes the overlap work.
+const INFLATE_DEPTH: usize = 2;
 
 /// The decompressed side of a gzipped FASTQ, as a plain [`std::io::Read`] fed by an inflater thread.
 ///
@@ -901,10 +902,11 @@ impl FastqReader {
 
 /// How many records one background mate-reader hands over per channel message.
 ///
-/// Big enough that the channel is touched once per few thousand reads instead of once per read
-/// (about 2 MB of records at 150 bp), small enough that the two streams stay within a few
-/// milliseconds of each other rather than one running a whole batch ahead of the other.
-const STREAM_CHUNK_RECORDS: usize = 8192;
+/// Big enough that the channel is touched once per two thousand reads instead of once per read
+/// (about 0.8 MB of records at 150 bp), small enough that the two streams stay within a few
+/// milliseconds of each other. Behind a slow aligner each file holds three chunks: 8192 records a
+/// chunk was 20 MB of a paired run's resident set, 11 MB more than now at `-t1`.
+const STREAM_CHUNK_RECORDS: usize = 2048;
 
 /// Chunks a mate reader may have ready before it blocks. One in flight plus one being consumed is
 /// double buffering; deeper only buys memory, exactly as for the batch queue in `cmd_mem`.
