@@ -200,8 +200,11 @@ reach those kernels in three ways:
 - **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
   also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
   cell scores at most the match score, so the bound holds. The relation count runs on NEON and on
-  SSE4.1 (`rescue_prune::count_hits`), so x86 prunes too. bwa-mem3 does not prune `--meth` on x86.
-  EM-seq is not pruned: its collapsed mismatch (2a) is below the bound's (K-1)a for any useful K.
+  SSE4.1 (`rescue_prune::count_hits`). x86 prunes only on AVX2: with AVX-512's 64 lanes the full
+  SW is cheaper than the count and the band (TAPS 150 bp `-t1`, ours / fork: Xeon 8370C 0.90
+  unpruned against 0.98 pruned, EPYC 9V45 0.85 against 0.98). `BWA4_RESCUE_PRUNE=1` prunes anyway.
+  bwa-mem3 does not prune `--meth` on x86. EM-seq is not pruned: its collapsed mismatch (2a) is
+  below the bound's (K-1)a for any useful K.
 
 A seed that scores 0 or less under the read's matrix (a pair it matched only in converted space)
 extends on the scalar kernel, as in bwa-mem3.
