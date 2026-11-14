@@ -70,6 +70,9 @@ pub struct MethOpt {
     pub set_as_failed: Option<u8>,
     /// `--chimera-qc`: bwameth's longest-M < 44% rule.
     pub chimera_qc: bool,
+    /// `--pbat`: read 1 (or a single-end read) carries G->A and read 2 C->T, the reverse of a
+    /// directional library.
+    pub pbat: bool,
     /// Scoring matrices by hypothesis, `[ref * 5 + read]`: `[0]` frees G->A (read 2, OB),
     /// `[1]` frees C->T (read 1, OT). Filled by [`MethOpt::fill_mats`] from the plain matrix.
     pub mats: [[i8; 25]; 2],
@@ -89,8 +92,14 @@ impl MethOpt {
             prune: Prune::Spec30,
             set_as_failed: None,
             chimera_qc: false,
+            pbat: false,
             mats: [[0; 25]; 2],
         }
+    }
+
+    /// Whether read `read` (0 = read 1 or single-end, 1 = read 2) carries C->T (OT/OB origin).
+    pub fn read_ot(&self, read: usize) -> bool {
+        (read == 0) != self.pbat
     }
 
     /// `mem_opt_fill_meth_mat`: the two matrices from the plain one (`mat`, after `-A`/`-B`).
@@ -277,6 +286,14 @@ mod tests {
         m.fill_mats(&mat, 1);
         assert_eq!((m.mats[1][5 + 3], m.mats[1][3 * 5 + 1]), (0, -4));
         assert_eq!(MethOpt::new(Chem::Taps).scoring, Scoring::Neutral);
+    }
+
+    #[test]
+    fn pbat_swaps_which_read_is_ct() {
+        let mut m = MethOpt::new(Chem::EmSeq);
+        assert_eq!((m.read_ot(0), m.read_ot(1)), (true, false));
+        m.pbat = true;
+        assert_eq!((m.read_ot(0), m.read_ot(1)), (false, true));
     }
 
     #[test]
