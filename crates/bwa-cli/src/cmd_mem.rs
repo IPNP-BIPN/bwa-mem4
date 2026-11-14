@@ -96,7 +96,7 @@ use rust_htslib::bam;
 use rust_htslib::htslib;
 
 use bwa_core::opt::flags;
-use bwa_core::{dna, MemOpt};
+use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, InterleavedFastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
@@ -1637,21 +1637,18 @@ fn se_read_batches(
 {
     move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
         // Opened INSIDE the closure so the reader itself never crosses a thread boundary.
-        let mut reader = FastqReader::from_path(&reads_path)?;
+        // nt4-coded as it parses, as bwa does in `mem_kernel1_core`; the SAM text is printed back
+        // out of these codes, as bwa does.
+        let mut reader = FastqReader::from_path(&reads_path)?.nt4();
         // Number of reads emitted in all previous batches, i.e. the global 0-based id of this
         // batch's first read. Invariant at the top of each turn: it equals the total length of every
         // batch already sent. Must stay global across batches, since downstream tie-breaks hash it.
         let mut base_id = 0u64;
         loop {
             // Up to `k_batch` INPUT BASES worth of reads; empty only at end of file.
-            let mut batch = reader.next_batch(k_batch)?;
+            let batch = reader.next_batch(k_batch)?;
             if batch.is_empty() {
                 break;
-            }
-            // nt4 in place, for the reason given in `pe_read_batches`. The SAM text is printed back
-            // out of these codes, as bwa does.
-            for rec in batch.iter_mut() {
-                dna::nt4_in_place(rec.seq_mut());
             }
             // Read count, saved before the move so `base_id` can advance after the send.
             let n = batch.len() as u64;
@@ -2368,16 +2365,17 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // read (see the reader above). Returns the batch's complete SAM text.
     let process = |batch: Vec<Record>, base_id: u64| -> Vec<Vec<u8>> {
         // The bases are nt4 codes already: the reader encoded them (see `se_read_batches`).
-        let all_codes: Vec<&[u8]> = batch.iter().map(Record::seq).collect();
+        let all_reads: Vec<&Record> = batch.iter().collect();
         // The denominator of the bytes-per-base column issue #25 is written in. One sum per batch,
         // and only when `BWA4_STAGE_ALLOC` is armed.
         if crate::stage_alloc::enabled() {
-            crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
+            crate::stage_alloc::note_bases(batch.iter().map(|r| r.seq_len() as u64).sum());
         }
         // Per-read alignments after dedup and before primary marking, also parallel to `batch`.
         let regs_all = stage_time::measure(Stage::Align, || {
-            batched_regs(&fm, &bns, &opt, &all_codes, dump_regs_enabled())
+            batched_regs(&fm, &bns, &opt, &all_reads, dump_regs_enabled())
         });
+        drop(all_reads);
         // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
         // `into_par_iter` yields the owned `Vec<MemAlnReg>`, dropping a per-read Vec allocation+copy.
         // One entry per read: that read's finished SAM records (possibly several, possibly one
@@ -2385,10 +2383,11 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         let per_read_sam: Vec<Vec<u8>> = stage_time::measure(Stage::SamEmit, || {
             batch
                 .par_iter()
-                .zip(all_codes.par_iter())
                 .zip(regs_all.into_par_iter())
                 .enumerate()
-                .map(|(read_in_batch, ((rec, codes), regs))| {
+                .map_init(Vec::new, |codes, (read_in_batch, (rec, regs))| {
+                    codes.clear();
+                    rec.codes_into(codes);
                     finish_se(
                         &fm,
                         &bns,
@@ -2430,20 +2429,21 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
 /// - `fm`: the FM index, for seeding. Immutable and shared by every worker.
 /// - `bns`: contig dictionary plus the packed reference, for extension and coordinate translation.
 /// - `opt`: the fully-derived options; read-only.
-/// - `codes`: one nt4-coded sequence per read (A=0, C=1, G=2, T=3, else 4). For paired-end this is
-///   the interleaved c1,c2,c1,c2,... list, so its length is twice the pair count.
+/// - `reads`: the batch's reads, nt4-coded by the reader. For paired-end this is the interleaved
+///   r1,r2,r1,r2,... list, so its length is twice the pair count. Each chunk unpacks its reads'
+///   codes into one buffer of its own, so no copy of the batch's bases is ever whole.
 /// - `leave_undeduped`: return the regions before dedup, so the caller owes that too. For
 ///   `BWA4_DUMP_REGS`, whose single-end dump prints both sides of it.
 ///
 /// # Returns
 ///
-/// One `Vec<MemAlnReg>` per entry of `codes`, in the same order. These are deduped, stamped and
+/// One `Vec<MemAlnReg>` per entry of `reads`, in the same order. These are deduped, stamped and
 /// unmarked: the caller still owes `mem_mark_primary_se`.
 fn batched_regs(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
-    codes: &[impl AsRef<[u8]> + Sync],
+    reads: &[&Record],
     leave_undeduped: bool,
 ) -> Vec<Vec<MemAlnReg>> {
     // One chunk per worker, so every thread gets a slice big enough to fill the SIMD lanes.
@@ -2468,15 +2468,27 @@ fn batched_regs(
     // +0.3% (its 16 MB shared L2 holds 4096), unchanged at -t8 and up where the budget is lower.
     const MAX_CHUNK: usize = 2048;
     let budget_chunk = (INFLIGHT_READS / worker_count).clamp(MIN_CHUNK, MAX_CHUNK);
-    let reads_per_chunk = codes.len().div_ceil(worker_count).min(budget_chunk).max(1);
-    let chunks = guided_bounds(codes.len(), MIN_CHUNK.min(reads_per_chunk), reads_per_chunk)
+    let reads_per_chunk = reads.len().div_ceil(worker_count).min(budget_chunk).max(1);
+    let chunks = guided_bounds(reads.len(), MIN_CHUNK.min(reads_per_chunk), reads_per_chunk)
         .into_iter()
-        .map(|r| &codes[r])
+        .map(|r| &reads[r])
         .collect();
     crate::stage_time::barrier::region(crate::stage_time::Stage::Align, || {
         run_in_order(chunks, |chunk| {
             crate::stage_time::barrier::worker(|| {
-                let mut regs = align_reads_batched(fm, bns, opt, chunk, &NeonBackend);
+                let mut flat = Vec::with_capacity(chunk.iter().map(|r| r.seq_len()).sum());
+                for r in chunk {
+                    r.codes_into(&mut flat);
+                }
+                let mut at = 0;
+                let codes: Vec<&[u8]> = chunk
+                    .iter()
+                    .map(|r| {
+                        at += r.seq_len();
+                        &flat[at - r.seq_len()..at]
+                    })
+                    .collect();
+                let mut regs = align_reads_batched(fm, bns, opt, &codes, &NeonBackend);
                 // Dedup here, chunk by chunk, not once the whole batch has aligned. The pass is
                 // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
                 // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
@@ -2487,9 +2499,8 @@ fn batched_regs(
                 // the slack cost 10% RSS on chr21 at -t4 (none on GIAB, where the index rules).
                 // The 13% (GIAB) to 29% (chr21) of reads past the threshold hold ~57% of it.
                 if !leave_undeduped {
-                    for (r, codes) in regs.iter_mut().zip(chunk) {
-                        let mut kept =
-                            mem_sort_dedup_patch(fm, opt, codes.as_ref(), std::mem::take(r));
+                    for (r, codes) in regs.iter_mut().zip(&codes) {
+                        let mut kept = mem_sort_dedup_patch(fm, opt, codes, std::mem::take(r));
                         // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
                         // the dedup and before any primary marking reads it.
                         bwa_mem::stamp_is_alt(bns, &mut kept);
@@ -2532,7 +2543,7 @@ fn dump_regs_enabled() -> bool {
 ///
 /// - `fm`, `bns`, `opt`: the shared immutable index halves and options.
 /// - `rec`: the original read, for QNAME, SEQ, QUAL and the `-C` comment.
-/// - `codes`: `rec.seq` in nt4 coding, same length; the alignment code works on this, not on ASCII.
+/// - `codes`: `rec`'s bases in nt4 coding; the alignment code works on this, not on ASCII.
 /// - `regs`: this read's regions from [`batched_regs`], CONSUMED here to avoid a per-read clone.
 /// - `read_id`: the read's global 0-based index across the whole input, not its index within the
 ///   batch. Load-bearing: `mem_mark_primary_se` hashes it to break score ties, so a per-batch id
@@ -2668,7 +2679,7 @@ fn finish_se(
         return buf;
     }
     for which in 0..alns.len() {
-        write_aln_se(&mut buf, bns, opt, rec, &alns, which);
+        write_aln_se(&mut buf, bns, opt, rec, codes, &alns, which);
     }
     buf
 }
@@ -2743,6 +2754,8 @@ fn write_aln_se(
     bns: &BntSeq,
     opt: &MemOpt,
     rec: &Record,
+    // `rec`'s bases as nt4 codes.
+    codes: &[u8],
     alns: &[EmitAln],
     which: usize,
 ) {
@@ -2791,9 +2804,9 @@ fn write_aln_se(
     // cigar ends (which coincide for a 1-op cigar) and maps them onto the *forward* read.
     // Half-open `[qb, qe)` over the FORWARD read, in bases. Starts as the whole read (the primary,
     // and any soft-clipping record, stores all of it) and is narrowed below only when hard clipping
-    // applies. Invariant: `0 <= qb <= qe <= rec.seq.len()`, and it indexes `rec.seq`/`rec.qual`
+    // applies. Invariant: `0 <= qb <= qe <= codes.len()`, and it indexes `codes`/`rec.qual`
     // BEFORE any reverse-complementing.
-    let (mut qb, mut qe) = (0usize, rec.seq().len());
+    let (mut qb, mut qe) = (0usize, codes.len());
     if clip_ends {
         // The two end ops. For a single-op cigar these are the same entry, and the two `if`s below
         // would both fire on it; that mirrors the C.
@@ -2929,10 +2942,10 @@ fn write_aln_se(
             sliced.reverse();
             sliced
         });
-        (sam_seq(&rec.seq()[qb..qe], true), reversed_qual)
+        (sam_seq(&codes[qb..qe], true), reversed_qual)
     } else {
         (
-            sam_seq(&rec.seq()[qb..qe], false),
+            sam_seq(&codes[qb..qe], false),
             rec.qual().map(|quals| quals[qb..qe].to_vec()),
         )
     };
@@ -2982,8 +2995,10 @@ fn pe_read_batches(
         let mut two: Option<PairedFastqReader> = None;
         let mut one: Option<InterleavedFastqReader> = None;
         match &reads2 {
-            Some(r2) => two = Some(PairedFastqReader::from_paths(&reads1, r2)?),
-            None => one = Some(InterleavedFastqReader::from_path(&reads1)?),
+            // nt4-coded as they parse, as bwa does in `mem_kernel1_core`; nothing downstream reads
+            // the ASCII bases of a pair. On the per-file parser threads, which cost no wall.
+            Some(r2) => two = Some(PairedFastqReader::from_paths(&reads1, r2, true)?),
+            None => one = Some(InterleavedFastqReader::from_path(&reads1, true)?),
         }
         // Pairs (not reads) emitted in all previous batches, so the global 0-based id of this
         // batch's first pair. Invariant at the top of each turn: it equals the summed length of
@@ -2998,14 +3013,6 @@ fn pe_read_batches(
             };
             if batch.is_empty() {
                 break;
-            }
-            // nt4 in place, as bwa does in `mem_kernel1_core`; nothing downstream reads the ASCII
-            // bases of a pair. Here rather than on the pool, where it ran at ~14% occupancy (1.3% of
-            // the wall at -t8): this thread waits on the hand-off anyway, so it costs no wall.
-            let mut batch = batch;
-            for (rec1, rec2) in batch.iter_mut() {
-                dna::nt4_in_place(rec1.seq_mut());
-                dna::nt4_in_place(rec2.seq_mut());
             }
             let n = batch.len() as u64;
             if tx.send((batch, base_pair)).is_err() {
@@ -3064,20 +3071,17 @@ fn run_pe(
         // The bases are nt4 codes already: the reader encoded them (see `pe_read_batches`).
         // Both mates of every pair, interleaved c1,c2,c1,c2,... so the batched extension sees one
         // flat list of reads: index `2i` is pair `i`'s mate 1 and `2i+1` its mate 2.
-        let all_codes: Vec<&[u8]> = batch
-            .iter()
-            .flat_map(|(rec1, rec2)| [rec1.seq(), rec2.seq()])
-            .collect();
+        let all_reads: Vec<&Record> = batch.iter().flat_map(|(rec1, rec2)| [rec1, rec2]).collect();
         // Both mates, so the bytes-per-base column counts the same bases the aligner processed.
         // One sum per batch, and only when `BWA4_STAGE_ALLOC` is armed.
         if crate::stage_alloc::enabled() {
-            crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
+            crate::stage_alloc::note_bases(all_reads.iter().map(|r| r.seq_len() as u64).sum());
         }
-        // Deduped regions, in the same interleaved order as `all_codes`.
+        // Deduped regions, in the same interleaved order as `all_reads`.
         let regs_all = stage_time::measure(Stage::Align, || {
-            batched_regs(fm, bns, opt, &all_codes, false)
+            batched_regs(fm, bns, opt, &all_reads, false)
         });
-        drop(all_codes);
+        drop(all_reads);
 
         // ---- De-interleave each mate's regions by sequential moves (no content copy) ----
         // Invariant: the two `next()` calls take mate 1's and mate 2's regions of the SAME pair;
@@ -3144,35 +3148,24 @@ fn run_pe(
             std::env::var_os("BWA4_NO_RESCUE").is_some() || opt.flag & flags::NO_RESCUE != 0;
         if !scalar_rescue && !no_rescue {
             stage_time::measure(Stage::Rescue, || {
-                // One rescue job per pair: each mate's codes plus a MUTABLE borrow of its region list,
-                // which the rescue appends newly found alignments to.
-                let mut rescue_jobs: Vec<PairRescueData> = batch
-                    .iter()
-                    .zip(paired.iter_mut())
-                    .map(|((rec1, rec2), (regs1, regs2))| PairRescueData {
-                        seq0: rec1.seq(),
-                        seq1: rec2.seq(),
-                        a0: regs1,
-                        a1: regs2,
-                    })
-                    .collect();
                 // Each pair's rescue is independent, so run chunks in parallel; a chunk of a few hundred
                 // pairs still has enough rescue jobs to fill the SIMD lanes. Keeps -t8 scaling (the rescue
                 // is otherwise a serial section) while byte-identical to the per-pair path.
-                // Read before the mutable borrow below; `par_chunks_mut` would otherwise hold it.
-                let chunk_pairs = rescue_pairs_per_chunk(rescue_jobs.len());
+                let chunk_pairs = rescue_pairs_per_chunk(batch.len());
                 // Shrinking toward the floor only (a forced size stays fixed).
                 let min = rescue_pairs_override().unwrap_or(RESCUE_MIN_PAIRS_PER_CHUNK);
-                let mut rest = rescue_jobs.as_mut_slice();
+                let mut pairs = batch.as_slice();
+                let mut rest = paired.as_mut_slice();
                 let mut chunks = Vec::new();
-                for r in guided_bounds(rest.len(), min, chunk_pairs) {
-                    let (chunk, tail) = std::mem::take(&mut rest).split_at_mut(r.len());
-                    chunks.push(chunk);
-                    rest = tail;
+                for r in guided_bounds(pairs.len(), min, chunk_pairs) {
+                    let (regs, tail) = std::mem::take(&mut rest).split_at_mut(r.len());
+                    let (recs, more) = pairs.split_at(r.len());
+                    chunks.push((recs, regs));
+                    (rest, pairs) = (tail, more);
                 }
                 stage_time::barrier::region(Stage::Rescue, || {
-                    run_in_order(chunks, |chunk| {
-                        stage_time::barrier::worker(|| batch_mate_rescue(fm, bns, opt, &pes, chunk))
+                    run_in_order(chunks, |(recs, regs)| {
+                        stage_time::barrier::worker(|| rescue_chunk(fm, bns, opt, &pes, recs, regs))
                     });
                 });
             });
@@ -3194,15 +3187,19 @@ fn run_pe(
                     .enumerate()
                     .fold_chunks(
                         SAM_CHUNK_PAIRS,
-                        || Vec::with_capacity(SAM_CHUNK_PAIRS * 1024),
-                        |mut buf, (pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
+                        || (Vec::with_capacity(SAM_CHUNK_PAIRS * 1024), Vec::new()),
+                        |(mut buf, mut codes), (pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
                             // `move`: the pair is freed inside, so `BWA4_BARRIER_TIME` counts its
                             // frees as work, not as tail (1.5 points of the 3.7% tail at -t4).
                             stage_time::barrier::worker(move || {
                                 // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
                                 // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
                                 let names = [rec1.name(), rec2.name()];
-                                let seqs = [rec1.seq(), rec2.seq()];
+                                codes.clear();
+                                rec1.codes_into(&mut codes);
+                                let n1 = codes.len();
+                                rec2.codes_into(&mut codes);
+                                let seqs = [&codes[..n1], &codes[n1..]];
                                 let quals = [rec1.qual(), rec2.qual()];
                                 let comments = [rec1.comment(), rec2.comment()];
                                 mem_sam_pe(
@@ -3223,10 +3220,11 @@ fn run_pe(
                                     &mut buf,
                                 )
                                 .expect("write to Vec");
-                                buf
+                                (buf, codes)
                             })
                         },
                     )
+                    .map(|(buf, _)| buf)
                     .collect()
             })
         });
@@ -3239,6 +3237,45 @@ fn run_pe(
     // load, so it is also the place that observes a reader error.
     let overlap = batch_overlap_enabled(verbose);
     run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)
+}
+
+/// Mate rescue over one chunk of pairs, `RESCUE_SLICE_PAIRS` at a time: the slice's bases are
+/// unpacked into one buffer and rescued, and the buffer is reused for the next slice. The rescue
+/// result does not depend on how the pairs are grouped (see [`rescue_pairs_per_chunk`]).
+fn rescue_chunk(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    recs: &[(Record, Record)],
+    regs: &mut [(Vec<MemAlnReg>, Vec<MemAlnReg>)],
+) {
+    // Far above the 256 pairs the kernel needs to fill its lanes; small enough that a worker's
+    // codes stay ~1 MB, where unpacking a whole chunk was ~5 MB a worker at the peak.
+    const RESCUE_SLICE_PAIRS: usize = 4096;
+    let mut codes = Vec::new();
+    for (recs, regs) in recs
+        .chunks(RESCUE_SLICE_PAIRS)
+        .zip(regs.chunks_mut(RESCUE_SLICE_PAIRS))
+    {
+        codes.clear();
+        for (rec1, rec2) in recs {
+            rec1.codes_into(&mut codes);
+            rec2.codes_into(&mut codes);
+        }
+        let mut rest = codes.as_slice();
+        let mut jobs: Vec<PairRescueData> = recs
+            .iter()
+            .zip(regs.iter_mut())
+            .map(|((rec1, rec2), (a0, a1))| {
+                let (seq0, more) = rest.split_at(rec1.seq_len());
+                let (seq1, more) = more.split_at(rec2.seq_len());
+                rest = more;
+                PairRescueData { seq0, seq1, a0, a1 }
+            })
+            .collect();
+        batch_mate_rescue(fm, bns, opt, pes, &mut jobs);
+    }
 }
 
 /// Floor of a rescue chunk, so a small batch (or a stage's last chunks) is not shredded into slivers
