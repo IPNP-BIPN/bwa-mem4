@@ -818,7 +818,6 @@ pub(crate) fn same_region(x: &MemAlnReg, y: &MemAlnReg) -> bool {
         && x.frac_rep.to_bits() == y.frac_rep.to_bits()
         && x.is_alt == y.is_alt
         && x.alt_sc == y.alt_sc
-        && x.hash == y.hash
 }
 
 /// Assign each region a primary, or promote it to primary itself. Port of
@@ -943,58 +942,77 @@ pub fn stamp_is_alt(bns: &BntSeq, regs: &mut [MemAlnReg]) {
     }
 }
 
-/// bwa's order (`alnreg_hlt`): score descending, non-ALT first, then hash. The key is total:
-/// `hash_64` is a bijection (each step multiplies by an odd constant or xorshifts), so the hashes
-/// of `id + i` are distinct and every sort leaves the regions where bwa's introsort does.
-fn sort_hlt(a: &mut [MemAlnReg]) {
-    let key = |r: &MemAlnReg| (std::cmp::Reverse(r.score), r.is_alt, r.hash);
-    if a.len() <= 16 {
-        a.sort_unstable_by_key(key);
-    } else {
-        // Indirect, as in `mem_sort_dedup_patch`: a region is 96 bytes, a key and index 24.
-        sort_scratch::PERM_PRI.with_borrow_mut(|perm| {
-            perm.clear();
-            // Off x86-64 the key and a 31-bit index are one u128 (`!score` biased to unsigned,
-            // ALT bit, hash, index), compared in two instructions instead of a tuple chain.
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                assert!(a.len() < 1 << 31);
-                perm.extend(a.iter().enumerate().map(|(i, r)| {
-                    u128::from(!(r.score as u32 ^ 0x8000_0000)) << 96
-                        | u128::from(r.is_alt) << 95
-                        | u128::from(r.hash) << 31
-                        | i as u128
-                }));
-                perm.sort_unstable();
-                permute(a, |j| {
-                    let src = (perm[j] as u32 & 0x7fff_ffff) as usize;
-                    perm[j] = perm[j] & !0x7fff_ffff | j as u128;
-                    src
-                });
-            }
-            // x86-64: fg-labs/bwa-mem3's `primary_pair`, `(!score << 1 | alt, hash)` compared
-            // bitwise. The pair is distinct per region, so the index never breaks a tie.
-            #[cfg(target_arch = "x86_64")]
-            {
-                perm.extend(a.iter().enumerate().map(|(i, r)| {
-                    let k0 = u64::from(!(r.score as u32 ^ 0x8000_0000)) << 1 | u64::from(r.is_alt);
-                    ((k0, r.hash), i as u32)
-                }));
-                perm.sort_unstable_by(|x, y| {
-                    let (a, b) = (x.0, y.0);
-                    let lt = (a.0 < b.0) | ((a.0 == b.0) & (a.1 < b.1));
-                    if lt {
-                        std::cmp::Ordering::Less
-                    } else if a == b {
-                        std::cmp::Ordering::Equal
-                    } else {
-                        std::cmp::Ordering::Greater
-                    }
-                });
-                permute(a, |j| std::mem::replace(&mut perm[j].1, j as u32) as usize);
-            }
-        });
+/// bwa's order (`alnreg_hlt`): score descending, non-ALT first, then `hash_64(id + i)` of each
+/// region's index `i` on entry (`bwamem.cpp:1428`). The key is total: `hash_64` is a bijection
+/// (each step multiplies by an odd constant or xorshifts), so the hashes of `id + i` are distinct
+/// and every sort leaves the regions where bwa's introsort does. Always indirect, since the hash
+/// is not stored in the region.
+///
+/// Returns the hashes in the new order when `keep_hashes` (the ALT re-ranking sorts on them
+/// again), else an empty vector.
+fn sort_hlt(a: &mut [MemAlnReg], id: u64, keep_hashes: bool) -> Vec<u64> {
+    let hash = |i: usize| hash_64(id.wrapping_add(i as u64));
+    if a.len() < 2 {
+        return if keep_hashes {
+            (0..a.len()).map(hash).collect()
+        } else {
+            Vec::new()
+        };
     }
+    sort_scratch::PERM_PRI.with_borrow_mut(|perm| {
+        perm.clear();
+        // Off x86-64 the key and a 31-bit index are one u128 (`!score` biased to unsigned, ALT
+        // bit, hash, index), compared in two instructions instead of a tuple chain.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            assert!(a.len() < 1 << 31);
+            perm.extend(a.iter().enumerate().map(|(i, r)| {
+                u128::from(!(r.score as u32 ^ 0x8000_0000)) << 96
+                    | u128::from(r.is_alt) << 95
+                    | u128::from(hash(i)) << 31
+                    | i as u128
+            }));
+            perm.sort_unstable();
+            let hashes = if keep_hashes {
+                perm.iter().map(|&p| (p >> 31) as u64).collect()
+            } else {
+                Vec::new()
+            };
+            permute(a, |j| {
+                let src = (perm[j] as u32 & 0x7fff_ffff) as usize;
+                perm[j] = perm[j] & !0x7fff_ffff | j as u128;
+                src
+            });
+            hashes
+        }
+        // x86-64: fg-labs/bwa-mem3's `primary_pair`, `(!score << 1 | alt, hash)` compared
+        // bitwise. The pair is distinct per region, so the index never breaks a tie.
+        #[cfg(target_arch = "x86_64")]
+        {
+            perm.extend(a.iter().enumerate().map(|(i, r)| {
+                let k0 = u64::from(!(r.score as u32 ^ 0x8000_0000)) << 1 | u64::from(r.is_alt);
+                ((k0, hash(i)), i as u32)
+            }));
+            perm.sort_unstable_by(|x, y| {
+                let (a, b) = (x.0, y.0);
+                let lt = (a.0 < b.0) | ((a.0 == b.0) & (a.1 < b.1));
+                if lt {
+                    std::cmp::Ordering::Less
+                } else if a == b {
+                    std::cmp::Ordering::Equal
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+            let hashes = if keep_hashes {
+                perm.iter().map(|p| p.0 .1).collect()
+            } else {
+                Vec::new()
+            };
+            permute(a, |j| std::mem::replace(&mut perm[j].1, j as u32) as usize);
+            hashes
+        }
+    })
 }
 
 /// Puts the region from `a[src(j)]` at `a[j]` for every `j`, cycle by cycle through one temporary:
@@ -1056,15 +1074,11 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     // Running count of non-ALT (primary-assembly) regions seen so far; the return value. Counted
     // during the reset loop because that loop already visits every region.
     let mut n_pri = 0;
-    for (i, r) in a.iter_mut().enumerate() {
+    for r in a.iter_mut() {
         // Reset before marking: this function can run more than once over the same regions (PE
         // rescue re-marks), and stale `sub` would defeat `mark_primary_core`'s `sub == 0` sentinel.
         r.sub = 0;
         r.secondary = -1;
-        // `hash_64(id + i)` (`bwamem.cpp:1428`). `wrapping_add` because the C adds an `int64_t` id
-        // to an `int` index with no overflow check; at realistic read counts this never wraps, but
-        // the wrapping form is the faithful one.
-        r.hash = hash_64(id.wrapping_add(i as u64));
         if !r.is_alt {
             n_pri += 1;
         }
@@ -1081,7 +1095,12 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
         for (i, r) in a.iter().enumerate() {
             eprintln!(
                 "  pre{i} q[{},{}) r[{},{}) score={} hash={}",
-                r.qb, r.qe, r.rb, r.re, r.score, r.hash
+                r.qb,
+                r.qe,
+                r.rb,
+                r.re,
+                r.score,
+                hash_64(id.wrapping_add(i as u64))
             );
         }
     }
@@ -1094,7 +1113,8 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     // are no ties left for introsort's instability to resolve differently. Contrast `alnreg_slt2`
     // in `mem_sort_dedup_patch` above, which keys on `re` alone and where instability genuinely
     // decides which alignment survives.
-    sort_hlt(a);
+    // The tie-break hashes come back only when the ALT re-ranking below will sort on them again.
+    let hashes = sort_hlt(a, id, n_pri > 0 && (n_pri as usize) < a.len());
     mark_primary_core(opt, a);
     let n = a.len();
     // First-round bookkeeping (`bwamem.cpp:1433-1439`), done BEFORE any re-ranking:
@@ -1117,12 +1137,18 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
         // assembly occupies the prefix `0..n_pri`. Skipped when n_pri == 0, exactly as the C skips
         // it: with no primary-assembly hit there is no prefix to isolate, and re-sorting would
         // reorder the ALT hits for nothing.
+        // Sorted as indices, since the hashes live beside the regions: the introsort only compares
+        // and moves, so it leaves the indices where it would have left the regions.
         if n_pri > 0 {
-            ks_introsort_by(a, |x, y| {
-                (!x.is_alt && y.is_alt)
-                    || (x.is_alt == y.is_alt
-                        && (x.score > y.score || (x.score == y.score && x.hash < y.hash)))
+            let mut idx: Vec<u32> = (0..n as u32).collect();
+            ks_introsort_by(&mut idx, |&x, &y| {
+                let (rx, ry) = (&a[x as usize], &a[y as usize]);
+                (!rx.is_alt && ry.is_alt)
+                    || (rx.is_alt == ry.is_alt
+                        && (rx.score > ry.score
+                            || (rx.score == ry.score && hashes[x as usize] < hashes[y as usize])))
             });
+            permute(a, |j| std::mem::replace(&mut idx[j], j as u32) as usize);
         }
         // `z[first_round_rank] = index_after_the_re-sort`. Built from `secondary_all`, which each
         // region carried through the sort, so it inverts the permutation the sort just applied.
@@ -1167,6 +1193,20 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     n_pri
 }
 
+/// `f64::from(n).ln()`, from a table below 1024: MAPQ takes the log of an alignment length, a seed
+/// coverage or a competitor count, always a small integer, and libm's `log` per record showed in
+/// x86 profiles. The table holds libm's own results (filled at first use, the argument opaque so
+/// nothing is folded at compile time), so every value is bit-identical.
+pub(crate) fn ln_int(n: i32) -> f64 {
+    static LN: std::sync::OnceLock<[f64; 1024]> = std::sync::OnceLock::new();
+    match usize::try_from(n) {
+        Ok(i) if i < 1024 => {
+            LN.get_or_init(|| std::array::from_fn(|k| std::hint::black_box(k as f64).ln()))[i]
+        }
+        _ => f64::from(n).ln(),
+    }
+}
+
 /// Approximate mapping quality of a primary region, 0..=60. Port of `mem_approx_mapq_se`
 /// (`bwamem.cpp:1470`).
 ///
@@ -1201,7 +1241,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         opt.min_seed_len * opt.a
     };
     // `csub` is the best competitor from within the same chain; take whichever evidence is stronger.
-    sub = sub.max(a.csub);
+    sub = sub.max(crate::lazy_csub::get(a.csub));
     // No margin at all: the competitor is as good as us, so the placement is arbitrary.
     if sub >= a.score {
         return 0;
@@ -1231,9 +1271,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         // The C's other branch (`bwamem.cpp:1485`), taken under `-Q 0` or a negative `-Q`: the
         // margin over the competitor scaled by how much of the read the seeds cover, then the
         // same identity shrink as below but squared once and only under 95% identity.
-        mapq = (MAPQ_SEEDCOV_COEF
-            * (1.0 - f64::from(sub) / f64::from(a.score))
-            * f64::from(a.seedcov).ln()
+        mapq = (MAPQ_SEEDCOV_COEF * (1.0 - f64::from(sub) / f64::from(a.score)) * ln_int(a.seedcov)
             + ROUND_BIAS) as i32;
         if identity < 0.95 {
             mapq = (f64::from(mapq) * identity * identity + ROUND_BIAS) as i32;
@@ -1248,7 +1286,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         let len_discount = if f64::from(l) < opt.mapq_coef_len {
             1.0
         } else {
-            opt.mapq_coef_fac / f64::from(l).ln()
+            opt.mapq_coef_fac / ln_int(l)
         };
         // Squared here and squared again in the line below, so identity enters to the *fourth*
         // power and the length term to the second. That steep falloff is deliberate: a
@@ -1265,7 +1303,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
     // so two competitors cost about 3 and ten cost 10. Applied before the clamp, so a large
     // penalty can drive `mapq` negative and the clamp catches it.
     if a.sub_n > 0 {
-        mapq -= (MAPQ_SUB_N_COEF * f64::from(a.sub_n + 1).ln() + ROUND_BIAS) as i32;
+        mapq -= (MAPQ_SUB_N_COEF * ln_int(a.sub_n + 1) + ROUND_BIAS) as i32;
     }
     // bwa's own ceiling, not a SAM one. Must happen before the `frac_rep` scaling below,
     // otherwise a large pre-clamp value would survive the multiplication (`bwamem.cpp:1490`).
@@ -1381,20 +1419,25 @@ mod tests {
                     let mut r = reg(20 + next(3) as i32, 0, 0, 0, 1);
                     r.is_alt = next(4) == 0;
                     r.rb = i as i64;
-                    r.hash = hash_64(round.wrapping_add(i as u64));
                     r
                 })
                 .collect();
-            let mut b = a.clone();
-            sort_hlt(&mut a);
-            ks_introsort_by(&mut b, |x, y| {
+            let mut b: Vec<(MemAlnReg, u64)> = a
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.clone(), hash_64(round.wrapping_add(i as u64))))
+                .collect();
+            let hashes = sort_hlt(&mut a, round, true);
+            ks_introsort_by(&mut b, |(x, hx), (y, hy)| {
                 x.score > y.score
                     || (x.score == y.score
-                        && (!x.is_alt && y.is_alt || (x.is_alt == y.is_alt && x.hash < y.hash)))
+                        && (!x.is_alt && y.is_alt || (x.is_alt == y.is_alt && hx < hy)))
             });
             let ia: Vec<i64> = a.iter().map(|r| r.rb).collect();
-            let ib: Vec<i64> = b.iter().map(|r| r.rb).collect();
+            let ib: Vec<i64> = b.iter().map(|(r, _)| r.rb).collect();
             assert_eq!(ia, ib, "round {round}, n {n}");
+            let hb: Vec<u64> = b.iter().map(|&(_, h)| h).collect();
+            assert_eq!(hashes, hb, "round {round}, n {n}");
         }
     }
 
@@ -1541,7 +1584,6 @@ mod tests {
             frac_rep: 0.0,
             is_alt: false,
             alt_sc: 0,
-            hash: 0,
         }
     }
 

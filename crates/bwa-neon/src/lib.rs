@@ -136,7 +136,9 @@ mod rescue_prune;
 /// [`KswJob`] (one unmapped mate against one reference window each) and returns one alignment per
 /// job. Note this kernel opens gaps from `H`, not from `M` like [`batched`]: that asymmetry is
 /// deliberate and mirrors the two different C originals (`ksw_u8` vs `ksw_extend2`).
-pub use matesw::{batched_ksw_align2, batched_mate_rescue, KswJob};
+pub use matesw::{
+    batched_ksw_align2, batched_mate_rescue, batched_mate_rescue_lazy, KswJob, SCORE2_PENDING,
+};
 
 /// `Σ mat[r[i] * 5 + q[i]]` over the common length: the ungapped score of `q` (read codes) against
 /// `r` (reference codes). Codes are at most 4, so every index is below 25. 16 bases a step through

@@ -317,6 +317,9 @@ jobs:
                      'bwa_mem4_mem::across::run_side' \
                      'bwa_mem4_mem::across::align_reads_batched' \
                      'bwa_mem4_mem::pe::batch_mate_rescue' \
+                     'bwa_mem4_mem::pe::skip_set' \
+                     'spec_from_iter::SpecFromIter<T,I>>::from_iter' \
+                     'bwa_mem4::cmd_mem::run_pe::.*closure.*closure.*closure.*closure' \
                      'bwa_neon::matesw::batched_align' \
                      'bwa_neon::rescue_band::Batch::run_jobs' \
                      'bwa_neon::rescue_band::Batch::add_jobs' \

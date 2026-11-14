@@ -276,6 +276,52 @@ pub mod rescue_split {
 /// directly; the counters live where the tracker does.
 pub use bwa_extend::sw::subopt_shape;
 
+/// Deferred `csub` of rescued regions. Mate rescue usually finds its hit on one diagonal end to
+/// end, and the second-best score `ksw_align2` reports with it costs bands at `min_seed_len`
+/// around every alignment the window could hold, where the score alone needs a few diagonals.
+/// Yet `csub` is read only for the regions SAM emit turns into MAPQ and XS (about one rescued
+/// region in twenty on human reads). So the batched rescue leaves it pending, `csub <= BASE` naming
+/// an entry of its chunk's [`crate::pe::PendS2`] table, and emit computes it for the pairs that
+/// read one: a read records the entry and yields -1, and the caller reruns the pair once the
+/// entries are resolved. Which regions are read never depends on a `csub` value (only MAPQ and
+/// XS values do), so the rerun reads the same entries, now resolved.
+pub mod lazy_csub {
+    use std::cell::RefCell;
+
+    /// The first pending value: `csub = BASE - index`. bwa's `csub` is -1 or a score.
+    pub const BASE: i32 = -2;
+
+    thread_local! {
+        static READS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The `csub` of pending entry `index`.
+    pub fn encode(index: usize) -> i32 {
+        BASE - index as i32
+    }
+
+    /// The table index a pending `csub` names, or `None` for a computed one.
+    pub fn index(csub: i32) -> Option<usize> {
+        (csub <= BASE).then(|| (BASE - csub) as usize)
+    }
+
+    /// `csub` as a reader sees it: a computed value is returned, a pending one is recorded for
+    /// [`take`] and reads as -1 (the reader's result is then discarded).
+    #[inline]
+    pub fn get(csub: i32) -> i32 {
+        if csub > BASE {
+            return csub;
+        }
+        READS.with(|r| r.borrow_mut().push((BASE - csub) as u32));
+        -1
+    }
+
+    /// The pending entries read on this thread since the last call, emptied.
+    pub fn take(out: &mut Vec<u32>) {
+        READS.with(|r| out.append(&mut r.borrow_mut()));
+    }
+}
+
 pub mod across;
 pub mod alt;
 pub mod cigar;
@@ -288,7 +334,7 @@ pub use across::{align_reads_batched, align_reads_batched_meth};
 pub use cigar::{cigar_string, reg2aln, MemAln};
 pub use pe::{
     batch_mate_rescue, mem_pestat, mem_pestat_from, mem_sam_pe, pestat_samples, PairRescueData,
-    PeStat,
+    PeStat, PendS2,
 };
 pub use primary::{mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch, stamp_is_alt};
 
@@ -368,10 +414,9 @@ pub struct MemAlnReg {
     /// `pa:f` tag (`bwamem.cpp:1714`, printed as `score / alt_sc`). Stays 0 on an index with no
     /// ALT contigs, which is why `pa:f` never appears without a `.alt` file.
     pub alt_sc: i32,
-    /// Per-region hash used purely as a deterministic tie-break when two regions compare equal
-    /// during primary marking, so that ordering does not depend on sort stability. Derived from
-    /// the read id, hence the `read_id` parameter threaded through `align_read_se`.
-    pub hash: u64,
+    // No `hash` (bwa's tie-break): only primary marking reads it, so `sort_hlt` derives it from
+    // the read id and the region's index there. The batch holds every region until SAM emit, and
+    // the 8 bytes took a region from 80 to 88.
 }
 
 /// Longest gap worth allowing for a `qlen`-base extension, i.e. how far the reference window must
@@ -795,7 +840,6 @@ pub(crate) fn mem_chain2aln_meta(
                 is_alt: chain.is_alt,
                 // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                 alt_sc: 0,
-                hash: 0,
             });
             continue;
         }
@@ -824,7 +868,6 @@ pub(crate) fn mem_chain2aln_meta(
             is_alt: chain.is_alt,
             // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
             alt_sc: 0,
-            hash: 0,
         };
 
         // ---------------------------- step 3a: extend leftwards ----------------------------

@@ -360,7 +360,6 @@ mod tests {
             frac_rep: 0.0,
             is_alt: false,
             alt_sc: 0,
-            hash: 0,
         }
     }
 

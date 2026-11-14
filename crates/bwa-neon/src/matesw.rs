@@ -484,7 +484,7 @@ pub fn batched_ksw_align2(
     max_sc: i32,
 ) -> Vec<KswAlignResult> {
     batched_align(
-        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, None, None,
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, None, None, false,
     )
 }
 
@@ -581,7 +581,37 @@ pub fn batched_mate_rescue(
         }
     }
     batched_align(
-        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, prune, rel,
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, prune, rel, false,
+    )
+}
+
+/// `score2` of a [`batched_mate_rescue_lazy`] result whose second-best score was not computed.
+pub const SCORE2_PENDING: i32 = -2;
+
+/// [`batched_mate_rescue`] for a caller that computes `score2` later and only where it reads it:
+/// a banded job whose ungapped floor (`rescue_prune::ungapped_floor`) exceeds `minsc` runs its
+/// bands at that floor, which holds every alignment scoring `S`, and reports
+/// `score2 = SCORE2_PENDING`, `te2 = -1`. Every other field, and every field of every other job,
+/// is [`batched_mate_rescue`]'s. `BWA4_RESCUE_LAZY=0` makes this [`batched_mate_rescue`].
+#[allow(clippy::too_many_arguments)]
+pub fn batched_mate_rescue_lazy(
+    jobs: &[KswJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    minsc: i32,
+    max_sc: i32,
+) -> Vec<KswAlignResult> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_LAZY").is_none_or(|v| v != "0")) {
+        return batched_mate_rescue(jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
+    }
+    let prune = prune_params(m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc);
+    batched_align(
+        jobs, m, mat, o_del, e_del, o_ins, e_ins, minsc, max_sc, prune, None, true,
     )
 }
 
@@ -634,6 +664,7 @@ pub(crate) fn batched_align(
     prune: Option<rescue_prune::Params>,
     // The relation the prune decides under (`--meth`, see `rescue_prune::decide_rel`).
     rel: Option<(u8, u8)>,
+    lazy: bool,
 ) -> Vec<KswAlignResult> {
     // `Some(start instant)` only when BWA4_MATESW_TIME is set; `None` disables all accounting so the
     // stock path pays one cached bool load and nothing else.
@@ -788,7 +819,8 @@ pub(crate) fn batched_align(
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             Some(p) if band_ok && u8_job_fits(j.query.len(), j.target.len(), mat, max_sc) => {
                 let quanta = ksw_padded_qlen(j.query.len(), max_sc);
-                let (d, t1) = band.decide(j.target, j.query, &p, gate(j.query.len()), rel);
+                let (d, t1, lz) =
+                    band.decide(j.target, j.query, &p, gate(j.query.len()), rel, lazy);
                 if let Some((hb, n)) = kept(&d, j.target.len()) {
                     let fp = window_fp(&j.target[hb..hb + n]);
                     if let Some((src, sh)) = find(&group, j, hb, n, fp) {
@@ -797,7 +829,7 @@ pub(crate) fn batched_align(
                     }
                     group.push((i as u32, hb as u32, n as u32, fp));
                 }
-                match band.commit(i, j.target, j.query, d, t1, &p, quanta) {
+                match band.commit(i, j.target, j.query, d, t1, lz, &p, quanta) {
                     Some(d) => Some(d),
                     None => {
                         if let Some(t0) = t_decide {

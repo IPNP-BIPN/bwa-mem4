@@ -60,6 +60,8 @@ const WCAP: usize = 30_000;
 pub(crate) struct Params {
     pub(crate) k: usize,
     pub(crate) a: i32,
+    /// The mismatch penalty, for [`ungapped_floor`].
+    pub(crate) b: i32,
     pub(crate) c: i32,
     pub(crate) o_del: i32,
     pub(crate) e_del: i32,
@@ -98,6 +100,7 @@ impl Params {
                 return Some(Params {
                     k: k as usize,
                     a,
+                    b,
                     c,
                     o_del,
                     e_del,
@@ -659,11 +662,34 @@ fn primary_hits(
 /// One bit per nonzero count, bit `x` for `cnt[x]`.
 #[inline]
 fn occupied_word(cnt: &[u16]) -> u64 {
-    let mut bits = 0u64;
-    for (x, &c) in cnt[..64].iter().enumerate() {
-        bits |= u64::from(c != 0) << x;
+    let cnt = &cnt[..64];
+    // SSE2 (x86-64 baseline): LLVM's own vectorisation widened every count to 64 bits, ~65
+    // instructions a word; compare, pack and movemask take 16 counts in four.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        let mut zero_bits = 0u64;
+        // SAFETY: SSE2 is part of x86-64; the eight unaligned 16-byte loads stay inside `cnt`.
+        unsafe {
+            let z = _mm_setzero_si128();
+            let p = cnt.as_ptr().cast::<__m128i>();
+            for g in 0..4 {
+                let a = _mm_cmpeq_epi16(_mm_loadu_si128(p.add(2 * g)), z);
+                let b = _mm_cmpeq_epi16(_mm_loadu_si128(p.add(2 * g + 1)), z);
+                let m = _mm_movemask_epi8(_mm_packs_epi16(a, b)) as u32;
+                zero_bits |= u64::from(m) << (16 * g);
+            }
+        }
+        !zero_bits
     }
-    bits
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut bits = 0u64;
+        for (x, &c) in cnt.iter().enumerate() {
+            bits |= u64::from(c != 0) << x;
+        }
+        bits
+    }
 }
 
 /// The K = 5 hit counter in NEON, after fg-labs/bwa-mem3's `lean_neon` (`src/rescue_prune_neon.h`,
@@ -2315,8 +2341,12 @@ pub(crate) fn round1_threshold(minsc: i32, ub2: i32) -> i32 {
 }
 
 /// [`decide`], and on a `Hull` the components the banded kernel runs: `c19` at `minsc` and, when
-/// the band threshold [`round1_threshold`] exceeds `minsc`, `ct` at it. Returns `T1`, or 0 when
-/// the decision is not a hull. `rel`: the hits are [`decide_rel`]'s.
+/// the band threshold exceeds `minsc`, `ct` at it. Returns the decision, the threshold `T1` (0 when
+/// the decision is not a hull) and whether `T1` is a lower bound on the job's score taken because
+/// the caller does not need `score2` (`lazy`): [`ungapped_floor`] when it exceeds `minsc`, else
+/// [`round1_threshold`] as for an exact job. `rel`: the hits are
+/// [`decide_rel`]'s.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decide_bands(
     t: &[u8],
     q: &[u8],
@@ -2325,34 +2355,44 @@ pub(crate) fn decide_bands(
     c19: &mut Vec<Comp>,
     ct: &mut Vec<Comp>,
     rel: Option<(u8, u8)>,
-) -> (Decision, i32) {
+    lazy: bool,
+) -> (Decision, i32, bool) {
     let (len1, len2, k) = (t.len(), q.len(), p.k);
     if len1 < k || len2 < k || len1 > WCAP || len2 > QCAP {
-        return (Decision::Full, 0);
+        return (Decision::Full, 0, false);
     }
     if rel.is_some_and(|(x, y)| (x ^ y).count_ones() != 1) {
-        return (Decision::Full, 0);
+        return (Decision::Full, 0, false);
     }
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        let counted = count_hits(s, t, q, p, max_hits, rel);
-        let Some(nd) = counted else {
-            return (Decision::Full, 0);
+        let Some(nd) = count_hits(s, t, q, p, max_hits, rel) else {
+            return (Decision::Full, 0, false);
         };
         let dec = decide_counts(s, p, len1, nd);
         if !matches!(dec, Decision::Hull { .. }) {
-            return (dec, 0);
+            return (dec, 0, false);
         }
         let off = (nd - len1 - 1) as i32;
-        let (mut ub1, mut ub2) = (0, 0);
-        for c in &s.c19 {
+        let (mut ub1, mut ub2, mut k1) = (0, 0, 0);
+        for (i, c) in s.c19.iter().enumerate() {
             if c.ub > ub1 {
-                (ub2, ub1) = (ub1, c.ub);
+                (ub2, ub1, k1) = (ub1, c.ub, i);
             } else if c.ub > ub2 {
                 ub2 = c.ub;
             }
         }
-        let t1 = round1_threshold(p.minsc, ub2);
+        let floor = if lazy {
+            ungapped_floor(s, t, q, p, off, k1)
+        } else {
+            0
+        };
+        let lazy = floor > p.minsc;
+        let t1 = if lazy {
+            floor
+        } else {
+            round1_threshold(p.minsc, ub2)
+        };
         std::mem::swap(&mut s.c19, c19);
         if s.dense {
             // The dense components are the threshold's whole runs: already extended.
@@ -2360,7 +2400,7 @@ pub(crate) fn decide_bands(
                 // SAFETY: `s.dense` means `dense_enabled` held (see `decide_counts`); `bounds` filled `s`.
                 unsafe { dense::components(s, t1, off, nd, ct) };
             }
-            return (dec, t1);
+            return (dec, t1, lazy);
         }
         for cm in c19.iter_mut() {
             extend(s, p, p.minsc, nd, cm);
@@ -2368,8 +2408,62 @@ pub(crate) fn decide_bands(
         if t1 > p.minsc {
             components(s, p, t1, off, nd, true, ct);
         }
-        (dec, t1)
+        (dec, t1, lazy)
     })
+}
+
+/// A lower bound on the job's score `S`: the best ungapped local score on the densest diagonal of
+/// component `s.c19[k1]` (the strongest at `minsc`). An ungapped segment is an alignment, so `S` is
+/// at least its score, and the filter only takes windows and mates without an N, so a cell scores
+/// `a` or `-b`. Every alignment scoring `>= S` lies in a component at this threshold, which gives
+/// `S`, `te` and `qe` exactly from far narrower bands than `minsc`'s: on human rescue windows the
+/// mate usually matches one diagonal end to end, and this bound is then `S` itself.
+fn ungapped_floor(s: &Scratch, t: &[u8], q: &[u8], p: &Params, off: i32, k1: usize) -> i32 {
+    let c = &s.c19[k1];
+    let lo = (c.dlo + off).max(0) as usize;
+    let hi = ((c.dhi + off).max(0) as usize).min(s.cnt.len().saturating_sub(1));
+    if lo > hi {
+        return 0;
+    }
+    // The first densest diagonal (two passes the compiler vectorises).
+    let cnt = &s.cnt[lo..=hi];
+    let top = cnt.iter().copied().max().unwrap_or(0);
+    let db = lo + cnt.iter().position(|&n| n == top).unwrap_or(0);
+    // Diagonal `d = i - j`: query column `j` meets target row `j + d`.
+    let d = db as i32 - off;
+    let j0 = (-d).max(0) as usize;
+    let j1 = ((t.len() as i32 - d).clamp(0, q.len() as i32) as usize).max(j0);
+    let (qs, ts) = (
+        &q[j0..j1],
+        &t[(j0 as i32 + d) as usize..(j1 as i32 + d) as usize],
+    );
+    // Kadane over `a` per match and `-b` per mismatch, a run of matches at a time: the running
+    // score only climbs along a run, so the best ends one, and a mismatch takes `b` off (floor 0).
+    let (mut cur, mut best, mut from) = (0i32, 0i32, 0usize);
+    let mut mismatch = |at: usize| {
+        cur += p.a * (at - from) as i32;
+        best = best.max(cur);
+        cur = (cur - p.b).max(0);
+        from = at + 1;
+    };
+    let n = qs.len();
+    let mut k = 0;
+    while k + 8 <= n {
+        let w = |x: &[u8]| u64::from_le_bytes(x[k..k + 8].try_into().unwrap());
+        let mut x = w(qs) ^ w(ts);
+        while x != 0 {
+            let byte = x.trailing_zeros() as usize / 8;
+            mismatch(k + byte);
+            x &= !(0xFF << (byte * 8));
+        }
+        k += 8;
+    }
+    for at in k..n {
+        if qs[at] != ts[at] {
+            mismatch(at);
+        }
+    }
+    best.max(cur + p.a * (n - from) as i32)
 }
 
 /// The smallest interval bound on the `gap` empty diagonals between two occupied ones, the left
@@ -2402,6 +2496,24 @@ fn gap_min(p: &Params, f_left: i32, b_right: i32, gap: u32) -> i32 {
 pub(crate) mod tests {
     use super::*;
     use bwa_extend::ksw_align2;
+
+    /// The SIMD [`occupied_word`] sets bit `x` exactly when `cnt[x] != 0`, counts up to `u16::MAX`.
+    #[test]
+    fn occupied_word_marks_nonzero_counts() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2000 {
+            let cnt: Vec<u16> = (0..64)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    [0, 0, 1, 255, 256, u16::MAX, x as u16][(x >> 32) as usize % 7]
+                })
+                .collect();
+            let want = (0..64).fold(0u64, |b, i| b | u64::from(cnt[i] != 0) << i);
+            assert_eq!(occupied_word(&cnt), want);
+        }
+    }
 
     /// [`super::count_hits`] with `cnt` made dense: the counter leaves `cnt` stale where no
     /// `occ_bits` bit is set (production reads it only under one), these tests read every slot.
@@ -2728,6 +2840,7 @@ pub(crate) mod tests {
             let p = Params {
                 k,
                 a: 1,
+                b: 4,
                 c: 1,
                 o_del: 6,
                 e_del: 1,
@@ -3536,8 +3649,9 @@ pub(crate) mod tests {
             // The pruned path itself, whatever `BWA4_RESCUE_PRUNE` says.
             let p = Params::from(a as i32, b as i32, o, e, o, e, minsc);
             assert!(p.is_some());
-            let got =
-                crate::matesw::batched_align(&jobs, 5, &mat, o, e, o, e, minsc, a as i32, p, None);
+            let got = crate::matesw::batched_align(
+                &jobs, 5, &mat, o, e, o, e, minsc, a as i32, p, None, false,
+            );
             for (i, j) in jobs.iter().enumerate() {
                 let lanes = if (j.query.len() as i32) * (a as i32) < 250 {
                     16
