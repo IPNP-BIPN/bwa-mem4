@@ -512,7 +512,7 @@ fn open_reader(path: &std::path::Path) -> Result<Option<Box<dyn FastxReader>>> {
         return parsed(needletail::parse_fastx_reader(stream));
     }
 
-    // Gzipped input, parallel path: rapidgzip decodes ONE stream on several threads and hands back
+    // Gzipped input, rapidgzip path: it decodes ONE stream on `gzip_threads` threads and hands back
     // a `Read`, so needletail parses plain text exactly as it would from an uncompressed file. A
     // pipe or FIFO is not seekable and the crate falls back to sequential decoding on its own, so
     // there is no input to special-case here. See `gzip_threads` for the budget.
@@ -573,46 +573,21 @@ fn open_reader(path: &std::path::Path) -> Result<Option<Box<dyn FastxReader>>> {
     unreachable!("the branch above returns when the feature is off")
 }
 
-/// Decoder threads per gzipped input file, as set by the binary from `-t`. `None` until then.
-#[cfg(feature = "parallel-gzip")]
-static GZIP_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Tell the reader how many threads one gzipped file's decoder may use.
+/// Threads for one gzipped file's decoder: 1, or `BWA4_GZIP_THREADS`.
 ///
-/// Called once by the binary before any input is opened, with `-t`. The value is halved because a
-/// paired-end run opens TWO files and each gets its own decoder, so the two together stay inside
-/// the thread budget the user asked for. It is not a throughput decision: the decoders matter
-/// during the FIRST batch, when every aligner worker is idle because no batch has arrived yet.
-///
-/// # Parameters
-/// * `threads`: the run's `-t`. 0 is treated as 1.
-#[cfg(feature = "parallel-gzip")]
-pub fn set_gzip_threads(threads: usize) {
-    let _ = GZIP_THREADS.set(threads.max(1).div_ceil(2));
-}
-
-/// Threads for one file's decoder: what the binary set, overridden by `BWA4_GZIP_THREADS`.
-///
-/// `BWA4_GZIP_THREADS` exists so the budget can be swept on a new machine rather than argued about;
-/// 1 reproduces the single-thread inflater's throughput without rebuilding. A value that does not
-/// parse, or 0, is ignored rather than clamped silently, so a typo in a benchmark script cannot
-/// quietly change what is being measured.
+/// One thread inflates a 150 bp FASTQ at about 1 GB/s, and only the FIRST batch ever waits on it
+/// (behind it the aligner is the bottleneck). Every extra thread keeps decoded chunks in flight for
+/// the whole run. chr21 sim pairs, gzip -1, M4, `-t/2` threads a file against one: -t4 +170 MB and
+/// a slower first batch (wait 67 vs 34 ms), -t8 +60 MB for the same wait, -t16 +200 MB to save 47
+/// ms once. A value that does not parse, or 0, is ignored rather than clamped silently, so a typo
+/// in a benchmark script cannot quietly change what is being measured.
 #[cfg(feature = "parallel-gzip")]
 fn gzip_threads() -> usize {
-    if let Ok(s) = std::env::var("BWA4_GZIP_THREADS") {
-        if let Ok(n) = s.trim().parse::<usize>() {
-            if n >= 1 {
-                return n;
-            }
-        }
-    }
-    // No setter call (a library user, or a unit test): fall back to the machine rather than to 1,
-    // since the whole point is not to leave the decoder single-threaded by accident.
-    *GZIP_THREADS.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .div_ceil(2)
-    })
+    std::env::var("BWA4_GZIP_THREADS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
 }
 
 /// Decompressed bytes handed over per channel message. 1 MiB is about 3 000 reads at 150 bp, so
