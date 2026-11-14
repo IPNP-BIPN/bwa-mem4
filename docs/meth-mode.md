@@ -211,7 +211,8 @@ reach those kernels in three ways:
   SSE4.1 (`rescue_prune::count_hits`). The count does not shrink with the lanes and the full SW
   does, so x86 prunes only from a mean mate length of 200 bp per 32 lanes: 200 bp on AVX2, 400 bp
   on AVX-512 (TAPS `-t1`, ours / fork: EPYC 7763 150 bp 0.92 pruned against 0.83 unpruned, 250 bp
-  0.80 against 0.82; EPYC 9V74 150 bp 0.91 against 0.81). NEON prunes at every length.
+  0.80 against 0.82; EPYC 9V74 150 bp 0.91 against 0.81, and with the gate below still 0.82 against
+  0.75 at c3c92a8). NEON prunes at every length.
   `BWA4_RESCUE_PRUNE=1` prunes anyway. bwa-mem3 does not prune `--meth` on x86. A window
   sharing more hits with its mate than the gate runs in full (its band would be the whole window).
   The plain gate is 1000 hits; relation hits are ~3x denser, so under a relation it is 3 per mate
@@ -259,24 +260,29 @@ moves wall times by up to 2x, cycles much less. The SAM output was identical. Ma
 | EM-seq | 17.2 / 26.3 (0.65) | 24.1 / 45.0 (0.54) |
 | TAPS | 15.7 / 24.0 (0.66) | 20.5 / 38.0 (0.54) |
 
-On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` times both binaries on
-200,000 pairs simulated from chr21, on the runner's CPU. Each cell is the wall-time ratio
-bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each, both binaries in the same job (commit
-ff41fc5). A range covers several jobs that drew the same CPU. The SAM output was byte-identical in
-every job.
+On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` (150 bp) or `meth:250` times
+both binaries on 200,000 pairs simulated from chr21, on the runner's CPU. Each cell is the wall-time
+ratio bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each, both binaries in the same job. A
+range covers several jobs that drew the same CPU. Each row gives the newest commit that drew that
+CPU; since 2b8f138 only the pruned path changed on x86 (AVX2 from 200 bp), so 2b8f138 and c3c92a8
+rows time the same code elsewhere. The SAM output was byte-identical in every job.
 
-| CPU (rescue kernel) | Jobs | EM-seq `-t1` | EM-seq `-t4` | TAPS `-t1` | TAPS `-t4` |
-|---|---|---|---|---|---|
-| Xeon Platinum 8573C (AVX-512, VBMI) | 1 | 0.900 | 0.931 | 0.889 | 0.925 |
-| Xeon Platinum 8370C (AVX-512, VBMI) | 1 | 0.920 | 0.930 | 0.906 | 0.912 |
-| Xeon 6973P-C (AVX-512, VBMI) | 1 | 0.892 | 0.902 | 0.879 | 0.900 |
-| EPYC 7763, Zen 3 (AVX2) | 7 | 0.850-0.855 | 0.822-0.828 | 0.910-0.928 | 0.905-0.912 |
-| EPYC 9V74, Zen 4 (AVX-512, VBMI) | 2 | 0.838-0.870 | 0.827-0.869 | 0.855-0.933 | 0.880-0.900 |
-| EPYC 9V45, Zen 5 (AVX-512, VBMI) | 2 | 0.950-0.953 | 0.892-0.895 | 0.958-0.977 | 0.898-0.909 |
+| CPU (rescue kernel) | Commit | Reads | Jobs | EM-seq `-t1` | EM-seq `-t4` | TAPS `-t1` | TAPS `-t4` |
+|---|---|---|---|---|---|---|---|
+| EPYC 7763, Zen 3 (AVX2) | 2b8f138 | 150 bp | 1 | 0.747 | 0.746 | 0.762 | 0.769 |
+| EPYC 7763, Zen 3 (AVX2) | 2b8f138, c3c92a8 | 250 bp | 2 | 0.683-0.696 | 0.672-0.680 | 0.697-0.703 | 0.675 |
+| EPYC 9V74, Zen 4 (AVX-512, VBMI) | 2b8f138, c3c92a8 | 150 bp | 3 | 0.721-0.735 | 0.765-0.770 | 0.739-0.747 | 0.779-0.782 |
+| EPYC 9V74, Zen 4 (AVX-512, VBMI) | 2b8f138 | 250 bp | 1 | 0.667 | 0.695 | 0.669 | 0.710 |
+| Xeon 6975P-C (AVX-512, VBMI) | 3fba29d | 150 bp | 1 | 0.809 | 0.850 | 0.810 | 0.845 |
+| Xeon Platinum 8573C (AVX-512, VBMI) | 46621ea | 250 bp | 1 | 0.855 | 0.867 | 0.824 | 0.857 |
+| EPYC 9V45, Zen 5 (AVX-512, VBMI) | 0b328ab | 250 bp | 1 | 0.890 | 0.885 | 0.868 | 0.854 |
 
-The user + sys CPU ratios are within 1.5% of the wall ratios. The max RSS ratio is 0.86 to 0.97
-at `-t1` and 0.62 to 0.79 at `-t4`. On the 9V45 the run-to-run noise is about 4%: over five jobs
-on the same EM-seq code, its `-t1` ratio was 0.94 to 1.00. On that CPU, bwa-mem4's seeding takes
+The user + sys CPU ratios are within 1.5% of the wall ratios. In the 2b8f138 and c3c92a8 jobs the
+max RSS ratio is 0.89 to 0.98 at `-t1` and 0.60 to 0.77 at `-t4`. The A/B arms of those jobs moved
+nothing worth keeping: `BWA4_LOCKSTEP_N` 12 or 16 stays within 1.5% of the probe's pick on the 7763,
+the 9V74 and the 6975P-C, and `BWA4_RESCUE_PRUNE=1` at 150 bp on the 9V74 costs TAPS 7 points
+(0.746 to 0.818). On the 9V45 the run-to-run noise is about 4%: over five jobs on the same EM-seq
+code, its `-t1` ratio was 0.94 to 1.00. On that CPU, bwa-mem4's seeding takes
 more perf samples than bwa-mem3's; extension makes up for it.
 
 ## Differences from bwa-mem3 0.16
