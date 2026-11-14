@@ -549,8 +549,9 @@ pub fn batched_mate_rescue(
             // The relation's K-mer count has its NEON and SSE forms (`rescue_prune::count_hits`);
             // in scalar it cost x86 more than the full SW it saved (EPYC 9V45 TAPS -t4: 3.81 s
             // unpruned, 4.09-4.17 s pruned).
+            let qlen = jobs.iter().map(|j| j.query.len()).sum::<usize>() / jobs.len().max(1);
             let prune = prune_params(m, &uni, o_del, e_del, o_ins, e_ins, minsc, max_sc)
-                .filter(|_| !full_sw_cheaper());
+                .filter(|_| !full_sw_cheaper(qlen));
             (prune, Some(rel))
         }
         _ => (
@@ -1112,21 +1113,30 @@ pub(crate) fn batched_align(
     out
 }
 
-/// Whether the full rescue SW costs less than the `--meth` relation prune's count plus band. On
-/// AVX-512 its 64 lanes do (CI 2026-11-14, TAPS 150 bp -t1, ours / fork: Xeon 8370C 0.90 unpruned
-/// against 0.98 pruned, EPYC 9V45 0.85 against 0.98; 250 bp on the 9V74 within noise); on AVX2 they
-/// do not (EPYC 7763 250 bp: 0.79 pruned, 0.82 unpruned). `BWA4_RESCUE_PRUNE=1` prunes anyway.
-fn full_sw_cheaper() -> bool {
+/// Whether the full rescue SW costs less than the `--meth` relation prune's count plus band, for
+/// mates of mean length `qlen`. The full SW's cost grows with `qlen` and its lanes divide it; the
+/// count's does not, so x86 prunes only from 200 bp per 32 lanes (CI 2026-11-14, TAPS -t1, ours /
+/// fork: EPYC 7763 AVX2 150 bp 0.92 pruned, 0.83 unpruned; 250 bp 0.80 pruned, 0.82 unpruned;
+/// AVX-512 unpruned wins at both, 9V74 150 bp 0.81 against 0.91, 9V45 250 bp 0.87 against 0.91).
+/// NEON prunes everywhere. `BWA4_RESCUE_PRUNE=1` prunes anyway.
+fn full_sw_cheaper(qlen: usize) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        static CHEAPER: OnceLock<bool> = OnceLock::new();
-        *CHEAPER.get_or_init(|| {
-            bwa_extend::has_avx512()
-                && std::env::var_os("BWA4_RESCUE_PRUNE").is_none_or(|v| v != "1")
+        // shortcut: two calibration points (150, 250 bp), the cut is between; refit on other lengths.
+        static MIN_QLEN: OnceLock<usize> = OnceLock::new();
+        qlen < *MIN_QLEN.get_or_init(|| {
+            if std::env::var_os("BWA4_RESCUE_PRUNE").is_some_and(|v| v == "1") {
+                0
+            } else if bwa_extend::has_avx512() {
+                400
+            } else {
+                200
+            }
         })
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
+        let _ = qlen;
         false
     }
 }
