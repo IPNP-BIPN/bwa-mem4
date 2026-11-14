@@ -1973,27 +1973,95 @@ fn mem_pair(
     id: u64,
 ) -> Option<PairResult> {
     thread_local! {
-        /// `v` and `u` below, kept per thread: two or three allocations per pair otherwise.
-        static PAIR_LISTS: std::cell::RefCell<[Vec<(u64, u64)>; 2]> =
-            const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+        /// `v` and `u` below, kept per thread: two or three allocations per pair otherwise. And
+        /// the insert-size penalties, kept across the pairs of a batch.
+        static PAIR_LISTS: std::cell::RefCell<PairScratch> =
+            const { std::cell::RefCell::new(([Vec::new(), Vec::new()], PairPenalty::new())) };
     }
     PAIR_LISTS.with(|c| {
-        let [v, u] = &mut *c.borrow_mut();
+        let ([v, u], pen) = &mut *c.borrow_mut();
         v.clear();
         u.clear();
-        mem_pair_in(bns, opt, pes, a, id, v, u)
+        pen.reset_for(pes, opt.a);
+        mem_pair_in(bns, opt, pes, a, id, [v, u], pen)
     })
 }
 
-/// [`mem_pair`] on the caller's two empty lists.
+/// [`mem_pair`]'s per-thread lists `v` and `u`, and its penalty memo.
+type PairScratch = ([Vec<(u64, u64)>; 2], PairPenalty);
+
+/// What [`PairPenalty`] was filled for: `(low, high, avg bits, std bits)` per orientation, and
+/// `opt.a`.
+type PairPenaltyKey = ([(i32, i32, u64, u64); 4], i32);
+
+/// [`mem_pair`]'s insert-size penalty, `INV_LOG4 * ln(2 * erfc(|ns| / sqrt 2)) * a`, by orientation
+/// and insert size, which is all it depends on: libm's `erfc` and `log` per candidate pair were
+/// ~0.3% of an x86 PE run. Valid for one batch's statistics and one `opt.a` (`key`). A slot is NaN
+/// until computed; a penalty that is NaN itself (`a == 0`) is simply recomputed each time.
+struct PairPenalty {
+    key: Option<PairPenaltyKey>,
+    /// Per orientation, the penalty at insert size `low + k` in slot `k`.
+    vals: [Vec<f64>; 4],
+}
+
+impl PairPenalty {
+    /// Insert sizes per orientation the memo covers; a wider `[low, high]` computes the rest.
+    const SPAN: i32 = 1 << 16;
+
+    const fn new() -> Self {
+        PairPenalty {
+            key: None,
+            vals: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        }
+    }
+
+    /// Empty every slot unless `pes` and `a` are the ones the slots were computed for.
+    fn reset_for(&mut self, pes: &[PeStat; 4], a: i32) {
+        let key = (
+            std::array::from_fn(|d| {
+                let p = &pes[d];
+                (p.low, p.high, p.avg.to_bits(), p.std.to_bits())
+            }),
+            a,
+        );
+        if self.key == Some(key) {
+            return;
+        }
+        for (v, p) in self.vals.iter_mut().zip(pes) {
+            v.clear();
+            v.resize((p.high - p.low + 1).clamp(0, Self::SPAN) as usize, f64::NAN);
+        }
+        self.key = Some(key);
+    }
+
+    /// The penalty of an insert of `dist`, which lies in `[pes.low, pes.high]`, in orientation `dir`.
+    fn get(&mut self, pes: &PeStat, dir: usize, dist: i64, a: i32) -> f64 {
+        match self.vals[dir].get_mut((dist - i64::from(pes.low)) as usize) {
+            Some(p) if !p.is_nan() => *p,
+            slot => {
+                // `ns` is bwa's name for the z-score of this insert size.
+                let ns = (dist as f64 - pes.avg) / pes.std;
+                // SAFETY: libm's `erfc` is a pure function of its argument.
+                let erfc_term = unsafe { erfc(ns.abs() * M_SQRT1_2) };
+                let pen = INV_LOG4 * (2.0 * erfc_term).ln() * f64::from(a);
+                if let Some(p) = slot {
+                    *p = pen;
+                }
+                pen
+            }
+        }
+    }
+}
+
+/// [`mem_pair`] on the caller's two empty lists `v` and `u`.
 fn mem_pair_in(
     bns: &BntSeq,
     opt: &MemOpt,
     pes: &[PeStat; 4],
     a: &[&[MemAlnReg]; 2],
     id: u64,
-    v: &mut Vec<(u64, u64)>,
-    u: &mut Vec<(u64, u64)>,
+    [v, u]: [&mut Vec<(u64, u64)>; 2],
+    pen: &mut PairPenalty,
 ) -> Option<PairResult> {
     let l_pac = bns.l_pac;
     // `v`: every candidate placement of either read, packed into two u64s so that a plain sort by
@@ -2095,16 +2163,12 @@ fn mem_pair_in(
                 // f64 throughout and the *system* libm `erfc`: this is the single most
                 // parity-sensitive expression in the file. A Rust-side erfc implementation, or f32
                 // anywhere in the chain, changes `q` by one on boundary pairs and silently reorders
-                // `u`, picking a different "best pair".
-                // `ns` is bwa's name for the z-score of this insert size.
-                let ns = (dist as f64 - pes[dir].avg) / pes[dir].std;
-                let erfc_term = unsafe { erfc(ns.abs() * M_SQRT1_2) };
+                // `u`, picking a different "best pair". The memo holds that same f64.
+                let penalty = pen.get(&pes[dir], dir, dist, opt.a);
                 // `v[..].1 >> 32` recovers each end's alignment score from the packed `y`. The
-                // `+ 0.499` is C's round-half-up, applied once to the whole sum, not per term.
-                let q = ((v[i].1 >> 32) as f64
-                    + (v[ku].1 >> 32) as f64
-                    + INV_LOG4 * (2.0 * erfc_term).ln() * f64::from(opt.a)
-                    + 0.499) as i64;
+                // `+ 0.499` is C's round-half-up, applied once to the whole sum, not per term; the
+                // additions run in the C's order.
+                let q = ((v[i].1 >> 32) as f64 + (v[ku].1 >> 32) as f64 + penalty + 0.499) as i64;
                 // A pair whose insert penalty exceeds its alignment scores floors at 0 rather than
                 // going negative, so it can still be selected if nothing better exists.
                 let q = q.max(0) as u64;
@@ -2917,7 +2981,8 @@ pub fn mem_sam_pe<W: Write>(
                 // Crowded runner-up field discounts the MAPQ, by `10*log10(n_sub+1)` phred units
                 // (see [`DECIBANS_PER_NAT`]).
                 if pr.n_sub > 0 {
-                    q_pe -= (DECIBANS_PER_NAT * f64::from(pr.n_sub + 1).ln() + 0.499) as i32;
+                    q_pe -=
+                        (DECIBANS_PER_NAT * crate::primary::ln_int(pr.n_sub + 1) + 0.499) as i32;
                 }
                 // Clamp BEFORE the repeat scaling, not after: bwa's order, and the two differ.
                 q_pe = q_pe.clamp(0, MAX_MAPQ);
@@ -3339,6 +3404,60 @@ mod tests {
         // Both reverse: RR (3).
         let (dir, _) = mem_infer_dir(l_pac, (l_pac << 1) - 1 - 100, (l_pac << 1) - 1 - 500);
         assert_eq!(dir, 3, "both reverse is RR (3)");
+    }
+}
+
+#[cfg(test)]
+mod pair_penalty_tests {
+    use super::*;
+
+    /// The memo returns exactly the expression it replaced, on a miss, on a hit, past its span and
+    /// after the statistics change (a new batch), and `ln_int` is libm's `ln` bit for bit.
+    #[test]
+    fn memo_matches_direct_formula() {
+        let direct = |p: &PeStat, dist: i64, a: i32| {
+            let ns = (dist as f64 - p.avg) / p.std;
+            INV_LOG4 * (2.0 * unsafe { erfc(ns.abs() * M_SQRT1_2) }).ln() * f64::from(a)
+        };
+        let mut pes = [PeStat::default(); 4];
+        pes[1] = PeStat {
+            low: 50,
+            high: 900,
+            failed: false,
+            avg: 412.25,
+            std: 61.5,
+        };
+        pes[2] = PeStat {
+            low: 0,
+            high: PairPenalty::SPAN + 10,
+            failed: false,
+            avg: 3e4,
+            std: 9e3,
+        };
+        let mut memo = PairPenalty::new();
+        for (round, a) in [(0, 1), (1, 1), (2, 2)] {
+            if round == 1 {
+                pes[1].avg += 1.0;
+            }
+            memo.reset_for(&pes, a);
+            for _hit in 0..2 {
+                for dist in [50, 51, 412, 899, 900] {
+                    let (want, got) = (direct(&pes[1], dist, a), memo.get(&pes[1], 1, dist, a));
+                    assert_eq!(got.to_bits(), want.to_bits(), "round {round} dist {dist}");
+                }
+                let far = i64::from(PairPenalty::SPAN) + 5;
+                let (want, got) = (direct(&pes[2], far, a), memo.get(&pes[2], 2, far, a));
+                assert_eq!(got.to_bits(), want.to_bits(), "past the span");
+            }
+        }
+        for n in [-3, 0, 1, 2, 149, 150, 1023, 1024, 5000, i32::MAX] {
+            let want = f64::from(n).ln();
+            assert_eq!(
+                crate::primary::ln_int(n).to_bits(),
+                want.to_bits(),
+                "ln_int({n})"
+            );
+        }
     }
 }
 

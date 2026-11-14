@@ -1166,6 +1166,20 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     n_pri
 }
 
+/// `f64::from(n).ln()`, from a table below 1024: MAPQ takes the log of an alignment length, a seed
+/// coverage or a competitor count, always a small integer, and libm's `log` per record showed in
+/// x86 profiles. The table holds libm's own results (filled at first use, the argument opaque so
+/// nothing is folded at compile time), so every value is bit-identical.
+pub(crate) fn ln_int(n: i32) -> f64 {
+    static LN: std::sync::OnceLock<[f64; 1024]> = std::sync::OnceLock::new();
+    match usize::try_from(n) {
+        Ok(i) if i < 1024 => {
+            LN.get_or_init(|| std::array::from_fn(|k| std::hint::black_box(k as f64).ln()))[i]
+        }
+        _ => f64::from(n).ln(),
+    }
+}
+
 /// Approximate mapping quality of a primary region, 0..=60. Port of `mem_approx_mapq_se`
 /// (`bwamem.cpp:1470`).
 ///
@@ -1230,9 +1244,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         // The C's other branch (`bwamem.cpp:1485`), taken under `-Q 0` or a negative `-Q`: the
         // margin over the competitor scaled by how much of the read the seeds cover, then the
         // same identity shrink as below but squared once and only under 95% identity.
-        mapq = (MAPQ_SEEDCOV_COEF
-            * (1.0 - f64::from(sub) / f64::from(a.score))
-            * f64::from(a.seedcov).ln()
+        mapq = (MAPQ_SEEDCOV_COEF * (1.0 - f64::from(sub) / f64::from(a.score)) * ln_int(a.seedcov)
             + ROUND_BIAS) as i32;
         if identity < 0.95 {
             mapq = (f64::from(mapq) * identity * identity + ROUND_BIAS) as i32;
@@ -1247,7 +1259,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         let len_discount = if f64::from(l) < opt.mapq_coef_len {
             1.0
         } else {
-            opt.mapq_coef_fac / f64::from(l).ln()
+            opt.mapq_coef_fac / ln_int(l)
         };
         // Squared here and squared again in the line below, so identity enters to the *fourth*
         // power and the length term to the second. That steep falloff is deliberate: a
@@ -1264,7 +1276,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
     // so two competitors cost about 3 and ten cost 10. Applied before the clamp, so a large
     // penalty can drive `mapq` negative and the clamp catches it.
     if a.sub_n > 0 {
-        mapq -= (MAPQ_SUB_N_COEF * f64::from(a.sub_n + 1).ln() + ROUND_BIAS) as i32;
+        mapq -= (MAPQ_SUB_N_COEF * ln_int(a.sub_n + 1) + ROUND_BIAS) as i32;
     }
     // bwa's own ceiling, not a SAM one. Must happen before the `frac_rep` scaling below,
     // otherwise a large pre-clamp value would survive the multiplication (`bwamem.cpp:1490`).

@@ -178,7 +178,8 @@ pub fn mem_flt_chained_seeds(
     let min_l = if opt.min_chain_weight != 0 {
         f64::from(MEM_HSP_COEF) * f64::from(opt.min_chain_weight)
     } else {
-        f64::from(MEM_MINSC_COEF) * (l_query as f64).ln()
+        f64::from(MEM_MINSC_COEF)
+            * i32::try_from(l_query).map_or_else(|_| (l_query as f64).ln(), crate::primary::ln_int)
     };
     if min_l > f64::from(MEM_SEEDSW_COEF) * l_query as f64 {
         // "don't run the following for short reads" -- the whole filter, for this read. This is the
