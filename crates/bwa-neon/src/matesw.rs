@@ -2189,6 +2189,27 @@ fn extract_group<R: RowMax>(
         *t = R::clamp_from(m);
     }
     let thr = &thr[..n_lanes];
+    // u8 rows: every lane's `score2` at once (`score2_lanes`), with no bitmap and no walk per lane.
+    let dense = (std::mem::size_of::<R>() == 1
+        && nrows <= DENSE_MAX_ROWS
+        && !bwa_extend::sw::subopt_shape::enabled())
+    .then(|| {
+        let a = (rowmax, n_lanes, nrows, minsc, max_sc, gmax, te, limit);
+        match lanes {
+            16 => Some(score2_lanes::<R, 16>(a)),
+            32 => Some(score2_lanes::<R, 32>(a)),
+            64 => Some(score2_lanes::<R, 64>(a)),
+            _ => None,
+        }
+    })
+    .flatten();
+    if let Some(s2) = dense {
+        for l in 0..n_lanes {
+            let best_qe = if te[l] >= 0 { qe[l] } else { -1 };
+            out[group_idx * lanes + l] = (gmax[l], te[l], best_qe, s2[l].0, s2[l].1);
+        }
+        return;
+    }
     let mut bits = vec![0u8; nrows.div_ceil(8) * n_lanes];
     for (blk, acc) in bits.chunks_exact_mut(n_lanes.max(1)).enumerate() {
         for k in 0..(nrows - 8 * blk).min(8) {
@@ -2265,6 +2286,79 @@ fn extract_group<R: RowMax>(
         let (score2, te2) = b.finish(best_score, best_te, max_sc);
         out[group_idx * lanes + l] = (best_score, best_te, best_qe, score2, te2);
     }
+}
+
+/// The most rows [`score2_lanes`] takes: row indices and the exclusion zone's bounds (`te` plus or
+/// minus at most 255) are held in `i16`.
+const DENSE_MAX_ROWS: usize = 32_000;
+
+/// Arguments of [`score2_lanes`], as [`extract_group`] names them.
+type Score2Args<'a, R> = (
+    &'a [R],
+    usize,
+    usize,
+    &'a [i32],
+    i32,
+    &'a [i32],
+    &'a [i32],
+    &'a [i32],
+);
+
+/// Every lane's `(score2, te2)` at once, over the `L`-lane row maxima of a u8 kernel: what
+/// [`extract_group`]'s walk gives (`SuboptimalTracker` fed every row reaching `minsc` up to the
+/// lane's `limit`, then the first strict maximum outside `te`'s exclusion zone), with each lane's
+/// streamed tracker (`rescue_band`'s `Tracker`: open candidate `cs`/`cr`, best kept `s2`/`te2`) in
+/// `i16` arrays updated without branches, so the lane loop vectorises. About 20 vector ops per row
+/// for all lanes, where the walk paid a strided load and a branch per marked row and lane, and
+/// under `--meth` most rows reach `minsc` (EM-seq 150 bp: 68% of rows marked). A lane that does not
+/// walk (`limit < 0`, `gmax < minsc` or `gmax <= 0`) gets `(-1, -1)`. `nrows <= DENSE_MAX_ROWS`.
+fn score2_lanes<R: RowMax, const L: usize>(
+    (rowmax, n_lanes, nrows, minsc, max_sc, gmax, te, limit): Score2Args<'_, R>,
+) -> [(i32, i32); 64] {
+    // Per lane: the bar, the last row, the exclusion zone. A lane that does not walk keeps
+    // `lim = -1` and never pushes.
+    let (mut thr, mut lim, mut lo, mut hi) = ([i16::MAX; L], [-1i16; L], [0i16; L], [0i16; L]);
+    for l in 0..n_lanes {
+        if limit[l] >= 0 && gmax[l] >= minsc[l] && gmax[l] > 0 {
+            let half = (gmax[l] + max_sc - 1) / max_sc;
+            // `minsc <= gmax <= 255`: the rows' range.
+            thr[l] = minsc[l].max(-1) as i16;
+            lim[l] = limit[l] as i16;
+            (lo[l], hi[l]) = ((te[l] - half) as i16, (te[l] + half) as i16);
+        }
+    }
+    // No open candidate: `cr = -2`, which no row follows and the close below skips.
+    let (mut cs, mut cr, mut s2, mut te2) = ([0i16; L], [-2i16; L], [-1i16; L], [-1i16; L]);
+    for i in 0..nrows {
+        let row: &[R; L] = rowmax[i * L..][..L].try_into().unwrap();
+        let ii = i as i16;
+        // Masks as `i16` (0 or -1) and selects as bit ops: in `bool`s AVX2 kept the loop scalar.
+        let m = |c: bool| -i16::from(c);
+        let sel = |k: i16, a: i16, b: i16| (a & k) | (b & !k);
+        for l in 0..L {
+            let v = row[l].into() as i16;
+            let p = m(v >= thr[l]) & m(ii <= lim[l]);
+            let cont = m(cr[l] == ii - 1);
+            // A pushed row that does not follow the open candidate closes it and opens its own.
+            let open = p & !cont;
+            let out_zone = m(cr[l] < lo[l]) | m(cr[l] > hi[l]);
+            let close = open & m(cr[l] >= 0) & out_zone & m(cs[l] > s2[l]);
+            s2[l] = sel(close, cs[l], s2[l]);
+            te2[l] = sel(close, cr[l], te2[l]);
+            // One that follows it raises it when strictly above.
+            let set = open | (p & cont & m(cs[l] < v));
+            cs[l] = sel(set, v, cs[l]);
+            cr[l] = sel(set, ii, cr[l]);
+        }
+    }
+    let mut out = [(-1i32, -1i32); 64];
+    for l in 0..n_lanes {
+        if (cr[l] >= 0) & ((cr[l] < lo[l]) | (cr[l] > hi[l])) & (cs[l] > s2[l]) {
+            (s2[l], te2[l]) = (cs[l], cr[l]);
+        }
+        out[l] = (i32::from(s2[l]), i32::from(te2[l]));
+    }
+    out
 }
 
 /// NEON i16x8 forward local-SW. Vectorizes the [`fwd_local_sw_scalar`] control flow across `LANES`
@@ -7151,6 +7245,73 @@ mod bench {
 
 #[cfg(test)]
 mod tests {
+    /// `score2_lanes` equals `SuboptimalTracker` lane by lane, on random row maxima (plateaus,
+    /// slopes, values around `minsc`), limits, `te` and lanes that do not walk.
+    #[test]
+    fn score2_lanes_equals_tracker() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as usize
+        };
+        fn run<const L: usize>(next: &mut impl FnMut() -> usize) {
+            let n_lanes = 1 + next() % L;
+            let nrows = next() % 400;
+            let mut cur = [30i32; L];
+            let mut rowmax = vec![0u8; nrows.max(1) * L];
+            for i in 0..nrows {
+                for l in 0..L {
+                    rowmax[i * L + l] = if next().is_multiple_of(2) {
+                        cur[l] = (cur[l] + (next() % 5) as i32 - 2).clamp(0, 70);
+                        cur[l] as u8
+                    } else {
+                        (next() % 70) as u8
+                    };
+                }
+            }
+            let (mut minsc, mut gmax, mut te, mut limit) =
+                ([0i32; L], [0i32; L], [0i32; L], [0i32; L]);
+            for l in 0..L {
+                minsc[l] = match next() % 6 {
+                    0 => i32::MAX,
+                    1 => (next() % 3) as i32 - 1,
+                    _ => 1 + (next() % 60) as i32,
+                };
+                limit[l] = if nrows == 0 {
+                    -1
+                } else {
+                    (next() % (nrows + 1)) as i32 - 1
+                };
+                gmax[l] = (next() % 80) as i32;
+                te[l] = if limit[l] >= 0 {
+                    (next() % (limit[l] as usize + 1)) as i32
+                } else {
+                    -1
+                };
+            }
+            let max_sc = 1 + (next() % 2) as i32;
+            let got = score2_lanes::<u8, L>((
+                &rowmax, n_lanes, nrows, &minsc, max_sc, &gmax, &te, &limit,
+            ));
+            for l in 0..n_lanes {
+                let mut tr = bwa_extend::SuboptimalTracker::new();
+                if limit[l] >= 0 && gmax[l] >= minsc[l] {
+                    for i in 0..=limit[l] as usize {
+                        tr.push_row(i as i32, i32::from(rowmax[i * L + l]), minsc[l]);
+                    }
+                }
+                assert_eq!(got[l], tr.finish(gmax[l], te[l], max_sc), "lane {l} of {L}");
+            }
+        }
+        for _ in 0..3000 {
+            run::<16>(&mut next);
+            run::<32>(&mut next);
+            run::<64>(&mut next);
+        }
+    }
+
     use super::*;
     use bwa_extend::ksw_align2;
 
