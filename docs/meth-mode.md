@@ -193,6 +193,11 @@ reach those kernels in three ways:
   exist for every `--meth` matrix; codes combined by XOR do not. With VBMI (Ice Lake and later,
   Zen 4 and later) the AVX-512 rescue kernel uses one `VPERMB` at `5 × reference + read`.
   Every kernel has an i16 form, which reads of more than 250 bp need.
+- **Extension on the u8 kernel** takes a job whose query and score ceiling fit a byte, whatever
+  its target length (up to the i16 kernel's 32,767): the row quantities live in 16-bit lanes. At
+  250 bp most extension targets (the rest of the read plus the band) are longer than 255 bases,
+  and took the 8-lane i16 kernel until 818ddf9 (M4 250 bp: EM-seq -13% cycles, TAPS -11%).
+  bwa-mem3's 8-bit kernel goes to 1,088 bases the same way.
 - **Mate rescue on the u8 kernel** takes a job whenever its score ceiling plus the table's bias
   fits a byte, as bwa-mem3 0.16 does (`matesw_use_u8`). At the default scoring that includes the
   250 bp mate, which bwa sends to its i16 kernel. The query padding stays bwa's, so the output
@@ -200,11 +205,21 @@ reach those kernels in three ways:
 - **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
   also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
   cell scores at most the match score, so the bound holds. The relation count runs on NEON and on
-  SSE4.1 (`rescue_prune::count_hits`). x86 prunes only on AVX2: with AVX-512's 64 lanes the full
-  SW is cheaper than the count and the band (TAPS 150 bp `-t1`, ours / fork: Xeon 8370C 0.90
-  unpruned against 0.98 pruned, EPYC 9V45 0.85 against 0.98). `BWA4_RESCUE_PRUNE=1` prunes anyway.
-  bwa-mem3 does not prune `--meth` on x86. EM-seq is not pruned: its collapsed mismatch (2a) is
-  below the bound's (K-1)a for any useful K.
+  SSE4.1 (`rescue_prune::count_hits`). The count does not shrink with the lanes and the full SW
+  does, so x86 prunes only from a mean mate length of 200 bp per 32 lanes: 200 bp on AVX2, 400 bp
+  on AVX-512 (TAPS `-t1`, ours / fork: EPYC 7763 150 bp 0.92 pruned against 0.83 unpruned, 250 bp
+  0.80 against 0.82; EPYC 9V74 150 bp 0.91 against 0.81). NEON prunes at every length.
+  `BWA4_RESCUE_PRUNE=1` prunes anyway. bwa-mem3 does not prune `--meth` on x86.
+- **EM-seq is not pruned**: its collapsed mismatch (2a) is below the bound's (K-1)a for any useful
+  K. A better bound would not pay either: on 20,000 simulated chr21 pairs, 70% of the rescue jobs
+  reach `minsc`, and in those windows 65% of the rows do (the three-letter alphabet is
+  low-complexity). An exact, free filter would still have to run 57% of the cells.
+- **The rescue's start pass** (the reverse DP that finds where the alignment begins) runs on the
+  band kernel, around the end's diagonal, whenever that kernel can take the batch, pruned or not:
+  EM-seq and x86 below the prune's length band it too (M4 EM-seq 150 bp: -6% cycles), as bwa-mem3
+  does. A batch with a mate whose score could pass 255 (past ~250 bp) takes the forward kernel,
+  since the band stops at the score as a byte. `BWA4_RESCUE_REVBAND=0` bands it only where the
+  prune runs, for a same-host A/B.
 
 A seed that scores 0 or less under the read's matrix (a pair it matched only in converted space)
 extends on the scalar kernel, as in bwa-mem3.
@@ -223,14 +238,14 @@ Each cell is bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each.
 The machine was loaded (load average 6 to 9) during these runs. Cycles and instructions are the
 steadier comparison.
 
-100,000 pairs simulated from chr21 at 150 and 250 bp, same machine (commit 458b9ec, load average
-about 17, `-t1`, the faster of three runs of each). Cycles (G), bwa-mem4 / bwa-mem3, then the
-ratio; the load moves wall times by up to 2x, cycles much less:
+100,000 pairs simulated from chr21 at 150 and 250 bp, same machine (commit 818ddf9, load average
+8 to 10, `-t1`, the faster of three runs of each). Cycles (G), bwa-mem4 / bwa-mem3, then the
+ratio; the load moves wall times by up to 2x, cycles much less. The SAM output was identical:
 
 | Set | 150 bp | 250 bp |
 |---|---|---|
-| EM-seq | 19.4 / 26.5 (0.73) | 30.5 / 45.7 (0.67) |
-| TAPS | 17.3 / 24.5 (0.71) | 25.1 / 38.4 (0.65) |
+| EM-seq | 18.0 / 26.6 (0.68) | 25.0 / 45.3 (0.55) |
+| TAPS | 17.3 / 24.2 (0.71) | 21.9 / 38.5 (0.57) |
 
 On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` times both binaries on
 200,000 pairs simulated from chr21, on the runner's CPU. Each cell is the wall-time ratio
