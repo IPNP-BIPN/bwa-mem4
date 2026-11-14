@@ -2094,6 +2094,21 @@ fn fwd_local_sw_scalar(
     out
 }
 
+/// A rescue kernel's row-maximum type (`u8` or `i32`), and a score clamped into it.
+trait RowMax: Copy + Into<i32> + PartialOrd {
+    fn clamp_from(v: i32) -> Self;
+}
+impl RowMax for u8 {
+    fn clamp_from(v: i32) -> u8 {
+        v.clamp(0, 255) as u8
+    }
+}
+impl RowMax for i32 {
+    fn clamp_from(v: i32) -> i32 {
+        v
+    }
+}
+
 /// Shared per-lane output extraction (`qe`, `score2`/`te2`) from a group's filled DP state, exactly
 /// as [`ksw_local_fwd`]. Used by both the scalar and NEON DP paths so they cannot drift.
 /// `rowmax` (per-row imax) is SoA `[row*lanes + lane]`; `qe` is the per-lane query end (the argmax
@@ -2131,7 +2146,7 @@ fn fwd_local_sw_scalar(
 /// # Returns
 /// Nothing; writes `(score, te, qe, score2, te2)` into `out` for each live lane.
 #[allow(clippy::too_many_arguments)]
-fn extract_group<R: Copy + Into<i32>>(
+fn extract_group<R: RowMax>(
     n_lanes: usize,
     group_idx: usize,
     lanes: usize,
@@ -2156,12 +2171,21 @@ fn extract_group<R: Copy + Into<i32>>(
         .map(|l| limit[l] as usize + 1)
         .max()
         .unwrap_or(0);
+    // Each lane's `minsc` in the rows' own type, clamped: a superset of marked rows is all `bits`
+    // needs, and the compare stays at the rows' width. Widened to i32 it was ~110 ops per row of
+    // 64 u8 lanes on x86, most of this function (3.4% of an EPYC 9V45 EM-seq run).
+    let mut thr = [R::clamp_from(0); 64];
+    for (t, &m) in thr.iter_mut().zip(minsc) {
+        *t = R::clamp_from(m);
+    }
+    let thr = &thr[..n_lanes];
     let mut bits = vec![0u8; nrows.div_ceil(8) * n_lanes];
     for (blk, acc) in bits.chunks_exact_mut(n_lanes.max(1)).enumerate() {
         for k in 0..(nrows - 8 * blk).min(8) {
             let row = &rowmax[(8 * blk + k) * lanes..][..n_lanes];
-            for ((a, &v), &m) in acc.iter_mut().zip(row).zip(minsc) {
-                *a |= u8::from(v.into() >= m) << k;
+            let bit = 1u8 << k;
+            for ((a, &v), &t) in acc.iter_mut().zip(row).zip(thr) {
+                *a |= if v >= t { bit } else { 0 };
             }
         }
     }
