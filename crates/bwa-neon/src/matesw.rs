@@ -2310,6 +2310,54 @@ fn extract_group<R: RowMax>(
 /// minus at most 255) are held in `i16`.
 const DENSE_MAX_ROWS: usize = 32_000;
 
+/// [`score2_lanes`]' row loop for 16 `u8` lanes: the same masks and selects on two `int16x8`
+/// halves. The portable loop's 16 `bool` masks were packed to bytes and widened back (12 extra
+/// ops a row, and twice the carried `cr` chain). `bounds` is `thr, lim, lo, hi`; `state` is
+/// `cs, cr, s2, te2`, read and written back; every slice holds at least 16 lanes.
+///
+/// # Safety
+/// `rows` points to `nrows * 16` readable bytes.
+#[cfg(target_arch = "aarch64")]
+unsafe fn s2_rows_neon16(
+    rows: *const u8,
+    nrows: usize,
+    bounds: [&[i16]; 4],
+    state: [&mut [i16]; 4],
+) {
+    use std::arch::aarch64::*;
+    let ld = |a: &[i16]| [vld1q_s16(a[..16].as_ptr()), vld1q_s16(a[8..16].as_ptr())];
+    let [thr, lim, lo, hi] = bounds.map(ld);
+    let [cs_a, cr_a, s2_a, te2_a] = state;
+    let (mut cs, mut cr, mut s2, mut te2) = (ld(cs_a), ld(cr_a), ld(s2_a), ld(te2_a));
+    for i in 0..nrows {
+        let r = vld1q_u8(rows.add(16 * i));
+        let v = [
+            vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(r))),
+            vreinterpretq_s16_u16(vmovl_high_u8(r)),
+        ];
+        let (ii, prev) = (vdupq_n_s16(i as i16), vdupq_n_s16(i as i16 - 1));
+        for h in 0..2 {
+            let p = vandq_u16(vcgeq_s16(v[h], thr[h]), vcleq_s16(ii, lim[h]));
+            let cont = vceqq_s16(cr[h], prev);
+            let open = vbicq_u16(p, cont);
+            let out_zone = vorrq_u16(vcltq_s16(cr[h], lo[h]), vcgtq_s16(cr[h], hi[h]));
+            let close = vandq_u16(
+                vandq_u16(open, vcgezq_s16(cr[h])),
+                vandq_u16(out_zone, vcgtq_s16(cs[h], s2[h])),
+            );
+            s2[h] = vbslq_s16(close, cs[h], s2[h]);
+            te2[h] = vbslq_s16(close, cr[h], te2[h]);
+            let set = vorrq_u16(open, vandq_u16(vandq_u16(p, cont), vcltq_s16(cs[h], v[h])));
+            cs[h] = vbslq_s16(set, v[h], cs[h]);
+            cr[h] = vbslq_s16(set, ii, cr[h]);
+        }
+    }
+    for (a, v) in [(cs_a, cs), (cr_a, cr), (s2_a, s2), (te2_a, te2)] {
+        vst1q_s16(a.as_mut_ptr(), v[0]);
+        vst1q_s16(a[8..].as_mut_ptr(), v[1]);
+    }
+}
+
 /// Arguments of [`score2_lanes`], as [`extract_group`] names them.
 type Score2Args<'a, R> = (
     &'a [R],
@@ -2347,7 +2395,21 @@ fn score2_lanes<R: RowMax, const L: usize>(
     }
     // No open candidate: `cr = -2`, which no row follows and the close below skips.
     let (mut cs, mut cr, mut s2, mut te2) = ([0i16; L], [-2i16; L], [-1i16; L], [-1i16; L]);
-    for i in 0..nrows {
+    let neon = cfg!(target_arch = "aarch64") && L == 16 && std::mem::size_of::<R>() == 1;
+    #[cfg(target_arch = "aarch64")]
+    if neon {
+        assert!(rowmax.len() >= nrows * 16);
+        // SAFETY: a 1-byte `RowMax` is `u8`; `rowmax` holds `nrows` rows of 16, as just checked.
+        unsafe {
+            s2_rows_neon16(
+                rowmax.as_ptr().cast(),
+                nrows,
+                [&thr[..], &lim[..], &lo[..], &hi[..]],
+                [&mut cs[..], &mut cr[..], &mut s2[..], &mut te2[..]],
+            );
+        }
+    }
+    for i in 0..if neon { 0 } else { nrows } {
         let row: &[R; L] = rowmax[i * L..][..L].try_into().unwrap();
         let ii = i as i16;
         // Masks as `i16` (0 or -1) and selects as bit ops: in `bool`s AVX2 kept the loop scalar.
