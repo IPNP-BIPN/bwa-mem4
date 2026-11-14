@@ -945,7 +945,9 @@ pub fn stamp_is_alt(bns: &BntSeq, regs: &mut [MemAlnReg]) {
 /// of `id + i` are distinct and every sort leaves the regions where bwa's introsort does.
 fn sort_hlt(a: &mut [MemAlnReg]) {
     let key = |r: &MemAlnReg| (std::cmp::Reverse(r.score), r.is_alt, r.hash);
-    if a.len() <= 16 {
+    // `--cfg bwa4_hlt_ind`: 3 to 16 regions sorted indirectly too (x86 A/B: the direct sort's
+    // insertion sort moves 96-byte regions).
+    if a.len() <= if cfg!(bwa4_hlt_ind) { 2 } else { 16 } {
         a.sort_unstable_by_key(key);
     } else {
         // Indirect, as in `mem_sort_dedup_patch`: a region is 96 bytes, a key and index 24.
