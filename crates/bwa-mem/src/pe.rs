@@ -666,6 +666,9 @@ pub(crate) struct RegionView {
     /// Hits [`insert_settled_view`] appended past the list's sorted prefix, put in place by
     /// [`settle_order`] before anything that reads the order.
     pending: usize,
+    /// Bumped by [`matesw_apply`] whenever a rescue hit may have changed the list: a skip set
+    /// computed at an unchanged version still holds.
+    version: u32,
 }
 
 thread_local! {
@@ -1111,6 +1114,8 @@ fn matesw_apply(
             let aln = alns[ai];
             ai += 1;
             if aln.score >= opt.min_seed_len && aln.qb >= 0 {
+                // Every change to `ma` below (insert, or the dedup that needs `n > 0`) follows this.
+                view.version = view.version.wrapping_add(1);
                 let t_ins = crate::rescue_split::start();
                 if t_ins.is_some() {
                     crate::rescue_split::APPLY_HITS
@@ -1323,6 +1328,8 @@ pub fn batch_mate_rescue(
     let mut todo: Vec<(u32, u8, u32)> = Vec::new();
     // Per anchor, `(start, count)` in `job_of`; per collected orientation, its kernel job.
     let mut call_jobs: Vec<(u32, u32)> = Vec::new();
+    // Each todo entry's view version at collect time.
+    let mut vers: Vec<u32> = Vec::new();
     let mut job_of: Vec<u32> = Vec::new();
     let mut kept: Vec<KswAlignResult> = Vec::with_capacity(4);
     // Identical windows of one (pair, direction): two anchors in identical repeat copies fetch the
@@ -1361,6 +1368,7 @@ pub fn batch_mate_rescue(
         let t_collect = crate::rescue_split::start();
         arena.clear();
         calls.clear();
+        vers.clear();
         for (t, at) in todo.iter().enumerate() {
             // The windows two anchors ahead are random DRAM misses: hint them now.
             if let Some(ahead) = todo.get(t + 2) {
@@ -1376,6 +1384,7 @@ pub fn batch_mate_rescue(
             let (pi, dir) = (at.0 as usize, at.1 as usize);
             let p = &pairs[pi];
             let target: &[MemAlnReg] = if dir == 0 { p.a1 } else { p.a0 };
+            vers.push(views[pi][dir].version);
             calls.push(matesw_collect(
                 fm,
                 bns,
@@ -1472,7 +1481,11 @@ pub fn batch_mate_rescue(
             let ms = mate(p, dir);
             let target = if dir == 0 { &mut *p.a1 } else { &mut *p.a0 };
             let view = &mut views[pi][dir];
-            let skip = skip_set(view, target, bns.l_pac, a.rb, pes);
+            // No hit applied to this list since its collect: the skip set collect computed holds.
+            let skip = match &calls[t] {
+                Some(c) if vers[t] == view.version => c.skip,
+                _ => skip_set(view, target, bns.l_pac, a.rb, pes),
+            };
             let was = calls[t].as_ref().map_or([1; 4], |c| c.skip);
             if (0..4).any(|r| skip[r] == 0 && was[r] != 0) {
                 // A dedup removed the region that closed an orientation: the per-pair path, here.
