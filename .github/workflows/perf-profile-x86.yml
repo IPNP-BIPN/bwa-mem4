@@ -943,3 +943,18 @@ jobs:
                 | sort -rn | head -70 || true
             done
           done
+          # libc is 2-3% of ours on Intel (0.5% on AMD) and has no symbols here: its two hottest
+          # addresses disassembled (memset stores one register, memcpy loads and stores), then
+          # who calls it, from a DWARF-unwound profile (the build has no frame pointers).
+          libc=$(ldd ../mem4-v3 | awk '/libc\.so/ {print $3}')
+          "$PERF" report -i em.ours.data --stdio --no-children 2>/dev/null \
+            | awk '/libc\.so/ && $NF ~ /^0x/ {print $NF}' | head -2 | while read -r a; do
+              echo "===== em ours: libc $a ====="
+              objdump -d --no-show-raw-insn --start-address=$((a - 0x30)) --stop-address=$((a + 0x20)) "$libc" \
+                | grep -E '^ +[0-9a-f]+:' || true
+            done
+          "$PERF" record -F 199 --call-graph dwarf,16384 -o em.dwarf.data -- \
+            ../mem4-v3 mem --meth -K 10000000 -t 1 ours/chr21.fa em_1.fq em_2.fq > /dev/null 2>/dev/null || true
+          echo "===== em ours: libc callers ====="
+          "$PERF" report -i em.dwarf.data --stdio --no-children --dsos libc.so.6 \
+            --call-graph=graph,0.5,callee 2>/dev/null | grep -vE '^#|^$' | head -90 || true
