@@ -199,9 +199,9 @@ reach those kernels in three ways:
   does not change.
 - **Rescue pruning** under genomic / neutral counts the K-mer hits of the relation: reference C
   also matches read T (OT), reference G read A (OB). This is bwa-mem3's relation filter. A freed
-  cell scores at most the match score, so the bound holds. The relation count is scalar, so x86
-  skips it: there the full 32- or 64-lane SW is cheaper than counting. bwa-mem3 does not prune
-  `--meth` on x86 either.
+  cell scores at most the match score, so the bound holds. The relation count runs on NEON and on
+  SSE4.1 (`rescue_prune::count_hits`), so x86 prunes too. bwa-mem3 does not prune `--meth` on x86.
+  EM-seq is not pruned: its collapsed mismatch (2a) is below the bound's (K-1)a for any useful K.
 
 A seed that scores 0 or less under the read's matrix (a pair it matched only in converted space)
 extends on the scalar kernel, as in bwa-mem3.
@@ -219,6 +219,15 @@ Each cell is bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each.
 
 The machine was loaded (load average 6 to 9) during these runs. Cycles and instructions are the
 steadier comparison.
+
+100,000 pairs simulated from chr21 at 150 and 250 bp, same machine (commit 458b9ec, load average
+about 17, `-t1`, the faster of three runs of each). Cycles (G), bwa-mem4 / bwa-mem3, then the
+ratio; the load moves wall times by up to 2x, cycles much less:
+
+| Set | 150 bp | 250 bp |
+|---|---|---|
+| EM-seq | 19.4 / 26.5 (0.73) | 30.5 / 45.7 (0.67) |
+| TAPS | 17.3 / 24.5 (0.71) | 25.1 / 38.4 (0.65) |
 
 On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` times both binaries on
 200,000 pairs simulated from chr21, on the runner's CPU. Each cell is the wall-time ratio
