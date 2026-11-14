@@ -469,30 +469,8 @@ pub(crate) fn gen_cigar2(
         // a single M run and the score is just the sum of matrix cells down the diagonal. The
         // matrix is row-major 5x5 indexed `[ref_base * 5 + query_base]`; the operand order matters
         // only for asymmetric matrices, but we keep bwa's order regardless.
-        //
-        // Invariant: at the top of iteration `i`, `diagonal_score` is the summed substitution score
-        // of columns `0..i`. There is no gap term because this path has no gaps by construction.
-        let mut diagonal_score = 0;
         let n = l_query as usize;
-        if (0..4).all(|b| opt.mat[b * 6] == opt.mat[0]) {
-            // Every equal pair scores `mat[0]` (`rseq` holds pac codes 0-3 only), so a run of
-            // equal bases is one multiply; only the mismatches read the matrix.
-            let mut i = 0;
-            loop {
-                let k = common_prefix(&rseq[i..n], &query[i..n]);
-                diagonal_score += k as i32 * i32::from(opt.mat[0]);
-                i += k;
-                if i >= n {
-                    break;
-                }
-                diagonal_score += i32::from(opt.mat[rseq[i] as usize * 5 + query[i] as usize]);
-                i += 1;
-            }
-        } else {
-            for i in 0..n {
-                diagonal_score += i32::from(opt.mat[rseq[i] as usize * 5 + query[i] as usize]);
-            }
-        }
+        let diagonal_score = bwa_neon::diag_score(&opt.mat, &rseq[..n], &query[..n]);
         // `(len << 4) | 0`: op 0 is M, so the `| 0` is elided.
         (diagonal_score, ungapped_cigar(l_query, spare_cigar))
     } else {

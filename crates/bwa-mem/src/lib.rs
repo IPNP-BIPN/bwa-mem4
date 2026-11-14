@@ -981,10 +981,7 @@ fn seed_score(opt: &MemOpt, seed: &bwa_seed::MemSeed, rseq: &[u8], codes: &[u8])
         return seed.len * opt.a;
     }
     let read = &codes[seed.qbeg as usize..(seed.qbeg + seed.len) as usize];
-    read.iter()
-        .zip(rseq)
-        .map(|(&q, &r)| i32::from(opt.mat[r as usize * 5 + q as usize]))
-        .sum()
+    bwa_neon::diag_score(&opt.mat, rseq, read)
 }
 
 /// [`align_read`] for a `--meth` read: seeds come from its converted copy (C->T when `ot`, i.e.

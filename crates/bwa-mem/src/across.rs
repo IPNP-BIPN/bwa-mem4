@@ -1228,14 +1228,20 @@ pub fn align_reads_batched_meth<B: SwBackend>(
     align_reads_batched_inner(fm, bns, opt, reads, Some((conv, ot)), backend)
 }
 
-/// A `--meth` seed's starting score ([`crate::seed_score`] on the seed's reference bases).
-fn meth_seed_score(fm: &FmIndex, opt: &MemOpt, seed: &MemSeed, codes: &[u8]) -> i32 {
-    crate::seed_score(
-        opt,
-        seed,
-        &fm.bases(seed.rbeg, seed.rbeg + i64::from(seed.len)),
-        codes,
-    )
+/// A `--meth` seed's starting score ([`crate::seed_score`] on the seed's reference bases), unpacked
+/// past the end of `arena` and dropped again (no allocation per seed).
+fn meth_seed_score(
+    fm: &FmIndex,
+    opt: &MemOpt,
+    seed: &MemSeed,
+    codes: &[u8],
+    arena: &mut Vec<u8>,
+) -> i32 {
+    let at = arena.len();
+    fm.bases_append(seed.rbeg, seed.rbeg + i64::from(seed.len), arena);
+    let s = crate::seed_score(opt, seed, &arena[at..], codes);
+    arena.truncate(at);
+    s
 }
 
 /// The body of [`align_reads_batched`], split out only so the probe above can time it as a whole.
@@ -1925,7 +1931,7 @@ fn align_reads_batched_inner<B: SwBackend>(
                         // The seed itself scores `len` matches at `opt.a` each; the extension starts
                         // from there so z-drop and clipping are judged against the whole alignment.
                         h0: if meth.is_some() {
-                            meth_seed_score(fm, opt, &seed, codes)
+                            meth_seed_score(fm, opt, &seed, codes, &mut arena)
                         } else {
                             seed.len * opt.a
                         },
@@ -1936,7 +1942,7 @@ fn align_reads_batched_inner<B: SwBackend>(
                     // Seed already flush with the read's 5' end: nothing to extend, so the region is
                     // final on this side and its score is just the seed's (`bwamem.cpp:2319-2321`).
                     reg.score = if meth.is_some() {
-                        meth_seed_score(fm, opt, &seed, codes)
+                        meth_seed_score(fm, opt, &seed, codes, &mut arena)
                     } else {
                         seed.len * opt.a
                     };
