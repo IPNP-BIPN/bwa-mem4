@@ -334,9 +334,9 @@ bwa-mem4:
   (`bismark` configuration above). Bismark also clears `BWAMEM3_METH_SEED_PRUNE`, which bwa-mem4
   ignores anyway.
 - **Version gate.** Bismark runs `<binary> version` and reads stdout, rejecting anything below
-  0.16.0 and warning on anything else. `bwa-mem4 version` prints `4.4.1` and exits 0. So the gate
-  passes with a "not the validated release" warning. A bwa-mem4 engine would need its own
-  minimum, the first bwa-mem4 release with `--meth`.
+  0.16.0 and warning on anything else. `bwa-mem4 version` prints its version (`4.5.0`) and exits
+  0. So the gate passes with a "not the validated release" warning. A bwa-mem4 engine would need
+  its own minimum: 4.5.0, the first bwa-mem4 release with `--meth`.
 - **Binary name and `@PG`.** The engine is named `bwa-mem3`, and Bismark writes
   `@PG ID:bwa-mem3 PN:bwa-mem3 VN:<detected>` into its BAM. Running bwa-mem4 through it works if
   the path given to Bismark points at the bwa-mem4 binary. Recording the right provenance needs a

@@ -18,7 +18,8 @@ code tells you not to use them.
 | Single-end | byte-identical on **353,517,767** records |
 | Paired-end | byte-identical on **707,312,349** records |
 | ALT contigs | byte-identical on the real GRCh38 analysis set, 261 ALT contigs |
-| Speed | SE **3.63x**, PE **3.49x** vs bwa-mem2 2.3 on the full 30x sample at `-t12`; index build **3.69x** |
+| Speed | SE **3.63x**, PE **3.49x** vs bwa-mem2 2.3 on the full 30x sample at `-t12` (4.4.0); since 4.5.0, **1.37x (SE) to 1.50x (PE)** faster than fg-labs/bwa-mem3 0.16 on GIAB, see [below](#against-fg-labsbwa-mem3); index build **3.69x** |
+| Memory vs bwa-mem3 | peak RSS **9.3 GB vs 13.7** (PE) and **8.9 vs 13.3** (SE) on 2M GIAB pairs at `-t8`, same SAM bytes |
 | Memory | peak RSS SE **11.7 GB** vs 25.0, PE **13.9 GB** vs 32.8; index build 73.8 GB vs 74.4 |
 | Output | SAM, BGZF-compressed SAM, BAM, CRAM |
 | Option surface | all three subcommands, and **every one of the 35 options `bwa-mem2 mem` accepts**; 64 of 64 per-option SAM parity cases pass |
@@ -78,24 +79,34 @@ against 97.14 on the Intel part, 76.29 against 79.35 on the AMD one), and the 51
 1.20x the AVX2 ones on the kernel A/B. Directional and narrow: one chromosome of simulated reads on
 cloud runners, not the headline ratio.
 
-**On x86 the fork, fg-labs/bwa-mem3, is now about twice as fast as bwa-mem4.** Measured on 6 Nov
-2026 with the `head-to-head` workflow on an AMD EPYC 9V74 (Zen 4, `avx512bw`, 4 threads), three
-interleaved repetitions, best of three; the fork is bioconda's 0.16.0 run with `--compat=bwa-mem2`,
-its mode that reproduces bwa-mem2, and its records are identical to ours on both datasets:
+### Against fg-labs/bwa-mem3
 
-| reads | bwa-mem2 | bwa-mem4 (`x86-64-v3`) | bwa-mem3 0.16.0 `--compat=bwa-mem2` | bwa-mem4 vs bwa-mem2 | fork vs bwa-mem4 |
+[fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.16.0 run with `--compat=bwa-mem2`, its
+mode that reproduces bwa-mem2. Every row below produces the same SAM bytes from both tools, and
+the same bytes as bwa-mem2 on GIAB (md5 checked on each run).
+
+Apple M4 Max, 14 Nov 2026, bwa-mem4 4.5.0 (plain `cargo build --release`, not PGO), `-t8
+-K 100000000`, the two tools interleaved, best of two:
+
+| reads | bwa-mem4 | bwa-mem3 0.16.0 | speedup | CPU cycles, mem4 / mem3 | peak RSS, mem4 / mem3 |
 |---|---|---|---|---|---|
-| chr21, 2M simulated pairs | 250.58 s | 125.82 s | 55.80 s | 1.99x | 2.25x faster |
-| real GIAB HG002 slice | 215.33 s | 81.29 s | 44.57 s | 2.65x | 1.82x faster |
+| GIAB HG002, 2M pairs PE | 14.1 s | 21.2 s | **1.50x** | 404 / 630 G | 9.3 / 13.7 GB |
+| GIAB HG002, 2M reads SE | 4.61 s | 6.32 s | **1.37x** | 123 / 178 G | 8.9 / 13.3 GB |
+| chr21, 1M simulated pairs | 4.97 s | 8.34 s | **1.68x** | 139 / 247 G | 1.6 / 2.1 GB |
 
-In August this paragraph said the opposite: on the same CPU and the same real reads we took 86.91 s
-against the fork's 99.41 s, 1.15x ahead. That was bwa-mem3 0.10.0. Its releases since (0.12 to
-0.16) each cut wall time on x86, and on these reads it went from 99.41 s to 44.57 s while we went
-from 86.91 s to 81.29 s. Its compat mode costs it 1-4% over its default mode here, so the gap is
-not a mode that skips work. The `bench-x86` run of the same day agrees: 28.53 s for the fork against
-68.33 s for us on chr21, records identical across all three tools. The x86 workflows now pin the
-fork's version and time it in `--compat=bwa-mem2`, so a new bioconda release can no longer move the
-comparison silently. None of this has been measured against the fork on Apple Silicon.
+On x86_64 (`head-to-head` workflow, 13 Nov 2026, a 4-core Intel Xeon GitHub runner, chr21, 2M
+pairs, bwa-mem4 built for `x86-64-v3`), before the last round of changes: 44.1 s against the fork's
+51.5 s on real reads and 58.3 s against 75.4 s on simulated ones (1.17x and 1.29x), with bwa-mem2 at
+244-250 s and 325-328 s. A CPU-by-CPU sample count on EPYC 7763, 9V74, Xeon 6975P-C and Neoverse N2
+put bwa-mem4 13-19% under the fork's CPU time; seeding (SMEM) is the one stage still behind the fork
+on x86 and N2, at parity on Apple Silicon.
+
+This section said the opposite on 6 Nov: the fork was then 1.8-2.25x ahead on x86. The gap was
+closed by mate rescue (an exact k-mer window filter, banded kernels sized to the best ungapped run,
+the suboptimal score computed only where SAM output reads it), extension (deduplicated and tightly
+banded jobs, a proof that skips the global CIGAR DP when the diagonal must win) and memory (80-byte
+alignment regions, reads kept 2-bit packed). The measurement log is `ROADMAP.md`.
+
 
 What the AVX-512 kernels contributed to the August lead over fork 0.10.0 was measured directly, by timing the same binary
 with the kernels forced down to AVX2 in the same interleaved loop, and the answer **depends on the
@@ -288,6 +299,15 @@ A Cargo workspace, one crate per pipeline stage. The binary is `bwa-mem4` (`inde
 bioinformatics: one read's journey from FASTQ to SAM line, a glossary of every abbreviation, and
 the rules for changing this code without breaking parity.
 
+## Methylation mode (`--meth`)
+
+Since 4.5.0, `bwa-mem4 index --meth` and `bwa-mem4 mem --meth[=emseq|taps|5base]` align
+directional bisulfite, EM-seq, TAPS and Illumina 5-base reads with the methylation mode of
+fg-labs/bwa-mem3 0.16, ported to Rust, options spelled as in bwa-mem3. Its SAM output is
+byte-identical to bwa-mem3 0.16 on the test sets, at 0.53-0.66 of its CPU cycles on Apple M4
+(150 and 250 bp, `-t1`) and 0.67-0.89 of its wall time on x86. Without `--meth` nothing changes.
+Details, options and validation: [docs/meth-mode.md](docs/meth-mode.md).
+
 ## GPU
 
 There is none, deliberately. A Metal backend existed and was removed: on a whole genome the
@@ -339,8 +359,8 @@ Prebuilt binaries for Linux and macOS, x86_64 and arm64, are attached to each
 [release](https://github.com/IPNP-BIPN/bwa-mem4/releases), with a `SHA256SUMS` file:
 
 ```sh
-tar xzf bwa-mem4-v4.4.1-linux-x86_64.tar.gz
-./bwa-mem4-v4.4.1-linux-x86_64/bwa-mem4 --version
+tar xzf bwa-mem4-v4.5.0-linux-x86_64.tar.gz
+./bwa-mem4-v4.5.0-linux-x86_64/bwa-mem4 --version
 ```
 
 Every published binary is required to rebuild the committed `testdata/tiny` index byte-identically
