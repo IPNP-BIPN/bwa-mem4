@@ -1901,6 +1901,26 @@ impl FmIndex {
                 // each one's interval holds the one before it, and so do their extensions: `s` never
                 // falls along `prev`, and from a survivor on every candidate survives (one test less
                 // per candidate, where x86 reloaded `min_intv` from the stack).
+                if w == r {
+                    // Kept in place until the first duplicate: only `k`, `s` and `m` change, where
+                    // the copy below also reloads and stores `l` and `n`.
+                    while r < end {
+                        let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                        debug_assert!(s >= min_intv);
+                        if s == curr_s {
+                            break;
+                        }
+                        curr_s = s;
+                        (*r).k = k;
+                        (*r).s = s;
+                        (*r).m = m;
+                        self.prefetch_occ(k, k + s);
+                        r = r.add(1);
+                    }
+                    // `r` is the duplicate, dropped, or the end.
+                    w = r;
+                    r = r.add(usize::from(r < end));
+                }
                 while r < end {
                     let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
                     debug_assert!(s >= min_intv);
