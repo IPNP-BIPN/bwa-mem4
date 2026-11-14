@@ -1385,42 +1385,32 @@ impl FmIndex {
     /// costs a wasted fetch and nothing else.
     #[inline]
     pub fn prefetch_occ(&self, sp: i64, ep: i64) {
-        // SAFETY (both arches): forming the block pointers is in-bounds (`sp`/`ep` are valid BWT
-        // positions, so `>>6` indexes an allocated `cp_occ` slot); the prefetch is a hint that never
-        // faults or writes.
+        // Byte `row / 2` of the blocks lies inside row `row`'s 32-byte block (64 rows each), so one
+        // shift addresses the line where the block index took a shift and a scale.
+        const _: () = assert!(std::mem::size_of::<CpOcc>() << 1 == CP_BLOCK_SIZE as usize);
+        let base = self.cp_occ.as_ptr().cast::<u8>();
+        let (p_sp, p_ep) = (
+            base.wrapping_add((sp >> 1) as usize),
+            base.wrapping_add((ep >> 1) as usize),
+        );
         #[cfg(target_arch = "aarch64")]
-        {
-            // Element-typed base pointer, so `.add(n)` steps whole checkpoint records.
-            let base = self.cp_occ.as_ptr();
+        // SAFETY: `prfm` is a hint that never faults or writes.
+        unsafe {
             // `pldl1keep` = prefetch-for-load into L1, keep (AArch64 equivalent of `_MM_HINT_T0`).
-            unsafe {
-                // Addresses of the two checkpoint BLOCKS covering rows `sp` and `ep`.
-                let p_sp = base.add((sp >> CP_SHIFT) as usize);
-                let p_ep = base.add((ep >> CP_SHIFT) as usize);
-                std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_sp, options(nostack, readonly, preserves_flags));
-                std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_ep, options(nostack, readonly, preserves_flags));
-            }
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_sp, options(nostack, readonly, preserves_flags));
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_ep, options(nostack, readonly, preserves_flags));
         }
         #[cfg(target_arch = "x86_64")]
-        {
+        // SAFETY: a prefetch is a hint that never faults or writes.
+        unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            // Same two checkpoint blocks as the AArch64 arm; `_MM_HINT_T0` = fetch into L1.
-            let base = self.cp_occ.as_ptr();
-            unsafe {
-                _mm_prefetch(
-                    base.add((sp >> CP_SHIFT) as usize) as *const i8,
-                    _MM_HINT_T0,
-                );
-                _mm_prefetch(
-                    base.add((ep >> CP_SHIFT) as usize) as *const i8,
-                    _MM_HINT_T0,
-                );
-            }
+            _mm_prefetch(p_sp.cast::<i8>(), _MM_HINT_T0);
+            _mm_prefetch(p_ep.cast::<i8>(), _MM_HINT_T0);
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            // No portable prefetch intrinsic: discard the rows to silence the unused warning.
-            let _ = (sp, ep);
+            // No portable prefetch intrinsic: discard the addresses to silence the unused warning.
+            let _ = (p_sp, p_ep);
         }
     }
 
@@ -1906,15 +1896,33 @@ impl FmIndex {
             let end = base.add(n);
             let mut r = base.add(p);
             let mut w = base.add(kept);
-            while r < end {
-                let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
-                if s >= min_intv && s != curr_s {
-                    curr_s = s;
-                    *w = Smem { k, s, m, ..*r };
-                    w = w.add(1);
-                    self.prefetch_occ(k, k + s);
+            if kept == 1 {
+                // The candidates are one read offset extended to shorter and shorter right ends, so
+                // each one's interval holds the one before it, and so do their extensions: `s` never
+                // falls along `prev`, and from a survivor on every candidate survives (one test less
+                // per candidate, where x86 reloaded `min_intv` from the stack).
+                while r < end {
+                    let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                    debug_assert!(s >= min_intv);
+                    if s != curr_s {
+                        curr_s = s;
+                        *w = Smem { k, s, m, ..*r };
+                        w = w.add(1);
+                        self.prefetch_occ(k, k + s);
+                    }
+                    r = r.add(1);
                 }
-                r = r.add(1);
+            } else {
+                while r < end {
+                    let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                    if s >= min_intv && s != curr_s {
+                        curr_s = s;
+                        *w = Smem { k, s, m, ..*r };
+                        w = w.add(1);
+                        self.prefetch_occ(k, k + s);
+                    }
+                    r = r.add(1);
+                }
             }
             w.offset_from(base) as usize
         }
