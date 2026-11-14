@@ -45,7 +45,6 @@
 //! | `Self { inner }` | field shorthand: when a local variable has the same name as the field, writing it once means `inner: inner`. |
 //! | `Vec<u8>` vs `&[u8]` | owned bytes versus a borrowed window onto somebody else's. [`Record`] holds owned copies because the parser reuses one internal buffer for every record; a borrow would dangle as soon as the next read is pulled. |
 //! | `.into_owned()` | turns a maybe-borrowed value into a definitely-owned one, copying only if it was still a borrow. Used to lift text out of the parser's buffer. |
-//! | `String::from_utf8_lossy` | interprets bytes as text, substituting a replacement character for anything invalid instead of failing. Read names are not guaranteed to be valid UTF-8, and refusing a file over a stray byte in a name would be worse than mangling that one name. |
 //! | `match (a, b)` | matching on a PAIR of values at once. The paired reader uses it to handle all four end-of-file combinations of two files in one place, and the compiler checks that none is forgotten. |
 //! | `_ => ...` | the catch-all arm, here standing for "exactly one of the two files ended". |
 //! | `let Some(x) = ... else { ... }` | bind and continue, or run a block that must leave the function. Used for the two mid-pair end-of-file checks. |
@@ -329,18 +328,12 @@ fn unpack_codes(packed: &[u8], n: usize, out: &mut Vec<u8>) {
 }
 
 impl Record {
-    /// SAM column 1 (QNAME).
-    ///
-    /// Not validated again: `next_record` validated it once. Each pair's names and comments were
-    /// checked ten times on their way to SAM, and `from_utf8` was a sixth of the reader thread's
-    /// time on M4 (2M GIAB reads).
+    /// SAM column 1 (QNAME), as raw bytes: a FASTQ header need not be valid UTF-8, and bwa copies it
+    /// through unchanged, so converting it here would change the output.
     #[inline]
     #[must_use]
-    pub fn name(&self) -> &str {
-        // SAFETY: `next_record`, the only constructor, copies these bytes from ASCII or from
-        // `String::from_utf8_lossy`'s output, and nothing writes this range afterwards
-        // (`seq_mut` hands out the bases only).
-        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.name_len as usize]) }
+    pub fn name(&self) -> &[u8] {
+        &self.buf[..self.name_len as usize]
     }
 
     /// FASTQ line 2 as ASCII: a record from a reader without [`FastqReader::nt4`].
@@ -406,17 +399,14 @@ impl Record {
         Some(&self.buf[start..start + self.seq_len as usize])
     }
 
-    /// The kseq `comment`, or `None` for a bare-name header. Not validated again, like
-    /// [`Record::name`].
+    /// The kseq `comment`, or `None` for a bare-name header. Raw bytes, as [`Record::name`].
     #[inline]
     #[must_use]
-    pub fn comment(&self) -> Option<&str> {
+    pub fn comment(&self) -> Option<&[u8]> {
         if self.comment_len == 0 {
             return None;
         }
-        let end = self.buf.len();
-        // SAFETY: as for `name`: built from ASCII or `from_utf8_lossy`'s output, never rewritten.
-        Some(unsafe { std::str::from_utf8_unchecked(&self.buf[end - self.comment_len as usize..]) })
+        Some(&self.buf[self.buf.len() - self.comment_len as usize..])
     }
 }
 
@@ -1078,9 +1068,7 @@ impl FastqReader {
                 // `rec.id()` is FASTQ line 1 WITHOUT the leading `@`, i.e. name plus any comment.
                 // Split into the two halves: the first becomes SAM QNAME, the second the `-C`
                 // trailer. Both are still borrowed from needletail's buffer at this point.
-                let (name_bytes, comment_bytes) = split_id(rec.id());
-                let name = ascii_or_lossy(name_bytes);
-                let comment = comment_bytes.map(ascii_or_lossy);
+                let (name, comment) = split_id(rec.id());
                 // FASTQ line 2 (bases) and line 4 (Phred+33). `qual` is `None` for FASTA input,
                 // where lines 3 and 4 do not exist.
                 let seq = rec.seq();
@@ -1088,7 +1076,7 @@ impl FastqReader {
                 // The copy out of needletail's buffer is not optional (it reuses that buffer for the
                 // next record), but it is ONE allocation sized exactly right, not three. See the
                 // type's own docs for what that is worth.
-                let comment_len = comment.as_ref().map_or(0, |c| c.len());
+                let comment_len = comment.map_or(0, <[u8]>::len);
                 let seq_bytes = if self.nt4 {
                     seq.len().div_ceil(4)
                 } else {
@@ -1097,7 +1085,7 @@ impl FastqReader {
                 let mut buf = Vec::with_capacity(
                     name.len() + seq_bytes + qual.map_or(0, <[u8]>::len) + comment_len,
                 );
-                buf.extend_from_slice(&name);
+                buf.extend_from_slice(name);
                 let bases = if !self.nt4 {
                     buf.extend_from_slice(&seq);
                     Bases::Ascii
@@ -1114,7 +1102,7 @@ impl FastqReader {
                 if let Some(q) = qual {
                     buf.extend_from_slice(q);
                 }
-                if let Some(c) = &comment {
+                if let Some(c) = comment {
                     buf.extend_from_slice(c);
                 }
                 Ok(Some(Record {
@@ -1294,9 +1282,8 @@ impl Drop for RecordStream {
 /// Streaming reader over a pair of FASTQ files (R1, R2) advanced in lockstep.
 ///
 /// The standard paired-end layout: the same fragment sequenced from both ends, with the two reads
-/// at the same ordinal position in the two files. Pairing is therefore POSITIONAL, not by name; the
-/// only name check is the length mismatch caught in [`Self::next_batch`]. That matches bwa, which
-/// also trusts file order here.
+/// at the same ordinal position in the two files. Pairing is POSITIONAL, and [`Self::next_batch`]
+/// then refuses a pair whose names differ, as bwa does (`mem_sam_pe`).
 ///
 /// Each file is parsed on its own thread ([`RecordStream`]); this struct is the consumer that
 /// interleaves them and applies the `-K` rule. See [`RecordStream`] for why.
@@ -1342,7 +1329,7 @@ impl PairedFastqReader {
     /// # Returns
     ///
     /// One `(R1, R2)` tuple per fragment, in file order; empty at EOF. [`Error::Fastq`] if one
-    /// file runs out before the other.
+    /// file runs out before the other, or if the two reads of a pair have different names.
     pub fn next_batch(&mut self, k_batch: usize) -> Result<Vec<(Record, Record)>> {
         // Invariant at the top of each iteration: `batch` holds the pairs read so far (both files
         // sit at the same ordinal record), `bases_so_far` is the sum of both mates' `seq.len()`
@@ -1356,8 +1343,16 @@ impl PairedFastqReader {
             // cannot be forgotten, which is the case that would otherwise emit mis-mated records.
             match (self.r1.next_record()?, self.r2.next_record()?) {
                 // Both files yielded: `mate1` is the R1 read, `mate2` the R2 read of one fragment.
-                // They are paired by POSITION; their names are not compared here.
+                // They are paired by POSITION, so a lost record shows up only here, as a name
+                // mismatch. Same refusal and wording as bwa's `mem_sam_pe`.
                 (Some(mate1), Some(mate2)) => {
+                    if mate1.name() != mate2.name() {
+                        return Err(Error::Fastq(format!(
+                            "paired reads have different names: \"{}\", \"{}\"",
+                            String::from_utf8_lossy(mate1.name()),
+                            String::from_utf8_lossy(mate2.name())
+                        )));
+                    }
                     bases_so_far += mate1.seq_len() + mate2.seq_len();
                     batch.push((mate1, mate2));
                 }
@@ -1426,7 +1421,7 @@ impl InterleavedFastqReader {
                 return Err(Error::Fastq(format!(
                     "-p: interleaved input ended on an unpaired read ('{}'). bwa would realign it \
                      single-end (bseq_classify); bwa-mem4 refuses rather than mis-pair it.",
-                    mate1.name()
+                    String::from_utf8_lossy(mate1.name())
                 )));
             };
             // `qname_from_id` already stripped any `/1`/`/2`, so genuine mates compare equal here.
@@ -1434,26 +1429,14 @@ impl InterleavedFastqReader {
                 return Err(Error::Fastq(format!(
                     "-p: consecutive reads '{}' and '{}' are not mates. bwa would split these into \
                      a single-end pass (bseq_classify); bwa-mem4 refuses rather than mis-pair them.",
-                    mate1.name(), mate2.name()
+                    String::from_utf8_lossy(mate1.name()),
+                    String::from_utf8_lossy(mate2.name())
                 )));
             }
             bases_so_far += mate1.seq_len() + mate2.seq_len();
             batch.push((mate1, mate2));
         }
         Ok(batch)
-    }
-}
-
-/// A header field as UTF-8 bytes: lossy, as before, and free in the normal case. ASCII (nearly
-/// every header, and `is_ascii` is a word-at-a-time scan where `from_utf8` walked these ~40 bytes
-/// one at a time) is kept as is, and `from_utf8_lossy` keeps valid UTF-8 as is too and only
-/// allocates for a header with a stray byte, the rare path this tolerates rather than rejecting
-/// the file over.
-fn ascii_or_lossy(b: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    if b.is_ascii() {
-        std::borrow::Cow::Borrowed(b)
-    } else {
-        std::borrow::Cow::Owned(String::from_utf8_lossy(b).into_owned().into_bytes())
     }
 }
 
@@ -1662,10 +1645,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A header byte that is not UTF-8 becomes U+FFFD in the name and the comment, and a clean
-    /// header comes through as is.
+    /// bwa copies a header's bytes through, so a byte that is not UTF-8 survives unchanged in the
+    /// name and the comment, and a clean header comes through as is.
     #[test]
-    fn non_utf8_header_is_replaced() {
+    fn non_utf8_header_keeps_its_bytes() {
         let dir = std::env::temp_dir().join(format!("bwa4_lossy_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("l.fq");
@@ -1676,10 +1659,10 @@ mod tests {
         .unwrap();
         let mut r = FastqReader::from_path(&p).unwrap();
         let rec = r.next_record().unwrap().unwrap();
-        assert_eq!(rec.name(), "r\u{fffd}x");
-        assert_eq!(rec.comment(), Some("c\u{fffd}"));
+        assert_eq!(rec.name(), b"r\xffx");
+        assert_eq!(rec.comment(), Some(&b"c\xfe"[..]));
         let rec = r.next_record().unwrap().unwrap();
-        assert_eq!((rec.name(), rec.comment()), ("ok", Some("tag")));
+        assert_eq!((rec.name(), rec.comment()), (&b"ok"[..], Some(&b"tag"[..])));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1728,8 +1711,8 @@ mod tests {
                 );
             }
             for (k, (m1, m2)) in batch.iter().enumerate() {
-                assert_eq!(m1.name(), format!("read{}", seen + k));
-                assert_eq!(m2.name(), format!("read{}", seen + k));
+                assert_eq!(m1.name(), format!("read{}", seen + k).as_bytes());
+                assert_eq!(m2.name(), format!("read{}", seen + k).as_bytes());
             }
             seen += batch.len();
         }
@@ -1740,6 +1723,32 @@ mod tests {
     /// Files of different lengths must still be refused rather than mis-paired, which is the one
     /// safety property the split could plausibly have broken: the two threads reach end of file
     /// independently, so the check has to live in the consumer.
+    /// Same record count, but R2 lost its first read and gained one at the end: only the names show
+    /// it. Every pair would otherwise be false, with a clean exit.
+    #[test]
+    fn paired_reader_refuses_different_names() {
+        let dir = std::env::temp_dir().join(format!("bwa4_pe_names_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p1 = dir.join("r1.fq");
+        let p2 = dir.join("r2.fq");
+        std::fs::write(&p1, "@a/1\nACGT\n+\nIIII\n@b/1\nACGT\n+\nIIII\n").unwrap();
+        std::fs::write(&p2, "@b/2\nACGT\n+\nIIII\n@a/2\nACGT\n+\nIIII\n").unwrap();
+        let err = PairedFastqReader::from_paths(&p1, &p2, false)
+            .unwrap()
+            .next_batch(usize::MAX)
+            .err()
+            .expect("different names must be refused");
+        assert!(err.to_string().contains("different names"), "{err}");
+        // `/1` and `/2` are not part of the name, so genuine mates still pair.
+        std::fs::write(&p2, "@a/2\nACGT\n+\nIIII\n@b/2\nACGT\n+\nIIII\n").unwrap();
+        let batch = PairedFastqReader::from_paths(&p1, &p2, false)
+            .unwrap()
+            .next_batch(usize::MAX)
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn paired_reader_refuses_unequal_files() {
         let dir = std::env::temp_dir().join(format!("bwa4_pe_uneven_{}", std::process::id()));
@@ -1959,7 +1968,7 @@ mod tests {
             loop {
                 match r.next_record() {
                     Ok(Some(rec)) => {
-                        if rec.name() != format!("read{n}") {
+                        if rec.name() != format!("read{n}").as_bytes() {
                             let _ = tx.send(Err(format!(
                                 "record {n} is named {:?}, not read{n}",
                                 rec.name()

@@ -212,14 +212,14 @@ pub fn write_header<W: Write>(
 /// and `mem_aln2sam` emits both tags under `if (p->score >= 0)` / `if (p->sub >= 0)`.
 pub fn write_unmapped<W: Write>(
     w: &mut W,
-    qname: &str,
+    qname: &[u8],
     seq: &[u8],
     qual: Option<&[u8]>,
-    comment: Option<&str>,
+    comment: Option<&[u8]>,
 ) -> io::Result<()> {
     // ---- Columns 1..9: QNAME, then the fixed unmapped middle (FLAG 4, no RNAME/POS/MAPQ/CIGAR,
     //      SE mate defaults) ----
-    w.write_all(qname.as_bytes())?;
+    w.write_all(qname)?;
     w.write_all(b"\t4\t*\t0\t0\t*\t*\t0\t0\t")?;
     // ---- Columns 10-11: SEQ as sequenced, QUAL or `*` ----
     w.write_all(seq)?;
@@ -296,7 +296,7 @@ pub fn write_unmapped<W: Write>(
 #[allow(clippy::too_many_arguments)]
 pub fn write_mapped_se<W: Write>(
     w: &mut W,
-    qname: &str,
+    qname: &[u8],
     flag: u32,
     rname: &str,
     pos: i64,
@@ -311,13 +311,11 @@ pub fn write_mapped_se<W: Write>(
     //
     // Rust: every `{name}` interpolates the parameter of that name, and every literal tab between
     // them is a real field separator. The three trailing `*\t0\t0` are the single-end mate columns,
-    // written as constants because they never vary on this path. The whole line is one formatting
-    // call so that the field ORDER is readable as a single string rather than reconstructed from a
-    // sequence of writes.
-    write!(
-        w,
-        "{qname}\t{flag}\t{rname}\t{pos}\t{mapq}\t{cigar}\t*\t0\t0\t"
-    )?;
+    // written as constants because they never vary on this path. QNAME goes first on its own since
+    // it is raw bytes, which `write!` cannot interpolate; the rest is one formatting call so that
+    // the field ORDER is readable as a single string rather than reconstructed from many writes.
+    w.write_all(qname)?;
+    write!(w, "\t{flag}\t{rname}\t{pos}\t{mapq}\t{cigar}\t*\t0\t0\t")?;
     // ---- Columns 10-11: SEQ (already in reference orientation) and QUAL ----
     w.write_all(seq)?;
     w.write_all(b"\t")?;
@@ -457,7 +455,7 @@ mod tests {
     #[test]
     fn unmapped_record_shape() {
         let mut buf = Vec::new();
-        write_unmapped(&mut buf, "r1", b"ACGT", Some(b"IIII"), None).unwrap();
+        write_unmapped(&mut buf, b"r1", b"ACGT", Some(b"IIII"), None).unwrap();
         assert_eq!(
             &buf,
             b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tAS:i:0\tXS:i:0\n"
@@ -467,7 +465,7 @@ mod tests {
     #[test]
     fn unmapped_missing_qual_is_star() {
         let mut buf = Vec::new();
-        write_unmapped(&mut buf, "r1", b"ACGT", None, None).unwrap();
+        write_unmapped(&mut buf, b"r1", b"ACGT", None, None).unwrap();
         assert_eq!(
             &buf,
             b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\tAS:i:0\tXS:i:0\n"
