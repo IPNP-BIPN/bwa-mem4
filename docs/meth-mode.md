@@ -249,14 +249,15 @@ Each cell is bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each.
 The machine was loaded (load average 6 to 9) during these runs. Cycles and instructions are the
 steadier comparison.
 
-100,000 pairs simulated from chr21 at 150 and 250 bp, same machine (commit 7ac2c9e, `-t1`, the
+100,000 pairs simulated from chr21 at 150 and 250 bp, same machine (commit c3c92a8, `-t1`, the
 faster of three interleaved runs of each). Cycles (G), bwa-mem4 / bwa-mem3, then the ratio; load
-moves wall times by up to 2x, cycles much less. The SAM output was identical:
+moves wall times by up to 2x, cycles much less. The SAM output was identical. Max RSS is 0.92 to
+0.97 of bwa-mem3's, except TAPS 150 bp, where both sit at 490-510 MB (run-to-run noise ±10 MB):
 
 | Set | 150 bp | 250 bp |
 |---|---|---|
-| EM-seq | 17.3 / 27.0 (0.64) | 24.4 / 45.5 (0.54) |
-| TAPS | 16.8 / 24.2 (0.69) | 20.7 / 38.3 (0.54) |
+| EM-seq | 17.2 / 26.3 (0.65) | 24.1 / 45.0 (0.54) |
+| TAPS | 15.7 / 24.0 (0.66) | 20.5 / 38.0 (0.54) |
 
 On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` times both binaries on
 200,000 pairs simulated from chr21, on the runner's CPU. Each cell is the wall-time ratio
