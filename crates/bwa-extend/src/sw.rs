@@ -1106,13 +1106,103 @@ pub fn tightened_global_band(
     }
     let denom = a + e_del + e_ins;
     let budget = short_len as i32 * a - score - (o_del + o_ins) - gap * e_long;
-    // `v_max`: the largest overshoot whose ceiling still reaches `score`.
     // `budget <= denom` with no length difference is the tie case above: no path beats `S`.
     if gap == 0 && budget <= denom {
         return (0, score);
     }
+    // `v_max`: the largest overshoot whose ceiling still reaches `score`.
     let v_max = (budget / denom).max(0);
+    if gap == 0 && v_max <= EXC_MAX_V {
+        let (o_min, e_pair) = (o_del.min(o_ins), e_del + e_ins);
+        let flat = match uniform_cells(mat, m) {
+            Some(u) => {
+                excursions_cannot_gain(query, target, uniform_cell(u), a, o_min, e_pair, v_max)
+            }
+            None => excursions_cannot_gain(
+                query,
+                target,
+                |x, y| i32::from(mat[y as usize * m + x as usize]),
+                a,
+                o_min,
+                e_pair,
+                v_max,
+            ),
+        };
+        if flat {
+            return (0, score);
+        }
+    }
     ((gap + v_max).min(w_), score)
+}
+
+/// Widest band [`excursions_cannot_gain`] is tried on.
+const EXC_MAX_V: i32 = 16;
+
+/// Whether no path between equal-length `query` and `target` within `v` diagonals of the main one
+/// scores above the main diagonal, by an upper bound on what each excursion off it can gain.
+///
+/// An excursion leaves the diagonal and comes back; it holds pairs `(k, k + d)` with `d != 0`, `I`
+/// bases (query only) and `D` bases, as many `D` as `I`. Measured against the diagonal over the
+/// query bases it covers, a pair gains `cell(q_k, t_{k+d}) - s_k` and an `I` base `-s_k - e_ins -
+/// e_del` (its own extension and that of one `D` base), and every gap run opens at `o_min` or more.
+/// The scan below maximises over a superset of these walks: a pair may follow the previous base's
+/// pair on its diagonal or an `I` base for free, or any state for one `o_min`; an `I` base may
+/// follow an `I` base for free or any state for one `o_min`; an excursion
+/// opens from the diagonal for `o_min` and closes for `o_min` after a pair or for nothing after an
+/// `I` run, whose open it already paid. Each real excursion is one of these walks at no more than
+/// its real cost, so if no walk closes above 0, no path scores above `S`.
+fn excursions_cannot_gain(
+    query: &[u8],
+    target: &[u8],
+    cell: impl Fn(u8, u8) -> i32,
+    a: i32,
+    o_min: i32,
+    e_pair: i32,
+    v: i32,
+) -> bool {
+    const NEG: i32 = i32::MIN / 4;
+    const W: usize = EXC_MAX_V as usize;
+    let (len, v) = (query.len(), v as usize);
+    // `g[W + d]`: best open walk whose last base `k` is paired on diagonal `d`; `gi`: whose last base
+    // is in an `I` run; `best`: the best of them and of 0 (on the diagonal) after base `k`.
+    let mut g = [NEG; 2 * W + 1];
+    let (mut gi, mut best) = (NEG, 0);
+    // Every walk is dominated by a fresh open (`g`, `gi` <= `-o_min`, `best` = 0). From there a
+    // base whose diagonal cell is `a` keeps it so (no pair or `I` base gains on it), so the scan
+    // jumps over those.
+    let mut fresh = true;
+    let mut k = 0;
+    while k < len {
+        let (qk, s) = (query[k], cell(query[k], target[k]));
+        k += 1;
+        if fresh && s == a {
+            continue;
+        }
+        let from = best - o_min;
+        let enter = from.max(gi);
+        let mut gmax = NEG;
+        for d in 1..=v {
+            // Diagonal `-d` pairs base `k - 1` with target `k - 1 - d`, diagonal `d` with `k - 1 + d`.
+            for (lane, j) in [(W - d, (k - 1).checked_sub(d)), (W + d, Some(k - 1 + d))] {
+                let x = match j.filter(|&j| j < len) {
+                    Some(j) => cell(qk, target[j]) - s + g[lane].max(enter),
+                    None => NEG,
+                };
+                g[lane] = x;
+                gmax = gmax.max(x);
+            }
+        }
+        gi = (-s - e_pair) + gi.max(from);
+        if gmax > o_min || gi > 0 {
+            return false;
+        }
+        best = gmax.max(gi).max(0);
+        fresh = gmax <= -o_min && gi <= -o_min;
+        if fresh {
+            (g, gi) = ([NEG; 2 * W + 1], NEG);
+        }
+    }
+    true
 }
 
 /// `(match, mismatch, n)` when the `m x m` matrix scores every pair of codes `0..4` by equality
