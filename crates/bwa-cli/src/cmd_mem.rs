@@ -3192,17 +3192,24 @@ fn run_pe(
             let mut out = Vec::with_capacity(batch.len().div_ceil(SAM_CHUNK_PAIRS));
             let (mut recs_left, mut regs_left) = (batch.into_iter(), paired.into_iter());
             let mut first = 0usize;
+            // Block N's deferred pairs resolve while block N+1 emits: alone, a block's few hundred
+            // jobs and reruns left most of the pool idle (0.28 s of wall per GIAB run).
+            let mut prev: Vec<(Vec<u8>, Vec<Deferred>)> = Vec::new();
             loop {
                 let recs: Vec<(Record, Record)> =
                     recs_left.by_ref().take(EMIT_BLOCK_PAIRS).collect();
-                if recs.is_empty() {
-                    break;
-                }
                 let regs: Vec<_> = regs_left.by_ref().take(recs.len()).collect();
                 let n = recs.len();
-                let mut bufs: Vec<(Vec<u8>, Vec<Deferred>)> = stage_time::barrier::region(
-                    Stage::SamEmit,
-                    || {
+                let resolve = |prev: &mut Vec<(Vec<u8>, Vec<Deferred>)>| {
+                    if prev.iter().any(|(_, d)| !d.is_empty()) {
+                        emit_deferred(fm, bns, opt, &pes, base_pair, &pend_tables, prev);
+                    }
+                };
+                let emit = || -> Vec<(Vec<u8>, Vec<Deferred>)> {
+                    if n == 0 {
+                        return Vec::new();
+                    }
+                    stage_time::barrier::region(Stage::SamEmit, || {
                         // `into_par_iter`, so each pair's records and regions are freed as its text appears.
                         // Batch N's tail overlaps batch N+1's align, and that is where the run's peak is.
                         recs
@@ -3276,12 +3283,14 @@ fn run_pe(
                     )
                     .map(|(buf, _, deferred)| (buf, deferred))
                     .collect()
-                    },
-                );
-                if bufs.iter().any(|(_, d)| !d.is_empty()) {
-                    emit_deferred(fm, bns, opt, &pes, base_pair, &pend_tables, &mut bufs);
+                    })
+                };
+                let (bufs, ()) = rayon::join(emit, || resolve(&mut prev));
+                out.extend(std::mem::take(&mut prev).into_iter().map(|(buf, _)| buf));
+                if n == 0 {
+                    break;
                 }
-                out.extend(bufs.into_iter().map(|(buf, _)| buf));
+                prev = bufs;
                 first += n;
             }
             out
@@ -3340,8 +3349,10 @@ fn emit_deferred(
             }
         }
     }
+    // A block's few hundred jobs spread over the pool: one 1024-job slice ran on one thread while
+    // the others waited (0.55 s of serial wall per GIAB run). 64 fills an AVX-512 lane group.
     let score2: Vec<i32> = jobs
-        .par_chunks(1024)
+        .par_chunks(64)
         .flat_map_iter(|c| resolve_pending(fm, opt, c))
         .collect();
     drop(jobs);
