@@ -494,9 +494,19 @@ fn collect_smems_batched_bsd(
     // smaller than `b`, so it is also the first BWT ROW whose suffix begins with `b`. Copied out of
     // `fm` so the hot slot loop does not re-borrow it per step.
     let counts = fm.counts();
-    // Per-read result slots, pre-sized so a finished walk can be moved straight into `output[ridx]`
-    // regardless of the order in which reads complete.
-    let mut output: Vec<Vec<Smem>> = (0..reads.len()).map(|_| Vec::new()).collect();
+    // Per-read result slots, pre-sized so a finished walk can be copied straight into `output[ridx]`
+    // regardless of the order in which reads complete. The previous batch's vectors when the aligner
+    // handed them back (`recycle_smems`); one dropped and reallocated per read was 14% of all
+    // allocations. One that grew past `SMEM_KEEP` (a repeat) is let go so the pool stays small.
+    let mut output = SMEM_POOL.take();
+    output.truncate(reads.len());
+    for v in &mut output {
+        if v.capacity() > SMEM_KEEP {
+            *v = Vec::new();
+        }
+        v.clear();
+    }
+    output.resize_with(reads.len(), Vec::new);
     let mut walks = vec![FirstWalk::NONE; if bsd.is_some() { reads.len() } else { 0 }];
     if reads.is_empty() {
         return (output, walks);
@@ -551,10 +561,10 @@ fn collect_smems_batched_bsd(
                 // leaves round 1 with 2.5 SMEMs and ends with 12.8, and handing over the walk's own
                 // buffer made both rounds regrow it (a realloc and a copy each). The slot keeps its
                 // buffer for the next read.
-                let mut v = Vec::with_capacity(slot.out.len() + SMEM_HEADROOM);
+                let v = &mut output[slot.ridx];
+                v.reserve(slot.out.len() + SMEM_HEADROOM);
                 v.extend_from_slice(&slot.out);
                 slot.out.clear();
-                output[slot.ridx] = v;
                 if bsd.is_some() {
                     walks[slot.ridx] = slot.bsd;
                 }
@@ -1940,6 +1950,20 @@ pub fn mem_collect_smem(fm: &FmIndex, codes: &[u8], opt: &MemOpt) -> Vec<Smem> {
 /// `collect_smems_batched_bsd`).
 const SMEM_HEADROOM: usize = 16;
 
+/// Largest per-read SMEM vector (in SMEMs) kept for the next batch: GIAB reads average 18.
+const SMEM_KEEP: usize = 128;
+
+thread_local! {
+    /// The per-read SMEM vectors of this thread's last batch, back from the aligner once chained.
+    static SMEM_POOL: std::cell::Cell<Vec<Vec<Smem>>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Hands a batch's per-read SMEM vectors (from [`mem_collect_smem_batched`]) back once they are no
+/// longer needed: the next batch seeded on this thread refills them instead of allocating.
+pub fn recycle_smems(per_read: Vec<Vec<Smem>>) {
+    SMEM_POOL.set(per_read);
+}
+
 /// Batched seeding for a read batch: round-1 SMEMs are collected in **lockstep**
 /// ([`collect_smems_batched`], hiding FM-index latency), then rounds 2/3 (re-seeding + interval-capped
 /// forward seeding) run per read. Returns, for every read, exactly what [`mem_collect_smem`] would.
@@ -2131,7 +2155,8 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
     let split_len = (opt.min_seed_len as f32 * opt.split_factor + SPLIT_LEN_ROUNDING) as i32;
 
     // Enumerate the re-seed jobs, preserving per-read append order (round-1 SMEM index ascending).
-    let mut jobs: Vec<ReseedJob> = Vec::new();
+    // At most one job per SMEM: sized for that, it never regrows.
+    let mut jobs: Vec<ReseedJob> = Vec::with_capacity(per_read.iter().map(Vec::len).sum());
     for (ridx, smems) in per_read.iter().enumerate() {
         for p in smems.iter() {
             // Parent SMEM's READ span as a half-open interval `[start, end)`.

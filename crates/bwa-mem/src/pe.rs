@@ -1328,7 +1328,10 @@ pub fn batch_mate_rescue(
     // that list's `(start, len)` in `anchors`, score-descending, at most `anchor_cap` long. Frozen
     // here: regions inserted by rescue must NOT themselves become anchors, and in bwa they cannot,
     // because the C snapshots `b[i]` before its own anchor loop too.
-    let mut anchors: Vec<Anchor> = Vec::new();
+    // Sized for every region the cap lets in: grown by doubling it was a realloc and a copy.
+    let most = |regs: &[MemAlnReg]| regs.len().min(anchor_cap);
+    let mut anchors: Vec<Anchor> =
+        Vec::with_capacity(pairs.iter().map(|p| most(p.a0) + most(p.a1)).sum());
     let mut spans: Vec<[(u32, u32); 2]> = Vec::with_capacity(pairs.len());
     for p in pairs.iter() {
         // Each side is snapshotted on its own: bwa gates only on MEM_F_NO_RESCUE, never on both
@@ -1360,11 +1363,11 @@ pub fn batch_mate_rescue(
     anchor_spread::record(&anchors, &spans);
 
     let mut views: Vec<[RegionView; 2]> = (0..pairs.len()).map(|_| Default::default()).collect();
-    // The block's windows and reverse-complemented mates, back to back.
-    let mut arena: Vec<u8> = Vec::new();
-    // The block's anchors in apply order, `(pair, dir, anchor index)`, and what collect made of each.
+    // `arena`: the block's windows and reverse-complemented mates, back to back. `calls`: what
+    // collect made of each anchor. Both kept between calls (see [`RESCUE_BUFS`]).
+    let (mut arena, mut calls) = RESCUE_BUFS.take();
+    // The block's anchors in apply order, `(pair, dir, anchor index)`.
     let mut todo: Vec<(u32, u8, u32)> = Vec::new();
-    let mut calls: Vec<Option<RescueCall>> = Vec::new();
     // Per anchor, `(start, count)` in `job_of`; per collected orientation, its kernel job.
     let mut call_jobs: Vec<(u32, u32)> = Vec::new();
     let mut job_of: Vec<u32> = Vec::new();
@@ -1554,6 +1557,15 @@ pub fn batch_mate_rescue(
         settle_order(p.a1, &mut v[0].pending);
         settle_order(p.a0, &mut v[1].pending);
     }
+    RESCUE_BUFS.set((arena, calls));
+}
+
+thread_local! {
+    /// [`batch_mate_rescue`]'s window arena and per-anchor calls, kept between calls: grown from
+    /// empty each time they were a sixth of the run's realloc copies (chr21, 200k pairs: 0.23 of
+    /// 1.29 GB). Cleared per block before use.
+    static RESCUE_BUFS: std::cell::Cell<(Vec<u8>, Vec<Option<RescueCall>>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
 }
 
 /// Anchors per [`batch_mate_rescue`] block; `BWA4_RESCUE_BLOCK` overrides it for measurement.

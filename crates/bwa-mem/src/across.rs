@@ -533,7 +533,8 @@ fn run_staged<B: SwBackend>(
     let mut ix = KEPT_INDEX.with(|c| std::mem::take(&mut *c.borrow_mut()));
     let mut blocking = KeptIndex::default();
     // This wave's extending slots, as (read, slot within the read).
-    let mut pending: Vec<(usize, usize)> = Vec::new();
+    // At most every slot once per wave: sized for that, it never regrows.
+    let mut pending: Vec<(usize, usize)> = Vec::with_capacity(st.len());
     let (mut wl, mut wr): (Vec<SideJob>, Vec<SideJob>) = (Vec::new(), Vec::new());
     // Reads with a slot still undecided, and each read's first undecided slot.
     let mut todo: Vec<usize> = (0..reads.len()).collect();
@@ -964,10 +965,18 @@ thread_local! {
     /// memory mimalloc had recycled zeroed it again (`rep stosb`, 0.3% of samples on EPYC 9V45).
     static SA_BUFS: std::cell::Cell<(Vec<i64>, Vec<i64>)> =
         const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+    /// `all_positions`, `all_counts` and the repeated runs, kept between chunks: grown from empty
+    /// per chunk they were a fifth of the run's realloc copies (chr21, 200k pairs: 0.26 of 1.29 GB).
+    #[allow(clippy::type_complexity)]
+    static POS_BUFS: std::cell::Cell<(Vec<i64>, Vec<i64>, Vec<bwa_chain::RepeatedRun>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new())) };
     /// `reg_meta` and `reg_preskip`, kept between chunks for the same reason: every pushed region
     /// writes its own slot before any pass reads it, and nothing reads past `regs[r].len()`.
     static META_BUFS: std::cell::Cell<(Vec<RegMeta>, Vec<bool>)> =
         const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+    /// `per_read_chains`, kept between chunks.
+    static CHAIN_BUFS: std::cell::Cell<Vec<Vec<MemChain>>> =
+        const { std::cell::Cell::new(Vec::new()) };
     /// `run_side`'s active job list and its counting-sort output.
     static SIDE_BUFS: std::cell::Cell<(Vec<usize>, Vec<usize>)> =
         const { std::cell::Cell::new((Vec::new(), Vec::new())) };
@@ -1321,11 +1330,13 @@ fn align_reads_batched_inner<B: SwBackend>(
     let (all_positions, all_counts): (Vec<i64>, Vec<i64>) = if batched_sa {
         #[cfg(feature = "stage-alloc")]
         let _tag = alloc_probe::enter(alloc_probe::B_ALIGN_SA);
-        let mut pos = Vec::new();
-        // Runs of rows that repeat an earlier run exactly, because two adjacent SMEMs are identical
-        // after the sort. Collected here and consumed by the resolution below; see `RepeatedRun`.
-        let mut repeats = Vec::new();
-        let mut counts = Vec::new();
+        // `repeats`: runs of rows that repeat an earlier run exactly, because two adjacent SMEMs are
+        // identical after the sort. Collected here and consumed by the resolution below; see
+        // `RepeatedRun`.
+        let (mut pos, mut counts, mut repeats) = POS_BUFS.take();
+        pos.clear();
+        counts.clear();
+        repeats.clear();
         for ri in 0..per_read_smems.len() {
             prefetch_smems(per_read_smems.get(ri + 1));
             let smems = &mut per_read_smems[ri];
@@ -1499,98 +1510,105 @@ fn align_reads_batched_inner<B: SwBackend>(
     // the seeds the extension phase will work through. Everything downstream indexes this by read.
     #[cfg(feature = "stage-alloc")]
     let _chain_tag = alloc_probe::enter(alloc_probe::B_ALIGN_CHAIN);
-    let per_read_chains: Vec<Vec<MemChain>> = (0..per_read_smems.len())
-        .zip(reads.iter())
-        .map(|(ri, codes)| {
-            prefetch_smems(per_read_smems.get(ri + 1));
-            let smems = std::mem::take(&mut per_read_smems[ri]);
-            // `counts`: positions contributed by each of this read's SMEMs. `n`: their total, i.e.
-            // how far `sa_cursor` must advance. `rbegs`: this read's own slice of the flat
-            // resolved-position array, in the order the chain builder expects.
-            let resolved = batched_sa.then(|| {
-                let counts = &all_counts[count_cursor..count_cursor + smems.len()];
-                count_cursor += smems.len();
-                let n: usize = counts.iter().map(|c| *c as usize).sum();
-                let rbegs = &all_rbegs[sa_cursor..sa_cursor + n];
-                sa_cursor += n;
-                (counts, rbegs)
-            });
-            // `--meth`: each hit back on the original genome, `-1` where the chemistry rejects it.
-            let meth_rbegs: Vec<i64>;
-            let resolved = match (resolved, meth) {
-                (Some((counts, rbegs)), Some((_, ot))) => {
-                    let mut out = Vec::with_capacity(rbegs.len());
-                    let mut at = 0usize;
-                    for (smem, &c) in smems.iter().zip(counts) {
-                        let len = (smem.n + 1 - smem.m) as i32;
-                        for &rb in &rbegs[at..at + c as usize] {
-                            out.push(bwa_chain::meth_seed_to_orig(bns, rb, len, ot).unwrap_or(-1));
-                        }
-                        at += c as usize;
+    // One chain vector per read, kept between chunks like the buffers above: one allocated per
+    // read was 14% of all allocations. One grown past 32 chains (a repeat) is let go.
+    let mut per_read_chains: Vec<Vec<MemChain>> = CHAIN_BUFS.take();
+    per_read_chains.truncate(reads.len());
+    for c in &mut per_read_chains {
+        if c.capacity() > 32 {
+            *c = Vec::new();
+        }
+        c.clear();
+    }
+    per_read_chains.resize_with(reads.len(), Vec::new);
+    for (ri, codes) in reads.iter().enumerate() {
+        let out = &mut per_read_chains[ri];
+        prefetch_smems(per_read_smems.get(ri + 1));
+        let smems = &per_read_smems[ri];
+        // `counts`: positions contributed by each of this read's SMEMs. `n`: their total, i.e.
+        // how far `sa_cursor` must advance. `rbegs`: this read's own slice of the flat
+        // resolved-position array, in the order the chain builder expects.
+        let resolved = batched_sa.then(|| {
+            let counts = &all_counts[count_cursor..count_cursor + smems.len()];
+            count_cursor += smems.len();
+            let n: usize = counts.iter().map(|c| *c as usize).sum();
+            let rbegs = &all_rbegs[sa_cursor..sa_cursor + n];
+            sa_cursor += n;
+            (counts, rbegs)
+        });
+        // `--meth`: each hit back on the original genome, `-1` where the chemistry rejects it.
+        let meth_rbegs: Vec<i64>;
+        let resolved = match (resolved, meth) {
+            (Some((counts, rbegs)), Some((_, ot))) => {
+                let mut orig = Vec::with_capacity(rbegs.len());
+                let mut at = 0usize;
+                for (smem, &c) in smems.iter().zip(counts) {
+                    let len = (smem.n + 1 - smem.m) as i32;
+                    for &rb in &rbegs[at..at + c as usize] {
+                        orig.push(bwa_chain::meth_seed_to_orig(bns, rb, len, ot).unwrap_or(-1));
                     }
-                    meth_rbegs = out;
-                    Some((counts, &meth_rbegs[..]))
+                    at += c as usize;
                 }
-                (r, _) => r,
-            };
-            // Chained and filtered in one step unless the pre-filter chains are dumped: only the
-            // kept chains get seed vectors.
-            if let (Some((counts, rbegs)), false) = (resolved, dump_chains) {
-                let mut out =
-                    bwa_chain::build_filtered_chains(bns, opt, codes, 0, &smems, counts, rbegs);
-                align_split::measure(&align_split::CHAINFLT_NS, || {
-                    crate::seedflt::mem_flt_chained_seeds(fm, bns, opt, codes, &mut out);
-                });
-                return out;
+                meth_rbegs = orig;
+                Some((counts, &meth_rbegs[..]))
             }
-            // This read's chains *before* filtering (the C's pre-`mem_chain_flt` list).
-            let pre = if let Some((counts, rbegs)) = resolved {
-                bwa_chain::build_chains_from_resolved(bns, opt, codes, 0, &smems, counts, rbegs)
-            } else {
-                build_chains_from_smems(fm, bns, opt, codes, 0, smems)
-            };
-            if dump_chains {
-                eprintln!("PRECHAIN nchains={}", pre.len());
-                for (ci, c) in pre.iter().enumerate() {
-                    eprintln!(
-                        "  prechain{ci} pos={} nseed={} w={} qbeg={} qend={}",
-                        c.pos,
-                        c.seeds.len(),
-                        bwa_chain::mem_chain_weight(c),
-                        c.seeds.first().map_or(0, |s| s.qbeg),
-                        c.seeds.last().map_or(0, |s| s.qbeg + s.len),
-                    );
-                }
-            }
-            // The kept chains: overlapping and dominated chains dropped, `kept`/`w` filled in. This
-            // is the value the closure yields into `per_read_chains`.
-            let mut out =
-                align_split::measure(&align_split::CHAINFLT_NS, || mem_chain_flt(opt, pre));
-            // bwa's second chain-level pass (`bwamem.cpp:1084`). See `crate::seedflt`; it is inside
-            // the chain-filter timer because it is the same stage of the C's pipeline and, on the
-            // short reads this path exists for, it returns without doing anything.
+            (r, _) => r,
+        };
+        // Chained and filtered in one step unless the pre-filter chains are dumped: only the
+        // kept chains get seed vectors.
+        if let (Some((counts, rbegs)), false) = (resolved, dump_chains) {
+            bwa_chain::build_filtered_chains(bns, opt, codes, 0, smems, counts, rbegs, out);
             align_split::measure(&align_split::CHAINFLT_NS, || {
-                crate::seedflt::mem_flt_chained_seeds(fm, bns, opt, codes, &mut out);
+                crate::seedflt::mem_flt_chained_seeds(fm, bns, opt, codes, out);
             });
-            if dump_chains {
-                eprintln!("CHAIN nchains={}", out.len());
-                for (ci, c) in out.iter().enumerate() {
-                    eprintln!(
-                        "  chain{ci} pos={} nseed={} w={} kept={}",
-                        c.pos,
-                        c.seeds.len(),
-                        c.w,
-                        c.kept
-                    );
-                }
+            continue;
+        }
+        // This read's chains *before* filtering (the C's pre-`mem_chain_flt` list).
+        let pre = if let Some((counts, rbegs)) = resolved {
+            bwa_chain::build_chains_from_resolved(bns, opt, codes, 0, smems, counts, rbegs)
+        } else {
+            build_chains_from_smems(fm, bns, opt, codes, 0, smems.clone())
+        };
+        if dump_chains {
+            eprintln!("PRECHAIN nchains={}", pre.len());
+            for (ci, c) in pre.iter().enumerate() {
+                eprintln!(
+                    "  prechain{ci} pos={} nseed={} w={} qbeg={} qend={}",
+                    c.pos,
+                    c.seeds.len(),
+                    bwa_chain::mem_chain_weight(c),
+                    c.seeds.first().map_or(0, |s| s.qbeg),
+                    c.seeds.last().map_or(0, |s| s.qbeg + s.len),
+                );
             }
-            out
-        })
-        .collect();
+        }
+        // The kept chains: overlapping and dominated chains dropped, `kept`/`w` filled in.
+        *out = align_split::measure(&align_split::CHAINFLT_NS, || mem_chain_flt(opt, pre));
+        // bwa's second chain-level pass (`bwamem.cpp:1084`). See `crate::seedflt`; it is inside
+        // the chain-filter timer because it is the same stage of the C's pipeline and, on the
+        // short reads this path exists for, it returns without doing anything.
+        align_split::measure(&align_split::CHAINFLT_NS, || {
+            crate::seedflt::mem_flt_chained_seeds(fm, bns, opt, codes, out);
+        });
+        if dump_chains {
+            eprintln!("CHAIN nchains={}", out.len());
+            for (ci, c) in out.iter().enumerate() {
+                eprintln!(
+                    "  chain{ci} pos={} nseed={} w={} kept={}",
+                    c.pos,
+                    c.seeds.len(),
+                    c.w,
+                    c.kept
+                );
+            }
+        }
+    }
+    bwa_seed::recycle_smems(per_read_smems);
     SA_BUFS.with(|b| {
         let (_, walked) = b.take();
         b.set((all_rbegs, walked));
     });
+    POS_BUFS.set((all_positions, all_counts, sa_repeats));
 
     // Chaining is over; everything from the region skeleton to the final compaction is extension.
     #[cfg(feature = "stage-alloc")]
@@ -2108,6 +2126,7 @@ fn align_reads_batched_inner<B: SwBackend>(
         read_regs.retain(|reg| reg.qe > reg.qb);
     }
     META_BUFS.set((reg_meta, reg_preskip));
+    CHAIN_BUFS.set(per_read_chains);
 
     regs
 }

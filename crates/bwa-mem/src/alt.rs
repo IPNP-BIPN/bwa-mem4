@@ -114,9 +114,8 @@ fn get_pri_idx(xa_drop_ratio: f64, regs: &[MemAlnReg], i: usize) -> Option<usize
     }
 }
 
-/// For each region index, the list of alternate-region indices to emit under it as `XA` hits,
-/// in region order. Empty for regions that are not XA primaries. Pure port of `mem_gen_alt`'s
-/// selection (the string formatting is done by the caller via `reg2aln`).
+/// For each region, the primary it is emitted under as an `XA` hit, or `None`. Pure port of
+/// `mem_gen_alt`'s selection (the string formatting is done by the caller via `reg2aln`).
 ///
 /// NOTATION: the C's `r` (the index of a primary region) is spelled `primary_idx` below; the quoted
 /// C expressions in this comment keep the C's spelling so they can be grepped in the source.
@@ -135,10 +134,9 @@ fn get_pri_idx(xa_drop_ratio: f64, regs: &[MemAlnReg], i: usize) -> Option<usize
 /// here: `cnt[r] > max_xa_hits_alt || (!has_alt[r] && cnt[r] > max_xa_hits)`, so the generous limit
 /// is a hard ceiling that applies even to ALT-bearing primaries.
 ///
-/// INVARIANT: the returned vector has one entry per region, indexed the same way as `regs`, and
-/// each inner list is in ascending region order because `i` walks upward. That order is what
-/// determines the order of the semicolon-separated fields in the emitted `XA:Z:` string, so it is
-/// output-visible and must not be sorted or reversed.
+/// INVARIANT: the returned vector has one entry per region, indexed the same way as `regs`. A
+/// primary's hits are emitted in ascending region order, which is the order of the
+/// semicolon-separated fields in its `XA:Z:` string, so it is output-visible.
 ///
 /// The C additionally short-circuits on `tot == 0` (`bwamem_extra.cpp:147`); we simply return the
 /// all-empty vector, which the caller skips region by region. Same result, no allocation to avoid.
@@ -154,9 +152,42 @@ fn get_pri_idx(xa_drop_ratio: f64, regs: &[MemAlnReg], i: usize) -> Option<usize
 ///
 /// # Returns
 ///
-/// One entry per region, indexed identically to `regs`: `groups[p]` is the ascending list of region
-/// indices to emit as `XA` hits under primary `p`, and is empty for every region that is not an XA
-/// primary or whose group blew the cap.
+/// One entry per region, indexed identically to `regs`: `Some(p)` when the region is emitted as an
+/// `XA` hit under primary `p`, `None` when it is not a runner-up or its primary's group blew the
+/// cap. Two vectors in all: a list per primary was one more allocation per primary.
+pub fn xa_group(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<Option<usize>> {
+    // Score-drop threshold, widened once here so both passes hand `get_pri_idx` the identical
+    // `f64` and cannot disagree about a boundary case. `n_regs` is the region count, which is also
+    // the length of `tally` and of the returned vector.
+    let ratio = f64::from(opt.xa_drop_ratio);
+    let n_regs = regs.len();
+    // `tally[p]`: the C's `cnt[p]`, how many regions name `p` as their XA primary, and `has_alt[p]`,
+    // whether any of them sits on an ALT contig, which selects the generous cap below. Written only
+    // by pass 1, so no cap decision may read it before that loop ends. The count is `i32` because it
+    // is compared against the `i32` option fields.
+    let mut tally = vec![(0i32, false); n_regs];
+    // ---- pass 1: each region's primary, and how many runners-up each primary has ----
+    // `get_pri_idx` is a pure function of `regs`, so evaluating it once here is the C's second
+    // evaluation too.
+    let mut listed: Vec<Option<usize>> = (0..n_regs).map(|i| get_pri_idx(ratio, regs, i)).collect();
+    for (i, p) in listed.iter().enumerate() {
+        if let Some(p) = *p {
+            tally[p].0 += 1;
+            tally[p].1 |= regs[i].is_alt;
+        }
+    }
+    // ---- pass 2: drop the runners-up of a primary over the cap, now that every count is final ----
+    for p in &mut listed {
+        if let Some(q) = *p {
+            let (cnt, has_alt) = tally[q];
+            if cnt > opt.max_xa_hits_alt || (!has_alt && cnt > opt.max_xa_hits) {
+                *p = None;
+            }
+        }
+    }
+    listed
+}
+
 /// `HN:i` of each region under `--meth`: how many alternative hits fall within `xa_drop_ratio` of
 /// it, counted before the `-h` cap drops them from XA (fg-labs/bwa-mem3 `mem_gen_alt`'s `cnt`).
 pub fn hit_counts(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<i32> {
@@ -168,50 +199,6 @@ pub fn hit_counts(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<i32> {
         }
     }
     cnt
-}
-
-pub fn xa_group(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<Vec<usize>> {
-    // Score-drop threshold, widened once here so both passes hand `get_pri_idx` the identical
-    // `f64` and cannot disagree about a boundary case. `n_regs` is the region count, which is also
-    // the length of `cnt`, `has_alt` and the returned `groups`.
-    let ratio = f64::from(opt.xa_drop_ratio);
-    let n_regs = regs.len();
-    // `cnt[p]`: how many regions name `p` as their XA primary. `has_alt[p]`: whether any of them
-    // sits on an ALT contig, which selects the generous cap below.
-    // Both are indexed by region, both start at the identity (0 / false), and both are written only
-    // by pass 1. Loop invariant of pass 1: at the top of iteration `i`, they hold the tallies over
-    // regions `0..i` only, so neither may be read for a cap decision before that loop ends. `cnt` is
-    // `i32` and not `usize` because it is compared against the `i32` option fields.
-    let mut cnt = vec![0i32; n_regs];
-    let mut has_alt = vec![false; n_regs];
-    // ---- pass 1: tally how many runners-up each primary has ----
-    // `get_pri_idx` is deliberately re-evaluated in pass 2 rather than cached, exactly as the C
-    // does; it is a pure function of `regs`, which neither pass mutates.
-    for i in 0..n_regs {
-        if let Some(primary_idx) = get_pri_idx(ratio, regs, i) {
-            cnt[primary_idx] += 1;
-            if regs[i].is_alt {
-                has_alt[primary_idx] = true;
-            }
-        }
-    }
-    // ---- pass 2: assign runners-up to primaries, now that every count is final ----
-    // The result being built. Invariant at the top of each iteration: `groups[p]` holds, in
-    // ascending order, exactly those regions `< i` that chose `p` and whose group is under the cap.
-    // Since `i` only grows, pushing at the tail keeps the order ascending, and that order is
-    // output-visible (it is the order of the fields in the emitted `XA:Z:` string).
-    let mut groups = vec![Vec::new(); n_regs];
-    for i in 0..n_regs {
-        if let Some(primary_idx) = get_pri_idx(ratio, regs, i) {
-            if cnt[primary_idx] > opt.max_xa_hits_alt
-                || (!has_alt[primary_idx] && cnt[primary_idx] > opt.max_xa_hits)
-            {
-                continue;
-            }
-            groups[primary_idx].push(i);
-        }
-    }
-    groups
 }
 
 /// Per-region `XA:Z:` string (`rname,±pos,cigar,NM;`... concatenated), or `None` for regions that
@@ -266,8 +253,8 @@ pub fn mem_gen_alt(
     l_query: i32,
     query: &[u8],
 ) -> XaTags {
-    // Selection is done first and in full: `groups[p]` is the final, cap-checked alternate list for
-    // primary `p`. `out` is the answer under construction, one slot per region, filled only at the
+    // Selection is done first and in full: `xa_group` names, cap checked, the primary each region is
+    // listed under. `out` is the answer under construction, one slot per region, filled only at the
     // indices that turn out to be XA primaries; every other slot stays `None`.
     // TRIED AND MEASURED AT ZERO (2026-09-10): skipping this whole function when no region has
     // `secondary_all >= 0` -- i.e. when the read's hits are all primaries, which is most reads, so
@@ -284,38 +271,39 @@ pub fn mem_gen_alt(
     // is ~1.3% of the profile against the fork's ~0.45%, and this is 3 of ~21 allocations per read.
     //
     // No region close enough to the one shadowing it (most reads): no XA anywhere, so skip
-    // `xa_group`'s three vectors. Its own test, so exact. The answer keeps one slot per region.
+    // `xa_group`'s vectors. Its own test, so exact. The answer keeps one slot per region.
     let ratio = f64::from(opt.xa_drop_ratio);
     if (0..regs.len()).all(|i| get_pri_idx(ratio, regs, i).is_none()) {
         return XaTags::default();
     }
-    let groups = xa_group(opt, regs);
-    let mut out = vec![None; regs.len()];
-    for (primary_idx, alt_indices) in groups.iter().enumerate() {
-        if alt_indices.is_empty() {
+    // Every primary's tag is built in one pass over the regions: walking them in ascending order
+    // appends each primary's records in ascending order, the C's order. Each tag holds complete
+    // records, each ending in its own `;`, so a record can always simply be appended.
+    let mut out: Vec<Option<Vec<u8>>> = vec![None; regs.len()];
+    for (alt_idx, primary_idx) in xa_group(opt, regs).into_iter().enumerate() {
+        let Some(primary_idx) = primary_idx else {
             continue;
-        }
-        // The tag value for THIS primary, built up record by record. Invariant at the top of each
-        // inner iteration: it holds the complete records of the alternates already visited, each one
-        // ending in its own `;`, so a record can always simply be appended.
-        let mut xa_bytes = Vec::new();
-        for &alt_idx in alt_indices {
-            // `aln` carries the re-derived CIGAR, contig `rid`, 0-based `pos` and edit distance
-            // `nm` for this one alternate placement.
-            let aln = reg2aln(fm, bns, opt, l_query, query, &regs[alt_idx]);
-            xa_bytes.extend_from_slice(bns.contigs[aln.rid as usize].name.as_bytes());
-            xa_bytes.push(b',');
-            xa_bytes.push(if aln.is_rev { b'-' } else { b'+' });
-            crate::emit::push_int(&mut xa_bytes, aln.pos + 1);
-            xa_bytes.push(b',');
-            crate::pe::add_cigar(&aln.cigar, false, &mut xa_bytes);
-            xa_bytes.push(b',');
-            crate::emit::push_int(&mut xa_bytes, i64::from(aln.nm));
-            xa_bytes.push(b';');
-        }
-        out[primary_idx] = Some(String::from_utf8(xa_bytes).expect("ASCII XA"));
+        };
+        let xa_bytes = out[primary_idx].get_or_insert_with(Vec::new);
+        // `aln` carries the re-derived CIGAR, contig `rid`, 0-based `pos` and edit distance `nm`
+        // for this one alternate placement.
+        let aln = reg2aln(fm, bns, opt, l_query, query, &regs[alt_idx]);
+        xa_bytes.extend_from_slice(bns.contigs[aln.rid as usize].name.as_bytes());
+        xa_bytes.push(b',');
+        xa_bytes.push(if aln.is_rev { b'-' } else { b'+' });
+        crate::emit::push_int(xa_bytes, aln.pos + 1);
+        xa_bytes.push(b',');
+        crate::pe::add_cigar(&aln.cigar, false, xa_bytes);
+        xa_bytes.push(b',');
+        crate::emit::push_int(xa_bytes, i64::from(aln.nm));
+        xa_bytes.push(b';');
     }
-    XaTags(out)
+    // Same-layout map, so the vector is converted in place.
+    XaTags(
+        out.into_iter()
+            .map(|b| b.map(|b| String::from_utf8(b).expect("ASCII XA")))
+            .collect(),
+    )
 }
 
 /// [`mem_gen_alt`]'s per-region `XA:Z` values, read by region index. Empty, with no allocation,
@@ -382,10 +370,7 @@ mod tests {
         // third 98 (< 112 -> not XA). All secondary to region 0.
         let opt = MemOpt::default();
         let regs = [reg(140, -1), reg(116, 0), reg(98, 0)];
-        let groups = xa_group(&opt, &regs);
-        assert_eq!(groups[0], vec![1]);
-        assert!(groups[1].is_empty());
-        assert!(groups[2].is_empty());
+        assert_eq!(xa_group(&opt, &regs), [None, Some(0), None]);
     }
 
     #[test]
@@ -396,9 +381,8 @@ mod tests {
         for _ in 0..6 {
             regs.push(reg(140, 0));
         }
-        let groups = xa_group(&opt, &regs);
         assert!(
-            groups[0].is_empty(),
+            xa_group(&opt, &regs).iter().all(Option::is_none),
             "primary with >5 alternates emits no XA"
         );
     }

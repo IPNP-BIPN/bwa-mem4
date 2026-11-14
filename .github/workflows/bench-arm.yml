@@ -126,7 +126,7 @@ jobs:
         run: |
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz
           gunzip -f chr21.fa.gz
           ls -la chr21.fa
 
@@ -268,7 +268,8 @@ jobs:
       - name: Fetch + index chr21, simulate reads
         run: |
           mkdir -p work && cd work
-          curl -fsSL --retry 3 "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz" -o chr21.fa.gz
+          curl -fsSL --retry 3 "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz" -o chr21.fa.gz \
+            || curl -fsSL --retry 5 --retry-all-errors "https://ftp.ebi.ac.uk/ensemblorg/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz" -o chr21.fa.gz
           gunzip -f chr21.fa.gz
           bwa-mem2 index chr21.fa
           n="${{ github.event.inputs.read_pairs || '1000000' }}"
@@ -424,7 +425,7 @@ jobs:
         run: |
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           bwa-mem2 index chr21.fa
           # Different seeds for training and measurement, so PGO is not handed the exact reads it is
           # then timed on.

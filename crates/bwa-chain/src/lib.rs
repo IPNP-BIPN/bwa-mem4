@@ -1052,6 +1052,8 @@ fn chain_seeds(
     let mut tree = (!flat).then(crate::kbtree::KbTree::new);
     // The flat index, the thread's allocation like `ends`: a fresh one per read regrew by
     // doubling, a realloc and a copy each time.
+    // A new key is shifted into place. A side run of new keys merged in when full (2026-11-13,
+    // repeats' long shifts) lost on real reads: x86 neutral, M4 +0.5..1.0% user (2026-11-14).
     let mut keys = KEYS.take();
     keys.clear();
     // Every accepted seed as `(chain, seed)` in arrival order, and each chain's seed count: the
@@ -1264,7 +1266,9 @@ pub fn build_chains_from_resolved(
 /// [`build_chains_from_resolved`] then [`mem_chain_flt`], the same chains in the same order, but
 /// only the chains the filter keeps get a seed vector: the weights and spans are read off the
 /// seeds laid back to back in one reused array, where a vector per chain was an allocation for
-/// every chain the filter then dropped.
+/// every chain the filter then dropped. The chains are appended to `out`, which the caller reuses
+/// from read to read.
+#[allow(clippy::too_many_arguments)]
 pub fn build_filtered_chains(
     bns: &BntSeq,
     opt: &MemOpt,
@@ -1273,7 +1277,8 @@ pub fn build_filtered_chains(
     smems: &[bwa_index::Smem],
     counts: &[i64],
     rbegs: &[i64],
-) -> Vec<MemChain> {
+    out: &mut Vec<MemChain>,
+) {
     let t_total = chain_time::enabled().then(std::time::Instant::now);
     let frac = frac_rep(opt, smems, codes);
     let mut chains = CHAINS.take();
@@ -1328,23 +1333,20 @@ pub fn build_filtered_chains(
     if !ranked.is_empty() {
         flt_ranked(opt, &mut ranked);
     }
-    let out = ranked
-        .iter()
-        .map(|f| {
-            let c = &chains[f.idx as usize];
-            MemChain {
-                seqid: c.seqid,
-                rid: c.rid,
-                pos: c.pos,
-                w: f.w,
-                kept: f.kept,
-                is_alt: c.is_alt,
-                first: f.first,
-                frac_rep: frac,
-                seeds: seeds_from(seeds_of(f.idx as usize)),
-            }
-        })
-        .collect();
+    out.extend(ranked.iter().map(|f| {
+        let c = &chains[f.idx as usize];
+        MemChain {
+            seqid: c.seqid,
+            rid: c.rid,
+            pos: c.pos,
+            w: f.w,
+            kept: f.kept,
+            is_alt: c.is_alt,
+            first: f.first,
+            frac_rep: frac,
+            seeds: seeds_from(seeds_of(f.idx as usize)),
+        }
+    }));
     POOL.set((pool, n_seeds));
     FLAT.set((flat, end, ranked));
     chains.clear();
@@ -1355,7 +1357,6 @@ pub fn build_filtered_chains(
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    out
 }
 
 /// `ChainSeeds::from_slice`, minus its variable-length `memcpy` call for the inline case: one or
@@ -1595,8 +1596,9 @@ pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
     // bounded by the recursion depth of repeated halving, i.e. `log2(usize::MAX)`.
     //
     // Pure implementation detail: the comparison and swap sequence is untouched, so the permutation
-    // is identical, which is the only property this port has to preserve.
-    let mut stack = [(0usize, 0usize, 0i64); 64];
+    // is identical, which is the only property this port has to preserve. Left uninitialised: a
+    // zeroed one was a 1.5 KB memset per call, and a call on 17 or fewer elements never pushes.
+    let mut stack = [const { std::mem::MaybeUninit::<(usize, usize, i64)>::uninit() }; 64];
     // Number of occupied `stack` slots; `stack[top - 1]` is the most recently pushed partition.
     let mut top = 0usize;
     // `s`/`t`: inclusive lo/hi array indices of the partition currently being worked on. Invariant at
@@ -1674,21 +1676,22 @@ pub fn ks_introsort_by<T>(a: &mut [T], lt: impl Fn(&T, &T) -> bool) {
             if is > ti {
                 if is > 16 {
                     debug_assert!(top < stack.len(), "introsort stack overflow");
-                    stack[top] = (s, i - 1, d);
+                    stack[top].write((s, i - 1, d));
                     top += 1;
                 }
                 s = if ti > 16 { i + 1 } else { t };
             } else {
                 if ti > 16 {
                     debug_assert!(top < stack.len(), "introsort stack overflow");
-                    stack[top] = (i + 1, t, d);
+                    stack[top].write((i + 1, t, d));
                     top += 1;
                 }
                 t = if is > 16 { i - 1 } else { s };
             }
         } else if top > 0 {
             top -= 1;
-            let (l, r, dep) = stack[top];
+            // SAFETY: every slot below `top` was written by a push above.
+            let (l, r, dep) = unsafe { stack[top].assume_init() };
             s = l;
             t = r;
             d = dep;
@@ -2486,8 +2489,11 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (state >> 33) as usize
         };
-        let (mut accepted, mut total) = (0, 0);
-        for _ in 0..4000 {
+        let (mut accepted, mut total, mut long) = (0, 0, 0);
+        for read in 0..4000 {
+            // Every 4th read scatters up to ~480 seeds over the reference: hundreds of chains,
+            // so new flat keys shift long tails of the index.
+            let scatter = read % 4 == 0;
             let nsmem = 1 + next() % 12;
             let mut smems = Vec::new();
             let mut counts = Vec::new();
@@ -2499,7 +2505,7 @@ mod tests {
             for _ in 0..nsmem {
                 let m = (next() % 120) as u32;
                 let n = m + 18 + (next() % 60) as u32;
-                let c = 1 + next() % 4;
+                let c = 1 + next() % if scatter { 40 } else { 4 };
                 smems.push(bwa_index::Smem {
                     m,
                     n,
@@ -2509,7 +2515,13 @@ mod tests {
                 for _ in 0..c {
                     let base = hot[next() % 3];
                     let off = (next() % 400) as i64 - 200;
-                    let r = if next() % 4 == 0 { base } else { base + off };
+                    let r = if scatter {
+                        (next() % (2 * bns.l_pac as usize)) as i64
+                    } else if next() % 4 == 0 {
+                        base
+                    } else {
+                        base + off
+                    };
                     rbegs.push(r.clamp(0, 2 * bns.l_pac - 1));
                 }
             }
@@ -2531,6 +2543,7 @@ mod tests {
             let order = chain_seeds(&bns, &opt, 7, &smems, &counts, &rbegs, true, &mut chains);
             if let Some(order) = order {
                 accepted += 1;
+                long += usize::from(chains.len() > 64);
                 assert_eq!(emit(&chains, order), tree);
             }
             // Chaining and filtering fused: the same kept chains as the two steps in turn.
@@ -2548,11 +2561,16 @@ mod tests {
                 &opt,
                 build_chains_from_resolved(&bns, &opt, &codes, 7, &smems, &counts, &rbegs),
             );
-            let fused = build_filtered_chains(&bns, &opt, &codes, 7, &smems, &counts, &rbegs);
+            let mut fused = Vec::new();
+            build_filtered_chains(&bns, &opt, &codes, 7, &smems, &counts, &rbegs, &mut fused);
             assert!(!two.is_empty());
             assert_eq!(key(fused), key(two));
         }
         assert!(accepted * 2 > total, "flat accepted {accepted} of {total}");
+        assert!(
+            long > 50,
+            "only {long} accepted reads opened over 64 chains"
+        );
     }
 
     #[test]

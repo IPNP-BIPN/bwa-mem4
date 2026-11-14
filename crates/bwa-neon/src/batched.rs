@@ -921,11 +921,11 @@ fn simd_dispatch(
     // staying byte-identical (see `ungapped_hit`). Non-HIT jobs fall through to the kernel binning.
     let mut out = vec![default_result(); jobs.len()];
     // Indices of the jobs the fast path declined, i.e. the ones that still need the real DP.
-    let mut needs_dp: Vec<usize> = Vec::new();
+    let mut needs_dp: Vec<usize> = Vec::with_capacity(jobs.len());
     // Dedup fingerprints of the declined jobs, taken here while the scan has their bytes in cache:
     // a pass of its own reloaded every job cold (on EPYC 9V45 the fold took 1.6x its Zen 4 time).
     let dedup_on = job_dedup_enabled();
-    let mut fps: Vec<u64> = Vec::new();
+    let mut fps: Vec<u64> = Vec::with_capacity(if dedup_on { jobs.len() } else { 0 });
     for (k, job) in jobs.iter().enumerate() {
         prefetch_job(jobs, k + PF_AHEAD);
         match ungapped_hit(job, a, b, x_threshold, zdrop) {
@@ -1391,7 +1391,9 @@ fn dispatch_bins(
         None => (jobs, None),
     };
     // Job indices per bin, in ascending order, partitioning `0..jobs.len()` exactly once.
-    let (mut u8_idx, mut i16_idx, mut sc_idx) = (Vec::new(), Vec::new(), Vec::new());
+    // Most jobs land in the u8 bin: sized for all of them, it never regrows.
+    let (mut u8_idx, mut i16_idx, mut sc_idx) =
+        (Vec::with_capacity(jobs.len()), Vec::new(), Vec::new());
     for (k, job) in jobs.iter().enumerate() {
         // Upper bound on every DP value this job can reach; must fit the lane type, as must both
         // lengths (column and row indices are stored in lanes too).
@@ -2760,8 +2762,17 @@ macro_rules! define_sw_kernel {
                 // the row's prologue and epilogue, so the compaction need not scan the lanes.
                 nxt: u64,
             }
-            let mut vs: Vec<Vs> = (0..kmax)
-                .map(|_| Vs {
+            // The slots, `sbt_buf` and `moves` of this thread's previous call: every field is
+            // rewritten per superblock before it is read, as between two superblocks of one call,
+            // so only the allocations carry over (the per-call ones were 4 x kmax blocks over
+            // 1 KiB each, allocated and zeroed afresh).
+            thread_local! {
+                static KEEP: std::cell::Cell<(Vec<Vs>, super::ABuf<$elem>, Vec<(u8, u8, u8, u8)>)> =
+                    const { std::cell::Cell::new((Vec::new(), super::ABuf::new(), Vec::new())) };
+            }
+            let (mut vs, mut sbt_buf, mut moves) =
+                KEEP.replace((Vec::new(), super::ABuf::new(), Vec::new()));
+            vs.resize_with(kmax, || Vs {
                     eh_h: super::ABuf::new(),
                     eh_e: super::ABuf::new(),
                     qcode: super::ABuf::new(),
@@ -2784,15 +2795,13 @@ macro_rules! define_sw_kernel {
                     jid: [u32::MAX; LANES],
                     run: false,
                     nxt: 0,
-                })
-                .collect();
+                });
             // Substitution-score pre-pass buffer (bwa-mem2's `sbt_buf`, `bandedSWA.cpp:1183-1214`):
             // the DNA match/mismatch/N score of each band column depends only on this row's target
             // base and the column's query base, never on the DP recurrence. Computing it in a
             // separate per-row loop and loading it in the DP body lifts ~7 vector ALU ops off the
             // serial H/E/F critical path. Refilled per vector and row, so one serves them all.
-            let mut sbt_buf: super::ABuf<$elem> = super::ABuf::new();
-            let mut moves: Vec<(u8, u8, u8, u8)> = Vec::new();
+            // (`sbt_buf` and the compaction's `moves` come from `KEEP` above.)
 
             for sb_start in (0..jobs.len()).step_by(LANES * kmax) {
                 let sb_end = (sb_start + LANES * kmax).min(jobs.len());
@@ -3576,6 +3585,7 @@ macro_rules! define_sw_kernel {
                 }
             }
 
+            KEEP.set((vs, sbt_buf, moves));
             out
         }
     };

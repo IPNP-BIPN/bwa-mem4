@@ -48,7 +48,7 @@ on:
         default: ""
         required: false
       alt_rustflags:
-        description: "If set, the alt arm is a second build of ours with these RUSTFLAGS appended (same-host A/B of codegen), e.g. -C target-cpu=x86-64-v4; skipped where that binary does not run. Several builds separated by ';' are arms alt, alt2, alt3..."
+        description: "If set, the alt arm is a second build of ours with these RUSTFLAGS appended (same-host A/B of codegen), e.g. -C target-cpu=x86-64-v4; skipped where that binary does not run. Several builds separated by ';' are arms alt, alt2, alt3...; an arm '@<full sha>' builds that commit instead"
         default: ""
         required: false
       icount:
@@ -185,9 +185,17 @@ jobs:
             # those, so a `-C target-cpu=x86-64-v4` proc macro killed rustc with SIGILL on a host
             # without AVX-512. Only the binary may need the newer CPU; the run step skips it if so.
             host=$(rustc -vV | sed -n 's/^host: //p')
-            CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CFLAGS="-O3 -fno-omit-frame-pointer" \
+            # `@<full sha>`: this arm is that commit, built the same way (a same-host A/B of code).
+            src=.
+            if [[ "$flags" == @* ]]; then
+              git fetch -q --depth 1 origin "${flags#@}"
+              src="../alt-src$sfx"
+              git worktree add -q --detach "$src" FETCH_HEAD
+              flags=""
+            fi
+            (cd "$src" && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CFLAGS="-O3 -fno-omit-frame-pointer" \
             RUSTFLAGS="$tier -C force-frame-pointers=yes ${{ github.event.inputs.extra_rustflags }} $flags" \
-              cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir "target-perf-alt$sfx" --target "$host"
+              cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir "$GITHUB_WORKSPACE/target-perf-alt$sfx" --target "$host")
             cp "target-perf-alt$sfx/$host/release/bwa-mem4" "./mem4-alt$sfx"
             echo "alt$sfx: $flags"
             i=$((i + 1))
@@ -200,7 +208,7 @@ jobs:
           set -euo pipefail
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           sed -i '1s/.*/>chr21/' chr21.fa
           bwa-mem2 index chr21.fa
           n="${{ github.event.inputs.read_pairs || '1000000' }}"
@@ -457,7 +465,7 @@ jobs:
           set -euo pipefail
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           sed -i '1s/.*/>chr21/' chr21.fa
           bwa-mem2 index chr21.fa
           wgsim -S 11 -N "${{ github.event.inputs.read_pairs || '1000000' }}" -1 150 -2 150 \
@@ -559,7 +567,7 @@ jobs:
           set -euo pipefail
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           sed -i '1s/.*/>chr21/' chr21.fa
           bwa-mem2 index chr21.fa
           n="${{ github.event.inputs.read_pairs || '50000' }}"
