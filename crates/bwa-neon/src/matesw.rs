@@ -3118,8 +3118,10 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
         // =====================================================================================
         // Per-row bookkeeping, identical in both paths: publish this row's max for `score2`, and
         // update the lane's global max / end coordinates / freeze state.
+        // Returns the lanes the row improves; their column is `resolve_qe!`'s, run once the
+        // iteration's rows are all finished.
         macro_rules! finish_row {
-            ($row:expr, $imax:expr, $h:expr, $hs:expr, $r:expr) => {{
+            ($row:expr, $imax:expr) => {{
                 let row = $row;
                 let imax = $imax;
                 // Publish the row in one store. Lanes that are out of target or already frozen get
@@ -3140,14 +3142,42 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                 let imp = vandq_u8(vcgtq_u8(imax, gmax_old), vbicq_u8(inside, frozen_v));
                 let gmax_v = vbslq_u8(imp, imax, gmax_old);
                 ep_st!(EP_GMAX, gmax_v);
-                // The column, for improved lanes only (~44% of rows have one): the first column
-                // holding the row max is in the first block whose running max reached it, so
-                // find that block per lane from the checkpoints (the last block has none and is
-                // reached by every lane still pending), then scan it backwards so the smallest
-                // column wins. Same column as the per-cell strict `>` argmax it replaces.
-                if vmaxvq_u8(imp) != 0 {
+                let rv8 = vreinterpretq_u8_u16(rv);
+                ep_st!(EP_TE, vbslq_u8(vzip1q_u8(imp, imp), rv8, ep_ld!(EP_TE)));
+                ep_st!(
+                    EP_TE + 1,
+                    vbslq_u8(vzip2q_u8(imp, imp), rv8, ep_ld!(EP_TE + 1))
+                );
+                // Freezing is rare (the reverse pass's stop score): lanes, then the arrays the
+                // early exit and `extract_group` read.
+                let newly = vandq_u8(imp, vcgeq_u8(gmax_v, ep_ld!(EP_ENDSC)));
+                if vmaxvq_u8(newly) != 0 {
+                    ep_st!(EP_FROZEN, vorrq_u8(frozen_v, newly));
+                    let mut nw = [0u8; LANES16];
+                    vst1q_u8(nw.as_mut_ptr(), newly);
+                    for l in 0..n_lanes {
+                        if nw[l] != 0 {
+                            frozen[l] = true;
+                            limit[l] = row as i32;
+                        }
+                    }
+                }
+                imp
+            }};
+        }
+        // The column of row `$r`'s max (H at `$h`, stride `$hs` rows) for the lanes `$need`: the
+        // first column holding it is in the first block whose running max reached it, so find that
+        // block per lane from the checkpoints (the last block has none and is reached by every lane
+        // still pending), then scan it backwards so the smallest column wins. Same column as the
+        // per-cell strict `>` argmax it replaces. `qe` is read only at a lane's last improving row,
+        // so the caller passes a row's improved lanes minus those a later row of the same
+        // iteration improves again (~44% of rows improve a lane, mostly in runs along a diagonal).
+        macro_rules! resolve_qe {
+            ($imax:expr, $h:expr, $hs:expr, $r:expr, $need:expr) => {{
+                let (imax, need) = ($imax, $need);
+                if vmaxvq_u8(need) != 0 {
                     let (h, hs): (*const u8, usize) = ($h, $hs);
-                    let (mut pending, mut col) = (imp, zero);
+                    let (mut pending, mut col) = (need, zero);
                     for blk in 0..nblk {
                         let reached = if blk + 1 < nblk {
                             vceqq_u8(vld1q_u8(ck_p.add((blk * 4 + $r) * LANES16)), imax)
@@ -3168,27 +3198,7 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                             break;
                         }
                     }
-                    ep_st!(EP_QE, vbslq_u8(imp, col, ep_ld!(EP_QE)));
-                }
-                let rv8 = vreinterpretq_u8_u16(rv);
-                ep_st!(EP_TE, vbslq_u8(vzip1q_u8(imp, imp), rv8, ep_ld!(EP_TE)));
-                ep_st!(
-                    EP_TE + 1,
-                    vbslq_u8(vzip2q_u8(imp, imp), rv8, ep_ld!(EP_TE + 1))
-                );
-                // Freezing is rare (the reverse pass's stop score): lanes, then the arrays the
-                // early exit and `extract_group` read.
-                let newly = vandq_u8(imp, vcgeq_u8(gmax_v, ep_ld!(EP_ENDSC)));
-                if vmaxvq_u8(newly) != 0 {
-                    ep_st!(EP_FROZEN, vorrq_u8(frozen_v, newly));
-                    let mut nw = [0u8; LANES16];
-                    vst1q_u8(nw.as_mut_ptr(), newly);
-                    for l in 0..n_lanes {
-                        if nw[l] != 0 {
-                            frozen[l] = true;
-                            limit[l] = row as i32;
-                        }
-                    }
+                    ep_st!(EP_QE, vbslq_u8(need, col, ep_ld!(EP_QE)));
                 }
             }};
         }
@@ -3398,10 +3408,15 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                 }
 
                 // Row order matters here: freezing at row `i` must suppress rows `i+1..=i+3`.
-                finish_row!(i, imax0, hq_p, 3, 0);
-                finish_row!(i + 1, imax1, hq_p.add(LANES16), 3, 1);
-                finish_row!(i + 2, imax2, hq_p.add(2 * LANES16), 3, 2);
-                finish_row!(i + 3, imax3, h_cur.as_ptr(), 1, 3);
+                let imp0 = finish_row!(i, imax0);
+                let imp1 = finish_row!(i + 1, imax1);
+                let imp2 = finish_row!(i + 2, imax2);
+                let imp3 = finish_row!(i + 3, imax3);
+                let later2 = vorrq_u8(imp2, imp3);
+                resolve_qe!(imax0, hq_p, 3, 0, vbicq_u8(imp0, vorrq_u8(imp1, later2)));
+                resolve_qe!(imax1, hq_p.add(LANES16), 3, 1, vbicq_u8(imp1, later2));
+                resolve_qe!(imax2, hq_p.add(2 * LANES16), 3, 2, vbicq_u8(imp2, imp3));
+                resolve_qe!(imax3, h_cur.as_ptr(), 1, 3, imp3);
             } else if rows == 2 {
                 let t0_v = vld1q_u8(seq_t.as_ptr().add(i * LANES16));
                 let t1_v = vld1q_u8(seq_t.as_ptr().add((i + 1) * LANES16));
@@ -3513,8 +3528,10 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                 }
 
                 // Row order matters here: freezing at row `i` must suppress row `i+1`.
-                finish_row!(i, imax0, hq_p, 3, 0);
-                finish_row!(i + 1, imax1, h_cur.as_ptr(), 1, 1);
+                let imp0 = finish_row!(i, imax0);
+                let imp1 = finish_row!(i + 1, imax1);
+                resolve_qe!(imax0, hq_p, 3, 0, vbicq_u8(imp0, imp1));
+                resolve_qe!(imax1, h_cur.as_ptr(), 1, 1, imp1);
             } else {
                 // Lane `l` = target base at row `i` of job `l`.
                 let t_v = vld1q_u8(seq_t.as_ptr().add(i * LANES16));
@@ -3625,7 +3642,8 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
                     h_diag_v = vld1q_u8(h_prev.as_ptr().add(j * LANES16));
                 }
 
-                finish_row!(i, imax_v, h_cur.as_ptr(), 1, 0);
+                let imp = finish_row!(i, imax_v);
+                resolve_qe!(imax_v, h_cur.as_ptr(), 1, 0, imp);
             }
             std::mem::swap(&mut h_prev, &mut h_cur);
 
