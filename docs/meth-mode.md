@@ -350,5 +350,22 @@ bwa-mem4:
 - **Speed.** See [Speed](#speed): on Apple Silicon bwa-mem4 is faster than bwa-mem3 0.16 and
   uses less memory. On x86 see the per-CPU table there.
 
-Bismark itself was not run here. The above comes from reading #1209 and the Bismark
-documentation.
+### Run through Bismark
+
+Bismark's Rust suite at its `dev` branch (ab7d686, the first with #1209), on 15 Nov 2026, Apple
+M4 Max: `bismark --illumina_5base --bwamem3 --path_to_bwamem3 <dir> --five_base_index <fa> -p 8`
+on TAPS/5-base pairs simulated from chr21 (`scripts/meth_sim.py --taps`), with `<dir>` holding
+either bwa-mem3 0.16.0 or the bwa-mem4 4.5.0 binary named `bwa-mem3`, against one
+`bwa-mem3 index --meth` index (kept outside the `--genome` folder, which Bismark requires):
+
+- 20,000 pairs: Bismark's BAM records are identical (38,618 records, same md5 without the
+  header), its alignment report differs only in the version line, and every
+  `bismark_methylation_extractor` output (CpG/CHG/CHH per strand, M-bias, bedGraph, coverage) is
+  identical.
+- 200,000 pairs, whole Bismark run, two interleaved repetitions: 4.11-4.12 s against 4.72-4.75 s
+  wall, 11.1 s against 15.8-16.0 s CPU, 1.01-1.02 GB against 1.25-1.27 GB peak RSS, BAM records
+  identical. The wall time gains less than the CPU time because Bismark's own steps are part of it.
+
+Bismark accepts bwa-mem4 with one warning ("detected bwa-mem3 4.5.0; Bismark's 5-Base engine is
+validated against 0.16.0") and records `@PG ID:bwa-mem3 PN:bwa-mem3 VN:4.5.0`: the version is
+right, the program name is not, which is the Bismark change described above.
