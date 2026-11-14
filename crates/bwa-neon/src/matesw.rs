@@ -2912,8 +2912,14 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
             continue;
         }
 
-        let mut seq_q = vec![PAD; qmax * LANES16];
-        let mut seq_t = vec![PAD; tmax * LANES16];
+        // The N re-encoding (or `MAT5`'s `5 t`), applied once per target base here so the column
+        // loops never pay for it. See the score-table comment above.
+        let enc_t = if MAT5 {
+            [0, 5, 10, 15, 20]
+        } else {
+            [0, 1, 2, 3, N_TARGET]
+        };
+        let (seq_q, seq_t) = soa_group(group, LANES16, qmax, tmax, max_sc, enc_t, [0, 1, 2, 3, 4]);
         let (mut qlen, mut tlen, mut minsc, mut endsc) = (
             [0usize; LANES16],
             [0usize; LANES16],
@@ -2925,23 +2931,6 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
             tlen[l] = j.target.len();
             minsc[l] = j.minsc;
             endsc[l] = j.endsc;
-            for (c, &b) in j.query.iter().enumerate() {
-                seq_q[c * LANES16 + l] = b;
-            }
-            for c in qlen[l]..ksw_padded_qlen(qlen[l], max_sc) {
-                seq_q[c * LANES16 + l] = ZPAD;
-            }
-            // The N re-encoding, applied once per target base here so the column loops never pay
-            // for it. See the score-table comment above.
-            for (r, &b) in j.target.iter().enumerate() {
-                seq_t[r * LANES16 + l] = if MAT5 {
-                    5 * b
-                } else if b == 4 {
-                    N_TARGET
-                } else {
-                    b
-                };
-            }
         }
 
         // Same DP state as the scalar path (H(i-1, .), H(i, .), the per-column E carry), narrowed to
@@ -3606,14 +3595,15 @@ unsafe fn fwd_local_sw_neon_u8_impl<const USQADD: bool, const SHARE_OE: bool, co
     out
 }
 
-/// The x86 u8 kernels' lane-major sequences of one group: `(seq_q, seq_t)`, `seq_q[c * lanes + l]`
+/// The u8 kernels' lane-major sequences of one group: `(seq_q, seq_t)`, `seq_q[c * lanes + l]`
 /// the query byte (ZPAD from its length to its padded one, PAD after) and `seq_t[r * lanes + l]`
 /// the target byte through `enc`, PAD past its length and in the lanes past the group. Each lane is
-/// written contiguous and the whole is transposed in 16x16 blocks (SSE2), where one strided byte
-/// store per base cost ~12% of the AVX-512 kernel on Zen 5 (bwa-mem3's `x86_soa_pack`, ~2%). The
-/// row counts are rounded up to 16 with PAD rows, which nothing reads.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
+/// written contiguous and the whole is transposed in 16x16 blocks (SSE2 / NEON), where one strided
+/// byte store per base cost ~12% of the AVX-512 kernel on Zen 5 (bwa-mem3's `x86_soa_pack`, ~2%)
+/// and ~1% of the M4's `--meth` run. The row counts are rounded up to 16 with PAD rows, which
+/// nothing reads.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "ssse3"))]
 fn soa_group(
     group: &[FwdJob],
     lanes: usize,
@@ -3659,6 +3649,91 @@ fn enc_bases(dst: &mut [u8], src: &[u8], enc: [u8; 5]) {
     for (d, &b) in dst[k..n].iter_mut().zip(&src[k..n]) {
         *d = enc[b as usize];
     }
+}
+
+/// [`enc_bases`] on NEON: one `TBL` per 16 bases.
+#[cfg(target_arch = "aarch64")]
+fn enc_bases(dst: &mut [u8], src: &[u8], enc: [u8; 5]) {
+    use std::arch::aarch64::*;
+    let n = dst.len().min(src.len());
+    let mut tbl = [0u8; 16];
+    tbl[..5].copy_from_slice(&enc);
+    let mut k = 0;
+    // SAFETY: NEON is aarch64's baseline; every load reads `src[k..k + 16]` and every store writes
+    // `dst[k..k + 16]`, inside both (`k + 16 <= n`).
+    unsafe {
+        let tbl = vld1q_u8(tbl.as_ptr());
+        while k + 16 <= n {
+            let v = vld1q_u8(src.as_ptr().add(k));
+            debug_assert!(src[k..k + 16].iter().all(|&b| b < 5));
+            vst1q_u8(dst.as_mut_ptr().add(k), vqtbl1q_u8(tbl, v));
+            k += 16;
+        }
+    }
+    for (d, &b) in dst[k..n].iter_mut().zip(&src[k..n]) {
+        *d = enc[b as usize];
+    }
+}
+
+/// [`transpose16`] on NEON: four rounds of `TRN1` / `TRN2` at 8, 16, 32 and 64 bits.
+#[cfg(target_arch = "aarch64")]
+fn transpose16(src: &[u8], lanes: usize, rows: usize) -> Vec<u8> {
+    use std::arch::aarch64::*;
+    assert!(lanes.is_multiple_of(16) && rows.is_multiple_of(16) && src.len() == lanes * rows);
+    let mut out = vec![0u8; src.len()];
+    for l0 in (0..lanes).step_by(16) {
+        for r0 in (0..rows).step_by(16) {
+            // SAFETY: NEON is aarch64's baseline; every load reads 16 bytes of lane `l0 + k`'s row
+            // inside `src` (`r0 + 16 <= rows`), every store 16 bytes of row `r0 + c` inside `out`.
+            unsafe {
+                let v: [uint8x16_t; 16] =
+                    std::array::from_fn(|k| vld1q_u8(src.as_ptr().add((l0 + k) * rows + r0)));
+                // Round 1: `a[2i + o]`, u16 element m = column 2m + o, lanes 2i and 2i + 1.
+                let a: [uint16x8_t; 16] = std::array::from_fn(|n| {
+                    let (x, y) = (v[n & !1], v[n | 1]);
+                    vreinterpretq_u16_u8(if n % 2 == 0 {
+                        vtrn1q_u8(x, y)
+                    } else {
+                        vtrn2q_u8(x, y)
+                    })
+                });
+                // Round 2: `b[4g + r]`, u32 element m = column 4m + r, lanes 4g .. 4g + 3.
+                let b: [uint32x4_t; 16] = std::array::from_fn(|n| {
+                    let (g, r) = (n / 4, n % 4);
+                    let (x, y) = (a[4 * g + r % 2], a[4 * g + r % 2 + 2]);
+                    vreinterpretq_u32_u16(if r < 2 {
+                        vtrn1q_u16(x, y)
+                    } else {
+                        vtrn2q_u16(x, y)
+                    })
+                });
+                // Round 3: `c[8h + r]`, u64 element p = column 8p + r, lanes 8h .. 8h + 7.
+                let c: [uint64x2_t; 16] = std::array::from_fn(|n| {
+                    let (h, r) = (n / 8, n % 8);
+                    let (x, y) = (b[8 * h + r % 4], b[8 * h + r % 4 + 4]);
+                    vreinterpretq_u64_u32(if r < 4 {
+                        vtrn1q_u32(x, y)
+                    } else {
+                        vtrn2q_u32(x, y)
+                    })
+                });
+                // Round 4: column `col`, lanes 0-7 then 8-15.
+                for col in 0..16 {
+                    let (x, y) = (c[col % 8], c[8 + col % 8]);
+                    let o = if col < 8 {
+                        vtrn1q_u64(x, y)
+                    } else {
+                        vtrn2q_u64(x, y)
+                    };
+                    vst1q_u8(
+                        out.as_mut_ptr().add((r0 + col) * lanes + l0),
+                        vreinterpretq_u8_u64(o),
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `out[r * lanes + l] = src[l * rows + r]`: `lanes` rows of `rows` bytes to `rows` rows of `lanes`,
@@ -7726,7 +7801,7 @@ mod tests {
     /// The 16x16 block transpose against the plain index map, on 3 x 2 blocks: each byte's index
     /// goes through as its low and its high byte, so every position is told apart.
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn transpose16_matches_index_map() {
         let (lanes, rows) = (48, 32);
         for shift in [0, 8] {
