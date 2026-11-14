@@ -251,6 +251,13 @@ pub struct FmIndex {
     /// steps here instead of stepping the FM index (fg-labs/bwa-mem3's `seed_jump`). Built by
     /// [`Self::load`]; empty on the test indices, which [`Self::seed_jump_depth`] reports as 0.
     seed_jump: Vec<SeedJump>,
+    /// Forward length of the genome `pac` packs, i.e. [`FmIndex::l_pac`]. `(ref_seq_len - 1) / 2`
+    /// for a plain index; the original genome's length for [`FmIndex::load_meth`], whose BWT
+    /// covers a converted text twice as long.
+    pac_l: i64,
+    /// `--meth` only: the converted text this BWT indexes, which the seed walk's text compare
+    /// ([`Self::text_match`]) reads; `pac` then holds the original genome for extension.
+    seed_pac: Option<Mmap>,
 }
 
 /// One [`FmIndex::seed_jump`] entry: the forward interval `(k, l, s)` of a string, as
@@ -994,7 +1001,9 @@ impl FmIndex {
         // build that died mid-write; a long one belongs to another reference.
         let want = 48 + 64 * cp_size as u64 + 5 * sa_size as u64 + 8;
         let got = bwt_file.metadata()?.len();
-        if got != want {
+        // fg-labs/bwa-mem3 appends an 8-byte format word (3) that nothing here reads: accept its
+        // index files (nf-core's `bwamem3/index` builds them) as they are.
+        if got != want && got != want + 8 {
             return Err(Error::IndexFormat(format!(
                 "{}: {got} bytes, expected {want} for {ref_seq_len} rows (truncated or mixed index; rebuild it)",
                 sibling(prefix, "bwt.2bit.64").display()
@@ -1196,6 +1205,8 @@ impl FmIndex {
         unsafe { crate::hugepage::advise_hugepage(pac.as_ptr(), pac.len()) };
 
         let mut fm = FmIndex {
+            pac_l: (ref_seq_len - 1) / 2,
+            seed_pac: None,
             ref_seq_len,
             count,
             cp_occ,
@@ -1394,42 +1405,32 @@ impl FmIndex {
     /// costs a wasted fetch and nothing else.
     #[inline]
     pub fn prefetch_occ(&self, sp: i64, ep: i64) {
-        // SAFETY (both arches): forming the block pointers is in-bounds (`sp`/`ep` are valid BWT
-        // positions, so `>>6` indexes an allocated `cp_occ` slot); the prefetch is a hint that never
-        // faults or writes.
+        // Byte `row / 2` of the blocks lies inside row `row`'s 32-byte block (64 rows each), so one
+        // shift addresses the line where the block index took a shift and a scale.
+        const _: () = assert!(std::mem::size_of::<CpOcc>() << 1 == CP_BLOCK_SIZE as usize);
+        let base = self.cp_occ.as_ptr().cast::<u8>();
+        let (p_sp, p_ep) = (
+            base.wrapping_add((sp >> 1) as usize),
+            base.wrapping_add((ep >> 1) as usize),
+        );
         #[cfg(target_arch = "aarch64")]
-        {
-            // Element-typed base pointer, so `.add(n)` steps whole checkpoint records.
-            let base = self.cp_occ.as_ptr();
+        // SAFETY: `prfm` is a hint that never faults or writes.
+        unsafe {
             // `pldl1keep` = prefetch-for-load into L1, keep (AArch64 equivalent of `_MM_HINT_T0`).
-            unsafe {
-                // Addresses of the two checkpoint BLOCKS covering rows `sp` and `ep`.
-                let p_sp = base.add((sp >> CP_SHIFT) as usize);
-                let p_ep = base.add((ep >> CP_SHIFT) as usize);
-                std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_sp, options(nostack, readonly, preserves_flags));
-                std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_ep, options(nostack, readonly, preserves_flags));
-            }
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_sp, options(nostack, readonly, preserves_flags));
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p_ep, options(nostack, readonly, preserves_flags));
         }
         #[cfg(target_arch = "x86_64")]
-        {
+        // SAFETY: a prefetch is a hint that never faults or writes.
+        unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            // Same two checkpoint blocks as the AArch64 arm; `_MM_HINT_T0` = fetch into L1.
-            let base = self.cp_occ.as_ptr();
-            unsafe {
-                _mm_prefetch(
-                    base.add((sp >> CP_SHIFT) as usize) as *const i8,
-                    _MM_HINT_T0,
-                );
-                _mm_prefetch(
-                    base.add((ep >> CP_SHIFT) as usize) as *const i8,
-                    _MM_HINT_T0,
-                );
-            }
+            _mm_prefetch(p_sp.cast::<i8>(), _MM_HINT_T0);
+            _mm_prefetch(p_ep.cast::<i8>(), _MM_HINT_T0);
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            // No portable prefetch intrinsic: discard the rows to silence the unused warning.
-            let _ = (sp, ep);
+            // No portable prefetch intrinsic: discard the addresses to silence the unused warning.
+            let _ = (p_sp, p_ep);
         }
     }
 
@@ -1796,12 +1797,28 @@ impl FmIndex {
                 i64::from(hit && (!A0 || c.k != self.sentinel_index)),
             )
         } else {
-            let o = self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx);
-            (
-                count_a + o,
-                self.occ_hoisted::<WIDE, A0>(cp, c.k + c.s, a, hx, lx) - o,
-            )
+            self.konly_two::<WIDE, A0>(cp, c, a, count_a, hx, lx)
         }
+    }
+
+    /// [`konly_hoisted`](Self::konly_hoisted) from the counts at both ends, right for any `s`: the
+    /// candidates after a round's first have `s >= 2` (distinct sizes, nested intervals) but for a
+    /// copy of the first, so they skip the one-row test.
+    #[inline(always)]
+    fn konly_two<const WIDE: bool, const A0: bool>(
+        &self,
+        cp: &[CpOcc],
+        c: &Smem,
+        a: usize,
+        count_a: i64,
+        hx: u64,
+        lx: u64,
+    ) -> (i64, i64) {
+        let o = self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx);
+        (
+            count_a + o,
+            self.occ_hoisted::<WIDE, A0>(cp, c.k + c.s, a, hx, lx) - o,
+        )
     }
 
     /// One outer iteration of the SMEM search's backward phase (bwa's two loops in
@@ -1915,15 +1932,53 @@ impl FmIndex {
             let end = base.add(n);
             let mut r = base.add(p);
             let mut w = base.add(kept);
-            while r < end {
-                let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
-                if s >= min_intv && s != curr_s {
-                    curr_s = s;
-                    *w = Smem { k, s, m, ..*r };
-                    w = w.add(1);
-                    self.prefetch_occ(k, k + s);
+            if kept == 1 {
+                // The candidates are one read offset extended to shorter and shorter right ends, so
+                // each one's interval holds the one before it, and so do their extensions: `s` never
+                // falls along `prev`, and from a survivor on every candidate survives (one test less
+                // per candidate, where x86 reloaded `min_intv` from the stack).
+                if w == r {
+                    // Kept in place until the first duplicate: only `k`, `s` and `m` change, where
+                    // the copy below also reloads and stores `l` and `n`.
+                    while r < end {
+                        let (k, s) = self.konly_two::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                        debug_assert!(s >= min_intv);
+                        if s == curr_s {
+                            break;
+                        }
+                        curr_s = s;
+                        (*r).k = k;
+                        (*r).s = s;
+                        (*r).m = m;
+                        self.prefetch_occ(k, k + s);
+                        r = r.add(1);
+                    }
+                    // `r` is the duplicate, dropped, or the end.
+                    w = r;
+                    r = r.add(usize::from(r < end));
                 }
-                r = r.add(1);
+                while r < end {
+                    let (k, s) = self.konly_two::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                    debug_assert!(s >= min_intv);
+                    if s != curr_s {
+                        curr_s = s;
+                        *w = Smem { k, s, m, ..*r };
+                        w = w.add(1);
+                        self.prefetch_occ(k, k + s);
+                    }
+                    r = r.add(1);
+                }
+            } else {
+                while r < end {
+                    let (k, s) = self.konly_two::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                    if s >= min_intv && s != curr_s {
+                        curr_s = s;
+                        *w = Smem { k, s, m, ..*r };
+                        w = w.add(1);
+                        self.prefetch_occ(k, k + s);
+                    }
+                    r = r.add(1);
+                }
             }
             w.offset_from(base) as usize
         }
@@ -2462,7 +2517,11 @@ impl FmIndex {
     /// result as stepping [`base`](Self::base) one position at a time, sixteen bases per compare
     /// on NEON and SSE2 (fg-labs/bwa-mem3's `ls_text_match`, eight at a time).
     pub fn text_match(&self, q: &[u8], mut j: usize, mut t: i64) -> usize {
-        let l_pac = self.l_pac();
+        // The text the BWT indexes: the converted genome under `--meth`, else `pac`.
+        let (text, l_pac) = match &self.seed_pac {
+            Some(p) => (&p[..], (self.ref_seq_len - 1) / 2),
+            None => (&self.pac[..], self.l_pac()),
+        };
         #[cfg(target_arch = "aarch64")]
         // SAFETY: NEON is mandatory on AArch64. Each `unpack16` reads pac bytes `[p >> 2, +8)`,
         // checked against `pac.len()`; each read load is `q[j..j + 16]`, checked against `q.len()`.
@@ -2475,7 +2534,7 @@ impl FmIndex {
                 )));
                 (m.trailing_zeros() / 4) as usize
             };
-            let pac = &self.pac[..];
+            let pac = text;
             if t < l_pac {
                 let o = (t & 3) as usize;
                 let (idx, sh) = (
@@ -2524,7 +2583,7 @@ impl FmIndex {
         // against `pac.len()`; each read load is `q[j..j + 16]`, checked against `q.len()`.
         unsafe {
             use std::arch::x86_64::*;
-            let pac = &self.pac[..];
+            let pac = text;
             // The first base of `q[j..j + 16]` that differs from `x`, 16 when none does.
             let first = |x: __m128i, j: usize| -> u32 {
                 let eq =
@@ -2534,7 +2593,7 @@ impl FmIndex {
             if t < l_pac {
                 // One base at a time to a byte boundary, then sixteen per compare from one word.
                 while t & 3 != 0 && j < q.len() && t < l_pac {
-                    if q[j] != self.base(t) {
+                    if q[j] != unpack_pac_base(text, l_pac, t) {
                         return j;
                     }
                     j += 1;
@@ -2553,7 +2612,7 @@ impl FmIndex {
                 // Text `t..t + 16` is forward `[2L - t - 16, 2L - t)` reversed and complemented: to
                 // where that range starts on a byte, then sixteen per compare.
                 while (2 * l_pac - t) & 3 != 0 && j < q.len() && t < 2 * l_pac {
-                    if q[j] != self.base(t) {
+                    if q[j] != unpack_pac_base(text, l_pac, t) {
                         return j;
                     }
                     j += 1;
@@ -2574,7 +2633,7 @@ impl FmIndex {
                 }
             }
         }
-        while j < q.len() && t < 2 * l_pac && q[j] == self.base(t) {
+        while j < q.len() && t < 2 * l_pac && q[j] == unpack_pac_base(text, l_pac, t) {
             j += 1;
             t += 1;
         }
@@ -2682,17 +2741,43 @@ impl FmIndex {
         (0..2 * self.l_pac()).map(|p| self.base(p)).collect()
     }
 
-    /// Length of the forward reference `L` (`ref_seq_len` is `2L + 1`).
+    /// Length of the forward reference `L` that `base`/`bases` read (`ref_seq_len` is `2L + 1` for
+    /// a plain index).
     ///
-    /// Recomputed rather than read from `.ann`, so the FM index can be used without a `BntSeq`.
-    /// The division is exact because `ref_seq_len - 1 == 2L` by construction.
+    /// Derived from the BWT at load, so the FM index can be used without a `BntSeq`. Under
+    /// [`FmIndex::load_meth`] it is the ORIGINAL genome's length, not half the seed BWT's.
     ///
     /// # Returns
     /// `L`, the forward-strand length in bases. This is the strand boundary: a 2L-space position
     /// below it is a forward hit, at or above it a reverse-complement hit.
     #[inline]
     pub fn l_pac(&self) -> i64 {
-        (self.ref_seq_len - 1) / 2
+        self.pac_l
+    }
+
+    /// The `--meth` index: BWT and suffix array from `seed_prefix` (the C->T/G->A converted
+    /// genome, `<ref>.meth`), packed bases from `pac_prefix` (the original `<ref>`), so seeding
+    /// runs on the converted text and extension on the real genome.
+    ///
+    /// `l_pac` is the original genome's forward length (`BntSeq::l_pac` of `pac_prefix`). Seed
+    /// hits come back in the converted index's coordinates; `bwa_chain::meth` maps them back.
+    pub fn load_meth(seed_prefix: &Path, pac_prefix: &Path, l_pac: i64) -> Result<Self> {
+        let mut fm = Self::load(seed_prefix)?;
+        let pac_file = std::fs::File::open(sibling(pac_prefix, "pac"))?;
+        // SAFETY: as in `load`, the index files are not mutated while a run holds them open.
+        let pac = unsafe { Mmap::map(&pac_file)? };
+        // The same guard as `load`: the unpack loops read `.pac` unchecked, sized from `l_pac`.
+        if pac.len() as u64 != (l_pac as u64 >> 2) + 2 {
+            return Err(Error::IndexFormat(format!(
+                "{}: {} bytes, expected {} for a {l_pac}-base reference (truncated or mixed index)",
+                sibling(pac_prefix, "pac").display(),
+                pac.len(),
+                (l_pac >> 2) + 2
+            )));
+        }
+        fm.seed_pac = Some(std::mem::replace(&mut fm.pac, pac));
+        fm.pac_l = l_pac;
+        Ok(fm)
     }
 }
 
@@ -3163,6 +3248,8 @@ mod tests {
                 .make_read_only()
                 .unwrap(),
             seed_jump: Vec::new(),
+            pac_l: 0,
+            seed_pac: None,
         };
         for block in 0..n_blocks {
             for y in [0i64, 1, 17, 63] {

@@ -188,6 +188,19 @@ pub fn xa_group(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<Option<usize>> {
     listed
 }
 
+/// `HN:i` of each region under `--meth`: how many alternative hits fall within `xa_drop_ratio` of
+/// it, counted before the `-h` cap drops them from XA (fg-labs/bwa-mem3 `mem_gen_alt`'s `cnt`).
+pub fn hit_counts(opt: &MemOpt, regs: &[MemAlnReg]) -> Vec<i32> {
+    let ratio = f64::from(opt.xa_drop_ratio);
+    let mut cnt = vec![0i32; regs.len()];
+    for i in 0..regs.len() {
+        if let Some(primary_idx) = get_pri_idx(ratio, regs, i) {
+            cnt[primary_idx] += 1;
+        }
+    }
+    cnt
+}
+
 /// Per-region `XA:Z:` string (`rname,±pos,cigar,NM;`... concatenated), or `None` for regions that
 /// are not XA primaries. Port of `mem_gen_alt`: groups near-primary alternates and formats each
 /// via `reg2aln`. Runs after `mem_mark_primary_se` (and, in PE, after the primary/secondary swap).

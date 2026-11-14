@@ -326,10 +326,11 @@ pub mod across;
 pub mod alt;
 pub mod cigar;
 pub mod emit;
+pub mod meth;
 pub mod pe;
 pub mod primary;
 pub mod seedflt;
-pub use across::align_reads_batched;
+pub use across::{align_reads_batched, align_reads_batched_meth};
 pub use cigar::{cigar_string, reg2aln, MemAln};
 pub use pe::{
     batch_mate_rescue, mem_pestat, mem_pestat_from, mem_sam_pe, pestat_samples, PairRescueData,
@@ -895,7 +896,7 @@ pub(crate) fn mem_chain2aln_meta(
             rs_buf.extend((0..ref_bases_available).rev().map(|i| rseq[i]));
             let (qs, rs) = (&qs_buf, &rs_buf);
             // Score already banked before this DP starts: the seed's `len` exact matches at `a` each.
-            let h0 = seed.len * opt.a;
+            let h0 = seed_score(opt, &seed, &rseq[(seed.rbeg - rmax0) as usize..], codes);
             // `prev0 = -1`: the region has not been scored yet on this side, which is the -1 the C
             // initialises `a->score` to (`bwamem.cpp:2218`).
             // The accepted left-extension answer (clipped optimum, run-to-end optimum, band width).
@@ -922,7 +923,7 @@ pub(crate) fn mem_chain2aln_meta(
         } else {
             // The seed already starts at query base 0, so there is nothing to extend into. Score is
             // just the seed's own match score and the region begins exactly at the seed.
-            reg.score = seed.len * opt.a;
+            reg.score = seed_score(opt, &seed, &rseq[(seed.rbeg - rmax0) as usize..], codes);
             reg.truesc = reg.score;
             reg.qb = 0;
             reg.rb = seed.rbeg;
@@ -1014,6 +1015,33 @@ pub(crate) fn mem_chain2aln_meta(
     }
 }
 
+/// The ungapped score of `seed` before any extension: `len * a` for an exact match, which is what
+/// it is outside `--meth`. Under `--meth` the seed matched in converted space only, so it is
+/// re-scored base by base against the original reference `rseq` (starting at the seed) with the
+/// read's chemistry matrix, and may even be <= 0 (`seed_ext_score` in fg-labs/bwa-mem3 0.16).
+fn seed_score(opt: &MemOpt, seed: &bwa_seed::MemSeed, rseq: &[u8], codes: &[u8]) -> i32 {
+    if opt.meth.is_none() {
+        return seed.len * opt.a;
+    }
+    let read = &codes[seed.qbeg as usize..(seed.qbeg + seed.len) as usize];
+    bwa_neon::diag_score(&opt.mat, rseq, read)
+}
+
+/// [`align_read`] for a `--meth` read: seeds come from its converted copy (C->T when `ot`, i.e.
+/// read 1 or single-end, else G->A) on the `--meth` index, extension uses the original `codes`.
+/// `opt.mat` must already be the read's chemistry matrix (`MethOpt::mats[ot]`).
+pub fn align_read_meth(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[u8],
+    ot: bool,
+) -> Vec<MemAlnReg> {
+    let conv = bwa_core::meth::convert_codes(codes, ot);
+    let chains = bwa_chain::build_chains_meth(fm, bns, opt, &conv, ot);
+    align_chains(fm, bns, opt, codes, chains)
+}
+
 /// Align one read (2-bit codes) through seeding -> chaining -> extension, returning all regions.
 ///
 /// The three stages are bwa's own: `build_chains` collects SMEM seeds from the FM index and groups
@@ -1035,9 +1063,21 @@ pub(crate) fn mem_chain2aln_meta(
 /// Every surviving region for the read, in extension order with purged entries compacted out.
 /// Possibly empty (an unmappable read). Not deduplicated and not primary-marked.
 pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec<MemAlnReg> {
-    // The read's chains after weak ones are dropped. The trailing 0 to `build_chains` is the seed
-    // batch/read id; unused on this scalar path.
-    let mut chains = mem_chain_flt(opt, build_chains(fm, bns, opt, codes, 0));
+    // The trailing 0 to `build_chains` is the seed batch/read id; unused on this scalar path.
+    align_chains(fm, bns, opt, codes, build_chains(fm, bns, opt, codes, 0))
+}
+
+/// Everything [`align_read`] does after seeding and chaining: chain filter, chained-seed filter,
+/// extension and the discard pass.
+fn align_chains(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[u8],
+    chains: Vec<MemChain>,
+) -> Vec<MemAlnReg> {
+    // The read's chains after weak ones are dropped.
+    let mut chains = mem_chain_flt(opt, chains);
     // bwa's second chain-level pass (`bwamem.cpp:1084`), between the chain filter and any
     // extension: it re-scores every short seed by a local alignment of its own neighbourhood and
     // drops the ones that do not earn their keep. A no-op below ~690 bp of read, by its own length

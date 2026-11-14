@@ -49,6 +49,18 @@ pub(crate) fn kernel_available() -> bool {
     }
 }
 
+/// The kernels' `mat5` for `mat`: a `--meth` matrix (`matesw::mat5_u8_ok`) as signed cells
+/// `[ref * 5 + read]`, past 25 zero; `None` for the standard matrix.
+fn mat5_of(mat: &[i8]) -> Option<[u8; 32]> {
+    (!crate::matesw::mat_is_standard(5, mat)).then(|| {
+        let mut t = [0u8; 32];
+        for (e, &v) in t.iter_mut().zip(&mat[..25]) {
+            *e = v as u8;
+        }
+        t
+    })
+}
+
 /// A band in full-window coordinates: target rows `r0..=r1`, diagonals `dlo..=dhi` (`d = i - j`).
 #[derive(Clone, Copy, Debug)]
 struct Band {
@@ -185,7 +197,7 @@ impl Batch {
         max_hits: usize,
         quanta: usize,
     ) -> Option<Decision> {
-        let (dec, t1, lazy) = self.decide(t, q, p, max_hits, false);
+        let (dec, t1, lazy) = self.decide(t, q, p, max_hits, None, false);
         self.commit(idx, t, q, dec, t1, lazy, p, quanta)
     }
 
@@ -198,9 +210,10 @@ impl Batch {
         q: &[u8],
         p: &Params,
         max_hits: usize,
+        rel: Option<(u8, u8)>,
         lazy: bool,
     ) -> (Decision, i32, bool) {
-        rescue_prune::decide_bands(t, q, p, max_hits, &mut self.c19, &mut self.ct, lazy)
+        rescue_prune::decide_bands(t, q, p, max_hits, &mut self.c19, &mut self.ct, rel, lazy)
     }
 
     /// [`Self::plan`] after [`Self::decide`] gave `(dec, t1)` for the same `t` and `q`.
@@ -319,8 +332,9 @@ impl Batch {
     /// give (`qb`/`tb` stay -1 for the reverse pass).
     ///
     /// # Safety
-    /// NEON must be available; `mat` must be the standard 5x5 table and every banded job's score
-    /// ceiling under the u8 limit (the caller's u8-kernel conditions).
+    /// NEON must be available; `mat` must be the standard 5x5 table or one
+    /// `matesw::mat5_u8_ok` admits and every banded job's score ceiling under the u8 limit (the
+    /// caller's u8-kernel conditions).
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn run(
         &mut self,
@@ -344,6 +358,7 @@ impl Batch {
             e_ins as u8,
         ];
         let tbl = crate::matesw::u8_score_table(mat);
+        self.work.mat5 = mat5_of(mat);
         let probe = crate::matesw::cells::enabled();
         let t_all = probe.then(std::time::Instant::now);
         let cells0 = self.work.cells;
@@ -588,6 +603,7 @@ impl Batch {
             e_ins as u8,
         ];
         let tbl = crate::matesw::u8_score_table(mat);
+        self.work.mat5 = mat5_of(mat);
         self.jobs.clear();
         for (i, &(q, t, s)) in jobs.iter().enumerate() {
             let (len2, nrows) = (q.len() as i32, t.len() as i32);
@@ -903,6 +919,102 @@ fn score2(rows: &[u8], row0: i32, s: i32, te: i32, minsc: i32, max_sc: i32) -> (
     }
 }
 
+/// [`score2`] on lane `lane` of row-major row maxima (`rowmax[row * lanes + lane]`, target rows
+/// `0..n`), the full rescue kernels' layout, where a per-lane copy would cost more than the walk.
+/// Outside the zone it visits only the rows `bits` marks (`bits[blk * nb + lane]` bit `k` for row
+/// `8 blk + k`, a superset of the rows reaching `minsc`), and pushes every row reaching `minsc`, as
+/// `SuboptimalTracker` does; the zone is handled as in [`score2`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score2_lane<R: Copy + Into<i32>>(
+    rowmax: &[R],
+    lanes: usize,
+    lane: usize,
+    n: usize,
+    bits: &[u8],
+    nb: usize,
+    (s, te): (i32, i32),
+    minsc: i32,
+    max_sc: i32,
+) -> (i32, i32) {
+    let half = (s + max_sc - 1) / max_sc;
+    let (low, high) = (te - half, te + half);
+    let mut t = Tracker {
+        s2: -1,
+        te2: -1,
+        cs: 0,
+        cr: i32::MIN,
+        low,
+        high,
+    };
+    let get = |i: usize| -> i32 { rowmax[i * lanes + lane].into() };
+    let p = |i: usize| get(i) >= minsc;
+    let idx = |row: i64| row.clamp(0, n as i64) as usize;
+    let (b0, b1) = if high - low >= 2 {
+        (idx(i64::from(low)), idx(i64::from(high) + 1))
+    } else {
+        (n, n)
+    };
+    // The marked rows of `[from, to)` in order, until `f` returns `false`; the row it stopped at.
+    let walk = |from: usize, to: usize, f: &mut dyn FnMut(usize) -> bool| -> Option<usize> {
+        let mut blk = from / 8;
+        while 8 * blk < to {
+            let mut m = u32::from(bits[blk * nb + lane]);
+            m &= !0u32 << from.saturating_sub(8 * blk);
+            m &= (1u32 << (to - 8 * blk).min(8)) - 1;
+            while m != 0 {
+                let i = 8 * blk + m.trailing_zeros() as usize;
+                m &= m - 1;
+                if !f(i) {
+                    return Some(i);
+                }
+            }
+            blk += 1;
+        }
+        None
+    };
+    walk(0, b0, &mut |i| {
+        if p(i) {
+            t.push(i as i32, get(i));
+        }
+        true
+    });
+    // Until the open candidate's row enters the zone (at most two pushed rows).
+    let x = walk(b0, b1, &mut |i| {
+        if p(i) {
+            t.push(i as i32, get(i));
+        }
+        !(low..=high).contains(&t.cr)
+    })
+    .map_or(b1, |i| i + 1);
+    if x < b1 {
+        let (h, known) = (b1 - 1, x - 1);
+        let raised = p(h) && {
+            let mut j = h;
+            while j > known && p(j - 1) && get(j - 1) >= get(j) {
+                j -= 1;
+            }
+            (h - j) % 2 == 0
+        };
+        (t.cs, t.cr) = if raised {
+            (get(h), h as i32)
+        } else {
+            (t.cs, low)
+        };
+    }
+    walk(b1, n, &mut |i| {
+        if p(i) {
+            t.push(i as i32, get(i));
+        }
+        true
+    });
+    t.close();
+    if s > 0 {
+        (t.s2, t.te2)
+    } else {
+        (-1, -1)
+    }
+}
+
 fn write(p: &Parent, o: &mut KswAlignResult) {
     let (score2, te2) = if p.lazy {
         (crate::matesw::SCORE2_PENDING, -1)
@@ -926,6 +1038,7 @@ pub(crate) mod neon {
     use std::arch::aarch64::*;
 
     pub(super) const L: usize = 16;
+
     /// Query code of a cell outside the query (`j < 0` or `j >= quanta`): dead, scores 0.
     const DEAD: u8 = 0xC0;
     /// Query code of a ksw pad column (`len2 <= j < quanta`): scores 0, carries the diagonal.
@@ -954,6 +1067,10 @@ pub(crate) mod neon {
     /// first query column there, and the row maxima, lane-major (`rl[lane * rstride + row]`).
     #[derive(Default)]
     pub(super) struct Work {
+        /// A `--meth` matrix (`matesw::mat5_u8_ok`) as signed cells `[ref * 5 + read]`, scored by
+        /// `TBL` on `5 * target + query` (targets staged as `5 * b`, N as 20; every pad code is
+        /// past the table and scores 0, as under the XOR form). `None`: the standard matrix.
+        pub(super) mat5: Option<[u8; 32]>,
         st: Vec<u8>,
         a: Vec<u8>,
         refv: Vec<u8>,
@@ -1078,15 +1195,16 @@ pub(crate) mod neon {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            if gaps[0] == gaps[2] {
-                self.run_impl::<true>(lanes, w, tbl, gaps)
-            } else {
-                self.run_impl::<false>(lanes, w, tbl, gaps)
+            match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
             }
         }
 
         #[target_feature(enable = "neon")]
-        unsafe fn run_impl<const SHARE: bool>(
+        unsafe fn run_impl<const SHARE: bool, const MAT5: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -1149,6 +1267,12 @@ pub(crate) mod neon {
                 {
                     crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
                     crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
+                    if MAT5 {
+                        for b in row[..lane.t.len()].iter_mut() {
+                            *b *= 5;
+                        }
+                        continue;
+                    }
                     // A target N scores -1 against everything through the table's slots 8 and
                     // 12-15 once it is re-encoded as 12 (`N_TARGET`); as 4 it would read the
                     // match slot against a query N. A pruned job holds none; a reverse-pass job
@@ -1166,6 +1290,7 @@ pub(crate) mod neon {
 
             // ---- DP ----
             let tblv = vld1q_u8(tbl.as_ptr());
+            let tbl5v = vld1q_u8_x2(self.mat5.unwrap_or([0; 32]).as_ptr());
             let zero = vdupq_n_u8(0);
             let one = vdupq_n_u8(1);
             let deadv = vdupq_n_u8(DEAD);
@@ -1246,7 +1371,11 @@ pub(crate) mod neon {
             macro_rules! cell {
                 ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
                  $live:expr) => {{
-                    let sc = vqtbl1q_u8(tblv, veorq_u8($q, $rref));
+                    let sc = if MAT5 {
+                        vqtbl2q_u8(tbl5v, vqaddq_u8($rref, $q))
+                    } else {
+                        vqtbl1q_u8(tblv, veorq_u8($q, $rref))
+                    };
                     let mut h0 = vmaxq_u8(vsqaddq_u8($d, vreinterpretq_s8_u8(sc)), $ein);
                     if let Some(m) = $top {
                         h0 = vandq_u8(h0, m);
@@ -1472,6 +1601,8 @@ mod avx2 {
     /// As the NEON kernel's `Work`.
     #[derive(Default)]
     pub(super) struct Work {
+        /// As the NEON kernel's: the `--meth` matrix, scored at `5 * target + query`.
+        pub(super) mat5: Option<[u8; 32]>,
         st: Vec<u8>,
         a: ABuf<u8>,
         refv: ABuf<u8>,
@@ -1510,15 +1641,16 @@ mod avx2 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            if gaps[0] == gaps[2] {
-                self.run_impl::<true>(lanes, w, tbl, gaps)
-            } else {
-                self.run_impl::<false>(lanes, w, tbl, gaps)
+            match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
             }
         }
 
         #[target_feature(enable = "avx2")]
-        unsafe fn run_impl<const SHARE: bool>(
+        unsafe fn run_impl<const SHARE: bool, const MAT5: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -1585,8 +1717,12 @@ mod avx2 {
                     };
                     crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
                     crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
-                    // Target N re-encoded as 12 (see the NEON kernel).
-                    if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
+                    // `MAT5`: targets as `5 * b` (see the NEON kernel), else N re-encoded as 12.
+                    if MAT5 {
+                        for b in row[..lane.t.len()].iter_mut() {
+                            *b *= 5;
+                        }
+                    } else if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
                         for b in row[..lane.t.len()].iter_mut() {
                             if *b == 4 {
                                 *b = 12;
@@ -1606,6 +1742,16 @@ mod avx2 {
             // The signed table in both 128-bit halves.
             let t128 = _mm_loadu_si128(tbl.as_ptr() as *const __m128i);
             let tblv = _mm256_set_m128i(t128, t128);
+            // `MAT5`: the 32 cells as their low 16 and `low ^ high`, read at `i = 5 t + q` by two
+            // in-lane shuffles (`batched`'s `tab5`): every pad code has bit 7 and the saturating
+            // add keeps it, so both read 0; `i - 16`'s sign zeroes the second for `i < 16`.
+            let (t5lo, t5hi) = {
+                let t5 = self.mat5.unwrap_or([0; 32]);
+                let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
+                let hi = _mm_xor_si128(lo, _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i));
+                (_mm256_set_m128i(lo, lo), _mm256_set_m128i(hi, hi))
+            };
+            let sixteen = _mm256_set1_epi8(16);
             let hz = _mm256_set1_epi8(HZ as i8);
             let nil = _mm256_setzero_si256();
             let one = _mm256_set1_epi8(1);
@@ -1676,7 +1822,15 @@ mod avx2 {
             macro_rules! cell {
                 ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
                  $clamp:expr) => {{
-                    let sc = _mm256_shuffle_epi8(tblv, _mm256_xor_si256($q, $rref));
+                    let sc = if MAT5 {
+                        let i = _mm256_adds_epu8($rref, $q);
+                        _mm256_xor_si256(
+                            _mm256_shuffle_epi8(t5lo, i),
+                            _mm256_shuffle_epi8(t5hi, _mm256_subs_epi8(i, sixteen)),
+                        )
+                    } else {
+                        _mm256_shuffle_epi8(tblv, _mm256_xor_si256($q, $rref))
+                    };
                     let mut h0 = _mm256_max_epi8(_mm256_adds_epi8($d, sc), $ein);
                     let ok: Option<bool> = $top;
                     if ok == Some(false) {
@@ -1903,6 +2057,8 @@ mod avx512 {
 
     /// As the NEON kernel's `Work`.
     pub(super) struct Work {
+        /// As the NEON kernel's: the `--meth` matrix, scored at `5 * target + query`.
+        pub(super) mat5: Option<[u8; 32]>,
         st: Vec<u8>,
         a: ABuf<u8>,
         refv: ABuf<u8>,
@@ -1921,6 +2077,7 @@ mod avx512 {
     impl Default for Work {
         fn default() -> Self {
             Work {
+                mat5: None,
                 st: Vec::new(),
                 a: ABuf::new(),
                 refv: ABuf::new(),
@@ -1960,15 +2117,16 @@ mod avx512 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            if gaps[0] == gaps[2] {
-                self.run_impl::<true>(lanes, w, tbl, gaps)
-            } else {
-                self.run_impl::<false>(lanes, w, tbl, gaps)
+            match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
             }
         }
 
         #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-        unsafe fn run_impl<const SHARE: bool>(
+        unsafe fn run_impl<const SHARE: bool, const MAT5: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -2035,8 +2193,12 @@ mod avx512 {
                     };
                     crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
                     crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
-                    // Target N re-encoded as 12 (see the NEON kernel).
-                    if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
+                    // `MAT5`: targets as `5 * b` (see the NEON kernel), else N re-encoded as 12.
+                    if MAT5 {
+                        for b in row[..lane.t.len()].iter_mut() {
+                            *b *= 5;
+                        }
+                    } else if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
                         for b in row[..lane.t.len()].iter_mut() {
                             if *b == 4 {
                                 *b = 12;
@@ -2055,6 +2217,14 @@ mod avx512 {
             }
             // The signed table in every 128-bit lane.
             let tblv = _mm512_broadcast_i32x4(_mm_loadu_si128(tbl.as_ptr() as *const __m128i));
+            // `MAT5`: as the AVX2 kernel's.
+            let (t5lo, t5hi) = {
+                let t5 = self.mat5.unwrap_or([0; 32]);
+                let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
+                let hi = _mm_xor_si128(lo, _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i));
+                (_mm512_broadcast_i32x4(lo), _mm512_broadcast_i32x4(hi))
+            };
+            let sixteen = _mm512_set1_epi8(16);
             let hz = _mm512_set1_epi8(HZ as i8);
             let nil = _mm512_setzero_si512();
             let one = _mm512_set1_epi8(1);
@@ -2122,7 +2292,15 @@ mod avx512 {
             macro_rules! cell {
                 ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
                  $live:expr) => {{
-                    let sc = _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref));
+                    let sc = if MAT5 {
+                        let i = _mm512_adds_epu8($rref, $q);
+                        _mm512_xor_si512(
+                            _mm512_shuffle_epi8(t5lo, i),
+                            _mm512_shuffle_epi8(t5hi, _mm512_subs_epi8(i, sixteen)),
+                        )
+                    } else {
+                        _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref))
+                    };
                     let mut h0 = _mm512_max_epi8(_mm512_adds_epi8($d, sc), $ein);
                     let ok: Option<bool> = $top;
                     if ok == Some(false) {
@@ -2395,6 +2573,8 @@ mod x86 {
     pub(super) const L: usize = avx512::L;
 
     pub(super) struct Work {
+        /// As the NEON kernel's, handed to whichever kernel runs.
+        pub(super) mat5: Option<[u8; 32]>,
         w2: avx2::Work,
         w5: avx512::Work,
         wide: bool,
@@ -2408,6 +2588,7 @@ mod x86 {
     impl Default for Work {
         fn default() -> Self {
             Work {
+                mat5: None,
                 w2: Default::default(),
                 w5: Default::default(),
                 wide: crate::matesw::rescue_avx512_ok(),
@@ -2449,12 +2630,14 @@ mod x86 {
         ) {
             let n = lanes.len();
             if self.wide {
+                self.w5.mat5 = self.mat5;
                 self.w5.run(lanes, w, tbl, gaps);
                 self.gmax[..n].copy_from_slice(&self.w5.gmax[..n]);
                 self.te[..n].copy_from_slice(&self.w5.te[..n]);
                 self.qe[..n].copy_from_slice(&self.w5.qe[..n]);
                 self.cells = self.w5.cells;
             } else {
+                self.w2.mat5 = self.mat5;
                 self.w2.run(lanes, w, tbl, gaps);
                 self.gmax[..n].copy_from_slice(&self.w2.gmax[..n]);
                 self.te[..n].copy_from_slice(&self.w2.te[..n]);
@@ -2519,13 +2702,37 @@ mod tests {
                 tr.finish(s, te, max_sc),
                 "rows {rows:?} row0 {row0} te {te} minsc {minsc}"
             );
+            // `score2_lane`: the rows as lane 1 of 3 (rows from 0), under the exact bitmap or a
+            // superset of it.
+            let (lanes, nb) = (3usize, 3usize);
+            let mut rm = vec![0u8; n * lanes];
+            for (i, &v) in rows.iter().enumerate() {
+                rm[i * lanes] = (next() % 256) as u8;
+                rm[i * lanes + 1] = v;
+            }
+            let extra = next() % 2 == 0;
+            let mut bits = vec![0u8; n.div_ceil(8) * nb];
+            for (i, &v) in rows.iter().enumerate() {
+                let set = i32::from(v) >= minsc || extra && next() % 3 == 0;
+                bits[i / 8 * nb + 1] |= u8::from(set) << (i % 8);
+            }
+            let te0 = te - row0;
+            let mut tr = bwa_extend::SuboptimalTracker::new();
+            for (i, &v) in rows.iter().enumerate() {
+                tr.push_row(i as i32, i32::from(v), minsc);
+            }
+            assert_eq!(
+                score2_lane(&rm, lanes, 1, n, &bits, nb, (s, te0), minsc, max_sc),
+                tr.finish(s, te0, max_sc),
+                "lane: rows {rows:?} te {te0} minsc {minsc} extra {extra}"
+            );
         }
     }
 
     /// The batched path (which bands every eligible pruned job) against `ksw_align2` on the full
     /// window: every consumed result (`score >= minsc`) must be identical, on generated jobs with
-    /// planted copies, repeats and indels, and on every `STRIDE`-th dumped real job when
-    /// `BWA4_PRUNE_BENCH` names a dump.
+    /// planted copies, repeats and indels (one in 50 a 250 bp mate, at the u8 bound), and on every
+    /// `STRIDE`-th dumped real job when `BWA4_PRUNE_BENCH` names a dump.
     #[test]
     fn bands_reproduce_ksw_align2() {
         let mut state = 0x7a3d_19c4_e5b2_0f61u64;
@@ -2536,8 +2743,8 @@ mod tests {
             (state >> 33) as usize
         };
         let mut gen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for _ in 0..8000 {
-            let qlen = 20 + next() % 160;
+        for k in 0..8000 {
+            let qlen = if k % 50 == 0 { 250 } else { 20 + next() % 160 };
             let tlen = qlen + next() % 1400;
             let mut t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
             if next() % 6 == 0 {
@@ -2583,7 +2790,7 @@ mod tests {
         }
         let mat = scmat(1, 4);
         let p = Params::from(1, 4, 6, 1, 6, 1, 19).unwrap();
-        let (mut banded, mut checked, mut pending) = (0usize, 0usize, 0usize);
+        let (mut banded, mut checked, mut long, mut pending) = (0usize, 0usize, 0usize, 0usize);
         for (set, minsc) in &sets {
             for chunk in set.chunks(1000) {
                 let jobs: Vec<KswJob> = chunk
@@ -2593,8 +2800,10 @@ mod tests {
                         target: t,
                     })
                     .collect();
-                let got = batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p), false);
-                let lazy = batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p), true);
+                let got =
+                    batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p), None, false);
+                let lazy =
+                    batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p), None, true);
                 for (i, (t, q)) in chunk.iter().enumerate() {
                     let full = ksw_align2(q, t, 5, &mat, 6, 1, 6, 1, *minsc, 1, 16);
                     let consumed = |r: &KswAlignResult| r.score >= *minsc;
@@ -2616,13 +2825,15 @@ mod tests {
                 let mut b = Batch::default();
                 for (i, (t, q)) in chunk.iter().enumerate() {
                     let quanta = q.len().div_ceil(16) * 16;
-                    if q.len() < 250 && b.plan(i, t, q, &p, usize::MAX, quanta).is_none() {
+                    if q.len() <= 250 && b.plan(i, t, q, &p, usize::MAX, quanta).is_none() {
                         banded += 1;
+                        long += usize::from(q.len() == 250);
                     }
                 }
             }
         }
-        eprintln!("bands: {banded} banded, {pending} lazy, of {checked}");
+        eprintln!("bands: {banded} banded, {pending} lazy, of {checked}, {long} banded 250 bp");
+        assert!(long >= 20, "too few banded 250 bp mates: {long}");
         assert!(
             pending > checked / 50,
             "too few lazy jobs: {pending} of {checked}"
@@ -2743,7 +2954,7 @@ mod tests {
             let quanta = q.len().div_ceil(16) * 16;
             b.clear();
             let (dec, t1, _) =
-                rescue_prune::decide_bands(t, q, &p, 1000, &mut b.c19, &mut b.ct, false);
+                rescue_prune::decide_bands(t, q, &p, 1000, &mut b.c19, &mut b.ct, None, false);
             let Decision::Hull { hb, he } = dec else {
                 continue;
             };

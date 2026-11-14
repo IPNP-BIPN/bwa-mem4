@@ -572,6 +572,8 @@ fn collect_smems_batched_bsd(
                     slot.reset_to(next_read, 0, min_intv, false);
                     next_read += 1;
                     prefetch_read(reads.get(next_read).copied());
+                    // `Start` reads no index memory, only prefetches: the new walk takes it now.
+                    slot.step(fm, reads[slot.ridx], min_seed_len, &counts);
                 } else {
                     *slot_opt = None;
                     live -= 1;
@@ -1136,15 +1138,18 @@ impl LsSlot {
                     }
                 }
                 LsPhase::Bwd => {
+                    // `PosDone` and `Start` read no index memory (`Start` only prefetches), so a walk
+                    // that ends here starts the next one in this visit, as the fork's driver refills a
+                    // slot at once: a visit of their own bought a dispatch and nothing else.
                     if self.jj < 0 {
                         self.phase = LsPhase::PosDone;
-                        return;
+                        continue;
                     }
                     // Base code at the READ offset being prepended on the left this round.
                     let a = codes[self.jj as usize];
                     if a > 3 {
                         self.phase = LsPhase::PosDone;
-                        return;
+                        continue;
                     }
                     #[cfg(feature = "seed-stats")]
                     if stats_on {
@@ -1161,8 +1166,9 @@ impl LsSlot {
                     );
                     self.num_prev = num_curr;
                     self.jj -= 1;
-                    if num_curr == 0 {
+                    if num_curr == 0 || self.jj < 0 || codes[self.jj as usize] > 3 {
                         self.phase = LsPhase::PosDone;
+                        continue;
                     }
                     return;
                 }
@@ -2225,6 +2231,8 @@ fn smem_round_2_batched(fm: &FmIndex, reads: &[&[u8]], opt: &MemOpt, per_read: &
                     slot.reset_to(j.ridx, j.x, j.min_intv, true);
                     next_job += 1;
                     prefetch_read(jobs.get(next_job).map(|j| reads[j.ridx]));
+                    // As in round 1: the new walk's `Start` in this visit.
+                    slot.step(fm, reads[slot.ridx], opt.min_seed_len, &counts);
                 } else {
                     *slot_opt = None;
                     live -= 1;

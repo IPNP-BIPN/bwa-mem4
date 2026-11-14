@@ -24,7 +24,7 @@ on:
         default: "1000000"
         required: false
       read_set:
-        description: "sim | real"
+        description: "sim | real | meth (the meth job: --meth EM-seq and TAPS, ours vs the fork; meth:250 for 250 bp reads)"
         default: "sim"
         required: false
       runner:
@@ -44,7 +44,7 @@ on:
         default: "false"
         required: false
       ours_env:
-        description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4"
+        description: "If set, also record ours under these env assignments (same-host A/B), e.g. BWA4_WAVE_WMIN=4. In the meth job, set for both arms instead (BWA4_* reach ours, BWAMEM3_* the fork), or prefixed ab: a third arm, ours under them (ab:@<full sha>: that commit's build instead)"
         default: ""
         required: false
       alt_rustflags:
@@ -73,7 +73,7 @@ env:
 
 jobs:
   profile:
-    if: github.event.inputs.icount != 'true'
+    if: github.event.inputs.icount != 'true' && !startsWith(github.event.inputs.read_set, 'meth')
     runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
     timeout-minutes: 90
     steps:
@@ -718,3 +718,276 @@ jobs:
           PY
             fi
           done
+
+  # `--meth` (read_set=meth): ours against the fork 0.16 on simulated EM-seq and TAPS pairs over
+  # chr21 (`scripts/meth_sim.py`), one host, one read set, each tool on its own `index --meth`.
+  # Wall, CPU (user + sys) and peak RSS per arm at -t1 and -t<cores, max 8>, the two arms
+  # interleaved and each run twice; the summary keeps each arm's faster run. `-K` is fixed so the
+  # fork's batches, hence its output, do not depend on -t, and the outputs are compared first.
+  meth:
+    if: startsWith(github.event.inputs.read_set, 'meth')
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-22.04' }}
+    timeout-minutes: 90
+    steps:
+      - name: What machine is this
+        id: host
+        env:
+          CPU_MATCH: ${{ github.event.inputs.cpu_match || '' }}
+        run: |
+          awk -F': ' '/^model name/{print "cpu: "$2; exit}' /proc/cpuinfo
+          echo "cores: $(nproc)"
+          grep -o -E 'avx2|avx512bw' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          if [ -z "$CPU_MATCH" ] || grep -m1 '^model name' /proc/cpuinfo | grep -qE "$CPU_MATCH"; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "not a $CPU_MATCH host: skipping"
+          fi
+
+      - if: steps.host.outputs.ok == '1'
+        uses: actions/checkout@v7
+
+      - if: steps.host.outputs.ok == '1'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - if: steps.host.outputs.ok == '1'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install perf
+        if: steps.host.outputs.ok == '1'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic || true
+          PERF=$(ls /usr/lib/linux-tools*/perf 2>/dev/null | head -1)
+          [ -n "$PERF" ] || { echo "::error::no perf binary found"; exit 1; }
+          echo "PERF=$PERF" >> "$GITHUB_ENV"
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+          sudo sysctl -w kernel.kptr_restrict=0
+
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        if: steps.host.outputs.ok == '1'
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
+      - name: Install bwa-mem3 (bioconda)
+        if: steps.host.outputs.ok == '1'
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
+          environment-name: bench
+          condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
+            channels:
+              - conda-forge
+              - bioconda
+          create-args: >-
+            bwa-mem3=0.16.0
+          init-shell: bash
+
+      - name: Build ours at the tier we ship
+        if: steps.host.outputs.ok == '1'
+        env:
+          OURS_ENV: ${{ github.event.inputs.ours_env || '' }}
+        run: |
+          # Line tables (no codegen change) so the profile step can name our kernel's source lines.
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+          RUSTFLAGS="-C target-cpu=x86-64-v3 ${{ github.event.inputs.extra_rustflags }}" \
+            cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-meth
+          cp target-meth/release/bwa-mem4 ./mem4-v3
+          # `ours_env=ab:@<full sha>`: the `ab` arm is that commit, built the same way (same-host A/B
+          # of code rather than of a knob).
+          case "$OURS_ENV" in
+            ab:@*)
+              sha="${OURS_ENV#ab:@}"
+              git fetch -q --depth 1 origin "$sha"
+              git worktree add -q --detach ../ab-src FETCH_HEAD
+              (cd ../ab-src && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+                RUSTFLAGS="-C target-cpu=x86-64-v3 ${{ github.event.inputs.extra_rustflags }}" \
+                cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir "$GITHUB_WORKSPACE/target-meth-ab")
+              cp target-meth-ab/release/bwa-mem4 ./mem4-ab
+              echo "ab arm: $sha" ;;
+          esac
+
+      - name: Kernel tests on this CPU
+        if: steps.host.outputs.ok == '1'
+        run: |
+          # The SIMD kernels against scalar on real hardware: avx512-check runs the AVX-512 ones
+          # under SDE only, and these runners draw Intel (VBMI) and Zen 4 / Zen 5 AVX-512 hosts.
+          grep -o -E 'avx512(bw|vbmi)' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+          RUSTFLAGS="-C target-cpu=x86-64-v3 ${{ github.event.inputs.extra_rustflags }}" \
+            cargo test --release --locked -p bwa-mem4-neon --jobs 2 --target-dir target-meth 2>&1 \
+            | grep -E '^test result|FAILED|panicked|skipping'
+
+      - name: Reference, indexes and reads
+        if: steps.host.outputs.ok == '1'
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          mkdir -p work/fork work/ours && cd work
+          url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          sed -i '1s/.*/>chr21/' chr21.fa
+          cp chr21.fa fork/ && cp chr21.fa ours/
+          bwa-mem3 index --meth fork/chr21.fa > /dev/null 2>&1
+          ../mem4-v3 index --meth ours/chr21.fa 2> /dev/null
+          n="${{ github.event.inputs.read_pairs || '200000' }}"
+          # `read_set=meth:250` simulates 250 bp reads (the inputs are at GitHub's limit of ten).
+          len="${{ github.event.inputs.read_set }}"; len="${len#meth}"; len="${len#:}"; len="${len:-150}"
+          python3 ../scripts/meth_sim.py chr21.fa em --pairs "$n" --len "$len" --seed 11
+          python3 ../scripts/meth_sim.py chr21.fa taps --pairs "$n" --len "$len" --seed 7 --taps
+          echo "simulated: $n EM-seq pairs, $n TAPS pairs, $len bp"
+
+      - name: Time both
+        if: steps.host.outputs.ok == '1'
+        shell: bash -el {0}
+        env:
+          OURS_ENV: ${{ github.event.inputs.ours_env || '' }}
+        run: |
+          set -euo pipefail
+          cd work
+          # ours_env, e.g. BWA4_RESCUE_TIER=sse41 BWAMEM3_FORCE_TIER=avx2: both arms see it, and
+          # each tool reads only its own variables. `ab:` first instead: a third arm, `ab`, runs
+          # ours under the rest (same-host A/B).
+          AB=; arms="ours fork"
+          case "$OURS_ENV" in
+            "") ;;
+            ab:*) AB="${OURS_ENV#ab:}"; arms="ours ab fork"; echo "ab arm: $AB" ;;
+            *) export $OURS_ENV; echo "env: $OURS_ENV" ;;
+          esac
+          T="$(nproc)"; [ "$T" -gt 8 ] && T=8
+          rows=rows.csv; : > "$rows"
+          for lib in em taps; do
+            mode=--meth; [ "$lib" = taps ] && mode=--meth=taps
+            reads=("${lib}_1.fq" "${lib}_2.fq")
+            # The command line of one arm at `-t $2`, options before the index and reads.
+            line() {
+              case "$1" in
+                ours) cmd=(../mem4-v3 mem "$mode" -K 10000000 -t "$2" ours/chr21.fa "${reads[@]}") ;;
+                ab) if [ -x ../mem4-ab ]; then cmd=(../mem4-ab mem "$mode" -K 10000000 -t "$2" ours/chr21.fa "${reads[@]}")
+                    else cmd=(env $AB ../mem4-v3 mem "$mode" -K 10000000 -t "$2" ours/chr21.fa "${reads[@]}"); fi ;;
+                *) cmd=(bwa-mem3 mem "$mode" -K 10000000 -t "$2" fork/chr21.fa "${reads[@]}") ;;
+              esac
+            }
+            # Also warms the page cache for both.
+            line ours "$T"; m4=$("${cmd[@]}" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+            line fork "$T"; m3=$("${cmd[@]}" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+            echo "===== $lib output md5: ours $m4 fork $m3 $([ "$m4" = "$m3" ] && echo identical || echo DIFFER) ====="
+            if [ -n "$AB" ]; then
+              line ab "$T"; ma=$("${cmd[@]}" 2>/dev/null | grep -v '^@PG' | md5sum | cut -c1-32)
+              echo "===== $lib ab md5: $ma $([ "$ma" = "$m4" ] && echo identical || echo DIFFER) ====="
+            fi
+            for t in 1 "$T"; do
+              for rep in 1 2; do
+                for arm in $arms; do
+                  line "$arm" "$t"
+                  /usr/bin/time -f '%e %U %S %M' -o t.txt "${cmd[@]}" > /dev/null 2> /dev/null
+                  read -r e u sy m < t.txt
+                  echo "$lib,$t,$arm,$rep,$e,$u,$sy,$m" | tee -a "$rows"
+                done
+              done
+            done
+          done
+          echo "===== meth summary: faster of 2 runs per arm (wall s, cpu s = user + sys, rss MB) ====="
+          printf "%-8s %3s  %15s  %15s  %13s  %s\n" lib -t "wall ours/fork" "cpu ours/fork" "rss ours/fork" "ratio wall cpu rss"
+          awk -F, '{ k = $1 "," $2 "," $3; c = $6 + $7
+                     if (!(k in w) || $5 < w[k]) w[k] = $5
+                     if (!(k in cpu) || c < cpu[k]) cpu[k] = c
+                     if (!(k in r) || $8 < r[k]) r[k] = $8 }
+               END { for (k in w) { split(k, a, ","); if (a[3] == "fork") continue
+                       f = a[1] "," a[2] ",fork"
+                       printf "%-8s %3s  %7.2f/%-7.2f  %7.2f/%-7.2f  %6d/%-6d  %.3f %.3f %.3f\n", a[1] (a[3] == "ab" ? "/ab" : ""), a[2],
+                         w[k], w[f], cpu[k], cpu[f], r[k] / 1024, r[f] / 1024, w[k] / w[f], cpu[k] / cpu[f], r[k] / r[f] } }' "$rows" | sort
+
+      - name: Where the time goes (-t 1)
+        if: steps.host.outputs.ok == '1'
+        shell: bash -el {0}
+        env:
+          OURS_ENV: ${{ github.event.inputs.ours_env || '' }}
+        run: |
+          set -euo pipefail
+          cd work
+          # ours_env, e.g. BWA4_RESCUE_TIER=sse41 BWAMEM3_FORCE_TIER=avx2: both arms see it, and
+          # each tool reads only its own variables (an `ab:` arm is timed above only).
+          case "$OURS_ENV" in ""|ab:*) ;; *) export $OURS_ENV; echo "env: $OURS_ENV" ;; esac
+          for lib in em taps; do
+            mode=--meth; [ "$lib" = taps ] && mode=--meth=taps
+            reads=("${lib}_1.fq" "${lib}_2.fq")
+            echo "===== $lib ours: BWA4_STAGE_TIME (wall per stage) ====="
+            BWA4_STAGE_TIME=1 ../mem4-v3 mem "$mode" -K 10000000 -t 1 ours/chr21.fa "${reads[@]}" 2>&1 >/dev/null | grep -vE '^\[M::' | tail -25 || true
+            parms="ours fork"; [ -x ../mem4-ab ] && parms="ours ab fork"
+            for arm in $parms; do
+              case "$arm" in
+                ours) cmd=(../mem4-v3 mem "$mode" -K 10000000 -t 1 ours/chr21.fa "${reads[@]}") ;;
+                ab) cmd=(../mem4-ab mem "$mode" -K 10000000 -t 1 ours/chr21.fa "${reads[@]}") ;;
+                *) cmd=(bwa-mem3 mem "$mode" -K 10000000 -t 1 fork/chr21.fa "${reads[@]}") ;;
+              esac
+              echo "===== $lib $arm: perf stat ====="
+              "$PERF" stat -x, -e cycles,instructions,branch-misses,L1-dcache-load-misses -- "${cmd[@]}" \
+                2>&1 > /dev/null | grep -E ',(cycles|instructions|branch-misses|L1-dcache-load-misses),' || true
+              # Sample counts at a fixed rate, so the two arms' symbols compare in CPU time.
+              "$PERF" record -F 999 -o "$lib.$arm.data" -- "${cmd[@]}" > /dev/null 2>/dev/null || true
+              echo "===== $lib $arm: top symbols by self time ====="
+              "$PERF" report -i "$lib.$arm.data" --stdio --no-children --show-nr-samples --percent-limit 0.3 2>/dev/null \
+                | grep -E '^# Samples|^\s+[0-9]+\.[0-9]+%' | head -60 || true
+            done
+          done
+          # The rescue kernel of each arm, instruction by instruction, in address order: the hot
+          # loop bodies and their weights, to set the two cells side by side.
+          for lib in em taps; do
+            for arm in ours fork; do
+              pat='bwa_neon::matesw::fwd_local_sw_[a-z0-9_]+'; [ "$arm" = fork ] && pat='kswv_[a-z0-9]+::kswv[0-9]+_u8'
+              sym=$("$PERF" report -i "$lib.$arm.data" --stdio --no-children 2>/dev/null \
+                | grep -E "\] $pat" | head -1 | sed 's/.*\[\.\] //; s/ *$//') || true
+              echo "===== $lib $arm: annotate $sym ====="
+              [ -n "$sym" ] && "$PERF" annotate -i "$lib.$arm.data" --stdio -s "$sym" 2>/dev/null \
+                | awk '$1 + 0 >= 0.25' | head -160 || true
+              [ "$arm" = ours ] && [ -n "$sym" ] || continue
+              # Every sampled address of our kernel, summed by its innermost bwa-neon source line
+              # (addr2line -i walks the inlined frames out of core::arch).
+              echo "===== $lib ours: kernel self time by source line ====="
+              "$PERF" annotate -i "$lib.$arm.data" --stdio --no-source -s "$sym" 2>/dev/null \
+                | awk '$1 ~ /^[0-9]+\.[0-9]+$/ && $2 == ":" {a = $3; sub(/:$/, "", a); print $1, a}' \
+                > ann.txt || true
+              addr2line -i -a -e ../mem4-v3 $(awk '{print "0x" $2}' ann.txt) 2>/dev/null \
+                | awk 'NR == FNR {p[$2] = $1; next}
+                       /^0x/ {a = $1; sub(/^0x0*/, "", a); want = 1; next}
+                       want && /bwa-neon\/src\// {sub(/.*bwa-neon\/src\//, ""); sub(/ .*/, ""); s[$0] += p[a]; want = 0}
+                       END {for (l in s) printf "%7.2f %s\n", s[l], l}' ann.txt - \
+                | sort -rn | head -70 || true
+            done
+          done
+          # Our SMEM walk, by source line: on x86 it is 30% of the run against 16% on an M4.
+          for lib in em taps; do
+            for sym in bwa_seed::mem_collect_smem_batched bwa_index::fmindex::FmIndex::backward_round; do
+              echo "===== $lib ours: $sym self time by source line ====="
+              "$PERF" annotate -i "$lib.ours.data" --stdio --no-source -s "$sym" 2>/dev/null \
+                | awk '$1 ~ /^[0-9]+\.[0-9]+$/ && $2 == ":" {a = $3; sub(/:$/, "", a); print $1, a}' \
+                > ann.txt || true
+              addr2line -i -a -e ../mem4-v3 $(awk '{print "0x" $2}' ann.txt) 2>/dev/null \
+                | awk 'NR == FNR {p[$2] = $1; next}
+                       /^0x/ {a = $1; sub(/^0x0*/, "", a); want = 1; next}
+                       want && /bwa-(seed|index)\/src\// {sub(/.*bwa-(seed|index)\/src\//, ""); sub(/ .*/, ""); s[$0] += p[a]; want = 0}
+                       END {for (l in s) printf "%7.2f %s\n", s[l], l}' ann.txt - \
+                | sort -rn | head -40 || true
+            done
+          done
+          # libc is 2-3% of ours on Intel (0.5% on AMD) and has no symbols here: its two hottest
+          # addresses disassembled (memset stores one register, memcpy loads and stores). No
+          # DWARF-unwound callers: that report took an hour of the job and resolved nothing.
+          libc=$(ldd ../mem4-v3 | awk '/libc\.so/ {print $3}')
+          "$PERF" report -i em.ours.data --stdio --no-children 2>/dev/null \
+            | awk '/libc\.so/ && $NF ~ /^0x/ {print $NF}' | head -2 | while read -r a; do
+              echo "===== em ours: libc $a ====="
+              objdump -d --no-show-raw-insn --start-address=$((a - 0x30)) --stop-address=$((a + 0x20)) "$libc" \
+                | grep -E '^ +[0-9a-f]+:' || true
+            done

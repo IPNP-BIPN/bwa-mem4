@@ -216,7 +216,18 @@ struct Scratch {
     mw: Vec<u64>,
     hw: Vec<u64>,
     dense: bool,
+    /// The relation `tab` describes ([`Scratch::load_query_rel`]), `None` for equality. Under one,
+    /// a query position sits under several codes: `tab`'s count and position are per entry, and a
+    /// code's entries chain from `ehead` (latest first) through `ent_nxt`, `ent_j` their positions.
+    qrel: Option<(u8, u8)>,
+    ehead: Vec<i16>,
+    ent_j: Vec<i16>,
+    ent_nxt: Vec<i16>,
 }
+
+/// Most relation entries a query may take (a T-rich mate under C/T enters up to `2^K` per
+/// position); past it the job is not filtered.
+const ECAP: usize = 8192;
 
 /// [`Scratch::tab`]'s flag for a code the query holds more than once, and its position field.
 const TAB_MULTI: u32 = 1 << 15;
@@ -259,18 +270,23 @@ impl Scratch {
             mw: Vec::new(),
             hw: Vec::new(),
             dense: false,
+            qrel: None,
+            ehead: Vec::new(),
+            ent_j: Vec::new(),
+            ent_nxt: Vec::new(),
         }
     }
 
     /// Index the query's K-mers, unless the table already describes this query at this K. A query
     /// holding an N is only flagged: the caller returns `Full` for it.
     fn load_query(&mut self, q: &[u8], k: usize) {
-        if self.qk == k && self.qcache == q {
+        if self.qk == k && self.qrel.is_none() && self.qcache == q {
             return;
         }
         self.qcache.clear();
         self.qcache.extend_from_slice(q);
         self.qk = k;
+        self.qrel = None;
         self.q_has_n = q.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0;
         let ncode = 1usize << (2 * k);
         if self.tab.len() != ncode {
@@ -316,6 +332,97 @@ impl Scratch {
             self.touched.set_len(nt);
         }
     }
+
+    /// [`Scratch::load_query`] under a relation: target base `x` also hits query base `y` (one
+    /// bit apart), so each query K-mer is entered under every code it relates to, each `y` read
+    /// as `y` or `x` (fg-labs/bwa-mem3's relation-expanded table). Past [`ECAP`] entries the
+    /// query is flagged like an N: not filtered.
+    fn load_query_rel(&mut self, q: &[u8], k: usize, (x, y): (u8, u8)) {
+        if self.qk == k && self.qrel == Some((x, y)) && self.qcache == q {
+            return;
+        }
+        self.qcache.clear();
+        self.qcache.extend_from_slice(q);
+        self.qk = k;
+        self.qrel = Some((x, y));
+        let ncode = 1usize << (2 * k);
+        if self.tab.len() != ncode {
+            self.tab = vec![0; ncode];
+            self.touched.clear();
+        }
+        // Read only where `tab` is set, which this load writes first.
+        self.ehead.resize(ncode, -1);
+        for &c in &self.touched {
+            self.tab[c as usize] = 0;
+        }
+        self.touched.clear();
+        self.ent_j.clear();
+        self.ent_nxt.clear();
+        self.pres = [0; 128];
+        self.q_has_n = q.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0;
+        if self.q_has_n {
+            return;
+        }
+        let (mask, flip) = ((ncode - 1) as u32, u32::from(x ^ y));
+        let (mut code, mut ym) = (0u32, 0u32);
+        self.ent_j.reserve(ECAP);
+        self.ent_nxt.reserve(ECAP);
+        // One past the distinct codes: a seen code still writes (unused) at slot `nt`.
+        self.touched.reserve(ECAP.min(ncode) + 1);
+        debug_assert!(self.ehead.len() == ncode && self.tab.len() == ncode);
+        let (tab, eh) = (self.tab.as_mut_ptr(), self.ehead.as_mut_ptr());
+        let (ej, en) = (self.ent_j.as_mut_ptr(), self.ent_nxt.as_mut_ptr());
+        let touched = self.touched.as_mut_ptr();
+        let (mut ne, mut nt) = (0usize, 0usize);
+        for (j, &b) in q.iter().enumerate() {
+            code = (code << 2 | u32::from(b)) & mask;
+            ym = (ym << 2 | if b == y { flip } else { 0 }) & mask;
+            if j + 1 < k {
+                continue;
+            }
+            // Every subset of the `y` positions read as `x`: `flip` is one bit per 2-bit slot.
+            // Branch-free and unchecked, as in `load_query`: whether a code was seen is data.
+            // `c <= mask < tab.len() == ehead.len()`, `ne < ECAP` before each write into the
+            // ECAP-reserved entry vectors, and `touched` holds at most one slot per code and per
+            // entry. SAFETY: those bounds.
+            let mut sub = ym;
+            unsafe {
+                loop {
+                    let c = (code ^ sub) as usize;
+                    if ne == ECAP {
+                        self.ent_j.set_len(ne);
+                        self.ent_nxt.set_len(ne);
+                        self.touched.set_len(nt);
+                        self.q_has_n = true;
+                        return;
+                    }
+                    let v = *tab.add(c);
+                    let seen = v != 0;
+                    *ej.add(ne) = j as i16;
+                    *en.add(ne) = if seen { *eh.add(c) } else { -1 };
+                    *eh.add(c) = ne as i16;
+                    *touched.add(nt) = c as u16;
+                    nt += usize::from(!seen);
+                    if k == 5 {
+                        self.pres[c >> 3] |= 1 << (c & 7);
+                    }
+                    *tab.add(c) =
+                        ((v >> 16) + 1) << 16 | if seen { TAB_MULTI } else { 0 } | j as u32;
+                    ne += 1;
+                    if sub == 0 {
+                        break;
+                    }
+                    sub = (sub - 1) & ym;
+                }
+            }
+        }
+        // SAFETY: `ne` entries and `nt` codes were written above, within the reservations.
+        unsafe {
+            self.ent_j.set_len(ne);
+            self.ent_nxt.set_len(ne);
+            self.touched.set_len(nt);
+        }
+    }
 }
 
 thread_local! {
@@ -337,7 +444,31 @@ pub(crate) fn decide(t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Decisio
     }
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        match count_hits(s, t, q, p, max_hits) {
+        match count_hits(s, t, q, p, max_hits, None) {
+            Some(nd) => decide_counts(s, p, len1, nd),
+            None => Decision::Full,
+        }
+    })
+}
+
+/// [`decide`] under a relation (`--meth` neutral and genomic): target base `x` also hits query
+/// base `y`. A related cell scores at most `a` and every other cell as the bound assumes, so the
+/// lemma holds with these hits (fg-labs/bwa-mem3's relation filter). The relation must flip one
+/// bit (`x ^ y`, as C/T and G/A do), else the window runs in full.
+pub(crate) fn decide_rel(
+    t: &[u8],
+    q: &[u8],
+    p: &Params,
+    max_hits: usize,
+    (x, y): (u8, u8),
+) -> Decision {
+    let (len1, len2, k) = (t.len(), q.len(), p.k);
+    if len1 < k || len2 < k || len1 > WCAP || len2 > QCAP || (x ^ y).count_ones() != 1 {
+        return Decision::Full;
+    }
+    SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
+        match count_hits(s, t, q, p, max_hits, Some((x, y))) {
             Some(nd) => decide_counts(s, p, len1, nd),
             None => Decision::Full,
         }
@@ -347,18 +478,25 @@ pub(crate) fn decide(t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Decisio
 /// The per-diagonal hit counts (`cnt`, `minrow` where `cnt != 0`, `occ_bits`). Returns the number of
 /// diagonal slots, or `None` when the job is not filtered (an N in either sequence, or more hits than
 /// `max_hits`). A job proven to fail by the hit total alone comes back with no diagonal occupied.
-fn count_hits(s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, max_hits: usize) -> Option<usize> {
+fn count_hits(
+    s: &mut Scratch,
+    t: &[u8],
+    q: &[u8],
+    p: &Params,
+    max_hits: usize,
+    rel: Option<(u8, u8)>,
+) -> Option<usize> {
     #[cfg(target_arch = "aarch64")]
     if p.k == 5 {
         // SAFETY: NEON is part of the aarch64 baseline.
-        return unsafe { neon::count_hits(s, t, q, p, max_hits) };
+        return unsafe { neon::count_hits(s, t, q, p, max_hits, rel) };
     }
     #[cfg(target_arch = "x86_64")]
     if p.k == 5 && sse::available() {
         // SAFETY: SSSE3 and SSE4.1 were just detected.
-        return unsafe { sse::count_hits(s, t, q, p, max_hits) };
+        return unsafe { sse::count_hits(s, t, q, p, max_hits, rel) };
     }
-    count_hits_scalar(s, t, q, p, max_hits)
+    count_hits_scalar(s, t, q, p, max_hits, rel)
 }
 
 /// [`count_hits`] in portable code: the reference the NEON counter is checked against, and the
@@ -369,9 +507,13 @@ fn count_hits_scalar(
     q: &[u8],
     p: &Params,
     max_hits: usize,
+    rel: Option<(u8, u8)>,
 ) -> Option<usize> {
     let (len1, len2, k) = (t.len(), q.len(), p.k);
-    s.load_query(q, k);
+    match rel {
+        Some(r) => s.load_query_rel(q, k, r),
+        None => s.load_query(q, k),
+    }
     if s.q_has_n || t.iter().fold(0u8, |acc, &b| acc | b) & !3 != 0 {
         return None;
     }
@@ -419,18 +561,30 @@ fn count_hits_scalar(
     // ---- The other occurrences of repeated K-mers, in any order (`minrow` takes the min) ----
     {
         let (tab, nxt) = (&s.tab[..], &s.nxt[..]);
+        let (ehead, ent_j, ent_nxt) = (&s.ehead[..], &s.ent_j[..], &s.ent_nxt[..]);
         let (cnt4, minrow) = (&mut s.cnt4[..], &mut s.minrow[..]);
         for (w, &word) in s.multi.iter().enumerate() {
             let mut word = word;
             while word != 0 {
                 let r = w * 64 + word.trailing_zeros() as usize;
                 word &= word - 1;
-                let mut j = nxt[(tab[codes[r] as usize] & TAB_POS) as usize];
-                while j >= 0 {
+                let mut hit = |j: i16| {
                     let d = r + k - 1 + off - j as usize;
                     cnt4[(r & 3) * stride + d] += 1;
                     minrow[d] = minrow[d].min(r as u16);
-                    j = nxt[j as usize];
+                };
+                if rel.is_some() {
+                    let mut e = ent_nxt[ehead[codes[r] as usize] as usize];
+                    while e >= 0 {
+                        hit(ent_j[e as usize]);
+                        e = ent_nxt[e as usize];
+                    }
+                } else {
+                    let mut j = nxt[(tab[codes[r] as usize] & TAB_POS) as usize];
+                    while j >= 0 {
+                        hit(j);
+                        j = nxt[j as usize];
+                    }
                 }
             }
         }
@@ -600,16 +754,24 @@ mod neon {
         }
     }
 
+    /// Under a relation (`rel`, see [`Scratch::load_query_rel`]) the same passes run on the
+    /// relation's table, whose count and latest position per code read like the equality one's;
+    /// only the chain to a code's earlier occurrences differs (entries, not positions), so layers
+    /// >= 2 carry entry indices and gather their positions.
     pub(super) unsafe fn count_hits(
         s: &mut Scratch,
         t: &[u8],
         q: &[u8],
         p: &Params,
         max_hits: usize,
+        rel: Option<(u8, u8)>,
     ) -> Option<usize> {
         const K: usize = 5;
         let (len1, len2) = (t.len(), q.len());
-        s.load_query(q, K);
+        match rel {
+            Some(r) => s.load_query_rel(q, K, r),
+            None => s.load_query(q, K),
+        }
         // ---- 1. N check while copying the window into a zero-padded buffer, so the 16-row code
         //      blocks never read past it ----
         // One pass: copy 16 bytes, OR them in. `rbuf` keeps `len1 + 32` bytes, the last 32 zero.
@@ -770,7 +932,13 @@ mod neon {
                 pack(&mut s.rb_d, nb, d, mb);
                 nb = pack(&mut s.rb_r, nb, r, mb);
                 pack(&mut s.mrow, nm, r, mm);
-                nm = pack(&mut s.mj, nm, j, mm);
+                // Under a relation the code: its entry chain starts at `ehead` (below).
+                let mv = if rel.is_some() {
+                    vld1q_u16(s.hcode.as_ptr().add(k0))
+                } else {
+                    j
+                };
+                nm = pack(&mut s.mj, nm, mv, mm);
                 idx = vaddq_u16(idx, k8);
                 k0 += 8;
             }
@@ -817,8 +985,23 @@ mod neon {
             let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
             e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
         };
-        for x in 0..nm {
-            s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+        // Under a relation `js` holds entries: position `ent_j[e]`, next `ent_nxt[e]`. Past the
+        // list's end the lanes are stale, clamped to stay in the entry arrays.
+        let (ej, en) = (s.ent_j.as_ptr(), s.ent_nxt.as_ptr());
+        let elast = s.ent_j.len().saturating_sub(1) as u64;
+        let gather4 = |a: *const i16, e: *const u16| -> u64 {
+            let x = (e as *const u64).read_unaligned();
+            let g = |sh: u32| u64::from(*a.add(((x >> sh) & 0xFFFF).min(elast) as usize) as u16);
+            g(0) | g(16) << 16 | g(32) << 32 | g(48) << 48
+        };
+        if rel.is_some() {
+            for x in 0..nm {
+                s.mj[x] = s.ent_nxt[s.ehead[s.mj[x] as usize] as usize] as u16;
+            }
+        } else {
+            for x in 0..nm {
+                s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+            }
         }
         let mut n = nm;
         grow(&mut s.hrow, n + 16);
@@ -840,11 +1023,21 @@ mod neon {
                 let mut k0 = 0usize;
                 while k0 < n {
                     let r = vld1q_u16(rows.as_ptr().add(k0));
-                    let j = vld1q_u16(js.as_ptr().add(k0));
-                    let jn = vreinterpretq_s16_u64(vcombine_u64(
-                        vcreate_u64(nxt4(js.as_ptr().add(k0))),
-                        vcreate_u64(nxt4(js.as_ptr().add(k0 + 4))),
-                    ));
+                    let (e0, e1) = (js.as_ptr().add(k0), js.as_ptr().add(k0 + 4));
+                    let (j, jn) = if rel.is_some() {
+                        let j = vcombine_u64(
+                            vcreate_u64(gather4(ej, e0)),
+                            vcreate_u64(gather4(ej, e1)),
+                        );
+                        let jn = vcombine_u64(
+                            vcreate_u64(gather4(en, e0)),
+                            vcreate_u64(gather4(en, e1)),
+                        );
+                        (vreinterpretq_u16_u64(j), vreinterpretq_s16_u64(jn))
+                    } else {
+                        let jn = vcombine_u64(vcreate_u64(nxt4(e0)), vcreate_u64(nxt4(e1)));
+                        (vld1q_u16(e0), vreinterpretq_s16_u64(jn))
+                    };
                     let d = vsubq_u16(vaddq_u16(r, koff), j);
                     let rp = vextq_u16::<7>(prev_r, r);
                     let dp = vextq_u16::<7>(prev_d, d);
@@ -995,7 +1188,8 @@ mod sse {
         _mm_alignr_epi8::<14>(cur, prev)
     }
 
-    /// See [`super::neon::count_hits`]; same results.
+    /// See [`super::neon::count_hits`]; same results, under a relation too (the same entry
+    /// chains: layer 1 packs codes, layers >= 2 gather `ent_j` / `ent_nxt`).
     ///
     /// # Safety
     /// SSSE3 and SSE4.1.
@@ -1006,10 +1200,14 @@ mod sse {
         q: &[u8],
         p: &Params,
         max_hits: usize,
+        rel: Option<(u8, u8)>,
     ) -> Option<usize> {
         const K: usize = 5;
         let (len1, len2) = (t.len(), q.len());
-        s.load_query(q, K);
+        match rel {
+            Some(r) => s.load_query_rel(q, K, r),
+            None => s.load_query(q, K),
+        }
         // ---- 1. N check while copying the window into a zero-padded buffer ----
         if s.rbuf.len() < len1 + 32 {
             s.rbuf.resize(len1 + 32, 0);
@@ -1171,7 +1369,13 @@ mod sse {
                 pack(&mut s.rb_d, nb, d, mb);
                 nb = pack(&mut s.rb_r, nb, r, mb);
                 pack(&mut s.mrow, nm, r, mm);
-                nm = pack(&mut s.mj, nm, j, mm);
+                // Under a relation the code: its entry chain starts at `ehead` (below).
+                let mv = if rel.is_some() {
+                    ld(s.hcode.as_ptr().add(k0) as *const u8)
+                } else {
+                    j
+                };
+                nm = pack(&mut s.mj, nm, mv, mm);
                 idx = _mm_add_epi16(idx, k8);
                 k0 += 8;
             }
@@ -1207,8 +1411,23 @@ mod sse {
             let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
             e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
         };
-        for x in 0..nm {
-            s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+        // Under a relation `js` holds entries: position `ent_j[e]`, next `ent_nxt[e]`. Past the
+        // list's end the lanes are stale, clamped to stay in the entry arrays.
+        let (ej, en) = (s.ent_j.as_ptr(), s.ent_nxt.as_ptr());
+        let elast = s.ent_j.len().saturating_sub(1) as u64;
+        let gather4 = |a: *const i16, e: *const u16| -> u64 {
+            let x = (e as *const u64).read_unaligned();
+            let g = |sh: u32| u64::from(*a.add(((x >> sh) & 0xFFFF).min(elast) as usize) as u16);
+            g(0) | g(16) << 16 | g(32) << 32 | g(48) << 48
+        };
+        if rel.is_some() {
+            for x in 0..nm {
+                s.mj[x] = s.ent_nxt[s.ehead[s.mj[x] as usize] as usize] as u16;
+            }
+        } else {
+            for x in 0..nm {
+                s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+            }
         }
         let mut n = nm;
         grow(&mut s.hrow, n + 16);
@@ -1227,8 +1446,15 @@ mod sse {
                 let mut k0 = 0usize;
                 while k0 < n {
                     let r = ld(rows.as_ptr().add(k0) as *const u8);
-                    let j = ld(js.as_ptr().add(k0) as *const u8);
-                    let jn = from2(nxt4(js.as_ptr().add(k0)), nxt4(js.as_ptr().add(k0 + 4)));
+                    let (e0, e1) = (js.as_ptr().add(k0), js.as_ptr().add(k0 + 4));
+                    let (j, jn) = if rel.is_some() {
+                        (
+                            from2(gather4(ej, e0), gather4(ej, e1)),
+                            from2(gather4(en, e0), gather4(en, e1)),
+                        )
+                    } else {
+                        (ld(e0 as *const u8), from2(nxt4(e0), nxt4(e1)))
+                    };
                     let d = _mm_sub_epi16(_mm_add_epi16(r, koff), j);
                     let rp = shift_in(prev_r, r);
                     let dp = shift_in(prev_d, d);
@@ -2118,7 +2344,9 @@ pub(crate) fn round1_threshold(minsc: i32, ub2: i32) -> i32 {
 /// the band threshold exceeds `minsc`, `ct` at it. Returns the decision, the threshold `T1` (0 when
 /// the decision is not a hull) and whether `T1` is a lower bound on the job's score taken because
 /// the caller does not need `score2` (`lazy`): [`ungapped_floor`] when it exceeds `minsc`, else
-/// [`round1_threshold`] as for an exact job.
+/// [`round1_threshold`] as for an exact job. `rel`: the hits are
+/// [`decide_rel`]'s.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decide_bands(
     t: &[u8],
     q: &[u8],
@@ -2126,15 +2354,19 @@ pub(crate) fn decide_bands(
     max_hits: usize,
     c19: &mut Vec<Comp>,
     ct: &mut Vec<Comp>,
+    rel: Option<(u8, u8)>,
     lazy: bool,
 ) -> (Decision, i32, bool) {
     let (len1, len2, k) = (t.len(), q.len(), p.k);
     if len1 < k || len2 < k || len1 > WCAP || len2 > QCAP {
         return (Decision::Full, 0, false);
     }
+    if rel.is_some_and(|(x, y)| (x ^ y).count_ones() != 1) {
+        return (Decision::Full, 0, false);
+    }
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        let Some(nd) = count_hits(s, t, q, p, max_hits) else {
+        let Some(nd) = count_hits(s, t, q, p, max_hits, rel) else {
             return (Decision::Full, 0, false);
         };
         let dec = decide_counts(s, p, len1, nd);
@@ -2291,8 +2523,9 @@ pub(crate) mod tests {
         q: &[u8],
         p: &Params,
         max_hits: usize,
+        rel: Option<(u8, u8)>,
     ) -> Option<usize> {
-        let nd = super::count_hits(s, t, q, p, max_hits)?;
+        let nd = super::count_hits(s, t, q, p, max_hits, rel)?;
         occ_ready(s);
         s.cnt.resize(s.cnt.len().max(nd), 0);
         for d in 0..nd {
@@ -2408,7 +2641,7 @@ pub(crate) mod tests {
                 }
             }
             let p = &params[iter % params.len()];
-            if let Some(nd) = count_hits(&mut s, &t, &q, p, usize::MAX) {
+            if let Some(nd) = count_hits(&mut s, &t, &q, p, usize::MAX, None) {
                 let want = dense_decision(&s, p, tlen, nd);
                 assert_eq!(sparse_decision(&mut s, p, tlen, nd), want, "iter {iter}");
                 match want {
@@ -2423,7 +2656,7 @@ pub(crate) mod tests {
         if let Ok(path) = std::env::var("BWA4_PRUNE_BENCH") {
             let p = &params[0];
             for (n, (t, q)) in load_dump(&path).iter().enumerate() {
-                if let Some(nd) = count_hits(&mut s, t, q, p, usize::MAX) {
+                if let Some(nd) = count_hits(&mut s, t, q, p, usize::MAX, None) {
                     let want = dense_decision(&s, p, t.len(), nd);
                     assert_eq!(sparse_decision(&mut s, p, t.len(), nd), want, "job {n}");
                 }
@@ -2456,7 +2689,7 @@ pub(crate) mod tests {
         let key = |c: &Comp| (c.ub, c.i0, c.dlo, c.dhi, c.dmaxhit);
         let mut s = Scratch::new();
         let check = |s: &mut Scratch, t: &[u8], q: &[u8], p: &Params, what: &str| -> u32 {
-            let Some(nd) = count_hits(s, t, q, p, usize::MAX) else {
+            let Some(nd) = count_hits(s, t, q, p, usize::MAX, None) else {
                 return 0;
             };
             if s.occ_bits.iter().all(|&w| w == 0) {
@@ -2619,7 +2852,7 @@ pub(crate) mod tests {
                 }
                 // A threshold of 1 so the early fail never skips the enumeration.
                 let p = Params { minsc: 1, ..p };
-                let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX) else {
+                let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX, None) else {
                     continue;
                 };
                 let (cnt, minrow) = naive_counts(t, q, k);
@@ -2642,9 +2875,71 @@ pub(crate) mod tests {
         }
     }
 
-    /// The NEON counter against the scalar one: same verdict, same `cnt`, same `minrow` wherever
-    /// `cnt != 0`, same `occ_bits`, on generated jobs (many repeats, poly-A, tiny lengths) and on
-    /// the real dump when `BWA4_PRUNE_BENCH` names one.
+    /// The relation counter against per-hit enumeration under the relation (target `x` also hits
+    /// query `y`), on windows holding mates with some `x` read as `y`, and small alphabets.
+    #[test]
+    fn rel_counts_equal_naive_counts() {
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let p = Params {
+            minsc: 1,
+            ..Params::from(1, 4, 6, 1, 6, 1, 19).unwrap()
+        };
+        let mut s = Scratch::new();
+        for (x, y) in [(1u8, 3u8), (2, 0)] {
+            for n in 0..2000 {
+                let qlen = 5 + next() % 150;
+                let tlen = qlen + next() % 600;
+                let alpha = [4, 4, 2, 3][next() % 4];
+                let mut t: Vec<u8> = (0..tlen).map(|_| (next() % alpha) as u8).collect();
+                let q: Vec<u8> = (0..qlen)
+                    .map(|_| match (next() % alpha) as u8 {
+                        b if b == x && next() % 2 == 0 => y,
+                        b => b,
+                    })
+                    .collect();
+                let at = next() % (tlen - qlen + 1);
+                for (i, &b) in q.iter().enumerate() {
+                    if next() % 30 != 0 {
+                        t[at + i] = if b == y && next() % 2 == 0 { x } else { b };
+                    }
+                }
+                let Some(nd) = count_hits_scalar(&mut s, &t, &q, &p, usize::MAX, Some((x, y)))
+                else {
+                    panic!("job {n}: refused");
+                };
+                let hit = |tb: u8, qb: u8| tb == qb || (tb == x && qb == y);
+                let off = qlen.div_ceil(16) * 16;
+                let (mut cnt, mut minrow) = (vec![0u16; nd], vec![u16::MAX; nd]);
+                for i in 4..tlen {
+                    for j in 4..qlen {
+                        if (0..5).all(|o| hit(t[i - o], q[j - o])) {
+                            cnt[i + off - j] += 1;
+                            minrow[i + off - j] = minrow[i + off - j].min((i - 4) as u16);
+                        }
+                    }
+                }
+                assert_eq!(&s.cnt[..nd], &cnt[..], "({x},{y}) job {n}: cnt");
+                assert_eq!(s.nhits, cnt.iter().map(|&c| c as usize).sum::<usize>());
+                for d in 0..nd {
+                    let bit = s.occ_bits[d / 64] >> (d % 64) & 1;
+                    assert_eq!(bit == 1, cnt[d] > 0, "({x},{y}) job {n}: occ bit {d}");
+                    if cnt[d] > 0 {
+                        assert_eq!(s.minrow[d], minrow[d], "({x},{y}) job {n}: minrow {d}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The NEON (or SSE) counter against the scalar one, under no relation, C/T and G/A: same
+    /// verdict, same `cnt`, same `minrow` wherever `cnt != 0`, same `occ_bits`, on generated jobs
+    /// (many repeats, poly-A, tiny lengths) and on the real dump when `BWA4_PRUNE_BENCH` names one.
     #[test]
     fn neon_counts_equal_scalar_counts() {
         let mut state = 0x5eed_1234_abcd_0001u64;
@@ -2686,19 +2981,22 @@ pub(crate) mod tests {
                     if t.len() < 5 || q.len() < 5 || t.len() > WCAP || q.len() > QCAP {
                         continue;
                     }
-                    let x = count_hits(&mut a, t, q, &p, mh);
-                    let y = count_hits_scalar(&mut b, t, q, &p, mh);
-                    assert_eq!(x, y, "job {n} minsc {minsc} mh {mh}: verdict");
-                    let Some(nd) = x else { continue };
-                    let nw = nd.div_ceil(64);
-                    assert_eq!(a.occ_bits[..nw], b.occ_bits[..nw], "job {n}: occ_bits");
-                    if a.occ_bits.iter().all(|&w| w == 0) {
-                        continue;
-                    }
-                    assert_eq!(a.cnt[..nd], b.cnt[..nd], "job {n}: cnt");
-                    for d in 0..nd {
-                        if a.cnt[d] != 0 {
-                            assert_eq!(a.minrow[d], b.minrow[d], "job {n}: minrow {d}");
+                    for rel in [None, Some((1u8, 3u8)), Some((2, 0))] {
+                        let x = count_hits(&mut a, t, q, &p, mh, rel);
+                        let y = count_hits_scalar(&mut b, t, q, &p, mh, rel);
+                        assert_eq!(x, y, "job {n} minsc {minsc} mh {mh} {rel:?}: verdict");
+                        let Some(nd) = x else { continue };
+                        let nw = nd.div_ceil(64);
+                        assert_eq!(a.occ_bits[..nw], b.occ_bits[..nw], "job {n} {rel:?}: occ");
+                        if a.occ_bits.iter().all(|&w| w == 0) {
+                            continue;
+                        }
+                        assert_eq!(a.nhits, b.nhits, "job {n} {rel:?}: nhits");
+                        assert_eq!(a.cnt[..nd], b.cnt[..nd], "job {n} {rel:?}: cnt");
+                        for d in 0..nd {
+                            if a.cnt[d] != 0 {
+                                assert_eq!(a.minrow[d], b.minrow[d], "job {n} {rel:?}: minrow {d}");
+                            }
                         }
                     }
                 }
@@ -2973,7 +3271,7 @@ pub(crate) mod tests {
                 continue;
             }
             let off = q.len().div_ceil(16) * 16;
-            let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX) else {
+            let Some(nd) = count_hits(&mut s, t, q, &p, usize::MAX, None) else {
                 continue;
             };
             let bnd = dense_bound(&s, &p, nd);
@@ -3106,7 +3404,7 @@ pub(crate) mod tests {
             let hull = (he + 1 - hb) as u64 * ql;
             c_now += hull;
             // Rebuild the counts and Kadane sums (decide's scratch is thread-local, not `s`).
-            let nd = count_hits(&mut s, t, q, &p, usize::MAX).unwrap();
+            let nd = count_hits(&mut s, t, q, &p, usize::MAX, None).unwrap();
             let c0 = components_at(&s, &p, nd, p.minsc);
             let mut ubs: Vec<i32> = c0.iter().map(|c| c.0).collect();
             ubs.sort_unstable_by(|a, b| b.cmp(a));
@@ -3281,12 +3579,12 @@ pub(crate) mod tests {
         let t0 = std::time::Instant::now();
         let mut nds = Vec::with_capacity(jobs.len());
         for (t, q) in &jobs {
-            nds.push(super::count_hits(&mut s, t, q, &p, 100_000));
+            nds.push(super::count_hits(&mut s, t, q, &p, 100_000, None));
         }
         let count_ns = t0.elapsed().as_nanos() as f64 / jobs.len() as f64;
         let t0 = std::time::Instant::now();
         for ((t, q), _) in jobs.iter().zip(&nds) {
-            if let Some(nd) = super::count_hits(&mut s, t, q, &p, 100_000) {
+            if let Some(nd) = super::count_hits(&mut s, t, q, &p, 100_000, None) {
                 std::hint::black_box(sparse_decision(&mut s, &p, t.len(), nd));
             }
         }
@@ -3351,8 +3649,9 @@ pub(crate) mod tests {
             // The pruned path itself, whatever `BWA4_RESCUE_PRUNE` says.
             let p = Params::from(a as i32, b as i32, o, e, o, e, minsc);
             assert!(p.is_some());
-            let got =
-                crate::matesw::batched_align(&jobs, 5, &mat, o, e, o, e, minsc, a as i32, p, false);
+            let got = crate::matesw::batched_align(
+                &jobs, 5, &mat, o, e, o, e, minsc, a as i32, p, None, false,
+            );
             for (i, j) in jobs.iter().enumerate() {
                 let lanes = if (j.query.len() as i32) * (a as i32) < 250 {
                     16

@@ -140,6 +140,137 @@ pub use matesw::{
     batched_ksw_align2, batched_mate_rescue, batched_mate_rescue_lazy, KswJob, SCORE2_PENDING,
 };
 
+/// `Σ mat[r[i] * 5 + q[i]]` over the common length: the ungapped score of `q` (read codes) against
+/// `r` (reference codes). Codes are at most 4, so every index is below 25. 16 bases a step through
+/// a byte-table lookup (TBL, or two PSHUFB halves); `--meth` seeds were 1.4% of an EM-seq run as a
+/// bounds-checked scalar loop.
+pub fn diag_score(mat: &[i8; 25], r: &[u8], q: &[u8]) -> i32 {
+    let n = r.len().min(q.len());
+    let mut tab = [0i8; 32];
+    tab[..25].copy_from_slice(mat);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64.
+    let (s, i) = unsafe { diag_score_neon(&tab, &r[..n], &q[..n]) };
+    #[cfg(target_arch = "x86_64")]
+    let (s, i) = if std::is_x86_feature_detected!("ssse3") {
+        // SAFETY: ssse3 detected.
+        unsafe { diag_score_ssse3(&tab, &r[..n], &q[..n]) }
+    } else {
+        (0, 0)
+    };
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let (s, i) = (0, 0);
+    s + (r[i..n].iter().zip(&q[i..n]))
+        .map(|(&r, &q)| i32::from(tab[(r as usize * 5 + q as usize) & 31]))
+        .sum::<i32>()
+}
+
+/// [`diag_score`]'s whole 16-base steps on NEON: their sum and the bases they covered.
+#[cfg(target_arch = "aarch64")]
+unsafe fn diag_score_neon(tab: &[i8; 32], r: &[u8], q: &[u8]) -> (i32, usize) {
+    use std::arch::aarch64::*;
+    let t = int8x16x2_t(vld1q_s8(tab.as_ptr()), vld1q_s8(tab.as_ptr().add(16)));
+    let (mut acc, steps) = (vdupq_n_s32(0), r.len() / 16);
+    for k in 0..steps {
+        let (rv, qv) = (
+            vld1q_u8(r.as_ptr().add(16 * k)),
+            vld1q_u8(q.as_ptr().add(16 * k)),
+        );
+        let v = vqtbl2q_s8(t, vmlaq_u8(qv, rv, vdupq_n_u8(5)));
+        acc = vpadalq_s16(acc, vpaddlq_s8(v));
+    }
+    (vaddvq_s32(acc), 16 * steps)
+}
+
+/// [`diag_score`]'s whole 16-base steps on x86: their sum and the bases they covered. The index
+/// `5r + q` picks the low half (index | 0x80 when above 15 zeroes it) or the high one (index - 16
+/// is negative below 16), and the signed bytes sum through `psadbw` biased by 128.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn diag_score_ssse3(tab: &[i8; 32], r: &[u8], q: &[u8]) -> (i32, usize) {
+    use std::arch::x86_64::*;
+    let (lo, hi) = (
+        _mm_loadu_si128(tab.as_ptr().cast()),
+        _mm_loadu_si128(tab.as_ptr().add(16).cast()),
+    );
+    let (mut acc, bias, steps) = (_mm_setzero_si128(), _mm_set1_epi8(-128), r.len() / 16);
+    for k in 0..steps {
+        let rv = _mm_loadu_si128(r.as_ptr().add(16 * k).cast());
+        let qv = _mm_loadu_si128(q.as_ptr().add(16 * k).cast());
+        // Codes below 8: the 16-bit shift carries nothing across bytes.
+        let idx = _mm_add_epi8(_mm_add_epi8(_mm_slli_epi16(rv, 2), rv), qv);
+        let up = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));
+        let v = _mm_or_si128(
+            _mm_shuffle_epi8(lo, _mm_or_si128(idx, up)),
+            _mm_shuffle_epi8(hi, _mm_sub_epi8(idx, _mm_set1_epi8(16))),
+        );
+        acc = _mm_add_epi64(
+            acc,
+            _mm_sad_epu8(_mm_xor_si128(v, bias), _mm_setzero_si128()),
+        );
+    }
+    let sum = _mm_cvtsi128_si64(acc) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(acc, acc));
+    ((sum - 128 * 16 * steps as i64) as i32, 16 * steps)
+}
+
+/// `--meth`'s matrices free the pair of bases `x < y` one conversion touches: the cells `[x][y]`
+/// and `[y][x]` score between the mismatch and `a`, at least one of them above the mismatch, and
+/// every other cell is the uniform matrix's. Returns `(x, y, uniform matrix, exact)`. On sequences
+/// with `x` rewritten as `y`, the uniform matrix scores every cell at least as high as `mat` (a pair
+/// cell becomes a match), and exactly as high when both pair cells are `a` (`exact`, the collapsed
+/// scoring). So with `exact` a batch runs on the rewritten bytes through every uniform-only kernel
+/// and fast path; without it, a proof that the rewritten bytes score below a threshold still holds.
+pub(crate) fn merged_pair(m: usize, mat: &[i8]) -> Option<(u8, u8, [i8; 25], bool)> {
+    if m != 5 || mat.len() < 25 {
+        return None;
+    }
+    let a = mat[0];
+    for x in 0..4 {
+        for y in x + 1..4 {
+            // The mismatch score, read off the two bases outside the pair.
+            let (u, v) = {
+                let mut o = (0..4).filter(|&b| b != x && b != y);
+                (o.next().unwrap(), o.next().unwrap())
+            };
+            let mm = mat[u * 5 + v];
+            let pair = [mat[x * 5 + y], mat[y * 5 + x]];
+            let mut uni: [i8; 25] = mat[..25].try_into().unwrap();
+            uni[x * 5 + y] = mm;
+            uni[y * 5 + x] = mm;
+            let uniform = (0..25).all(|k| {
+                uni[k]
+                    == if k / 5 == 4 || k % 5 == 4 {
+                        mat[4]
+                    } else if k / 5 == k % 5 {
+                        a
+                    } else {
+                        mm
+                    }
+            });
+            if uniform && mm < a && pair.iter().all(|c| (mm..=a).contains(c)) && pair != [mm; 2] {
+                return Some((x as u8, y as u8, uni, pair == [a; 2]));
+            }
+        }
+    }
+    None
+}
+
+/// Every job's `(query, target)` with base `x` rewritten as `y`, packed in one buffer; the spans
+/// index it in job order. See [`merged_pair`].
+pub(crate) fn rewrite_jobs<'a>(
+    seqs: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    x: u8,
+    y: u8,
+) -> (Vec<u8>, Vec<(usize, usize, usize)>) {
+    let (mut buf, mut spans) = (Vec::new(), Vec::new());
+    for (q, t) in seqs {
+        let at = buf.len();
+        buf.extend(q.iter().chain(t).map(|&b| if b == x { y } else { b }));
+        spans.push((at, at + q.len(), buf.len()));
+    }
+    (buf, spans)
+}
+
 /// The NEON seed-extension backend. See the module docs: it delegates to the scalar kernel today
 /// and is the drop-in point for the lane-parallel NEON DP (phase 9a).
 #[derive(Debug, Default, Clone, Copy)]
@@ -304,6 +435,35 @@ mod tests {
         assert_backend_matches_scalar, assert_backend_saturation_boundary_matches_scalar,
         assert_backend_tie_rule_matches_scalar,
     };
+
+    /// [`diag_score`] equals the plain sum for every length across the 16-base steps, with signed
+    /// cells from -128 to 127 and N codes on both sides.
+    #[test]
+    fn diag_score_matches_scalar() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % m) as u8
+        };
+        for round in 0..200 {
+            let mut mat = [0i8; 25];
+            mat.iter_mut().for_each(|c| *c = next(256) as i8);
+            if round == 0 {
+                mat = [-128; 25];
+            }
+            let n = round % 70;
+            let r: Vec<u8> = (0..n).map(|_| next(5)).collect();
+            let q: Vec<u8> = (0..n + round % 3).map(|_| next(5)).collect();
+            let want: i32 = r
+                .iter()
+                .zip(&q)
+                .map(|(&r, &q)| i32::from(mat[r as usize * 5 + q as usize]))
+                .sum();
+            assert_eq!(diag_score(&mat, &r, &q), want, "round {round}");
+        }
+    }
 
     /// The two shared acceptance gates from `bwa-extend`, run against this backend. They take no
     /// arguments: each generates its own fixed-seed sweep and panics on the first field-level

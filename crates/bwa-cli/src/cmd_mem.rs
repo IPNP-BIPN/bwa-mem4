@@ -523,6 +523,34 @@ pub struct MemArgs {
     /// Print help.
     #[arg(long = "help", action = clap::ArgAction::Help)]
     pub help: Option<bool>,
+
+    // ---- Methylation mode, ported from fg-labs/bwa-mem3 0.16 (see `docs/meth-mode.md`) ----
+    // Long-only, spelled as in the fork so a Bismark command line runs unchanged. The value of
+    // `--meth` binds only with `=`, as in the fork: `--meth taps` would make `taps` the index.
+    /// Bisulfite/EM-seq/TAPS mode: emseq (default; bisulfite, em-seq), taps, 5base (5-base).
+    /// Needs an index built with `index --meth`.
+    #[arg(long = "meth", value_name = "CHEM", num_args = 0..=1, require_equals = true,
+          default_missing_value = "emseq")]
+    pub meth: Option<String>,
+    /// Where a conversion is free: all [all]. `cpg` is not supported by this port.
+    #[arg(long = "meth-context", value_name = "all|cpg")]
+    pub meth_context: Option<String>,
+    /// collapsed (EM-seq default, sets -B 2), genomic, or neutral (TAPS default).
+    #[arg(long = "meth-scoring", value_name = "MODE")]
+    pub meth_scoring: Option<String>,
+    /// Bismark tags to emit: all [all], none, XR,XG,... or exclusions ^XM / -XM.
+    #[arg(long = "meth-tags", value_name = "SPEC", allow_hyphen_values = true)]
+    pub meth_tags: Option<String>,
+    /// Prune short repetitive seeds before SA lookup: spec30 [spec30 under --meth], baseline, off.
+    #[arg(long = "meth-seed-prune", value_name = "MODE", num_args = 0..=1, require_equals = true,
+          default_missing_value = "spec30")]
+    pub meth_seed_prune: Option<String>,
+    /// Flag alignments of conversion strand f (XG:Z:CT) or r (XG:Z:GA) as QC-fail (0x200).
+    #[arg(long = "set-as-failed", value_name = "f|r")]
+    pub set_as_failed: Option<String>,
+    /// bwameth's chimera rule: longest M < 44% of the read sets 0x200, clears 0x2, caps MAPQ at 1.
+    #[arg(long = "chimera-qc")]
+    pub chimera_qc: bool,
 }
 
 /// Parse bwa's `INT[,INT]` pair syntax. bwa reads the first integer with `strtol`, then takes a
@@ -1057,9 +1085,87 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     //
     // From the POST-rescale a/b. Doing this earlier would leave the SIMD kernel scoring with
     // pre-rescale values while the gap logic used post-rescale scalars.
+    let meth = build_meth(args, &mut opt)?;
     opt.fill_scmat();
+    if let Some(mut meth) = meth {
+        meth.fill_mats(&opt.mat, opt.a);
+        opt.meth = Some(meth);
+    }
     validate_scoring(&opt)?;
     Ok(opt)
+}
+
+/// The `--meth*` options (`meth_opts_parse` + `meth_opts_finalize` + `mem_opt_apply_meth_defaults`
+/// in fg-labs/bwa-mem3 0.16). Applies the meth defaults to `opt` where the user gave no value and
+/// returns the mode, its matrices still unfilled; `None` without `--meth`.
+fn build_meth(args: &MemArgs, opt: &mut MemOpt) -> anyhow::Result<Option<bwa_core::meth::MethOpt>> {
+    use bwa_core::meth;
+    let Some(chem) = &args.meth else {
+        let stray = [
+            (args.meth_context.is_some(), "--meth-context"),
+            (args.meth_scoring.is_some(), "--meth-scoring"),
+            (args.meth_tags.is_some(), "--meth-tags"),
+            (args.meth_seed_prune.is_some(), "--meth-seed-prune"),
+            (args.set_as_failed.is_some(), "--set-as-failed"),
+            (args.chimera_qc, "--chimera-qc"),
+        ];
+        if let Some((_, flag)) = stray.iter().find(|(given, _)| *given) {
+            anyhow::bail!("{flag} requires --meth");
+        }
+        return Ok(None);
+    };
+    let mut m = meth::MethOpt::new(meth::parse_chem(chem).map_err(anyhow::Error::msg)?);
+    if let Some(s) = &args.meth_scoring {
+        m.scoring = meth::parse_scoring(s).map_err(anyhow::Error::msg)?;
+    }
+    match args.meth_context.as_deref() {
+        None | Some("all") => {}
+        // shortcut: the CpG-only 7-code model is not ported (Bismark runs `all`); port
+        // `meth_model.cpp` if someone needs TAPS CpG-context scoring.
+        Some("cpg") => anyhow::bail!("--meth-context cpg is not supported by bwa-mem4"),
+        Some(other) => {
+            anyhow::bail!("--meth-context accepts 'all' (default) or 'cpg', got '{other}'")
+        }
+    }
+    if let Some(s) = &args.meth_tags {
+        m.tags = meth::parse_tags(s).map_err(|e| anyhow::anyhow!("--meth-tags '{s}': {e}"))?;
+    }
+    if let Some(s) = &args.meth_seed_prune {
+        m.prune = meth::parse_prune(s).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(s) = &args.set_as_failed {
+        m.set_as_failed = match s.as_str() {
+            "f" => Some(b'f'),
+            "r" => Some(b'r'),
+            _ => anyhow::bail!("--set-as-failed requires 'f' or 'r'"),
+        };
+    }
+    m.chimera_qc = args.chimera_qc;
+    if args.read_type.is_some() {
+        anyhow::bail!("--meth cannot be combined with -x");
+    }
+    // `mem_opt_apply_meth_defaults`: bwameth's penalties, scaled by `-A` like any default.
+    if args.clip_penalty.is_none() {
+        opt.pen_clip5 = 10 * opt.a;
+        opt.pen_clip3 = 10 * opt.a;
+    }
+    if args.pen_unpaired.is_none() {
+        opt.pen_unpaired = 100 * opt.a;
+    }
+    if args.min_score.is_none() {
+        opt.t = 40 * opt.a;
+    }
+    opt.flag |= flags::NO_MULTI;
+    if m.scoring == meth::Scoring::Collapsed && args.mismatch.is_none() {
+        opt.b = 2 * opt.a;
+    }
+    if opt.b <= 0 {
+        anyhow::bail!(
+            "--meth requires a positive mismatch penalty, but the effective penalty is {}",
+            opt.b
+        );
+    }
+    Ok(Some(m))
 }
 
 /// Refuse gap and clipping penalties the aligner cannot run with. Checked on the FINAL options,
@@ -2241,17 +2347,22 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // extension and for turning a concatenated-genome offset back into (contig, position).
     // Both are loaded once, live for the whole run, and are shared immutably with every worker.
     // Together they are several GB for a human genome (memory-mapped where possible).
-    let fm = FmIndex::load(&args.index_prefix)?;
-    let mut bns = BntSeq::load(&args.index_prefix)?;
-    // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
-    anyhow::ensure!(
-        fm.l_pac() == bns.l_pac,
-        "{}: the .ann describes a {}-base reference but the .bwt.2bit.64 a {}-base one \
-         (mixed index from two builds; rebuild it)",
-        args.index_prefix.display(),
-        bns.l_pac,
-        fm.l_pac()
-    );
+    let (fm, mut bns) = if opt.meth.is_some() {
+        load_meth_index(&args.index_prefix)?
+    } else {
+        let fm = FmIndex::load(&args.index_prefix)?;
+        let bns = BntSeq::load(&args.index_prefix)?;
+        // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
+        anyhow::ensure!(
+            fm.l_pac() == bns.l_pac,
+            "{}: the .ann describes a {}-base reference but the .bwt.2bit.64 a {}-base one \
+             (mixed index from two builds; rebuild it)",
+            args.index_prefix.display(),
+            bns.l_pac,
+            fm.l_pac()
+        );
+        (fm, bns)
+    };
     // `-j`: clear the ALT flags the loader just read from `<prefix>.alt`, so every contig counts as
     // primary assembly. Done here, after loading, exactly as `fastmap.cpp:907` does it.
     if args.ignore_alt {
@@ -2319,6 +2430,11 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // be pasted back. This costs no byte-identity: `@PG` is excluded from every parity gate in this
     // project precisely because it legitimately differs between the two tools.
     let command_line = argv.join(" ").replace('\t', "\\t");
+    // `--meth` writes its header through htslib in the fork, which puts this `@HD` first unless
+    // `-H` brought one.
+    if opt.meth.is_some() && !hdr_parts.iter().any(|l| l.starts_with("@HD\t")) {
+        out.write_all(b"@HD\tVN:1.5\tSO:unsorted\tGO:query\n")?;
+    }
     sam::write_header(
         &mut out,
         &sqs,
@@ -2395,7 +2511,11 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         }
         // Per-read alignments after dedup and before primary marking, also parallel to `batch`.
         let regs_all = stage_time::measure(Stage::Align, || {
-            batched_regs(&fm, &bns, &opt, &all_reads, dump_regs_enabled())
+            if opt.meth.is_some() {
+                meth_regs(&fm, &bns, &opt, &all_reads, false)
+            } else {
+                batched_regs(&fm, &bns, &opt, &all_reads, dump_regs_enabled(), None)
+            }
         });
         drop(all_reads);
         // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
@@ -2410,6 +2530,17 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
                 .map_init(Vec::new, |codes, (read_in_batch, (rec, regs))| {
                     codes.clear();
                     rec.codes_into(codes);
+                    if opt.meth.is_some() {
+                        return finish_se_meth(
+                            &fm,
+                            &bns,
+                            &opt,
+                            rec,
+                            codes,
+                            regs,
+                            base_id + read_in_batch as u64,
+                        );
+                    }
                     finish_se(
                         &fm,
                         &bns,
@@ -2467,6 +2598,7 @@ fn batched_regs(
     opt: &MemOpt,
     reads: &[&Record],
     leave_undeduped: bool,
+    meth: Option<bool>,
 ) -> Vec<Vec<MemAlnReg>> {
     // One chunk per worker, so every thread gets a slice big enough to fill the SIMD lanes.
     // Size of the rayon pool, i.e. effectively `-t`. Clamped so the division below cannot divide
@@ -2510,7 +2642,26 @@ fn batched_regs(
                         &flat[at - r.seq_len()..at]
                     })
                     .collect();
-                let mut regs = align_reads_batched(fm, bns, opt, &codes, &NeonBackend);
+                let mut regs = match meth {
+                    None => align_reads_batched(fm, bns, opt, &codes, &NeonBackend),
+                    // `--meth`: seed the chunk's converted copies, align the reads themselves.
+                    Some(ot) => {
+                        let conv: Vec<Vec<u8>> = codes
+                            .iter()
+                            .map(|c| bwa_core::meth::convert_codes(c, ot))
+                            .collect();
+                        let conv: Vec<&[u8]> = conv.iter().map(Vec::as_slice).collect();
+                        bwa_mem::align_reads_batched_meth(
+                            fm,
+                            bns,
+                            opt,
+                            &codes,
+                            &conv,
+                            ot,
+                            &NeonBackend,
+                        )
+                    }
+                };
                 // Dedup here, chunk by chunk, not once the whole batch has aligned. The pass is
                 // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
                 // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
@@ -2539,6 +2690,95 @@ fn batched_regs(
         .flatten()
         .collect()
     })
+}
+
+/// The `--meth` index: `<prefix>.ann/.amb/.pac` of the original genome and the converted seed
+/// index `<prefix>.meth.bwt.2bit.64` (`index --meth`). A prefix given as `<ref>.meth` is taken to
+/// mean `<ref>`, as in the fork.
+fn load_meth_index(prefix: &std::path::Path) -> anyhow::Result<(FmIndex, BntSeq)> {
+    let text = prefix.to_string_lossy();
+    let orig = std::path::PathBuf::from(text.strip_suffix(".meth").unwrap_or(&text));
+    let seed = std::path::PathBuf::from(format!("{}.meth", orig.display()));
+    let bns = BntSeq::load(&orig)?;
+    let fm = FmIndex::load_meth(&seed, &orig, bns.l_pac).map_err(|e| {
+        anyhow::anyhow!(
+            "--meth: cannot load the seed index {}: {e}; build it with `bwa-mem4 index --meth`",
+            seed.display()
+        )
+    })?;
+    // The seed index is the genome converted both ways, so exactly twice as long.
+    if fm.ref_seq_len != 4 * bns.l_pac + 1 {
+        anyhow::bail!(
+            "--meth: {} is not the seed index of {} (rebuild with `bwa-mem4 index --meth`)",
+            seed.display(),
+            orig.display()
+        );
+    }
+    Ok((fm, bns))
+}
+
+/// The regions of a `--meth` batch, deduped: the batched aligner run once per chemistry, each
+/// with its own matrix (`MethOpt::mats`). `paired`: `reads` interleaves read 1 (C->T) and read 2
+/// (G->A); otherwise every read is read 1.
+fn meth_regs(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    reads: &[&Record],
+    paired: bool,
+) -> Vec<Vec<MemAlnReg>> {
+    let ot_opt = bwa_mem::meth::read_opt(opt, true);
+    if !paired {
+        return batched_regs(fm, bns, &ot_opt, reads, false, Some(true));
+    }
+    let r1: Vec<&Record> = reads.iter().step_by(2).copied().collect();
+    let r2: Vec<&Record> = reads.iter().skip(1).step_by(2).copied().collect();
+    let ob_opt = bwa_mem::meth::read_opt(opt, false);
+    let a = batched_regs(fm, bns, &ot_opt, &r1, false, Some(true));
+    let b = batched_regs(fm, bns, &ob_opt, &r2, false, Some(false));
+    a.into_iter().zip(b).flat_map(|(x, y)| [x, y]).collect()
+}
+
+/// [`finish_se`] under `--meth`: bwa's own `mem_reg2sam` (which `finish_se` mirrors) with the
+/// meth record extras, then the QC-fail rule over the read's records.
+fn finish_se_meth(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    rec: &Record,
+    codes: &[u8],
+    mut regs: Vec<MemAlnReg>,
+    read_id: u64,
+) -> Vec<u8> {
+    if dump_regs_enabled() {
+        eprintln!("=== read {} ===", String::from_utf8_lossy(rec.name()));
+        bwa_mem::dump_regs(bns, "meth pre-mark", &regs);
+    }
+    mem_mark_primary_se(opt, &mut regs, read_id);
+    if opt.flag & flags::PRIMARY5 != 0 {
+        bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);
+    }
+    let meth = opt.meth.as_ref().expect("finish_se_meth runs under --meth");
+    let emit = bwa_mem::meth::MethEmit { fm, meth, ot: true };
+    let mut buf = Vec::new();
+    bwa_mem::pe::mem_reg2sam(
+        fm,
+        bns,
+        &bwa_mem::meth::read_opt(opt, true),
+        rec.name(),
+        codes,
+        rec.qual(),
+        rec.comment(),
+        &regs,
+        0,
+        None,
+        Some(&emit),
+        &mut buf,
+    );
+    if meth.may_qcfail() {
+        bwa_mem::meth::propagate_qcfail(&mut buf);
+    }
+    buf
 }
 
 /// Env-gated (`BWA4_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
@@ -3096,7 +3336,11 @@ fn run_pe(
         }
         // Deduped regions, in the same interleaved order as `all_reads`.
         let regs_all = stage_time::measure(Stage::Align, || {
-            batched_regs(fm, bns, opt, &all_reads, false)
+            if opt.meth.is_some() {
+                meth_regs(fm, bns, opt, &all_reads, true)
+            } else {
+                batched_regs(fm, bns, opt, &all_reads, false, None)
+            }
         });
         drop(all_reads);
 

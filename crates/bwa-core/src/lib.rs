@@ -33,6 +33,7 @@ pub mod alloc_probe;
 pub mod cpu;
 pub mod dna;
 pub mod error;
+pub mod meth;
 pub mod opt;
 pub mod rg;
 pub mod sysram;
