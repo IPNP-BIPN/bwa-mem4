@@ -935,7 +935,7 @@ pub fn reg2aln(
         score: reg.score,
         // XS:i is the better of the two suboptimal estimates: `sub` from overlapping regions
         // (`mem_mark_primary_se`) and `csub` from within the same chain.
-        sub: reg.sub.max(reg.csub),
+        sub: reg.sub.max(crate::lazy_csub::get(reg.csub)),
         alt_sc: reg.alt_sc,
         is_alt: reg.is_alt,
         // Filled in by the caller from `mem_gen_alt`; `reg2aln` never produces XA itself, because

@@ -69,7 +69,7 @@ use std::io::{self, Write};
 use bwa_core::MemOpt;
 use bwa_extend::{ksw_align2, KswAlignResult};
 use bwa_index::{BntSeq, FmIndex};
-use bwa_neon::{batched_mate_rescue, KswJob};
+use bwa_neon::{batched_mate_rescue, batched_mate_rescue_lazy, KswJob, SCORE2_PENDING};
 
 use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
@@ -1063,7 +1063,9 @@ fn rescue_jobs<'a>(
 /// results for that call's jobs, in orientation order. `ma` is the mate's region vector, mutated in
 /// place and left sorted score-descending. `ma_settled` says whether `ma` is what
 /// [`insert_into_settled`] requires, starts false for a list fresh from the first dedup, and is kept
-/// up to date here.
+/// up to date here. `pend`, when given, takes the jobs of results whose `score2` is pending (see
+/// [`batch_mate_rescue`]), `read` naming the rescued end (0 or 1) for [`PendS2::fetch`].
+#[allow(clippy::too_many_arguments)]
 fn matesw_apply(
     fm: &FmIndex,
     bns: &BntSeq,
@@ -1072,6 +1074,8 @@ fn matesw_apply(
     alns: &[KswAlignResult],
     ma: &mut Vec<MemAlnReg>,
     view: &mut RegionView,
+    mut pend: Option<&mut Vec<PendS2>>,
+    read: u8,
 ) {
     let l_pac = bns.l_pac;
     let l_ms = call.l_ms;
@@ -1145,6 +1149,19 @@ fn matesw_apply(
                     rb + i64::from(aln.te) + 1
                 };
                 let seedcov = ((b_re - b_rb).min(i64::from(qe - qb)) >> 1) as i32;
+                // A lazy kernel's pending `score2` names this window in the chunk's table.
+                let csub = if aln.score2 == SCORE2_PENDING {
+                    let pend = pend.as_deref_mut().expect("a pending score2 needs a table");
+                    pend.push(PendS2 {
+                        rb,
+                        len: o.target.1,
+                        rev: is_rev,
+                        read,
+                    });
+                    crate::lazy_csub::encode(pend.len() - 1)
+                } else {
+                    aln.score2
+                };
                 let b = MemAlnReg {
                     rb: b_rb,
                     re: b_re,
@@ -1154,7 +1171,7 @@ fn matesw_apply(
                     score: aln.score,
                     truesc: 0,
                     sub: 0,
-                    csub: aln.score2,
+                    csub,
                     sub_n: 0,
                     seedcov,
                     seedlen0: 0,
@@ -1219,6 +1236,68 @@ fn matesw_apply(
     }
 }
 
+/// The rescue job behind a pending `csub` ([`crate::lazy_csub`]): the window `rb..rb + len` in the
+/// doubled coordinate space, already clamped to its contig, and the mate that was aligned in it,
+/// read `read` (0 or 1) as sequenced, reverse complemented when `rev`. Rerunning that job through
+/// [`batched_mate_rescue`] gives the `score2` that becomes `csub`.
+#[derive(Clone, Copy, Debug)]
+pub struct PendS2 {
+    pub rb: i64,
+    pub len: u32,
+    pub rev: bool,
+    pub read: u8,
+}
+
+impl PendS2 {
+    /// The job's query and target, appended to `arena`: `(query start, target start)`; the query
+    /// ends where the target starts and the target runs to the arena's end.
+    pub fn fetch(&self, fm: &FmIndex, seqs: &[&[u8]; 2], arena: &mut Vec<u8>) -> (usize, usize) {
+        let q0 = arena.len();
+        let ms = seqs[self.read as usize];
+        if self.rev {
+            arena.extend(ms.iter().rev().map(|&b| if b < 4 { 3 - b } else { 4 }));
+        } else {
+            arena.extend_from_slice(ms);
+        }
+        let t0 = arena.len();
+        fm.bases_append(self.rb, self.rb + i64::from(self.len), arena);
+        (q0, t0)
+    }
+}
+
+/// `score2` of each pending job, by [`batched_mate_rescue`] over the same windows the rescue ran.
+pub fn resolve_pending(fm: &FmIndex, opt: &MemOpt, jobs: &[(PendS2, [&[u8]; 2])]) -> Vec<i32> {
+    let mut arena = Vec::new();
+    let spans: Vec<(usize, usize, usize)> = jobs
+        .iter()
+        .map(|(p, seqs)| {
+            let (q0, t0) = p.fetch(fm, seqs, &mut arena);
+            (q0, t0, arena.len())
+        })
+        .collect();
+    let kj: Vec<KswJob> = spans
+        .iter()
+        .map(|&(q0, t0, t1)| KswJob {
+            query: &arena[q0..t0],
+            target: &arena[t0..t1],
+        })
+        .collect();
+    batched_mate_rescue(
+        &kj,
+        5,
+        &opt.mat,
+        opt.o_del,
+        opt.e_del,
+        opt.o_ins,
+        opt.e_ins,
+        opt.min_seed_len * opt.a,
+        opt.a,
+    )
+    .into_iter()
+    .map(|r| r.score2)
+    .collect()
+}
+
 /// One read pair's rescue inputs for [`batch_mate_rescue`]: the two mates' nt4 codes and their
 /// (mutable) dedup'd region vectors. `a0`/`seq0` is read 1, `a1`/`seq1` is read 2.
 pub struct PairRescueData<'a> {
@@ -1258,13 +1337,17 @@ pub struct PairRescueData<'a> {
 /// `pen_unpaired` (`-U`, doubling as the anchor score window) and the ksw scoring parameters. `pes`
 /// is the batch's insert-size estimate, which must already be final: it is read by every collect.
 /// `pairs` is the whole batch, mutated in place, and must be the same pairs, in the same order, that
-/// [`mem_sam_pe`] will later be called on with `rescue_done = true`.
+/// [`mem_sam_pe`] will later be called on with `rescue_done = true`. `pend`, when given, makes
+/// `score2` lazy: a rescued region whose `score2` the kernel left pending gets
+/// `csub = lazy_csub::encode(i)` with `pend[i]` the job to rerun, through [`resolve_pending`], if
+/// SAM emit reads that `csub`.
 pub fn batch_mate_rescue(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
     pes: &[PeStat; 4],
     pairs: &mut [PairRescueData],
+    mut pend: Option<&mut Vec<PendS2>>,
 ) {
     // `-m` (`opt->max_matesw`, default 50): at most this many anchors per end. bwa expresses it as
     // the loop bound `j < opt->max_matesw`, so a value of 0 disables rescue entirely, and negative
@@ -1455,7 +1538,11 @@ pub fn batch_mate_rescue(
         let alns = if jobs.is_empty() {
             Vec::new()
         } else {
-            batched_mate_rescue(
+            (if pend.is_some() {
+                batched_mate_rescue_lazy
+            } else {
+                batched_mate_rescue
+            })(
                 &jobs,
                 5,
                 &opt.mat,
@@ -1503,7 +1590,7 @@ pub fn batch_mate_rescue(
                         opt.min_seed_len * opt.a,
                         opt.a,
                     );
-                    matesw_apply(fm, bns, opt, &call, &alns, target, view);
+                    matesw_apply(fm, bns, opt, &call, &alns, target, view, None, 0);
                 }
                 continue;
             }
@@ -1523,7 +1610,19 @@ pub fn batch_mate_rescue(
                 }
             }
             let call = RescueCall { skip, ..*call };
-            matesw_apply(fm, bns, opt, &call, &kept, target, view);
+            // dir 0 rescues read 2 (index 1), dir 1 read 1.
+            let read = (dir == 0) as u8;
+            matesw_apply(
+                fm,
+                bns,
+                opt,
+                &call,
+                &kept,
+                target,
+                view,
+                pend.as_deref_mut(),
+                read,
+            );
         }
         crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
         p0 = p1;
@@ -3009,7 +3108,10 @@ pub fn mem_sam_pe<W: Write>(
                     // front instead, purely to satisfy the borrow checker. Equivalent because that
                     // loop only writes `sub` and `secondary`, never `score` or `csub`.
                     let chosen_score = [a0[z[0]].score, a1[z[1]].score];
-                    let chosen_csub = [a0[z[0]].csub, a1[z[1]].csub];
+                    let chosen_csub = [
+                        crate::lazy_csub::get(a0[z[0]].csub),
+                        crate::lazy_csub::get(a1[z[1]].csub),
+                    ];
                     for i in 0..2 {
                         let a = if i == 0 { &mut *a0 } else { &mut *a1 };
                         let zi = z[i];
@@ -3764,7 +3866,7 @@ mod matesw_apply_tests {
             te2: -1,
         };
         let (mut ma, mut view) = (ma0, RegionView::default());
-        matesw_apply(&fm, &bns, &opt, &call, &[miss], &mut ma, &mut view);
+        matesw_apply(&fm, &bns, &opt, &call, &[miss], &mut ma, &mut view, None, 0);
         assert_eq!(format!("{ma:?}"), format!("{want:?}"));
     }
 }

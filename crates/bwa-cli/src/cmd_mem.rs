@@ -101,8 +101,9 @@ use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, InterleavedFastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
     align_reads_batched, alt::mem_gen_alt, batch_mate_rescue, cigar::cigar_string_which,
-    cigar::MemAln, cigar_string, mem_approx_mapq_se, mem_mark_primary_se, mem_pestat_from,
-    mem_sam_pe, mem_sort_dedup_patch, pestat_samples, reg2aln, MemAlnReg, PairRescueData, PeStat,
+    cigar::MemAln, cigar_string, lazy_csub, mem_approx_mapq_se, mem_mark_primary_se,
+    mem_pestat_from, mem_sam_pe, mem_sort_dedup_patch, pe::resolve_pending, pestat_samples,
+    reg2aln, MemAlnReg, PairRescueData, PeStat, PendS2,
 };
 use bwa_neon::NeonBackend;
 
@@ -3146,6 +3147,8 @@ fn run_pe(
         // value works. Default off. True here means NO rescue happens anywhere, batched or per-pair.
         let no_rescue =
             std::env::var_os("BWA4_NO_RESCUE").is_some() || opt.flag & flags::NO_RESCUE != 0;
+        // Per rescue chunk, its first pair and its table of pending `csub` jobs (`lazy_csub`).
+        let mut pend_tables: Vec<(usize, Vec<PendS2>)> = Vec::new();
         if !scalar_rescue && !no_rescue {
             stage_time::measure(Stage::Rescue, || {
                 // Each pair's rescue is independent, so run chunks in parallel; a chunk of a few hundred
@@ -3157,17 +3160,20 @@ fn run_pe(
                 let mut pairs = batch.as_slice();
                 let mut rest = paired.as_mut_slice();
                 let mut chunks = Vec::new();
+                let mut starts = Vec::new();
                 for r in guided_bounds(pairs.len(), min, chunk_pairs) {
+                    starts.push(r.start);
                     let (regs, tail) = std::mem::take(&mut rest).split_at_mut(r.len());
                     let (recs, more) = pairs.split_at(r.len());
                     chunks.push((recs, regs));
                     (rest, pairs) = (tail, more);
                 }
-                stage_time::barrier::region(Stage::Rescue, || {
+                let tables = stage_time::barrier::region(Stage::Rescue, || {
                     run_in_order(chunks, |(recs, regs)| {
                         stage_time::barrier::worker(|| rescue_chunk(fm, bns, opt, &pes, recs, regs))
-                    });
+                    })
                 });
+                pend_tables = starts.into_iter().zip(tables).collect();
             });
         }
 
@@ -3177,18 +3183,37 @@ fn run_pe(
         // A buffer per pair was an allocation per pair, freed on the writer's thread. 64 pairs a
         // buffer cost +0.2 GB RSS on GIAB at -K 100M (blocks in a larger mimalloc class); 16 none.
         const SAM_CHUNK_PAIRS: usize = 16;
+        // Emit runs block by block so the pairs deferred on a pending `csub` (`lazy_csub`, ~2% of
+        // pairs, the repeat-heavy ones) are resolved and freed every block, not held to the end of
+        // the batch, where emit overlaps the next batch's align (the run's peak); a block's
+        // deferred jobs still fill the kernel's lanes.
+        const EMIT_BLOCK_PAIRS: usize = 8192;
         let bufs: Vec<Vec<u8>> = stage_time::measure(Stage::SamEmit, || {
-            stage_time::barrier::region(Stage::SamEmit, || {
-                // `into_par_iter`, so each pair's records and regions are freed as its text appears.
-                // Batch N's tail overlaps batch N+1's align, and that is where the run's peak is.
-                batch
+            let mut out = Vec::with_capacity(batch.len().div_ceil(SAM_CHUNK_PAIRS));
+            let (mut recs_left, mut regs_left) = (batch.into_iter(), paired.into_iter());
+            let mut first = 0usize;
+            loop {
+                let recs: Vec<(Record, Record)> =
+                    recs_left.by_ref().take(EMIT_BLOCK_PAIRS).collect();
+                if recs.is_empty() {
+                    break;
+                }
+                let regs: Vec<_> = regs_left.by_ref().take(recs.len()).collect();
+                let n = recs.len();
+                let mut bufs: Vec<(Vec<u8>, Vec<Deferred>)> = stage_time::barrier::region(
+                    Stage::SamEmit,
+                    || {
+                        // `into_par_iter`, so each pair's records and regions are freed as its text appears.
+                        // Batch N's tail overlaps batch N+1's align, and that is where the run's peak is.
+                        recs
                     .into_par_iter()
-                    .zip(paired.into_par_iter())
+                    .zip(regs.into_par_iter())
                     .enumerate()
+                    .map(|(i, x)| (first + i, x))
                     .fold_chunks(
                         SAM_CHUNK_PAIRS,
-                        || (Vec::with_capacity(SAM_CHUNK_PAIRS * 1024), Vec::new()),
-                        |(mut buf, mut codes), (pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
+                        || (Vec::with_capacity(SAM_CHUNK_PAIRS * 1024), Vec::new(), Vec::new()),
+                        |(mut buf, mut codes, mut deferred), (pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
                             // `move`: the pair is freed inside, so `BWA4_BARRIER_TIME` counts its
                             // frees as work, not as tail (1.5 points of the 3.7% tail at -t4).
                             stage_time::barrier::worker(move || {
@@ -3202,6 +3227,14 @@ fn run_pe(
                                 let seqs = [&codes[..n1], &codes[n1..]];
                                 let quals = [rec1.qual(), rec2.qual()];
                                 let comments = [rec1.comment(), rec2.comment()];
+                                // A pair holding a pending `csub` keeps its regions as rescue left
+                                // them, for the rerun should emit read one.
+                                let kept = regs1
+                                    .iter()
+                                    .chain(&regs2)
+                                    .any(|r| lazy_csub::index(r.csub).is_some())
+                                    .then(|| (regs1.clone(), regs2.clone()));
+                                let at = buf.len();
                                 mem_sam_pe(
                                     fm,
                                     bns,
@@ -3220,13 +3253,38 @@ fn run_pe(
                                     &mut buf,
                                 )
                                 .expect("write to Vec");
-                                (buf, codes)
+                                if let Some(regs) = kept {
+                                    let mut ids = Vec::new();
+                                    lazy_csub::take(&mut ids);
+                                    if !ids.is_empty() {
+                                        buf.truncate(at);
+                                        let n1 = rec1.seq_len();
+                                        deferred.push(Deferred {
+                                            at,
+                                            pair: pair_in_batch,
+                                            codes: codes.clone(),
+                                            n1,
+                                            recs: (rec1, rec2),
+                                            regs,
+                                            ids,
+                                        });
+                                    }
+                                }
+                                (buf, codes, deferred)
                             })
                         },
                     )
-                    .map(|(buf, _)| buf)
+                    .map(|(buf, _, deferred)| (buf, deferred))
                     .collect()
-            })
+                    },
+                );
+                if bufs.iter().any(|(_, d)| !d.is_empty()) {
+                    emit_deferred(fm, bns, opt, &pes, base_pair, &pend_tables, &mut bufs);
+                }
+                out.extend(bufs.into_iter().map(|(buf, _)| buf));
+                first += n;
+            }
+            out
         });
         // Handed to the writer as pieces, in pair order (the indexed parallel map above preserved
         // it). No concatenation: see `run_pipeline`'s docs for why that buffer is not built.
@@ -3239,9 +3297,148 @@ fn run_pe(
     run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)
 }
 
+/// A pair whose emit read a pending `csub` ([`lazy_csub`]): its output's place in the chunk buffer,
+/// its index in the batch, its bases (`codes[..n1]` read 1, the rest read 2), its records, its
+/// regions as rescue left them, and the pending entries it read.
+struct Deferred {
+    at: usize,
+    pair: usize,
+    codes: Vec<u8>,
+    n1: usize,
+    recs: (Record, Record),
+    regs: (Vec<MemAlnReg>, Vec<MemAlnReg>),
+    ids: Vec<u32>,
+}
+
+/// Compute the pending `csub`s the deferred pairs read, rerun those pairs' emit with them, and put
+/// each pair's records back at its place in its chunk buffer. `pend_tables` holds each rescue
+/// chunk's first pair and table; a pair's pending entries are in its chunk's table.
+#[allow(clippy::too_many_arguments)]
+fn emit_deferred(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    base_pair: u64,
+    pend_tables: &[(usize, Vec<PendS2>)],
+    bufs: &mut [(Vec<u8>, Vec<Deferred>)],
+) {
+    let table = |pair: usize| &pend_tables[pend_tables.partition_point(|t| t.0 <= pair) - 1].1;
+    // Every read entry once per pair, then one kernel batch per slice of jobs.
+    let mut jobs: Vec<(PendS2, [&[u8]; 2])> = Vec::new();
+    let mut owner: Vec<(usize, usize, u32)> = Vec::new();
+    for (b, (_, deferred)) in bufs.iter_mut().enumerate() {
+        for d in deferred.iter_mut() {
+            d.ids.sort_unstable();
+            d.ids.dedup();
+        }
+        for (k, d) in deferred.iter().enumerate() {
+            let seqs = [&d.codes[..d.n1], &d.codes[d.n1..]];
+            for &id in &d.ids {
+                jobs.push((table(d.pair)[id as usize], seqs));
+                owner.push((b, k, id));
+            }
+        }
+    }
+    let score2: Vec<i32> = jobs
+        .par_chunks(1024)
+        .flat_map_iter(|c| resolve_pending(fm, opt, c))
+        .collect();
+    drop(jobs);
+    let mut values: Vec<Vec<Vec<(u32, i32)>>> = bufs
+        .iter()
+        .map(|(_, d)| vec![Vec::new(); d.len()])
+        .collect();
+    for (&(b, k, id), &s2) in owner.iter().zip(&score2) {
+        values[b][k].push((id, s2));
+    }
+    bufs.par_iter_mut()
+        .zip(values)
+        .filter(|((_, d), _)| !d.is_empty())
+        .for_each(|((buf, deferred), values)| {
+            let mut out = Vec::with_capacity(buf.len() + deferred.len() * 1024);
+            let mut from = 0;
+            for (d, vals) in std::mem::take(deferred).into_iter().zip(values) {
+                out.extend_from_slice(&buf[from..d.at]);
+                from = d.at;
+                emit_resolved(
+                    fm,
+                    bns,
+                    opt,
+                    pes,
+                    base_pair,
+                    table(d.pair),
+                    d,
+                    vals,
+                    &mut out,
+                );
+            }
+            out.extend_from_slice(&buf[from..]);
+            *buf = out;
+        });
+}
+
+/// One deferred pair's emit with the pending `csub`s it reads set from `vals` (`(entry, score2)`).
+/// The regions read never depend on a `csub` value, so the rerun reads no other entry; were it to,
+/// those are resolved here and the pair is emitted again.
+#[allow(clippy::too_many_arguments)]
+fn emit_resolved(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    base_pair: u64,
+    table: &[PendS2],
+    d: Deferred,
+    mut vals: Vec<(u32, i32)>,
+    out: &mut Vec<u8>,
+) {
+    let (rec1, rec2) = &d.recs;
+    let seqs = [&d.codes[..d.n1], &d.codes[d.n1..]];
+    loop {
+        let (mut regs1, mut regs2) = d.regs.clone();
+        for r in regs1.iter_mut().chain(regs2.iter_mut()) {
+            if let Some(i) = lazy_csub::index(r.csub) {
+                if let Some(&(_, s2)) = vals.iter().find(|v| v.0 as usize == i) {
+                    r.csub = s2;
+                }
+            }
+        }
+        let at = out.len();
+        mem_sam_pe(
+            fm,
+            bns,
+            opt,
+            pes,
+            base_pair + d.pair as u64,
+            &[rec1.name(), rec2.name()],
+            &seqs,
+            &[rec1.qual(), rec2.qual()],
+            &[rec1.comment(), rec2.comment()],
+            &mut regs1,
+            &mut regs2,
+            true,
+            out,
+        )
+        .expect("write to Vec");
+        let mut more = Vec::new();
+        lazy_csub::take(&mut more);
+        if more.is_empty() {
+            return;
+        }
+        out.truncate(at);
+        more.sort_unstable();
+        more.dedup();
+        let jobs: Vec<(PendS2, [&[u8]; 2])> =
+            more.iter().map(|&id| (table[id as usize], seqs)).collect();
+        vals.extend(more.into_iter().zip(resolve_pending(fm, opt, &jobs)));
+    }
+}
+
 /// Mate rescue over one chunk of pairs, `RESCUE_SLICE_PAIRS` at a time: the slice's bases are
 /// unpacked into one buffer and rescued, and the buffer is reused for the next slice. The rescue
-/// result does not depend on how the pairs are grouped (see [`rescue_pairs_per_chunk`]).
+/// result does not depend on how the pairs are grouped (see [`rescue_pairs_per_chunk`]). Returns
+/// the chunk's pending `csub` jobs ([`lazy_csub`]).
 fn rescue_chunk(
     fm: &FmIndex,
     bns: &BntSeq,
@@ -3249,7 +3446,8 @@ fn rescue_chunk(
     pes: &[PeStat; 4],
     recs: &[(Record, Record)],
     regs: &mut [(Vec<MemAlnReg>, Vec<MemAlnReg>)],
-) {
+) -> Vec<PendS2> {
+    let mut pend = Vec::new();
     // Far above the 256 pairs the kernel needs to fill its lanes; small enough that a worker's
     // codes stay ~1 MB, where unpacking a whole chunk was ~5 MB a worker at the peak.
     const RESCUE_SLICE_PAIRS: usize = 4096;
@@ -3274,8 +3472,9 @@ fn rescue_chunk(
                 PairRescueData { seq0, seq1, a0, a1 }
             })
             .collect();
-        batch_mate_rescue(fm, bns, opt, pes, &mut jobs);
+        batch_mate_rescue(fm, bns, opt, pes, &mut jobs, Some(&mut pend));
     }
+    pend
 }
 
 /// Floor of a rescue chunk, so a small batch (or a stage's last chunks) is not shredded into slivers

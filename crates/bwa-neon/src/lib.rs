@@ -136,7 +136,9 @@ mod rescue_prune;
 /// [`KswJob`] (one unmapped mate against one reference window each) and returns one alignment per
 /// job. Note this kernel opens gaps from `H`, not from `M` like [`batched`]: that asymmetry is
 /// deliberate and mirrors the two different C originals (`ksw_u8` vs `ksw_extend2`).
-pub use matesw::{batched_ksw_align2, batched_mate_rescue, KswJob};
+pub use matesw::{
+    batched_ksw_align2, batched_mate_rescue, batched_mate_rescue_lazy, KswJob, SCORE2_PENDING,
+};
 
 /// The NEON seed-extension backend. See the module docs: it delegates to the scalar kernel today
 /// and is the drop-in point for the lane-parallel NEON DP (phase 9a).

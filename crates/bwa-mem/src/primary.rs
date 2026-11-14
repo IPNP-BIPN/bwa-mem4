@@ -1238,7 +1238,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         opt.min_seed_len * opt.a
     };
     // `csub` is the best competitor from within the same chain; take whichever evidence is stronger.
-    sub = sub.max(a.csub);
+    sub = sub.max(crate::lazy_csub::get(a.csub));
     // No margin at all: the competitor is as good as us, so the placement is arbitrary.
     if sub >= a.score {
         return 0;

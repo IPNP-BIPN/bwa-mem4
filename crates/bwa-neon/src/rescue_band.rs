@@ -78,6 +78,9 @@ struct Parent {
     /// Offset of the parent's merged row-max buffer (hull rows) in `pool`, or -1 (one band).
     buf: i32,
     round: u8,
+    /// `t1` is a lower bound on the score and the caller takes `score2` later: round 1 is final,
+    /// without row maxima, and `score2` is reported as [`crate::matesw::SCORE2_PENDING`].
+    lazy: bool,
 }
 
 /// One band to run: its parent and band, the group sort key.
@@ -182,20 +185,22 @@ impl Batch {
         max_hits: usize,
         quanta: usize,
     ) -> Option<Decision> {
-        let (dec, t1) = self.decide(t, q, p, max_hits);
-        self.commit(idx, t, q, dec, t1, p, quanta)
+        let (dec, t1, lazy) = self.decide(t, q, p, max_hits, false);
+        self.commit(idx, t, q, dec, t1, lazy, p, quanta)
     }
 
-    /// The prune decision of window `t` against mate `q` and its round-1 threshold, leaving the
-    /// components in this batch for [`Self::commit`].
+    /// The prune decision of window `t` against mate `q`, its round-1 threshold and whether that
+    /// threshold is a score floor (`lazy`: the caller defers `score2`), leaving the components in
+    /// this batch for [`Self::commit`].
     pub(crate) fn decide(
         &mut self,
         t: &[u8],
         q: &[u8],
         p: &Params,
         max_hits: usize,
-    ) -> (Decision, i32) {
-        rescue_prune::decide_bands(t, q, p, max_hits, &mut self.c19, &mut self.ct)
+        lazy: bool,
+    ) -> (Decision, i32, bool) {
+        rescue_prune::decide_bands(t, q, p, max_hits, &mut self.c19, &mut self.ct, lazy)
     }
 
     /// [`Self::plan`] after [`Self::decide`] gave `(dec, t1)` for the same `t` and `q`.
@@ -207,6 +212,7 @@ impl Batch {
         q: &[u8],
         dec: Decision,
         t1: i32,
+        lazy: bool,
         p: &Params,
         quanta: usize,
     ) -> Option<Decision> {
@@ -247,7 +253,7 @@ impl Batch {
             return None;
         }
         let c0 = self.bands.len();
-        if t1 > p.minsc {
+        if t1 > p.minsc && !lazy {
             for c in &self.c19 {
                 let Some(b) = to_band(c, p, p.minsc, len1, quanta, hb, he) else {
                     self.bands.truncate(b0);
@@ -273,6 +279,7 @@ impl Batch {
             te2: -1,
             buf: -1,
             round: 0,
+            lazy,
         });
         None
     }
@@ -304,6 +311,7 @@ impl Batch {
             te2: -1,
             buf: -1,
             round: 0,
+            lazy: false,
         });
     }
 
@@ -351,7 +359,11 @@ impl Batch {
             self.finish(pi, minsc, max_sc);
             let p = &self.parents[pi];
             let z = (p.s + max_sc - 1) / max_sc;
-            let done = p.t1 == minsc
+            // A lazy parent's `t1` is at most its score, so its bands held every alignment
+            // scoring `S` and round 1 gave `S`, `te` and `qe` exactly.
+            debug_assert!(!p.lazy || p.s >= p.t1);
+            let done = p.lazy
+                || p.t1 == minsc
                 || (p.s >= p.t1 && (p.s2 >= p.t1 || (p.te - z <= p.hb && p.te + z >= p.he)));
             if done {
                 write(p, &mut out[p.job as usize]);
@@ -438,7 +450,7 @@ impl Batch {
                 key: width_bucket(w) << 16 | rows,
             });
         }
-        if self.jobs.len() - first > 1 {
+        if self.jobs.len() - first > 1 && !p.lazy {
             // Merged row maxima over the hull rows.
             let h = (p.he - p.hb + 1) as usize;
             p.buf = self.pool.len() as i32;
@@ -510,6 +522,14 @@ impl Batch {
                     (-1, 0)
                 };
                 let nrows = (b.r1 - b.r0 + 1) as usize;
+                if p.lazy {
+                    // No row maxima: `score2` is the caller's to compute.
+                    if g8 > p.s || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)))
+                    {
+                        (p.s, p.te, p.qe) = (g8, te, qe);
+                    }
+                    continue;
+                }
                 let rl = self.work.lane_rows(l, nrows);
                 if p.buf < 0 {
                     // The parent's only band: its outputs are the parent's.
@@ -884,14 +904,19 @@ fn score2(rows: &[u8], row0: i32, s: i32, te: i32, minsc: i32, max_sc: i32) -> (
 }
 
 fn write(p: &Parent, o: &mut KswAlignResult) {
+    let (score2, te2) = if p.lazy {
+        (crate::matesw::SCORE2_PENDING, -1)
+    } else {
+        (p.s2, p.te2)
+    };
     *o = KswAlignResult {
         score: p.s,
         qb: -1,
         qe: if p.te >= 0 { p.qe } else { -1 },
         tb: -1,
         te: p.te,
-        score2: p.s2,
-        te2: p.te2,
+        score2,
+        te2,
     };
 }
 
@@ -2558,7 +2583,7 @@ mod tests {
         }
         let mat = scmat(1, 4);
         let p = Params::from(1, 4, 6, 1, 6, 1, 19).unwrap();
-        let (mut banded, mut checked) = (0usize, 0usize);
+        let (mut banded, mut checked, mut pending) = (0usize, 0usize, 0usize);
         for (set, minsc) in &sets {
             for chunk in set.chunks(1000) {
                 let jobs: Vec<KswJob> = chunk
@@ -2568,13 +2593,24 @@ mod tests {
                         target: t,
                     })
                     .collect();
-                let got = batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p));
+                let got = batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p), false);
+                let lazy = batched_align(&jobs, 5, &mat, 6, 1, 6, 1, *minsc, 1, Some(p), true);
                 for (i, (t, q)) in chunk.iter().enumerate() {
                     let full = ksw_align2(q, t, 5, &mat, 6, 1, 6, 1, *minsc, 1, 16);
                     let consumed = |r: &KswAlignResult| r.score >= *minsc;
                     checked += 1;
                     if consumed(&full) || consumed(&got[i]) {
                         assert_eq!(got[i], full, "job {i} of a set of {}", set.len());
+                    }
+                    // Lazy: identical but for a pending `score2`, and pending only above `minsc`.
+                    let mut l = lazy[i];
+                    if l.score2 == crate::matesw::SCORE2_PENDING {
+                        assert!(l.te2 == -1 && l.score > *minsc, "lazy job {i}: {l:?}");
+                        (l.score2, l.te2) = (full.score2, full.te2);
+                        pending += 1;
+                    }
+                    if consumed(&full) || consumed(&l) {
+                        assert_eq!(l, full, "lazy job {i} of a set of {}", set.len());
                     }
                 }
                 let mut b = Batch::default();
@@ -2586,7 +2622,11 @@ mod tests {
                 }
             }
         }
-        eprintln!("bands: {banded} banded of {checked}");
+        eprintln!("bands: {banded} banded, {pending} lazy, of {checked}");
+        assert!(
+            pending > checked / 50,
+            "too few lazy jobs: {pending} of {checked}"
+        );
         assert!(
             banded > checked / 20,
             "too few banded jobs: {banded} of {checked}"
@@ -2702,7 +2742,8 @@ mod tests {
             }
             let quanta = q.len().div_ceil(16) * 16;
             b.clear();
-            let (dec, t1) = rescue_prune::decide_bands(t, q, &p, 1000, &mut b.c19, &mut b.ct);
+            let (dec, t1, _) =
+                rescue_prune::decide_bands(t, q, &p, 1000, &mut b.c19, &mut b.ct, false);
             let Decision::Hull { hb, he } = dec else {
                 continue;
             };
