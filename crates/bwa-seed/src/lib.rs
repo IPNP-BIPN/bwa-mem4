@@ -1136,15 +1136,18 @@ impl LsSlot {
                     }
                 }
                 LsPhase::Bwd => {
+                    // `PosDone` and `Start` read no index memory (`Start` only prefetches), so a walk
+                    // that ends here starts the next one in this visit, as the fork's driver refills a
+                    // slot at once: a visit of their own bought a dispatch and nothing else.
                     if self.jj < 0 {
                         self.phase = LsPhase::PosDone;
-                        return;
+                        continue;
                     }
                     // Base code at the READ offset being prepended on the left this round.
                     let a = codes[self.jj as usize];
                     if a > 3 {
                         self.phase = LsPhase::PosDone;
-                        return;
+                        continue;
                     }
                     #[cfg(feature = "seed-stats")]
                     if stats_on {
@@ -1161,8 +1164,9 @@ impl LsSlot {
                     );
                     self.num_prev = num_curr;
                     self.jj -= 1;
-                    if num_curr == 0 {
+                    if num_curr == 0 || self.jj < 0 || codes[self.jj as usize] > 3 {
                         self.phase = LsPhase::PosDone;
+                        continue;
                     }
                     return;
                 }
