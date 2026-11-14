@@ -2517,10 +2517,10 @@ pub(crate) fn add_cigar(cigar: &[u32], hard_clip: bool, out: &mut Vec<u8>) {
 #[allow(clippy::too_many_arguments)]
 fn mem_aln2sam(
     bns: &BntSeq,
-    name: &str,
+    name: &[u8],
     seq: &[u8],
     qual: Option<&[u8]>,
-    comment: Option<&str>,
+    comment: Option<&[u8]>,
     list: &[MemAln],
     which: usize,
     m: Option<&MemAln>,
@@ -2602,7 +2602,7 @@ fn mem_aln2sam(
     }
 
     // ---- step 2: QNAME, FLAG ----
-    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(name);
     out.push(b'\t');
     // Bit 0x10000 is bwa-internal, not SAM: `mem_reg2sam` sets it instead of 0x800 under `-M`
     // (MEM_F_NO_MULTI) to mark "supplementary, but report it as secondary". Here it is masked off
@@ -2838,7 +2838,8 @@ fn mem_aln2sam(
             &p.cigar,
             hard,
             &emitted_seq,
-            comment,
+            // The comment is raw bytes now; the tag parser reads text, as it did before.
+            comment.map(String::from_utf8_lossy).as_deref(),
         );
         out.push(b'\n');
         return;
@@ -2877,10 +2878,10 @@ pub fn mem_reg2sam(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
-    name: &str,
+    name: &[u8],
     seq: &[u8],
     qual: Option<&[u8]>,
-    comment: Option<&str>,
+    comment: Option<&[u8]>,
     a: &[MemAlnReg],
     extra_flag: u32,
     m: Option<&MemAln>,
@@ -3062,10 +3063,8 @@ thread_local! {
 ///
 /// RETURNS whatever `w` reported; the only failure mode is the write itself.
 ///
-/// UNVERIFIED: the C aborts with `err_fatal` when the two ends' names differ ("paired reads have
-/// different names"). No equivalent check was found anywhere in this workspace, so mismatched pairs
-/// appear to be emitted silently rather than rejected. That affects diagnostics only, not the
-/// output of well-formed input.
+/// The C aborts here with `err_fatal` when the two ends' names differ ("paired reads have different
+/// names"). The same refusal lives earlier in this port, in `PairedFastqReader::next_batch`.
 #[allow(clippy::too_many_arguments)]
 pub fn mem_sam_pe<W: Write>(
     fm: &FmIndex,
@@ -3073,10 +3072,10 @@ pub fn mem_sam_pe<W: Write>(
     opt: &MemOpt,
     pes: &[PeStat; 4],
     id: u64,
-    names: &[&str; 2],
+    names: &[&[u8]; 2],
     seqs: &[&[u8]; 2],
     quals: &[Option<&[u8]>; 2],
-    comments: &[Option<&str>; 2],
+    comments: &[Option<&[u8]>; 2],
     a0: &mut Vec<MemAlnReg>,
     a1: &mut Vec<MemAlnReg>,
     rescue_done: bool,

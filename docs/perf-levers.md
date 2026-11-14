@@ -148,8 +148,8 @@ Caveat on the arithmetic: bwa-mem2's share is measured **directly** (`-S -P`); o
 
 ## PE profile on real GIAB: mate rescue is 47%, and it looks nothing like SE
 
-`BWA4_NO_RESCUE=1` skips mate rescue entirely -- the analogue of `bwa-mem2 -S`. It is a
-**measurement gate, not a lever**: it changes the output by design (63,102 records differ on real
+`-S` skips mate rescue entirely, as `bwa-mem2 -S` does (this run used `BWA4_NO_RESCUE=1`, since
+removed as a duplicate of `-S`). It is a **measurement gate, not a lever**: it changes the output by design (63,102 records differ on real
 GIAB; on wgsim it barely moves, which is the whole point). It exists so our rescue cost can be
 measured **directly** rather than decomposed as `PE - 2 x SE`.
 

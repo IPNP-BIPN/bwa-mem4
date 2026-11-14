@@ -198,7 +198,10 @@ fn main() -> anyhow::Result<()> {
     // Capture the raw command line for the @PG CL tag before clap consumes it. It must be the raw
     // argv, not a reconstruction from the parsed args: the CL field is meant to record what the
     // user actually typed, defaults and all, so the SAM file documents its own provenance.
-    let argv: Vec<String> = std::env::args().collect();
+    // Lossy because `args()` panics on a non-UTF-8 argument, and a path may be one.
+    let argv: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     // Arms the allocation probe if `BWA4_STAGE_ALLOC` is set. First thing after argv, because it
     // reads the environment (which allocates) and the allocator must never do that itself; every
     // allocation before this line goes uncounted, which is clap's parsing and nothing else.

@@ -166,6 +166,13 @@ def group_input(args, tmp, ref, rep):
         _, w, _ = run(args.oracle, ref, [f"{tmp}/{name}"])
         _, g, _ = run(args.ours, ref, [f"{tmp}/{name}"])
         rep.check(f"input: {name}", g == w)
+    # A first read shorter than the wrap width sits on one line: only later records show the wrapping.
+    short = [(recs[0][0], recs[0][1][:40], recs[0][2][:40])] + recs[1:]
+    write_fastq(f"{tmp}/short_flat.fq", short)
+    write_fastq(f"{tmp}/short_wrapped.fq", short, wrap=60)
+    _, w, _ = run(args.oracle, ref, [f"{tmp}/short_flat.fq"])
+    _, g, _ = run(args.ours, ref, [f"{tmp}/short_wrapped.fq"])
+    rep.check("input: wrapped after a short first read", g == w)
 
 
 def group_reference(args, tmp, _ref, rep):
@@ -270,7 +277,6 @@ def group_malformed(args, tmp, ref, rep):
         "truncated_before_quality": f"@a\n{seq}\n+\n",
         "no_separator": f"@a\n{seq}\n{'I' * 150}\n",
         "bare_at": "@\n",
-        "empty_file": "",
     }
     for name, body in cases.items():
         path = f"{tmp}/bad_{name}.fq"
@@ -284,6 +290,32 @@ def group_malformed(args, tmp, ref, rep):
     open(path, "wb").write(bytes(rng.randrange(256) for _ in range(50000)))
     _, _, err = run(args.ours, ref, [path])
     rep.check("malformed: random bytes", b"panicked" not in err, "PANICKED")
+
+    # Not broken at all, and bwa has an answer for each: exit code and bytes must both match.
+    empty = f"{tmp}/empty.fq"
+    open(empty, "w").close()
+    gzip_file(empty, f"{empty}.gz")
+    latin1 = f"{tmp}/latin1.fq"
+    with open(latin1, "wb") as f:
+        f.write(b"@r\xe9ad comm\xe9nt\n" + seq.encode() + b"\n+\n" + b"I" * len(seq) + b"\n")
+    for name, reads, extra in (
+        ("empty file", [empty], ()),
+        ("empty gzip", [f"{empty}.gz"], ()),
+        ("empty pair", [empty, empty], ()),
+        ("non-UTF-8 name and comment", [latin1], ("-C",)),
+    ):
+        want = run(args.oracle, ref, reads, extra)
+        got = run(args.ours, ref, reads, extra)
+        rep.check(f"same as oracle: {name}", got[:2] == want[:2])
+
+    # A lost mate keeps both files the same length, so only the names can show it.
+    r1, r2 = f"{tmp}/shift_1.fq", f"{tmp}/shift_2.fq"
+    write_fastq(r1, [(n, seq, "I" * len(seq)) for n in ("a", "b")])
+    write_fastq(r2, [(n, seq, "I" * len(seq)) for n in ("b", "a")])
+    rep.check(
+        "refused like the oracle: mates out of step",
+        run(args.ours, ref, [r1, r2])[0] != 0 and run(args.oracle, ref, [r1, r2])[0] != 0,
+    )
 
 
 GROUPS = {

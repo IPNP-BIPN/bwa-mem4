@@ -466,7 +466,7 @@ question about a vector: it costs more than sixteen well-predicted scalar iterat
 
 ## The GPU probe reproduces the kernel's shape but not its cache, and that is why it stops here (2026-08-30)
 
-`scripts/msl/mem_ops.m` now adds the real kernel's differences one at a time, on the same recurrence
+`scripts/msl/mem_ops.m` (now on branch `gpu`) adds the real kernel's differences one at a time, on the same recurrence
 and the same access pattern, to see how much of the gap between a bare loop and the shipped kernel
 each one explains:
 
