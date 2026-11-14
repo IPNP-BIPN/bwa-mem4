@@ -518,8 +518,13 @@ fn open_reader(path: &std::path::Path) -> Result<Option<Box<dyn FastxReader>>> {
     // there is no input to special-case here. See `gzip_threads` for the budget.
     #[cfg(feature = "parallel-gzip")]
     if is_gzip {
+        // 256 KiB decoded chunks, one queued per thread: the default 4 MiB with two spare queued
+        // cost 50 MB of a -t1 run (chr21 gzip: 443 -> 393 MB), and the first batch's wait is
+        // unchanged at -t8 and -t16 (78 and 158 ms).
         let dec = rapidgzip_core::Decoder::builder()
             .decoder_threads(gzip_threads())
+            .decoded_chunk_size(256 << 10)
+            .in_flight_chunks(gzip_threads() + 1)
             .build()
             .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
         let stream = dec
