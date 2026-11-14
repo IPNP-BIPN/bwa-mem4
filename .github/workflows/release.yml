@@ -146,11 +146,11 @@ jobs:
           - os: macos-15
             target_id: macos-arm64
             deployment_target: "11.0"
-            # The one platform where PGO pays, and it pays a lot: +12.4% on an M4, +6.1% SE / +8.5%
-            # PE at genome scale (docs/perf-levers.md). What it buys is branch layout on the branchy
-            # driver, seeding and SAM paths, and how much that is worth is a property of the core's
-            # branch predictor, not of this code.
-            pgo: true
+            # PGO used to pay here (+6.1% SE / +8.5% PE, docs/perf-levers.md), but the hand-placed
+            # inlining since has taken that gain, and the tiny training set now mislays the rescue
+            # path: on an M4, 2M GIAB pairs -t8, this exact recipe costs +3.7% PE cycles (656G vs
+            # 632G) for -1.3% SE (178G vs 180G). Trained on 50k real GIAB pairs it still loses both.
+            pgo: false
           - os: macos-15-intel
             target_id: macos-x86_64
             deployment_target: "10.12"
@@ -167,7 +167,7 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.ref || (inputs.tag || github.ref) }}
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -200,8 +200,8 @@ jobs:
       #   | AMD EPYC 7763 (Zen 3)       |104.22/104.27/104.27|107.36/108.15/108.24| -3.3% |
       #
       # The Zen 3 row uses THIS recipe, tiny-fixture training included, so it is not a proxy. So the
-      # step is now gated on `matrix.pgo`: Apple Silicon builds profile-guided, everything else
-      # builds plain, and the artefacts that no longer use it become reproducible from a clean tree
+      # step is now gated on `matrix.pgo`. Apple Silicon built profile-guided until 2026-11, when it
+      # stopped paying there too (see the macos-arm64 row); every target builds plain now, and the artefacts that no longer use it become reproducible from a clean tree
       # again. What PGO buys here is branch layout on the branchy driver, seeding and SAM paths, and
       # how much that is worth is a property of the core's branch predictor rather than of the code.
       #
@@ -403,10 +403,16 @@ jobs:
               printf 'It produces **identical output**: the release job rebuilds the committed index with it and diffs\n'
               printf 'a full alignment against the baseline binary'\''s, byte for byte, before either is packaged.\n\n'
               [ -n "$SPEED" ] && printf '%s\n\n' "$SPEED"
-              printf 'Use it if your CPU has the instruction set:\n\n'
-              printf '    grep -q %s /proc/cpuinfo && ./bwa-mem4-%s mem ...\n\n' "$PROBE" "$VC"
               printf '`bwa-mem4` itself stays compiled at the x86-64 baseline so that it runs anywhere, including hosts\n'
-              printf 'where the variant would die with an illegal instruction. Nothing chooses between them for you.\n'
+              printf 'where the variant would die with an illegal instruction.\n'
+              if [ "$VC" = x86-64-v3 ]; then
+                # `exec_v3` in crates/bwa-cli/src/main.rs looks for exactly this file name.
+                printf 'On a host with %s it hands over to `bwa-mem4-%s` beside it at startup, so keep\n' "$NEEDS" "$VC"
+                printf 'the two files together and run `./bwa-mem4 mem ...` as usual.\n'
+              else
+                printf 'Use it if your CPU has the instruction set:\n\n'
+                printf '    grep -q %s /proc/cpuinfo && ./bwa-mem4-%s mem ...\n' "$PROBE" "$VC"
+              fi
             } > "dist/$NAME/VARIANT-$VC.md"
           fi
           # LICENSE travels with the binary: this is a derivative work of bwa-mem2 and the MIT terms

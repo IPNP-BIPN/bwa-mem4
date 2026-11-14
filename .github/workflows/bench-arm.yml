@@ -70,7 +70,7 @@ jobs:
           grep -m1 -E 'CPU implementer|CPU part' /proc/cpuinfo || true
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: "1.96.1"
 
@@ -79,11 +79,28 @@ jobs:
       # bwa-mem2 (index + oracle) and wgsim (reads) from bioconda. The fork (fg-labs bwa-mem3) is
       # attempted but OPTIONAL: linux-aarch64 bioconda coverage is thinner than linux-64, and the
       # load-bearing signal (the W-sweep on our own binary) does not need it.
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + wgsim (+ fork, optional) via bioconda
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
@@ -109,7 +126,7 @@ jobs:
         run: |
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz
           gunzip -f chr21.fa.gz
           ls -la chr21.fa
 
@@ -210,15 +227,32 @@ jobs:
           echo "nproc: $(nproc)"; grep -m1 -E 'CPU implementer|CPU part' /proc/cpuinfo || true
           # 0x41=ARM implementer; part 0xd40=Neoverse-v1, 0xd4f=Neoverse-v2.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: "1.96.1"
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + wgsim + fork via bioconda
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
@@ -234,7 +268,8 @@ jobs:
       - name: Fetch + index chr21, simulate reads
         run: |
           mkdir -p work && cd work
-          curl -fsSL --retry 3 "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz" -o chr21.fa.gz
+          curl -fsSL --retry 3 "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz" -o chr21.fa.gz \
+            || curl -fsSL --retry 5 --retry-all-errors "https://ftp.ebi.ac.uk/ensemblorg/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz" -o chr21.fa.gz
           gunzip -f chr21.fa.gz
           bwa-mem2 index chr21.fa
           n="${{ github.event.inputs.read_pairs || '1000000' }}"
@@ -344,7 +379,7 @@ jobs:
           grep -m1 -E 'CPU implementer|CPU part' /proc/cpuinfo || true
 
       - name: Install Rust with the LLVM tools
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: "1.96.1"
           # `llvm-profdata` must be the toolchain's, matching the LLVM rustc was built with.
@@ -352,11 +387,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + wgsim (bioconda)
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
@@ -373,7 +425,7 @@ jobs:
         run: |
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           bwa-mem2 index chr21.fa
           # Different seeds for training and measurement, so PGO is not handed the exact reads it is
           # then timed on.

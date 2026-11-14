@@ -21,6 +21,11 @@ repository = "https://github.com/IPNP-BIPN/bwa-mem4"
 # between "the gate is meaningful" and "the gate is off". Each entry is a lint the tree does not
 # currently satisfy. They are allowed EXPLICITLY, not silenced globally, so a NEW lint of any other
 # kind still fails the build. Burn these down rather than adding to them.
+[workspace.lints.rust]
+# `--cfg bwa4_r3_outline` (perf CI alt_rustflags) keeps round 3's step out of line, so icount
+# counts it apart.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bwa4_r3_outline)'] }
+
 [workspace.lints.clippy]
 # Doc-comment formatting in the module headers written during the documentation pass. Cosmetic,
 # affects rustdoc rendering only. Safe to fix, just not worth a reflow of every glossary table today.
@@ -75,7 +80,8 @@ bgzf = { version = "0.4", features = ["multithreading-simple"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-mimalloc = { version = "0.1", default-features = false }
+libmimalloc-sys = { version = "0.1.49", default-features = false }
+smallvec = "1.15"
 # BAM/CRAM output. `hts-sys` compiles the vendored htslib C sources with the system toolchain, so
 # there is no runtime dependency on a brew/apt htslib. `default-features = false` drops bzip2, lzma
 # and curl: we only ever WRITE local files, and htslib's own writers never pick those codecs (BAM is

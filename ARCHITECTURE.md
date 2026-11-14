@@ -418,7 +418,7 @@ correlated. Exploiting that is worth a lot of accuracy.
    distribution says within a few hundred bases where the mate must be, so a full local
    Smith-Waterman (`bwa_extend::ksw_align2`) over that small window finds it. On real data this is
    roughly 47% of paired-end wall time, which is why it has its own vectorized kernel
-   (`crates/bwa-neon/src/matesw.rs`) and its own kill switch (`-S`, or `BWA4_NO_RESCUE`).
+   (`crates/bwa-neon/src/matesw.rs`) and its own kill switch (`-S`).
 
 3. **`mem_pair` (`pe.rs:1042`).** Build one flat list of every candidate placement from both reads,
    packed into two `u64`s so a plain sort orders them by genomic position, then sweep left to right.
@@ -490,7 +490,7 @@ table (nothing depends on something listed above it, except `bwa-cli` which depe
 | `bwa-extend` | The scalar Smith-Waterman kernels: `ksw_extend2` (banded local extension), `ksw_global2` (banded global, for CIGARs), `ksw_align2` / `ksw_local_fwd` (mate rescue). Defines the `SwBackend` trait and the two acceptance harnesses that every accelerated backend must pass | nothing |
 | `bwa-neon` | Vectorized backends, NEON on AArch64 and AVX2 on x86_64. `batched.rs` bins jobs by provable score bound into u8 (16/32 lane) and i16 (8/16 lane) kernels with a scalar fallback, plus an ungapped fast path; `matesw.rs` does the same for mate-rescue local SW. Note the single-alignment `extend` deliberately delegates to scalar: one alignment has no lanes to fill | `bwa-extend` |
 | `bwa-mem` | The alignment core and pipeline glue: extension driver (`lib.rs`, `across.rs`), dedup / primary marking / MAPQ (`primary.rs`), CIGAR / NM / MD (`cigar.rs`), all paired-end logic (`pe.rs`), `XA` generation (`alt.rs`) | `bwa-core`, `bwa-index`, `bwa-seed`, `bwa-chain`, `bwa-extend`, `bwa-neon` |
-| `bwa-cli` | The `bwa-mem4` binary: `index` and `mem` subcommands, option parsing and validation (`cmd_mem.rs`, 1484 lines, half of it per-option documentation), the threaded read/process/write pipeline | most of the above, `clap`, `rayon`, `bgzf`, `mimalloc` |
+| `bwa-cli` | The `bwa-mem4` binary: `index` and `mem` subcommands, option parsing and validation (`cmd_mem.rs`, 1484 lines, half of it per-option documentation), the threaded read/process/write pipeline | most of the above, `clap`, `rayon`, `bgzf`, `libmimalloc-sys` |
 | `bwa-diff` | The `sam-diff` binary: field-level SAM concordance reporting, so a divergence reads as "37 records differ in XA" rather than as a byte offset. Deliberately lossy (five fields, primaries only, order-insensitive), so a clean report is **not** proof of parity | `serde`, `serde_json` |
 
 `bwa-sam` was an empty placeholder crate, reserved early for primary marking / MAPQ / CIGAR / tags
@@ -819,8 +819,8 @@ directory.
 | Script | What it does |
 |---|---|
 | `check.sh` | `fmt --check` + `clippy -D warnings` + `cargo test --workspace`. Must be green on every PR |
-| `oracle_diff.sh` | End-to-end single-end SAM diff versus the installed `bwa-mem2`. Preflights that the oracle really is version 2.3, gates `@SQ` byte-identity, then runs `sam-diff`. Must not regress |
-| `index_diff.sh` | `cmp` our five index files against `bwa-mem2 index`. Exits 0 with SKIP if `bwa-mem4 index` is a stub |
+| `oracle_diff.sh` | End-to-end single-end SAM diff versus the installed `bwa-mem2`. Preflights that the oracle really is version 2.3, then gates `@SQ` and every record byte-identical, SE and PE (when `work/r2.fq` exists); `sam-diff` explains a failure. Must not regress |
+| `index_diff.sh` | `cmp` our five index files against `bwa-mem2 index` on a region of `REF`. Fails if either index fails or any file differs |
 | `scale_test.sh` | Whole-chromosome gate: index byte-identity (hard fail) then paired-end concordance |
 | `setup_reference.sh` | Recreates the gitignored `reference/`: clones bwa-mem2 at rev `7aa5ff6c`, downloads and sha256-verifies the two patches, applies them. This is what makes the oracle reproducible |
 | `make_testdata.sh` | Builds `work/`: a chr20 slice, its index, and wgsim reads (seed 11) |
@@ -840,14 +840,14 @@ made the `mem_gen_alt` work tractable (`DIVERGENCES.md`).
 
 The code carries built-in tracing, all gated on environment variables so they cost nothing when
 unset. Behaviour gates (these change output or skip work, so never leave one set during a parity
-run): `BWA4_NO_RESCUE`, `BWA4_NO_DISCARD`, `BWA4_NO_SKIP_CONTAINED`, `BWA4_SCALAR_RESCUE`,
+run): `BWA4_NO_DISCARD`, `BWA4_NO_SKIP_CONTAINED`, `BWA4_SCALAR_RESCUE`,
 `BWA4_SEED_R2_SERIAL`, `BWA4_LOCKSTEP_N`, `BWA4_SA_SORT`, `BWA4_SA_PER_READ`.
 
 Dumps and timers (read-only): `BWA4_DUMP_SMEMS`, `BWA4_DUMP_CHAINS`, `BWA4_DUMP_REGS`,
 `BWA4_DUMP_PRESORT` (takes a read id, dumps that read's regions immediately before the hash sort,
 which is where parity investigations usually start), `BWA4_DUMP_BW` (band-retry trace in bwa's
 `-v 4` format, so it diffs directly against the oracle), `BWA4_DUMP_PESTAT`, `BWA4_CHAIN_TIME`,
-`BWA4_MATESW_TIME`, `BWA4_TRAFFIC`, `BWA4_GPU_STATS`.
+`BWA4_MATESW_TIME`, `BWA4_TRAFFIC`.
 
 ### The method that actually cracks a divergence
 

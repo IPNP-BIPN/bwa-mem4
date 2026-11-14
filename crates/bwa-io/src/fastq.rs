@@ -45,7 +45,6 @@
 //! | `Self { inner }` | field shorthand: when a local variable has the same name as the field, writing it once means `inner: inner`. |
 //! | `Vec<u8>` vs `&[u8]` | owned bytes versus a borrowed window onto somebody else's. [`Record`] holds owned copies because the parser reuses one internal buffer for every record; a borrow would dangle as soon as the next read is pulled. |
 //! | `.into_owned()` | turns a maybe-borrowed value into a definitely-owned one, copying only if it was still a borrow. Used to lift text out of the parser's buffer. |
-//! | `String::from_utf8_lossy` | interprets bytes as text, substituting a replacement character for anything invalid instead of failing. Read names are not guaranteed to be valid UTF-8, and refusing a file over a stray byte in a name would be worse than mangling that one name. |
 //! | `match (a, b)` | matching on a PAIR of values at once. The paired reader uses it to handle all four end-of-file combinations of two files in one place, and the compiler checks that none is forgotten. |
 //! | `_ => ...` | the catch-all arm, here standing for "exactly one of the two files ended". |
 //! | `let Some(x) = ... else { ... }` | bind and continue, or run a block that must leave the function. Used for the two mid-pair end-of-file checks. |
@@ -89,11 +88,9 @@ pub struct Record {
     /// every SAM emitter and, for `-p` input, by [`InterleavedFastqReader::next_batch`] to
     /// recognise mates.
     name_len: u32,
-    /// Bytes of `buf` holding FASTQ line 2, the bases as ASCII in the orientation they came off the
-    /// instrument, starting at `name_len`. Typically 100-150. Not uppercased, not validated, not
-    /// 2-bit packed here: any byte outside ACGT/acgt becomes N (code 4) when `dna::nt4` is applied
-    /// downstream. Feeds seeding, and (possibly reverse-complemented and soft-clip-sliced) SAM
-    /// column 10 (SEQ).
+    /// Bases in FASTQ line 2, in the orientation they came off the instrument, held from offset
+    /// `name_len` in the form `bases` says. Typically 100-150. Feeds seeding, and (possibly
+    /// reverse-complemented and soft-clip-sliced) SAM column 10 (SEQ).
     seq_len: u32,
     /// Bytes of `buf` holding the kseq `comment`, at the end. 0 means no comment, which is the same
     /// thing here: [`split_id`] only reports a comment when it has at least one non-whitespace byte.
@@ -107,29 +104,288 @@ pub struct Record {
     /// sequence, and rather than `comment_len`'s zero-means-absent trick because a zero-length read
     /// would then be indistinguishable from a FASTA one. `false` makes SAM column 11 `*`.
     has_qual: bool,
+    /// How `buf` holds the bases. [`FastqReader::nt4`] picks the coded forms.
+    bases: Bases,
+}
+
+/// The form a [`Record`]'s bases take in its buffer.
+///
+/// `Packed` is a memory measure. The aligner holds every record of two batches (the one aligning
+/// and the one the reader has ready), and a 150 bp read with a 40-byte name was 340 bytes in the
+/// allocator's 384-byte class. Four bases a byte makes it 228 bytes in the 256 class: chr21, 1M
+/// pairs, -t4, peak RSS 1030 -> 960 MB, and more at higher `-t`, where batches scale with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bases {
+    /// ASCII as read, `seq_len` bytes, not uppercased or validated.
+    Ascii,
+    /// nt4 codes (A=0, C=1, G=2, T=3, anything else 4), one a byte: a read holding a base that is
+    /// not ACGT/acgt, which two bits cannot hold.
+    Codes,
+    /// nt4 codes 0..=3, four a byte, base `i` in bits `2 * (i % 4)` of byte `i / 4`.
+    Packed,
+}
+
+/// The nt4 code of an A/C/G/T byte in either case: bits 1 and 2 of the ASCII, XORed. Only defined
+/// on those eight bytes; [`is_acgt`] says whether a byte is one of them.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline]
+fn acgt_code(b: u8) -> u8 {
+    ((b >> 1) ^ (b >> 2)) & 3
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline]
+fn is_acgt(b: u8) -> bool {
+    matches!(b & 0xDF, b'A' | b'C' | b'G' | b'T')
+}
+
+/// Pack 64 bases four a byte, base `i` in bits `2 * (i % 4)` of byte `i / 4`, and say whether all
+/// were A/C/G/T in either case (else `dst` is meaningless). NEON: the code is bits 1 and 2 of the
+/// ASCII XORed, and `ld4` de-interleaves so each output byte is one lane.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is baseline on aarch64; reads 64 bytes of `src`, writes 16 of `dst`.
+    unsafe {
+        let (m3, mdf) = (vdupq_n_u8(3), vdupq_n_u8(0xDF));
+        let hit = |v| {
+            let u = vandq_u8(v, mdf);
+            let ac = vorrq_u8(vceqq_u8(u, vdupq_n_u8(b'A')), vceqq_u8(u, vdupq_n_u8(b'C')));
+            vorrq_u8(
+                ac,
+                vorrq_u8(vceqq_u8(u, vdupq_n_u8(b'G')), vceqq_u8(u, vdupq_n_u8(b'T'))),
+            )
+        };
+        let code = |v| vandq_u8(veorq_u8(vshrq_n_u8::<1>(v), vshrq_n_u8::<2>(v)), m3);
+        // Lane `j` of `q.k` is base `4j + k`.
+        let q = vld4q_u8(src.as_ptr());
+        let all = vandq_u8(vandq_u8(hit(q.0), hit(q.1)), vandq_u8(hit(q.2), hit(q.3)));
+        let lo = vorrq_u8(code(q.0), vshlq_n_u8::<2>(code(q.1)));
+        let hi = vorrq_u8(vshlq_n_u8::<4>(code(q.2)), vshlq_n_u8::<6>(code(q.3)));
+        vst1q_u8(dst.as_mut_ptr(), vorrq_u8(lo, hi));
+        vminvq_u8(all) == 0xFF
+    }
+}
+
+/// [`pack64`] in SSE2: codes byte by byte, then each 32-bit lane's four into its low byte, then two
+/// narrowing packs.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
+    use std::arch::x86_64::*;
+    // SAFETY: SSE2 is baseline on x86-64; reads 64 bytes of `src`, writes 16 of `dst`.
+    unsafe {
+        let (m3, mdf, mff) = (
+            _mm_set1_epi8(3),
+            _mm_set1_epi8(0xDF_u8 as i8),
+            _mm_set1_epi32(0xFF),
+        );
+        let eq = |u, b: u8| _mm_cmpeq_epi8(u, _mm_set1_epi8(b as i8));
+        let mut all = _mm_set1_epi8(-1);
+        let mut w = [_mm_setzero_si128(); 4];
+        for (k, wk) in w.iter_mut().enumerate() {
+            let v = _mm_loadu_si128(src.as_ptr().add(16 * k).cast());
+            let u = _mm_and_si128(v, mdf);
+            let ac = _mm_or_si128(eq(u, b'A'), eq(u, b'C'));
+            all = _mm_and_si128(
+                all,
+                _mm_or_si128(ac, _mm_or_si128(eq(u, b'G'), eq(u, b'T'))),
+            );
+            // 16-bit shifts: the bits a byte borrows from its neighbour are masked off.
+            let c = _mm_and_si128(
+                _mm_xor_si128(_mm_srli_epi16::<1>(v), _mm_srli_epi16::<2>(v)),
+                m3,
+            );
+            // c0 | c1 << 2 | c2 << 4 | c3 << 6 in each 32-bit lane's low byte.
+            let lo = _mm_or_si128(c, _mm_srli_epi32::<6>(c));
+            let hi = _mm_or_si128(_mm_srli_epi32::<12>(c), _mm_srli_epi32::<18>(c));
+            *wk = _mm_and_si128(_mm_or_si128(lo, hi), mff);
+        }
+        let b = _mm_packus_epi16(_mm_packs_epi32(w[0], w[1]), _mm_packs_epi32(w[2], w[3]));
+        _mm_storeu_si128(dst.as_mut_ptr().cast(), b);
+        _mm_movemask_epi8(all) == 0xFFFF
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
+    for (d, q) in dst.iter_mut().zip(src.chunks_exact(4)) {
+        *d = acgt_code(q[0]) | acgt_code(q[1]) << 2 | acgt_code(q[2]) << 4 | acgt_code(q[3]) << 6;
+    }
+    src.iter().all(|&b| is_acgt(b))
+}
+
+/// Write the 64 codes 16 packed bytes hold to `dst`. NEON: an interleaving `st4` puts lane `j` of
+/// shift `k` at byte `4j + k`.
+///
+/// # Safety
+///
+/// `dst` must be valid for 64 bytes of writes.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn unpack16(src: &[u8; 16], dst: *mut u8) {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is baseline on aarch64; reads 16 bytes of `src`, writes the 64 the caller vouches for.
+    unsafe {
+        let (v, m3) = (vld1q_u8(src.as_ptr()), vdupq_n_u8(3));
+        let codes = uint8x16x4_t(
+            vandq_u8(v, m3),
+            vandq_u8(vshrq_n_u8::<2>(v), m3),
+            vandq_u8(vshrq_n_u8::<4>(v), m3),
+            vshrq_n_u8::<6>(v),
+        );
+        vst4q_u8(dst, codes);
+    }
+}
+
+/// [`unpack16`] in SSE2: byte then 16-bit unpacks do the interleave.
+///
+/// # Safety
+///
+/// `dst` must be valid for 64 bytes of writes.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn unpack16(src: &[u8; 16], dst: *mut u8) {
+    use std::arch::x86_64::*;
+    // SAFETY: SSE2 is baseline on x86-64; reads 16 bytes of `src`, writes the 64 the caller vouches for.
+    unsafe {
+        let (v, m3) = (_mm_loadu_si128(src.as_ptr().cast()), _mm_set1_epi8(3));
+        let c0 = _mm_and_si128(v, m3);
+        let c1 = _mm_and_si128(_mm_srli_epi16::<2>(v), m3);
+        let c2 = _mm_and_si128(_mm_srli_epi16::<4>(v), m3);
+        let c3 = _mm_and_si128(_mm_srli_epi16::<6>(v), m3);
+        let (lo01, hi01) = (_mm_unpacklo_epi8(c0, c1), _mm_unpackhi_epi8(c0, c1));
+        let (lo23, hi23) = (_mm_unpacklo_epi8(c2, c3), _mm_unpackhi_epi8(c2, c3));
+        let p = dst.cast::<__m128i>();
+        _mm_storeu_si128(p, _mm_unpacklo_epi16(lo01, lo23));
+        _mm_storeu_si128(p.add(1), _mm_unpackhi_epi16(lo01, lo23));
+        _mm_storeu_si128(p.add(2), _mm_unpacklo_epi16(hi01, hi23));
+        _mm_storeu_si128(p.add(3), _mm_unpackhi_epi16(hi01, hi23));
+    }
+}
+
+/// # Safety
+///
+/// `dst` must be valid for 64 bytes of writes.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+unsafe fn unpack16(src: &[u8; 16], dst: *mut u8) {
+    for (j, &b) in src.iter().enumerate() {
+        // SAFETY: bytes 4j..4j + 4 of the 64 the caller vouches for.
+        unsafe {
+            dst.add(4 * j).cast::<[u8; 4]>().write_unaligned([
+                b & 3,
+                b >> 2 & 3,
+                b >> 4 & 3,
+                b >> 6,
+            ])
+        };
+    }
+}
+
+/// Append `seq` packed four codes a byte, and say whether every byte of it is A/C/G/T in either
+/// case. On `false` the bytes appended are meaningless and the caller drops them. A short last
+/// block is padded with `A`, so it takes the SIMD path too.
+fn pack_acgt(seq: &[u8], out: &mut Vec<u8>) -> bool {
+    let mut ok = true;
+    let mut packed = [0u8; 16];
+    for block in seq.chunks(64) {
+        let mut pad = [b'A'; 64];
+        let src: &[u8; 64] = match block.try_into() {
+            Ok(full) => full,
+            Err(_) => {
+                pad[..block.len()].copy_from_slice(block);
+                &pad
+            }
+        };
+        ok &= pack64(src, &mut packed);
+        out.extend_from_slice(&packed[..block.len().div_ceil(4)]);
+    }
+    ok
+}
+
+/// Append the first `n` codes `packed` holds (four a byte, low bits first; `packed` may run past
+/// them). Every read is unpacked three times (seeding, mate rescue, SAM), so this is SIMD all the
+/// way, straight into `out`'s spare capacity: a short last block is padded.
+fn unpack_codes(packed: &[u8], n: usize, out: &mut Vec<u8>) {
+    assert!(n <= 4 * packed.len());
+    let at = out.len();
+    out.reserve(64 * packed.len().div_ceil(16));
+    let mut pad = [0u8; 16];
+    for (k, block) in packed.chunks(16).enumerate() {
+        let src: &[u8; 16] = match block.try_into() {
+            Ok(full) => full,
+            Err(_) => {
+                pad[..block.len()].copy_from_slice(block);
+                &pad
+            }
+        };
+        // SAFETY: the reserve left 64 bytes of spare capacity per block past `at`.
+        unsafe { unpack16(src, out.as_mut_ptr().add(at + 64 * k)) };
+    }
+    // SAFETY: the blocks wrote every byte below `at + 4 * packed.len()`, which covers `at + n`.
+    unsafe { out.set_len(at + n) };
 }
 
 impl Record {
-    /// SAM column 1 (QNAME).
-    ///
-    /// # Panics
-    /// Never in practice: the bytes were produced by `String::from_utf8_lossy` at parse time, so
-    /// they are valid UTF-8 by construction. The check is kept rather than elided with `unsafe`
-    /// because it costs a scan of ~40 bytes per call against the ~150-byte copies this type exists
-    /// to remove.
+    /// SAM column 1 (QNAME), as raw bytes: a FASTQ header need not be valid UTF-8, and bwa copies it
+    /// through unchanged, so converting it here would change the output.
     #[inline]
     #[must_use]
-    pub fn name(&self) -> &str {
-        std::str::from_utf8(&self.buf[..self.name_len as usize])
-            .expect("record name is UTF-8 by construction (from_utf8_lossy at parse time)")
+    pub fn name(&self) -> &[u8] {
+        &self.buf[..self.name_len as usize]
     }
 
-    /// FASTQ line 2: the ASCII bases.
+    /// FASTQ line 2 as ASCII: a record from a reader without [`FastqReader::nt4`].
+    ///
+    /// # Panics
+    ///
+    /// On a record whose bases are coded; [`Record::codes_into`] reads those.
     #[inline]
     #[must_use]
     pub fn seq(&self) -> &[u8] {
+        assert!(
+            self.bases == Bases::Ascii,
+            "coded bases: read them with Record::codes_into"
+        );
         let start = self.name_len as usize;
         &self.buf[start..start + self.seq_len as usize]
+    }
+
+    /// Number of bases.
+    #[inline]
+    #[must_use]
+    pub fn seq_len(&self) -> usize {
+        self.seq_len as usize
+    }
+
+    /// Append the bases as nt4 codes (A=0, C=1, G=2, T=3, anything else 4), bwa's encoding.
+    pub fn codes_into(&self, out: &mut Vec<u8>) {
+        let n = self.seq_len as usize;
+        let start = self.name_len as usize;
+        match self.bases {
+            Bases::Ascii => out.extend(
+                self.buf[start..start + n]
+                    .iter()
+                    .map(|&b| bwa_core::dna::nt4(b)),
+            ),
+            Bases::Codes => out.extend_from_slice(&self.buf[start..start + n]),
+            Bases::Packed => {
+                // Whole 16-byte blocks where the buffer has them (the quality string follows), so
+                // the last block needs no padding copy; the codes past `n` it yields are dropped.
+                let end = (start + n.div_ceil(4).next_multiple_of(16)).min(self.buf.len());
+                unpack_codes(&self.buf[start..end], n, out);
+            }
+        }
+    }
+
+    /// Bytes of `buf` the bases take.
+    #[inline]
+    fn seq_bytes(&self) -> usize {
+        match self.bases {
+            Bases::Packed => (self.seq_len as usize).div_ceil(4),
+            Bases::Ascii | Bases::Codes => self.seq_len as usize,
+        }
     }
 
     /// FASTQ line 4: Phred+33 quality, one byte per base, or `None` for FASTA input.
@@ -139,25 +395,18 @@ impl Record {
         if !self.has_qual {
             return None;
         }
-        let start = self.name_len as usize + self.seq_len as usize;
+        let start = self.name_len as usize + self.seq_bytes();
         Some(&self.buf[start..start + self.seq_len as usize])
     }
 
-    /// The kseq `comment`, or `None` for a bare-name header.
-    ///
-    /// # Panics
-    /// Never in practice, for the same reason as [`Record::name`].
+    /// The kseq `comment`, or `None` for a bare-name header. Raw bytes, as [`Record::name`].
     #[inline]
     #[must_use]
-    pub fn comment(&self) -> Option<&str> {
+    pub fn comment(&self) -> Option<&[u8]> {
         if self.comment_len == 0 {
             return None;
         }
-        let end = self.buf.len();
-        Some(
-            std::str::from_utf8(&self.buf[end - self.comment_len as usize..])
-                .expect("record comment is UTF-8 by construction (from_utf8_lossy at parse time)"),
-        )
+        Some(&self.buf[self.buf.len() - self.comment_len as usize..])
     }
 }
 
@@ -167,7 +416,10 @@ pub struct FastqReader {
     /// decompressor. Boxed because the concrete parser type depends on the compression needletail
     /// sniffed from the file's magic bytes. Advanced only by [`FastqReader::next_record`]; holds
     /// all the reader's position state, so this struct has no offset of its own.
-    inner: Box<dyn FastxReader>,
+    /// `None` for an empty input: it yields no records.
+    inner: Option<Box<dyn FastxReader>>,
+    /// Whether records come out with their bases nt4-coded (see [`FastqReader::nt4`]).
+    nt4: bool,
 }
 
 /// Bytes peeked from the head of an input to decide whether it needs [`UnwrapFastq`].
@@ -453,7 +705,20 @@ fn unwrap_multiline_fastq<R: std::io::Read + Send + 'static>(
 /// [`Error::Fastq`] if the file cannot be opened, is empty, or is not a format any enabled backend
 /// recognises. The message names the path, since a user who passed the wrong file gets nothing else
 /// to go on.
-fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
+/// needletail's parser, or `None` for an input with no bytes at all. bwa-mem2 treats an empty FASTQ
+/// (or an empty `.gz`) as zero reads, writes the header and exits 0; needletail refuses it with
+/// `EmptyFile`, which would fail a pipeline that feeds us one empty chunk among many.
+fn parsed(
+    r: std::result::Result<Box<dyn FastxReader>, needletail::errors::ParseError>,
+) -> Result<Option<Box<dyn FastxReader>>> {
+    match r {
+        Ok(r) => Ok(Some(r)),
+        Err(e) if e.kind == needletail::errors::ParseErrorKind::EmptyFile => Ok(None),
+        Err(e) => Err(Error::Fastq(e.to_string())),
+    }
+}
+
+fn open_reader(path: &std::path::Path) -> Result<Option<Box<dyn FastxReader>>> {
     // Whether the path can be opened a second time and read from the start. A regular file can; a
     // FIFO, a process substitution (`<(zcat r1.gz)`) or a character device cannot, because the two
     // magic bytes read below are consumed from the stream and never come back.
@@ -470,15 +735,17 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // text.
     let magic = {
         use std::io::Read;
-        let mut buf = [0u8; 2];
-        // A file shorter than two bytes cannot be a FASTQ; let needletail produce that error.
-        let n = opened.read(&mut buf).unwrap_or(0);
-        if n == 2 {
-            Some(buf)
-        } else {
-            None
-        }
+        let mut buf = Vec::with_capacity(2);
+        // `take(2).read_to_end`, not one `read`: a pipe can hand over a single byte first, and
+        // that byte must still go back in front of the stream below.
+        (&mut opened)
+            .take(2)
+            .read_to_end(&mut buf)
+            .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+        buf
     };
+    let head_bytes = magic.clone();
+    let magic: Option<[u8; 2]> = magic.try_into().ok();
     let is_gzip = magic == Some([0x1f, 0x8b]);
     let looks_like_text = magic.is_some_and(|m| m[0] == b'@' || m[0] == b'>');
 
@@ -486,27 +753,32 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // let it sniff compression itself. Sequential by construction, which is also what any parallel
     // decoder would have to fall back to on a stream it cannot seek in.
     if !seekable {
-        let head = std::io::Cursor::new(magic.map(Vec::from).unwrap_or_default());
+        let head = std::io::Cursor::new(head_bytes);
         let stream = std::io::Read::chain(head, opened);
         let stream = unwrap_multiline_fastq(stream)?;
-        return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(needletail::parse_fastx_reader(stream));
     }
 
-    // Gzipped input, parallel path: rapidgzip decodes ONE stream on several threads and hands back
+    // Gzipped input, rapidgzip path: it decodes ONE stream on `gzip_threads` threads and hands back
     // a `Read`, so needletail parses plain text exactly as it would from an uncompressed file. A
     // pipe or FIFO is not seekable and the crate falls back to sequential decoding on its own, so
     // there is no input to special-case here. See `gzip_threads` for the budget.
     #[cfg(feature = "parallel-gzip")]
     if is_gzip {
+        // 256 KiB decoded chunks, one queued per thread: the default 4 MiB with two spare queued
+        // cost 50 MB of a -t1 run (chr21 gzip: 443 -> 393 MB), and the first batch's wait is
+        // unchanged at -t8 and -t16 (78 and 158 ms).
         let dec = rapidgzip_core::Decoder::builder()
             .decoder_threads(gzip_threads())
+            .decoded_chunk_size(256 << 10)
+            .in_flight_chunks(gzip_threads() + 1)
             .build()
             .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
         let stream = dec
             .open(path)
             .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
         let stream = unwrap_multiline_fastq(stream)?;
-        return needletail::parse_fastx_reader(stream).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(needletail::parse_fastx_reader(stream));
     }
 
     // Gzipped input, single-thread fallback: inflate on a thread of its own and hand needletail the
@@ -515,7 +787,7 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     #[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
     if is_gzip {
         let blocks = unwrap_multiline_fastq(spawn_inflate(path)?)?;
-        return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(needletail::parse_fastx_reader(blocks));
     }
 
     // PLAIN TEXT, AND IT GETS THE SAME READ-AHEAD THREAD THE COMPRESSED PATHS GET.
@@ -534,11 +806,11 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
     // delivered by a different thread.
     if !is_gzip && looks_like_text {
         let blocks = unwrap_multiline_fastq(spawn_plain(path)?)?;
-        return needletail::parse_fastx_reader(blocks).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(needletail::parse_fastx_reader(blocks));
     }
 
     if is_gzip || looks_like_text || cfg!(not(feature = "multi-format")) {
-        return parse_fastx_file(path).map_err(|e| Error::Fastq(e.to_string()));
+        return parsed(parse_fastx_file(path));
     }
 
     #[cfg(feature = "multi-format")]
@@ -547,62 +819,38 @@ fn open_reader(path: &std::path::Path) -> Result<Box<dyn FastxReader>> {
         // needletail then parses the decompressed stream exactly as it would a plain file.
         let (reader, _format) = niffler::send::from_path(path)
             .map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
-        needletail::parse_fastx_reader(reader).map_err(|e| Error::Fastq(e.to_string()))
+        parsed(needletail::parse_fastx_reader(reader))
     }
     #[cfg(not(feature = "multi-format"))]
     unreachable!("the branch above returns when the feature is off")
 }
 
-/// Decoder threads per gzipped input file, as set by the binary from `-t`. `None` until then.
-#[cfg(feature = "parallel-gzip")]
-static GZIP_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Tell the reader how many threads one gzipped file's decoder may use.
+/// Threads for one gzipped file's decoder: 1, or `BWA4_GZIP_THREADS`.
 ///
-/// Called once by the binary before any input is opened, with `-t`. The value is halved because a
-/// paired-end run opens TWO files and each gets its own decoder, so the two together stay inside
-/// the thread budget the user asked for. It is not a throughput decision: the decoders matter
-/// during the FIRST batch, when every aligner worker is idle because no batch has arrived yet.
-///
-/// # Parameters
-/// * `threads`: the run's `-t`. 0 is treated as 1.
-#[cfg(feature = "parallel-gzip")]
-pub fn set_gzip_threads(threads: usize) {
-    let _ = GZIP_THREADS.set(threads.max(1).div_ceil(2));
-}
-
-/// Threads for one file's decoder: what the binary set, overridden by `BWA4_GZIP_THREADS`.
-///
-/// `BWA4_GZIP_THREADS` exists so the budget can be swept on a new machine rather than argued about;
-/// 1 reproduces the single-thread inflater's throughput without rebuilding. A value that does not
-/// parse, or 0, is ignored rather than clamped silently, so a typo in a benchmark script cannot
-/// quietly change what is being measured.
+/// One thread inflates a 150 bp FASTQ at about 1 GB/s, and only the FIRST batch ever waits on it
+/// (behind it the aligner is the bottleneck). Every extra thread keeps decoded chunks in flight for
+/// the whole run. chr21 sim pairs, gzip -1, M4, `-t/2` threads a file against one: -t4 +170 MB and
+/// a slower first batch (wait 67 vs 34 ms), -t8 +60 MB for the same wait, -t16 +200 MB to save 47
+/// ms once. A value that does not parse, or 0, is ignored rather than clamped silently, so a typo
+/// in a benchmark script cannot quietly change what is being measured.
 #[cfg(feature = "parallel-gzip")]
 fn gzip_threads() -> usize {
-    if let Ok(s) = std::env::var("BWA4_GZIP_THREADS") {
-        if let Ok(n) = s.trim().parse::<usize>() {
-            if n >= 1 {
-                return n;
-            }
-        }
-    }
-    // No setter call (a library user, or a unit test): fall back to the machine rather than to 1,
-    // since the whole point is not to leave the decoder single-threaded by accident.
-    *GZIP_THREADS.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .div_ceil(2)
-    })
+    std::env::var("BWA4_GZIP_THREADS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
 }
 
-/// Decompressed bytes handed over per channel message. 4 MiB is about 12 000 reads at 150 bp, so
-/// the channel is touched ~90 times for a 1 M-pair mate file, and three of them in flight cost
-/// 12 MiB, which is noise next to a batch of records.
-const INFLATE_BLOCK: usize = 4 << 20;
+/// Decompressed bytes handed over per channel message. 1 MiB is about 3 000 reads at 150 bp, so
+/// the channel is touched ~360 times for a 1 M-pair mate file. Behind a slow aligner every queue
+/// fills, so a file holds `INFLATE_DEPTH + 2` blocks: at 4 MiB and depth 3 that was 40 MiB per
+/// paired run, more than a whole `-t1` batch of records.
+const INFLATE_BLOCK: usize = 1 << 20;
 
 /// Blocks the inflater may run ahead. One in flight plus one being parsed is the double buffering
-/// that makes the overlap work; the third absorbs a slow parse without stalling the inflater.
-const INFLATE_DEPTH: usize = 3;
+/// that makes the overlap work.
+const INFLATE_DEPTH: usize = 2;
 
 /// The decompressed side of a gzipped FASTQ, as a plain [`std::io::Read`] fed by an inflater thread.
 ///
@@ -787,7 +1035,17 @@ impl FastqReader {
     pub fn from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         Ok(Self {
             inner: open_reader(path.as_ref())?,
+            nt4: false,
         })
+    }
+
+    /// Hand out records whose bases are already nt4 codes, packed four a byte when the read is all
+    /// A/C/G/T: [`Record::codes_into`] reads them, [`Record::seq`] no longer can. bwa codes them the
+    /// same way before aligning and prints SAM SEQ back out of the codes, so nothing is lost.
+    #[must_use]
+    pub fn nt4(mut self) -> Self {
+        self.nt4 = true;
+        self
     }
 
     /// Pull the next read, or `None` at EOF.
@@ -798,7 +1056,10 @@ impl FastqReader {
     /// with all four FASTQ lines already split into [`Record`] fields, or [`Error::Fastq`] on a
     /// malformed record.
     pub fn next_record(&mut self) -> Result<Option<Record>> {
-        match self.inner.next() {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        match inner.next() {
             None => Ok(None),
             Some(rec) => {
                 // One parsed record, borrowing needletail's internal buffer: everything taken from
@@ -807,12 +1068,7 @@ impl FastqReader {
                 // `rec.id()` is FASTQ line 1 WITHOUT the leading `@`, i.e. name plus any comment.
                 // Split into the two halves: the first becomes SAM QNAME, the second the `-C`
                 // trailer. Both are still borrowed from needletail's buffer at this point.
-                let (name_bytes, comment_bytes) = split_id(rec.id());
-                // Lossy UTF-8, as before, and free in the normal case: `from_utf8_lossy` borrows
-                // when the bytes are already valid and only allocates for a header with a stray
-                // byte, which is the rare path this tolerates rather than rejecting the file over.
-                let name = String::from_utf8_lossy(name_bytes);
-                let comment = comment_bytes.map(String::from_utf8_lossy);
+                let (name, comment) = split_id(rec.id());
                 // FASTQ line 2 (bases) and line 4 (Phred+33). `qual` is `None` for FASTA input,
                 // where lines 3 and 4 do not exist.
                 let seq = rec.seq();
@@ -820,23 +1076,41 @@ impl FastqReader {
                 // The copy out of needletail's buffer is not optional (it reuses that buffer for the
                 // next record), but it is ONE allocation sized exactly right, not three. See the
                 // type's own docs for what that is worth.
-                let comment_len = comment.as_ref().map_or(0, |c| c.len());
+                let comment_len = comment.map_or(0, <[u8]>::len);
+                let seq_bytes = if self.nt4 {
+                    seq.len().div_ceil(4)
+                } else {
+                    seq.len()
+                };
                 let mut buf = Vec::with_capacity(
-                    name.len() + seq.len() + qual.map_or(0, <[u8]>::len) + comment_len,
+                    name.len() + seq_bytes + qual.map_or(0, <[u8]>::len) + comment_len,
                 );
-                buf.extend_from_slice(name.as_bytes());
-                buf.extend_from_slice(&seq);
+                buf.extend_from_slice(name);
+                let bases = if !self.nt4 {
+                    buf.extend_from_slice(&seq);
+                    Bases::Ascii
+                } else if pack_acgt(&seq, &mut buf) {
+                    Bases::Packed
+                } else {
+                    // A base two bits cannot hold (N, IUPAC, junk): one code a byte instead.
+                    buf.truncate(name.len());
+                    buf.reserve_exact(seq.len() - seq_bytes);
+                    buf.extend_from_slice(&seq);
+                    bwa_core::dna::nt4_in_place(&mut buf[name.len()..]);
+                    Bases::Codes
+                };
                 if let Some(q) = qual {
                     buf.extend_from_slice(q);
                 }
-                if let Some(c) = &comment {
-                    buf.extend_from_slice(c.as_bytes());
+                if let Some(c) = comment {
+                    buf.extend_from_slice(c);
                 }
                 Ok(Some(Record {
                     name_len: name.len() as u32,
                     seq_len: seq.len() as u32,
                     comment_len: comment_len as u32,
                     has_qual: qual.is_some(),
+                    bases,
                     buf: buf.into_boxed_slice(),
                 }))
             }
@@ -870,7 +1144,7 @@ impl FastqReader {
             match self.next_record()? {
                 None => break,
                 Some(rec) => {
-                    bases_so_far += rec.seq().len();
+                    bases_so_far += rec.seq_len();
                     batch.push(rec);
                 }
             }
@@ -881,10 +1155,11 @@ impl FastqReader {
 
 /// How many records one background mate-reader hands over per channel message.
 ///
-/// Big enough that the channel is touched once per few thousand reads instead of once per read
-/// (about 2 MB of records at 150 bp), small enough that the two streams stay within a few
-/// milliseconds of each other rather than one running a whole batch ahead of the other.
-const STREAM_CHUNK_RECORDS: usize = 8192;
+/// Big enough that the channel is touched once per two thousand reads instead of once per read
+/// (about 0.8 MB of records at 150 bp), small enough that the two streams stay within a few
+/// milliseconds of each other. Behind a slow aligner each file holds three chunks: 8192 records a
+/// chunk was 20 MB of a paired run's resident set, 11 MB more than now at `-t1`.
+const STREAM_CHUNK_RECORDS: usize = 2048;
 
 /// Chunks a mate reader may have ready before it blocks. One in flight plus one being consumed is
 /// double buffering; deeper only buys memory, exactly as for the batch queue in `cmd_mem`.
@@ -920,10 +1195,11 @@ impl RecordStream {
     ///
     /// Opening happens on the thread too, so an unreadable file surfaces as the stream's first
     /// item rather than at construction; the caller sees it on the first [`Self::next_record`].
-    fn spawn(path: std::path::PathBuf) -> Self {
+    fn spawn(path: std::path::PathBuf, nt4: bool) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<Record>>>(STREAM_CHUNK_DEPTH);
         let handle = std::thread::spawn(move || {
             let mut reader = match FastqReader::from_path(&path) {
+                Ok(r) if nt4 => r.nt4(),
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(Err(e));
@@ -1006,9 +1282,8 @@ impl Drop for RecordStream {
 /// Streaming reader over a pair of FASTQ files (R1, R2) advanced in lockstep.
 ///
 /// The standard paired-end layout: the same fragment sequenced from both ends, with the two reads
-/// at the same ordinal position in the two files. Pairing is therefore POSITIONAL, not by name; the
-/// only name check is the length mismatch caught in [`Self::next_batch`]. That matches bwa, which
-/// also trusts file order here.
+/// at the same ordinal position in the two files. Pairing is POSITIONAL, and [`Self::next_batch`]
+/// then refuses a pair whose names differ, as bwa does (`mem_sam_pe`).
 ///
 /// Each file is parsed on its own thread ([`RecordStream`]); this struct is the consumer that
 /// interleaves them and applies the `-K` rule. See [`RecordStream`] for why.
@@ -1028,16 +1303,17 @@ impl PairedFastqReader {
     /// - `p1`: path to the R1 FASTQ, `p2`: path to the R2 FASTQ, both from argv in that order.
     ///   They must hold the same number of records, in the same order; nothing is checked here
     ///   (the length mismatch surfaces later, in [`Self::next_batch`]).
+    /// - `nt4`: code the bases as [`FastqReader::nt4`] does.
     ///
     /// # Errors
     ///
     /// Never fails here: each file is opened on its reader thread, so a missing or malformed file
     /// is reported by the first [`Self::next_batch`] instead. The `Result` is kept so callers do
     /// not have to change and so the signature can go back to eager opening.
-    pub fn from_paths<P: AsRef<std::path::Path>>(p1: P, p2: P) -> Result<Self> {
+    pub fn from_paths<P: AsRef<std::path::Path>>(p1: P, p2: P, nt4: bool) -> Result<Self> {
         Ok(Self {
-            r1: RecordStream::spawn(p1.as_ref().to_path_buf()),
-            r2: RecordStream::spawn(p2.as_ref().to_path_buf()),
+            r1: RecordStream::spawn(p1.as_ref().to_path_buf(), nt4),
+            r2: RecordStream::spawn(p2.as_ref().to_path_buf(), nt4),
         })
     }
 
@@ -1053,7 +1329,7 @@ impl PairedFastqReader {
     /// # Returns
     ///
     /// One `(R1, R2)` tuple per fragment, in file order; empty at EOF. [`Error::Fastq`] if one
-    /// file runs out before the other.
+    /// file runs out before the other, or if the two reads of a pair have different names.
     pub fn next_batch(&mut self, k_batch: usize) -> Result<Vec<(Record, Record)>> {
         // Invariant at the top of each iteration: `batch` holds the pairs read so far (both files
         // sit at the same ordinal record), `bases_so_far` is the sum of both mates' `seq.len()`
@@ -1067,9 +1343,17 @@ impl PairedFastqReader {
             // cannot be forgotten, which is the case that would otherwise emit mis-mated records.
             match (self.r1.next_record()?, self.r2.next_record()?) {
                 // Both files yielded: `mate1` is the R1 read, `mate2` the R2 read of one fragment.
-                // They are paired by POSITION; their names are not compared here.
+                // They are paired by POSITION, so a lost record shows up only here, as a name
+                // mismatch. Same refusal and wording as bwa's `mem_sam_pe`.
                 (Some(mate1), Some(mate2)) => {
-                    bases_so_far += mate1.seq().len() + mate2.seq().len();
+                    if mate1.name() != mate2.name() {
+                        return Err(Error::Fastq(format!(
+                            "paired reads have different names: \"{}\", \"{}\"",
+                            String::from_utf8_lossy(mate1.name()),
+                            String::from_utf8_lossy(mate2.name())
+                        )));
+                    }
+                    bases_so_far += mate1.seq_len() + mate2.seq_len();
                     batch.push((mate1, mate2));
                 }
                 // Clean EOF: both files ended on the same record boundary.
@@ -1103,9 +1387,11 @@ impl InterleavedFastqReader {
     ///
     /// - `p`: path to the one FASTQ holding both mates alternating (R1, R2, R1, R2, ...), from
     ///   argv under `-p`. Must contain an even number of records with mates adjacent.
-    pub fn from_path<P: AsRef<std::path::Path>>(p: P) -> Result<Self> {
+    /// - `nt4`: code the bases as [`FastqReader::nt4`] does.
+    pub fn from_path<P: AsRef<std::path::Path>>(p: P, nt4: bool) -> Result<Self> {
+        let inner = FastqReader::from_path(p)?;
         Ok(Self {
-            inner: FastqReader::from_path(p)?,
+            inner: if nt4 { inner.nt4() } else { inner },
         })
     }
 
@@ -1135,7 +1421,7 @@ impl InterleavedFastqReader {
                 return Err(Error::Fastq(format!(
                     "-p: interleaved input ended on an unpaired read ('{}'). bwa would realign it \
                      single-end (bseq_classify); bwa-mem4 refuses rather than mis-pair it.",
-                    mate1.name()
+                    String::from_utf8_lossy(mate1.name())
                 )));
             };
             // `qname_from_id` already stripped any `/1`/`/2`, so genuine mates compare equal here.
@@ -1143,14 +1429,31 @@ impl InterleavedFastqReader {
                 return Err(Error::Fastq(format!(
                     "-p: consecutive reads '{}' and '{}' are not mates. bwa would split these into \
                      a single-end pass (bseq_classify); bwa-mem4 refuses rather than mis-pair them.",
-                    mate1.name(), mate2.name()
+                    String::from_utf8_lossy(mate1.name()),
+                    String::from_utf8_lossy(mate2.name())
                 )));
             }
-            bases_so_far += mate1.seq().len() + mate2.seq().len();
+            bases_so_far += mate1.seq_len() + mate2.seq_len();
             batch.push((mate1, mate2));
         }
         Ok(batch)
     }
+}
+
+/// Index of the first byte `<= b' '` in `b` (every ASCII whitespace byte is one), or `b.len()`.
+fn first_le_space(b: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let (chunks, rest) = b.as_chunks::<8>();
+    for (k, c) in chunks.iter().enumerate() {
+        let x = u64::from_le_bytes(*c);
+        // The high bit of each byte below 0x21, plus maybe some above a flagged one (borrows only
+        // run upward), so the lowest flag is exact.
+        let m = x.wrapping_sub(ONES * 0x21) & !x & (ONES * 0x80);
+        if m != 0 {
+            return 8 * k + (m.trailing_zeros() / 8) as usize;
+        }
+    }
+    b.len() - rest.len() + rest.iter().position(|&c| c <= b' ').unwrap_or(rest.len())
 }
 
 /// Both halves of a FASTQ header at once, as BORROWED slices of it.
@@ -1173,10 +1476,16 @@ impl InterleavedFastqReader {
 fn split_id(id: &[u8]) -> (&[u8], Option<&[u8]>) {
     // One past the last QNAME byte: the first whitespace, or the whole slice for a bare-name
     // header (which is the common case for simulated reads).
-    let name_end = id
-        .iter()
-        .position(u8::is_ascii_whitespace)
-        .unwrap_or(id.len());
+    // Eight bytes a step to each byte at or below a space, then the exact test there: the byte loop
+    // was a sixth of the parse on GIAB headers (~37 printable bytes before the first space).
+    let mut name_end = 0;
+    loop {
+        name_end += first_le_space(&id[name_end..]);
+        if name_end == id.len() || id[name_end].is_ascii_whitespace() {
+            break;
+        }
+        name_end += 1;
+    }
     let mut name = &id[..name_end];
     // Trailing `/<digit>` (bwa's `trim_readno`). READNO_SUFFIX_LEN is the `/` plus the digit. The
     // length guard means a read literally named `/1` keeps its name rather than becoming empty, and
@@ -1272,8 +1581,90 @@ mod multi_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_unwrapping, split_id, FastqReader, PairedFastqReader, UnwrapFastq};
+    use super::{
+        first_le_space, needs_unwrapping, pack_acgt, split_id, unpack_codes, FastqReader,
+        PairedFastqReader, UnwrapFastq,
+    };
     use std::io::Write;
+
+    /// Packing round-trips to bwa's nt4 codes at every length across the SIMD block edges (64
+    /// bases packing, 16 packed bytes unpacking), and a single non-ACGT byte anywhere, in a SIMD
+    /// block or in the scalar tail, sends the read to one code a byte.
+    #[test]
+    fn packed_bases_round_trip_and_refuse_non_acgt() {
+        let alphabet = b"ACGTacgtTGCAtgca";
+        for n in 0..=200 {
+            let seq: Vec<u8> = (0..n).map(|i| alphabet[(i * 7 + i / 5) % 16]).collect();
+            let mut packed = vec![0xAA];
+            assert!(pack_acgt(&seq, &mut packed), "n={n}");
+            assert_eq!(packed.len(), 1 + n.div_ceil(4), "n={n}");
+            let mut codes = vec![9];
+            unpack_codes(&packed[1..], n, &mut codes);
+            let want: Vec<u8> = seq.iter().map(|&b| bwa_core::dna::nt4(b)).collect();
+            assert_eq!(codes[1..], want[..], "n={n}");
+            // Bytes past the bases (the quality string, in a record) decode to codes past `n`,
+            // which must be dropped.
+            let mut slack = packed[1..].to_vec();
+            slack.extend([0xFF; 20]);
+            let mut codes = Vec::new();
+            unpack_codes(&slack, n, &mut codes);
+            assert_eq!(codes, want, "n={n} with slack");
+            for bad in [b'N', b'n', b'R', b'.', 0] {
+                for at in [0, n / 2, n.saturating_sub(1)]
+                    .into_iter()
+                    .filter(|&a| a < n)
+                {
+                    let mut s = seq.clone();
+                    s[at] = bad;
+                    assert!(!pack_acgt(&s, &mut Vec::new()), "n={n} at={at} byte={bad}");
+                }
+            }
+        }
+    }
+
+    /// An empty FASTQ, plain or gzipped, is zero reads (bwa-mem2 exits 0 on it), not an error.
+    #[test]
+    fn empty_input_is_zero_records() {
+        let dir = std::env::temp_dir().join(format!("bwa4_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("e.fq");
+        std::fs::write(&plain, b"").unwrap();
+        // A valid gzip stream of zero bytes (`gzip -n < /dev/null`): header, empty block, trailer.
+        let gz = dir.join("e.fq.gz");
+        std::fs::write(
+            &gz,
+            [
+                0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        for p in [&plain, &gz] {
+            let mut r = FastqReader::from_path(p).unwrap();
+            assert!(r.next_record().unwrap().is_none(), "{}", p.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// bwa copies a header's bytes through, so a byte that is not UTF-8 survives unchanged in the
+    /// name and the comment, and a clean header comes through as is.
+    #[test]
+    fn non_utf8_header_keeps_its_bytes() {
+        let dir = std::env::temp_dir().join(format!("bwa4_lossy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("l.fq");
+        std::fs::write(
+            &p,
+            b"@r\xffx c\xfe\nACGT\n+\nIIII\n@ok tag\nACGT\n+\nIIII\n",
+        )
+        .unwrap();
+        let mut r = FastqReader::from_path(&p).unwrap();
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(rec.name(), b"r\xffx");
+        assert_eq!(rec.comment(), Some(&b"c\xfe"[..]));
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!((rec.name(), rec.comment()), (&b"ok"[..], Some(&b"tag"[..])));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Build a FASTQ of `n` records named `<prefix><i>` with a 4-base sequence, and return its path.
     fn write_fastq(
@@ -1303,7 +1694,7 @@ mod tests {
         let p1 = write_fastq(&dir, "r1.fq", "read", n);
         let p2 = write_fastq(&dir, "r2.fq", "read", n);
 
-        let mut r = PairedFastqReader::from_paths(&p1, &p2).unwrap();
+        let mut r = PairedFastqReader::from_paths(&p1, &p2, false).unwrap();
         // 8 bases per pair (4 per mate), so a 800-base batch is exactly 100 pairs.
         let mut seen = 0usize;
         loop {
@@ -1320,8 +1711,8 @@ mod tests {
                 );
             }
             for (k, (m1, m2)) in batch.iter().enumerate() {
-                assert_eq!(m1.name(), format!("read{}", seen + k));
-                assert_eq!(m2.name(), format!("read{}", seen + k));
+                assert_eq!(m1.name(), format!("read{}", seen + k).as_bytes());
+                assert_eq!(m2.name(), format!("read{}", seen + k).as_bytes());
             }
             seen += batch.len();
         }
@@ -1332,13 +1723,39 @@ mod tests {
     /// Files of different lengths must still be refused rather than mis-paired, which is the one
     /// safety property the split could plausibly have broken: the two threads reach end of file
     /// independently, so the check has to live in the consumer.
+    /// Same record count, but R2 lost its first read and gained one at the end: only the names show
+    /// it. Every pair would otherwise be false, with a clean exit.
+    #[test]
+    fn paired_reader_refuses_different_names() {
+        let dir = std::env::temp_dir().join(format!("bwa4_pe_names_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p1 = dir.join("r1.fq");
+        let p2 = dir.join("r2.fq");
+        std::fs::write(&p1, "@a/1\nACGT\n+\nIIII\n@b/1\nACGT\n+\nIIII\n").unwrap();
+        std::fs::write(&p2, "@b/2\nACGT\n+\nIIII\n@a/2\nACGT\n+\nIIII\n").unwrap();
+        let err = PairedFastqReader::from_paths(&p1, &p2, false)
+            .unwrap()
+            .next_batch(usize::MAX)
+            .err()
+            .expect("different names must be refused");
+        assert!(err.to_string().contains("different names"), "{err}");
+        // `/1` and `/2` are not part of the name, so genuine mates still pair.
+        std::fs::write(&p2, "@a/2\nACGT\n+\nIIII\n@b/2\nACGT\n+\nIIII\n").unwrap();
+        let batch = PairedFastqReader::from_paths(&p1, &p2, false)
+            .unwrap()
+            .next_batch(usize::MAX)
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn paired_reader_refuses_unequal_files() {
         let dir = std::env::temp_dir().join(format!("bwa4_pe_uneven_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p1 = write_fastq(&dir, "r1.fq", "read", 10);
         let p2 = write_fastq(&dir, "r2.fq", "read", 7);
-        let mut r = PairedFastqReader::from_paths(&p1, &p2).unwrap();
+        let mut r = PairedFastqReader::from_paths(&p1, &p2, false).unwrap();
         assert!(r.next_batch(usize::MAX).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1351,7 +1768,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p1 = write_fastq(&dir, "r1.fq", "read", 4);
         let p2 = dir.join("nope.fq");
-        let mut r = PairedFastqReader::from_paths(&p1, &p2).unwrap();
+        let mut r = PairedFastqReader::from_paths(&p1, &p2, false).unwrap();
         assert!(r.next_batch(usize::MAX).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1492,6 +1909,22 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reads_from_a_non_seekable_fifo() {
+        // A timeout is retried on a fresh FIFO: the rare hang described above is not a wrong answer
+        // and has not been traced to this reader, while a real regression (wrong count, wrong name,
+        // an error) fails on the first attempt, and a reader that truly hangs fails all three.
+        for attempt in 1..=3 {
+            match fifo_attempt() {
+                Some(Ok(n)) => return assert_eq!(n, 2500, "records read from a FIFO"),
+                Some(Err(e)) => panic!("{e}"),
+                None => eprintln!("FIFO attempt {attempt} timed out after 20s, retrying"),
+            }
+        }
+        panic!("FIFO reader did not finish in 3 attempts of 20s (see this test's doc comment)");
+    }
+
+    /// One run of [`reads_from_a_non_seekable_fifo`]: `None` when the reader did not finish.
+    #[cfg(unix)]
+    fn fifo_attempt() -> Option<std::result::Result<usize, String>> {
         use std::io::Write;
         // Nanoseconds since the epoch, purely to make the directory name unrepeatable. A pid alone
         // is not: pids are recycled, and a hung run leaves its FIFO in place.
@@ -1535,7 +1968,7 @@ mod tests {
             loop {
                 match r.next_record() {
                     Ok(Some(rec)) => {
-                        if rec.name() != format!("read{n}") {
+                        if rec.name() != format!("read{n}").as_bytes() {
                             let _ = tx.send(Err(format!(
                                 "record {n} is named {:?}, not read{n}",
                                 rec.name()
@@ -1555,16 +1988,31 @@ mod tests {
         });
 
         // Generous: the work is 83890 bytes through a pipe, which takes milliseconds. The bound is
-        // here to convert a hang into a failure, not to measure anything.
-        let got = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .expect("FIFO reader did not finish within 60s (see this test's doc comment)");
+        // here to convert a hang into a failure, not to measure anything. On a timeout the writer
+        // and reader threads are abandoned (see the doc comment).
+        let got = rx.recv_timeout(std::time::Duration::from_secs(20)).ok();
         std::fs::remove_dir_all(&dir).ok();
-        match got {
-            Ok(n) => assert_eq!(n, 2500, "records read from a FIFO"),
-            Err(e) => panic!("{e}"),
+        if got.is_some() {
+            writer.join().unwrap();
         }
-        writer.join().unwrap();
+        got
+    }
+
+    /// The word-at-a-time scan against the byte loop it replaced, around every chunk boundary.
+    #[test]
+    fn first_le_space_matches_the_byte_scan() {
+        for len in 0..40 {
+            for at in 0..=len {
+                for c in [b' ', b'\t', b'\x0c', b'\x01', 0x20, 0x21, 0x7f, 0x80, 0xff] {
+                    let mut v = vec![b'A'; len];
+                    if at < len {
+                        v[at] = c;
+                    }
+                    let want = v.iter().position(|&x| x <= b' ').unwrap_or(len);
+                    assert_eq!(first_le_space(&v), want, "len {len} at {at} byte {c:#x}");
+                }
+            }
+        }
     }
 
     /// The header split, on the four shapes that matter: a comment, both read-number suffixes, and

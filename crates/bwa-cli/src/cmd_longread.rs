@@ -90,9 +90,13 @@ fn reference_fasta(prefix: &Path) -> Result<std::path::PathBuf> {
     if prefix.is_file() {
         return Ok(prefix.to_path_buf());
     }
-    // A few conventional spellings, in case the prefix was given without its extension.
+    // A few conventional spellings, in case the prefix was given without its extension. Appended,
+    // never `with_extension`: that would turn the prefix `GRCh38.p14` into another build's `GRCh38.fa`.
     for ext in ["fa", "fasta", "fna", "fa.gz", "fasta.gz"] {
-        let candidate = prefix.with_extension(ext);
+        let mut candidate = prefix.as_os_str().to_os_string();
+        candidate.push(".");
+        candidate.push(ext);
+        let candidate = std::path::PathBuf::from(candidate);
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -113,6 +117,8 @@ fn reference_fasta(prefix: &Path) -> Result<std::path::PathBuf> {
 /// - `prefix`: the index prefix, resolved to a FASTA by [`reference_fasta`].
 /// - `reads`: the read files. A second file is mapped as independent single-end reads: pairing is a
 ///   short-read concept and rammap's own CLI treats long reads as fragments.
+/// - `extra_header`: the `-H` and `-R` lines, written after the `@SQ` lines. The caller has already
+///   installed `-R`'s ID, which every record then carries as `RG:Z`.
 /// - `out`: where the SAM goes, already opened by the caller (stdout or `-o`).
 /// - `argv`: the full command line, for the `@PG CL:` field.
 pub fn run(
@@ -120,6 +126,7 @@ pub fn run(
     mode: &str,
     prefix: &Path,
     reads: &[std::path::PathBuf],
+    extra_header: &[String],
     out: &mut dyn Write,
     argv: &[String],
 ) -> Result<()> {
@@ -143,11 +150,11 @@ pub fn run(
         do_ds: false,
         eqx: false,
         output_sam: true,
-        rg_id: None,
+        rg_id: bwa_core::rg::rg_id().map(Into::into),
         split_mode: false,
     };
 
-    write_header(out, aligner.index(), argv)?;
+    write_header(out, aligner.index(), extra_header, argv)?;
 
     // Records emitted, for the closing log line.
     let mut n_reads = 0u64;
@@ -226,11 +233,15 @@ fn map_batch(
                 // definition, so this is lossless; a malformed file that is not gets its QUAL
                 // dropped rather than the run aborted.
                 let qual = rec.qual().and_then(|q| std::str::from_utf8(q).ok());
+                // rammap's formatter also wants `&str` here. This path is not byte-identical to
+                // bwa anyway, so a stray byte is replaced rather than refused.
+                let name = String::from_utf8_lossy(rec.name());
+                let comment = rec.comment().map(String::from_utf8_lossy);
                 let read = ReadInfo {
-                    qname: rec.name(),
+                    qname: &name,
                     qseq: rec.seq(),
                     qual,
-                    comment: rec.comment(),
+                    comment: comment.as_deref(),
                     n_seg: 1,
                     seg_idx: 0,
                 };
@@ -407,16 +418,25 @@ fn preset_slug(preset: Preset) -> &'static str {
 /// Mirrors rammap's own header (`rammap/src/main.rs`), because the records under it are rammap's.
 /// The `@PG` deliberately does NOT say `bwa-mem4`: the file should name the mapper that produced
 /// its alignments.
-fn write_header(out: &mut dyn Write, index: &Index, argv: &[String]) -> Result<()> {
+fn write_header(
+    out: &mut dyn Write,
+    index: &Index,
+    extra_header: &[String],
+    argv: &[String],
+) -> Result<()> {
     writeln!(out, "@HD\tVN:1.6\tSO:unsorted\tGO:query")?;
     for s in &index.seqs {
         writeln!(out, "@SQ\tSN:{}\tLN:{}", s.name, s.len)?;
     }
+    for line in extra_header {
+        writeln!(out, "{line}")?;
+    }
+    // Tabs escaped for the same reason as the short-read `@PG`: a real one would split the field.
     writeln!(
         out,
         "@PG\tID:rammap\tPN:rammap\tVN:{}\tCL:{}",
         rammap_version(),
-        argv.join(" ")
+        argv.join(" ").replace('\t', "\\t")
     )?;
     Ok(())
 }
@@ -432,6 +452,22 @@ fn rammap_version() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// A dotted prefix names its own FASTA, never a sibling that shares its stem.
+    #[test]
+    fn dotted_prefix_does_not_select_another_reference() {
+        let dir = std::env::temp_dir().join(format!("bwa4_lr_ref_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("GRCh38.fa"), ">other\nACGT\n").unwrap();
+        let prefix = dir.join("GRCh38.p14");
+        assert!(super::reference_fasta(&prefix).is_err());
+        std::fs::write(dir.join("GRCh38.p14.fa"), ">own\nACGT\n").unwrap();
+        assert_eq!(
+            super::reference_fasta(&prefix).unwrap(),
+            dir.join("GRCh38.p14.fa")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The `@PG VN:` we write must be the version actually linked.
     ///
     /// `rammap_version` is a literal because the crate does not expose its own `CARGO_PKG_VERSION`,

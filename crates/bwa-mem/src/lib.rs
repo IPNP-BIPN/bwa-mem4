@@ -198,6 +198,17 @@ pub mod rescue_split {
     pub static T_SORT1: AtomicU64 = AtomicU64::new(0);
     pub static T_SCAN: AtomicU64 = AtomicU64::new(0);
     pub static T_SORT3: AtomicU64 = AtomicU64::new(0);
+    /// Inside `collect`: the skip scan over the mate's regions (and the rows it walked), and the
+    /// window fetch + reverse complement. Inside `apply`: the hit insertions (and their count).
+    pub static COLLECT_SKIP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COLLECT_SKIP_ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static COLLECT_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static COLLECT_FETCH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_INSERT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static VIEW_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static VIEW_BUILDS: AtomicU64 = AtomicU64::new(0);
+    pub static VIEW_BUILD_ROWS: AtomicU64 = AtomicU64::new(0);
 
     /// Whether the probe records. Read once and cached.
     ///
@@ -238,6 +249,21 @@ pub mod rescue_split {
             APPLY_DEDUP_ROWS.load(Relaxed),
         );
         eprintln!(
+            "[rescue-split] collect: skip scan {:.3}s over {} calls / {} rows, fetch+rc {:.3}s; apply: inserts {:.3}s over {} hits",
+            COLLECT_SKIP_NS.load(Relaxed) as f64 / 1e9,
+            COLLECT_CALLS.load(Relaxed),
+            COLLECT_SKIP_ROWS.load(Relaxed),
+            COLLECT_FETCH_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_INSERT_NS.load(Relaxed) as f64 / 1e9,
+            APPLY_HITS.load(Relaxed),
+        );
+        eprintln!(
+            "[rescue-split] view builds {} over {} rows in {:.3}s",
+            VIEW_BUILDS.load(Relaxed),
+            VIEW_BUILD_ROWS.load(Relaxed),
+            VIEW_BUILD_NS.load(Relaxed) as f64 / 1e9,
+        );
+        eprintln!(
             "[dedup-internals] sort_re {:.3}s, scan {:.3}s, sort_score {:.3}s CPU (all callers)",
             T_SORT1.load(Relaxed) as f64 / 1e9,
             T_SCAN.load(Relaxed) as f64 / 1e9,
@@ -250,16 +276,66 @@ pub mod rescue_split {
 /// directly; the counters live where the tracker does.
 pub use bwa_extend::sw::subopt_shape;
 
+/// Deferred `csub` of rescued regions. Mate rescue usually finds its hit on one diagonal end to
+/// end, and the second-best score `ksw_align2` reports with it costs bands at `min_seed_len`
+/// around every alignment the window could hold, where the score alone needs a few diagonals.
+/// Yet `csub` is read only for the regions SAM emit turns into MAPQ and XS (about one rescued
+/// region in twenty on human reads). So the batched rescue leaves it pending, `csub <= BASE` naming
+/// an entry of its chunk's [`crate::pe::PendS2`] table, and emit computes it for the pairs that
+/// read one: a read records the entry and yields -1, and the caller reruns the pair once the
+/// entries are resolved. Which regions are read never depends on a `csub` value (only MAPQ and
+/// XS values do), so the rerun reads the same entries, now resolved.
+pub mod lazy_csub {
+    use std::cell::RefCell;
+
+    /// The first pending value: `csub = BASE - index`. bwa's `csub` is -1 or a score.
+    pub const BASE: i32 = -2;
+
+    thread_local! {
+        static READS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The `csub` of pending entry `index`.
+    pub fn encode(index: usize) -> i32 {
+        BASE - index as i32
+    }
+
+    /// The table index a pending `csub` names, or `None` for a computed one.
+    pub fn index(csub: i32) -> Option<usize> {
+        (csub <= BASE).then(|| (BASE - csub) as usize)
+    }
+
+    /// `csub` as a reader sees it: a computed value is returned, a pending one is recorded for
+    /// [`take`] and reads as -1 (the reader's result is then discarded).
+    #[inline]
+    pub fn get(csub: i32) -> i32 {
+        if csub > BASE {
+            return csub;
+        }
+        READS.with(|r| r.borrow_mut().push((BASE - csub) as u32));
+        -1
+    }
+
+    /// The pending entries read on this thread since the last call, emptied.
+    pub fn take(out: &mut Vec<u32>) {
+        READS.with(|r| out.append(&mut r.borrow_mut()));
+    }
+}
+
 pub mod across;
 pub mod alt;
 pub mod cigar;
 pub mod emit;
+pub mod meth;
 pub mod pe;
 pub mod primary;
 pub mod seedflt;
-pub use across::align_reads_batched;
+pub use across::{align_reads_batched, align_reads_batched_meth};
 pub use cigar::{cigar_string, reg2aln, MemAln};
-pub use pe::{batch_mate_rescue, mem_pestat, mem_sam_pe, PairRescueData, PeStat};
+pub use pe::{
+    batch_mate_rescue, mem_pestat, mem_pestat_from, mem_sam_pe, pestat_samples, PairRescueData,
+    PeStat, PendS2,
+};
 pub use primary::{mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch, stamp_is_alt};
 
 /// Sentinel for uninitialized region bounds (bwa's `H0_`, `macro.h:44`: `#define H0_ -99`).
@@ -338,12 +414,9 @@ pub struct MemAlnReg {
     /// `pa:f` tag (`bwamem.cpp:1714`, printed as `score / alt_sc`). Stays 0 on an index with no
     /// ALT contigs, which is why `pa:f` never appears without a `.alt` file.
     pub alt_sc: i32,
-    /// Per-region hash used purely as a deterministic tie-break when two regions compare equal
-    /// during primary marking, so that ordering does not depend on sort stability. Derived from
-    /// the read id, hence the `read_id` parameter threaded through `align_read_se`.
-    pub hash: u64,
-    /// Number of chain components merged into this region by the dedup pass. Starts at 1.
-    pub n_comp: i32,
+    // No `hash` (bwa's tie-break): only primary marking reads it, so `sort_hlt` derives it from
+    // the read id and the region's index there. The batch holds every region until SAM emit, and
+    // the 8 bytes took a region from 80 to 88.
 }
 
 /// Longest gap worth allowing for a `qlen`-base extension, i.e. how far the reference window must
@@ -376,27 +449,68 @@ pub struct MemAlnReg {
 /// C-QUIRK: the C evaluates `qlen * opt->a - opt->o_del` in `int` and only then casts to `double`;
 /// we promote to `f64` before multiplying. The two agree for every `qlen` an int can hold without
 /// the product overflowing (`qlen < 2^31 / a`), which no read approaches, so this is a widening
-/// that cannot change output. The division and the truncating cast are kept in `f64`/`as i32`
-/// exactly as the C does, because doing it in integers would round differently.
+/// that cannot change output. The division and truncating cast are done in integers where that is
+/// provably the same value (see [`gap_len`]) and in `f64`/`as i32` exactly as the C does elsewhere.
 #[must_use]
 pub(crate) fn cal_max_gap(opt: &MemOpt, qlen: i32) -> i32 {
-    // `opt.a` is the per-base match score, the reward this extension could earn per query base.
-    let match_score = f64::from(opt.a);
     // Longest DELETION (bases missing from the read) whose affine penalty is still repaid by the
-    // `qlen * a` this extension could earn. May be negative before the `.max(1)` floor below when
-    // `qlen` is small enough that even opening a gap costs more than the whole extension is worth.
-    let max_deletion_len = ((f64::from(qlen) * match_score - f64::from(opt.o_del))
-        / f64::from(opt.e_del)
-        + 1.0) as i32;
-    // Same quantity for an INSERTION (extra bases in the read), which may use different open/extend
-    // penalties, hence the separate computation rather than reusing the deletion answer.
-    let max_insertion_len = ((f64::from(qlen) * match_score - f64::from(opt.o_ins))
-        / f64::from(opt.e_ins)
-        + 1.0) as i32;
+    // `qlen * a` this extension could earn, then the same for an INSERTION, which may use different
+    // open/extend penalties. Either may be negative before the `.max(1)` floor below.
+    let max_deletion_len = gap_len(qlen, opt.a, opt.o_del, opt.e_del);
+    let max_insertion_len = gap_len(qlen, opt.a, opt.o_ins, opt.e_ins);
     // Whichever gap kind can stretch furthest decides the window; floored at 1 so a window is never
     // empty even when neither gap kind pays for itself.
     let max_gap = max_deletion_len.max(max_insertion_len).max(1);
     max_gap.min(opt.w << 1)
+}
+
+/// `(int)((double)(qlen * a - o) / e + 1.)`, the C's expression, without the double division in the
+/// common case. For `e > 0` and `|N| < 2^52` (`N = qlen * a - o`), `N / e` is never within a
+/// rounding step of a nonzero integer (the gap is at least `1 / e`), so truncating `N / e + 1`
+/// equals the integer `(N + e) / e`, which Rust rounds toward zero as the cast does. Everything
+/// else (a zero or negative `e`, huge products) takes the C's double path. Per seed this was four
+/// dependent `divsd` in `align_reads_batched`'s window loop, the hottest spot of that function on x86.
+#[inline]
+fn gap_len(qlen: i32, a: i32, o: i32, e: i32) -> i32 {
+    let n = i64::from(qlen) * i64::from(a) - i64::from(o);
+    if e == 1 && n.abs() < 1 << 52 {
+        return (n + 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    }
+    if e > 1 && n.abs() < 1 << 52 {
+        let e = i64::from(e);
+        return ((n + e) / e).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    }
+    ((f64::from(qlen) * f64::from(a) - f64::from(o)) / f64::from(e) + 1.0) as i32
+}
+
+#[cfg(test)]
+mod gap_len_tests {
+    /// The integer form against the C's double expression over every small input and a spread of
+    /// large ones, including negative numerators and saturating results.
+    #[test]
+    fn gap_len_equals_the_double_expression() {
+        let c = |q: i32, a: i32, o: i32, e: i32| {
+            ((f64::from(q) * f64::from(a) - f64::from(o)) / f64::from(e) + 1.0) as i32
+        };
+        for q in -300..2000 {
+            for a in 0..6 {
+                for o in [-3, 0, 1, 5, 6, 11, 40, 1000] {
+                    for e in -2..9 {
+                        assert_eq!(super::gap_len(q, a, o, e), c(q, a, o, e), "{q} {a} {o} {e}");
+                    }
+                }
+            }
+        }
+        for &q in &[i32::MAX, i32::MIN, 1 << 30, -(1 << 30), 123_456_789] {
+            for &a in &[1, 7, i32::MAX, -5] {
+                for &o in &[0, 6, i32::MAX, i32::MIN] {
+                    for &e in &[1, 2, 3, 1000, i32::MAX] {
+                        assert_eq!(super::gap_len(q, a, o, e), c(q, a, o, e), "{q} {a} {o} {e}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// What one accepted call to `ksw_extend2` reports back, plus the band that produced it.
@@ -726,8 +840,6 @@ pub(crate) fn mem_chain2aln_meta(
                 is_alt: chain.is_alt,
                 // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                 alt_sc: 0,
-                hash: 0,
-                n_comp: 1,
             });
             continue;
         }
@@ -756,8 +868,6 @@ pub(crate) fn mem_chain2aln_meta(
             is_alt: chain.is_alt,
             // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
             alt_sc: 0,
-            hash: 0,
-            n_comp: 1,
         };
 
         // ---------------------------- step 3a: extend leftwards ----------------------------
@@ -786,7 +896,7 @@ pub(crate) fn mem_chain2aln_meta(
             rs_buf.extend((0..ref_bases_available).rev().map(|i| rseq[i]));
             let (qs, rs) = (&qs_buf, &rs_buf);
             // Score already banked before this DP starts: the seed's `len` exact matches at `a` each.
-            let h0 = seed.len * opt.a;
+            let h0 = seed_score(opt, &seed, &rseq[(seed.rbeg - rmax0) as usize..], codes);
             // `prev0 = -1`: the region has not been scored yet on this side, which is the -1 the C
             // initialises `a->score` to (`bwamem.cpp:2218`).
             // The accepted left-extension answer (clipped optimum, run-to-end optimum, band width).
@@ -813,7 +923,7 @@ pub(crate) fn mem_chain2aln_meta(
         } else {
             // The seed already starts at query base 0, so there is nothing to extend into. Score is
             // just the seed's own match score and the region begins exactly at the seed.
-            reg.score = seed.len * opt.a;
+            reg.score = seed_score(opt, &seed, &rseq[(seed.rbeg - rmax0) as usize..], codes);
             reg.truesc = reg.score;
             reg.qb = 0;
             reg.rb = seed.rbeg;
@@ -905,6 +1015,33 @@ pub(crate) fn mem_chain2aln_meta(
     }
 }
 
+/// The ungapped score of `seed` before any extension: `len * a` for an exact match, which is what
+/// it is outside `--meth`. Under `--meth` the seed matched in converted space only, so it is
+/// re-scored base by base against the original reference `rseq` (starting at the seed) with the
+/// read's chemistry matrix, and may even be <= 0 (`seed_ext_score` in fg-labs/bwa-mem3 0.16).
+fn seed_score(opt: &MemOpt, seed: &bwa_seed::MemSeed, rseq: &[u8], codes: &[u8]) -> i32 {
+    if opt.meth.is_none() {
+        return seed.len * opt.a;
+    }
+    let read = &codes[seed.qbeg as usize..(seed.qbeg + seed.len) as usize];
+    bwa_neon::diag_score(&opt.mat, rseq, read)
+}
+
+/// [`align_read`] for a `--meth` read: seeds come from its converted copy (C->T when `ot`, i.e.
+/// read 1 or single-end, else G->A) on the `--meth` index, extension uses the original `codes`.
+/// `opt.mat` must already be the read's chemistry matrix (`MethOpt::mats[ot]`).
+pub fn align_read_meth(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[u8],
+    ot: bool,
+) -> Vec<MemAlnReg> {
+    let conv = bwa_core::meth::convert_codes(codes, ot);
+    let chains = bwa_chain::build_chains_meth(fm, bns, opt, &conv, ot);
+    align_chains(fm, bns, opt, codes, chains)
+}
+
 /// Align one read (2-bit codes) through seeding -> chaining -> extension, returning all regions.
 ///
 /// The three stages are bwa's own: `build_chains` collects SMEM seeds from the FM index and groups
@@ -926,9 +1063,21 @@ pub(crate) fn mem_chain2aln_meta(
 /// Every surviving region for the read, in extension order with purged entries compacted out.
 /// Possibly empty (an unmappable read). Not deduplicated and not primary-marked.
 pub fn align_read(fm: &FmIndex, bns: &BntSeq, opt: &MemOpt, codes: &[u8]) -> Vec<MemAlnReg> {
-    // The read's chains after weak ones are dropped. The trailing 0 to `build_chains` is the seed
-    // batch/read id; unused on this scalar path.
-    let mut chains = mem_chain_flt(opt, build_chains(fm, bns, opt, codes, 0));
+    // The trailing 0 to `build_chains` is the seed batch/read id; unused on this scalar path.
+    align_chains(fm, bns, opt, codes, build_chains(fm, bns, opt, codes, 0))
+}
+
+/// Everything [`align_read`] does after seeding and chaining: chain filter, chained-seed filter,
+/// extension and the discard pass.
+fn align_chains(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    codes: &[u8],
+    chains: Vec<MemChain>,
+) -> Vec<MemAlnReg> {
+    // The read's chains after weak ones are dropped.
+    let mut chains = mem_chain_flt(opt, chains);
     // bwa's second chain-level pass (`bwamem.cpp:1084`), between the chain filter and any
     // extension: it re-scores every short seed by a local alignment of its own neighbourhood and
     // drops the ones that do not earn their keep. A no-op below ~690 bp of read, by its own length

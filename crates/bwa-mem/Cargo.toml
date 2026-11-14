@@ -19,6 +19,7 @@ bwa-chain = { workspace = true }
 bwa-extend = { workspace = true }
 # SIMD kernels: the batched mate-rescue local-SW (self-dispatching NEON/scalar).
 bwa-neon = { workspace = true }
+smallvec = { workspace = true }
 
 [lints]
 workspace = true

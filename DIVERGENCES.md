@@ -4,6 +4,10 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## Acceptees (par conception)
 
+- **Mode `--meth` : l'oracle est bwa-mem3 0.16, pas bwa-mem2.** bwa-mem2 n'a pas de mode
+  methylation. Parite octet a octet avec bwa-mem3 0.16 via `scripts/meth_oracle_diff.sh` ; les
+  ecarts restants (hors jeu de test) sont listes dans `docs/meth-mode.md`.
+
 - **Scoring non defaut (`-A 2`) : bwa-mem2 ne s'accorde pas avec lui-meme, et nous suivons son build
   arm64. FIGE (2026-08-18).** Sous un score de match non defaut, les builds x86_64 et arm64 de
   bwa-mem2 2.3 produisent des alignements differents sur les memes reads. Ce n'est pas une
@@ -87,6 +91,18 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
   Consequence assumee : `diff` brut entre une sortie bwa-mem2 et une sortie bwa-mem4 montrera
   toujours cette ligne. Tous les scripts du depot filtrent `^@PG` pour cette raison.
+
+- **FASTQ tronque : nous echouons la ou bwa-mem2 ecrit une sortie partielle. ACCEPTE (2026-11-03).**
+  Sur un FASTQ texte coupe en plein record, bwa-mem2 ecrit les records lisibles et sort avec le code 0.
+  Sur un gzip tronque, il les ecrit aussi, puis sort avec le code 1. Nous sortons avec le code 1 et le
+  message nomme la cause ; le lot en cours n'est pas ecrit. Un fichier incomplet qui passe pour un
+  resultat complet est le pire cas pour un pipeline, donc nous ne suivons pas l'oracle ici.
+
+- **Valeurs negatives : refusees sauf pour `-t` et `-K`. ACCEPTE (2026-11-03).** bwa-mem2 lit ses
+  options avec `atoi` et accepte tout. `-t` et `-K` ont un sens defini (ramenes au defaut) et donnent
+  ses records. Les autres options numeriques restent une erreur en ligne de commande : les laisser
+  passer ferait paniquer `-w` et `-B` (appaire), et changerait les records sous `-k`, `-Q` et `-B`,
+  pour des valeurs qui n'ont pas de sens. Mesure sur 200 paires simulees et `testdata/tiny`.
 
 ## Résolu (phase 8, via oracle instrumenté)
 

@@ -43,22 +43,40 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: "1.96.1"
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install the pipeline (bioconda)
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: gate
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
+          # The oracle is pinned, as in parity.yml: an upstream release must not move the gate.
           create-args: >-
-            bwa-mem2
+            bwa-mem2=2.3
             samtools
             bcftools
             rtg-tools
@@ -76,7 +94,7 @@ jobs:
         run: |
           mkdir -p work/gate && cd work/gate
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           # Ensembl calls it `21`, the GIAB benchmark calls it `chr21`. Same assembly, same
           # coordinates, different naming convention, and a caller will silently produce nothing if
           # the two disagree. Renaming the single header is the whole fix.

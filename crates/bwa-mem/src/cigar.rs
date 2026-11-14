@@ -163,6 +163,8 @@ pub struct MemAln {
     /// Alternate hits (`XA:Z:`), pre-formatted `rname,±pos,cigar,NM;`... or `None`. Set by the
     /// caller via `mem_gen_alt`; `reg2aln` leaves it `None`.
     pub xa: Option<String>,
+    /// `HN:i`, emitted under `--meth` only, when >= 0 (see `alt::hit_counts`). -1 otherwise.
+    pub hn: i32,
 }
 
 /// Format the `pa:f` payload the way C's `printf("%.3f", (double)score / alt_sc)` does
@@ -225,6 +227,7 @@ impl MemAln {
             alt_sc: 0,
             is_alt: false,
             xa: None,
+            hn: -1,
         }
     }
 }
@@ -304,6 +307,56 @@ fn infer_bw(l1: i32, l2: i32, score: i32, a: i32, q: i32, r: i32) -> i32 {
         w = (l1 - l2).abs();
     }
     w
+}
+
+/// `l_query` M in `cigar` (emptied first), with room for the two soft clips `reg2aln` may add, so
+/// adding them never reallocates (a capacity-1 `Vec` did, for every clipped read).
+fn ungapped_cigar(l_query: i32, mut cigar: Vec<u32>) -> Vec<u32> {
+    cigar.clear();
+    cigar.reserve(3);
+    cigar.push((l_query as u32) << 4);
+    cigar
+}
+
+thread_local! {
+    /// The CIGAR and MD buffers of this thread's dropped [`MemAln`]s, which [`gen_cigar2`] fills
+    /// again: a fresh pair per emitted record was half of SAM emission's allocations.
+    static SPARE: std::cell::Cell<Vec<(Vec<u32>, String)>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Most buffer pairs [`SPARE`] keeps per thread; a pair holds at most a few hundred bytes.
+const SPARE_CAP: usize = 16;
+
+/// A recycled CIGAR and MD buffer pair, possibly holding old contents, or two empty ones.
+fn spare_bufs() -> (Vec<u32>, String) {
+    SPARE
+        .with(|s| {
+            let mut v = s.take();
+            let pair = v.pop();
+            s.set(v);
+            pair
+        })
+        .unwrap_or_default()
+}
+
+impl Drop for MemAln {
+    fn drop(&mut self) {
+        if self.cigar.capacity() == 0 && self.md.capacity() == 0 {
+            return;
+        }
+        let pair = (
+            std::mem::take(&mut self.cigar),
+            std::mem::take(&mut self.md),
+        );
+        // `try_with`: a record dropped while the thread is being torn down just frees its buffers.
+        let _ = SPARE.try_with(|s| {
+            let mut v = s.take();
+            if v.len() < SPARE_CAP {
+                v.push(pair);
+            }
+            s.set(v);
+        });
+    }
 }
 
 /// Global-align `query_codes` (the seed-region query slice) to reference `[rb, re)` and compute the
@@ -410,20 +463,16 @@ pub(crate) fn gen_cigar2(
     // the reference. Both come from one branch or the other and are final from here on; step 4 only
     // reads them.
     global_fp::survey(l_query, rlen, &query, &rseq, opt, w_);
+    let (spare_cigar, mut md) = spare_bufs();
     let (score, cigar) = if l_query == rlen && w_ == 0 {
         // Ungapped fast path (bwa.cpp:280): equal lengths and a proven-zero band mean the CIGAR is
         // a single M run and the score is just the sum of matrix cells down the diagonal. The
         // matrix is row-major 5x5 indexed `[ref_base * 5 + query_base]`; the operand order matters
         // only for asymmetric matrices, but we keep bwa's order regardless.
-        //
-        // Invariant: at the top of iteration `i`, `diagonal_score` is the summed substitution score
-        // of columns `0..i`. There is no gap term because this path has no gaps by construction.
-        let mut diagonal_score = 0;
-        for i in 0..l_query as usize {
-            diagonal_score += i32::from(opt.mat[rseq[i] as usize * 5 + query[i] as usize]);
-        }
+        let n = l_query as usize;
+        let diagonal_score = bwa_neon::diag_score(&opt.mat, &rseq[..n], &query[..n]);
         // `(len << 4) | 0`: op 0 is M, so the `| 0` is elided.
-        (diagonal_score, vec![(l_query as u32) << 4])
+        (diagonal_score, ungapped_cigar(l_query, spare_cigar))
     } else {
         // Derive an internal band from affordability, then intersect it with the caller's `w_`.
         // `((l_query+1)>>1) * match_score` is the score of matching *half* the query: bwa's
@@ -469,7 +518,7 @@ pub(crate) fn gen_cigar2(
                     &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
                 );
                 if w == 0 {
-                    (lower_bound, vec![(l_query as u32) << 4])
+                    (lower_bound, ungapped_cigar(l_query, spare_cigar))
                 } else {
                     ksw_global2(
                         &query, &rseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, w,
@@ -511,7 +560,8 @@ pub(crate) fn gen_cigar2(
     // Sized from the reference span: MD alternates run lengths and mismatched bases, so it cannot
     // exceed a few bytes per aligned base and is usually far shorter. Growing from empty cost two
     // or three reallocations per record.
-    let mut md = String::with_capacity((rlen as usize / 4).max(16));
+    md.clear();
+    md.reserve((rlen as usize / 4).max(16));
     // Three cursors, named `x`, `y` and `u` in the C: the query position, the reference position,
     // and the length of the match run currently being accumulated (the integers that alternate with
     // the letters in an MD string).
@@ -537,15 +587,27 @@ pub(crate) fn gen_cigar2(
             // M covers both matches and mismatches, so we have to compare base by base. Note the
             // comparison is on nt4 codes, so an N in the query (code 4) never equals a reference
             // base and always scores as a mismatch in NM.
-            for i in 0..len {
-                if query[query_pos + i] != rseq[ref_pos + i] {
-                    crate::emit::push_int_str(&mut md, i64::from(match_run));
-                    md.push(base_char(rseq[ref_pos + i]));
-                    n_mm += 1;
-                    match_run = 0;
-                } else {
-                    match_run += 1;
+            let (q, r) = (
+                &query[query_pos..query_pos + len],
+                &rseq[ref_pos..ref_pos + len],
+            );
+            let mut i = 0;
+            loop {
+                let k = common_prefix(&q[i..], &r[i..]);
+                match_run += k as i32;
+                i += k;
+                if i >= len {
+                    break;
                 }
+                crate::emit::push_int_str(&mut md, i64::from(match_run));
+                md.push(base_char(r[i]));
+                // `--meth`: MD stays literal, but NM counts only what the read's matrix
+                // penalises, so a conversion is not an edit (fg-labs/bwa-mem3 `nm_from_mat`).
+                if opt.meth.is_none() || opt.mat[r[i] as usize * 5 + q[i] as usize] < 0 {
+                    n_mm += 1;
+                }
+                match_run = 0;
+                i += 1;
             }
             query_pos += len;
             ref_pos += len;
@@ -579,6 +641,25 @@ pub(crate) fn gen_cigar2(
     SCRATCH_QUERY.with(|c| *c.borrow_mut() = std::mem::take(&mut query));
     SCRATCH_RSEQ.with(|c| *c.borrow_mut() = std::mem::take(&mut rseq));
     Some((score, cigar, n_mm + n_gap, md))
+}
+
+/// The length of the common prefix of `a` and `b`, at most the shorter length; eight bytes per
+/// compare.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let w = |s: &[u8]| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        let x = w(a) ^ w(b);
+        if x != 0 {
+            return i + (x.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
 }
 
 thread_local! {
@@ -839,12 +920,13 @@ pub fn reg2aln(
         score: reg.score,
         // XS:i is the better of the two suboptimal estimates: `sub` from overlapping regions
         // (`mem_mark_primary_se`) and `csub` from within the same chain.
-        sub: reg.sub.max(reg.csub),
+        sub: reg.sub.max(crate::lazy_csub::get(reg.csub)),
         alt_sc: reg.alt_sc,
         is_alt: reg.is_alt,
         // Filled in by the caller from `mem_gen_alt`; `reg2aln` never produces XA itself, because
         // XA generation calls back into `reg2aln` and would recurse.
         xa: None,
+        hn: -1,
     }
 }
 
@@ -1066,5 +1148,24 @@ pub mod global_fp {
             "[global-fp] the lemma licenses X <= {}",
             THRESHOLD.load(Relaxed)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `common_prefix` stops at the first difference wherever it falls in an 8-byte word, and at
+    /// the shorter length.
+    #[test]
+    fn common_prefix_equals_bytewise() {
+        let a: Vec<u8> = (0..40u8).map(|i| i % 4).collect();
+        for n in 0..a.len() {
+            for at in 0..=n {
+                let mut b = a[..n].to_vec();
+                if at < n {
+                    b[at] ^= 1;
+                }
+                assert_eq!(super::common_prefix(&a, &b), at);
+            }
+        }
     }
 }

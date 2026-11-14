@@ -1,4 +1,4 @@
-//! `BWA4_NO_BATCH_OVERLAP` halves the pipeline's batch memory, and the whole case for it rests on
+//! `BWA4_BATCH_OVERLAP` doubles the pipeline's batch memory, and the whole case for it rests on
 //! one claim: it cannot move a byte of output. That claim is not obvious from the code. The switch
 //! changes how many batches are being aligned at once, on different threads, and this project has
 //! learned repeatedly that output identity survives a scheduling change only when something holds
@@ -58,7 +58,7 @@ fn write_reads(path: &Path, n: usize, len: usize, stride: usize) {
 /// # Parameters
 ///
 /// - `reads`: one or two FASTQ paths (paired when two).
-/// - `no_overlap`: whether to set `BWA4_NO_BATCH_OVERLAP`.
+/// - `no_overlap`: true for one batch in flight, false to set `BWA4_BATCH_OVERLAP`.
 ///
 /// # Returns
 ///
@@ -71,12 +71,13 @@ fn align(reads: &[PathBuf], no_overlap: bool) -> String {
         .arg("2000")
         .arg(repo_root().join("testdata/tiny/tiny.fa"))
         .args(reads);
+    // Both variables set explicitly: the test must not silently pass because the developer running
+    // it had one exported in their shell, which would make both arms the same arm.
+    cmd.env_remove("BWA4_NO_BATCH_OVERLAP");
     if no_overlap {
-        cmd.env("BWA4_NO_BATCH_OVERLAP", "1");
+        cmd.env_remove("BWA4_BATCH_OVERLAP");
     } else {
-        // Explicitly cleared: the test must not silently pass because the developer running it had
-        // the variable exported in their shell, which would make both arms the same arm.
-        cmd.env_remove("BWA4_NO_BATCH_OVERLAP");
+        cmd.env("BWA4_BATCH_OVERLAP", "1");
     }
     let out = cmd.output().unwrap();
     assert!(
@@ -105,7 +106,7 @@ fn single_end_output_is_identical_with_and_without_the_overlap() {
     );
     assert_eq!(
         with, without,
-        "BWA4_NO_BATCH_OVERLAP changed the single-end output"
+        "BWA4_BATCH_OVERLAP changed the single-end output"
     );
 }
 
@@ -128,6 +129,6 @@ fn paired_end_output_is_identical_with_and_without_the_overlap() {
     );
     assert_eq!(
         with, without,
-        "BWA4_NO_BATCH_OVERLAP changed the paired-end output"
+        "BWA4_BATCH_OVERLAP changed the paired-end output"
     );
 }

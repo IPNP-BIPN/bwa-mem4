@@ -43,7 +43,6 @@
 //! | `seedlen0` | length of the seed the chain was founded on |
 //! | `frac_rep` | fraction of the read covered by seeds that hit repetitive loci; scales MAPQ down at the end |
 //! | `w` | band width (in bp) used for the banded dynamic programming of this region |
-//! | `n_comp` | how many original regions were folded into this one by merging |
 //! | `hash` | Thomas Wang hash of the global read id plus the region index: a deterministic, thread-count-independent tie-breaker for equal-scoring regions |
 //! | `l` | in MAPQ, the alignment length (longer of the query and reference spans) |
 //! | `identity` | in MAPQ, the fractional identity *inferred from the score*, not counted from a CIGAR |
@@ -77,7 +76,7 @@
 //! out and leaves an empty one behind, which is how a stage rebuilds its input in place without
 //! cloning it or leaving a half-valid value visible.
 
-use bwa_chain::{ks_introsort_by, ks_introsort_by_key};
+use bwa_chain::{ks_introsort_by, ks_introsort_by_key, ks_introsort_by_u40_key};
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 
@@ -119,6 +118,9 @@ const ROUND_BIAS: f64 = 0.499;
 /// Empirical in bwa: treat it as calibrated so that a one-match-score margin maps to a few phred
 /// points. It is not derived from anything documented in the C.
 const MAPQ_SCORE_COEF: f64 = 6.02;
+
+/// bwa's `MEM_MAPQ_COEF` (`bwamem.h`), the scale of the `-Q 0` MAPQ branch (`bwamem.cpp:1485`).
+const MAPQ_SEEDCOV_COEF: f64 = 30.0;
 
 /// `10 / ln(10)`, so `MAPQ_SUB_N_COEF * ln(sub_n + 1)` is `10 * log10(sub_n + 1)` phred points
 /// (`bwamem.cpp:1487`). The C writes the rounded literal 4.343, not the exact ratio, so we do too.
@@ -257,8 +259,11 @@ fn mem_patch_reg(
         * f64::from(right.score + left.score)
         + ROUND_BIAS) as i32;
     // Accept only if the actual global score reaches 90% of the more optimistic prediction. Falling
-    // short means the two regions do not in fact align through the interval between them.
-    if f64::from(score) / f64::from(q_s.max(r_s)) < f64::from(PATCH_MIN_SC_RATIO) {
+    // short means the two regions do not in fact align through the interval between them. And never
+    // on a score of 0 or below: the C returns the score and its callers merge only on `> 0`. Two
+    // regions from `--meth` seeds that score under 0 in the original alphabet predict a negative
+    // score, which a negative global score passes the ratio against (fork 0.16 parity).
+    if score <= 0 || f64::from(score) / f64::from(q_s.max(r_s)) < f64::from(PATCH_MIN_SC_RATIO) {
         return None;
     }
     Some((score, w))
@@ -447,8 +452,8 @@ mod sort_scratch {
     use super::MemAlnReg;
     use std::cell::RefCell;
 
-    /// Pass 1a's permutation: `re` and the index of the region it came from.
-    type PermRe = Vec<(i64, u32)>;
+    /// Pass 1a's permutation: `re << 24 | index` (see `ks_introsort_by_u40_key`).
+    type PermRe = Vec<u64>;
     /// Pass 3's permutation: the sort key and the index of the region it came from.
     ///
     /// The key's SHAPE is per-architecture, and that is measured rather than assumed. See the sort
@@ -462,6 +467,14 @@ mod sort_scratch {
     thread_local! {
         pub static PERM_RE: RefCell<PermRe> = const { RefCell::new(Vec::new()) };
         pub static PERM_SCORE: RefCell<PermScore> = const { RefCell::new(Vec::new()) };
+        /// `mem_mark_primary_se`'s permutation: (score descending, ALT last, hash) and the index,
+        /// packed into one u128 off x86-64 (see [`super::sort_hlt`]).
+        #[cfg(target_arch = "x86_64")]
+        #[allow(clippy::type_complexity)]
+        pub static PERM_PRI: RefCell<Vec<((u64, u64), u32)>> =
+            const { RefCell::new(Vec::new()) };
+        #[cfg(not(target_arch = "x86_64"))]
+        pub static PERM_PRI: RefCell<Vec<u128>> = const { RefCell::new(Vec::new()) };
         /// The gather target, which comes back holding the previous region buffer.
         pub static SPARE: RefCell<Vec<MemAlnReg>> = const { RefCell::new(Vec::new()) };
     }
@@ -522,16 +535,11 @@ pub fn mem_sort_dedup_patch(
     let _t1 = crate::rescue_split::start();
     sort_scratch::PERM_RE.with_borrow_mut(|perm| {
         sort_scratch::SPARE.with_borrow_mut(|spare| {
-            ks_introsort_by_key(&mut a, perm, spare, |r| r.re, |x, y| x < y);
+            ks_introsort_by_u40_key(&mut a, perm, spare, |r| r.re);
         });
     });
     crate::rescue_split::stop(&crate::rescue_split::T_SORT1, _t1);
     let _t2 = crate::rescue_split::start();
-    // `n_comp` counts how many original regions were folded into this one; it starts at 1 (itself)
-    // and the merge branch accumulates. Only `mem_patch_reg` merging changes it.
-    for r in &mut a {
-        r.n_comp = 1;
-    }
 
     // ---- Pass 1b: backward scan, killing redundant regions and merging collinear ones ---------
     for i in 1..a.len() {
@@ -607,11 +615,7 @@ pub fn mem_sort_dedup_patch(
                     // `truesc` and `score` both become the *global* merged score, so the retry loop
                     // in `reg2aln` will later compare that global score against itself and converge
                     // immediately: merged regions never trigger a band retry.
-                    //
-                    // `+ 1` in the `n_comp` update mirrors `bwamem.cpp:325` exactly. It appears to
-                    // double count (`q` contributes its own `n_comp` and then one more), but it is
-                    // the C's arithmetic and `n_comp` only feeds heuristics, never SAM bytes.
-                    a[i].n_comp += a[j_idx].n_comp + 1;
+                    // (bwa also sums an `n_comp` here, which nothing ever reads; it is not kept.)
                     a[i].seedcov = a[i].seedcov.max(a[j_idx].seedcov);
                     a[i].sub = a[i].sub.max(a[j_idx].sub);
                     a[i].csub = a[i].csub.max(a[j_idx].csub);
@@ -678,7 +682,9 @@ pub fn mem_sort_dedup_patch(
                 perm,
                 spare,
                 |r| (r.score, r.rb, r.qb),
-                |x, y| x.0 > y.0 || (x.0 == y.0 && (x.1 < y.1 || (x.1 == y.1 && x.2 < y.2))),
+                // Bitwise, not short-circuit (fg-labs/bwa-mem3's `dedup_psc_lt_bf`): the same
+                // boolean, without three data-dependent branches per comparison.
+                |x, y| (x.0 > y.0) | ((x.0 == y.0) & ((x.1 < y.1) | ((x.1 == y.1) & (x.2 < y.2)))),
             );
             #[cfg(not(target_arch = "x86_64"))]
             ks_introsort_by_key(&mut a, perm, spare, score_key, |x, y| x < y);
@@ -726,12 +732,10 @@ pub fn mem_sort_dedup_patch(
 ///   whatever survives, since equal triples would have passed the test above. So the position is
 ///   unique, whatever the permutation before it.
 ///
-/// The full pass also sets `n_comp` to 1, which `ma`'s regions already hold.
-///
 /// # Parameters
 /// * `opt`: for `mask_level_redun`.
 /// * `ma`: a list returned by [`mem_sort_dedup_patch`] with empty `codes` from at least two regions.
-///   The caller tracks that: a shorter input returns early, without the `n_comp` reset, and a pass
+///   The caller tracks that: a shorter input returns early, and a pass
 ///   with `codes` can leave pairs it merged untested.
 /// * `b`: the new region.
 ///
@@ -740,7 +744,7 @@ pub fn mem_sort_dedup_patch(
 pub(crate) fn insert_into_settled(
     opt: &MemOpt,
     ma: &mut Vec<MemAlnReg>,
-    mut b: MemAlnReg,
+    b: MemAlnReg,
 ) -> Result<(), MemAlnReg> {
     let mask_level_redun = opt.mask_level_redun;
     // Below 1 is what makes the tied-`re` argument hold, and a zero-length `b` is the compaction's.
@@ -779,14 +783,13 @@ pub(crate) fn insert_into_settled(
         let mr = (q.re - q.rb).min(b.re - b.rb);
         let mq = (q.qe - q.qb).min(b.qe - b.qb);
         if or_ as f32 > mask_level_redun * mr as f32 && oq as f32 > mask_level_redun * mq as f32 {
-            if !same_but_n_comp(q, &b) {
+            if !same_region(q, &b) {
                 return Err(b);
             }
             identical = true;
         }
     }
     if !identical {
-        b.n_comp = 1;
         let at = ma.partition_point(|r| {
             (-i64::from(r.score), r.rb, r.qb) < (-i64::from(b.score), b.rb, b.qb)
         });
@@ -795,9 +798,8 @@ pub(crate) fn insert_into_settled(
     Ok(())
 }
 
-/// Whether two regions are indistinguishable to everything after the dedup. `n_comp` is left out
-/// because the pass resets it on both.
-fn same_but_n_comp(x: &MemAlnReg, y: &MemAlnReg) -> bool {
+/// Whether two regions are indistinguishable to everything after the dedup: every field equal.
+pub(crate) fn same_region(x: &MemAlnReg, y: &MemAlnReg) -> bool {
     x.rb == y.rb
         && x.re == y.re
         && x.qb == y.qb
@@ -816,7 +818,6 @@ fn same_but_n_comp(x: &MemAlnReg, y: &MemAlnReg) -> bool {
         && x.frac_rep.to_bits() == y.frac_rep.to_bits()
         && x.is_alt == y.is_alt
         && x.alt_sc == y.alt_sc
-        && x.hash == y.hash
 }
 
 /// Assign each region a primary, or promote it to primary itself. Port of
@@ -862,7 +863,8 @@ fn mark_primary_core(opt: &MemOpt, a: &mut [MemAlnReg]) {
     // Indices into `a` of the primaries found so far, in discovery order, which (given the
     // best-first sort) is also descending score order. Invariant at the top of each iteration: it
     // holds every region in `0..i` that no earlier primary absorbed, and it is never empty.
-    let mut primaries: Vec<usize> = vec![0];
+    // Inline: a read has one to three primaries, and this ran once per read per end on the heap.
+    let mut primaries: smallvec::SmallVec<[usize; 8]> = smallvec::smallvec![0];
     for i in 1..n {
         // Fields of the candidate `a[i]`, copied out so the loop below can borrow `a` immutably
         // and then write to `a[j]`: query bounds, score, and whether it is an ALT-contig hit.
@@ -940,6 +942,100 @@ pub fn stamp_is_alt(bns: &BntSeq, regs: &mut [MemAlnReg]) {
     }
 }
 
+/// bwa's order (`alnreg_hlt`): score descending, non-ALT first, then `hash_64(id + i)` of each
+/// region's index `i` on entry (`bwamem.cpp:1428`). The key is total: `hash_64` is a bijection
+/// (each step multiplies by an odd constant or xorshifts), so the hashes of `id + i` are distinct
+/// and every sort leaves the regions where bwa's introsort does. Always indirect, since the hash
+/// is not stored in the region.
+///
+/// Returns the hashes in the new order when `keep_hashes` (the ALT re-ranking sorts on them
+/// again), else an empty vector.
+fn sort_hlt(a: &mut [MemAlnReg], id: u64, keep_hashes: bool) -> Vec<u64> {
+    let hash = |i: usize| hash_64(id.wrapping_add(i as u64));
+    if a.len() < 2 {
+        return if keep_hashes {
+            (0..a.len()).map(hash).collect()
+        } else {
+            Vec::new()
+        };
+    }
+    sort_scratch::PERM_PRI.with_borrow_mut(|perm| {
+        perm.clear();
+        // Off x86-64 the key and a 31-bit index are one u128 (`!score` biased to unsigned, ALT
+        // bit, hash, index), compared in two instructions instead of a tuple chain.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            assert!(a.len() < 1 << 31);
+            perm.extend(a.iter().enumerate().map(|(i, r)| {
+                u128::from(!(r.score as u32 ^ 0x8000_0000)) << 96
+                    | u128::from(r.is_alt) << 95
+                    | u128::from(hash(i)) << 31
+                    | i as u128
+            }));
+            perm.sort_unstable();
+            let hashes = if keep_hashes {
+                perm.iter().map(|&p| (p >> 31) as u64).collect()
+            } else {
+                Vec::new()
+            };
+            permute(a, |j| {
+                let src = (perm[j] as u32 & 0x7fff_ffff) as usize;
+                perm[j] = perm[j] & !0x7fff_ffff | j as u128;
+                src
+            });
+            hashes
+        }
+        // x86-64: fg-labs/bwa-mem3's `primary_pair`, `(!score << 1 | alt, hash)` compared
+        // bitwise. The pair is distinct per region, so the index never breaks a tie.
+        #[cfg(target_arch = "x86_64")]
+        {
+            perm.extend(a.iter().enumerate().map(|(i, r)| {
+                let k0 = u64::from(!(r.score as u32 ^ 0x8000_0000)) << 1 | u64::from(r.is_alt);
+                ((k0, hash(i)), i as u32)
+            }));
+            perm.sort_unstable_by(|x, y| {
+                let (a, b) = (x.0, y.0);
+                let lt = (a.0 < b.0) | ((a.0 == b.0) & (a.1 < b.1));
+                if lt {
+                    std::cmp::Ordering::Less
+                } else if a == b {
+                    std::cmp::Ordering::Equal
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+            let hashes = if keep_hashes {
+                perm.iter().map(|p| p.0 .1).collect()
+            } else {
+                Vec::new()
+            };
+            permute(a, |j| std::mem::replace(&mut perm[j].1, j as u32) as usize);
+            hashes
+        }
+    })
+}
+
+/// Puts the region from `a[src(j)]` at `a[j]` for every `j`, cycle by cycle through one temporary:
+/// each region moves once, where gathering into a spare and copying it back moved every one twice
+/// (the copy back was 13% of real reads' memmove bytes). `src(j)` returns `j`'s source and marks
+/// `j` placed, so a later `src(j)` returns `j` itself.
+fn permute(a: &mut [MemAlnReg], mut src: impl FnMut(usize) -> usize) {
+    for i in 0..a.len() {
+        let mut k = src(i);
+        if k == i {
+            continue;
+        }
+        let first = a[i].clone();
+        let mut j = i;
+        while k != i {
+            a[j] = a[k].clone();
+            j = k;
+            k = src(j);
+        }
+        a[j] = first;
+    }
+}
+
 /// Mark primary/secondary regions and set `sub`/`sub_n`. Port of `mem_mark_primary_se`
 /// (`bwamem.cpp:1420`) for the primary-assembly (non-ALT) case.
 ///
@@ -978,15 +1074,11 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     // Running count of non-ALT (primary-assembly) regions seen so far; the return value. Counted
     // during the reset loop because that loop already visits every region.
     let mut n_pri = 0;
-    for (i, r) in a.iter_mut().enumerate() {
+    for r in a.iter_mut() {
         // Reset before marking: this function can run more than once over the same regions (PE
         // rescue re-marks), and stale `sub` would defeat `mark_primary_core`'s `sub == 0` sentinel.
         r.sub = 0;
         r.secondary = -1;
-        // `hash_64(id + i)` (`bwamem.cpp:1428`). `wrapping_add` because the C adds an `int64_t` id
-        // to an `int` index with no overflow check; at realistic read counts this never wraps, but
-        // the wrapping form is the faithful one.
-        r.hash = hash_64(id.wrapping_add(i as u64));
         if !r.is_alt {
             n_pri += 1;
         }
@@ -1003,7 +1095,12 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
         for (i, r) in a.iter().enumerate() {
             eprintln!(
                 "  pre{i} q[{},{}) r[{},{}) score={} hash={}",
-                r.qb, r.qe, r.rb, r.re, r.score, r.hash
+                r.qb,
+                r.qe,
+                r.rb,
+                r.re,
+                r.score,
+                hash_64(id.wrapping_add(i as u64))
             );
         }
     }
@@ -1016,11 +1113,8 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     // are no ties left for introsort's instability to resolve differently. Contrast `alnreg_slt2`
     // in `mem_sort_dedup_patch` above, which keys on `re` alone and where instability genuinely
     // decides which alignment survives.
-    ks_introsort_by(a, |x, y| {
-        x.score > y.score
-            || (x.score == y.score
-                && (!x.is_alt && y.is_alt || (x.is_alt == y.is_alt && x.hash < y.hash)))
-    });
+    // The tie-break hashes come back only when the ALT re-ranking below will sort on them again.
+    let hashes = sort_hlt(a, id, n_pri > 0 && (n_pri as usize) < a.len());
     mark_primary_core(opt, a);
     let n = a.len();
     // First-round bookkeeping (`bwamem.cpp:1433-1439`), done BEFORE any re-ranking:
@@ -1043,12 +1137,18 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
         // assembly occupies the prefix `0..n_pri`. Skipped when n_pri == 0, exactly as the C skips
         // it: with no primary-assembly hit there is no prefix to isolate, and re-sorting would
         // reorder the ALT hits for nothing.
+        // Sorted as indices, since the hashes live beside the regions: the introsort only compares
+        // and moves, so it leaves the indices where it would have left the regions.
         if n_pri > 0 {
-            ks_introsort_by(a, |x, y| {
-                (!x.is_alt && y.is_alt)
-                    || (x.is_alt == y.is_alt
-                        && (x.score > y.score || (x.score == y.score && x.hash < y.hash)))
+            let mut idx: Vec<u32> = (0..n as u32).collect();
+            ks_introsort_by(&mut idx, |&x, &y| {
+                let (rx, ry) = (&a[x as usize], &a[y as usize]);
+                (!rx.is_alt && ry.is_alt)
+                    || (rx.is_alt == ry.is_alt
+                        && (rx.score > ry.score
+                            || (rx.score == ry.score && hashes[x as usize] < hashes[y as usize])))
             });
+            permute(a, |j| std::mem::replace(&mut idx[j], j as u32) as usize);
         }
         // `z[first_round_rank] = index_after_the_re-sort`. Built from `secondary_all`, which each
         // region carried through the sort, so it inverts the permutation the sort just applied.
@@ -1093,6 +1193,20 @@ pub fn mem_mark_primary_se(opt: &MemOpt, a: &mut [MemAlnReg], id: u64) -> i32 {
     n_pri
 }
 
+/// `f64::from(n).ln()`, from a table below 1024: MAPQ takes the log of an alignment length, a seed
+/// coverage or a competitor count, always a small integer, and libm's `log` per record showed in
+/// x86 profiles. The table holds libm's own results (filled at first use, the argument opaque so
+/// nothing is folded at compile time), so every value is bit-identical.
+pub(crate) fn ln_int(n: i32) -> f64 {
+    static LN: std::sync::OnceLock<[f64; 1024]> = std::sync::OnceLock::new();
+    match usize::try_from(n) {
+        Ok(i) if i < 1024 => {
+            LN.get_or_init(|| std::array::from_fn(|k| std::hint::black_box(k as f64).ln()))[i]
+        }
+        _ => f64::from(n).ln(),
+    }
+}
+
 /// Approximate mapping quality of a primary region, 0..=60. Port of `mem_approx_mapq_se`
 /// (`bwamem.cpp:1470`).
 ///
@@ -1127,7 +1241,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         opt.min_seed_len * opt.a
     };
     // `csub` is the best competitor from within the same chain; take whichever evidence is stronger.
-    sub = sub.max(a.csub);
+    sub = sub.max(crate::lazy_csub::get(a.csub));
     // No margin at all: the competitor is as good as us, so the placement is arbitrary.
     if sub >= a.score {
         return 0;
@@ -1153,11 +1267,18 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
     let mut mapq: i32;
     if a.score == 0 {
         mapq = 0;
+    } else if opt.mapq_coef_len <= 0.0 {
+        // The C's other branch (`bwamem.cpp:1485`), taken under `-Q 0` or a negative `-Q`: the
+        // margin over the competitor scaled by how much of the read the seeds cover, then the
+        // same identity shrink as below but squared once and only under 95% identity.
+        mapq = (MAPQ_SEEDCOV_COEF * (1.0 - f64::from(sub) / f64::from(a.score)) * ln_int(a.seedcov)
+            + ROUND_BIAS) as i32;
+        if identity < 0.95 {
+            mapq = (f64::from(mapq) * identity * identity + ROUND_BIAS) as i32;
+        }
     } else {
-        // `mapQ_coef_len > 0` always holds for the default options (it is set to 50 at
-        // `bwamem.cpp:140`), so only the C's first branch (`bwamem.cpp:1480`) is ported. The
-        // `else` branch at `bwamem.cpp:1485`, which uses `MEM_MAPQ_COEF` and `log(seedcov)`, is
-        // dead code under any reachable option set.
+        // `mapQ_coef_len > 0` (the default, 50 at `bwamem.cpp:140`): the C's first branch
+        // (`bwamem.cpp:1480`).
         //
         // Length discount (the C's first `tmp`): short alignments (below 50bp) get no discount,
         // longer ones get `log(50) / log(l)`, which decays slowly. The intuition is that a long
@@ -1165,7 +1286,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         let len_discount = if f64::from(l) < opt.mapq_coef_len {
             1.0
         } else {
-            opt.mapq_coef_fac / f64::from(l).ln()
+            opt.mapq_coef_fac / ln_int(l)
         };
         // Squared here and squared again in the line below, so identity enters to the *fourth*
         // power and the length term to the second. That steep falloff is deliberate: a
@@ -1182,7 +1303,7 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
     // so two competitors cost about 3 and ten cost 10. Applied before the clamp, so a large
     // penalty can drive `mapq` negative and the clamp catches it.
     if a.sub_n > 0 {
-        mapq -= (MAPQ_SUB_N_COEF * f64::from(a.sub_n + 1).ln() + ROUND_BIAS) as i32;
+        mapq -= (MAPQ_SUB_N_COEF * ln_int(a.sub_n + 1) + ROUND_BIAS) as i32;
     }
     // bwa's own ceiling, not a SAM one. Must happen before the `frac_rep` scaling below,
     // otherwise a large pre-clamp value would survive the multiplication (`bwamem.cpp:1490`).
@@ -1279,6 +1400,71 @@ pub fn mem_reorder_primary5(t: i32, regs: &mut [MemAlnReg]) {
 mod tests {
     use super::*;
 
+    /// `mem_mark_primary_se`'s unstable sort puts the regions where bwa's introsort does: with the
+    /// hashes of `id + i` distinct, the key is total. Few scores and ALT flags, so ties up to the
+    /// hash are the common case; lengths on both sides of the indirect threshold.
+    #[test]
+    fn mark_primary_sort_matches_introsort() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for round in 0..400u64 {
+            let n = 1 + next(80) as usize;
+            let mut a: Vec<MemAlnReg> = (0..n)
+                .map(|i| {
+                    let mut r = reg(20 + next(3) as i32, 0, 0, 0, 1);
+                    r.is_alt = next(4) == 0;
+                    r.rb = i as i64;
+                    r
+                })
+                .collect();
+            let mut b: Vec<(MemAlnReg, u64)> = a
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.clone(), hash_64(round.wrapping_add(i as u64))))
+                .collect();
+            let hashes = sort_hlt(&mut a, round, true);
+            ks_introsort_by(&mut b, |(x, hx), (y, hy)| {
+                x.score > y.score
+                    || (x.score == y.score
+                        && (!x.is_alt && y.is_alt || (x.is_alt == y.is_alt && hx < hy)))
+            });
+            let ia: Vec<i64> = a.iter().map(|r| r.rb).collect();
+            let ib: Vec<i64> = b.iter().map(|(r, _)| r.rb).collect();
+            assert_eq!(ia, ib, "round {round}, n {n}");
+            let hb: Vec<u64> = b.iter().map(|&(_, h)| h).collect();
+            assert_eq!(hashes, hb, "round {round}, n {n}");
+        }
+    }
+
+    /// A merge whose global score is not positive is no merge: two negative regions (`--meth` seeds
+    /// can score under 0) predict a negative score, which a negative global score passed the ratio
+    /// test against. The same pair on the reference's own bases still merges.
+    #[test]
+    fn patch_needs_a_positive_global_score() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let fm = FmIndex::load(std::path::Path::new(prefix)).unwrap();
+        let opt = MemOpt::default();
+        let rb = 1000i64;
+        let refb = fm.bases(rb, rb + 60);
+        assert!(refb.iter().all(|&b| b < 4));
+        let span = |score: i32, at: i64| {
+            let mut r = reg(score, 0, 0, 0, 20);
+            (r.rb, r.re, r.qb, r.qe) = (rb + at, rb + at + 20, at as i32, at as i32 + 20);
+            r
+        };
+        let mismatched: Vec<u8> = refb.iter().map(|&b| 3 - b).collect();
+        assert_eq!(
+            mem_patch_reg(&fm, &opt, &mismatched, &span(-10, 0), &span(-10, 40)),
+            None
+        );
+        assert!(mem_patch_reg(&fm, &opt, &refb, &span(20, 0), &span(20, 40)).is_some());
+    }
+
     /// The incremental insert against the pass it stands in for, on lists built to hit every case its
     /// proof names: tied `re`, tied scores, exact duplicates, near-duplicates differing in one field,
     /// and regions just either side of the redundancy threshold. Every field is compared, since the
@@ -1313,7 +1499,6 @@ mod tests {
             r.truesc = 0;
             r.csub = next(3) as i32;
             r.seedcov = next(2) as i32;
-            r.n_comp = 0;
             r
         };
         let same = |x: &[MemAlnReg], y: &[MemAlnReg]| format!("{x:?}") == format!("{y:?}");
@@ -1328,7 +1513,6 @@ mod tests {
                 let mut b = region(&mut next);
                 if next(2) == 0 {
                     b = settled[next(settled.len() as u64) as usize].clone();
-                    b.n_comp = 0;
                     match next(4) {
                         0 => b.csub += 1,
                         1 => b.re += 1,
@@ -1400,8 +1584,6 @@ mod tests {
             frac_rep: 0.0,
             is_alt: false,
             alt_sc: 0,
-            hash: 0,
-            n_comp: 0,
         }
     }
 
@@ -1470,5 +1652,19 @@ mod tests {
         let opt = MemOpt::default();
         let a = reg(145, 140, 1, 323, 150);
         assert_eq!(mem_approx_mapq_se(&opt, &a), 8);
+    }
+
+    /// `-Q 0` takes the C's seed-coverage branch (`bwamem.cpp:1485`); it used to give MAPQ 0 to
+    /// every read. Expected values worked by hand from the C; the whole range 0..=60 also matched
+    /// bwa-mem2 byte for byte on a repeat-rich simulated genome.
+    #[test]
+    fn mapq_q0_uses_seedcov_branch() {
+        let mut opt = MemOpt::default();
+        opt.mapq_coef_len = 0.0;
+        opt.mapq_coef_fac = 0.0;
+        // identity >= 0.95: 30 * (1 - 140/145) * ln(323) -> 6, minus the sub_n penalty 3.
+        assert_eq!(mem_approx_mapq_se(&opt, &reg(145, 140, 1, 323, 150)), 3);
+        // identity 0.933 < 0.95: 30 * 0.5 * ln(30) -> 51, then * identity^2 -> 44.
+        assert_eq!(mem_approx_mapq_se(&opt, &reg(100, 50, 0, 30, 150)), 44);
     }
 }

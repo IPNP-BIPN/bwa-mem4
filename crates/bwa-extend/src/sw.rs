@@ -217,7 +217,8 @@ pub fn ksw_extend2(
     // Sequence lengths in bases: `qlen` is the number of DP columns, `tlen` the number of rows.
     let qlen = query.len();
     let tlen = target.len();
-    debug_assert!(h0 > 0);
+    // No `h0 > 0` assert: bwa asserts it, but `--meth` re-scores a seed against the original
+    // genome and can start at h0 <= 0, which the recurrence handles (fg-labs/bwa-mem3 dropped it too).
     // Cost of the *first* base of a gap, open plus one extend. Precomputed because the inner loop
     // subtracts it once per cell; `oe_del` for deletions (consuming target), `oe_ins` for
     // insertions (consuming query).
@@ -496,7 +497,7 @@ pub fn ksw_extend2(
 /// penalties from it repeatedly, and starting a quarter of the way up from the bottom leaves ample
 /// headroom so those subtractions cannot wrap. Reproduce the constant exactly, since an unreachable
 /// cell's exact value can leak into a tie-break.
-const MINUS_INF: i32 = -0x4000_0000;
+pub(crate) const MINUS_INF: i32 = -0x4000_0000;
 
 /// Append `(op, len)` to a CIGAR (op-merged), mirroring bwa's `push_cigar` (`ksw.cpp:546-556`).
 /// Ops follow the BAM encoding used throughout bwa: 0=M, 1=I, 2=D, packed as `len << 4 | op`.
@@ -513,7 +514,7 @@ const MINUS_INF: i32 = -0x4000_0000;
 ///   Must fit in 4 bits.
 /// * `len`: run length in bases, `>= 1`. Normally `1` (the traceback emits a single base per step);
 ///   the two leading-gap flushes at the end of the traceback pass a longer run.
-fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
+pub(crate) fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
     if let Some(last) = cigar.last_mut() {
         if (*last & 0xf) == op {
             *last += len << 4;
@@ -521,6 +522,199 @@ fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
         }
     }
     cigar.push((len << 4) | op);
+}
+
+/// A traceback's CIGAR, built back to front one op per step with the current `(op, len)` run kept
+/// apart and handed to [`push_cigar`] only when the op changes: the same words one push per step
+/// builds, without the per-step check of the last word (fg-labs/bwa-mem3's `ksw_g2_backtrack`).
+pub(crate) struct RunCigar {
+    cigar: Vec<u32>,
+    op: u32,
+    len: u32,
+}
+
+impl Default for RunCigar {
+    /// Eight words up front: a gapped read's few ops plus the two soft clips `reg2aln` adds later,
+    /// so neither the traceback nor the clips reallocate.
+    fn default() -> Self {
+        Self {
+            cigar: Vec::with_capacity(8),
+            op: 0,
+            len: 0,
+        }
+    }
+}
+
+impl RunCigar {
+    /// One step of operation `op` (`0 = M`, `1 = I`, `2 = D`).
+    #[inline(always)]
+    pub(crate) fn step(&mut self, op: u32) {
+        if op == self.op {
+            self.len += 1;
+        } else {
+            if self.len > 0 {
+                push_cigar(&mut self.cigar, self.op, self.len);
+            }
+            (self.op, self.len) = (op, 1);
+        }
+    }
+
+    /// The CIGAR so far, still back to front, with the open run flushed.
+    pub(crate) fn finish(mut self) -> Vec<u32> {
+        if self.len > 0 {
+            push_cigar(&mut self.cigar, self.op, self.len);
+        }
+        self.cigar
+    }
+}
+
+/// Gap costs of [`ksw_global2`]'s cell: first base (open + extend) and each further base.
+struct GlobalGaps {
+    oe_del: i32,
+    e_del: i32,
+    oe_ins: i32,
+    e_ins: i32,
+}
+
+/// One cell of [`ksw_global2`]'s forward pass. `mm` is H(i-1, j-1) and `e` E(i, j) on entry, `s`
+/// the score of (target[i], query[j]); updates `f` (to F(i, j+1)) and `h1` (to H(i, j)) and
+/// returns the traceback byte and E(i+1, j).
+///
+/// Direction bits 0-1 say how H was reached (0 = M, 1 = E, 2 = F); `>=` throughout means ties
+/// prefer M over E over F (`ksw.cpp:613-616`), which is part of the output CIGAR. E and F open from
+/// M, never from H (`ksw.cpp:604-607`); bit 2 records a continued deletion, bit 4 a continued
+/// insertion, two bits per field so the traceback shifts by `which << 1` uniformly. Every select
+/// goes through `select_unpredictable`: the conditions flip on mismatch positions, and LLVM's x86
+/// backend otherwise compiled them into branches (~21 cycles per cell on Zen 3 at ~50%
+/// misprediction). The hint forces conditional moves; the values are untouched.
+#[inline(always)]
+fn global_cell(mm: i32, e: i32, s: i8, f: &mut i32, h1: &mut i32, g: &GlobalGaps) -> (u8, i32) {
+    use std::hint::select_unpredictable;
+    let mm = mm + i32::from(s);
+    let mut d: u8 = u8::from(mm < e);
+    let mut h = select_unpredictable(mm >= e, mm, e);
+    d = select_unpredictable(h >= *f, d, 2);
+    h = select_unpredictable(h >= *f, h, *f);
+    *h1 = h;
+    let t = mm - g.oe_del;
+    let e = e - g.e_del;
+    d |= select_unpredictable(e > t, 1 << 2, 0);
+    let e = select_unpredictable(e > t, e, t);
+    let t = mm - g.oe_ins;
+    *f -= g.e_ins;
+    d |= select_unpredictable(*f > t, 2 << 4, 0);
+    *f = select_unpredictable(*f > t, *f, t);
+    (d, e)
+}
+
+/// `row[j] = mat_row[query[j]]`, 16 columns per table lookup where the CPU has one (fg-labs/
+/// bwa-mem3's `ksw_g2_query_profile`). A block holding a code past the row falls to the scalar loop,
+/// which indexes exactly as before.
+fn query_profile_row(row: &mut [i8], query: &[u8], mat_row: &[i8]) {
+    let mut j = 0;
+    if mat_row.len() <= 16 {
+        let mut tab = [0i8; 16];
+        tab[..mat_row.len()].copy_from_slice(mat_row);
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is mandatory on AArch64; every load and store is 16 bytes inside
+        // `query[j..]` / `row[j..]` with `j + 16 <= len`.
+        unsafe {
+            use std::arch::aarch64::*;
+            let t = vld1q_u8(tab.as_ptr().cast());
+            while j + 16 <= query.len() {
+                let idx = vld1q_u8(query.as_ptr().add(j));
+                if usize::from(vmaxvq_u8(idx)) >= mat_row.len() {
+                    break;
+                }
+                vst1q_u8(row.as_mut_ptr().add(j).cast(), vqtbl1q_u8(t, idx));
+                j += 16;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            // SAFETY: SSSE3 was just detected.
+            j = unsafe { query_profile_ssse3(row, query, &tab, mat_row.len()) };
+        }
+    }
+    for (r, &q) in row[j..].iter_mut().zip(&query[j..]) {
+        *r = mat_row[q as usize];
+    }
+}
+
+/// [`query_profile_row`]'s x86 blocks: `pshufb` over the 16-entry table. Returns where they stopped.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn query_profile_ssse3(row: &mut [i8], query: &[u8], tab: &[i8; 16], n: usize) -> usize {
+    use std::arch::x86_64::*;
+    let t = _mm_loadu_si128(tab.as_ptr().cast());
+    // Codes `0..n` are kept; `min(idx, n - 1) == idx` fails for any larger one, and for bytes with
+    // the top bit set, which `pshufb` would turn into 0.
+    let lim = _mm_set1_epi8((n - 1) as i8);
+    let mut j = 0;
+    while j + 16 <= query.len() {
+        let idx = _mm_loadu_si128(query.as_ptr().add(j).cast());
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(idx, lim), idx)) != 0xffff {
+            break;
+        }
+        _mm_storeu_si128(row.as_mut_ptr().add(j).cast(), _mm_shuffle_epi8(t, idx));
+        j += 16;
+    }
+    j
+}
+
+/// The interior rows `[i0, i1)` of [`ksw_global2`] at band `w = (N - 1) / 2`: each row is the full
+/// `N` cells `[i - w, i + w]` with `h1` and `f` starting at MINUS_INF, reads `eh[i-w ..= i+w]`, and
+/// writes back the same span plus `eh[i+w+1] = {h1, MINUS_INF}`. Row `i + 1` reads only what row
+/// `i` wrote and nothing reads `eh[i-w]` again, so the window stays in registers, shifted by one
+/// cell per row, and is stored back after the last row. Same cells, same order as the row loop.
+/// `target` and `z` are cut to the rows up front and walked as iterators, so the loop keeps no
+/// bounds of its own for them (N = 3 then has no stack traffic left, and every N runs 8-22% fewer
+/// instructions per row); the gaps are copied local so they stay in registers.
+#[allow(clippy::type_complexity)]
+#[inline(never)]
+fn global_mid_rows<const N: usize>(
+    (eh_h, eh_e, qp, target, z, qlen, g): (
+        &mut [i32],
+        &mut [i32],
+        &[i8],
+        &[u8],
+        &mut [u8],
+        usize,
+        &GlobalGaps,
+    ),
+    i0: usize,
+    i1: usize,
+) {
+    let w = (N - 1) / 2;
+    let g = GlobalGaps { ..*g };
+    let mut wh = [0i32; N];
+    let mut we = [0i32; N];
+    wh.copy_from_slice(&eh_h[i0 - w..i0 - w + N]);
+    we.copy_from_slice(&eh_e[i0 - w..i0 - w + N]);
+    let rows = target[i0..i1]
+        .iter()
+        .zip(z[i0 * N..i1 * N].as_chunks_mut::<N>().0);
+    for (iw, (&tc, zi)) in (i0 - w..).zip(rows) {
+        let q: &[i8; N] = qp[tc as usize * qlen + iw..][..N].try_into().unwrap();
+        let (mut f, mut h1) = (MINUS_INF, MINUS_INF);
+        let (mut nh, mut ne) = ([0i32; N], [0i32; N]);
+        for k in 0..N {
+            let s = h1;
+            let (d, e) = global_cell(wh[k], we[k], q[k], &mut f, &mut h1, &g);
+            zi[k] = d;
+            // eh[beg + k] becomes {s, e}; the next row's window starts one cell later.
+            if k > 0 {
+                nh[k - 1] = s;
+                ne[k - 1] = e;
+            }
+        }
+        nh[N - 1] = h1;
+        ne[N - 1] = MINUS_INF;
+        wh = nh;
+        we = ne;
+    }
+    eh_h[i1 - w..i1 - w + N].copy_from_slice(&wh);
+    eh_e[i1 - w..i1 - w + N].copy_from_slice(&we);
 }
 
 /// Banded **global** (end-to-end, Needleman-Wunsch with affine gaps) alignment with traceback: a
@@ -557,8 +751,32 @@ fn push_cigar(cigar: &mut Vec<u32>, op: u32, len: u32) {
 /// packed run-length encoding, one `len << 4 | op` word per run with `op` in `{0=M, 1=I, 2=D}`, in
 /// left-to-right order. Its `M`+`I` lengths sum to `query.len()` and its `M`+`D` lengths sum to
 /// `target.len()`.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 pub fn ksw_global2(
+    query: &[u8],
+    target: &[u8],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w: i32,
+) -> (i32, Vec<u32>) {
+    // The wavefront kernel (NEON, or SSE4.1 on x86_64) where it is proven byte-identical and
+    // wide enough to pay.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if let Some(r) =
+        crate::global_wave::try_wave16(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
+    {
+        return r;
+    }
+    ksw_global2_scalar(query, target, m, mat, o_del, e_del, o_ins, e_ins, w)
+}
+
+/// [`ksw_global2`] on the scalar row-major kernel, every shape.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub(crate) fn ksw_global2_scalar(
     query: &[u8],
     target: &[u8],
     m: usize,
@@ -620,10 +838,14 @@ pub fn ksw_global2(
             eh_h: eh_h_buf,
             eh_e: eh_e_buf,
         } = &mut *scratch;
-        z_buf.clear();
-        z_buf.resize(n_col * tlen, 0u8);
-        qp_buf.clear();
-        qp_buf.resize(qlen * m, 0i8);
+        // Grown, never cleared: the forward pass writes every `z` cell the traceback reads and
+        // every `qp` entry (ksw.c mallocs both uninitialised), so zeroing them was pure cost.
+        if z_buf.len() < n_col * tlen {
+            z_buf.resize(n_col * tlen, 0u8);
+        }
+        if qp_buf.len() < qlen * m {
+            qp_buf.resize(qlen * m, 0i8);
+        }
         // Fixed-length reslices, and they are not cosmetic: `resize` leaves the vector length opaque to
         // LLVM, which reinstated a bounds check on every `eh_h[j]`/`eh_e[j]`/`z[..]` access in the
         // inner loop and cost 2.1 us per call on ARM (7.66 -> 10.75 s CPU over 1.46M calls) before
@@ -631,16 +853,9 @@ pub fn ksw_global2(
         // `vec![...]` used to provide.
         let z: &mut [u8] = &mut z_buf[..n_col * tlen];
         let qp: &mut [i8] = &mut qp_buf[..qlen * m];
-        // Flat cursor into `qp`: index of the next entry to write. Walks all `m * qlen` entries in
-        // order and ends at `qlen * m`.
-        let mut write_pos = 0;
-        for target_code in 0..m {
+        for (target_code, row) in qp.chunks_exact_mut(qlen).enumerate() {
             // The `mat` row for this target base: `mat_row[q]` scores it against query code `q`.
-            let mat_row = &mat[target_code * m..target_code * m + m];
-            for &query_base in query {
-                qp[write_pos] = mat_row[query_base as usize];
-                write_pos += 1;
-            }
+            query_profile_row(row, query, &mat[target_code * m..target_code * m + m]);
         }
 
         // Row -1. Unlike the local kernel there is no 0 sentinel: unreachable is MINUS_INF, and the
@@ -661,7 +876,33 @@ pub fn ksw_global2(
         // ===========================================================================================
         // Forward pass: fill the score arrays and record, per cell, how each of H/E/F was reached
         // ===========================================================================================
-        for i in 0..tlen {
+        // Rows strictly inside the band (`w < i`, `i + w + 1 < qlen`) cover exactly `2w + 1` cells
+        // each, and each one reads only what the row before wrote; for a narrow band those rows run
+        // in a register window instead (`global_mid_rows`, fg-labs/bwa-mem3's `mid_rows`).
+        let mid_lo = (w + 1).min(tlen);
+        let mid_hi = qlen.saturating_sub(w + 1).min(tlen).max(mid_lo);
+        let g = GlobalGaps {
+            oe_del,
+            e_del,
+            oe_ins,
+            e_ins,
+        };
+        let mut i = 0;
+        while i < tlen {
+            if i == mid_lo && mid_hi > mid_lo && (1..=7).contains(&w) {
+                let rows = (&mut *eh_h, &mut *eh_e, &*qp, target, &mut *z, qlen, &g);
+                match w {
+                    1 => global_mid_rows::<3>(rows, mid_lo, mid_hi),
+                    2 => global_mid_rows::<5>(rows, mid_lo, mid_hi),
+                    3 => global_mid_rows::<7>(rows, mid_lo, mid_hi),
+                    4 => global_mid_rows::<9>(rows, mid_lo, mid_hi),
+                    5 => global_mid_rows::<11>(rows, mid_lo, mid_hi),
+                    6 => global_mid_rows::<13>(rows, mid_lo, mid_hi),
+                    _ => global_mid_rows::<15>(rows, mid_lo, mid_hi),
+                }
+                i = mid_hi;
+                continue;
+            }
             // F(i, beg): no insertion can be open at the row's left edge, and "impossible" is MINUS_INF
             // here rather than 0, since a global alignment has no local floor.
             let mut f = MINUS_INF;
@@ -693,50 +934,16 @@ pub fn ksw_global2(
                 // previous row) and `e` is E(i, j); after the `+= q[j]` below, `mm` is M(i,j). The
                 // store of `h1` into `eh_h[j]` publishes H(i, j-1), which is what row i+1 will read as
                 // *its* diagonal predecessor, so both reads must happen before it.
-                let mut mm = eh_h[j];
-                let mut e = eh_e[j];
+                let (mm, e) = (eh_h[j], eh_e[j]);
                 eh_h[j] = h1;
-                mm += i32::from(q[j]);
-                // Direction bits 0-1. `>=` throughout means ties prefer M over E over F, in that order
-                // (`ksw.cpp:613-616`). Tie order is part of the output CIGAR, so it is not free choice.
-                // `d` accumulates this cell's traceback byte: bits 0-1 (set here) say how H(i,j) was
-                // reached, 0 = from M, 1 = from E, 2 = from F. `h` becomes H(i,j) = max(M, E, F).
-                // Every select in this body goes through `select_unpredictable`, and that hint is the
-                // whole x86 story: the conditions flip on mismatch positions, i.e. randomly, and LLVM's
-                // x86 backend was compiling these `if`s into BRANCHES (64 branches, 12 cmov in the v3
-                // asm of this function). At ~50% misprediction and ~17 cycles each on Zen 3 that is
-                // ~21 cycles per cell, the measured 30.6 us per call against 5.4 us for the same call
-                // on an M4, whose predictor absorbs it. The hint forces conditional moves; the VALUES
-                // are untouched, so this cannot move a byte, and the tie-break comments still hold.
-                use std::hint::select_unpredictable;
-                let mut d: u8 = u8::from(mm < e);
-                let mut h = select_unpredictable(mm >= e, mm, e);
-                d = select_unpredictable(h >= f, d, 2);
-                h = select_unpredictable(h >= f, h, f);
-                h1 = h;
-                // Outgoing E/F, again opening from M (`mm`), never from `h`: same "no 100M3I3D20M" rule
-                // as the local kernel, spelled out in the C's comment at `ksw.cpp:604-607`. Bit 2 records
-                // "the deletion was continued rather than opened", bit 4 the same for the insertion; the
-                // C uses two bits per field (`1<<2`, `2<<4`) purely so the traceback can shift by
-                // `which<<1` uniformly (`ksw.cpp:625` notes one bit would do).
-                // `t` is the "open a fresh deletion here" candidate, M(i,j) minus the first gap base;
-                // `e` becomes the "keep the deletion already open" candidate. The larger is E(i+1, j).
-                let t = mm - oe_del;
-                e -= e_del;
-                d |= select_unpredictable(e > t, 1 << 2, 0);
-                e = select_unpredictable(e > t, e, t);
+                let (d, e) = global_cell(mm, e, q[j], &mut f, &mut h1, &g);
                 eh_e[j] = e;
-                // Same for the insertion side: `t` opens a fresh one from M(i,j), `f` extends the one
-                // already open. The larger is F(i, j+1), which flows rightward in this register only.
-                let t = mm - oe_ins;
-                f -= e_ins;
-                d |= select_unpredictable(f > t, 2 << 4, 0);
-                f = select_unpredictable(f > t, f, t);
                 // Stored band-relative: column j of row i lives at offset j - beg.
                 z[z_row_offset + (j - beg)] = d;
             }
             eh_h[end] = h1;
             eh_e[end] = MINUS_INF;
+            i += 1;
         }
         // H(tlen-1, qlen-1) as flushed by the last row's epilogue: the score of aligning all of `query`
         // against all of `target`. May be negative.
@@ -748,7 +955,7 @@ pub fn ksw_global2(
         // Traceback from the bottom-right cell of the band (`ksw.cpp:650-664`). `k` is the last query
         // column row `tlen-1` actually evaluated, i.e. `min(i + w + 1, qlen) - 1`.
         // The CIGAR under construction, built back to front (reversed at the very end).
-        let mut cigar: Vec<u32> = Vec::new();
+        let mut run = RunCigar::default();
         // The traceback cursor: `i` is the current target row and `k` the current query column, both
         // 0-based and both walking down to -1. At the top of each iteration they name the cell whose
         // direction bits are about to be read; the step then decrements whichever sequence the emitted
@@ -761,24 +968,40 @@ pub fn ksw_global2(
         // reads bits 2-3 (does the deletion continue), state 2 reads bits 4-5. That is the whole reason
         // the forward pass stored the continuation bits.
         let mut which = 0u8;
-        while i >= 0 && k >= 0 {
-            // Recompute the row's `beg` to undo the band-relative storage. Must match the forward pass.
-            let beg = (i as usize).saturating_sub(w);
-            // The traceback byte the forward pass stored for cell (i, k): `f<<4 | e<<2 | h`.
-            let d = z[i as usize * n_col + (k as usize - beg)];
-            which = (d >> (which << 1)) & 3;
-            if which == 0 {
-                push_cigar(&mut cigar, 0, 1);
-                i -= 1;
-                k -= 1;
-            } else if which == 1 {
-                push_cigar(&mut cigar, 2, 1);
-                i -= 1;
-            } else {
-                push_cigar(&mut cigar, 1, 1);
-                k -= 1;
+        if i >= 0 && k >= 0 {
+            // Where cell (i, k) is stored, band-relative as the forward pass wrote it, moved with
+            // each step rather than recomputed: `beg` drops by one with `i` exactly when `i > w`.
+            let mut idx = i as usize * n_col + (k as usize - (i as usize).saturating_sub(w));
+            loop {
+                // The traceback byte the forward pass stored for cell (i, k): `f<<4 | e<<2 | h`.
+                which = (z[idx] >> (which << 1)) & 3;
+                run.step(match which {
+                    0 => 0,
+                    1 => 2,
+                    _ => 1,
+                });
+                let shift = usize::from(i > w as i64);
+                match which {
+                    0 => {
+                        idx = idx.wrapping_sub(n_col + 1 - shift);
+                        i -= 1;
+                        k -= 1;
+                    }
+                    1 => {
+                        idx = idx.wrapping_sub(n_col - shift);
+                        i -= 1;
+                    }
+                    _ => {
+                        idx = idx.wrapping_sub(1);
+                        k -= 1;
+                    }
+                }
+                if i < 0 || k < 0 {
+                    break;
+                }
             }
         }
+        let mut cigar = run.finish();
         // The loop stops as soon as *either* sequence is exhausted; whatever remains of the other must
         // be a single leading gap, emitted here (target left over = D, query left over = I).
         if i >= 0 {
@@ -824,10 +1047,19 @@ pub fn ksw_global2(
 ///
 /// # Returns
 ///
-/// `(w, S)` with `w <= w_` the band to use. `w == 0` happens only for equal lengths and means the
-/// diagonal is the sole path scoring `S` or better, so the result is `S` and a single `M` run and
-/// the DP can be skipped. Returns `(w_, S)` unchanged for a matrix with no positive cell or negative
-/// gap penalties, where the bound's monotonicity does not hold.
+/// `(w, S)` with `w <= w_` the band to use. `w == 0` happens only for equal lengths and means no
+/// path scores above `S`, so the result is `S` and a single `M` run and the DP can be skipped.
+///
+/// That holds even when another path ties `S`. A path leaving the diagonal does so in excursions,
+/// each with at least one `I` and one `D` run; one spanning query `[p, r)` aligns at most `r - p - 1`
+/// pairs, so it gains at most `sum (a - s_k) - a - (o_ins + e_ins) - (o_del + e_del)` over that
+/// span, `s_k` the diagonal's cells. With `L * a - S` the sum over the whole diagonal, no path beats
+/// `S` once that sum is at most `a + o_ins + e_ins + o_del + e_del`. Then `H(L-1, L-1) = S`, which
+/// forces `H(k, k) = M(k, k)` all the way down the diagonal, and the traceback, preferring M on
+/// ties, walks it. Strictness would only matter if the traceback could prefer a tying gap.
+///
+/// Returns `(w_, S)` unchanged for a matrix with no positive cell or negative gap penalties, where
+/// the bound's monotonicity does not hold.
 ///
 /// # Parameters
 ///
@@ -849,20 +1081,15 @@ pub fn tightened_global_band(
     // `short_len`: the shorter length, which caps the aligned pairs. `gap`: the length difference.
     let short_len = qlen.min(tlen);
     let gap = qlen.abs_diff(tlen);
-    let cell = |pos_q: usize, pos_t: usize| -> i32 {
-        i32::from(mat[target[pos_t] as usize * m + query[pos_q] as usize])
-    };
-    // Walk the gap's position left to right: `run` starts with every pair on the far diagonal and
-    // moves one pair per step onto the near one. `best` keeps the highest total seen.
     let (t_shift, q_shift) = if tlen >= qlen { (gap, 0) } else { (0, gap) };
-    let mut run: i32 = (0..short_len).map(|k| cell(k + q_shift, k + t_shift)).sum();
-    let mut best = run;
-    if gap != 0 {
-        for k in 0..short_len {
-            run += cell(k, k) - cell(k + q_shift, k + t_shift);
-            best = best.max(run);
-        }
-    }
+    // bwa's matrices score a pair by equality alone, so compares stand in for the table: one
+    // lookup per pair was the whole cost of this scan on x86.
+    let best = match uniform_cells(mat, m) {
+        Some(u) => single_gap_best(query, target, short_len, q_shift, t_shift, uniform_cell(u)),
+        None => single_gap_best(query, target, short_len, q_shift, t_shift, |x, y| {
+            i32::from(mat[y as usize * m + x as usize])
+        }),
+    };
     let gap = gap as i32;
     // `gap_cost`: what the one mandatory gap costs, and the extend penalty of its side.
     let (gap_cost, e_long) = if gap == 0 {
@@ -880,9 +1107,178 @@ pub fn tightened_global_band(
     }
     let denom = a + e_del + e_ins;
     let budget = short_len as i32 * a - score - (o_del + o_ins) - gap * e_long;
+    // `budget <= denom` with no length difference is the tie case above: no path beats `S`.
+    if gap == 0 && budget <= denom {
+        return (0, score);
+    }
     // `v_max`: the largest overshoot whose ceiling still reaches `score`.
     let v_max = (budget / denom).max(0);
+    if gap == 0 && v_max <= EXC_MAX_V {
+        let (o_min, e_pair) = (o_del.min(o_ins), e_del + e_ins);
+        let flat = match uniform_cells(mat, m) {
+            Some(u) => {
+                excursions_cannot_gain(query, target, uniform_cell(u), a, o_min, e_pair, v_max)
+            }
+            None => excursions_cannot_gain(
+                query,
+                target,
+                |x, y| i32::from(mat[y as usize * m + x as usize]),
+                a,
+                o_min,
+                e_pair,
+                v_max,
+            ),
+        };
+        if flat {
+            return (0, score);
+        }
+    }
     ((gap + v_max).min(w_), score)
+}
+
+/// Widest band [`excursions_cannot_gain`] is tried on.
+const EXC_MAX_V: i32 = 16;
+
+/// Whether no path between equal-length `query` and `target` within `v` diagonals of the main one
+/// scores above the main diagonal, by an upper bound on what each excursion off it can gain.
+///
+/// An excursion leaves the diagonal and comes back; it holds pairs `(k, k + d)` with `d != 0`, `I`
+/// bases (query only) and `D` bases, as many `D` as `I`. Measured against the diagonal over the
+/// query bases it covers, a pair gains `cell(q_k, t_{k+d}) - s_k` and an `I` base `-s_k - e_ins -
+/// e_del` (its own extension and that of one `D` base), and every gap run opens at `o_min` or more.
+/// The scan below maximises over a superset of these walks: a pair may follow the previous base's
+/// pair on its diagonal or an `I` base for free, or any state for one `o_min`; an `I` base may
+/// follow an `I` base for free or any state for one `o_min`; an excursion
+/// opens from the diagonal for `o_min` and closes for `o_min` after a pair or for nothing after an
+/// `I` run, whose open it already paid. Each real excursion is one of these walks at no more than
+/// its real cost, so if no walk closes above 0, no path scores above `S`.
+fn excursions_cannot_gain(
+    query: &[u8],
+    target: &[u8],
+    cell: impl Fn(u8, u8) -> i32,
+    a: i32,
+    o_min: i32,
+    e_pair: i32,
+    v: i32,
+) -> bool {
+    const NEG: i32 = i32::MIN / 4;
+    const W: usize = EXC_MAX_V as usize;
+    let (len, v) = (query.len(), v as usize);
+    // `g[W + d]`: best open walk whose last base `k` is paired on diagonal `d`; `gi`: whose last base
+    // is in an `I` run; `best`: the best of them and of 0 (on the diagonal) after base `k`.
+    let mut g = [NEG; 2 * W + 1];
+    let (mut gi, mut best) = (NEG, 0);
+    // Every walk is dominated by a fresh open (`g`, `gi` <= `-o_min`, `best` = 0). From there a
+    // base whose diagonal cell is `a` keeps it so (no pair or `I` base gains on it), so the scan
+    // jumps over those.
+    let mut fresh = true;
+    let mut k = 0;
+    while k < len {
+        let (qk, s) = (query[k], cell(query[k], target[k]));
+        k += 1;
+        if fresh && s == a {
+            continue;
+        }
+        let from = best - o_min;
+        let enter = from.max(gi);
+        let mut gmax = NEG;
+        for d in 1..=v {
+            // Diagonal `-d` pairs base `k - 1` with target `k - 1 - d`, diagonal `d` with `k - 1 + d`.
+            for (lane, j) in [(W - d, (k - 1).checked_sub(d)), (W + d, Some(k - 1 + d))] {
+                let x = match j.filter(|&j| j < len) {
+                    Some(j) => cell(qk, target[j]) - s + g[lane].max(enter),
+                    None => NEG,
+                };
+                g[lane] = x;
+                gmax = gmax.max(x);
+            }
+        }
+        gi = (-s - e_pair) + gi.max(from);
+        if gmax > o_min || gi > 0 {
+            return false;
+        }
+        best = gmax.max(gi).max(0);
+        fresh = gmax <= -o_min && gi <= -o_min;
+        if fresh {
+            (g, gi) = ([NEG; 2 * W + 1], NEG);
+        }
+    }
+    true
+}
+
+/// `(match, mismatch, n)` when the `m x m` matrix scores every pair of codes `0..4` by equality
+/// alone and every pair involving code 4 (`N`) alike, as `bwa_fill_scmat` builds it.
+fn uniform_cells(mat: &[i8], m: usize) -> Option<(i32, i32, i32)> {
+    if m != 5 {
+        return None;
+    }
+    let (ma, mi, n) = (mat[0], mat[1], mat[4]);
+    let expect = |i: usize, j: usize| match (i == 4 || j == 4, i == j) {
+        (true, _) => n,
+        (false, true) => ma,
+        (false, false) => mi,
+    };
+    (0..25)
+        .all(|c| mat[c] == expect(c / 5, c % 5))
+        .then_some((ma.into(), mi.into(), n.into()))
+}
+
+/// The score of a query code against a target code under [`uniform_cells`]'s `(match, mismatch, n)`.
+#[inline(always)]
+fn uniform_cell((ma, mi, n): (i32, i32, i32)) -> impl Fn(u8, u8) -> i32 {
+    move |x, y| {
+        if x >= 4 || y >= 4 {
+            n
+        } else if x == y {
+            ma
+        } else {
+            mi
+        }
+    }
+}
+
+/// [`tightened_global_band`]'s scan: the best total over the alignments with one gap of the length
+/// difference. `run` starts with every pair on the far diagonal (`q_shift`/`t_shift` in) and moves
+/// one pair per step onto the near one (`k, k`); the highest total seen is returned. `cell(q, t)`
+/// scores a query code against a target code.
+#[inline(always)]
+fn single_gap_best(
+    query: &[u8],
+    target: &[u8],
+    short_len: usize,
+    q_shift: usize,
+    t_shift: usize,
+    cell: impl Fn(u8, u8) -> i32,
+) -> i32 {
+    let (qf, tf) = (
+        &query[q_shift..q_shift + short_len],
+        &target[t_shift..t_shift + short_len],
+    );
+    let mut run: i32 = qf.iter().zip(tf).map(|(&x, &y)| cell(x, y)).sum();
+    if q_shift == t_shift {
+        return run;
+    }
+    let mut best = run;
+    // In blocks, so the per-pair differences vectorize and only the running maximum is serial.
+    let mut d = [0i32; 64];
+    let (qn, tn) = (&query[..short_len], &target[..short_len]);
+    for k0 in (0..short_len).step_by(d.len()) {
+        let r = k0..(k0 + d.len()).min(short_len);
+        let n = r.len();
+        for (o, ((&a, &b), (&c, &e))) in d[..n].iter_mut().zip(
+            qn[r.clone()]
+                .iter()
+                .zip(&tn[r.clone()])
+                .zip(qf[r.clone()].iter().zip(&tf[r])),
+        ) {
+            *o = cell(a, b) - cell(c, e);
+        }
+        for &v in &d[..n] {
+            run += v;
+            best = best.max(run);
+        }
+    }
+    best
 }
 
 /// Result of `ksw_align2`: a local (Smith-Waterman) alignment with start/end coordinates and the
@@ -1403,6 +1799,68 @@ mod tests {
     /// `tightened_global_band` promises the same score and CIGAR, ties included, as the band it
     /// replaces. A two-letter alphabet, cheap gaps and low-complexity targets are what make ties and
     /// gap-adjacent paths common; matching bwa's defaults alone would hardly exercise them.
+    /// The compare-based scan of a uniform matrix gives the table lookup's best single-gap total,
+    /// N codes, both gap sides and block boundaries included; a non-uniform matrix keeps the table.
+    #[test]
+    fn single_gap_scan_matches_table() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| -> u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for _ in 0..20_000 {
+            let mat = scmat(1 + next(4) as i8, 1 + next(6) as i8);
+            let u = uniform_cells(&mat, 5).expect("scmat is uniform");
+            let (ql, tl) = (1 + next(200) as usize, 1 + next(200) as usize);
+            let q: Vec<u8> = (0..ql).map(|_| next(5) as u8).collect();
+            let t: Vec<u8> = (0..tl).map(|_| next(5) as u8).collect();
+            let (short, gap) = (ql.min(tl), ql.abs_diff(tl));
+            let (ts, qs) = if tl >= ql { (gap, 0) } else { (0, gap) };
+            // The scan as first written: one table lookup per pair.
+            let cell = |pq: usize, pt: usize| i32::from(mat[t[pt] as usize * 5 + q[pq] as usize]);
+            let mut run: i32 = (0..short).map(|k| cell(k + qs, k + ts)).sum();
+            let mut best = run;
+            if gap != 0 {
+                for k in 0..short {
+                    run += cell(k, k) - cell(k + qs, k + ts);
+                    best = best.max(run);
+                }
+            }
+            assert_eq!(
+                single_gap_best(&q, &t, short, qs, ts, uniform_cell(u)),
+                best
+            );
+        }
+        let mut odd = scmat(1, 4);
+        odd[2] = -3;
+        assert_eq!(uniform_cells(&odd, 5), None);
+    }
+
+    #[test]
+    fn diagonal_tied_by_a_gapped_path_is_still_the_cigar() {
+        // Shifting the middle by one turns its 3 mismatches into matches and pays exactly the 14 of
+        // the two gaps, so a gapped path ties the diagonal's score of 2.
+        let code = |s: &[u8]| -> Vec<u8> {
+            s.iter()
+                .map(|&c| b"ACGT".iter().position(|&x| x == c).unwrap() as u8)
+                .collect()
+        };
+        let (q, t) = (code(b"TTAAACCCCGGGGTTCA"), code(b"TTAAAACCCCGGGGTCA"));
+        let mat = scmat(1, 4);
+        assert_eq!(
+            tightened_global_band(&q, &t, 5, &mat, 6, 1, 6, 1, 5),
+            (0, 2)
+        );
+        assert_eq!(
+            ksw_global2(&q, &t, 5, &mat, 6, 1, 6, 1, 5),
+            (2, vec![17 << 4])
+        );
+        // One less per gap open and the gapped path wins outright: the tie above is real.
+        assert_eq!(ksw_global2(&q, &t, 5, &mat, 5, 1, 5, 1, 5).0, 4);
+    }
+
     #[test]
     fn tightened_band_is_byte_identical() {
         let mut state = 0x9E37_79B9_7F4A_7C15u64;

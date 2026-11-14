@@ -51,8 +51,9 @@ TC="$HOME/.rustup/toolchains/1.96.1-aarch64-apple-darwin"
 if [ -x "$TC/bin/cargo" ] && [ -d "$TC/lib/rustlib/x86_64-apple-darwin" ]; then
   echo "== x86_64 cross-check =="
   # The x87 ABI warning is a macos-x86_64 target quirk unrelated to this code and absent on Linux.
-  RUSTC="$TC/bin/rustc" PATH="$TC/bin:$PATH" "$TC/bin/cargo" clippy \
-      --workspace --all-targets --target x86_64-apple-darwin -- -D warnings 2>&1 \
+  # `|| true`: under pipefail clippy's own failure status would hide the grep's match.
+  { RUSTC="$TC/bin/rustc" PATH="$TC/bin:$PATH" "$TC/bin/cargo" clippy \
+      --workspace --all-targets --target x86_64-apple-darwin -- -D warnings 2>&1 || true; } \
     | grep -E "^error" | grep -v "x87" && { echo "x86_64 check FAILED"; exit 1; }
   echo "x86_64 OK"
 

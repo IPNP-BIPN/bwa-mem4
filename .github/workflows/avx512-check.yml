@@ -42,6 +42,7 @@ on:
   pull_request:
     paths:
       - "crates/bwa-neon/**"
+      - "crates/bwa-extend/**"
       - ".github/workflows/avx512-check.yml"
   schedule:
     - cron: "30 6 * * 1"  # Mondays 06:30 UTC
@@ -95,15 +96,25 @@ jobs:
           fi
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: "1.96.1"
 
       - uses: Swatinem/rust-cache@v2
 
+      # Cached, and a cold cache retries for up to ~10 minutes (the CDN returns 504s).
+      - uses: actions/cache@v4
+        with:
+          path: sde.tar.xz
+          key: sde-${{ env.SDE_SHA256 }}
+
       - name: Fetch Intel SDE
         run: |
-          curl -fsSL -o sde.tar.xz "$SDE_URL"
+          for i in 1 2 3 4 5 6; do
+            [ -s sde.tar.xz ] && break
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 15 -o sde.tar.xz "$SDE_URL" \
+              || { rm -f sde.tar.xz; sleep $((30 * i)); }
+          done
           echo "$SDE_SHA256  sde.tar.xz" | sha256sum -c -
           tar xf sde.tar.xz
           "./$SDE_DIR/sde64" -version | head -3
@@ -130,6 +141,10 @@ jobs:
           cargo test -p bwa-mem4-neon --release --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.test == true) | .executable' | tee /tmp/testbins
           test -s /tmp/testbins || { echo "cargo built no test binary" >&2; exit 1; }
+          # The CIGAR wavefront's 32-lane kernel lives in bwa-extend.
+          cargo test -p bwa-mem4-extend --release --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.test == true) | .executable' | tee /tmp/extbins
+          test -s /tmp/extbins || { echo "cargo built no bwa-extend test binary" >&2; exit 1; }
 
       - name: "Run the AVX-512 byte-identity tests on an emulated ${{ matrix.chip }}"
         run: |
@@ -162,6 +177,17 @@ jobs:
             echo "expected 3 avx512 tests (matesw u8, matesw i16, batched u8+i16), got $ran" >&2
             exit 1
           fi
+
+      - name: "Run the CIGAR wavefront test (8, 16 and 32 lanes) on an emulated ${{ matrix.chip }}"
+        run: |
+          set -o pipefail
+          sde="./$SDE_DIR/sde64"
+          for bin in $(cat /tmp/extbins); do
+            "$sde" -${{ matrix.chip }} -- "$bin" wave16_matches_scalar --nocapture --test-threads 1 2>&1 | tee -a /tmp/wave.txt
+          done
+          # The test runs every kernel the host can; under SDE that must include the 32-lane one.
+          grep -q 'wave16 lanes checked: \[8, 16, 32\]' /tmp/wave.txt \
+            || { echo "the 32-lane wavefront kernel did not run" >&2; exit 1; }
 
       - name: Prove the XOR score table really issued, not a fallback
         if: matrix.chip == 'spr'
@@ -224,7 +250,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: "1.96.1"
 

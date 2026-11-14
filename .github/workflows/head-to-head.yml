@@ -102,23 +102,40 @@ jobs:
           fi
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: "1.96.1"
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch micromamba (retried; its CDN returns 504s)
+        shell: bash
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) p=linux-64 ;; Linux-aarch64) p=linux-aarch64 ;;
+            Darwin-arm64) p=osx-arm64 ;; *) p=osx-64 ;;
+          esac
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/micromamba" \
+              "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-$p" && break
+            echo "attempt $i failed"; sleep $((i * 20))
+          done
+          chmod +x "$RUNNER_TEMP/micromamba" && "$RUNNER_TEMP/micromamba" --version
       - name: Install bwa-mem2 + bwa-mem3 + wgsim + samtools (bioconda)
         uses: mamba-org/setup-micromamba@v2
         with:
+          download-micromamba: false
+          micromamba-binary-path: ${{ runner.temp }}/micromamba
           environment-name: bench
           condarc: |
+            remote_max_retries: 10
+            remote_backoff_factor: 5
             channels:
               - conda-forge
               - bioconda
           create-args: >-
             bwa-mem2
-            bwa-mem3
+            bwa-mem3=0.16.0
             wgsim
             samtools
           init-shell: bash
@@ -160,7 +177,7 @@ jobs:
           set -euo pipefail
           mkdir -p work && cd work
           url="https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.21.fa.gz"
-          curl -fsSL --retry 3 "$url" -o chr21.fa.gz && gunzip -f chr21.fa.gz
+          curl -fsSL --retry 3 "$url" -o chr21.fa.gz || curl -fsSL --retry 5 --retry-all-errors "${url/ftp.ensembl.org/ftp.ebi.ac.uk/ensemblorg}" -o chr21.fa.gz && gunzip -f chr21.fa.gz
           # The benchmark's contig must be named as the GIAB BAM names it, or the slice below has
           # nothing to fetch; bwa-mem2's indexer is what all four binaries read.
           sed -i '1s/.*/>chr21/' chr21.fa
@@ -188,7 +205,7 @@ jobs:
             # Warm every binary: on a cold page cache the first of four looks slower for reasons
             # that have nothing to do with the aligner.
             for b in ../mem4-baseline ../mem4-v3; do $b mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null; done
-            bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
+            bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             [ -x ../mem4-base-ref ] && env BWA4_TIGHT_BAND=1 ../mem4-base-ref mem -t "$T" chr21.fa "$r1" "$r2" >/dev/null 2>/dev/null
             if [ "$AVX2_ARM" = "true" ]; then
@@ -199,7 +216,7 @@ jobs:
               b0=$(timed ../mem4-baseline mem -t "$T" chr21.fa "$r1" "$r2")
               b3=$(timed ../mem4-v3       mem -t "$T" chr21.fa "$r1" "$r2")
               tb=$(timed env BWA4_TIGHT_BAND=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2")
-              fk=$(timed bwa-mem3         mem -t "$T" chr21.fa "$r1" "$r2")
+              fk=$(timed bwa-mem3         mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2")
               m2=$(timed bwa-mem2         mem -t "$T" chr21.fa "$r1" "$r2")
               line="rep $rep: baseline ${b0}s | v3 ${b3}s | v3+tight ${tb}s | fork ${fk}s | mem2 ${m2}s"
               if [ -x ../mem4-base-ref ]; then
@@ -234,12 +251,27 @@ jobs:
           for set in sim real; do
             r1="${set}1.fq"; r2="${set}2.fq"
             echo; echo "===== $set: the fork's own profile ====="
-            bwa-mem3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> fk.err || { tail -5 fk.err; exit 1; }
+            bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> fk.err || { tail -5 fk.err; exit 1; }
             sed -n '/Runtime profile/,/Important parameter/p' fk.err | grep -vE '^\s*$' | head -30
             echo; echo "===== $set: ours (v3 build, one batch in flight so shares are exact) ====="
             env BWA4_NO_BATCH_OVERLAP=1 BWA4_STAGE_TIME=1 BWA4_CHAIN_TIME=1 BWA4_EMIT_SPLIT=1 BWA4_RESCUE_SPLIT=1 \
-              ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> m4.err
-            grep -E '^\[(stage-time|chain-time|emit-split|rescue-split)\]' m4.err
+              BWA4_BARRIER_TIME=1 ../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2" > /dev/null 2> m4.err
+            grep -E '^\[(stage-time|chain-time|emit-split|rescue-split|barrier)\]' m4.err
+          done
+          # How busy each side keeps the cores, in normal runs: CPU time over wall shows the idle the
+          # per-stage numbers cannot, and involuntary switches show workers losing the core to the
+          # reader and writer threads on a host with exactly `T` cores.
+          for set in sim real; do
+            r1="${set}1.fq"; r2="${set}2.fq"
+            for arm in ours fork; do
+              case $arm in
+                ours) cmd=(../mem4-v3 mem -t "$T" chr21.fa "$r1" "$r2") ;;
+                fork) cmd=(bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "$r1" "$r2") ;;
+              esac
+              /usr/bin/time -v -o tv.txt "${cmd[@]}" > /dev/null 2>/dev/null
+              echo "$set $arm: $(grep -E 'Elapsed|User time|System time|Percent of CPU|context switches|Maximum resident' tv.txt \
+                | sed -E 's/^\s+//; s/ \(.*\)//; s/: /=/' | tr '\n' ' ')"
+            done
           done
 
       - name: And the two of ours still agree
@@ -254,4 +286,8 @@ jobs:
             [ "$a" = "$b" ] || { echo "::error::$set: v3 output differs from baseline"; exit 1; }
             [ "$a" = "$c" ] || { echo "::error::$set: TIGHT BAND output differs from baseline"; exit 1; }
             echo "$set: identical across all three ($a)"
+            f=$(bwa-mem3 mem --compat=bwa-mem2 -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@' | md5sum)
+            o=$(../mem4-baseline mem -t "$T" chr21.fa "${set}1.fq" "${set}2.fq" 2>/dev/null | grep -v '^@' | md5sum)
+            # Informational: the fork's --compat=bwa-mem2 records against ours (= bwa-mem2's, per parity.yml).
+            [ "$f" = "$o" ] && echo "$set: fork records identical to ours" || echo "$set: fork records DIFFER from ours"
           done

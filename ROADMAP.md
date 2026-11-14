@@ -5510,3 +5510,12 @@ x86_64 ayant ete sautee sur cette machine, faute de toolchain.
 pas ete chronometre, et la CI est son premier juge. Le chemin `wide` n'a jamais vu de vrai genome de
 cette taille : un test le couvre en reduisant la tranche, avec des compteurs pousses au-dela de 2^32
 a la main.
+
+## Le code GPU retourne sur la branche `gpu` (2026-11-02)
+
+Les crates `bwa-gpu` et `bwa-metal`, rouvertes sur `dev` le 2026-08-29, ne sont liees a aucun
+binaire : rien dans les manifestes de `bwa-mem4` n'en depend. Elles quittent `dev` avec
+`scripts/gpu_parity.sh`, `scripts/msl_probe.sh` et `scripts/msl/`. Rien n'est perdu : `gpu` a
+`45fb073` contient leur dernier etat. `docs/gpu-plan.md` et les mesures restent ici. La PR #82
+(`feat/gpu-wgpu-cosched`) modifie ces crates et vise `dev` : elle devra soit viser `gpu`, soit les
+ramener.

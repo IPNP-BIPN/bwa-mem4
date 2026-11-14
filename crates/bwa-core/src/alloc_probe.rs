@@ -74,7 +74,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8};
 /// Every bucket's label, and by its index the bucket itself.
 ///
 /// One flat namespace shared by three crates, which is why it lives in `bwa-core` rather than next
-/// to either user. The first nine mirror `bwa-mem4`'s `stage_time::Stage` discriminants exactly, so
+/// to either user. The first eight mirror `bwa-mem4`'s `stage_time::Stage` discriminants exactly, so
 /// the wall-clock table and this one can be read side by side (a unit test in the binary crate
 /// checks the two name lists still match). Then the two pipeline threads and a catch-all, and last
 /// the sub-phases of `align`, which `bwa-mem4-mem` tags from inside [`crate`]'s dependents.
@@ -83,7 +83,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8};
 /// disjoint and `align` keeps only what none of its sub-phases claimed.
 pub const BUCKET_NAMES: [&str; N_BUCKETS] = [
     "wait_read",
-    "encode",
     "align",
     "deinterleave",
     "dedup_prep",
@@ -102,24 +101,24 @@ pub const BUCKET_NAMES: [&str; N_BUCKETS] = [
 
 /// Number of pipeline stages, i.e. how many leading entries of [`BUCKET_NAMES`] are owned by the
 /// binary crate's `stage_time::Stage`.
-pub const N_STAGES: usize = 9;
+pub const N_STAGES: usize = 8;
 /// Bucket for allocations made by the FASTQ reader thread.
-pub const B_READER: u8 = 9;
+pub const B_READER: u8 = 8;
 /// Bucket for allocations made by the SAM/BAM writer thread.
-pub const B_WRITER: u8 = 10;
+pub const B_WRITER: u8 = 9;
 /// Bucket for everything outside a named stage: index load, header emission, teardown, and any
 /// thread that is neither the reader, the writer, nor inside a tagged scope.
-pub const B_UNSTAGED: u8 = 11;
+pub const B_UNSTAGED: u8 = 10;
 /// Round-1 SMEM collection for a whole read chunk (`mem_collect_smem_batched`).
-pub const B_ALIGN_SEED: u8 = 12;
+pub const B_ALIGN_SEED: u8 = 11;
 /// Suffix-array resolution: the flat position list and the lockstep `get_sa_batch`.
-pub const B_ALIGN_SA: u8 = 13;
+pub const B_ALIGN_SA: u8 = 12;
 /// Chain construction and filtering (`build_chains_from_resolved`, `mem_chain_flt`).
-pub const B_ALIGN_CHAIN: u8 = 14;
+pub const B_ALIGN_CHAIN: u8 = 13;
 /// Banded extension: job collection, the DP kernels, and the discard/compaction passes.
-pub const B_ALIGN_EXTEND: u8 = 15;
+pub const B_ALIGN_EXTEND: u8 = 14;
 /// Number of buckets, i.e. the accumulator arrays' length.
-pub const N_BUCKETS: usize = 16;
+pub const N_BUCKETS: usize = 15;
 
 /// Thread-local role, consulted before the global stage tag. `0` means "no role, use the stage".
 const ROLE_NONE: u8 = 0;

@@ -96,13 +96,14 @@ use rust_htslib::bam;
 use rust_htslib::htslib;
 
 use bwa_core::opt::flags;
-use bwa_core::{dna, MemOpt};
+use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, InterleavedFastqReader, PairedFastqReader, Record, SqRecord};
 use bwa_mem::{
     align_reads_batched, alt::mem_gen_alt, batch_mate_rescue, cigar::cigar_string_which,
-    cigar::MemAln, cigar_string, mem_approx_mapq_se, mem_mark_primary_se, mem_pestat, mem_sam_pe,
-    mem_sort_dedup_patch, reg2aln, MemAlnReg, PairRescueData, PeStat,
+    cigar::MemAln, cigar_string, lazy_csub, mem_approx_mapq_se, mem_mark_primary_se,
+    mem_pestat_from, mem_sam_pe, mem_sort_dedup_patch, pe::resolve_pending, pestat_samples,
+    reg2aln, MemAlnReg, PairRescueData, PeStat, PendS2,
 };
 use bwa_neon::NeonBackend;
 
@@ -204,7 +205,8 @@ pub struct MemArgs {
     // on it here, because reads are numbered globally and emitted in input order.
     /// Number of threads [1]. Output order and global read ids are independent of it, so
     /// byte-identity holds at any `-t` once `-K` fixes the batch boundaries.
-    #[arg(short = 't', default_value_t = 1)]
+    // bwa reads this with `atoi`, so a negative is a value there; clap would call it an unknown flag.
+    #[arg(short = 't', default_value_t = 1, allow_negative_numbers = true)]
     pub threads: i32,
     // `-K INT` -> the batch size in input bases. bwa stores it in a local `fixed_chunk_size`
     // (`fastmap.cpp:709`) rather than in `opt`, then folds it into `opt->chunk_size` at
@@ -215,7 +217,7 @@ pub struct MemArgs {
     // distribution once per batch, so moving a batch boundary can change MAPQ and pairing decisions
     // for the reads near it. Pin `-K` to make a run reproducible across `-t` values.
     /// Process INT input bases per batch (fixes batch boundaries for reproducibility).
-    #[arg(short = 'K')]
+    #[arg(short = 'K', allow_negative_numbers = true)]
     pub k_batch: Option<i64>,
 
     // ---- Algorithm options ----
@@ -521,6 +523,34 @@ pub struct MemArgs {
     /// Print help.
     #[arg(long = "help", action = clap::ArgAction::Help)]
     pub help: Option<bool>,
+
+    // ---- Methylation mode, ported from fg-labs/bwa-mem3 0.16 (see `docs/meth-mode.md`) ----
+    // Long-only, spelled as in the fork so a Bismark command line runs unchanged. The value of
+    // `--meth` binds only with `=`, as in the fork: `--meth taps` would make `taps` the index.
+    /// Bisulfite/EM-seq/TAPS mode: emseq (default; bisulfite, em-seq), taps, 5base (5-base).
+    /// Needs an index built with `index --meth`.
+    #[arg(long = "meth", value_name = "CHEM", num_args = 0..=1, require_equals = true,
+          default_missing_value = "emseq")]
+    pub meth: Option<String>,
+    /// Where a conversion is free: all [all]. `cpg` is not supported by this port.
+    #[arg(long = "meth-context", value_name = "all|cpg")]
+    pub meth_context: Option<String>,
+    /// collapsed (EM-seq default, sets -B 2), genomic, or neutral (TAPS default).
+    #[arg(long = "meth-scoring", value_name = "MODE")]
+    pub meth_scoring: Option<String>,
+    /// Bismark tags to emit: all [all], none, XR,XG,... or exclusions ^XM / -XM.
+    #[arg(long = "meth-tags", value_name = "SPEC", allow_hyphen_values = true)]
+    pub meth_tags: Option<String>,
+    /// Prune short repetitive seeds before SA lookup: spec30 [spec30 under --meth], baseline, off.
+    #[arg(long = "meth-seed-prune", value_name = "MODE", num_args = 0..=1, require_equals = true,
+          default_missing_value = "spec30")]
+    pub meth_seed_prune: Option<String>,
+    /// Flag alignments of conversion strand f (XG:Z:CT) or r (XG:Z:GA) as QC-fail (0x200).
+    #[arg(long = "set-as-failed", value_name = "f|r")]
+    pub set_as_failed: Option<String>,
+    /// bwameth's chimera rule: longest M < 44% of the read sets 0x200, clears 0x2, caps MAPQ at 1.
+    #[arg(long = "chimera-qc")]
+    pub chimera_qc: bool,
 }
 
 /// Parse bwa's `INT[,INT]` pair syntax. bwa reads the first integer with `strtol`, then takes a
@@ -1055,9 +1085,87 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     //
     // From the POST-rescale a/b. Doing this earlier would leave the SIMD kernel scoring with
     // pre-rescale values while the gap logic used post-rescale scalars.
+    let meth = build_meth(args, &mut opt)?;
     opt.fill_scmat();
+    if let Some(mut meth) = meth {
+        meth.fill_mats(&opt.mat, opt.a);
+        opt.meth = Some(meth);
+    }
     validate_scoring(&opt)?;
     Ok(opt)
+}
+
+/// The `--meth*` options (`meth_opts_parse` + `meth_opts_finalize` + `mem_opt_apply_meth_defaults`
+/// in fg-labs/bwa-mem3 0.16). Applies the meth defaults to `opt` where the user gave no value and
+/// returns the mode, its matrices still unfilled; `None` without `--meth`.
+fn build_meth(args: &MemArgs, opt: &mut MemOpt) -> anyhow::Result<Option<bwa_core::meth::MethOpt>> {
+    use bwa_core::meth;
+    let Some(chem) = &args.meth else {
+        let stray = [
+            (args.meth_context.is_some(), "--meth-context"),
+            (args.meth_scoring.is_some(), "--meth-scoring"),
+            (args.meth_tags.is_some(), "--meth-tags"),
+            (args.meth_seed_prune.is_some(), "--meth-seed-prune"),
+            (args.set_as_failed.is_some(), "--set-as-failed"),
+            (args.chimera_qc, "--chimera-qc"),
+        ];
+        if let Some((_, flag)) = stray.iter().find(|(given, _)| *given) {
+            anyhow::bail!("{flag} requires --meth");
+        }
+        return Ok(None);
+    };
+    let mut m = meth::MethOpt::new(meth::parse_chem(chem).map_err(anyhow::Error::msg)?);
+    if let Some(s) = &args.meth_scoring {
+        m.scoring = meth::parse_scoring(s).map_err(anyhow::Error::msg)?;
+    }
+    match args.meth_context.as_deref() {
+        None | Some("all") => {}
+        // shortcut: the CpG-only 7-code model is not ported (Bismark runs `all`); port
+        // `meth_model.cpp` if someone needs TAPS CpG-context scoring.
+        Some("cpg") => anyhow::bail!("--meth-context cpg is not supported by bwa-mem4"),
+        Some(other) => {
+            anyhow::bail!("--meth-context accepts 'all' (default) or 'cpg', got '{other}'")
+        }
+    }
+    if let Some(s) = &args.meth_tags {
+        m.tags = meth::parse_tags(s).map_err(|e| anyhow::anyhow!("--meth-tags '{s}': {e}"))?;
+    }
+    if let Some(s) = &args.meth_seed_prune {
+        m.prune = meth::parse_prune(s).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(s) = &args.set_as_failed {
+        m.set_as_failed = match s.as_str() {
+            "f" => Some(b'f'),
+            "r" => Some(b'r'),
+            _ => anyhow::bail!("--set-as-failed requires 'f' or 'r'"),
+        };
+    }
+    m.chimera_qc = args.chimera_qc;
+    if args.read_type.is_some() {
+        anyhow::bail!("--meth cannot be combined with -x");
+    }
+    // `mem_opt_apply_meth_defaults`: bwameth's penalties, scaled by `-A` like any default.
+    if args.clip_penalty.is_none() {
+        opt.pen_clip5 = 10 * opt.a;
+        opt.pen_clip3 = 10 * opt.a;
+    }
+    if args.pen_unpaired.is_none() {
+        opt.pen_unpaired = 100 * opt.a;
+    }
+    if args.min_score.is_none() {
+        opt.t = 40 * opt.a;
+    }
+    opt.flag |= flags::NO_MULTI;
+    if m.scoring == meth::Scoring::Collapsed && args.mismatch.is_none() {
+        opt.b = 2 * opt.a;
+    }
+    if opt.b <= 0 {
+        anyhow::bail!(
+            "--meth requires a positive mismatch penalty, but the effective penalty is {}",
+            opt.b
+        );
+    }
+    Ok(Some(m))
 }
 
 /// Refuse gap and clipping penalties the aligner cannot run with. Checked on the FINAL options,
@@ -1274,6 +1382,22 @@ impl HtsWriter {
         threads: usize,
         header_text: &[u8],
     ) -> anyhow::Result<Self> {
+        // `HeaderView::from_bytes` dereferences htslib's answer unchecked, and a line htslib cannot
+        // parse (`-H` is free text) makes that answer null. Asked first, before a file exists.
+        let header_c = std::ffi::CString::new(header_text)
+            .map_err(|_| anyhow::anyhow!("the SAM header contains a NUL byte"))?;
+        // SAFETY: `header_c` is a valid NUL-terminated string of the given length, htslib only reads
+        // it, and the header it returns is ours to destroy.
+        unsafe {
+            let parsed = htslib::sam_hdr_parse(header_text.len() + 1, header_c.as_ptr());
+            if parsed.is_null() {
+                anyhow::bail!(
+                    "-o {}: htslib cannot parse the SAM header. Check the lines given to -H and -R.",
+                    path.display()
+                );
+            }
+            htslib::sam_hdr_destroy(parsed);
+        }
         // Paths cross the FFI boundary as NUL-terminated bytes; an embedded NUL is the one thing a
         // Rust path can hold that a C string cannot.
         let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
@@ -1372,6 +1496,32 @@ const BGZF_SINK_BUFFER_BYTES: usize = 1 << 20;
 /// what turns them back into few, large syscalls. At 8 KiB a `-t16` batch would be ~50k of them;
 /// at 1 MiB it is ~400. Output bytes are identical either way, only the syscall count changes.
 const PLAIN_SINK_BUFFER_BYTES: usize = 1 << 20;
+
+impl Output {
+    /// One batch's SAM pieces, in order. The plain sink takes them 1024 at a time through
+    /// `write_vectored`: a group larger than the `BufWriter` goes straight to the file or pipe
+    /// (`writev`) instead of being copied into the buffer first, a memcpy of the whole output.
+    fn write_pieces(&mut self, pieces: &[Vec<u8>]) -> io::Result<()> {
+        let Output::Plain(w) = self else {
+            return pieces.iter().try_for_each(|p| self.write_all(p));
+        };
+        for group in pieces.chunks(1024) {
+            let mut slices: Vec<io::IoSlice<'_>> =
+                group.iter().map(|p| io::IoSlice::new(p)).collect();
+            let mut bufs = &mut slices[..];
+            io::IoSlice::advance_slices(&mut bufs, 0);
+            while !bufs.is_empty() {
+                match w.write_vectored(bufs) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => io::IoSlice::advance_slices(&mut bufs, n),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 impl Write for Output {
     #[inline]
@@ -1554,8 +1704,13 @@ impl Output {
 
 /// How many batches may be in flight, as `(readahead, writebehind)`.
 ///
-/// One each way, which is double buffering: while the aligner works on a batch, the reader may have
-/// exactly one more ready and the writer may have exactly one still draining. Nothing deeper.
+/// Double buffering: while the aligner works on a batch, the reader may have exactly one more ready
+/// and the writer may have exactly one still draining. Nothing deeper.
+///
+/// The read side is a rendezvous (`sync_channel(0)`) because the reader holds the batch it is
+/// building on top of whatever sits in the queue: a queue of one let it park a second finished batch
+/// behind the queued one, two batches ahead of the aligner, 0.28 GB of records on GIAB PE at
+/// `-K 100M`. The write side stays at one, so the aligner never waits on a sink still draining.
 ///
 /// It used to be 2 and 3, and those were the whole of the memory gap against `fg-labs/bwa-mem3`
 /// reported in issue #25. The queues are bounded in BATCHES, and a batch is `-K` bases, which at the
@@ -1573,17 +1728,17 @@ impl Output {
 /// just memory.
 ///
 /// `BWA4_QUEUE_DEPTH=read,write` raises them again, so the trade can be measured on a machine where
-/// input really is the bottleneck rather than argued about here. A value that does not parse, or
-/// that asks for a zero-length queue, is ignored rather than clamped silently: a typo in a benchmark
-/// script should not quietly change what is being measured.
-const BATCH_READAHEAD: usize = 1;
+/// input really is the bottleneck rather than argued about here (`read` may be 0, the default). A
+/// value that does not parse, or that asks for a zero-length write queue, is ignored rather than
+/// clamped silently: a typo in a benchmark script should not quietly change what is being measured.
+const BATCH_READAHEAD: usize = 0;
 const SAM_WRITEBEHIND: usize = 1;
 
 fn queue_depths() -> (usize, usize) {
     if let Ok(s) = std::env::var("BWA4_QUEUE_DEPTH") {
         if let Some((r, w)) = s.split_once(',') {
             if let (Ok(r), Ok(w)) = (r.trim().parse::<usize>(), w.trim().parse::<usize>()) {
-                if r >= 1 && w >= 1 {
+                if w >= 1 {
                     return (r, w);
                 }
             }
@@ -1606,7 +1761,9 @@ fn se_read_batches(
 {
     move |tx: std::sync::mpsc::SyncSender<(Vec<Record>, u64)>| -> anyhow::Result<()> {
         // Opened INSIDE the closure so the reader itself never crosses a thread boundary.
-        let mut reader = FastqReader::from_path(&reads_path)?;
+        // nt4-coded as it parses, as bwa does in `mem_kernel1_core`; the SAM text is printed back
+        // out of these codes, as bwa does.
+        let mut reader = FastqReader::from_path(&reads_path)?.nt4();
         // Number of reads emitted in all previous batches, i.e. the global 0-based id of this
         // batch's first read. Invariant at the top of each turn: it equals the total length of every
         // batch already sent. Must stay global across batches, since downstream tie-breaks hash it.
@@ -1713,58 +1870,23 @@ fn spawn_reader<B: Send + 'static>(
 
 /// Whether the pipeline holds a second batch in flight, deciding it once for the process.
 ///
-/// Three inputs, in priority order, because two of them are the user saying they know better:
-///
-/// 1. `BWA4_NO_BATCH_OVERLAP` set: one batch. Half the batch memory, about 1.1% of wall.
-/// 2. `BWA4_BATCH_OVERLAP` set: two batches, whatever the machine looks like.
-/// 3. Otherwise the RAM policy in [`bwa_core::sysram::batch_overlap_fits`]: overlap when the host
-///    can hold the index plus two batches with headroom, one batch when it cannot.
-///
-/// The policy exists because the two ways of being wrong are not symmetric. Dropping the overlap on
-/// a machine that could have afforded it costs 1.1% of wall; keeping it on one that cannot costs a
-/// run that swaps, and the user has no way to guess that an environment variable would have saved
-/// them. Machine-dependent, and legitimately so: the number of batches in flight is not observable
-/// in the SAM, since batch order comes from joining a batch before sending its bytes.
-///
-/// Read once and cached, like every other environment gate here.
-///
-/// # Parameters
-///
-/// - `l_pac`: forward-strand reference length, for the index footprint estimate.
-/// - `k_batch`: `-K` in bases, i.e. one batch's input size.
-/// - `verbose`: `-v`; at 3 or more the decision and the two figures behind it are printed, in bwa's
-///   own progress-line style, so a surprising memory or wall figure can be explained afterwards.
-///
-/// # Returns
-///
-/// True to overlap batch N's tail with batch N+1's alignment.
-fn batch_overlap_enabled(l_pac: u64, k_batch: usize, verbose: i32) -> bool {
+/// Off unless `BWA4_BATCH_OVERLAP` is set. The second batch is worth at most ~1% of wall (within
+/// run-to-run noise on GIAB PE at `-t8` and `-t12` on an M4 Max) and costs a whole resident batch:
+/// 0.8 GB on chr21, 1.4 GB on GIAB `-t8`, 2.3 GB at `-t12`, where it put peak RSS above
+/// fg-labs/bwa-mem3 (14.0 vs 13.8 GB, against 11.6 GB with one batch). The number of batches in
+/// flight is not observable in the SAM. `BWA4_NO_BATCH_OVERLAP` still wins, for old scripts.
+fn batch_overlap_enabled(verbose: i32) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if std::env::var_os("BWA4_NO_BATCH_OVERLAP").is_some() {
-            if verbose >= 3 {
-                eprintln!("[M::main_mem] batch overlap off (BWA4_NO_BATCH_OVERLAP)");
-            }
-            return false;
-        }
-        let forced = std::env::var_os("BWA4_BATCH_OVERLAP").is_some();
-        let d = bwa_core::sysram::batch_overlap_fits(l_pac, k_batch as u64);
-        let overlap = forced || d.overlap;
+        let on = std::env::var_os("BWA4_BATCH_OVERLAP").is_some()
+            && std::env::var_os("BWA4_NO_BATCH_OVERLAP").is_none();
         if verbose >= 3 {
-            // `?` for undetectable RAM: the figure is genuinely unknown there, and printing a zero
-            // would read as "this machine has no memory" rather than "the probe did not answer".
-            let have = d
-                .ram_gb
-                .map_or_else(|| "?".to_string(), |g| format!("{g:.1}"));
             eprintln!(
-                "[M::main_mem] batch overlap {} (RAM {} GB, needs {:.1} GB for index + 2 batches){}",
-                if overlap { "on" } else { "off" },
-                have,
-                d.need_gb,
-                if forced { ", forced" } else { "" },
+                "[M::main_mem] batch overlap {}",
+                if on { "on (BWA4_BATCH_OVERLAP)" } else { "off" }
             );
         }
-        overlap
+        on
     })
 }
 
@@ -1842,9 +1964,7 @@ fn run_pipeline<B: Send>(
                 let t1 = probe.then(std::time::Instant::now);
                 // In order, so the concatenation of the pieces is exactly the batch's SAM text.
                 // `Output`'s buffering is what turns these back into few, large syscalls.
-                for piece in &pieces {
-                    out.write_all(piece)?;
-                }
+                out.write_pieces(&pieces)?;
                 if let (Some(t0), Some(t1)) = (t0, t1) {
                     blocked += t1.duration_since(t0).as_secs_f64();
                     writing += t1.elapsed().as_secs_f64();
@@ -1897,9 +2017,8 @@ fn run_pipeline<B: Send>(
         // (chr21, 2M pairs, `-K` 100M, 4 threads): resident memory is live memory there, 1.02x, so
         // the 2.02x we carry against fg-labs/bwa-mem3 (4.78 GB against 2.36 GB) is not allocator
         // retention and not a fatter batch. It is THIS line: with one batch in flight the same run
-        // takes 2.49 GB, which is 1.05x the fork rather than 2.02x. `BWA4_NO_BATCH_OVERLAP=1` is
-        // how that half of the memory is handed back, for a caller who would rather have it than
-        // the overlap.
+        // takes 2.49 GB, which is 1.05x the fork rather than 2.02x. Hence one batch by default,
+        // and `BWA4_BATCH_OVERLAP=1` for a caller who would rather spend that memory.
         let mut inflight: Option<std::thread::ScopedJoinHandle<'_, Vec<Vec<u8>>>> = None;
         loop {
             // Blocked here == starved by the reader. Charged to `wait_read`, which is the one
@@ -1921,8 +2040,8 @@ fn run_pipeline<B: Send>(
             let process_ref = &process;
             let started = scope.spawn(move || process_ref(batch, base_id));
             // Two reasons to retire this batch before reading the next one, and they meet here.
-            // `BWA4_NO_BATCH_OVERLAP` is the user-facing one: it halves resident memory (see the
-            // block above). `BWA4_STAGE_ALLOC` is the probe's: it tags allocations with a
+            // The default (no `BWA4_BATCH_OVERLAP`) is the user-facing one: it halves resident
+            // memory (see the block above). `BWA4_STAGE_ALLOC` is the probe's: it tags allocations with a
             // PROCESS-WIDE stage, so two batches in flight would each overwrite the other's tag and
             // every per-stage byte count would be a blend of two stages.
             //
@@ -1997,6 +2116,42 @@ fn forget_index(fm: bwa_index::FmIndex, bns: bwa_index::BntSeq) {
     std::mem::forget(bns);
 }
 
+/// The header lines `-H` and `-R` add, in emission order: `-H` first, then `-R` appended to it.
+/// `main_mem` builds hdr_line during getopt and only after the loop does
+/// `hdr_line = bwa_insert_header(rg_line, hdr_line)`, so @RG lands last.
+///
+/// # Returns
+///
+/// One complete, already-escape-expanded header line per entry, without its newline. Empty when
+/// neither option was given. Errors on an unreadable `-H` file or a malformed `-R`.
+fn extra_header_lines(args: &MemArgs) -> anyhow::Result<Vec<String>> {
+    let mut hdr_parts: Vec<String> = Vec::new();
+    if let Some(header_arg) = &args.header_insert {
+        if let Some(rest) = header_arg.strip_prefix('@') {
+            hdr_parts.push(bwa_core::rg::escape(&format!("@{rest}")));
+        } else {
+            // Not starting with '@': bwa treats it as a FILE of header lines.
+            // Whole file slurped; non-`@` lines are skipped below rather than rejected.
+            let text = std::fs::read_to_string(header_arg)
+                .map_err(|e| anyhow::anyhow!("-H: cannot read '{header_arg}': {e}"))?;
+            for line in text.lines() {
+                if line.starts_with('@') {
+                    hdr_parts.push(bwa_core::rg::escape(line));
+                }
+            }
+        }
+    }
+    if let Some(rg_arg) = &args.read_group {
+        // Installs the parsed ID process-wide as a side effect, and returns the header line.
+        // The escape-expanded `@RG` line; the ID it also installed is what every record's `RG:Z:`
+        // tag will carry, so this call must happen before any record is written.
+        let rg_header_line =
+            bwa_core::rg::set_rg(rg_arg).map_err(|e| anyhow::anyhow!("-R: {e}"))?;
+        hdr_parts.push(rg_header_line);
+    }
+    Ok(hdr_parts)
+}
+
 /// Run `bwa-mem4 mem` end to end: build options, load the index, write the SAM header, then stream
 /// batches through the align-and-format pipeline (single-end here, paired-end via [`run_pe`]).
 ///
@@ -2016,23 +2171,13 @@ fn forget_index(fm: bwa_index::FmIndex, bns: bwa_index::BntSeq) {
 /// `Ok(())` after the last SAM record has been written and the sink finalized. Errors: an
 /// unreadable index, an unreadable `-H` file, a malformed `-I`/`-O`/`-E`/`-L`/`-h` argument, or any
 /// I/O failure in the pipeline.
-pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
+pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Wall-clock origin for the end-of-run traffic dump only; not on any hot path.
     let t_run = std::time::Instant::now();
-    // Options we parse for CLI compatibility but do not yet honour. Failing loudly is the point: an
-    // aligner that accepts `-a` and silently emits only primaries hands back a result the user
-    // believes is something it is not. Refuse rather than mislead.
-    // Each tuple is (was the flag given, its spelling for the message, what it would have done).
-    // Currently EMPTY: every option this port accepts is now honoured. The machinery is kept
-    // because it is the place to re-add an entry the moment a new flag is parsed ahead of being
-    // implemented.
-    let unimplemented: &[(bool, &str, &str)] = &[];
-    if let Some((_, flag, what)) = unimplemented.iter().find(|(given, _, _)| *given) {
-        anyhow::bail!(
-            "{flag} is not implemented yet ({what}). bwa-mem4 parses it for CLI compatibility but \
-             would ignore it, so it refuses rather than emit output that silently differs from \
-             bwa-mem2."
-        );
+    // `-p` reads mates interleaved from the first file; bwa ignores a second one, with this same
+    // warning (`fastmap.cpp`). Pairing it with the first file instead pairs unrelated records.
+    if args.smart_pairing && args.reads2.take().is_some() {
+        eprintln!("[W::main_mem] when '-p' is in use, the second query file is ignored.");
     }
 
     // ================= Long-read routing, before any bwa work =================
@@ -2042,14 +2187,29 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // the reasoning, the preset mapping and what it does to the output contract. `-x intractg` is
     // NOT routed and continues below on the bwa-identical path.
     //
-    // Placed before `build_opt` because none of bwa's options apply to a different mapper; the only
-    // thing consumed here is `-o` (where the SAM goes) and the read paths.
+    // Placed before `build_opt` because bwa's alignment options do not apply to a different mapper.
+    // What still applies is what describes the file rather than the alignment: `-o`, `-R` and `-H`.
     if let Some(mode) = args.read_type.as_deref() {
         if let Some(preset) = crate::cmd_longread::preset_for(mode) {
             let mut reads = vec![args.reads.clone()];
             if let Some(r2) = args.reads2.clone() {
                 reads.push(r2);
             }
+            // rammap's records go out as SAM text, so a binary or compressed name would be a lie.
+            if let Some(path) = &args.output {
+                let ext = path.extension().unwrap_or_default();
+                if ["bam", "cram", "gz", "bgz"]
+                    .iter()
+                    .any(|want| ext.eq_ignore_ascii_case(want))
+                {
+                    anyhow::bail!(
+                        "-o {}: long-read mode (-x {mode}) writes SAM text only. Name the file \
+                         .sam, or convert it afterwards with samtools.",
+                        path.display()
+                    );
+                }
+            }
+            let hdr_parts = extra_header_lines(&args)?;
             // Same sink choice as the short-read path: a file when `-o` was given, else stdout.
             let mut out: Box<dyn std::io::Write> = match &args.output {
                 Some(path) => Box::new(std::io::BufWriter::new(
@@ -2066,7 +2226,15 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
                 .num_threads(args.threads.max(1) as usize)
                 .build_global()
                 .ok();
-            crate::cmd_longread::run(preset, mode, &args.index_prefix, &reads, &mut out, argv)?;
+            crate::cmd_longread::run(
+                preset,
+                mode,
+                &args.index_prefix,
+                &reads,
+                &hdr_parts,
+                &mut out,
+                argv,
+            )?;
             out.flush()?;
             return Ok(());
         }
@@ -2141,10 +2309,12 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // Batch size in INPUT BASES, not reads. Default `chunk_size * -t` (10M per thread), mirroring
     // bwa's `aux.task_size`; `-K` overrides it. Load-bearing for paired-end reproducibility: the
     // insert-size model is re-estimated per batch, so the boundary this fixes is visible in the
-    // output. Clamped to >= 1 so a zero or negative `-K` cannot stall the reader.
+    // output. As in bwa (`fastmap.cpp`), `-K` counts only when > 0, and the default uses the thread
+    // count already clamped to >= 1: `-t 0` and `-K 0` used to give one-read batches here.
     let k_batch = args
         .k_batch
-        .unwrap_or(opt.chunk_size * i64::from(args.threads))
+        .filter(|&k| k > 0)
+        .unwrap_or(opt.chunk_size * i64::from(opt.n_threads))
         .max(1) as usize;
 
     // ================= Start reading before loading the index =================
@@ -2157,12 +2327,6 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // The channel is bounded at the same readahead depth as before, so the reader still cannot
     // accumulate batches while the index loads: it fills the queue and blocks. Output is unaffected,
     // since the batches, their order and their base ids are identical either way.
-    // Decoder budget for gzipped input, set from `-t` before the first file is opened. Halved per
-    // file inside, since a paired-end run opens two. Spending threads here is free where it counts:
-    // during the first batch no worker has anything to do yet.
-    #[cfg(feature = "parallel-gzip")]
-    bwa_io::fastq::set_gzip_threads(pool_threads);
-
     let paired = args.reads2.is_some() || args.smart_pairing;
     let (pe_batch_rx, se_batch_rx, reader) = if paired {
         let (rx, h) = spawn_reader(pe_read_batches(
@@ -2183,8 +2347,22 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // extension and for turning a concatenated-genome offset back into (contig, position).
     // Both are loaded once, live for the whole run, and are shared immutably with every worker.
     // Together they are several GB for a human genome (memory-mapped where possible).
-    let fm = FmIndex::load(&args.index_prefix)?;
-    let mut bns = BntSeq::load(&args.index_prefix)?;
+    let (fm, mut bns) = if opt.meth.is_some() {
+        load_meth_index(&args.index_prefix)?
+    } else {
+        let fm = FmIndex::load(&args.index_prefix)?;
+        let bns = BntSeq::load(&args.index_prefix)?;
+        // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
+        anyhow::ensure!(
+            fm.l_pac() == bns.l_pac,
+            "{}: the .ann describes a {}-base reference but the .bwt.2bit.64 a {}-base one \
+             (mixed index from two builds; rebuild it)",
+            args.index_prefix.display(),
+            bns.l_pac,
+            fm.l_pac()
+        );
+        (fm, bns)
+    };
     // `-j`: clear the ALT flags the loader just read from `<prefix>.alt`, so every contig counts as
     // primary assembly. Done here, after loading, exactly as `fastmap.cpp:907` does it.
     if args.ignore_alt {
@@ -2202,10 +2380,6 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     crate::stage_alloc::mark_baseline();
     // One `@SQ` line per contig, in index order. That order comes from the FASTA and must be
     // preserved: downstream tools treat @SQ order as the coordinate sort order.
-    //
-    // Known gap vs the C: `bwa_print_sam_hdr` also appends `\tAH:*` to an ALT contig's @SQ line
-    // (`bwa.cpp:530`). `Contig` here has no `is_alt` field, so that suffix is never emitted. It is
-    // unreachable in practice because no `.alt` file is read at all (see `-j`).
     // The `@SQ` payload: (name, length in bases) per contig, index order preserved. Used only to
     // write the header, then dropped.
     let sqs: Vec<SqRecord> = bns
@@ -2219,36 +2393,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         .collect();
 
     // ================= Assemble the SAM header =================
-    //
-    // `-H` first, then `-R` appended to it: `main_mem` builds hdr_line during getopt and only after
-    // the loop does `hdr_line = bwa_insert_header(rg_line, hdr_line)`, so @RG lands last.
-    // Extra header lines in emission order: the `-H` lines first, then the `-R` @RG line. Each entry
-    // is one complete, already-escape-expanded header line without its newline. Empty when neither
-    // option was given.
-    let mut hdr_parts: Vec<String> = Vec::new();
-    if let Some(header_arg) = &args.header_insert {
-        if let Some(rest) = header_arg.strip_prefix('@') {
-            hdr_parts.push(bwa_core::rg::escape(&format!("@{rest}")));
-        } else {
-            // Not starting with '@': bwa treats it as a FILE of header lines.
-            // Whole file slurped; non-`@` lines are skipped below rather than rejected.
-            let text = std::fs::read_to_string(header_arg)
-                .map_err(|e| anyhow::anyhow!("-H: cannot read '{header_arg}': {e}"))?;
-            for line in text.lines() {
-                if line.starts_with('@') {
-                    hdr_parts.push(bwa_core::rg::escape(line));
-                }
-            }
-        }
-    }
-    if let Some(rg_arg) = &args.read_group {
-        // Installs the parsed ID process-wide as a side effect, and returns the header line.
-        // The escape-expanded `@RG` line; the ID it also installed is what every record's `RG:Z:`
-        // tag will carry, so this call must happen before any record is written.
-        let rg_header_line =
-            bwa_core::rg::set_rg(rg_arg).map_err(|e| anyhow::anyhow!("-R: {e}"))?;
-        hdr_parts.push(rg_header_line);
-    }
+    let hdr_parts = extra_header_lines(&args)?;
     // The extra header block as one newline-joined string, or `None` for "no extra lines" (which is
     // what `write_header` needs to distinguish, since an empty string would emit a blank line).
     let hdr_lines = if hdr_parts.is_empty() {
@@ -2285,6 +2430,11 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // be pasted back. This costs no byte-identity: `@PG` is excluded from every parity gate in this
     // project precisely because it legitimately differs between the two tools.
     let command_line = argv.join(" ").replace('\t', "\\t");
+    // `--meth` writes its header through htslib in the fork, which puts this `@HD` first unless
+    // `-H` brought one.
+    if opt.meth.is_some() && !hdr_parts.iter().any(|l| l.starts_with("@HD\t")) {
+        out.write_all(b"@HD\tVN:1.5\tSO:unsorted\tGO:query\n")?;
+    }
     sam::write_header(
         &mut out,
         &sqs,
@@ -2322,27 +2472,18 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         bwa_mem::cigar::global_fp::dump();
         bwa_mem::rescue_split::dump();
         bwa_mem::subopt_shape::dump();
-        bwa_mem::rescue_split::dump();
-        bwa_mem::emit_split::dump();
-        bwa_neon::batched::tight_ceil::dump();
-        bwa_neon::batched::job_dup::dump();
-        bwa_neon::batched::bin_split::dump();
         bwa_mem::across::align_split::dump();
         bwa_mem::seed_stats_dump();
-        bwa_mem::pe::rescue_rounds::dump();
-        bwa_mem::pe::rescue_rounds::dump_clusters();
         bwa_mem::primary::dedup_shape::dump();
         bwa_mem::pe::anchor_spread::dump();
         bwa_chain::chain_time::dump();
-        bwa_chain::smem_dup::dump();
         bwa_chain::smem_dup::dump();
         bwa_index::traffic::dump(t_run.elapsed().as_secs_f64());
         // Last, because it is the widest view: the others break down one stage, this one accounts
         // for all of them. Runs on the main thread, where the stage accumulators live.
         stage_time::dump(t_run.elapsed());
         stage_time::barrier::dump();
-        // Where the BYTES went, next to where the wall clock went. The line above was duplicated,
-        // which printed the occupancy table twice.
+        // Where the BYTES went, next to where the wall clock went.
         crate::stage_alloc::dump();
         forget_index(fm, bns);
         return Ok(());
@@ -2361,27 +2502,22 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // `batch` is one `-K` worth of reads in input order; `base_id` is the global id of its first
     // read (see the reader above). Returns the batch's complete SAM text.
     let process = |batch: Vec<Record>, base_id: u64| -> Vec<Vec<u8>> {
-        // ASCII bases -> nt4 codes (A=0, C=1, G=2, T=3, anything else 4), once per read.
-        // Parallel to `batch`: `all_codes[i]` is `batch[i]`'s sequence, same length.
-        //
-        // Run on the pool, as bwa-mem2 does (it encodes inside `mem_kernel1_core`, under `kt_for`).
-        // `dna::nt4` is a pure 256-entry table lookup, so `all_codes[i]` depends on `batch[i]` and
-        // nothing else, and `par_iter` is INDEXED so element order is preserved: byte-identical.
-        let all_codes: Vec<Vec<u8>> = stage_time::measure(Stage::Encode, || {
-            batch
-                .par_iter()
-                .map(|rec| rec.seq().iter().map(|&base| dna::nt4(base)).collect())
-                .collect()
-        });
+        // The bases are nt4 codes already: the reader encoded them (see `se_read_batches`).
+        let all_reads: Vec<&Record> = batch.iter().collect();
         // The denominator of the bytes-per-base column issue #25 is written in. One sum per batch,
         // and only when `BWA4_STAGE_ALLOC` is armed.
         if crate::stage_alloc::enabled() {
-            crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
+            crate::stage_alloc::note_bases(batch.iter().map(|r| r.seq_len() as u64).sum());
         }
         // Per-read alignments after dedup and before primary marking, also parallel to `batch`.
         let regs_all = stage_time::measure(Stage::Align, || {
-            batched_regs(&fm, &bns, &opt, &all_codes, dump_regs_enabled())
+            if opt.meth.is_some() {
+                meth_regs(&fm, &bns, &opt, &all_reads, false)
+            } else {
+                batched_regs(&fm, &bns, &opt, &all_reads, dump_regs_enabled(), None)
+            }
         });
+        drop(all_reads);
         // Move each read's regions out of `regs_all` (consumed by `finish_se`) instead of cloning:
         // `into_par_iter` yields the owned `Vec<MemAlnReg>`, dropping a per-read Vec allocation+copy.
         // One entry per read: that read's finished SAM records (possibly several, possibly one
@@ -2389,10 +2525,22 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         let per_read_sam: Vec<Vec<u8>> = stage_time::measure(Stage::SamEmit, || {
             batch
                 .par_iter()
-                .zip(all_codes.par_iter())
                 .zip(regs_all.into_par_iter())
                 .enumerate()
-                .map(|(read_in_batch, ((rec, codes), regs))| {
+                .map_init(Vec::new, |codes, (read_in_batch, (rec, regs))| {
+                    codes.clear();
+                    rec.codes_into(codes);
+                    if opt.meth.is_some() {
+                        return finish_se_meth(
+                            &fm,
+                            &bns,
+                            &opt,
+                            rec,
+                            codes,
+                            regs,
+                            base_id + read_in_batch as u64,
+                        );
+                    }
                     finish_se(
                         &fm,
                         &bns,
@@ -2411,7 +2559,7 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     };
 
     let verbose = args.verbose.unwrap_or(3);
-    let overlap = batch_overlap_enabled(bns.l_pac as u64, k_batch, verbose);
+    let overlap = batch_overlap_enabled(verbose);
     run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)?;
     reader.join().expect("reader thread panicked")?;
     bwa_chain::chain_time::dump();
@@ -2434,21 +2582,23 @@ pub fn run(args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
 /// - `fm`: the FM index, for seeding. Immutable and shared by every worker.
 /// - `bns`: contig dictionary plus the packed reference, for extension and coordinate translation.
 /// - `opt`: the fully-derived options; read-only.
-/// - `codes`: one nt4-coded sequence per read (A=0, C=1, G=2, T=3, else 4). For paired-end this is
-///   the interleaved c1,c2,c1,c2,... list, so its length is twice the pair count.
+/// - `reads`: the batch's reads, nt4-coded by the reader. For paired-end this is the interleaved
+///   r1,r2,r1,r2,... list, so its length is twice the pair count. Each chunk unpacks its reads'
+///   codes into one buffer of its own, so no copy of the batch's bases is ever whole.
 /// - `leave_undeduped`: return the regions before dedup, so the caller owes that too. For
 ///   `BWA4_DUMP_REGS`, whose single-end dump prints both sides of it.
 ///
 /// # Returns
 ///
-/// One `Vec<MemAlnReg>` per entry of `codes`, in the same order. These are deduped, stamped and
+/// One `Vec<MemAlnReg>` per entry of `reads`, in the same order. These are deduped, stamped and
 /// unmarked: the caller still owes `mem_mark_primary_se`.
 fn batched_regs(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
-    codes: &[Vec<u8>],
+    reads: &[&Record],
     leave_undeduped: bool,
+    meth: Option<bool>,
 ) -> Vec<Vec<MemAlnReg>> {
     // One chunk per worker, so every thread gets a slice big enough to fill the SIMD lanes.
     // Size of the rayon pool, i.e. effectively `-t`. Clamped so the division below cannot divide
@@ -2465,35 +2615,170 @@ fn batched_regs(
     // per-worker share. Scheduling only -- the per-read regions do not depend on the chunk size.
     const INFLIGHT_READS: usize = 16384; // total reads' intermediates resident at once, all workers
     const MIN_CHUNK: usize = 512; // lockstep floor: enough reads in flight to hide FM latency
-    let budget_chunk = (INFLIGHT_READS / worker_count).max(MIN_CHUNK);
-    let reads_per_chunk = codes.len().div_ceil(worker_count).min(budget_chunk).max(1);
+
+    // Ceiling per chunk whatever `-t`: a chunk's extension passes stream its regions and job bases
+    // (~10 KB a read), which past ~2048 reads spill a 1-2 MB L2. Same-host fair CI A/B, 4096 -> 2048
+    // reads a chunk (-t4): EPYC 9V45 -2.8%, Xeon 8573C -1.4%; 1024 neutral on 9V45. M4 at -t4
+    // +0.3% (its 16 MB shared L2 holds 4096), unchanged at -t8 and up where the budget is lower.
+    const MAX_CHUNK: usize = 2048;
+    let budget_chunk = (INFLIGHT_READS / worker_count).clamp(MIN_CHUNK, MAX_CHUNK);
+    let reads_per_chunk = reads.len().div_ceil(worker_count).min(budget_chunk).max(1);
+    let chunks = guided_bounds(reads.len(), MIN_CHUNK.min(reads_per_chunk), reads_per_chunk)
+        .into_iter()
+        .map(|r| &reads[r])
+        .collect();
     crate::stage_time::barrier::region(crate::stage_time::Stage::Align, || {
-        codes
-            .par_chunks(reads_per_chunk)
-            .flat_map(|chunk| {
-                crate::stage_time::barrier::worker(|| {
-                    let mut regs = align_reads_batched(fm, bns, opt, chunk, &NeonBackend);
-                    // Dedup here, chunk by chunk, not once the whole batch has aligned. The pass is
-                    // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
-                    // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
-                    // apiece, and most die here. Held to the end of the batch they were the largest
-                    // live item in the run, and doing it late also kept their capacity, so the
-                    // survivors' lists are given back too.
-                    if !leave_undeduped {
-                        for (r, codes) in regs.iter_mut().zip(chunk) {
-                            let mut kept = mem_sort_dedup_patch(fm, opt, codes, std::mem::take(r));
-                            // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
-                            // the dedup and before any primary marking reads it.
-                            bwa_mem::stamp_is_alt(bns, &mut kept);
-                            kept.shrink_to_fit();
-                            *r = kept;
-                        }
+        run_in_order(chunks, |chunk| {
+            crate::stage_time::barrier::worker(|| {
+                let mut flat = Vec::with_capacity(chunk.iter().map(|r| r.seq_len()).sum());
+                for r in chunk {
+                    r.codes_into(&mut flat);
+                }
+                let mut at = 0;
+                let codes: Vec<&[u8]> = chunk
+                    .iter()
+                    .map(|r| {
+                        at += r.seq_len();
+                        &flat[at - r.seq_len()..at]
+                    })
+                    .collect();
+                let mut regs = match meth {
+                    None => align_reads_batched(fm, bns, opt, &codes, &NeonBackend),
+                    // `--meth`: seed the chunk's converted copies, align the reads themselves.
+                    Some(ot) => {
+                        let conv: Vec<Vec<u8>> = codes
+                            .iter()
+                            .map(|c| bwa_core::meth::convert_codes(c, ot))
+                            .collect();
+                        let conv: Vec<&[u8]> = conv.iter().map(Vec::as_slice).collect();
+                        bwa_mem::align_reads_batched_meth(
+                            fm,
+                            bns,
+                            opt,
+                            &codes,
+                            &conv,
+                            ot,
+                            &NeonBackend,
+                        )
                     }
-                    regs
-                })
+                };
+                // Dedup here, chunk by chunk, not once the whole batch has aligned. The pass is
+                // pure per read, so WHERE it runs cannot move a byte, and it decides how much of
+                // a batch stays resident: GIAB reads leave align with ~13 regions each, 96 bytes
+                // apiece, and most die here. Held to the end of the batch they were the largest
+                // live item in the run. Only lists left with 4+ empty slots are shrunk: a
+                // `shrink_to_fit` on every read was a realloc and a copy each, a quarter of the
+                // allocator's samples on EPYC 9V45 (real reads, -0.9% overall), while keeping all
+                // the slack cost 10% RSS on chr21 at -t4 (none on GIAB, where the index rules).
+                // The 13% (GIAB) to 29% (chr21) of reads past the threshold hold ~57% of it.
+                if !leave_undeduped {
+                    for (r, codes) in regs.iter_mut().zip(&codes) {
+                        let mut kept = mem_sort_dedup_patch(fm, opt, codes, std::mem::take(r));
+                        // `bwamem.cpp:1161`: re-stamp is_alt from each region's own contig, after
+                        // the dedup and before any primary marking reads it.
+                        bwa_mem::stamp_is_alt(bns, &mut kept);
+                        if kept.capacity() - kept.len() >= 4 {
+                            kept.shrink_to_fit();
+                        }
+                        *r = kept;
+                    }
+                }
+                regs
             })
-            .collect()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     })
+}
+
+/// The `--meth` index: `<prefix>.ann/.amb/.pac` of the original genome and the converted seed
+/// index `<prefix>.meth.bwt.2bit.64` (`index --meth`). A prefix given as `<ref>.meth` is taken to
+/// mean `<ref>`, as in the fork.
+fn load_meth_index(prefix: &std::path::Path) -> anyhow::Result<(FmIndex, BntSeq)> {
+    let text = prefix.to_string_lossy();
+    let orig = std::path::PathBuf::from(text.strip_suffix(".meth").unwrap_or(&text));
+    let seed = std::path::PathBuf::from(format!("{}.meth", orig.display()));
+    let bns = BntSeq::load(&orig)?;
+    let fm = FmIndex::load_meth(&seed, &orig, bns.l_pac).map_err(|e| {
+        anyhow::anyhow!(
+            "--meth: cannot load the seed index {}: {e}; build it with `bwa-mem4 index --meth`",
+            seed.display()
+        )
+    })?;
+    // The seed index is the genome converted both ways, so exactly twice as long.
+    if fm.ref_seq_len != 4 * bns.l_pac + 1 {
+        anyhow::bail!(
+            "--meth: {} is not the seed index of {} (rebuild with `bwa-mem4 index --meth`)",
+            seed.display(),
+            orig.display()
+        );
+    }
+    Ok((fm, bns))
+}
+
+/// The regions of a `--meth` batch, deduped: the batched aligner run once per chemistry, each
+/// with its own matrix (`MethOpt::mats`). `paired`: `reads` interleaves read 1 (C->T) and read 2
+/// (G->A); otherwise every read is read 1.
+fn meth_regs(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    reads: &[&Record],
+    paired: bool,
+) -> Vec<Vec<MemAlnReg>> {
+    let ot_opt = bwa_mem::meth::read_opt(opt, true);
+    if !paired {
+        return batched_regs(fm, bns, &ot_opt, reads, false, Some(true));
+    }
+    let r1: Vec<&Record> = reads.iter().step_by(2).copied().collect();
+    let r2: Vec<&Record> = reads.iter().skip(1).step_by(2).copied().collect();
+    let ob_opt = bwa_mem::meth::read_opt(opt, false);
+    let a = batched_regs(fm, bns, &ot_opt, &r1, false, Some(true));
+    let b = batched_regs(fm, bns, &ob_opt, &r2, false, Some(false));
+    a.into_iter().zip(b).flat_map(|(x, y)| [x, y]).collect()
+}
+
+/// [`finish_se`] under `--meth`: bwa's own `mem_reg2sam` (which `finish_se` mirrors) with the
+/// meth record extras, then the QC-fail rule over the read's records.
+fn finish_se_meth(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    rec: &Record,
+    codes: &[u8],
+    mut regs: Vec<MemAlnReg>,
+    read_id: u64,
+) -> Vec<u8> {
+    if dump_regs_enabled() {
+        eprintln!("=== read {} ===", String::from_utf8_lossy(rec.name()));
+        bwa_mem::dump_regs(bns, "meth pre-mark", &regs);
+    }
+    mem_mark_primary_se(opt, &mut regs, read_id);
+    if opt.flag & flags::PRIMARY5 != 0 {
+        bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);
+    }
+    let meth = opt.meth.as_ref().expect("finish_se_meth runs under --meth");
+    let emit = bwa_mem::meth::MethEmit { fm, meth, ot: true };
+    let mut buf = Vec::new();
+    bwa_mem::pe::mem_reg2sam(
+        fm,
+        bns,
+        &bwa_mem::meth::read_opt(opt, true),
+        rec.name(),
+        codes,
+        rec.qual(),
+        rec.comment(),
+        &regs,
+        0,
+        None,
+        Some(&emit),
+        &mut buf,
+    );
+    if meth.may_qcfail() {
+        bwa_mem::meth::propagate_qcfail(&mut buf);
+    }
+    buf
 }
 
 /// Env-gated (`BWA4_DUMP_REGS`) region dump; cached, since `finish_se` runs per read.
@@ -2520,7 +2805,7 @@ fn dump_regs_enabled() -> bool {
 ///
 /// - `fm`, `bns`, `opt`: the shared immutable index halves and options.
 /// - `rec`: the original read, for QNAME, SEQ, QUAL and the `-C` comment.
-/// - `codes`: `rec.seq` in nt4 coding, same length; the alignment code works on this, not on ASCII.
+/// - `codes`: `rec`'s bases in nt4 coding; the alignment code works on this, not on ASCII.
 /// - `regs`: this read's regions from [`batched_regs`], CONSUMED here to avoid a per-read clone.
 /// - `read_id`: the read's global 0-based index across the whole input, not its index within the
 ///   batch. Load-bearing: `mem_mark_primary_se` hashes it to break score ties, so a per-batch id
@@ -2545,7 +2830,7 @@ fn finish_se(
     // After marking, `regs[0]` is the highest-scoring primary.
     let mut regs = regs;
     if dump_regs_enabled() {
-        eprintln!("=== read {} ===", rec.name());
+        eprintln!("=== read {} ===", String::from_utf8_lossy(rec.name()));
         bwa_mem::dump_regs(bns, "pre-dedup", &regs);
         regs = mem_sort_dedup_patch(fm, opt, codes, regs);
         bwa_mem::stamp_is_alt(bns, &mut regs);
@@ -2569,7 +2854,7 @@ fn finish_se(
     // Parallel to `regs`: the `XA:Z` value for each region, or `None` where there is none. All-`None`
     // under `-a`, since the shadowed hits become their own records instead.
     let xa_per_reg = if output_all {
-        vec![None; regs.len()]
+        bwa_mem::alt::XaTags::default()
     } else {
         mem_gen_alt(fm, bns, opt, &regs, codes.len() as i32, codes)
     };
@@ -2633,7 +2918,7 @@ fn finish_se(
             aln,
             mapq,
             is_alt: reg.is_alt,
-            xa: xa_per_reg[reg_idx].clone(),
+            xa: xa_per_reg.get(reg_idx),
             secondary: is_secondary,
             sup: is_supplementary,
         });
@@ -2648,7 +2933,7 @@ fn finish_se(
         sam::write_unmapped(
             &mut buf,
             rec.name(),
-            &dna::to_sam_ascii(rec.seq()),
+            &sam_seq(codes, false),
             rec.qual(),
             rec.comment(),
         )
@@ -2656,7 +2941,7 @@ fn finish_se(
         return buf;
     }
     for which in 0..alns.len() {
-        write_aln_se(&mut buf, bns, opt, rec, &alns, which);
+        write_aln_se(&mut buf, bns, opt, rec, codes, &alns, which);
     }
     buf
 }
@@ -2683,6 +2968,18 @@ struct EmitAln {
     secondary: bool,
     /// A later *primary* hit: supplementary (0x800, or 0x10000 -> 0x100 under `-M`).
     sup: bool,
+}
+
+/// SAM column 10 out of nt4 codes: bwa's `"ACGTN"[c]`, or on the reverse strand the reverse
+/// complement. Lowercase and non-ACGT input were folded into the codes by the reader.
+fn sam_seq(codes: &[u8], rev: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(codes.len());
+    if rev {
+        bwa_mem::emit::push_seq_rev(&mut out, codes);
+    } else {
+        bwa_mem::emit::push_seq_fwd(&mut out, codes);
+    }
+    out
 }
 
 /// `mem_aln2sam` for one of a read's alignments. `which` indexes `alns`: 0 is the primary, any other
@@ -2719,6 +3016,8 @@ fn write_aln_se(
     bns: &BntSeq,
     opt: &MemOpt,
     rec: &Record,
+    // `rec`'s bases as nt4 codes.
+    codes: &[u8],
     alns: &[EmitAln],
     which: usize,
 ) {
@@ -2767,9 +3066,9 @@ fn write_aln_se(
     // cigar ends (which coincide for a 1-op cigar) and maps them onto the *forward* read.
     // Half-open `[qb, qe)` over the FORWARD read, in bases. Starts as the whole read (the primary,
     // and any soft-clipping record, stores all of it) and is narrowed below only when hard clipping
-    // applies. Invariant: `0 <= qb <= qe <= rec.seq.len()`, and it indexes `rec.seq`/`rec.qual`
+    // applies. Invariant: `0 <= qb <= qe <= codes.len()`, and it indexes `codes`/`rec.qual`
     // BEFORE any reverse-complementing.
-    let (mut qb, mut qe) = (0usize, rec.seq().len());
+    let (mut qb, mut qe) = (0usize, codes.len());
     if clip_ends {
         // The two end ops. For a single-op cigar these are the same entry, and the two `if`s below
         // would both fire on it; that mirrors the C.
@@ -2869,16 +3168,11 @@ fn write_aln_se(
         tags.push_str("\tXA:Z:");
         tags.push_str(xa_string);
     }
-    // `-C`: bwa appends the FASTQ comment after everything else.
-    if bwa_core::rg::copy_comment() {
-        if let Some(comment) = rec.comment() {
-            tags.push('\t');
-            tags.push_str(comment);
-        }
-    }
-    // `-V` closes the record, after even the comment (`bwamem.cpp:1721`). The comment is in whatever
-    // encoding the FASTA was, so from here `tags` is bytes.
+    // Both trailers below are in whatever encoding their file was, so from here `tags` is bytes.
     let mut tags = tags.into_bytes();
+    // `-C`: bwa appends the FASTQ comment after everything else.
+    bwa_core::rg::append_comment(&mut tags, rec.comment());
+    // `-V` closes the record, after even the comment (`bwamem.cpp:1721`).
     if opt.flag & flags::REF_HDR != 0 {
         bwa_mem::emit::push_xr(&mut tags, bns.contigs[aln.rid as usize].comment());
     }
@@ -2905,15 +3199,10 @@ fn write_aln_se(
             sliced.reverse();
             sliced
         });
-        (dna::revcomp_ascii(&rec.seq()[qb..qe]), reversed_qual)
+        (sam_seq(&codes[qb..qe], true), reversed_qual)
     } else {
         (
-            // `to_sam_ascii`, not `to_vec`: SAM column 10 is bwa's `"ACGTN"[code]` and not the
-            // FASTQ's own bytes, so lowercase input is upper-cased and anything that is not a base
-            // becomes `N`. The reverse branch above gets the same normalisation from
-            // `revcomp_ascii`. Skipping it here leaked raw input into every forward-strand
-            // single-end record.
-            dna::to_sam_ascii(&rec.seq()[qb..qe]),
+            sam_seq(&codes[qb..qe], false),
             rec.qual().map(|quals| quals[qb..qe].to_vec()),
         )
     };
@@ -2963,8 +3252,10 @@ fn pe_read_batches(
         let mut two: Option<PairedFastqReader> = None;
         let mut one: Option<InterleavedFastqReader> = None;
         match &reads2 {
-            Some(r2) => two = Some(PairedFastqReader::from_paths(&reads1, r2)?),
-            None => one = Some(InterleavedFastqReader::from_path(&reads1)?),
+            // nt4-coded as they parse, as bwa does in `mem_kernel1_core`; nothing downstream reads
+            // the ASCII bases of a pair. On the per-file parser threads, which cost no wall.
+            Some(r2) => two = Some(PairedFastqReader::from_paths(&reads1, r2, true)?),
+            None => one = Some(InterleavedFastqReader::from_path(&reads1, true)?),
         }
         // Pairs (not reads) emitted in all previous batches, so the global 0-based id of this
         // batch's first pair. Invariant at the top of each turn: it equals the summed length of
@@ -2980,7 +3271,6 @@ fn pe_read_batches(
             if batch.is_empty() {
                 break;
             }
-            // Pair count, saved before the move so `base_pair` can advance after the send.
             let n = batch.len() as u64;
             if tx.send((batch, base_pair)).is_err() {
                 break;
@@ -3035,99 +3325,46 @@ fn run_pe(
     // `batch` is one `-K` worth of read PAIRS in input order; `base_pair` is the global id of its
     // first pair. Returns the batch's complete SAM text.
     let process = |batch: Vec<(Record, Record)>, base_pair: u64| -> Vec<Vec<u8>> {
-        // ---- Both mates of every pair, interleaved as c1,c2,c1,c2,... so the batched extension
-        //      sees one flat list of reads ----
-        // Length is `2 * batch.len()`; index `2i` is pair `i`'s mate 1 and `2i+1` its mate 2.
-        //
-        // Run on the pool, as bwa-mem2 does (it encodes inside `mem_kernel1_core`, under `kt_for`).
-        // Indexed by the FLAT read index `i`, so `i >> 1` is the pair and `i & 1` the mate: an
-        // indexed `par_iter` over a range preserves order exactly, and `dna::nt4` is a pure table
-        // lookup, so each entry depends only on its own read. Byte-identical to the serial form.
-        let all_codes: Vec<Vec<u8>> = stage_time::measure(Stage::Encode, || {
-            stage_time::barrier::region(Stage::Encode, || {
-                (0..2 * batch.len())
-                    .into_par_iter()
-                    .map(|i| {
-                        stage_time::barrier::worker(|| {
-                            let (rec1, rec2) = &batch[i >> 1];
-                            let seq = if i & 1 == 0 { rec1.seq() } else { rec2.seq() };
-                            seq.iter().map(|&base| dna::nt4(base)).collect()
-                        })
-                    })
-                    .collect()
-            })
-        });
+        // The bases are nt4 codes already: the reader encoded them (see `pe_read_batches`).
+        // Both mates of every pair, interleaved c1,c2,c1,c2,... so the batched extension sees one
+        // flat list of reads: index `2i` is pair `i`'s mate 1 and `2i+1` its mate 2.
+        let all_reads: Vec<&Record> = batch.iter().flat_map(|(rec1, rec2)| [rec1, rec2]).collect();
         // Both mates, so the bytes-per-base column counts the same bases the aligner processed.
         // One sum per batch, and only when `BWA4_STAGE_ALLOC` is armed.
         if crate::stage_alloc::enabled() {
-            crate::stage_alloc::note_bases(all_codes.iter().map(|c| c.len() as u64).sum());
+            crate::stage_alloc::note_bases(all_reads.iter().map(|r| r.seq_len() as u64).sum());
         }
-        // Deduped regions, in the same interleaved order as `all_codes`.
+        // Deduped regions, in the same interleaved order as `all_reads`.
         let regs_all = stage_time::measure(Stage::Align, || {
-            batched_regs(fm, bns, opt, &all_codes, false)
+            if opt.meth.is_some() {
+                meth_regs(fm, bns, opt, &all_reads, true)
+            } else {
+                batched_regs(fm, bns, opt, &all_reads, false, None)
+            }
         });
+        drop(all_reads);
 
-        // ---- De-interleave: pair up each mate's owned codes + regions by sequential moves (no
-        //      content copy), so the parallel prep can consume them instead of cloning
-        //      `all_codes[2i]`/`regs_all[2i]` per pair ----
-        // Owning cursors over the two interleaved lists. Invariant: both have yielded the same
-        // number of items at every point, so the four `next()` calls below always take mate 1's
-        // codes, mate 2's codes, mate 1's regions and mate 2's regions of the SAME pair. Each
-        // `unwrap` is sound because both lists hold exactly `2 * batch.len()` items.
-        // Re-paired, one entry per input pair, in pair order: ((codes1, codes2), (regs1, regs2)).
-        #[allow(clippy::type_complexity)]
-        let paired: Vec<((Vec<u8>, Vec<u8>), (Vec<MemAlnReg>, Vec<MemAlnReg>))> =
+        // ---- De-interleave each mate's regions by sequential moves (no content copy) ----
+        // Invariant: the two `next()` calls take mate 1's and mate 2's regions of the SAME pair;
+        // each `unwrap` is sound because the list holds exactly `2 * batch.len()` items.
+        let mut paired: Vec<(Vec<MemAlnReg>, Vec<MemAlnReg>)> =
             stage_time::measure(Stage::Deinterleave, || {
-                let mut code_iter = all_codes.into_iter();
                 let mut regs_iter = regs_all.into_iter();
                 (0..batch.len())
-                    .map(|_| {
-                        let codes1 = code_iter.next().unwrap();
-                        let codes2 = code_iter.next().unwrap();
-                        let regs1 = regs_iter.next().unwrap();
-                        let regs2 = regs_iter.next().unwrap();
-                        ((codes1, codes2), (regs1, regs2))
-                    })
+                    .map(|_| (regs_iter.next().unwrap(), regs_iter.next().unwrap()))
                     .collect()
             });
-
-        // ---- Reunite each pair with its records ----
-        // Everything the pairing and output stages need, one entry per pair in pair order. Mutable
-        // because mate rescue writes new regions into it and `mem_sam_pe` then rewrites them again.
-        let mut prepared: Vec<PrepPair> = stage_time::measure(Stage::DedupPrep, || {
-            stage_time::barrier::region(Stage::DedupPrep, || {
-                // `into_par_iter`, not `par_iter`: `batch` is dead after this stage, so the six
-                // per-pair fields below are MOVED out of the records instead of cloned. At 1M pairs
-                // that is six million allocations and about 376 MB of copying removed from a
-                // parallel stage. Indexed either way, so the order is unchanged and so is the
-                // output.
-                batch
-                    .into_par_iter()
-                    .zip(paired.into_par_iter())
-                    .map(|((rec1, rec2), ((codes1, codes2), (regs1, regs2)))| {
-                        stage_time::barrier::worker(|| PrepPair {
-                            codes1,
-                            codes2,
-                            regs1,
-                            regs2,
-                            rec1,
-                            rec2,
-                        })
-                    })
-                    .collect()
-            })
-        });
 
         // ---- Insert-size distribution, estimated once over the WHOLE batch. This is why batch
         //      boundaries (`-K`) are visible in paired-end output ----
         // Borrowed view of every mate's regions, re-interleaved, as `mem_pestat` expects: it reads
         // consecutive pairs of entries as the two ends of one pair.
-        // Charged to `pestat` rather than to a row of its own: it exists only to feed `mem_pestat`
-        // and shares its fate under any fix.
-        let regs_ref: Vec<&[MemAlnReg]> = stage_time::measure(Stage::Pestat, || {
-            prepared
+        // Charged to `dedup_prep`, the row that used to move every pair into one struct with its
+        // records: the stages below zip `batch` with `paired` instead.
+        let regs_ref: Vec<&[MemAlnReg]> = stage_time::measure(Stage::DedupPrep, || {
+            paired
                 .iter()
-                .flat_map(|pair| [pair.regs1.as_slice(), pair.regs2.as_slice()])
+                .flat_map(|(regs1, regs2)| [regs1.as_slice(), regs2.as_slice()])
                 .collect()
         });
         // The insert-size model in force for THIS batch: the four orientations' mean, std and the
@@ -3135,7 +3372,22 @@ fn run_pe(
         // unambiguous pairs. Read by both mate rescue and `mem_sam_pe`.
         let pes = match pes0 {
             Some(fixed) => fixed,
-            None => stage_time::measure(Stage::Pestat, || mem_pestat(opt, bns.l_pac, &regs_ref)),
+            // `mem_pestat` spread over the pool: its walk over every pair's regions (~24 ns a pair,
+            // cache misses) and its sorts were a serial 0.7% of the wall on four cores. The lists
+            // are sorted before the fit, so the order they are gathered in cannot matter.
+            None => stage_time::measure(Stage::Pestat, || {
+                let mut samples = regs_ref
+                    .par_chunks(2 * 8192)
+                    .map(|reads| pestat_samples(opt, bns.l_pac, reads))
+                    .reduce(<[Vec<i64>; 4]>::default, |mut all, part| {
+                        for (a, p) in all.iter_mut().zip(part) {
+                            a.extend(p);
+                        }
+                        all
+                    });
+                samples.iter_mut().for_each(|s| s.par_sort_unstable());
+                mem_pestat_from(samples)
+            }),
         };
 
         // Mate rescue, batched across the whole pair batch so the per-anchor insert-window SW fills
@@ -3155,76 +3407,153 @@ fn run_pe(
         // value works. Default off. True here means NO rescue happens anywhere, batched or per-pair.
         let no_rescue =
             std::env::var_os("BWA4_NO_RESCUE").is_some() || opt.flag & flags::NO_RESCUE != 0;
+        // Per rescue chunk, its first pair and its table of pending `csub` jobs (`lazy_csub`).
+        let mut pend_tables: Vec<(usize, Vec<PendS2>)> = Vec::new();
         if !scalar_rescue && !no_rescue {
             stage_time::measure(Stage::Rescue, || {
-                // One rescue job per pair: each mate's codes plus a MUTABLE borrow of its region list,
-                // which the rescue appends newly found alignments to. Borrowing `prepared` mutably is
-                // why this vector exists at all rather than the rescue reading `prepared` directly.
-                let mut rescue_jobs: Vec<PairRescueData> = prepared
-                    .iter_mut()
-                    .map(|pair| PairRescueData {
-                        seq0: pair.codes1.as_slice(),
-                        seq1: pair.codes2.as_slice(),
-                        a0: &mut pair.regs1,
-                        a1: &mut pair.regs2,
-                    })
-                    .collect();
                 // Each pair's rescue is independent, so run chunks in parallel; a chunk of a few hundred
                 // pairs still has enough rescue jobs to fill the SIMD lanes. Keeps -t8 scaling (the rescue
                 // is otherwise a serial section) while byte-identical to the per-pair path.
-                // Read before the mutable borrow below; `par_chunks_mut` would otherwise hold it.
-                let chunk_pairs = rescue_pairs_per_chunk(rescue_jobs.len());
-                stage_time::barrier::region(Stage::Rescue, || {
-                    rescue_jobs.par_chunks_mut(chunk_pairs).for_each(|chunk| {
-                        stage_time::barrier::worker(|| batch_mate_rescue(fm, bns, opt, &pes, chunk))
-                    });
+                let chunk_pairs = rescue_pairs_per_chunk(batch.len());
+                // Shrinking toward the floor only (a forced size stays fixed).
+                let min = rescue_pairs_override().unwrap_or(RESCUE_MIN_PAIRS_PER_CHUNK);
+                let mut pairs = batch.as_slice();
+                let mut rest = paired.as_mut_slice();
+                let mut chunks = Vec::new();
+                let mut starts = Vec::new();
+                for r in guided_bounds(pairs.len(), min, chunk_pairs) {
+                    starts.push(r.start);
+                    let (regs, tail) = std::mem::take(&mut rest).split_at_mut(r.len());
+                    let (recs, more) = pairs.split_at(r.len());
+                    chunks.push((recs, regs));
+                    (rest, pairs) = (tail, more);
+                }
+                let tables = stage_time::barrier::region(Stage::Rescue, || {
+                    run_in_order(chunks, |(recs, regs)| {
+                        stage_time::barrier::worker(|| rescue_chunk(fm, bns, opt, &pes, recs, regs))
+                    })
                 });
+                pend_tables = starts.into_iter().zip(tables).collect();
             });
         }
 
         // Emit paired SAM in parallel (each pair owns its regions; global pair id fixes hashes).
-        // One entry per pair, in pair order: that pair's SAM records (normally two, more when either
-        // mate is split). rayon's indexed parallel iterator preserves the order.
+        // One entry per `SAM_CHUNK_PAIRS` pairs, in pair order: those pairs' SAM records (normally
+        // two a pair, more when a mate is split). rayon's indexed `fold_chunks` preserves the order.
+        // A buffer per pair was an allocation per pair, freed on the writer's thread. 64 pairs a
+        // buffer cost +0.2 GB RSS on GIAB at -K 100M (blocks in a larger mimalloc class); 16 none.
+        const SAM_CHUNK_PAIRS: usize = 16;
+        // Emit runs block by block so the pairs deferred on a pending `csub` (`lazy_csub`, ~2% of
+        // pairs, the repeat-heavy ones) are resolved and freed every block, not held to the end of
+        // the batch, where emit overlaps the next batch's align (the run's peak); a block's
+        // deferred jobs still fill the kernel's lanes.
+        const EMIT_BLOCK_PAIRS: usize = 8192;
         let bufs: Vec<Vec<u8>> = stage_time::measure(Stage::SamEmit, || {
-            stage_time::barrier::region(Stage::SamEmit, || {
-                // `into_par_iter`, so each pair's records and regions are freed as its text appears.
-                // Batch N's tail overlaps batch N+1's align, and that is where the run's peak is.
-                prepared
+            let mut out = Vec::with_capacity(batch.len().div_ceil(SAM_CHUNK_PAIRS));
+            let (mut recs_left, mut regs_left) = (batch.into_iter(), paired.into_iter());
+            let mut first = 0usize;
+            // Block N's deferred pairs resolve while block N+1 emits: alone, a block's few hundred
+            // jobs and reruns left most of the pool idle (0.28 s of wall per GIAB run).
+            let mut prev: Vec<(Vec<u8>, Vec<Deferred>)> = Vec::new();
+            loop {
+                let recs: Vec<(Record, Record)> =
+                    recs_left.by_ref().take(EMIT_BLOCK_PAIRS).collect();
+                let regs: Vec<_> = regs_left.by_ref().take(recs.len()).collect();
+                let n = recs.len();
+                let resolve = |prev: &mut Vec<(Vec<u8>, Vec<Deferred>)>| {
+                    if prev.iter().any(|(_, d)| !d.is_empty()) {
+                        emit_deferred(fm, bns, opt, &pes, base_pair, &pend_tables, prev);
+                    }
+                };
+                let emit = || -> Vec<(Vec<u8>, Vec<Deferred>)> {
+                    if n == 0 {
+                        return Vec::new();
+                    }
+                    stage_time::barrier::region(Stage::SamEmit, || {
+                        // `into_par_iter`, so each pair's records and regions are freed as its text appears.
+                        // Batch N's tail overlaps batch N+1's align, and that is where the run's peak is.
+                        recs
                     .into_par_iter()
+                    .zip(regs.into_par_iter())
                     .enumerate()
-                    .map(|(pair_in_batch, mut pair)| {
-                        stage_time::barrier::worker(|| {
-                            // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
-                            // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
-                            let names = [pair.rec1.name(), pair.rec2.name()];
-                            let seqs = [pair.codes1.as_slice(), pair.codes2.as_slice()];
-                            let quals = [pair.rec1.qual(), pair.rec2.qual()];
-                            let comments = [pair.rec1.comment(), pair.rec2.comment()];
-                            // This pair's SAM text.
-                            let mut buf = Vec::new();
-                            mem_sam_pe(
-                                fm,
-                                bns,
-                                opt,
-                                &pes,
-                                base_pair + pair_in_batch as u64,
-                                &names,
-                                &seqs,
-                                &quals,
-                                &comments,
-                                &mut pair.regs1,
-                                &mut pair.regs2,
-                                // rescue_done: true when nothing further should rescue -- either the batched
-                                // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
-                                !scalar_rescue || no_rescue,
-                                &mut buf,
-                            )
-                            .expect("write to Vec");
-                            buf
-                        })
-                    })
+                    .map(|(i, x)| (first + i, x))
+                    .fold_chunks(
+                        SAM_CHUNK_PAIRS,
+                        || (Vec::with_capacity(SAM_CHUNK_PAIRS * 1024), Vec::new(), Vec::new()),
+                        |(mut buf, mut codes, mut deferred), (pair_in_batch, ((rec1, rec2), (mut regs1, mut regs2)))| {
+                            // `move`: the pair is freed inside, so `BWA4_BARRIER_TIME` counts its
+                            // frees as work, not as tail (1.5 points of the 3.7% tail at -t4).
+                            stage_time::barrier::worker(move || {
+                                // The two mates' per-record inputs, as [mate1, mate2] arrays because that is the
+                                // shape `mem_sam_pe` takes (it indexes them 0/1 throughout).
+                                let names = [rec1.name(), rec2.name()];
+                                codes.clear();
+                                rec1.codes_into(&mut codes);
+                                let n1 = codes.len();
+                                rec2.codes_into(&mut codes);
+                                let seqs = [&codes[..n1], &codes[n1..]];
+                                let quals = [rec1.qual(), rec2.qual()];
+                                let comments = [rec1.comment(), rec2.comment()];
+                                // A pair holding a pending `csub` keeps its regions as rescue left
+                                // them, for the rerun should emit read one.
+                                let kept = regs1
+                                    .iter()
+                                    .chain(&regs2)
+                                    .any(|r| lazy_csub::index(r.csub).is_some())
+                                    .then(|| (regs1.clone(), regs2.clone()));
+                                let at = buf.len();
+                                mem_sam_pe(
+                                    fm,
+                                    bns,
+                                    opt,
+                                    &pes,
+                                    base_pair + pair_in_batch as u64,
+                                    &names,
+                                    &seqs,
+                                    &quals,
+                                    &comments,
+                                    &mut regs1,
+                                    &mut regs2,
+                                    // rescue_done: true when nothing further should rescue -- either the batched
+                                    // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
+                                    !scalar_rescue || no_rescue,
+                                    &mut buf,
+                                )
+                                .expect("write to Vec");
+                                if let Some(regs) = kept {
+                                    let mut ids = Vec::new();
+                                    lazy_csub::take(&mut ids);
+                                    if !ids.is_empty() {
+                                        buf.truncate(at);
+                                        let n1 = rec1.seq_len();
+                                        deferred.push(Deferred {
+                                            at,
+                                            pair: pair_in_batch,
+                                            codes: codes.clone(),
+                                            n1,
+                                            recs: (rec1, rec2),
+                                            regs,
+                                            ids,
+                                        });
+                                    }
+                                }
+                                (buf, codes, deferred)
+                            })
+                        },
+                    )
+                    .map(|(buf, _, deferred)| (buf, deferred))
                     .collect()
-            })
+                    })
+                };
+                let (bufs, ()) = rayon::join(emit, || resolve(&mut prev));
+                out.extend(std::mem::take(&mut prev).into_iter().map(|(buf, _)| buf));
+                if n == 0 {
+                    break;
+                }
+                prev = bufs;
+                first += n;
+            }
+            out
         });
         // Handed to the writer as pieces, in pair order (the indexed parallel map above preserved
         // it). No concatenation: see `run_pipeline`'s docs for why that buffer is not built.
@@ -3233,9 +3562,195 @@ fn run_pe(
 
     // The reader is joined by `run`, which owns its handle: it started the thread before the index
     // load, so it is also the place that observes a reader error.
-    let overlap = batch_overlap_enabled(bns.l_pac as u64, k_batch, verbose);
+    let overlap = batch_overlap_enabled(verbose);
     run_pipeline(out, overlap, batch_rx, process, verbose, k_batch)
 }
+
+/// A pair whose emit read a pending `csub` ([`lazy_csub`]): its output's place in the chunk buffer,
+/// its index in the batch, its bases (`codes[..n1]` read 1, the rest read 2), its records, its
+/// regions as rescue left them, and the pending entries it read.
+struct Deferred {
+    at: usize,
+    pair: usize,
+    codes: Vec<u8>,
+    n1: usize,
+    recs: (Record, Record),
+    regs: (Vec<MemAlnReg>, Vec<MemAlnReg>),
+    ids: Vec<u32>,
+}
+
+/// Compute the pending `csub`s the deferred pairs read, rerun those pairs' emit with them, and put
+/// each pair's records back at its place in its chunk buffer. `pend_tables` holds each rescue
+/// chunk's first pair and table; a pair's pending entries are in its chunk's table.
+#[allow(clippy::too_many_arguments)]
+fn emit_deferred(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    base_pair: u64,
+    pend_tables: &[(usize, Vec<PendS2>)],
+    bufs: &mut [(Vec<u8>, Vec<Deferred>)],
+) {
+    let table = |pair: usize| &pend_tables[pend_tables.partition_point(|t| t.0 <= pair) - 1].1;
+    // Every read entry once per pair, then one kernel batch per slice of jobs.
+    let mut jobs: Vec<(PendS2, [&[u8]; 2])> = Vec::new();
+    let mut owner: Vec<(usize, usize, u32)> = Vec::new();
+    for (b, (_, deferred)) in bufs.iter_mut().enumerate() {
+        for d in deferred.iter_mut() {
+            d.ids.sort_unstable();
+            d.ids.dedup();
+        }
+        for (k, d) in deferred.iter().enumerate() {
+            let seqs = [&d.codes[..d.n1], &d.codes[d.n1..]];
+            for &id in &d.ids {
+                jobs.push((table(d.pair)[id as usize], seqs));
+                owner.push((b, k, id));
+            }
+        }
+    }
+    // A block's few hundred jobs spread over the pool: one 1024-job slice ran on one thread while
+    // the others waited (0.55 s of serial wall per GIAB run). 64 fills an AVX-512 lane group.
+    let score2: Vec<i32> = jobs
+        .par_chunks(64)
+        .flat_map_iter(|c| resolve_pending(fm, opt, c))
+        .collect();
+    drop(jobs);
+    let mut values: Vec<Vec<Vec<(u32, i32)>>> = bufs
+        .iter()
+        .map(|(_, d)| vec![Vec::new(); d.len()])
+        .collect();
+    for (&(b, k, id), &s2) in owner.iter().zip(&score2) {
+        values[b][k].push((id, s2));
+    }
+    bufs.par_iter_mut()
+        .zip(values)
+        .filter(|((_, d), _)| !d.is_empty())
+        .for_each(|((buf, deferred), values)| {
+            let mut out = Vec::with_capacity(buf.len() + deferred.len() * 1024);
+            let mut from = 0;
+            for (d, vals) in std::mem::take(deferred).into_iter().zip(values) {
+                out.extend_from_slice(&buf[from..d.at]);
+                from = d.at;
+                emit_resolved(
+                    fm,
+                    bns,
+                    opt,
+                    pes,
+                    base_pair,
+                    table(d.pair),
+                    d,
+                    vals,
+                    &mut out,
+                );
+            }
+            out.extend_from_slice(&buf[from..]);
+            *buf = out;
+        });
+}
+
+/// One deferred pair's emit with the pending `csub`s it reads set from `vals` (`(entry, score2)`).
+/// The regions read never depend on a `csub` value, so the rerun reads no other entry; were it to,
+/// those are resolved here and the pair is emitted again.
+#[allow(clippy::too_many_arguments)]
+fn emit_resolved(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    base_pair: u64,
+    table: &[PendS2],
+    d: Deferred,
+    mut vals: Vec<(u32, i32)>,
+    out: &mut Vec<u8>,
+) {
+    let (rec1, rec2) = &d.recs;
+    let seqs = [&d.codes[..d.n1], &d.codes[d.n1..]];
+    loop {
+        let (mut regs1, mut regs2) = d.regs.clone();
+        for r in regs1.iter_mut().chain(regs2.iter_mut()) {
+            if let Some(i) = lazy_csub::index(r.csub) {
+                if let Some(&(_, s2)) = vals.iter().find(|v| v.0 as usize == i) {
+                    r.csub = s2;
+                }
+            }
+        }
+        let at = out.len();
+        mem_sam_pe(
+            fm,
+            bns,
+            opt,
+            pes,
+            base_pair + d.pair as u64,
+            &[rec1.name(), rec2.name()],
+            &seqs,
+            &[rec1.qual(), rec2.qual()],
+            &[rec1.comment(), rec2.comment()],
+            &mut regs1,
+            &mut regs2,
+            true,
+            out,
+        )
+        .expect("write to Vec");
+        let mut more = Vec::new();
+        lazy_csub::take(&mut more);
+        if more.is_empty() {
+            return;
+        }
+        out.truncate(at);
+        more.sort_unstable();
+        more.dedup();
+        let jobs: Vec<(PendS2, [&[u8]; 2])> =
+            more.iter().map(|&id| (table[id as usize], seqs)).collect();
+        vals.extend(more.into_iter().zip(resolve_pending(fm, opt, &jobs)));
+    }
+}
+
+/// Mate rescue over one chunk of pairs, `RESCUE_SLICE_PAIRS` at a time: the slice's bases are
+/// unpacked into one buffer and rescued, and the buffer is reused for the next slice. The rescue
+/// result does not depend on how the pairs are grouped (see [`rescue_pairs_per_chunk`]). Returns
+/// the chunk's pending `csub` jobs ([`lazy_csub`]).
+fn rescue_chunk(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    recs: &[(Record, Record)],
+    regs: &mut [(Vec<MemAlnReg>, Vec<MemAlnReg>)],
+) -> Vec<PendS2> {
+    let mut pend = Vec::new();
+    // Far above the 256 pairs the kernel needs to fill its lanes; small enough that a worker's
+    // codes stay ~1 MB, where unpacking a whole chunk was ~5 MB a worker at the peak.
+    const RESCUE_SLICE_PAIRS: usize = 4096;
+    let mut codes = Vec::new();
+    for (recs, regs) in recs
+        .chunks(RESCUE_SLICE_PAIRS)
+        .zip(regs.chunks_mut(RESCUE_SLICE_PAIRS))
+    {
+        codes.clear();
+        for (rec1, rec2) in recs {
+            rec1.codes_into(&mut codes);
+            rec2.codes_into(&mut codes);
+        }
+        let mut rest = codes.as_slice();
+        let mut jobs: Vec<PairRescueData> = recs
+            .iter()
+            .zip(regs.iter_mut())
+            .map(|((rec1, rec2), (a0, a1))| {
+                let (seq0, more) = rest.split_at(rec1.seq_len());
+                let (seq1, more) = more.split_at(rec2.seq_len());
+                rest = more;
+                PairRescueData { seq0, seq1, a0, a1 }
+            })
+            .collect();
+        batch_mate_rescue(fm, bns, opt, pes, &mut jobs, Some(&mut pend));
+    }
+    pend
+}
+
+/// Floor of a rescue chunk, so a small batch (or a stage's last chunks) is not shredded into slivers
+/// narrower than the kernel's lanes.
+const RESCUE_MIN_PAIRS_PER_CHUNK: usize = 256;
 
 /// Read pairs handed to one parallel mate-rescue task, derived from the batch rather than fixed.
 ///
@@ -3319,8 +3834,6 @@ fn rescue_pairs_per_chunk(n_pairs: usize) -> usize {
     /// Two chunks per worker: enough for work-stealing to rebalance, few enough to keep the SIMD
     /// batches wide.
     const CHUNKS_PER_WORKER: usize = 2;
-    /// Floor, so a small batch is not shredded into slivers narrower than the kernel's lanes.
-    const RESCUE_MIN_PAIRS_PER_CHUNK: usize = 256;
     if let Some(forced) = rescue_pairs_override() {
         return forced;
     }
@@ -3342,34 +3855,75 @@ fn rescue_pairs_override() -> Option<usize> {
     })
 }
 
-/// One read pair prepared for the pairing/output stage: nt4 codes, dedup'd regions, names, quals.
-struct PrepPair {
-    /// nt4-coded bases of mate 1 and mate 2 (A=0, C=1, G=2, T=3, else 4).
-    codes1: Vec<u8>,
-    codes2: Vec<u8>,
-    /// Each mate's deduplicated candidate alignments, still unpaired at this point. Mutated twice
-    /// more: mate rescue may append to them, then `mem_sam_pe` marks primaries and pairs them.
-    regs1: Vec<MemAlnReg>,
-    regs2: Vec<MemAlnReg>,
-    /// The two input records, MOVED out of the batch rather than copied field by field.
-    ///
-    /// This used to be six owned fields (`name1/2`, `qual1/2`, `comment1/2`) cloned out of the
-    /// records, which is six allocations per pair. Since `Record` became one buffer plus offsets
-    /// the whole record is 32 bytes and moving it is strictly cheaper than copying any one of its
-    /// parts. `seq` rides along unused here (the stage works on `codes`), which costs nothing: the
-    /// bytes were going to be freed at the end of the batch either way.
-    ///
-    /// `name()` is the QNAME: bwa emits the SAME name on both records of a pair, so any `/1`, `/2`
-    /// suffix has already been stripped by the reader. `qual()` is the per-base ASCII quality, or
-    /// `None` for FASTA input (SAM column 11 becomes `*`), always as long as the corresponding
-    /// `codes`. `comment()` is the `-C` trailer.
-    rec1: Record,
-    rec2: Record,
+/// `n` items cut for guided scheduling: each chunk is what is left over `2 * workers`, within
+/// `[min, max]`. Taken in order (see [`run_in_order`]), the last chunks are the small ones, so a
+/// stage ends with its workers finishing together. With one batch in flight every stage's tail is
+/// idle cores: equal chunks left three of four waiting on the last one (EPYC 9V74, `-t4`: align
+/// 98.1% busy, rescue 95.7%).
+fn guided_bounds(n: usize, min: usize, max: usize) -> Vec<std::ops::Range<usize>> {
+    let workers = rayon::current_num_threads().max(1);
+    let max = max.max(1);
+    let min = min.clamp(1, max);
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let size = ((n - at) / (2 * workers)).clamp(min, max).min(n - at);
+        out.push(at..at + size);
+        at += size;
+    }
+    out
+}
+
+/// `f` on every chunk, each pool worker taking the next chunk in order as it frees up, and the
+/// results in chunk order. Not a rayon iterator: its splitting hands the LAST chunks to thieves
+/// first, which defeats shrinking them.
+fn run_in_order<C: Send, R: Send>(chunks: Vec<C>, f: impl Fn(C) -> R + Sync) -> Vec<R> {
+    let queue = std::sync::Mutex::new(chunks.into_iter().enumerate());
+    let done = std::sync::Mutex::new(Vec::new());
+    rayon::broadcast(|_| loop {
+        let next = queue.lock().expect("chunk queue").next();
+        let Some((k, chunk)) = next else { break };
+        let r = f(chunk);
+        done.lock().expect("chunk results").push((k, r));
+    });
+    let mut done = done.into_inner().expect("chunk results");
+    done.sort_unstable_by_key(|&(k, _)| k);
+    done.into_iter().map(|(_, r)| r).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunks tile `0..n` in order within `[min, max]` (only the last may be shorter), and
+    /// [`run_in_order`] hands results back in chunk order whichever worker finished first.
+    #[test]
+    fn guided_chunks_tile_the_batch_and_keep_their_order() {
+        for (n, min, max) in [
+            (0, 4, 16),
+            (1, 4, 16),
+            (1000, 4, 16),
+            (5000, 256, 2048),
+            (7, 0, 0),
+        ] {
+            let bounds = guided_bounds(n, min, max);
+            assert_eq!(bounds.iter().map(|r| r.len()).sum::<usize>(), n);
+            let mut at = 0;
+            for (k, r) in bounds.iter().enumerate() {
+                assert_eq!(r.start, at);
+                assert!(r.len() <= max.max(1));
+                assert!(r.len() >= min.clamp(1, max.max(1)) || k + 1 == bounds.len());
+                at = r.end;
+            }
+        }
+        let items: Vec<usize> = (0..5000).collect();
+        let chunks: Vec<&[usize]> = guided_bounds(items.len(), 4, 64)
+            .into_iter()
+            .map(|r| &items[r])
+            .collect();
+        let back: Vec<usize> = run_in_order(chunks, |c| c.to_vec()).concat();
+        assert_eq!(back, items);
+    }
 
     /// The separator rule is bwa's; the trailing-character refusal is ours (see [`parse_int_pair`]).
     #[test]
@@ -3426,7 +3980,7 @@ mod tests {
     #[test]
     fn queue_depth_defaults_to_double_buffering() {
         assert_eq!(queue_depths(), (BATCH_READAHEAD, SAM_WRITEBEHIND));
-        assert_eq!((BATCH_READAHEAD, SAM_WRITEBEHIND), (1, 1));
+        assert_eq!((BATCH_READAHEAD, SAM_WRITEBEHIND), (0, 1));
     }
 
     /// Two SAM records against a one-contig header, as the aligner would have formatted them.

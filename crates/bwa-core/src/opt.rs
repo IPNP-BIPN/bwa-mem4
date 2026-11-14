@@ -336,6 +336,10 @@ pub struct MemOpt {
     ///
     /// Derived state, not an independent option: see [`MemOpt::fill_scmat`] for the ordering rule.
     pub mat: [i8; 25],
+
+    /// `--meth`: the methylation mode's settings and its two per-chemistry matrices (see
+    /// [`crate::meth`]). `None` for every run without `--meth`, which then never reads it.
+    pub meth: Option<crate::meth::MethOpt>,
 }
 
 impl Default for MemOpt {
@@ -392,6 +396,7 @@ impl Default for MemOpt {
             max_xa_hits: 5,
             max_xa_hits_alt: 200,
             mat,
+            meth: None,
         }
     }
 }

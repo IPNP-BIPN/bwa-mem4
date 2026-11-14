@@ -22,7 +22,14 @@ every binary pre-warmed, interleaved x4):
 | PGO, region-trained | **1.061x** (1.070/1.060/1.054/1.059) | — |
 | PGO, genome-trained | **1.061x** (1.063/1.060/1.057/1.062) | **1.085x** (1.080/1.091/1.083) |
 
-**PGO is worth ~+6.1% SE / +8.5% PE at genome scale**, and byte-identical: 500k SE + 1M PE records
+> **Superseded (2026-11-07): PGO no longer pays on Apple Silicon either.** M4 Max, 2M GIAB pairs,
+> `-t8 -K 100000000`, three interleaved reps, cycles from `/usr/bin/time -l`: the release recipe
+> (tiny training set) is 656G vs 632G plain in PE (+3.7%) and 178.1G vs 180.4G in SE (-1.3%);
+> trained on 50k real GIAB pairs it is 639G PE and 182.8G SE, worse in both. The hand-placed
+> `#[inline(always)]` and code layout work since this table was measured took what PGO used to buy.
+> The release workflow builds macOS arm64 without PGO since. The history below is kept as measured.
+
+**PGO was worth ~+6.1% SE / +8.5% PE at genome scale**, and byte-identical: 500k SE + 1M PE records
 `cmp`-clean against the non-PGO binary (only `@PG CL:` differs, which records the invocation path).
 
 > ### ⚠️ On Apple Silicon. Off it, PGO LOSES.
@@ -141,8 +148,8 @@ Caveat on the arithmetic: bwa-mem2's share is measured **directly** (`-S -P`); o
 
 ## PE profile on real GIAB: mate rescue is 47%, and it looks nothing like SE
 
-`BWA4_NO_RESCUE=1` skips mate rescue entirely -- the analogue of `bwa-mem2 -S`. It is a
-**measurement gate, not a lever**: it changes the output by design (63,102 records differ on real
+`-S` skips mate rescue entirely, as `bwa-mem2 -S` does (this run used `BWA4_NO_RESCUE=1`, since
+removed as a duplicate of `-S`). It is a **measurement gate, not a lever**: it changes the output by design (63,102 records differ on real
 GIAB; on wgsim it barely moves, which is the whole point). It exists so our rescue cost can be
 measured **directly** rather than decomposed as `PE - 2 x SE`.
 
@@ -440,7 +447,22 @@ kernels, `#[inline(always)]` on `backward_ext`, the statistics branches compiled
 paths, and the `OnceLock` reads hoisted out of the loops. See ROADMAP.md, section of that date. Like everything else in this section, the wgsim figure understated the lever that
 matters, because it understates the stage that dominates.
 
-### Tested and dead: flattening the rescue rounds (the fork's shape)
+### Revived and shipped: flattening the rescue rounds (the fork's shape)
+
+**2026-11-09: built, and it wins.** The verdict below judged flattening by lane fill alone, before
+the K-mer filter and the band kernel existed. Both gain from a big call: the filter's query table
+is cached per mate, and a pair's fifty anchors share one mate, so a round (one anchor per pair)
+rebuilt it for nearly every job; the band kernel groups jobs of like width and depth more tightly.
+`batch_mate_rescue` now runs bwa-mem2's own pre/post shape per block of ~4096 anchors: collect every
+anchor against the mate list as it was before rescue, one kernel call, then apply in bwa's order
+with `skip` re-read from the current list. Measured waste: 0.01% of jobs on chr21, 1.0% on GIAB,
+and no orientation ever reopened (handled exactly anyway, by re-running that anchor). M4 GIAB PE
+2M pairs: 557-567G -> 537-538G cycles, 2.196T -> 2.136T instructions, RSS -150 MB; chr21 -3.4%
+cycles; md5 unchanged. An earlier attempt that speculated rounds AHEAD while keeping them (double
+collect) lost on GIAB; the win needed the rounds gone. `BWA4_RESCUE_ROUNDS` went with them.
+
+The original analysis, kept for the record:
+
 
 `batch_mate_rescue` issues one `batched_ksw_align2` call per ROUND, and a round only holds the pairs
 whose anchor list is still that deep, so later rounds look like they must be running near-empty SIMD
@@ -1612,3 +1634,29 @@ and #586, #587, #590, #610, #611 were not tried. #583, #593 and #601 are documen
 since mimalloc obtains the huge pages itself, but a library consumer on the system allocator lost the hint
 on the three heap arrays (`cp_occ`, `sa_hi`, `sa_ls_word`); `pac` is an aligned mapping and was fine.
 Fixed by rounding the range inward. The huge-page effect of the fix is not measured.
+
+## Rescue component bands (fork #535): NO-GO, priced offline (2026-11-05)
+
+Phase 1 of `docs/superpowers/plans/2026-11-04-rescue-next-lever.md`. 739,868 real rescue jobs
+(`BWA4_RESCUE_DUMP` on the first 200k HG002 pairs, hg38), priced with `prune_bench`, which now
+reports DP cells (target rows x query length) per decision:
+
+| hit gate | jobs proven failing | cells still run | filter cost |
+|---|---|---|---|
+| 400 (default) | 13.7% | **83.2%** | 1.2 us/job |
+| none | 15.4% | **71.5%** | 8.8 us/job |
+
+Even a free, ungated filter removes 28.5% of the cells. Bands instead of one hull, measured with a
+test-only probe on every `Hull` job: **70.6% of cells kept against 71.4%** for the hull, 0.8 points,
+against a go threshold of 10. The components of a window almost always overlap, so splitting them
+buys nothing. Not built; the probe was removed, the cell columns stay in `prune_bench`.
+
+Where PE CPU goes (macOS `sample`, 15 s of a live `-t12` PE run on 2M real pairs, busy samples):
+rescue SW kernel ~40%, rest of rescue ~14%, extension ~17%, SMEM + SA + chaining ~20%. The kernel is
+at the machine's op ceiling (above), and pruning is near its own ceiling, so mate rescue has no
+large exact lever left on this path.
+
+RAM, same run: peak live heap 9.06 GB, of which 6.8 GB index and run-long buffers; the index alone
+maps 6.4 GB (one-read run). Footprint 11.6-12.2 GB with batch overlap, 10.1 GB with
+`BWA4_NO_BATCH_OVERLAP=1`. mimalloc purge options (`MIMALLOC_PURGE_DELAY=0`, `PURGE_DECOMMITS=1`) do
+not lower it and triple sys time.

@@ -102,7 +102,7 @@ jobs:
           fi
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-03
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -118,12 +118,23 @@ jobs:
           samtools --version | head -1
           bgzip --version | head -1
 
+      # The release CDN returns 504s for minutes at a time: the pinned tarball is cached, and a
+      # cold cache retries for up to ~10 minutes.
+      - uses: actions/cache@v4
+        with:
+          path: bwa-mem2.tar.bz2
+          key: bwa-mem2-${{ env.BWA_MEM2_VERSION }}-${{ env.BWA_MEM2_SHA256 }}
+
       - name: Fetch bwa-mem2 ${{ env.BWA_MEM2_VERSION }} (the oracle)
         run: |
           set -euo pipefail
           V="${BWA_MEM2_VERSION}"
-          curl -fsSL -o bwa-mem2.tar.bz2 \
-            "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${V}/bwa-mem2-${V}_x64-linux.tar.bz2"
+          for i in 1 2 3 4 5 6; do
+            [ -s bwa-mem2.tar.bz2 ] && break
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 15 -o bwa-mem2.tar.bz2 \
+              "https://github.com/bwa-mem2/bwa-mem2/releases/download/v${V}/bwa-mem2-${V}_x64-linux.tar.bz2" \
+              || { rm -f bwa-mem2.tar.bz2; sleep $((30 * i)); }
+          done
           echo "${BWA_MEM2_SHA256}  bwa-mem2.tar.bz2" | sha256sum -c -
           tar xjf bwa-mem2.tar.bz2
           echo "$PWD/bwa-mem2-${V}_x64-linux" >> "$GITHUB_PATH"
@@ -217,9 +228,9 @@ jobs:
           KNOWN_X86_XS_DIVERGENCE: "1"
         run: |
           set -o pipefail
+          # Exits non-zero on any failed case; pipefail carries that through `tee`. (A grep for
+          # "0 failed" used to decide here, and it also matched "10 failed".)
           bash scripts/opt_parity.sh ./target/release/bwa-mem4 | tee /tmp/parity.log
-          # The script always exits 0 so the full report is printed; the pass/fail decision is here.
-          grep -q "0 failed" /tmp/parity.log
 
       # The long-read path's oracle is rammap, not bwa-mem2, so it cannot ride on the step above.
       # The binary is installed rather than skipped: `longread_parity.sh` exits 0 with a SKIP when

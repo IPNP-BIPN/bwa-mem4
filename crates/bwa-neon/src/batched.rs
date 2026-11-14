@@ -169,6 +169,76 @@ pub fn batched_extend(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
+    // A `--meth` seed can score `<= 0` (a C/T pair it matched in converted space scores a
+    // mismatch here). The SIMD kernels start from `h0 > 0`; the scalar reference takes any.
+    if jobs.iter().any(|j| j.h0 <= 0) {
+        let (low, pos): (Vec<usize>, Vec<usize>) = (0..jobs.len()).partition(|&k| jobs[k].h0 <= 0);
+        let pick = |idx: &[usize]| idx.iter().map(|&k| jobs[k]).collect::<Vec<_>>();
+        let mut out = vec![default_result(); jobs.len()];
+        let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
+        let low: Vec<usize> = (low.into_iter())
+            .filter(|&k| {
+                let j = &jobs[k];
+                let w = clamp_band(
+                    w0,
+                    j.query.len(),
+                    max_sc,
+                    end_bonus,
+                    o_ins,
+                    e_ins,
+                    o_del,
+                    e_del,
+                );
+                dead_seed(j, m, mat, w).map(|r| out[k] = r).is_none()
+            })
+            .collect();
+        let got = batched_extend_scalar(
+            &pick(&low),
+            m,
+            mat,
+            o_del,
+            e_del,
+            o_ins,
+            e_ins,
+            w0,
+            end_bonus,
+            zdrop,
+        );
+        for (&k, r) in low.iter().zip(got) {
+            out[k] = r;
+        }
+        let got = batched_extend(
+            &pick(&pos),
+            m,
+            mat,
+            o_del,
+            e_del,
+            o_ins,
+            e_ins,
+            w0,
+            end_bonus,
+            zdrop,
+        );
+        for (&k, r) in pos.iter().zip(got) {
+            out[k] = r;
+        }
+        return out;
+    }
+    if let Some((x, y, uni, true)) = crate::merged_pair(m, mat) {
+        let (buf, spans) = crate::rewrite_jobs(jobs.iter().map(|j| (j.query, j.target)), x, y);
+        let conv: Vec<ExtendJob> = jobs
+            .iter()
+            .zip(&spans)
+            .map(|(j, &(a, b, c))| ExtendJob {
+                query: &buf[a..b],
+                target: &buf[b..c],
+                h0: j.h0,
+            })
+            .collect();
+        return batched_extend(
+            &conv, m, &uni, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        );
+    }
     extend_shape::record(jobs);
     #[cfg(target_arch = "aarch64")]
     {
@@ -250,7 +320,7 @@ fn extend_tier() -> Tier {
     use std::sync::OnceLock;
     static TIER: OnceLock<Tier> = OnceLock::new();
     *TIER.get_or_init(|| {
-        let have_512 = is_x86_feature_detected!("avx512bw");
+        let have_512 = bwa_extend::has_avx512();
         let have_2 = is_x86_feature_detected!("avx2");
         let have_sse = is_x86_feature_detected!("sse4.1");
         match std::env::var("BWA4_EXTEND_TIER").as_deref() {
@@ -550,6 +620,99 @@ fn cell_bound(job: &ExtendJob, max_sc: i32) -> i32 {
     job.h0 + (job.query.len().min(job.target.len()) as i32) * max_sc.max(0)
 }
 
+/// [`ungapped_hit`]'s diagonal walk: the mismatch columns as bits and their count, or `None` on an
+/// N, on more than `x_threshold` mismatches, or on a mismatch at column `>= cap` (cap <= 128). All
+/// three exits decline, so testing them 16 columns at a time cannot change which jobs decline.
+#[inline]
+fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u128, i32)> {
+    // Whole 16-column blocks then lie wholly below or wholly at or past `cap`.
+    debug_assert!(cap <= 128 && cap.is_multiple_of(16));
+    let n = q.len();
+    let (mut bits, mut total) = (0u128, 0i32);
+    #[cfg_attr(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        allow(unused_mut)
+    )]
+    let mut col = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; every load reads 16 bytes below `n` of slices
+    // `n` long.
+    unsafe {
+        use std::arch::aarch64::*;
+        while col + 16 <= n {
+            let (a, b) = (vld1q_u8(q.as_ptr().add(col)), vld1q_u8(t.as_ptr().add(col)));
+            if vmaxvq_u8(vmaxq_u8(a, b)) >= 4 {
+                return None;
+            }
+            let ne = vmvnq_u8(vceqq_u8(a, b));
+            // Four bits per byte, then one per byte.
+            let nib = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                vreinterpretq_u16_u8(ne),
+            )));
+            if nib != 0 {
+                if col + 16 > cap {
+                    return None;
+                }
+                // Bit 4k (byte k) to bit k, branch-free: a loop over the set bits mispredicted its
+                // exit on every block with a mismatch (~1% of an M4 run).
+                let mut x = nib & 0x1111_1111_1111_1111;
+                x = (x | x >> 3) & 0x0303_0303_0303_0303;
+                x = (x | x >> 6) & 0x000F_000F_000F_000F;
+                x = (x | x >> 12) & 0x0000_00FF_0000_00FF;
+                x = (x | x >> 24) & 0xFFFF;
+                total += x.count_ones() as i32;
+                if total > x_threshold {
+                    return None;
+                }
+                bits |= u128::from(x) << col;
+            }
+            col += 16;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of the x86_64 baseline; every load reads 16 bytes below `n` of slices
+    // `n` long.
+    unsafe {
+        use std::arch::x86_64::*;
+        let three = _mm_set1_epi8(3);
+        while col + 16 <= n {
+            let a = _mm_loadu_si128(q.as_ptr().add(col).cast());
+            let b = _mm_loadu_si128(t.as_ptr().add(col).cast());
+            // A code >= 4 has a bit above the low two: `max(a, b, 3) != 3` finds it.
+            let hi = _mm_max_epu8(_mm_max_epu8(a, b), three);
+            if _mm_movemask_epi8(_mm_cmpeq_epi8(hi, three)) != 0xFFFF {
+                return None;
+            }
+            let ne = !(_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u32) & 0xFFFF;
+            if ne != 0 {
+                if col + 16 > cap {
+                    return None;
+                }
+                total += ne.count_ones() as i32;
+                if total > x_threshold {
+                    return None;
+                }
+                bits |= u128::from(ne) << col;
+            }
+            col += 16;
+        }
+    }
+    for col in col..n {
+        let (query_base, target_base) = (q[col], t[col]);
+        if query_base >= 4 || target_base >= 4 {
+            return None;
+        }
+        if query_base != target_base {
+            total += 1;
+            if total > x_threshold || col >= cap {
+                return None;
+            }
+            bits |= 1u128 << col;
+        }
+    }
+    Some((bits, total))
+}
+
 /// Ungapped diagonal fast path (nh13's `ungapped_analyze`, FP_STATUS_HIT; `bwamem.cpp`): when a
 /// seed extension stays on the diagonal with few enough mismatches, the ungapped alignment is
 /// *provably* optimal and the banded Smith-Waterman is skipped.
@@ -624,25 +787,12 @@ fn ungapped_hit(
     // `mismatch_bits` bit `c` is set iff diagonal position `c` is a mismatch (so only positions
     // `< 128` are representable); `total_mis` counts them, including any beyond the bitmap, and is
     // what gets tested against `x_threshold`.
-    let mut mismatch_bits: u128 = 0;
-    let mut total_mis = 0i32;
-    for col in 0..diag_len {
-        // SAFETY of indexing: target.len() >= diag_len checked above.
-        let (query_base, target_base) = (job.query[col], job.target[col]);
-        if query_base >= 4 || target_base >= 4 {
-            return None;
-        }
-        if query_base != target_base {
-            total_mis += 1;
-            if total_mis > x_threshold {
-                return None; // a gapped alignment could win: let the kernel decide
-            }
-            if col >= MISMATCH_BITMAP_BITS {
-                return None; // past the mismatch bitmap
-            }
-            mismatch_bits |= 1u128 << col;
-        }
-    }
+    let (mismatch_bits, total_mis) = mismatch_scan(
+        &job.query[..diag_len],
+        &job.target[..diag_len],
+        x_threshold,
+        MISMATCH_BITMAP_BITS,
+    )?;
     if total_mis == 0 {
         // A mismatch-free walk only ever climbs, so its last cell is also its best: local and
         // query-exhausting alignments coincide and both consume all `diag_len` bases.
@@ -662,32 +812,40 @@ fn ungapped_hit(
     // 1..=x_threshold mismatches: the walk is cheap but no longer closed-form. `running` is the
     // score at the current column, `best_score`/`best_end` the best cell seen and where it was
     // (these are ksw_extend2's `max`/`max_i`, tracked along the single diagonal).
+    // Walked mismatch to mismatch, not column by column (a mispredict per mismatch): with `a > 0` a
+    // match run only climbs, so it can raise the best only at its last column, and with `b > 0` a
+    // mismatch only falls, so only there can z-drop fire or the diagonal die. Other matrices
+    // decline to the DP.
+    if a <= 0 || b <= 0 {
+        return None;
+    }
     let (mut running, mut best_score, mut best_end) = (job.h0, job.h0, 0i32);
-    for col in 0..diag_len {
-        if running == 0 {
-            continue; // local SW: once the diagonal dies it stays dead (no e/f restart)
-        }
-        if mismatch_bits >> col & 1 == 0 {
-            running += a;
+    let (mut pos, mut rest) = (0i32, mismatch_bits);
+    loop {
+        // Columns `pos..end` match; `end` is the next mismatch, or the end of the walk.
+        let end = if rest == 0 {
+            diag_len as i32
         } else {
-            running -= b;
-            if running < 0 {
-                running = 0;
-            }
-        }
+            rest.trailing_zeros() as i32
+        };
+        running += (end - pos) * a;
         if running > best_score {
             best_score = running;
-            best_end = col as i32 + 1;
-        } else if zdrop > 0 && best_score - running > zdrop {
-            return None; // ksw would break the row loop here; this walk does not model that
+            best_end = end;
         }
-    }
-    if running == 0 {
-        // The diagonal died. `gscore`/`gtle` then depend on cells this walk does not model (ksw
-        // breaks the row loop at `m == 0`, leaving max_ie on the last live row), so decline the HIT
-        // rather than report a field we cannot prove. nh13 returns gtle = N here and relies on the
-        // caller ignoring it when gscore <= 0; we would rather not ship a struct that lies.
-        return None;
+        if rest == 0 {
+            break;
+        }
+        rest &= rest - 1;
+        running -= b;
+        // A dead diagonal (`running <= 0`): `gscore`/`gtle` then depend on cells this walk does
+        // not model (ksw breaks the row loop at `m == 0`, leaving max_ie on the last live row), so
+        // decline rather than report a field we cannot prove. A z-drop: ksw would break the row
+        // loop here, which this walk does not model either.
+        if running <= 0 || zdrop > 0 && best_score - running > zdrop {
+            return None;
+        }
+        pos = end + 1;
     }
     Some(ExtendResult {
         score: best_score,
@@ -731,6 +889,15 @@ fn simd_dispatch(
     // The NEON kernels score DNA with a vector compare that assumes the uniform bwa matrix
     // (diagonal `a`, off-diagonal `mm`, ambiguous row/col = `npen`). Any other matrix -> scalar.
     if !is_uniform_dna(mat, m) {
+        if m == 5
+            && mat[1] < 0
+            && mat[..25].iter().all(|v| (mat[1]..=mat[0]).contains(v))
+            && (0..4).all(|i| mat[i * 6] == mat[0])
+        {
+            return mat5_extend(
+                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            );
+        }
         return batched_extend_scalar(
             jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
@@ -771,11 +938,21 @@ fn simd_dispatch(
     // staying byte-identical (see `ungapped_hit`). Non-HIT jobs fall through to the kernel binning.
     let mut out = vec![default_result(); jobs.len()];
     // Indices of the jobs the fast path declined, i.e. the ones that still need the real DP.
-    let mut needs_dp: Vec<usize> = Vec::new();
+    let mut needs_dp: Vec<usize> = Vec::with_capacity(jobs.len());
+    // Dedup fingerprints of the declined jobs, taken here while the scan has their bytes in cache:
+    // a pass of its own reloaded every job cold (on EPYC 9V45 the fold took 1.6x its Zen 4 time).
+    let dedup_on = job_dedup_enabled();
+    let mut fps: Vec<u64> = Vec::with_capacity(if dedup_on { jobs.len() } else { 0 });
     for (k, job) in jobs.iter().enumerate() {
+        prefetch_job(jobs, k + PF_AHEAD);
         match ungapped_hit(job, a, b, x_threshold, zdrop) {
             Some(result) => out[k] = result,
-            None => needs_dp.push(k),
+            None => {
+                needs_dp.push(k);
+                if dedup_on {
+                    fps.push(job_fingerprint(job));
+                }
+            }
         }
     }
     if needs_dp.is_empty() {
@@ -784,7 +961,7 @@ fn simd_dispatch(
     if needs_dp.len() == jobs.len() {
         // No HITs: bin `jobs` directly (avoid the gather).
         return dispatch_bins(
-            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            jobs, &fps, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
         );
     }
     // Gather the declined jobs into a dense batch (kernels want full lanes, and a sparse batch
@@ -792,12 +969,210 @@ fn simd_dispatch(
     // is `jobs[needs_dp[s]]`, so `dp_results[s]` belongs at `out[needs_dp[s]]`.
     let dp_jobs: Vec<ExtendJob> = needs_dp.iter().map(|&k| jobs[k]).collect();
     let dp_results = dispatch_bins(
-        &dp_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        &dp_jobs, &fps, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
     );
     for (dp_slot, &k) in needs_dp.iter().enumerate() {
         out[k] = dp_results[dp_slot];
     }
     out
+}
+
+/// [`ungapped_hit`] under a matrix whose cells lie in `[mat[1], mat[0]]` (`tab5`). A diagonal cell
+/// scoring `s` can gain at most `a - s` on a gapped path, so the walk is provably optimal while
+/// those gains sum below the cheapest gap, `gap_min = o_min + e_min`: at a uniform matrix that is
+/// `X (a + b) < o_min + e_min`, [`simd_dispatch`]'s bound. The walk is [`ungapped_hit`]'s, cell by
+/// cell: the best moves on a strict `>`, and only a falling cell can kill the diagonal or z-drop.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn ungapped_hit_mat(job: &ExtendJob, mat: &[i8], gap_min: i32, zdrop: i32) -> Option<ExtendResult> {
+    let n = job.query.len();
+    if n == 0 || job.h0 <= 0 || job.target.len() < n {
+        return None;
+    }
+    let a = i32::from(mat[0]);
+    let (mut running, mut best, mut best_end, mut gain) = (job.h0, job.h0, 0usize, 0i32);
+    for (c, (&q, &t)) in job.query.iter().zip(job.target).enumerate() {
+        if (q | t) > 3 {
+            return None;
+        }
+        let sc = i32::from(mat[t as usize * 5 + q as usize]);
+        gain += a - sc;
+        if gain >= gap_min {
+            return None;
+        }
+        running += sc;
+        if running > best {
+            (best, best_end) = (running, c + 1);
+        }
+        if sc < 0 && (running <= 0 || zdrop > 0 && best - running > zdrop) {
+            return None;
+        }
+    }
+    Some(ExtendResult {
+        score: best,
+        qle: best_end as i32,
+        tle: best_end as i32,
+        gtle: n as i32,
+        gscore: running,
+        max_off: 0,
+    })
+}
+
+/// Exclusive bound on the target length (the DP rows) of a u8 extension job: the i16 kernel's,
+/// since every row quantity (`max_i`, `max_ie`, `max_off`, the band edges before clamping, the
+/// z-drop distances) lives in the i16 row lanes (`trk = i16`), never in a u8 one. The u8 lanes hold
+/// scores and columns only, which the query length and the cell bound keep under 256; a live
+/// lane's band start never passes the query length either (the row after its band empties, the
+/// lane is done). At 250 bp most extension targets are past 256 (the read's rest plus the band),
+/// which sent them to the 8-lane i16 kernel: 23% of an M4 `--meth` 250 bp run.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const U8_TLEN: usize = 32768;
+
+/// Extension under a 5x5 matrix with diagonal `mat[0]` and every cell in `[mat[1], mat[0]]`
+/// (`--meth`'s neutral and genomic): [`ungapped_hit_mat`] first, then the u8 kernel's `tab5` form
+/// (NEON, or the calibrated x86 tier) for every job it can hold, the i16 one for every job within
+/// `dispatch_bins`' i16 bounds, the scalar reference for the rest. The positive-`h0`-only kernels
+/// are never given a seed the matrix scored `<= 0`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn mat5_extend(
+    jobs: &[ExtendJob],
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w0: i32,
+    end_bonus: i32,
+    zdrop: i32,
+) -> Vec<ExtendResult> {
+    const U8_LEN: usize = 256;
+    const MAX_SEQ_LEN16: usize = 32768;
+    let max_sc = i32::from(mat[0]);
+    // `dispatch_bins`' u8 headroom, for this matrix.
+    let headroom = (-i32::from(mat[1])).max(-i32::from(mat[m - 1])) + max_sc;
+    let mut out = vec![default_result(); jobs.len()];
+    let gap_min = o_del.min(o_ins) + e_del.min(e_ins);
+    let dp: Vec<usize> = (0..jobs.len())
+        .filter(|&k| match ungapped_hit_mat(&jobs[k], mat, gap_min, zdrop) {
+            Some(r) => {
+                out[k] = r;
+                false
+            }
+            None => true,
+        })
+        .collect();
+    // The job fits lanes of `len` (query length and cell bound, as in `dispatch_bins`; the target
+    // within `tlen`).
+    let fits = |k: usize, len: usize, tlen: usize| {
+        let j = &jobs[k];
+        j.h0 > 0
+            && j.query.len() < len
+            && j.target.len() < tlen
+            && cell_bound(j, max_sc) + headroom < len as i32
+    };
+    let (fit, rest): (Vec<usize>, Vec<usize>) =
+        dp.into_iter().partition(|&k| fits(k, U8_LEN, U8_TLEN));
+    let (fit16, rest): (Vec<usize>, Vec<usize>) = rest
+        .into_iter()
+        .partition(|&k| fits(k, MAX_SEQ_LEN16, MAX_SEQ_LEN16));
+    let (fit, fit_band) = band_order(jobs, fit, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus);
+    let pick = |idx: &[usize]| idx.iter().map(|&k| jobs[k]).collect::<Vec<_>>();
+    let inl = inline_sbt_enabled();
+    let (fit_jobs, fit16_jobs) = (pick(&fit), pick(&fit16));
+    // The kernel for this ISA and `INL_SBT`; on x86 the tier the standard matrix calibrated to.
+    macro_rules! mat5_kernel {
+        ($md:ident :: $k:ident) => {
+            mat5_kernel!($md::$k, fit_jobs)
+        };
+        ($md:ident :: $k:ident, $js:ident) => {
+            if inl {
+                $md::$k::<true>(
+                    &$js, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            } else {
+                $md::$k::<false>(
+                    &$js, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+        };
+    }
+    if !fit_band.is_empty() {
+        BAND_HINT.with(|h| *h.borrow_mut() = fit_band);
+    }
+    // SAFETY: the caller detected the ISA (NEON, or SSE4.1 at least on x86, whose tier names
+    // only a feature the host has); every job passed the u8 bounds above; the matrix is the
+    // `tab5` shape.
+    let got = unsafe {
+        #[cfg(target_arch = "aarch64")]
+        {
+            mat5_kernel!(neon::batched_extend_neon_u8_mat5)
+        }
+        #[cfg(target_arch = "x86_64")]
+        match extend_tier() {
+            Tier::Avx512 => mat5_kernel!(avx512::batched_extend_avx512_u8_mat5),
+            Tier::Avx2 => mat5_kernel!(avx2::batched_extend_avx2_u8_mat5),
+            Tier::Sse41 => mat5_kernel!(sse41::batched_extend_sse41_u8_mat5),
+            Tier::Scalar => batched_extend_scalar(
+                &fit_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+            ),
+        }
+    };
+    BAND_HINT.with(|h| h.borrow_mut().clear());
+    for (&k, r) in fit.iter().zip(got) {
+        out[k] = r;
+    }
+    // SAFETY: as above, with every job inside the i16 bounds.
+    let got = unsafe {
+        #[cfg(target_arch = "aarch64")]
+        {
+            mat5_kernel!(neon::batched_extend_neon_i16_mat5, fit16_jobs)
+        }
+        #[cfg(target_arch = "x86_64")]
+        match extend_tier() {
+            Tier::Avx512 => mat5_kernel!(avx512::batched_extend_avx512_i16_mat5, fit16_jobs),
+            Tier::Avx2 => mat5_kernel!(avx2::batched_extend_avx2_i16_mat5, fit16_jobs),
+            Tier::Sse41 => mat5_kernel!(sse41::batched_extend_sse41_i16_mat5, fit16_jobs),
+            Tier::Scalar => batched_extend_scalar(
+                &fit16_jobs,
+                m,
+                mat,
+                o_del,
+                e_del,
+                o_ins,
+                e_ins,
+                w0,
+                end_bonus,
+                zdrop,
+            ),
+        }
+    };
+    for (&k, r) in fit16.iter().zip(got) {
+        out[k] = r;
+    }
+    let rest_jobs = pick(&rest);
+    let got = batched_extend_scalar(
+        &rest_jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+    );
+    for (&k, r) in rest.iter().zip(got) {
+        out[k] = r;
+    }
+    out
+}
+
+/// Hint the line holding `p` into L1. No effect on any result.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn prefetch<T>(p: *const T) {
+    // SAFETY: a prefetch never faults, whatever the address.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
 }
 
 /// Compute each DISTINCT extension job once and copy the answer to its repeats.
@@ -814,7 +1189,7 @@ fn simd_dispatch(
 ///
 /// The cost of finding them has to stay far below what they cost to compute. A byte-wise hash over
 /// ~230 bytes per job would eat a third of the job's own DP; instead this fingerprints the lengths,
-/// `h0` and up to 32 bytes from each end of each sequence, reading them as 64-bit words, and then
+/// `h0` and every byte of each sequence as 64-bit words in four independent chains, and then
 /// **verifies candidates by comparing the bytes**. The fingerprint may collide; the verification is
 /// what makes the result exact.
 ///
@@ -824,74 +1199,140 @@ fn simd_dispatch(
 /// # Returns
 /// `(unique, map)`: the distinct jobs in first-appearance order, and for each input job the index
 /// of its representative in `unique`. `map[i] == i'` means `out[i]` must be `results[i']`.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
-    use std::collections::hash_map::Entry;
-    use std::collections::HashMap;
+/// How many jobs ahead of the one being scanned [`prefetch_job`] hints, and how many 64-byte lines
+/// of each of its sequences. Every line: the fingerprint reads every byte, and the ungapped scan
+/// leaves most of them untouched when it exits early. Same-host CI A/B against 4 ahead x 2 lines:
+/// `job_fingerprint::fold` -40% on EPYC 9V45 (-0.75% of all samples), -20..-25% on 7763 and 9V74
+/// at 8 lines; M4 neutral.
+const PF_AHEAD: usize = 8;
+const PF_LINES: usize = 8;
 
-    /// Fold up to `LIMIT` bytes from each end of `s` into `h`, eight at a time. Reading words
-    /// rather than bytes is what keeps this at a few percent of a job's DP instead of a third of it.
-    fn fold(h: &mut u64, s: &[u8]) {
-        const LIMIT: usize = 32;
-        let mut mix = |chunk: &[u8]| {
-            for w in chunk.chunks(8) {
-                let mut v = 0u64;
-                for (i, &b) in w.iter().enumerate() {
-                    v |= u64::from(b) << (8 * i);
-                }
-                *h ^= v;
-                *h = h.wrapping_mul(0x1000_0000_01b3);
+/// Hint the first [`PF_LINES`] lines of job `k`'s query and target, if there is a job `k`. A batch
+/// is a whole chunk's jobs in length order, megabytes of bases read at random, so every pass over it
+/// (ungapped scan, dedup fingerprints, band bounds) waited on its first load of each job: a third
+/// of `run_side` on x86.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_job(jobs: &[ExtendJob], k: usize) {
+    if let Some(n) = jobs.get(k) {
+        for s in [n.query, n.target] {
+            let p = s.as_ptr();
+            for i in 0..PF_LINES.min(s.len().div_ceil(64)) {
+                prefetch(p.wrapping_add(64 * i));
             }
-        };
-        if s.len() <= 2 * LIMIT {
-            mix(s);
-        } else {
-            mix(&s[..LIMIT]);
-            mix(&s[s.len() - LIMIT..]);
         }
     }
+}
 
-    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(jobs.len());
+/// [`dedup_jobs`]'s fingerprint of one job: its lengths, `h0` and every byte of both sequences.
+/// Any value is correct, since equal fingerprints are confirmed byte by byte.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+fn job_fingerprint(job: &ExtendJob) -> u64 {
+    const S0: u64 = 0xa076_1d64_78bd_642f;
+    const S1: u64 = 0xe703_7ed1_a0b4_28db;
+    const S2: u64 = 0x8ebc_6af0_9c88_c6e3;
+    #[inline(always)]
+    fn mum(a: u64, b: u64) -> u64 {
+        let r = u128::from(a) * u128::from(b);
+        r as u64 ^ (r >> 64) as u64
+    }
+    /// Every byte of `s` folded from `seed`, 32 at a time in two independent chains of 64 x 64 ->
+    /// 128 multiplies folded back to 64 bits (wyhash's `mum`), one per 16 bytes; the last 1..=31
+    /// bytes go in as up to two overlapping 16-byte windows, one per chain (the lengths are hashed
+    /// apart), not as a serial chain of words: on Zen 5 the fold's samples sat on the `xor`s
+    /// waiting for each multiply. Covering only 32 bytes at each end let 121M of 126M candidate
+    /// pairs on 1M chr21 pairs collide (repeat windows share their ends), and the byte comparisons
+    /// that rejected them cost more than hashing everything. Four chains of 64-bit multiplies were
+    /// vectorised by LLVM into emulated AVX2 `vpmuludq` sequences, a latency chain that was a fifth
+    /// of `dispatch_bins` on Zen 5; a 128-bit product stays a scalar `mul`.
+    fn fold(seed: u64, s: &[u8]) -> u64 {
+        let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
+        let (mut a, mut b) = (seed, seed ^ S2);
+        let (blocks, rest) = s.as_chunks::<32>();
+        for blk in blocks {
+            a = mum(word(&blk[..8]) ^ S0, word(&blk[8..16]) ^ a);
+            b = mum(word(&blk[16..24]) ^ S1, word(&blk[24..]) ^ b);
+        }
+        let n = s.len();
+        match rest.len() {
+            0 => {}
+            r if n >= 16 => {
+                if r > 16 {
+                    a = mum(word(&rest[..8]) ^ S0, word(&rest[8..16]) ^ a);
+                }
+                b = mum(word(&s[n - 16..n - 8]) ^ S1, word(&s[n - 8..]) ^ b);
+            }
+            _ if n >= 8 => a = mum(word(&s[..8]) ^ S0, word(&s[n - 8..]) ^ a),
+            _ => {
+                a = mum(
+                    s.iter().rev().fold(0, |v, &x| v << 8 | u64::from(x)) ^ S0,
+                    a,
+                )
+            }
+        }
+        mum(a ^ S2, b ^ S1)
+    }
+
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    h ^= (job.query.len() as u64) << 32 | job.target.len() as u64;
+    h = h.wrapping_mul(0x1000_0000_01b3);
+    h ^= job.h0 as u64;
+    h = h.wrapping_mul(0x1000_0000_01b3);
+    // Two independent folds, so the query's multiplies overlap the target's.
+    mum(fold(h, job.query) ^ S0, fold(h ^ S1, job.target) ^ S2)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn dedup_jobs<'a>(jobs: &[ExtendJob<'a>], fps: &[u64]) -> (Vec<ExtendJob<'a>>, Vec<u32>) {
+    debug_assert_eq!(fps.len(), jobs.len());
+    // Open addressing, linear probe, at most half full. A slot is `(fingerprint, latest distinct
+    // job with it + 1)`, 0 meaning empty; `older[i]`: the previous distinct job with job `i`'s
+    // fingerprint (`u32::MAX`: none). Distinct jobs never compare equal, so at most one on a chain
+    // matches and the walk order does not matter. A std `HashMap` here missed cache on every probe
+    // with nothing to hide it behind (a fifth of `dispatch_bins` on x86).
+    let cap = (jobs.len() * 2).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut table: Vec<(u64, u32)> = vec![(0, 0); cap];
+    let slot_of = |h: u64| (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
+    let mut older: Vec<u32> = Vec::with_capacity(jobs.len());
     let mut unique: Vec<ExtendJob<'a>> = Vec::with_capacity(jobs.len());
     let mut map: Vec<u32> = Vec::with_capacity(jobs.len());
+    const AHEAD: usize = 16;
 
-    for job in jobs {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        h ^= (job.query.len() as u64) << 32 | job.target.len() as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-        h ^= job.h0 as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-        fold(&mut h, job.query);
-        fold(&mut h, job.target);
-
-        let slot = match buckets.entry(h) {
-            Entry::Occupied(e) => {
-                // Same fingerprint: could be the same job or a collision, so compare the bytes.
-                // Only jobs that reach here pay for a comparison, and they are the minority.
-                let mut found = None;
-                for &cand in e.get() {
-                    let u = &unique[cand as usize];
-                    if u.h0 == job.h0 && u.query == job.query && u.target == job.target {
-                        found = Some(cand);
-                        break;
-                    }
-                }
-                match found {
-                    Some(cand) => cand,
-                    None => {
-                        let idx = unique.len() as u32;
-                        unique.push(*job);
-                        e.into_mut().push(idx);
-                        idx
-                    }
-                }
+    for (i, job) in jobs.iter().enumerate() {
+        if let Some(&f) = fps.get(i + AHEAD) {
+            prefetch(table.as_ptr().wrapping_add(slot_of(f)));
+        }
+        let h = fps[i];
+        let mut at = slot_of(h);
+        while table[at].1 != 0 && table[at].0 != h {
+            at = (at + 1) & mask;
+        }
+        let head = if table[at].1 == 0 {
+            table[at].0 = h;
+            u32::MAX
+        } else {
+            table[at].1 - 1
+        };
+        // Same fingerprint: could be the same job or a collision, so compare the bytes. Only jobs
+        // that reach here pay for a comparison, and they are the minority.
+        let mut cand = head;
+        while cand != u32::MAX {
+            let u = &unique[cand as usize];
+            if u.h0 == job.h0 && u.query == job.query && u.target == job.target {
+                break;
             }
-            Entry::Vacant(e) => {
-                let idx = unique.len() as u32;
-                unique.push(*job);
-                e.insert(vec![idx]);
-                idx
-            }
+            cand = older[cand as usize];
+        }
+        let slot = if cand != u32::MAX {
+            cand
+        } else {
+            let idx = unique.len() as u32;
+            unique.push(*job);
+            older.push(head);
+            table[at].1 = idx + 1;
+            idx
         };
         map.push(slot);
     }
@@ -928,6 +1369,8 @@ fn job_dedup_enabled() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn dispatch_bins(
     jobs: &[ExtendJob],
+    // `job_fingerprint` of each job when dedup is on (see `batched_extend`), else empty.
+    fps: &[u64],
     m: usize,
     mat: &[i8],
     o_del: i32,
@@ -938,13 +1381,14 @@ fn dispatch_bins(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
-    // The 8-bit kernel is **unsigned u8** (values 0..=255, positions <256), so it takes any job whose
-    // score ceiling `minval` and both lengths fit under 256 — twice the reach of bwa-mem2's signed
+    // The 8-bit kernel is **unsigned u8** (values 0..=255, columns <256), so it takes any job whose
+    // score ceiling `minval` and query length fit under 256 — twice the reach of bwa-mem2's signed
     // `MAX_SEQ_LEN8=128`, hence far more jobs run in 16 lanes vs int16's 8. Both kernels are exact in
     // range, so this only changes which one runs, never the result.
-    // Exclusive limits, in the same units for both lengths (bases) and scores. Raising `U8_LEN`
-    // past 256 would let a score or a column index wrap in a u8 lane and silently corrupt results;
-    // `MAX_SEQ_LEN16` is bwa-mem2's own name and value (`bandedSWA.h`) for the signed-i16 ceiling.
+    // Exclusive limits, in the same units for lengths (bases) and scores. Raising `U8_LEN` past 256
+    // would let a score or a column index wrap in a u8 lane and silently corrupt results; the
+    // target (the rows) has the i16 kernel's bound, `MAX_SEQ_LEN16`, bwa-mem2's own name and value
+    // (`bandedSWA.h`) for the signed-i16 ceiling: [`U8_TLEN`] says why.
     const U8_LEN: usize = 256;
     const MAX_SEQ_LEN16: usize = 32768;
     // Largest single-cell score the matrix can award, feeding `cell_bound`'s worst case.
@@ -977,13 +1421,15 @@ fn dispatch_bins(
     // Identical jobs are one job's work and a copy; see `dedup_jobs`. Done here rather than deeper
     // so every bin below sees the deduplicated batch, and undone at the end by indexing through
     // `dup_map`, which leaves the returned vector in caller order exactly as before.
-    let dedup = (jobs.len() > 1 && job_dedup_enabled()).then(|| dedup_jobs(jobs));
+    let dedup = (jobs.len() > 1 && job_dedup_enabled()).then(|| dedup_jobs(jobs, fps));
     let (jobs, dup_map): (&[ExtendJob], Option<&[u32]>) = match &dedup {
         Some((unique, map)) => (unique.as_slice(), Some(map.as_slice())),
         None => (jobs, None),
     };
     // Job indices per bin, in ascending order, partitioning `0..jobs.len()` exactly once.
-    let (mut u8_idx, mut i16_idx, mut sc_idx) = (Vec::new(), Vec::new(), Vec::new());
+    // Most jobs land in the u8 bin: sized for all of them, it never regrows.
+    let (mut u8_idx, mut i16_idx, mut sc_idx) =
+        (Vec::with_capacity(jobs.len()), Vec::new(), Vec::new());
     for (k, job) in jobs.iter().enumerate() {
         // Upper bound on every DP value this job can reach; must fit the lane type, as must both
         // lengths (column and row indices are stored in lanes too).
@@ -997,11 +1443,11 @@ fn dispatch_bins(
             bin_split::record(
                 (qlen * tlen) as u64,
                 qlen >= U8_LEN,
-                tlen >= U8_LEN,
+                tlen >= U8_TLEN,
                 minval + sbt_headroom >= U8_LEN as i32,
             );
         }
-        if qlen < U8_LEN && tlen < U8_LEN && minval + sbt_headroom < U8_LEN as i32 {
+        if qlen < U8_LEN && tlen < U8_TLEN && minval + sbt_headroom < U8_LEN as i32 {
             u8_idx.push(k);
         } else if qlen < MAX_SEQ_LEN16
             && tlen < MAX_SEQ_LEN16
@@ -1046,11 +1492,16 @@ fn dispatch_bins(
     // Homogeneous fast path: whole batch in one bin -> run the kernel on `jobs` with no gather/scatter.
     // `n` is the batch size, so `x_idx.len() == n` means bin `x` took every job.
     let n = jobs.len();
+    // Band order of the u8 batch (see `band_split`); the bands go to the kernel through `BAND_HINT`.
+    let split = band_split();
+    let (u8_idx, u8_band) = band_order(
+        jobs, u8_idx, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus,
+    );
     // The three single-bin fast paths. Each has to go through `expand`, because with the dedup
     // above `jobs` is the DISTINCT batch and the caller is owed one result per ORIGINAL job. Missing
     // that on these paths is what the paired-end overlap test caught: they are the common case, so
     // the bug was not subtle, only invisible until something indexed past the end.
-    if u8_idx.len() == n {
+    if u8_idx.len() == n && split == 0 {
         // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
         return expand(unsafe { run_u8!(jobs) }, dup_map);
     }
@@ -1082,10 +1533,14 @@ fn dispatch_bins(
             out[k] = bin_results[bin_slot];
         }
     };
+    if !u8_band.is_empty() {
+        BAND_HINT.with(|h| *h.borrow_mut() = u8_band);
+    }
     run_bin(&u8_idx, &|bin| unsafe {
         // SAFETY: neon available (checked by caller); U8_LEN bounds keep all values/positions in u8.
         run_u8!(bin)
     });
+    BAND_HINT.with(|h| h.borrow_mut().clear());
     run_bin(&i16_idx, &|bin| unsafe {
         // SAFETY: neon available; MAX_SEQ_LEN16 bounds keep all values inside i16.
         run_i16!(bin)
@@ -1098,6 +1553,87 @@ fn dispatch_bins(
     // Expand back to one result per ORIGINAL job. `out` currently holds one per distinct job; every
     // repeat takes its representative's answer, which is the same answer it would have computed.
     expand(out, dup_map)
+}
+
+/// `idx`, the jobs of a u8 batch, in band order (see [`band_split`]), with each one's band as the
+/// kernel computes it, which it then takes from `BAND_HINT`; `idx` as given and no bands under
+/// `BWA4_BAND_SPLIT=0` or for one job.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn band_order(
+    jobs: &[ExtendJob],
+    idx: Vec<usize>,
+    m: usize,
+    mat: &[i8],
+    o_del: i32,
+    e_del: i32,
+    o_ins: i32,
+    e_ins: i32,
+    w0: i32,
+    end_bonus: i32,
+) -> (Vec<usize>, Vec<i32>) {
+    let split = band_split();
+    if split == 0 || idx.len() < 2 {
+        return (idx, Vec::new());
+    }
+    let u8_idx = idx;
+    // The kernel's own `max_sc`, so a hinted band is the one it would compute.
+    let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
+    let band = |k: usize| {
+        let job = &jobs[k];
+        let mut wl = clamp_band(
+            w0,
+            job.query.len(),
+            max_sc,
+            end_bonus,
+            o_ins,
+            e_ins,
+            o_del,
+            e_del,
+        );
+        if tight_band_enabled() {
+            wl = wl.min(tight_band_bound(
+                job.query,
+                job.target,
+                job.h0,
+                i32::from(mat[0]),
+                i32::from(mat[1]),
+                (o_del.min(o_ins), e_del.min(e_ins)),
+                end_bonus,
+            ));
+        }
+        wl
+    };
+    // At most 9 classes: a stable counting sort, the stable sort's permutation in O(n).
+    let class = |w: i32| {
+        if split > 0 {
+            usize::from(w >= split)
+        } else {
+            (w / -split).clamp(0, 8) as usize
+        }
+    };
+    let bands: Vec<i32> = (0..u8_idx.len())
+        .map(|i| {
+            if let Some(&n) = u8_idx.get(i + PF_AHEAD) {
+                prefetch_job(jobs, n);
+            }
+            band(u8_idx[i])
+        })
+        .collect();
+    let mut start = [0usize; 10];
+    for &w in &bands {
+        start[class(w) + 1] += 1;
+    }
+    for c in 1..start.len() {
+        start[c] += start[c - 1];
+    }
+    let (mut idx, mut wb) = (vec![0usize; bands.len()], vec![0i32; bands.len()]);
+    for (&k, &w) in u8_idx.iter().zip(&bands) {
+        let c = class(w);
+        (idx[start[c]], wb[start[c]]) = (k, w);
+        start[c] += 1;
+    }
+    (idx, wb)
 }
 
 /// Turn one result per DISTINCT job into one result per original job.
@@ -1454,6 +1990,34 @@ pub fn batched_extend_scalar(
 /// An [`ExtendResult`] with every field 0. Note this is *not* the "no alignment" encoding the DP
 /// itself produces: a real empty extension reports `gscore = -1`, not 0. Nothing may read these
 /// zeros as if they meant something.
+/// [`batched_extend_scalar`]'s result for a seed scoring `h0 <= 0` whose first cell cannot go
+/// positive (`h0 == 0` blocks the diagonal, else `h0 + S(t[0], q[0]) <= 0`; always so at `a = 1`):
+/// row 0 is all zeros, so the DP stops there (`ksw.cpp:508`) having consumed nothing, and row 0
+/// scores the query's end 0 only when its band (`w`, clamped) reaches it. `--meth` TAPS made ~1.3
+/// such jobs a read, each a whole scalar chunk setup. `None` when the DP has work to do.
+fn dead_seed(job: &ExtendJob, m: usize, mat: &[i8], w: i32) -> Option<ExtendResult> {
+    let (q, t, h0) = (job.query, job.target, job.h0);
+    let blocked =
+        |&q0: &u8, &t0: &u8| h0 == 0 || h0 + i32::from(mat[t0 as usize * m + q0 as usize]) <= 0;
+    if h0 > 0
+        || !q
+            .first()
+            .zip(t.first())
+            .is_none_or(|(q0, t0)| blocked(q0, t0))
+    {
+        return None;
+    }
+    let reach = !t.is_empty() && q.len() as i32 <= w + 1;
+    Some(ExtendResult {
+        score: h0,
+        qle: 0,
+        tle: 0,
+        gtle: i32::from(reach),
+        gscore: if reach { 0 } else { -1 },
+        max_off: 0,
+    })
+}
+
 fn default_result() -> ExtendResult {
     ExtendResult {
         score: 0,
@@ -1465,12 +2029,277 @@ fn default_result() -> ExtendResult {
     }
 }
 
+/// `dst.copy_from_slice(src)` in 16-byte moves (the tail overlapped), never a libc call. The
+/// staging rows are a few hundred bytes, where a `memcpy` call per lane and sequence was the top
+/// libc caller in both the N2 and the EPYC profiles.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) fn copy_fast(dst: &mut [u8], src: &[u8]) {
+    type V = [u8; 16];
+    let n = src.len();
+    assert_eq!(dst.len(), n);
+    let (d, s) = (dst.as_mut_ptr(), src.as_ptr());
+    // SAFETY: every access is inside `0..n` of both slices.
+    unsafe {
+        if n >= 16 {
+            let mut i = 0;
+            while i + 16 < n {
+                d.add(i)
+                    .cast::<V>()
+                    .write_unaligned(s.add(i).cast::<V>().read_unaligned());
+                i += 16;
+            }
+            d.add(n - 16)
+                .cast::<V>()
+                .write_unaligned(s.add(n - 16).cast::<V>().read_unaligned());
+        } else if n >= 8 {
+            d.cast::<u64>()
+                .write_unaligned(s.cast::<u64>().read_unaligned());
+            d.add(n - 8)
+                .cast::<u64>()
+                .write_unaligned(s.add(n - 8).cast::<u64>().read_unaligned());
+        } else if n >= 4 {
+            d.cast::<u32>()
+                .write_unaligned(s.cast::<u32>().read_unaligned());
+            d.add(n - 4)
+                .cast::<u32>()
+                .write_unaligned(s.add(n - 4).cast::<u32>().read_unaligned());
+        } else if n > 0 {
+            // First, middle and last cover 1 to 3 bytes (a byte loop becomes a memcpy).
+            for k in [0, n / 2, n - 1] {
+                *d.add(k) = *s.add(k);
+            }
+        }
+    }
+}
+
+/// `dst.fill(b)` in 16-byte stores (the last overlapped), never a libc call (see [`copy_fast`]).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) fn fill_fast(dst: &mut [u8], b: u8) {
+    let n = dst.len();
+    let d = dst.as_mut_ptr();
+    // SAFETY: every store is inside `0..n`.
+    unsafe {
+        if n >= 16 {
+            // Opaque, or LLVM sees a splat store loop and turns it back into `memset`.
+            let v = std::hint::black_box([b; 16]);
+            let mut i = 0;
+            while i + 16 < n {
+                d.add(i).cast::<[u8; 16]>().write_unaligned(v);
+                i += 16;
+            }
+            d.add(n - 16).cast::<[u8; 16]>().write_unaligned(v);
+        } else if n >= 8 {
+            let v = u64::from_ne_bytes([b; 8]);
+            d.cast::<u64>().write_unaligned(v);
+            d.add(n - 8).cast::<u64>().write_unaligned(v);
+        } else if n >= 4 {
+            let v = u32::from_ne_bytes([b; 4]);
+            d.cast::<u32>().write_unaligned(v);
+            d.add(n - 4).cast::<u32>().write_unaligned(v);
+        } else if n > 0 {
+            for k in [0, n / 2, n - 1] {
+                *d.add(k) = b;
+            }
+        }
+    }
+}
+
+/// The first and last `a` bytes of a sequence of `1..16` bytes at `p`, as little-endian words,
+/// with `a` the largest power of two `<= len`, so that the two cover the sequence: the boundary
+/// tile of `piece16` read without touching a byte outside it.
+///
+/// # Safety
+/// `p` valid for `len` bytes, `1 <= len < 16`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn short_ends(p: *const u8, len: usize) -> (u64, u64, usize) {
+    if len >= 8 {
+        let w = |o: usize| (p.add(o) as *const u64).read_unaligned();
+        (w(0), w(len - 8), 8)
+    } else if len >= 4 {
+        let w = |o: usize| u64::from((p.add(o) as *const u32).read_unaligned());
+        (w(0), w(len - 4), 4)
+    } else if len >= 2 {
+        let w = |o: usize| u64::from((p.add(o) as *const u16).read_unaligned());
+        (w(0), w(len - 2), 2)
+    } else {
+        (u64::from(*p), u64::from(*p), 1)
+    }
+}
+
+/// A buffer whose slice starts on a 64-byte boundary, so a vector at a multiple of its own width
+/// never splits a cache line: a `Vec<u8>` is only as aligned as the allocator makes it (16 bytes),
+/// which splits every AVX-512 access and one AVX2 access in four.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) struct ABuf<T> {
+    v: Vec<T>,
+    off: usize,
+    len: usize,
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl<T: Copy> ABuf<T> {
+    pub(crate) const fn new() -> Self {
+        ABuf {
+            v: Vec::new(),
+            off: 0,
+            len: 0,
+        }
+    }
+
+    /// `n` elements, all `x`.
+    pub(crate) fn reset(&mut self, n: usize, x: T) {
+        self.v.clear();
+        self.v.resize(n + 64 / std::mem::size_of::<T>(), x);
+        self.off = self.v.as_ptr().align_offset(64);
+        self.len = n;
+    }
+
+    /// At least `n` elements, the first `n` as they were where the buffer already had them.
+    pub(crate) fn fit(&mut self, n: usize, x: T) {
+        if self.len < n {
+            let old = std::mem::take(&mut self.v);
+            let (off, len) = (self.off, self.len);
+            self.reset(n, x);
+            self[..len].copy_from_slice(&old[off..off + len]);
+        }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl<T: Copy> Default for ABuf<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl<T> std::ops::Deref for ABuf<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        // SAFETY: `reset` keeps `off + len <= v.len()`.
+        unsafe { std::slice::from_raw_parts(self.v.as_ptr().add(self.off), self.len) }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl<T> std::ops::DerefMut for ABuf<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as for `deref`.
+        unsafe { std::slice::from_raw_parts_mut(self.v.as_mut_ptr().add(self.off), self.len) }
+    }
+}
+
+/// Most vectors in one lane-compaction superblock (see `compact_plan`).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const COMPACT_MAX: usize = 16;
+
+/// Vectors per lane-compaction superblock for a kernel of `lanes` lanes: fg-labs/bwa-mem3's per-tier
+/// defaults (8 for 16 lanes, 6 for 32, 4 for 64). `BWA4_COMPACT_K` overrides it, 1 turns it off.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn compact_groups(lanes: usize) -> usize {
+    use std::sync::OnceLock;
+    static K: OnceLock<Option<usize>> = OnceLock::new();
+    let over = *K.get_or_init(|| {
+        std::env::var("BWA4_COMPACT_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|k: usize| k.clamp(1, COMPACT_MAX))
+    });
+    over.unwrap_or(match lanes {
+        64 => 4,
+        32 => 6,
+        _ => 8,
+    })
+}
+
+/// The compaction plan of fg-labs/bwa-mem3's `bsw_compact_plan`. `live[v]` has bit `l` set iff lane
+/// `l` of vector `v` is live, `run[v]` iff the vector still runs. Vectors with no live lane stop
+/// first; then, while more vectors run than `ceil(live lanes / lanes)`, the running vector with the
+/// fewest live lanes (lowest index on ties) is emptied, each live lane in order going to the first
+/// dead slot of the other running vectors (lowest vector, then lowest lane), and stops. The moves are
+/// appended to `moves` as `(source vector, lane, destination vector, lane)`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn compact_plan(
+    live: &mut [u64],
+    run: &mut [bool],
+    lanes: usize,
+    moves: &mut Vec<(u8, u8, u8, u8)>,
+) {
+    let full = if lanes >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << lanes) - 1
+    };
+    let (mut total, mut nact) = (0usize, 0usize);
+    for v in 0..live.len() {
+        if run[v] && live[v] == 0 {
+            run[v] = false;
+        }
+        if run[v] {
+            nact += 1;
+            total += live[v].count_ones() as usize;
+        }
+    }
+    while nact > total.div_ceil(lanes) {
+        let mut d = usize::MAX;
+        for v in 0..live.len() {
+            if run[v] && (d == usize::MAX || live[v].count_ones() < live[d].count_ones()) {
+                d = v;
+            }
+        }
+        let mut src = live[d];
+        while src != 0 {
+            let s = src.trailing_zeros() as usize;
+            src &= src - 1;
+            // `nact > ceil(total / lanes)` leaves the other running vectors at least as many holes.
+            let rv = (0..live.len())
+                .find(|&v| run[v] && v != d && live[v] != full)
+                .expect("a hole");
+            let rl = (!live[rv] & full).trailing_zeros() as usize;
+            moves.push((d as u8, s as u8, rv as u8, rl as u8));
+            live[rv] |= 1 << rl;
+        }
+        live[d] = 0;
+        run[d] = false;
+        nact -= 1;
+    }
+}
+
 /// Whether the extension kernels give the fully-in-band columns their own unmasked regime.
 /// `BWA4_EXTEND_BANDFAST=0` sends every column through the masked body. Read once, cached.
 fn band_fast_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BWA4_EXTEND_BANDFAST").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// Per-job bands `dispatch_bins` computed to order a u8 batch, handed to the kernel it calls next
+    /// so the ungapped-score walk runs once per job. Taken (emptied) by the kernel.
+    static BAND_HINT: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How `dispatch_bins` orders the u8 batch by band before chunking it into vectors, so a vector does
+/// not pay its widest lane's column range for narrow ones (fg-labs/bwa-mem3 batches narrow bands
+/// apart, `bsw_tb_probe_rung` / `compact_min_w`). Negative `-c` (default -8): stable sort by band
+/// class `w / c` (capped at 8, i.e. one class for every band of `8c` and wider), keeping the
+/// caller's length order inside a class. Positive `T`: two groups, `w < T` first. `0`: caller order.
+/// `BWA4_BAND_SPLIT` overrides it. The kernel reuses the computed bands (`BAND_HINT`).
+/// M4 chr21 -8: 244 -> 228-231G cycles, 1.045T -> 0.968T instructions; GIAB PE -6 to -8G, SE -1.7G.
+fn band_split() -> i32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<i32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BWA4_BAND_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-8)
+    })
 }
 
 /// Whether the extension kernels fold the substitution pre-pass into the column loop (issue #48B).
@@ -1515,8 +2344,102 @@ fn tight_band_enabled() -> bool {
 
 /// Set by the field-level equivalence gates to pin the full band; see [`tight_band_enabled`].
 /// Sticky by design: gates run concurrently under the test harness, so an unset would race.
+/// It also turns off [`exact_stop_enabled`], which moves the same fields.
 pub(crate) static FULL_BAND_FOR_FIELD_GATES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the SIMD extension kernels retire a lane as soon as no later row can change what the
+/// caller reads (the exact early stop). At the end of row `i`, every later cell scores at most
+/// `B = vmax + max_sc * min(tlen - 1 - i, qlen - beg)`: it descends from a cell of row `i`'s band
+/// `[beg, end)` (row max `vmax`) or, while `beg == 0`, from the virtual column -1 (at most `h0`,
+/// folded into `vmax`), by at most that many diagonal steps worth `max_sc` each, and gaps only
+/// cost. So once `B <= max`, the local result is final (`max` moves on a strict `>`), and once also
+/// `B < gscore`, so are `gscore`/`gtle` (they move on `<=`). If instead `B <= max - end_bonus`, every
+/// to-end score, now or later, is one the caller rejects (`run_side` passes its `pen_clip` as
+/// `end_bonus` and takes the global branch only on `gscore > score - pen_clip`), so it clips with
+/// or without the stop: the window [`tight_band_bound`] already relies on. A lane whose alignment
+/// has ended otherwise runs every remaining target row, since z-drop never fires on a pure
+/// deletion tail: 22% of the rows (10% of the cells) of 100k GIAB pairs come after the stop.
+///
+/// # Returns
+/// True unless `BWA4_NO_EXACT_STOP` is set to anything at all; false under
+/// [`FULL_BAND_FOR_FIELD_GATES`] in tests, unless [`EXACT_STOP_TEST`] says otherwise.
+fn exact_stop_enabled() -> bool {
+    use std::sync::OnceLock;
+    #[cfg(test)]
+    if let Some(on) = EXACT_STOP_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    if cfg!(test) && FULL_BAND_FOR_FIELD_GATES.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_NO_EXACT_STOP").is_none())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's override of [`exact_stop_enabled`]: per thread, so a test can pin it either
+    /// way while the field gates hold the sticky [`FULL_BAND_FOR_FIELD_GATES`].
+    pub(crate) static EXACT_STOP_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Bit position of column `k` in [`block_mismatches`]' mask is `k << BLOCK_SHIFT`: NEON narrows a
+/// byte compare to four bits per column, the other targets to one.
+const BLOCK_SHIFT: u32 = if cfg!(target_arch = "aarch64") { 2 } else { 0 };
+
+/// The columns of a 16-column block where `q` and `t` differ, column `k` at bit `k << BLOCK_SHIFT`,
+/// or `None` if either holds an N (code >= 4). Both slices are exactly 16 long.
+#[inline]
+fn block_mismatches(q: &[u8], t: &[u8]) -> Option<u64> {
+    debug_assert!(q.len() == 16 && t.len() == 16);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; both loads read the 16 bytes asserted above.
+    unsafe {
+        use std::arch::aarch64::*;
+        let (a, b) = (vld1q_u8(q.as_ptr()), vld1q_u8(t.as_ptr()));
+        if vmaxvq_u8(vmaxq_u8(a, b)) >= 4 {
+            return None;
+        }
+        // Four bits per byte; the lowest of each four marks the column.
+        let nib = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+            vmvnq_u8(vceqq_u8(a, b)),
+        ))));
+        Some(nib & 0x1111_1111_1111_1111)
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of the x86_64 baseline; both loads read the 16 bytes asserted above.
+    unsafe {
+        use std::arch::x86_64::*;
+        let (a, b) = (
+            _mm_loadu_si128(q.as_ptr() as *const __m128i),
+            _mm_loadu_si128(t.as_ptr() as *const __m128i),
+        );
+        // A code >= 4 has a bit above the low two; `max_epu8` then a compare against 3 finds it.
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_max_epu8(_mm_max_epu8(a, b), _mm_set1_epi8(3)),
+            _mm_set1_epi8(3),
+        )) != 0xFFFF
+        {
+            return None;
+        }
+        Some(u64::from(
+            !(_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u32) & 0xFFFF,
+        ))
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let mut bits = 0u64;
+        for (k, (&x, &y)) in q.iter().zip(t).enumerate() {
+            if x >= 4 || y >= 4 {
+                return None;
+            }
+            bits |= u64::from(x != y) << k;
+        }
+        Some(bits)
+    }
+}
 
 /// The ungapped-score band bound for one job, or `i32::MAX` when no bound applies.
 ///
@@ -1581,17 +2504,51 @@ fn tight_band_bound(
     // and this walk's prefix maximum before death is exactly that.
     let mut h = h0;
     let mut s_best = h0;
-    for col in 0..min_len {
-        let (qc, tc) = (query[col], target[col]);
-        if qc >= 4 || tc >= 4 {
-            return i32::MAX;
+    // 16 columns at a time, one step per mismatch rather than per base (the fork's
+    // `ungapped_walk_mis`): with `a > 0` and `mm < 0` the score only rises along a run of matches,
+    // so the run's last column holds its best and only a mismatch can kill the walk. A block holding
+    // an N goes to the byte loop below, which returns or dies exactly where it did before.
+    let mut col = 0usize;
+    let dead = 'blocks: {
+        if a <= 0 || mm >= 0 {
+            break 'blocks false;
         }
-        h += if qc == tc { a } else { mm };
-        if h <= 0 {
-            break;
+        while col + 16 <= min_len {
+            let Some(mut ne) = block_mismatches(&query[col..col + 16], &target[col..col + 16])
+            else {
+                break 'blocks false;
+            };
+            let mut run_start = 0i32;
+            while ne != 0 {
+                let k = (ne.trailing_zeros() >> BLOCK_SHIFT) as i32;
+                h += (k - run_start) * a;
+                s_best = s_best.max(h);
+                h += mm;
+                if h <= 0 {
+                    break 'blocks true;
+                }
+                run_start = k + 1;
+                ne &= ne - 1;
+            }
+            h += (16 - run_start) * a;
+            s_best = s_best.max(h);
+            col += 16;
         }
-        if h > s_best {
-            s_best = h;
+        false
+    };
+    if !dead {
+        for col in col..min_len {
+            let (qc, tc) = (query[col], target[col]);
+            if qc >= 4 || tc >= 4 {
+                return i32::MAX;
+            }
+            h += if qc == tc { a } else { mm };
+            if h <= 0 {
+                break;
+            }
+            if h > s_best {
+                s_best = h;
+            }
         }
     }
     // The cost of sitting at offset `B` is ONE gap run of `B` columns at the cheapest rates,
@@ -1628,9 +2585,11 @@ fn tight_band_bound(
 /// `k = (qlen*max_sc + end_bonus - o_ins) / e_ins + 1`; likewise for deletions. `.max(1)` keeps the
 /// band from collapsing to zero on very short queries.
 ///
-/// This must stay in `f64`, not integer division: the C computes it in `double` and truncates once
-/// at the cast, and integer division would round differently for negative numerators (short query,
-/// large `o_ins`), producing a different band and therefore a different alignment.
+/// The C computes `(int)((double)x / e + 1.)` and `.max(1)` follows. Every negative `x` lands at or
+/// below 0 and so on 1, and for `x >= 0` the double quotient truncates exactly as integer division
+/// does (a non-integer `x / e` stays at least `1 / e` from an integer, far more than an f64 ulp at
+/// these magnitudes), so `max(x, 0) / e + 1` is the same number without the two divides in double
+/// precision, which were a dependency chain on every job (`dispatch_bins`' hottest line on x86).
 ///
 /// Returns the clamped half-width in cells. `w0` is the user's `-w`; the result is never larger.
 ///
@@ -1662,20 +2621,13 @@ fn clamp_band(
     o_del: i32,
     e_del: i32,
 ) -> i32 {
-    let mut clamped = w0;
-    // Longest insertion, in bases, that could still pay for itself: the point where
-    // `o_ins + k*e_ins` consumes the whole score the alignment could earn. Same below for `max_del`
-    // with the deletion penalties. Both can come out negative or zero on a very short query, which
-    // is what the `.max(1)` guards against.
-    let max_ins = (((qlen as f64 * f64::from(max_sc) + f64::from(end_bonus) - f64::from(o_ins))
-        / f64::from(e_ins))
-        + 1.0) as i32;
-    clamped = clamped.min(max_ins.max(1));
-    let max_del = (((qlen as f64 * f64::from(max_sc) + f64::from(end_bonus) - f64::from(o_del))
-        / f64::from(e_del))
-        + 1.0) as i32;
-    clamped = clamped.min(max_del.max(1));
-    clamped
+    // The most the alignment could earn; the longest gap that still pays for itself is the one
+    // whose `o + k*e` eats all of it, already floored at one column.
+    let earn = qlen as i64 * i64::from(max_sc) + i64::from(end_bonus);
+    let useful = |o: i32, e: i32| (earn - i64::from(o)).max(0) / i64::from(e) + 1;
+    i64::from(w0)
+        .min(useful(o_ins, e_ins))
+        .min(useful(o_del, e_del)) as i32
 }
 
 /// Generate a batched banded-SW kernel for a lane element type + target-feature string. One macro
@@ -1729,11 +2681,18 @@ macro_rules! define_sw_kernel {
             dup = $dup:path, lds = $lds:path, sts = $sts:path, ldu = $ldu:path,
             sub = $sub:path, max = $max:path,
             ceqz = $ceqz:path, cge = $cge:path,
-            ceq = $ceq:path, orru = $orru:path,
+            ceq = $ceq:path, orru = $orru:path, orr = $orr:path,
             andu = $andu:path, bsl = $bsl:path,
             band = $band:path, band_bias = $bbias:expr,
             band_width = $bwidth:expr, diag = |$dm:ident, $ds:ident, $db:ident| $diag:expr,
-            sbt_bias = |$bb:ident| $sbias:expr
+            sbt_bias = |$bb:ident| $sbias:expr,
+            sbt_tbl = $sbt_tbl:literal,
+            tab5 = $tab5:literal,
+            tbl_ld = |$tp:ident| $tblld:expr,
+            tbl = |$tt:ident, $tk:ident, $tq:ident| $tblx:expr,
+            rowvec = $rowvec:literal,
+            trk = $trk:ty,
+            row = $rowmod:ident
         ) => {
         /// # Safety
         /// Requires the `$feat` target feature; all vector loads/stores use fixed-size
@@ -1776,6 +2735,10 @@ macro_rules! define_sw_kernel {
             let oe_ins = o_ins + e_ins;
             // Best single-cell score in the matrix, used only by `clamp_band`.
             let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
+            // The exact early stop (`exact_stop_enabled`), read once per call.
+            let stop = super::exact_stop_enabled().then_some((max_sc, end_bonus));
+            // The unmasked regime of fully-in-band columns (`band_fast_enabled`), likewise.
+            let band_fast = super::band_fast_enabled();
 
             // One slot per job, overwritten chunk by chunk before returning.
             let mut out = vec![default_result(); jobs.len()];
@@ -1816,6 +2779,29 @@ macro_rules! define_sw_kernel {
             let sbt_match_v = $dup((bias + i32::from(mat[0])) as $elem); // bias + a
             let sbt_mism_v = $dup((bias + i32::from(mat[1])) as $elem); // bias - |mm|
             let sbt_npen_v = $dup((bias + i32::from(mat[m - 1])) as $elem); // bias - |npen|
+            // The same three scores as a 16-entry table indexed by `t ^ q`, with a target N
+            // re-encoded as 12 per row: equal bases give 0 (match), unequal ACGT give 1..=3
+            // (mismatch), and any N gives >= 4 (12 ^ 0..=3 = 12..=15, 12 ^ 4 = 8, 4 ^ 0..=3 = 4..=7).
+            // One XOR and one byte shuffle (`tbl` / `pshufb`) replace the compare/blend chain.
+            // Byte lanes only (`sbt_tbl`); the i16 kernels keep the compare form.
+            //
+            // `tab5` (`--meth`'s neutral and genomic matrices, which no `t ^ q` class can hold): the
+            // whole 5x5 matrix at `5 t + q`, 32 entries, with a target N keyed 4 rather than 12 so
+            // the row key is the base itself; `$tblx` forms the index.
+            let tab_v = {
+                let mut tab = [(bias + i32::from(mat[m - 1])) as $elem; 32];
+                if $tab5 {
+                    for (e, &v) in tab.iter_mut().zip(&mat[..25]) {
+                        *e = (bias + i32::from(v)) as $elem;
+                    }
+                } else {
+                    tab[0] = (bias + i32::from(mat[0])) as $elem;
+                    tab[1..4].fill((bias + i32::from(mat[1])) as $elem);
+                }
+                let $tp = tab.as_ptr() as *const u8;
+                $tblld
+            };
+            let twelve_v = $dup(if $tab5 { 4 } else { 12 });
             // Only a kernel that keeps the bias needs non-negative lanes; USQADD's are signed.
             debug_assert!(
                 bias != full_bias
@@ -1825,125 +2811,219 @@ macro_rules! define_sw_kernel {
                 "biased substitution scores must be non-negative"
             );
 
-            // Per-chunk DP scratch, allocated once and reused across chunks (clear+resize keeps the
-            // capacity, so it grows to the largest chunk's size then stops reallocating). Byte-safe:
-            // resize-from-empty zero-fills, identical to the old per-chunk `vec![0; ..]`.
-            let mut eh_h: Vec<$elem> = Vec::new();
-            let mut eh_e: Vec<$elem> = Vec::new();
-            let mut qcode: Vec<$elem> = Vec::new();
-            let mut tcode: Vec<$elem> = Vec::new();
-            // Substitution-score pre-pass buffers (bwa-mem2's `sbt_buf`, `bandedSWA.cpp:1183-1214`):
+            // Superblocks of `kmax` vectors walk the rows in lockstep, so every lane of a superblock
+            // is at the same row `i`. When lanes finish (z-drop, end of target), the live lanes of
+            // the emptiest vector move into dead slots of the others and it stops running: the same-row
+            // lane compaction of fg-labs/bwa-mem3 (`bsw_compact.h`). A moved lane carries its whole
+            // slot (every SoA column, its remaining target rows, its trackers), so it computes exactly
+            // what it would have in place: a lane never reads another lane's slot, and the shared
+            // column range only has to cover its band, which the union over the vector's lanes does.
+            // Measured on GIAB lanes (BWA4_LANE_TRACE): 16 lanes compute 3.0x the useful cells,
+            // 2.05x with 8-vector superblocks.
+            let kmax = super::compact_groups(LANES);
+            // Each job's band as `dispatch_bins` already computed it to order the batch, if it did.
+            let band_hint = super::BAND_HINT.with(|h| std::mem::take(&mut *h.borrow_mut()));
+            let band_hint = (band_hint.len() == jobs.len()).then_some(band_hint);
+            struct Vs {
+                eh_h: super::ABuf<$elem>,
+                eh_e: super::ABuf<$elem>,
+                qcode: super::ABuf<$elem>,
+                tcode: super::ABuf<$elem>,
+                qlen: [usize; LANES],
+                tlen: [usize; LANES],
+                qlen32: [$trk; LANES],
+                tlen32: [$trk; LANES],
+                h0: [$trk; LANES],
+                w: [$trk; LANES],
+                beg: [$trk; LANES],
+                end: [$trk; LANES],
+                max: [$trk; LANES],
+                max_i: [$trk; LANES],
+                max_j: [$trk; LANES],
+                max_ie: [$trk; LANES],
+                gscore: [$trk; LANES],
+                max_off: [$trk; LANES],
+                done: [bool; LANES],
+                // Job index of the slot's lane, `u32::MAX` once it moved away or for padding.
+                jid: [u32; LANES],
+                run: bool,
+                // `rowvec`: the lanes live into the next row (not done, row `i + 1` exists), from
+                // the row's prologue and epilogue, so the compaction need not scan the lanes.
+                nxt: u64,
+            }
+            // The slots, `sbt_buf` and `moves` of this thread's previous call: every field is
+            // rewritten per superblock before it is read, as between two superblocks of one call,
+            // so only the allocations carry over (the per-call ones were 4 x kmax blocks over
+            // 1 KiB each, allocated and zeroed afresh).
+            thread_local! {
+                static KEEP: std::cell::Cell<(Vec<Vs>, super::ABuf<$elem>, Vec<(u8, u8, u8, u8)>)> =
+                    const { std::cell::Cell::new((Vec::new(), super::ABuf::new(), Vec::new())) };
+            }
+            let (mut vs, mut sbt_buf, mut moves) =
+                KEEP.replace((Vec::new(), super::ABuf::new(), Vec::new()));
+            vs.resize_with(kmax, || Vs {
+                    eh_h: super::ABuf::new(),
+                    eh_e: super::ABuf::new(),
+                    qcode: super::ABuf::new(),
+                    tcode: super::ABuf::new(),
+                    qlen: [0; LANES],
+                    tlen: [0; LANES],
+                    qlen32: [0; LANES],
+                    tlen32: [0; LANES],
+                    h0: [0; LANES],
+                    w: [0; LANES],
+                    beg: [0; LANES],
+                    end: [0; LANES],
+                    max: [0; LANES],
+                    max_i: [-1; LANES],
+                    max_j: [-1; LANES],
+                    max_ie: [-1; LANES],
+                    gscore: [-1; LANES],
+                    max_off: [0; LANES],
+                    done: [true; LANES],
+                    jid: [u32::MAX; LANES],
+                    run: false,
+                    nxt: 0,
+                });
+            // Substitution-score pre-pass buffer (bwa-mem2's `sbt_buf`, `bandedSWA.cpp:1183-1214`):
             // the DNA match/mismatch/N score of each band column depends only on this row's target
             // base and the column's query base, never on the DP recurrence. Computing it in a
             // separate per-row loop and loading it in the DP body lifts ~7 vector ALU ops off the
-            // serial H/E/F critical path, where on x86 (fewer vector-ALU ports than lanes) they
-            // otherwise contend with the recurrence. Byte-identical: same values, only reordered.
-            let mut sbt_buf: Vec<$elem> = Vec::new();
+            // serial H/E/F critical path. Refilled per vector and row, so one serves them all.
+            // (`sbt_buf` and the compaction's `moves` come from `KEEP` above.)
 
-            // =======================================================================
-            // One chunk = one register's worth of independent alignments.
-            // =======================================================================
-            for chunk_start in (0..jobs.len()).step_by(LANES) {
-                // Jobs in this chunk: LANES except for a partial final chunk. Lanes
-                // `nlane..LANES` are never marked active, so their garbage never reaches `out`.
-                let nlane = (jobs.len() - chunk_start).min(LANES);
-
-                // --- chunk setup: per-lane lengths, h0 and band --------------------
-                // Indexed by lane `l`: sequence lengths in bases, the seed's starting score, and
-                // this lane's clamped band half-width in cells.
-                let mut qlen = [0usize; LANES];
-                let mut tlen = [0usize; LANES];
-                let mut h0 = [0i32; LANES];
-                let mut w = [0i32; LANES];
-                for l in 0..nlane {
-                    let job = &jobs[chunk_start + l];
-                    qlen[l] = job.query.len();
-                    tlen[l] = job.target.len();
-                    h0[l] = job.h0;
-                    w[l] = clamp_band(w0, qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del);
-                    // `BWA4_TIGHT_BAND`: clamp this lane's band by the ungapped-score bound. The
-                    // row loop below derives `beg[l]`/`end[l]` from `w[l]` and `gbeg`/`gend` as
-                    // their union, so a tighter lane narrows the walked columns wherever the whole
-                    // chunk is tight, which the ceiling probe says is nearly everywhere. The walk
-                    // is O(min_len) against the O(len^2) it removes.
-                    if tight_band_enabled() {
-                        let bound = tight_band_bound(
-                            job.query,
-                            job.target,
-                            job.h0,
-                            i32::from(mat[0]),
-                            i32::from(mat[1]),
-                            (o_del.min(o_ins), e_del.min(e_ins)),
-                            end_bonus,
-                        );
-                        w[l] = w[l].min(bound);
-                    }
-                }
-                // Longest query and target in this chunk, in bases: `max_q` sizes the shared row,
-                // `max_t` is the number of lockstep row iterations every lane pays for.
-                let max_q = qlen[..nlane].iter().copied().max().unwrap_or(0);
-                let max_t = tlen[..nlane].iter().copied().max().unwrap_or(0);
-
+            for sb_start in (0..jobs.len()).step_by(LANES * kmax) {
+                let sb_end = (sb_start + LANES * kmax).min(jobs.len());
+                let nvec = (sb_end - sb_start).div_ceil(LANES);
+                // Longest query and target in the superblock: every vector is sized alike so a
+                // moved lane's slot is a plain copy. `max_t` bounds the lockstep rows.
+                let max_q = jobs[sb_start..sb_end].iter().map(|j| j.query.len()).max().unwrap_or(0);
+                let max_t = jobs[sb_start..sb_end].iter().map(|j| j.target.len()).max().unwrap_or(0);
                 // Columns per SoA buffer: `max_q + 1` because the row epilogue writes `eh_h[end]`
-                // with `end == qlen` possible. Buffers are therefore `stride * LANES` elements,
-                // element `j * LANES + l` being column `j` of lane `l`.
+                // with `end == qlen` possible. Element `j * LANES + l` is column `j` of lane `l`.
                 let stride = max_q + 1;
-                eh_h.clear();
-                eh_h.resize(stride * LANES, 0 as $elem);
-                eh_e.clear();
-                eh_e.resize(stride * LANES, 0 as $elem);
-
-                // Transpose the per-job sequences into SoA: `qcode[j * LANES + l]` is job `l`'s base
-                // at query column `j`. One vector load then yields "column j of all lanes", which is
-                // the whole reason for the layout (bwa-mem2's `seq1SoA`/`seq2SoA`, `bandedSWA.cpp:449`).
-                // Padding is code 0 (an ordinary base), not a sentinel: padded lanes are masked out
-                // of every write by `band`, so whatever score they compute is discarded. The point of
-                // padding is only that the load stays in bounds and branch-free.
-                qcode.clear();
-                qcode.resize(stride * LANES, 0 as $elem);
-                tcode.clear();
-                tcode.resize((max_t + 1) * LANES, 0 as $elem);
-                // Same column layout as `qcode`; refilled per row by the substitution pre-pass.
-                sbt_buf.clear();
-                sbt_buf.resize(stride * LANES, 0 as $elem);
-                for l in 0..nlane {
-                    for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
-                        qcode[ju * LANES + l] = c as $elem;
-                    }
-                    for (iu, &c) in jobs[chunk_start + l].target.iter().enumerate() {
-                        tcode[iu * LANES + l] = c as $elem;
-                    }
-                }
-
-                // --- per-lane band and result trackers (same meaning as the scalar path) ---
-                let mut beg = [0i32; LANES];
-                let mut end = [0i32; LANES];
-                let mut max = [0i32; LANES];
-                let mut max_i = [-1i32; LANES];
-                let mut max_j = [-1i32; LANES];
-                let mut max_ie = [-1i32; LANES];
-                let mut gscore = [-1i32; LANES];
-                let mut max_off = [0i32; LANES];
-                let mut done = [true; LANES];
-
-                // --- row -1: the leading-insertion run that seeds the first real row ---
-                for l in 0..nlane {
-                    eh_h[l] = h0[l] as $elem; // column 0
-                    if qlen[l] >= 1 {
-                        eh_h[LANES + l] = if h0[l] > oe_ins {
-                            (h0[l] - oe_ins) as $elem
-                        } else {
-                            0
+                // The NEON u8 kernel fills the codes through a lane-major staging area and 16x16
+                // transposes (whole 16-position blocks, hence the rounded sizes); the others per base.
+                // Padding is code 0, masked out of every write by `band`.
+                let soa_cols = if $rowvec { stride.next_multiple_of(16) } else { stride };
+                let soa_rows = if $rowvec { (max_t + 1).next_multiple_of(16) } else { max_t + 1 };
+                sbt_buf.reset(stride * LANES, 0 as $elem);
+                for (v, st) in vs[..nvec].iter_mut().enumerate() {
+                    let chunk_start = sb_start + v * LANES;
+                    let nlane = (sb_end - chunk_start).min(LANES);
+                    st.qlen = [0; LANES];
+                    st.tlen = [0; LANES];
+                    st.h0 = [0; LANES];
+                    st.w = [0; LANES];
+                    st.beg = [0; LANES];
+                    st.end = [0; LANES];
+                    st.max = [0; LANES];
+                    st.max_i = [-1; LANES];
+                    st.max_j = [-1; LANES];
+                    st.max_ie = [-1; LANES];
+                    st.gscore = [-1; LANES];
+                    st.max_off = [0; LANES];
+                    st.done = [true; LANES];
+                    st.jid = [u32::MAX; LANES];
+                    st.run = true;
+                    for l in 0..nlane {
+                        let job = &jobs[chunk_start + l];
+                        st.jid[l] = (chunk_start + l) as u32;
+                        st.qlen[l] = job.query.len();
+                        st.tlen[l] = job.target.len();
+                        st.h0[l] = job.h0 as $trk;
+                        let mut wl = match &band_hint {
+                            Some(h) => h[chunk_start + l],
+                            None => clamp_band(w0, st.qlen[l], max_sc, end_bonus, o_ins, e_ins, o_del, e_del),
                         };
+                        // `BWA4_TIGHT_BAND`: clamp this lane's band by the ungapped-score bound.
+                        // Under `tab5` (diagonal `a`, every cell in `[mat[1], a]`) the walk charges
+                        // each off-diagonal cell `mat[1]`, no more than it scores: the `S` it finds
+                        // is still attained, only lower, so the band only widens.
+                        if band_hint.is_none() && tight_band_enabled() {
+                            let bound = tight_band_bound(
+                                job.query,
+                                job.target,
+                                job.h0,
+                                i32::from(mat[0]),
+                                i32::from(mat[1]),
+                                (o_del.min(o_ins), e_del.min(e_ins)),
+                                end_bonus,
+                            );
+                            wl = wl.min(bound);
+                        }
+                        // Exact: a band past every index (all `< 256` when `$trk` is i16) is as
+                        // good as unbounded.
+                        st.w[l] = wl.min(i32::from(<$trk>::MAX) / 2) as $trk;
                     }
-                    let mut j = 2usize;
-                    while j <= qlen[l] && i32::from(eh_h[(j - 1) * LANES + l]) > e_ins {
-                        eh_h[j * LANES + l] = eh_h[(j - 1) * LANES + l] - e_ins as $elem;
-                        j += 1;
+                    st.qlen32 = std::array::from_fn(|l| st.qlen[l] as $trk);
+                    st.tlen32 = std::array::from_fn(|l| st.tlen[l] as $trk);
+                    st.eh_h.reset(stride * LANES, 0 as $elem);
+                    st.eh_e.reset(stride * LANES, 0 as $elem);
+                    if $rowvec {
+                        // `fill_soa` writes every lane of both.
+                        st.qcode.fit(soa_cols * LANES, 0 as $elem);
+                        st.tcode.fit(soa_rows * LANES, 0 as $elem);
+                    } else {
+                        st.qcode.reset(soa_cols * LANES, 0 as $elem);
+                        st.tcode.reset(soa_rows * LANES, 0 as $elem);
                     }
-                    max[l] = h0[l];
-                    end[l] = qlen[l] as i32;
-                    done[l] = false;
+                    if $rowvec {
+                        // SAFETY: `rowvec` kernels are u8 (`$elem` is u8), and both SoA sizes are
+                        // multiples of 16 under `rowvec`.
+                        unsafe {
+                            super::$rowmod::fill_soa::<LANES>(
+                                &jobs[chunk_start..chunk_start + nlane],
+                                soa_cols,
+                                soa_rows,
+                                st.qcode.as_mut_ptr() as *mut u8,
+                                st.tcode.as_mut_ptr() as *mut u8,
+                            );
+                        }
+                    } else {
+                        let (qc, tc) = (&mut st.qcode[..], &mut st.tcode[..]);
+                        for l in 0..nlane {
+                            for (ju, &c) in jobs[chunk_start + l].query.iter().enumerate() {
+                                qc[ju * LANES + l] = c as $elem;
+                            }
+                            for (iu, &c) in jobs[chunk_start + l].target.iter().enumerate() {
+                                tc[iu * LANES + l] = c as $elem;
+                            }
+                        }
+                    }
+                    // --- row -1: the leading-insertion run that seeds the first real row ---
+                    // Column `j >= 1` holds `max(h0 - oe_ins - (j-1)*e_ins, 0)` up to `qlen`: the
+                    // C's `eh[j] = eh[j-1] - e_ins while eh[j-1] > e_ins` run in closed form, one
+                    // vector per column instead of a store-to-load chain per lane.
+                    let eh = &mut st.eh_h[..];
+                    let mut ramp = [0 as $elem; LANES];
+                    let mut qlen_e = [0 as $elem; LANES];
+                    let mut jmax = 0usize;
+                    for l in 0..nlane {
+                        let h0l = i32::from(st.h0[l]);
+                        eh[l] = h0l as $elem; // column 0
+                        qlen_e[l] = st.qlen[l] as $elem;
+                        if h0l > oe_ins {
+                            ramp[l] = (h0l - oe_ins) as $elem;
+                            // Columns whose value is still positive: `j - 1 < (h0 - oe_ins) / e_ins`.
+                            let n = if e_ins > 0 {
+                                (h0l - oe_ins - 1) as usize / e_ins as usize + 1
+                            } else {
+                                st.qlen[l]
+                            };
+                            jmax = jmax.max(n.min(st.qlen[l]));
+                        }
+                        st.max[l] = st.h0[l];
+                        st.end[l] = st.qlen[l] as $trk;
+                        st.done[l] = false;
+                    }
+                    let qlen_v = $lds(qlen_e.as_ptr());
+                    let mut ramp_v = $lds(ramp.as_ptr());
+                    for j in 1..=jmax {
+                        let keep = $cge(qlen_v, $dup(j as $elem));
+                        $sts(eh.as_mut_ptr().add(j * LANES), $bsl(keep, ramp_v, zero_v));
+                        ramp_v = $max($sub(ramp_v, e_ins_v), zero_v);
+                    }
                 }
 
                 // =================================================================
@@ -1956,401 +3036,1790 @@ macro_rules! define_sw_kernel {
                 // the i32 trackers summarize rows `0..i`; `beg`/`end` are the previous row's
                 // tightened range, not yet intersected with row `i`'s band.
                 for i in 0..max_t as i32 {
-                    // --- row prologue (scalar, per lane): band intersection, left edge ---
-                    // `h1[l]` = H(i, beg[l]-1), the value carried into the row's first column.
-                    let mut h1 = [0 as $elem; LANES];
-                    // `active[l]`: this lane has a row `i` and has not terminated. `gbeg`/`gend`:
-                    // the union of the active lanes' bands, i.e. the half-open column range the
-                    // shared vector loop below must cover. They stay `i32::MAX`/`0` (an empty
-                    // range) if no lane is active this row.
-                    let mut active = [false; LANES];
-                    let mut gbeg = i32::MAX;
-                    let mut gend = 0i32;
-                    for l in 0..nlane {
-                        if done[l] || i >= tlen[l] as i32 {
+                    for v in 0..nvec {
+                    if !vs[v].run {
+                        continue;
+                    }
+                    #[allow(unused_variables)]
+                    let Vs {
+                        eh_h, eh_e, qcode, tcode, qlen, tlen, qlen32, tlen32, h0, w, beg, end, max,
+                        max_i, max_j, max_ie, gscore, max_off, done, run, nxt, ..
+                    } = &mut vs[v];
+                    // Plain slices, so the column loop keeps their pointers in registers: through the
+                    // `Vec` headers, which sit in the heap like the cells, every store would force a reload.
+                    let (eh_h, eh_e) = (&mut eh_h[..], &mut eh_e[..]);
+                    let (qcode, tcode) = (&qcode[..], &tcode[..]);
+                    // Local copies of the per-lane inputs, for the same reason; they never change mid-row.
+                    let (qlen, tlen, qlen32, tlen32, h0, w) = (*qlen, *tlen, *qlen32, *tlen32, *h0, *w);
+                    // Padding lanes are `done` from the start, so the per-lane loops cover them all.
+                    let nlane = LANES;
+                        // --- row prologue (per lane): band intersection, left edge. `h1[l]` = H(i,
+                        //     beg[l]-1), the value carried into the row's first column; `active[l]`:
+                        //     this lane has a row `i` and has not terminated; `gbeg`/`gend`: the union
+                        //     of the active lanes' bands, the half-open column range the shared vector
+                        //     loop must cover; `fast_lo`/`fast_hi`: their intersection. The NEON u8
+                        //     kernel does this in i32 vector lanes (`rowvec`), the others per lane. ---
+                        let mut h1 = [0 as $elem; LANES];
+                        let mut active = [false; LANES];
+                        let mut beg_lane = [0 as $elem; LANES];
+                        let mut end_lane = [0 as $elem; LANES];
+                        let mut active_lane = [0 as $umask; LANES];
+                        let (gbeg, gend, fast_lo_raw, fast_hi_raw);
+                        #[allow(unused_assignments)]
+                        let mut next_bits = 0u64;
+                        if $rowvec {
+                            // SAFETY: `rowvec` is set only on the NEON u8 kernel, where LANES == 16,
+                            // `$elem` and `$umask` are u8, `band_width` holds and `band_bias` is 0.
+                            (gbeg, gend, fast_lo_raw, fast_hi_raw, next_bits) = unsafe {
+                                super::$rowmod::prologue::<LANES>(
+                                    i,
+                                    done.as_ptr(),
+                                    tlen32.as_ptr().cast(),
+                                    qlen32.as_ptr().cast(),
+                                    w.as_ptr().cast(),
+                                    h0.as_ptr().cast(),
+                                    beg.as_mut_ptr().cast(),
+                                    end.as_mut_ptr().cast(),
+                                    o_del,
+                                    e_del,
+                                    h1.as_mut_ptr() as *mut u8,
+                                    active.as_mut_ptr(),
+                                    beg_lane.as_mut_ptr() as *mut u8,
+                                    end_lane.as_mut_ptr() as *mut u8,
+                                    active_lane.as_mut_ptr() as *mut u8,
+                                    $bbias as u8,
+                                )
+                            };
+                        } else {
+                            let (mut gb, mut ge) = (i32::MAX, 0i32);
+                            let (mut fl, mut fh) = (i32::MIN, i32::MAX);
+                            for l in 0..nlane {
+                                if done[l] || i >= tlen[l] as i32 {
+                                    continue;
+                                }
+                                active[l] = true;
+                                let wl = i32::from(w[l]);
+                                let (mut b, mut e) = (i32::from(beg[l]), i32::from(end[l]));
+                                if b < i - wl {
+                                    b = i - wl;
+                                }
+                                if e > i + wl + 1 {
+                                    e = i + wl + 1;
+                                }
+                                if e > qlen[l] as i32 {
+                                    e = qlen[l] as i32;
+                                }
+                                (beg[l], end[l]) = (b as $trk, e as $trk);
+                                h1[l] = if b == 0 {
+                                    (i32::from(h0[l]) - (o_del + e_del * (i + 1))).max(0) as $elem
+                                } else {
+                                    0
+                                };
+                                gb = gb.min(b);
+                                ge = ge.max(e);
+                                fl = fl.max(b);
+                                fh = fh.min(e);
+                            }
+                            for l in 0..nlane {
+                                if active[l] {
+                                    // XOR-ed into signed space when `$bbias` is non-zero (issue #48C).
+                                    beg_lane[l] = (beg[l] as $elem) ^ ($bbias as $elem);
+                                    // Under `$bwidth` this lane holds the band's WIDTH instead of its
+                                    // end, which an inactive lane leaves at 0 and so never matches.
+                                    end_lane[l] = if $bwidth {
+                                        (end[l] - beg[l]).max(0) as $elem
+                                    } else {
+                                        (end[l] as $elem) ^ ($bbias as $elem)
+                                    };
+                                    active_lane[l] = <$umask>::MAX;
+                                }
+                            }
+                            (gbeg, gend, fast_lo_raw, fast_hi_raw) = (gb, ge, fl, fh);
+                        }
+                        if gbeg == i32::MAX {
+                            // No lane is active, and none can become so (`done` and `i >= tlen` are
+                            // monotone): this vector is finished.
+                            *run = false;
                             continue;
                         }
-                        active[l] = true;
-                        if beg[l] < i - w[l] {
-                            beg[l] = i - w[l];
-                        }
-                        if end[l] > i + w[l] + 1 {
-                            end[l] = i + w[l] + 1;
-                        }
-                        if end[l] > qlen[l] as i32 {
-                            end[l] = qlen[l] as i32;
-                        }
-                        h1[l] = if beg[l] == 0 {
-                            (h0[l] - (o_del + e_del * (i + 1))).max(0) as $elem
-                        } else {
-                            0
-                        };
-                        gbeg = gbeg.min(beg[l]);
-                        gend = gend.max(end[l]);
-                    }
 
-                    // Move the row-local scalars into vectors. `h1_v` was just computed per lane
-                    // (the first-column value), the rest start at their identity.
-                    let mut h1_v = $lds(h1.as_ptr());
-                    let mut f_v = zero_v;
-                    let mut rowmax_v = zero_v;
-                    // `mj = -1` as the C does; for the u8 kernel this is 255, which is fine because
-                    // it is only ever read after `rowmax > 0` has proved some column updated it.
-                    let mut mj_v = $dup((-1i32) as $elem);
+                        // Move the row-local scalars into vectors. `h1_v` was just computed per lane
+                        // (the first-column value), the rest start at their identity.
+                        let mut h1_v = $lds(h1.as_ptr());
+                        let mut f_v = zero_v;
+                        let mut rowmax_v = zero_v;
+                        // `mj = -1` as the C does; for the u8 kernel this is 255, which is fine because
+                        // it is only ever read after `rowmax > 0` has proved some column updated it.
+                        let mut mj_v = $dup((-1i32) as $elem);
+                        // The per-lane band as vectors, so the inner loop masks with compares instead
+                        // of a branch per lane. `beg`/`end` must fit `$elem` too, the second reason the
+                        // u8 kernel caps lengths at 256. An inactive lane has an all-zero mask and an
+                        // empty band. Inactive lanes' slots are written with computed values in the
+                        // unmasked range and never read again: a lane never reactivates, and every
+                        // reader is under `active`.
+                        let beg_v = $lds(beg_lane.as_ptr());
+                        let end_v = $lds(end_lane.as_ptr());
+                        let active_v = $ldu(active_lane.as_ptr());
+                        // All-ones, the value `band` provably takes in the unmasked range.
+                        let ones_v = $ldu([<$umask>::MAX; LANES].as_ptr());
+                        // First and last column of this row whose stored H or E is non-zero, per lane,
+                        // kept by the column loop so the band tightening below reads them instead of
+                        // scanning the row (fg-labs/bwa-mem3's `BSW8_NF_TRACK`). `unseen_v` is all-ones
+                        // in a lane until its first such column; `first_v` follows `j` until then.
+                        let mut unseen_v = ones_v;
+                        let mut first_v = zero_v;
+                        let mut last_v = zero_v;
+                        let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
+                        let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
+                        let t_key = $bsl(t_is_n, twelve_v, t_v); // `tab_v`'s row half of the index
 
-                    // Build the per-lane band as vectors so the inner loop can mask with two
-                    // compares instead of a branch per lane. `beg`/`end` are column indices, so they
-                    // must fit `$elem` too, which is the second reason the u8 kernel caps lengths at
-                    // 256. An inactive lane gets an all-zero mask (`beg = end = 0` would also make
-                    // the range empty, but the explicit `active_v` is what keeps a *finished* lane's
-                    // stale state from being rewritten; under `$bwidth` the empty range is the mask).
-                    let mut beg_lane = [0 as $elem; LANES];
-                    let mut end_lane = [0 as $elem; LANES];
-                    let mut active_lane = [0 as $umask; LANES];
-                    // The band range every ACTIVE lane shares, for the unmasked column regime below.
-                    // Computed here because this loop already visits every lane once per row, so it
-                    // costs nothing beyond a max and a min.
-                    //
-                    // Inactive lanes are ignored, and that is a proof rather than an optimism. In
-                    // the unmasked range their `eh_h`/`eh_e` slots, their `h1`/`f` register lanes and
-                    // their `rowmax`/`mj` lanes are all written with computed values instead of
-                    // being held at their old ones. None of it is ever read again:
-                    //
-                    //  - a lane never REACTIVATES. `active` is rebuilt per row as
-                    //    `!done[l] && i < tlen[l]`, and both `done[l]` and `i >= tlen[l]` are
-                    //    monotone in `i`;
-                    //  - the band-tightening scan at the top of the row (`first_live`/`last_live`,
-                    //    which is the only reader of `eh_h`/`eh_e` outside the column loop) runs
-                    //    inside `if !active[l] { continue }`, as does the row epilogue;
-                    //  - `h1_v` is reloaded from the scalar `h1[]` at the start of every row and
-                    //    `f_v` is zeroed, so a garbage register lane cannot survive the row, and the
-                    //    epilogue writes `h1[l]` back for active lanes only.
-                    //
-                    // Requiring every lane to be active instead cost the regime most of its reach:
-                    // only 19.7% of rows have all sixteen live, against 12.8% of columns taking the
-                    // fast path.
-                    let (mut fast_lo_raw, mut fast_hi_raw) = (i32::MIN, i32::MAX);
-                    for l in 0..nlane {
-                        if active[l] {
-                            fast_lo_raw = fast_lo_raw.max(beg[l]);
-                            fast_hi_raw = fast_hi_raw.min(end[l]);
-                        }
-                    }
-                    for l in 0..nlane {
-                        if active[l] {
-                            // XOR-ed into signed space when `$bbias` is non-zero (issue #48C).
-                            // Free here: these two scalar stores happen once per row anyway.
-                            beg_lane[l] = (beg[l] as $elem) ^ ($bbias as $elem);
-                            // Under `$bwidth` this lane holds the band's WIDTH instead of its end, which
-                            // an inactive lane leaves at 0 and so never matches: see `band_u8`.
-                            end_lane[l] = if $bwidth {
-                                (end[l] - beg[l]).max(0) as $elem
-                            } else {
-                                (end[l] as $elem) ^ ($bbias as $elem)
-                            };
-                            // All-ones = "true" in the blend/and convention used throughout.
-                            active_lane[l] = <$umask>::MAX;
-                        }
-                    }
-                    let beg_v = $lds(beg_lane.as_ptr());
-                    let end_v = $lds(end_lane.as_ptr());
-                    let active_v = $ldu(active_lane.as_ptr());
-                    // All-ones, the value `band` provably takes in the unmasked range.
-                    let ones_v = $ldu([<$umask>::MAX; LANES].as_ptr());
-                    let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
-                    let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
-
-                    // --- substitution pre-pass (vector, off the critical path) ---
-                    // For every band column, compute the same `sbt_pos`/`sbt_neg` the DP body used to
-                    // compute inline, and stash them. These ops depend only on `t_v` (fixed this row)
-                    // and the column's query base, so they carry no DP dependency and the scheduler
-                    // runs them at throughput here instead of braided into the H/E/F chain below.
-                    // Issue #48B: with `INL_SBT` the pre-pass does not run at all and its body moves
-                    // into the column loop below. It is the same expression on the same inputs, so
-                    // byte-identity is immediate; what it removes is one full-width STORE here and
-                    // one full-width LOAD there, per column, which exist only to shuttle a value
-                    // between two loops of the same iteration. That is the one thing the compiler
-                    // cannot do itself, unlike the ALU rewrites of #48A and #48D which it had
-                    // already done.
-                    if !INL_SBT {
-                        for j in gbeg..gend {
-                            let col_base = j as usize * LANES;
-                            let q_v = $lds(qcode.as_ptr().add(col_base));
-                            let is_eq = $ceq(t_v, q_v);
-                            let is_n = $orru(t_is_n, $cge(q_v, amb_v));
-                            // One biased value per cell: N wins over the equality test, exactly as
-                            // the split form's `is_n` blend sat outermost on both halves.
-                            let sbt = $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v));
-                            $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
-                        }
-                    }
-
-                    // The shared column loop over the union band. Every lane executes every column;
-                    // `band` decides whether the lane keeps the result. This is the core trade of
-                    // inter-sequence batching: uniform control flow at the cost of some wasted lanes.
-                    // --- inner loop (vector): one column of all lanes per iteration ---
-                    // Invariant at the top of each `j` iteration: lane `l` of `h1_v` holds
-                    // H(i, j-1), lane `l` of `f_v` holds F(i, j) carried from the left, and lane
-                    // `l` of `rowmax_v`/`mj_v` holds the best H in columns `beg[l]..j` of this row
-                    // and its column index (only meaningful for lanes that were in band).
-                    // ISSUE: the band mask and the five blends it drives are nine of the twenty-six vector ops
-                    // this loop emits per column of sixteen cells (counted in the shipped disassembly, not in
-                    // the source). In the columns where EVERY live lane is in band, that mask is provably
-                    // all-ones, so all nine fold away. Same shape as the rescue kernel's padding regime, and
-                    // the same byte-identity argument: a provably constant mask folded, not a mask dropped.
-                    macro_rules! column {
-                                ($j:expr, $masked:literal, $share_oe:literal) => {{
-                                    let j = $j;
-                                // Byte offset of column `j` in every SoA buffer (all lanes of that column
-                                // sit contiguously, which is the whole point of the layout).
+                        // --- substitution pre-pass (vector, off the critical path) ---
+                        // For every band column, compute the same `sbt_pos`/`sbt_neg` the DP body used to
+                        // compute inline, and stash them. These ops depend only on `t_v` (fixed this row)
+                        // and the column's query base, so they carry no DP dependency and the scheduler
+                        // runs them at throughput here instead of braided into the H/E/F chain below.
+                        // Issue #48B: with `INL_SBT` the pre-pass does not run at all and its body moves
+                        // into the column loop below. It is the same expression on the same inputs, so
+                        // byte-identity is immediate; what it removes is one full-width STORE here and
+                        // one full-width LOAD there, per column, which exist only to shuttle a value
+                        // between two loops of the same iteration. That is the one thing the compiler
+                        // cannot do itself, unlike the ALU rewrites of #48A and #48D which it had
+                        // already done.
+                        if !INL_SBT {
+                            for j in gbeg..gend {
                                 let col_base = j as usize * LANES;
-                                // The column index itself broadcast to every lane, so the band compares
-                                // and the `mj` update can be done lane-wise against per-lane bounds.
-                                let j_v = $dup(j as $elem);
-                                // band = active && beg <= j < end, as an all-ones/all-zero mask per lane.
-                                // Two compares rather than a shift-based window because `beg`/`end` differ
-                                // per lane.
-                                //
-                                // ISSUE #48C. `$band` is the per-ISA spelling of `(j >= beg) & (j < end)`,
-                                // because the good spelling is not the same everywhere and the disassembly
-                                // says so: AVX2 and SSE4.1 have no unsigned byte compare, so the portable
-                                // form is emulated as two `vpmaxub` plus two `vpcmpeqb` plus an `vpandn`,
-                                // about 6 of the 54 instructions in their column loop. XOR-ing `j`, `beg`
-                                // and `end` by 0x80 (an order-preserving bijection between u8 and i8) makes
-                                // the native signed `vpcmpgtb` legal and takes it to two compares and one
-                                // `vpandn`. AVX-512 needs none of this: it has `vpcmpltub` and LLVM already
-                                // emits it, which is why its column loop is 38 instructions and its
-                                // `band_bias` is 0. NEON likewise has native `vcgeq_u8`/`vcltq_u8`.
-                                let j_band_v = $dup((j as $elem) ^ ($bbias as $elem));
-                                let band = if $masked {
-                                        if $bwidth {
-                                            $band(j_band_v, beg_v, end_v)
-                                        } else {
-                                            $andu(active_v, $band(j_band_v, beg_v, end_v))
-                                        }
-                                    } else {
-                                        // Unreachable in the unmasked range and folded away there; naming it
-                                        // keeps the two arms textually one body.
-                                        ones_v
-                                    };
-
-                                // This column's biased substitution score, from the pre-pass above. One
-                                // load replaces the ~7 ALU ops that used to sit on the critical path here,
-                                // and, since the pre-pass went from a pair of values to one, half the loads
-                                // and half the stores the pre-pass form originally cost.
-                                let sbt = if INL_SBT {
-                                    let q_v = $lds(qcode.as_ptr().add(col_base));
+                                let q_v = $lds(qcode.as_ptr().add(col_base));
+                                // One biased value per cell: N wins over the equality test, exactly as
+                                // the split form's `is_n` blend sat outermost on both halves.
+                                let sbt = if $sbt_tbl {
+                                    let ($tt, $tk, $tq) = (tab_v, t_key, q_v);
+                                    $tblx
+                                } else {
                                     let is_eq = $ceq(t_v, q_v);
                                     let is_n = $orru(t_is_n, $cge(q_v, amb_v));
                                     $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
-                                } else {
-                                    $lds(sbt_buf.as_ptr().add(col_base))
                                 };
-
-                                let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
-                                                                             // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
-                                                                             // deletion state ENTERING cell (i, j), so it is indexed (i, j) here and in
-                                                                             // the scalar path. Same convention as the C ("eh[j] = { H(i-1,j-1), E(i,j) }",
-                                                                             // `ksw.cpp:479`); labelling it E(i-1, j) would make the two paths look like
-                                                                             // they hold different values when they hold the same one.
-                                let e_v = $lds(eh_e.as_ptr().add(col_base)); // E(i, j)
-
-                                // eh_h[j] <- h1 (old) for in-band lanes; out-of-band keep old m_v.
-                                // The mask has to be applied on the *store*, not skipped around, because all
-                                // lanes share the store instruction: writing back the value just loaded is
-                                // how an out-of-band lane is left untouched.
-                                $sts(
-                                        eh_h.as_mut_ptr().add(col_base),
-                                        if $masked { $bsl(band, h1_v, m_v) } else { h1_v },
-                                    );
-
-                                // M = ((m + (bias + score)) - bias); m==0 -> local restart (0). Saturating
-                                // for u8, plain for signed; identical either way in the guaranteed range,
-                                // which for u8 is what `dispatch_bins` reserves headroom for.
-                                let bigm_pre = {
-                                    let ($dm, $ds, $db) = (m_v, sbt, sbt_bias_v);
-                                    $diag
-                                };
-                                // The local restart: `ceqz` finds the lanes whose diagonal predecessor was
-                                // already 0 and forces M back to 0 there (`ksw.cpp:487`,
-                                // `bandedSWA.cpp:334-335` which does the same `cmpeq h00, zero` + blend).
-                                let bigm_v = $bsl($ceqz(m_v), zero_v, bigm_pre);
-
-                                // max(M, E) is only an intermediate on the way to H; gaps open from M, not
-                                // from this (see below).
-                                let m_or_e_v = $max(bigm_v, e_v);
-                                let h_v = $max(m_or_e_v, f_v);
-                                h1_v = if $masked { $bsl(band, h_v, h1_v) } else { h_v };
-
-                                // if row_max <= h { mj = j; row_max = h } (ties take larger j)
-                                // `$cge` gives the non-strict compare, matching the scalar `row_max <= h`
-                                // and `ksw.cpp:491`. Because `j` increases monotonically, the last lane to
-                                // satisfy it wins, which reproduces the C's "later column keeps the tie".
-                                // All-ones in the lanes that are in band *and* whose new H ties or beats
-                                // this row's running best, i.e. exactly the lanes whose `rowmax`/`mj` the
-                                // two blends below should replace.
-                                let cmp = $cge(h_v, rowmax_v);
-                                let upd = if $masked { $andu(band, cmp) } else { cmp };
-                                rowmax_v = $bsl(upd, h_v, rowmax_v);
-                                mj_v = $bsl(upd, j_v, mj_v);
-
-                                // e = max(e - e_del, max(M - oe_del, 0)); bandedSWA's MAIN_CODE16 opens the
-                                // gap from `m11`, not `h11` (`bandedSWA.cpp:342-345`). The explicit
-                                // `max(., zero)` is redundant for the u8 kernel (saturating `sub` already
-                                // floors at 0) but free, and required for i16 where `sub` wraps.
-                                // `open_del_v` lane l = the score of opening a fresh deletion here,
-                                // M - (o_del + e_del), floored at 0; `e_new` lane l = E(i+1, j), the better
-                                // of extending the deletion already open in this column and that open.
-                                let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
-                                let e_new = $max($sub(e_v, e_del_v), open_del_v);
-                                $sts(
-                                        eh_e.as_mut_ptr().add(col_base),
-                                        if $masked { $bsl(band, e_new, e_v) } else { e_new },
-                                    );
-
-                                // f = max(f - e_ins, max(M - oe_ins, 0)). M does not depend on the carried f,
-                                // so the carried chain is just sub+max (~2 ops) with no f->h->f dependency.
-                                // This is the whole reason the F recurrence needs no lazy-F fixup loop of the
-                                // kind striped kernels use (`ksw.cpp:179-190`): striped layouts break the
-                                // left-to-right order of F, inter-sequence layouts do not. F is genuinely
-                                // sequential along the row, and that sequential chain is this kernel's
-                                // critical path, which is why shortening it to sub+max was a measurable win.
-                                // Mirror of the pair above for the insertion: `open_ins_v` lane l is the
-                                // cost-adjusted score of opening one here, `f_new` lane l is F(i, j+1),
-                                // which the next iteration will read as its carried `f_v`.
-                                let open_ins_v = if $share_oe {
-                                    open_del_v
-                                } else {
-                                    $max($sub(bigm_v, oe_ins_v), zero_v)
-                                };
-                                let f_new = $max($sub(f_v, e_ins_v), open_ins_v);
-                                f_v = if $masked { $bsl(band, f_new, f_v) } else { f_new };
-                                }};
+                                $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
                             }
-                    // `[fast_lo, fast_hi)` is where every lane is active and in band, so the mask is all-ones.
-                    // Empty the moment one lane has finished, which is why it is recomputed per row rather than
-                    // assumed: `run_side` re-collects active jobs per ROUND, but a lane can go inactive mid-DP.
-                    let (fast_lo, fast_hi) = if super::band_fast_enabled() {
-                        (fast_lo_raw.max(gbeg), fast_hi_raw.min(gend))
-                    } else {
-                        (gbeg, gbeg)
-                    };
-                    // bwa's stock `-O 6,6 -E 1,1` opens both gap kinds at one cost, so one `M - oe` feeds both
-                    // recurrences. Tested per row, not per cell: this branch never moves and the column
-                    // loops below stay free of it.
-                    if oe_del == oe_ins {
-                        for j in gbeg..fast_lo {
-                            column!(j, true, true);
                         }
-                        for j in fast_lo..fast_hi {
-                            column!(j, false, true);
-                        }
-                        for j in fast_hi.max(fast_lo)..gend {
-                            column!(j, true, true);
-                        }
-                    } else {
-                        for j in gbeg..fast_lo {
-                            column!(j, true, false);
-                        }
-                        for j in fast_lo..fast_hi {
-                            column!(j, false, false);
-                        }
-                        for j in fast_hi.max(fast_lo)..gend {
-                            column!(j, true, false);
-                        }
-                    }
 
-                    // --- row epilogue (scalar, per lane): mirrors batched_extend_scalar ---
-                    // Spill the three row results back to scalars. The row epilogue below is kept
-                    // scalar on purpose: it is per-row (not per-cell) work, it is full of data
-                    // dependent branching (z-drop, band tightening, early termination), and
-                    // vectorizing it would buy nothing while making the tie-breaks much harder to
-                    // keep bit-exact against the C.
-                    let mut h1_out = [0 as $elem; LANES];
-                    let mut rowmax_out = [0 as $elem; LANES];
-                    let mut mj_out = [0 as $elem; LANES];
-                    $sts(h1_out.as_mut_ptr(), h1_v);
-                    $sts(rowmax_out.as_mut_ptr(), rowmax_v);
-                    $sts(mj_out.as_mut_ptr(), mj_v);
+                        // The shared column loop over the union band. Every lane executes every column;
+                        // `band` decides whether the lane keeps the result. This is the core trade of
+                        // inter-sequence batching: uniform control flow at the cost of some wasted lanes.
+                        // --- inner loop (vector): one column of all lanes per iteration ---
+                        // Invariant at the top of each `j` iteration: lane `l` of `h1_v` holds
+                        // H(i, j-1), lane `l` of `f_v` holds F(i, j) carried from the left, and lane
+                        // `l` of `rowmax_v`/`mj_v` holds the best H in columns `beg[l]..j` of this row
+                        // and its column index (only meaningful for lanes that were in band).
+                        // ISSUE: the band mask and the five blends it drives are nine of the twenty-six vector ops
+                        // this loop emits per column of sixteen cells (counted in the shipped disassembly, not in
+                        // the source). In the columns where EVERY live lane is in band, that mask is provably
+                        // all-ones, so all nine fold away. Same shape as the rescue kernel's padding regime, and
+                        // the same byte-identity argument: a provably constant mask folded, not a mask dropped.
+                        macro_rules! column {
+                                    ($j:expr, $masked:literal, $share_oe:literal) => {{
+                                        let j = $j;
+                                    // Byte offset of column `j` in every SoA buffer (all lanes of that column
+                                    // sit contiguously, which is the whole point of the layout).
+                                    let col_base = j as usize * LANES;
+                                    // The column index itself broadcast to every lane, so the band compares
+                                    // and the `mj` update can be done lane-wise against per-lane bounds.
+                                    let j_v = $dup(j as $elem);
+                                    // band = active && beg <= j < end, as an all-ones/all-zero mask per lane.
+                                    // Two compares rather than a shift-based window because `beg`/`end` differ
+                                    // per lane.
+                                    //
+                                    // ISSUE #48C. `$band` is the per-ISA spelling of `(j >= beg) & (j < end)`,
+                                    // because the good spelling is not the same everywhere and the disassembly
+                                    // says so: AVX2 and SSE4.1 have no unsigned byte compare, so the portable
+                                    // form is emulated as two `vpmaxub` plus two `vpcmpeqb` plus an `vpandn`,
+                                    // about 6 of the 54 instructions in their column loop. XOR-ing `j`, `beg`
+                                    // and `end` by 0x80 (an order-preserving bijection between u8 and i8) makes
+                                    // the native signed `vpcmpgtb` legal and takes it to two compares and one
+                                    // `vpandn`. AVX-512 needs none of this: it has `vpcmpltub` and LLVM already
+                                    // emits it, which is why its column loop is 38 instructions and its
+                                    // `band_bias` is 0. NEON likewise has native `vcgeq_u8`/`vcltq_u8`.
+                                    let j_band_v = $dup((j as $elem) ^ ($bbias as $elem));
+                                    let band = if $masked {
+                                            if $bwidth {
+                                                $band(j_band_v, beg_v, end_v)
+                                            } else {
+                                                $andu(active_v, $band(j_band_v, beg_v, end_v))
+                                            }
+                                        } else {
+                                            // Unreachable in the unmasked range and folded away there; naming it
+                                            // keeps the two arms textually one body.
+                                            ones_v
+                                        };
 
-                    for l in 0..nlane {
-                        if !active[l] {
-                            continue;
-                        }
-                        // Widen back to i32 before any comparison: the trackers (`max`, `gscore`,
-                        // `max_i`, ...) are i32 and hold values like -1 that `$elem` cannot express.
-                        // From here on the logic is identical to `batched_extend_scalar`'s epilogue,
-                        // and the comments there apply line for line.
-                        let h1_l = i32::from(h1_out[l]);
-                        let row_max_l = i32::from(rowmax_out[l]);
-                        let mj_l = i32::from(mj_out[l]);
-                        eh_h[end[l] as usize * LANES + l] = h1_l as $elem;
-                        eh_e[end[l] as usize * LANES + l] = 0;
-                        if end[l] == qlen[l] as i32 && gscore[l] <= h1_l {
-                            max_ie[l] = i;
-                            gscore[l] = h1_l;
-                        }
-                        if row_max_l == 0 {
-                            done[l] = true;
-                            continue;
-                        }
-                        if row_max_l > max[l] {
-                            max[l] = row_max_l;
-                            max_i[l] = i;
-                            max_j[l] = mj_l;
-                            let off = (mj_l - i).abs();
-                            if off > max_off[l] {
-                                max_off[l] = off;
+                                    // This column's biased substitution score, from the pre-pass above. One
+                                    // load replaces the ~7 ALU ops that used to sit on the critical path here,
+                                    // and, since the pre-pass went from a pair of values to one, half the loads
+                                    // and half the stores the pre-pass form originally cost.
+                                    let sbt = if INL_SBT {
+                                        let q_v = $lds(qcode.as_ptr().add(col_base));
+                                        if $sbt_tbl {
+                                            let ($tt, $tk, $tq) = (tab_v, t_key, q_v);
+                                            $tblx
+                                        } else {
+                                            let is_eq = $ceq(t_v, q_v);
+                                            let is_n = $orru(t_is_n, $cge(q_v, amb_v));
+                                            $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
+                                        }
+                                    } else {
+                                        $lds(sbt_buf.as_ptr().add(col_base))
+                                    };
+
+                                    let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
+                                                                                 // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
+                                                                                 // deletion state ENTERING cell (i, j), so it is indexed (i, j) here and in
+                                                                                 // the scalar path. Same convention as the C ("eh[j] = { H(i-1,j-1), E(i,j) }",
+                                                                                 // `ksw.cpp:479`); labelling it E(i-1, j) would make the two paths look like
+                                                                                 // they hold different values when they hold the same one.
+                                    let e_v = $lds(eh_e.as_ptr().add(col_base)); // E(i, j)
+
+                                    // eh_h[j] <- h1 (old) for in-band lanes; out-of-band keep old m_v.
+                                    // The mask has to be applied on the *store*, not skipped around, because all
+                                    // lanes share the store instruction: writing back the value just loaded is
+                                    // how an out-of-band lane is left untouched.
+                                    let h_st = if $masked { $bsl(band, h1_v, m_v) } else { h1_v };
+                                    $sts(eh_h.as_mut_ptr().add(col_base), h_st);
+
+                                    // M = ((m + (bias + score)) - bias); m==0 -> local restart (0). Saturating
+                                    // for u8, plain for signed; identical either way in the guaranteed range,
+                                    // which for u8 is what `dispatch_bins` reserves headroom for.
+                                    let bigm_pre = {
+                                        let ($dm, $ds, $db) = (m_v, sbt, sbt_bias_v);
+                                        $diag
+                                    };
+                                    // The local restart: `ceqz` finds the lanes whose diagonal predecessor was
+                                    // already 0 and forces M back to 0 there (`ksw.cpp:487`,
+                                    // `bandedSWA.cpp:334-335` which does the same `cmpeq h00, zero` + blend).
+                                    let bigm_v = $bsl($ceqz(m_v), zero_v, bigm_pre);
+
+                                    // max(M, E) is only an intermediate on the way to H; gaps open from M, not
+                                    // from this (see below).
+                                    let m_or_e_v = $max(bigm_v, e_v);
+                                    let h_v = $max(m_or_e_v, f_v);
+                                    h1_v = if $masked { $bsl(band, h_v, h1_v) } else { h_v };
+
+                                    // if row_max <= h { mj = j; row_max = h } (ties take larger j)
+                                    // `$cge` gives the non-strict compare, matching the scalar `row_max <= h`
+                                    // and `ksw.cpp:491`. Because `j` increases monotonically, the last lane to
+                                    // satisfy it wins, which reproduces the C's "later column keeps the tie".
+                                    // All-ones in the lanes that are in band *and* whose new H ties or beats
+                                    // this row's running best, i.e. exactly the lanes whose `rowmax`/`mj` the
+                                    // two blends below should replace.
+                                    let cmp = $cge(h_v, rowmax_v);
+                                    let upd = if $masked { $andu(band, cmp) } else { cmp };
+                                    rowmax_v = $bsl(upd, h_v, rowmax_v);
+                                    mj_v = $bsl(upd, j_v, mj_v);
+
+                                    // e = max(e - e_del, max(M - oe_del, 0)); bandedSWA's MAIN_CODE16 opens the
+                                    // gap from `m11`, not `h11` (`bandedSWA.cpp:342-345`). The explicit
+                                    // `max(., zero)` is redundant for the u8 kernel (saturating `sub` already
+                                    // floors at 0) but free, and required for i16 where `sub` wraps.
+                                    // `open_del_v` lane l = the score of opening a fresh deletion here,
+                                    // M - (o_del + e_del), floored at 0; `e_new` lane l = E(i+1, j), the better
+                                    // of extending the deletion already open in this column and that open.
+                                    let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
+                                    let e_new = $max($sub(e_v, e_del_v), open_del_v);
+                                    let e_st = if $masked { $bsl(band, e_new, e_v) } else { e_new };
+                                    $sts(eh_e.as_mut_ptr().add(col_base), e_st);
+                                    // What the C's band scans test at this column, `eh[j].h == 0 &&
+                                    // eh[j].e == 0`, on the values just stored.
+                                    let dead = $ceqz($orr(h_st, e_st));
+                                    last_v = $bsl(dead, last_v, j_v);
+                                    first_v = $bsl(unseen_v, j_v, first_v);
+                                    unseen_v = $andu(unseen_v, dead);
+
+                                    // f = max(f - e_ins, max(M - oe_ins, 0)). M does not depend on the carried f,
+                                    // so the carried chain is just sub+max (~2 ops) with no f->h->f dependency.
+                                    // This is the whole reason the F recurrence needs no lazy-F fixup loop of the
+                                    // kind striped kernels use (`ksw.cpp:179-190`): striped layouts break the
+                                    // left-to-right order of F, inter-sequence layouts do not. F is genuinely
+                                    // sequential along the row, and that sequential chain is this kernel's
+                                    // critical path, which is why shortening it to sub+max was a measurable win.
+                                    // Mirror of the pair above for the insertion: `open_ins_v` lane l is the
+                                    // cost-adjusted score of opening one here, `f_new` lane l is F(i, j+1),
+                                    // which the next iteration will read as its carried `f_v`.
+                                    let open_ins_v = if $share_oe {
+                                        open_del_v
+                                    } else {
+                                        $max($sub(bigm_v, oe_ins_v), zero_v)
+                                    };
+                                    let f_new = $max($sub(f_v, e_ins_v), open_ins_v);
+                                    f_v = if $masked { $bsl(band, f_new, f_v) } else { f_new };
+                                    }};
+                                }
+                        // `[fast_lo, fast_hi)` is where every lane is active and in band, so the mask is all-ones.
+                        // Empty the moment one lane has finished, which is why it is recomputed per row rather than
+                        // assumed: `run_side` re-collects active jobs per ROUND, but a lane can go inactive mid-DP.
+                        let (fast_lo, fast_hi) = if band_fast {
+                            (fast_lo_raw.max(gbeg), fast_hi_raw.min(gend))
+                        } else {
+                            (gbeg, gbeg)
+                        };
+                        // bwa's stock `-O 6,6 -E 1,1` opens both gap kinds at one cost, so one `M - oe` feeds both
+                        // recurrences. Tested per row, not per cell: this branch never moves and the column
+                        // loops below stay free of it.
+                        if oe_del == oe_ins {
+                            for j in gbeg..fast_lo {
+                                column!(j, true, true);
                             }
-                        } else if zdrop > 0 {
-                            let drop = if i - max_i[l] > mj_l - max_j[l] {
-                                max[l] - row_max_l - ((i - max_i[l]) - (mj_l - max_j[l])) * e_del
-                            } else {
-                                max[l] - row_max_l - ((mj_l - max_j[l]) - (i - max_i[l])) * e_ins
+                            for j in fast_lo..fast_hi {
+                                column!(j, false, true);
+                            }
+                            for j in fast_hi.max(fast_lo)..gend {
+                                column!(j, true, true);
+                            }
+                        } else {
+                            for j in gbeg..fast_lo {
+                                column!(j, true, false);
+                            }
+                            for j in fast_lo..fast_hi {
+                                column!(j, false, false);
+                            }
+                            for j in fast_hi.max(fast_lo)..gend {
+                                column!(j, true, false);
+                            }
+                        }
+
+                        // --- row epilogue: mirrors batched_extend_scalar ---
+                        // Spill the three row results back to scalars. The trackers (`max`, `gscore`,
+                        // `max_i`, ..., termination) are per-row work with data-dependent tests; the
+                        // NEON u8 kernel updates them in i32 vector lanes with the tests as selects
+                        // (`rowvec`), the others per lane. The scatter stores and the band-tightening
+                        // scans stay scalar everywhere. Widened to i32 before any comparison: the
+                        // trackers hold values like -1 that `$elem` cannot express. The logic is
+                        // identical to `batched_extend_scalar`'s epilogue, whose comments apply.
+                        let mut h1_out = [0 as $elem; LANES];
+                        let mut rowmax_out = [0 as $elem; LANES];
+                        let mut mj_out = [0 as $elem; LANES];
+                        $sts(h1_out.as_mut_ptr(), h1_v);
+                        $sts(rowmax_out.as_mut_ptr(), rowmax_v);
+                        $sts(mj_out.as_mut_ptr(), mj_v);
+                        let mut first_out = [0 as $elem; LANES];
+                        let mut last_out = [0 as $elem; LANES];
+                        let mut seen_out = [0 as $elem; LANES];
+                        $sts(first_out.as_mut_ptr(), first_v);
+                        $sts(last_out.as_mut_ptr(), last_v);
+                        $sts(seen_out.as_mut_ptr(), $bsl(unseen_v, zero_v, $dup(1 as $elem)));
+
+                        if $rowvec {
+                            // SAFETY: as for `prologue16`.
+                            let live = unsafe {
+                                super::$rowmod::epilogue::<LANES>(
+                                    i,
+                                    active.as_ptr(),
+                                    h1_out.as_ptr() as *const u8,
+                                    rowmax_out.as_ptr() as *const u8,
+                                    mj_out.as_ptr() as *const u8,
+                                    end.as_ptr().cast(),
+                                    qlen32.as_ptr().cast(),
+                                    zdrop,
+                                    e_del,
+                                    e_ins,
+                                    max.as_mut_ptr().cast(),
+                                    max_i.as_mut_ptr().cast(),
+                                    max_j.as_mut_ptr().cast(),
+                                    max_ie.as_mut_ptr().cast(),
+                                    gscore.as_mut_ptr().cast(),
+                                    max_off.as_mut_ptr().cast(),
+                                    done.as_mut_ptr(),
+                                    beg.as_ptr().cast(),
+                                    tlen32.as_ptr().cast(),
+                                    h0.as_ptr().cast(),
+                                    stop,
+                                )
                             };
-                            if drop > zdrop {
+                            // Band tightening (`ksw.cpp:519-523`) from the column loop's trackers,
+                            // picked in vector lanes. Columns outside `[beg, end)` hold zeros from this
+                            // chunk except at `end` itself, which keeps last row's `h1` when the `qlen`
+                            // clamp held `end` still, and past `qlen`, where another lane's columns may
+                            // hold a previous chunk's values: a lane whose tracker points at or past
+                            // `end` scans the row instead, from `end - 1` down to its new `beg` (a
+                            // 16-lane vector scan runs as deep as the deepest lane, 1.5x slower).
+                            // Unchecked indexing: every column touched is in `[beg, end] <= qlen <
+                            // stride`, the buffers' column count, and `last_live >= beg` is tested first.
+                            *nxt = live & next_bits;
+                            let (hp, ep) = (eh_h.as_mut_ptr(), eh_e.as_mut_ptr());
+                            // `eh[end] = {h1, 0}` for every lane, branch-free: an inactive lane's
+                            // slot is never read again (a lane moved in brings its own columns), and
+                            // its `end` is in `0..=qlen` all the same.
+                            let off: [u32; LANES] =
+                                std::array::from_fn(|l| end[l] as u32 * LANES as u32 + l as u32);
+                            for l in 0..LANES {
+                                // SAFETY: see above.
+                                unsafe {
+                                    *hp.add(off[l] as usize) = h1_out[l];
+                                    *ep.add(off[l] as usize) = 0;
+                                }
+                            }
+                            // SAFETY: as for `prologue16`; the outputs are u8 (`rowvec`).
+                            let mut sc = unsafe {
+                                super::$rowmod::tighten::<LANES>(
+                                    live,
+                                    first_out.as_ptr() as *const u8,
+                                    last_out.as_ptr() as *const u8,
+                                    seen_out.as_ptr() as *const u8,
+                                    h1_out.as_ptr() as *const u8,
+                                    qlen32.as_ptr().cast(),
+                                    beg.as_mut_ptr().cast(),
+                                    end.as_mut_ptr().cast(),
+                                )
+                            };
+                            while sc != 0 {
+                                let l = sc.trailing_zeros() as usize;
+                                sc &= sc - 1;
+                                let mut last_live = i32::from(end[l]) - 1;
+                                // SAFETY: see above.
+                                while last_live >= i32::from(beg[l])
+                                    && unsafe {
+                                        *hp.add(last_live as usize * LANES + l) == 0
+                                            && *ep.add(last_live as usize * LANES + l) == 0
+                                    }
+                                {
+                                    last_live -= 1;
+                                }
+                                end[l] = (last_live + 2).min(qlen[l] as i32) as $trk;
+                            }
+                            continue;
+                        }
+                        for l in 0..nlane {
+                            if !active[l] {
+                                continue;
+                            }
+                            let h1_l = i32::from(h1_out[l]);
+                            let row_max_l = i32::from(rowmax_out[l]);
+                            let mj_l = i32::from(mj_out[l]);
+                            let (end_l, qlen_l) = (i32::from(end[l]), qlen[l] as i32);
+                            eh_h[end_l as usize * LANES + l] = h1_l as $elem;
+                            eh_e[end_l as usize * LANES + l] = 0;
+                            if end_l == qlen_l && i32::from(gscore[l]) <= h1_l {
+                                max_ie[l] = i as $trk;
+                                gscore[l] = h1_l as $trk;
+                            }
+                            if row_max_l == 0 {
                                 done[l] = true;
                                 continue;
                             }
+                            let (mx, mi, mjj) = (i32::from(max[l]), i32::from(max_i[l]), i32::from(max_j[l]));
+                            if row_max_l > mx {
+                                max[l] = row_max_l as $trk;
+                                max_i[l] = i as $trk;
+                                max_j[l] = mj_l as $trk;
+                                let off = (mj_l - i).abs();
+                                if off > i32::from(max_off[l]) {
+                                    max_off[l] = off as $trk;
+                                }
+                            } else if zdrop > 0 {
+                                let drop = if i - mi > mj_l - mjj {
+                                    mx - row_max_l - ((i - mi) - (mj_l - mjj)) * e_del
+                                } else {
+                                    mx - row_max_l - ((mj_l - mjj) - (i - mi)) * e_ins
+                                };
+                                if drop > zdrop {
+                                    done[l] = true;
+                                    continue;
+                                }
+                            }
+                            // The exact stop (see `exact_stop_enabled`), from the row's own `beg`.
+                            if let Some((sc, eb)) = stop {
+                                let (b, mx) = (i32::from(beg[l]), i32::from(max[l]));
+                                let vmax = if b == 0 { row_max_l.max(i32::from(h0[l])) } else { row_max_l };
+                                let bound = vmax + sc.max(0) * (tlen[l] as i32 - 1 - i).min(qlen_l - b);
+                                if bound <= mx && (bound < i32::from(gscore[l]) || bound <= mx.saturating_sub(eb)) {
+                                    done[l] = true;
+                                    continue;
+                                }
+                            }
+                            // From the trackers; see the `rowvec` arm for the two stale cases.
+                            let first_live = if seen_out[l] != 0 {
+                                (first_out[l] as i32).min(end_l)
+                            } else {
+                                end_l
+                            };
+                            beg[l] = first_live as $trk;
+                            let last_live = if h1_out[l] != 0 {
+                                end_l
+                            } else if seen_out[l] == 0 {
+                                first_live - 1
+                            } else if (last_out[l] as i32) < end_l {
+                                last_out[l] as i32
+                            } else {
+                                let mut last_live = end_l - 1;
+                                while last_live >= first_live
+                                    && eh_h[last_live as usize * LANES + l] == 0
+                                    && eh_e[last_live as usize * LANES + l] == 0
+                                {
+                                    last_live -= 1;
+                                }
+                                last_live
+                            };
+                            end[l] = (if last_live + 2 < qlen_l { last_live + 2 } else { qlen_l }) as $trk;
                         }
-                        let mut first_live = beg[l];
-                        while first_live < end[l]
-                            && eh_h[first_live as usize * LANES + l] == 0
-                            && eh_e[first_live as usize * LANES + l] == 0
-                        {
-                            first_live += 1;
+
+                    }
+                    if nvec < 2 {
+                        continue;
+                    }
+                    // --- compaction between rows ---
+                    // A lane stays live into row i + 1 iff it is not done and has that row.
+                    let mut live = [0u64; super::COMPACT_MAX];
+                    let mut runv = [false; super::COMPACT_MAX];
+                    for v in 0..nvec {
+                        runv[v] = vs[v].run;
+                        if runv[v] && $rowvec {
+                            live[v] = vs[v].nxt;
+                        } else if runv[v] {
+                            let st = &vs[v];
+                            for l in 0..LANES {
+                                if !st.done[l] && (i + 1) < i32::from(st.tlen32[l]) {
+                                    live[v] |= 1u64 << l;
+                                }
+                            }
                         }
-                        beg[l] = first_live;
-                        let mut last_live = end[l];
-                        while last_live >= beg[l]
-                            && eh_h[last_live as usize * LANES + l] == 0
-                            && eh_e[last_live as usize * LANES + l] == 0
-                        {
-                            last_live -= 1;
-                        }
-                        end[l] = if last_live + 2 < qlen[l] as i32 {
-                            last_live + 2
+                    }
+                    moves.clear();
+                    super::compact_plan(&mut live[..nvec], &mut runv[..nvec], LANES, &mut moves);
+                    for &(sv, sl, dv, dl) in &moves {
+                        let (sv, sl, dv, dl) = (sv as usize, sl as usize, dv as usize, dl as usize);
+                        let (src, dst) = if sv < dv {
+                            let (a, b) = vs.split_at_mut(dv);
+                            (&mut a[sv], &mut b[0])
                         } else {
-                            qlen[l] as i32
+                            let (a, b) = vs.split_at_mut(sv);
+                            (&mut b[0], &mut a[dv])
                         };
+                        // The slot being overwritten holds a finished lane: its result first.
+                        let k = dst.jid[dl];
+                        if k != u32::MAX {
+                            out[k as usize] = ExtendResult {
+                                score: i32::from(dst.max[dl]),
+                                qle: i32::from(dst.max_j[dl]) + 1,
+                                tle: i32::from(dst.max_i[dl]) + 1,
+                                gtle: i32::from(dst.max_ie[dl]) + 1,
+                                gscore: i32::from(dst.gscore[dl]),
+                                max_off: i32::from(dst.max_off[dl]),
+                            };
+                        }
+                        // Only what the lane can still read: columns `0..=qlen` of H/E (`end <= qlen`;
+                        // those below `beg` must carry over too), its query codes, and its target
+                        // rows from `i + 1`. The rest of the slot is outside its band, masked.
+                        let (ql, tl) = (src.qlen[sl], src.tlen[sl]);
+                        // Unchecked: every vector's buffers hold `stride` (> qlen) H/E columns,
+                        // `soa_cols` (>= stride) query and `soa_rows` (> tlen) target columns.
+                        assert!(
+                            ql < stride && dst.eh_h.len() == stride * LANES && src.eh_h.len() == stride * LANES
+                                && dst.eh_e.len() == stride * LANES && src.eh_e.len() == stride * LANES
+                                && dst.qcode.len() >= ql * LANES && src.qcode.len() >= ql * LANES
+                                && dst.tcode.len() >= tl * LANES && src.tcode.len() >= tl * LANES
+                        );
+                        // SAFETY: the lengths just asserted bound every index below.
+                        unsafe {
+                            let (dh, sh) = (dst.eh_h.as_mut_ptr().add(dl), src.eh_h.as_ptr().add(sl));
+                            let (de, se) = (dst.eh_e.as_mut_ptr().add(dl), src.eh_e.as_ptr().add(sl));
+                            for c in 0..=ql {
+                                *dh.add(c * LANES) = *sh.add(c * LANES);
+                                *de.add(c * LANES) = *se.add(c * LANES);
+                            }
+                            let (dq, sq) = (dst.qcode.as_mut_ptr().add(dl), src.qcode.as_ptr().add(sl));
+                            for c in 0..ql {
+                                *dq.add(c * LANES) = *sq.add(c * LANES);
+                            }
+                            let (dt, stc) = (dst.tcode.as_mut_ptr().add(dl), src.tcode.as_ptr().add(sl));
+                            for r in (i as usize + 1)..tl {
+                                *dt.add(r * LANES) = *stc.add(r * LANES);
+                            }
+                        }
+                        dst.qlen[dl] = src.qlen[sl];
+                        dst.tlen[dl] = src.tlen[sl];
+                        dst.qlen32[dl] = src.qlen32[sl];
+                        dst.tlen32[dl] = src.tlen32[sl];
+                        dst.h0[dl] = src.h0[sl];
+                        dst.w[dl] = src.w[sl];
+                        dst.beg[dl] = src.beg[sl];
+                        dst.end[dl] = src.end[sl];
+                        dst.max[dl] = src.max[sl];
+                        dst.max_i[dl] = src.max_i[sl];
+                        dst.max_j[dl] = src.max_j[sl];
+                        dst.max_ie[dl] = src.max_ie[sl];
+                        dst.gscore[dl] = src.gscore[sl];
+                        dst.max_off[dl] = src.max_off[sl];
+                        dst.done[dl] = false;
+                        dst.jid[dl] = src.jid[sl];
+                        src.jid[sl] = u32::MAX;
+                        src.done[sl] = true;
+                    }
+                    for v in 0..nvec {
+                        vs[v].run = runv[v];
                     }
                 }
 
-                for l in 0..nlane {
-                    out[chunk_start + l] = ExtendResult {
-                        score: max[l],
-                        qle: max_j[l] + 1,
-                        tle: max_i[l] + 1,
-                        gtle: max_ie[l] + 1,
-                        gscore: gscore[l],
-                        max_off: max_off[l],
-                    };
+                for st in &vs[..nvec] {
+                    for l in 0..LANES {
+                        let k = st.jid[l];
+                        if k != u32::MAX {
+                            out[k as usize] = ExtendResult {
+                                score: i32::from(st.max[l]),
+                                qle: i32::from(st.max_j[l]) + 1,
+                                tle: i32::from(st.max_i[l]) + 1,
+                                gtle: i32::from(st.max_ie[l]) + 1,
+                                gscore: i32::from(st.gscore[l]),
+                                max_off: i32::from(st.max_off[l]),
+                            };
+                        }
+                    }
                 }
             }
 
+            KEEP.set((vs, sbt_buf, moves));
             out
         }
     };
+}
+
+/// The x86 u8 kernels' row prologue and epilogue in i16 vector lanes (`rowvec` in
+/// [`define_sw_kernel!`], `trk = i16`), sixteen lanes per AVX2 register: the NEON `neon_row`
+/// logic over `N` lanes (32 for AVX2, 64 for AVX-512, which implies AVX2). Writes the lane
+/// vectors in the x86 kernels' form: `beg`/`end` XOR-ed with `bias` (`band_bias`), `end` itself
+/// (no `band_width`).
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86_row {
+    use std::arch::x86_64::*;
+
+    /// Sixteen bytes from `p` widened to i16.
+    #[target_feature(enable = "avx2")]
+    unsafe fn widen16(p: *const u8) -> __m256i {
+        _mm256_cvtepu8_epi16(_mm_loadu_si128(p as *const __m128i))
+    }
+
+    /// Sixteen i16 in `0..256` narrowed to sixteen bytes stored at `p`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn narrow16(p: *mut u8, v: __m256i) {
+        let b = _mm_packus_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        _mm_storeu_si128(p as *mut __m128i, b);
+    }
+
+    /// One bit per i16 lane of a mask.
+    #[target_feature(enable = "avx2")]
+    unsafe fn bits16(m: __m256i) -> u64 {
+        let b = _mm_packs_epi16(_mm256_castsi256_si128(m), _mm256_extracti128_si256::<1>(m));
+        _mm_movemask_epi8(b) as u32 as u64
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn ld(p: *const i16) -> __m256i {
+        _mm256_loadu_si256(p as *const __m256i)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn st(p: *mut i16, v: __m256i) {
+        _mm256_storeu_si256(p as *mut __m256i, v)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn sel(m: __m256i, t: __m256i, f: __m256i) -> __m256i {
+        _mm256_blendv_epi8(f, t, m)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn hmin(v: __m256i) -> i16 {
+        let x = _mm_min_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        let x = _mm_min_epi16(x, _mm_srli_si128::<8>(x));
+        let x = _mm_min_epi16(x, _mm_srli_si128::<4>(x));
+        _mm_extract_epi16::<0>(_mm_min_epi16(x, _mm_srli_si128::<2>(x))) as i16
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn hmax(v: __m256i) -> i16 {
+        let x = _mm_max_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        let x = _mm_max_epi16(x, _mm_srli_si128::<8>(x));
+        let x = _mm_max_epi16(x, _mm_srli_si128::<4>(x));
+        _mm_extract_epi16::<0>(_mm_max_epi16(x, _mm_srli_si128::<2>(x))) as i16
+    }
+
+    /// The row epilogue's band tightening for the `live` lanes, from the column loop's trackers
+    /// (`first`, `last`, `seen`, and the row's `h1`): writes `beg`, and `end` for every lane the
+    /// trackers answer. Returns the lanes whose last live column needs the scan (their tracker
+    /// points at or past `end`): `beg` written, `end` left for the caller's scan.
+    ///
+    /// # Safety
+    /// AVX2; every pointer addresses `N` lanes; `N` is a multiple of 16.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn tighten<const N: usize>(
+        live: u64,
+        first: *const u8,
+        last: *const u8,
+        seen: *const u8,
+        h1: *const u8,
+        qlen: *const i16,
+        beg: *mut i16,
+        end: *mut i16,
+    ) -> u64 {
+        let lb = _mm256_setr_epi16(
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            i16::MIN,
+        );
+        let zero = _mm256_setzero_si256();
+        let (one, two) = (_mm256_set1_epi16(1), _mm256_set1_epi16(2));
+        let mut scan = 0u64;
+        for o in (0..N).step_by(16) {
+            let b16 = ((live >> o) & 0xffff) as u16;
+            if b16 == 0 {
+                continue;
+            }
+            let m = _mm256_cmpeq_epi16(_mm256_and_si256(_mm256_set1_epi16(b16 as i16), lb), lb);
+            let e = ld(end.add(o));
+            let sn = _mm256_cmpgt_epi16(widen16(seen.add(o)), zero);
+            let fl = sel(sn, _mm256_min_epi16(widen16(first.add(o)), e), e);
+            st(beg.add(o), sel(m, fl, ld(beg.add(o))));
+            let lst = widen16(last.add(o));
+            let hz = _mm256_cmpeq_epi16(widen16(h1.add(o)), zero);
+            let ll = sel(hz, sel(sn, lst, _mm256_sub_epi16(fl, one)), e);
+            let need = _mm256_andnot_si256(
+                _mm256_cmpgt_epi16(e, lst),
+                _mm256_and_si256(m, _mm256_and_si256(hz, sn)),
+            );
+            let ne = _mm256_min_epi16(_mm256_add_epi16(ll, two), ld(qlen.add(o)));
+            st(end.add(o), sel(_mm256_andnot_si256(need, m), ne, e));
+            scan |= bits16(need) << o;
+        }
+        scan
+    }
+
+    /// As `neon_row::prologue`, over `N` lanes.
+    ///
+    /// # Safety
+    /// AVX2; every pointer addresses `N` lanes; `N` is a multiple of 16.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn prologue<const N: usize>(
+        i: i32,
+        done: *const bool,
+        tlen: *const i16,
+        qlen: *const i16,
+        w: *const i16,
+        h0: *const i16,
+        beg: *mut i16,
+        end: *mut i16,
+        o_del: i32,
+        e_del: i32,
+        h1: *mut u8,
+        active: *mut bool,
+        beg_lane: *mut u8,
+        end_lane: *mut u8,
+        active_lane: *mut u8,
+        bias: u8,
+    ) -> (i32, i32, i32, i32, u64) {
+        let iv = _mm256_set1_epi16(i as i16);
+        let i1 = _mm256_set1_epi16(i as i16 + 1);
+        let mut nbits = 0u64;
+        let zero = _mm256_setzero_si256();
+        let (one, ff) = (_mm256_set1_epi16(1), _mm256_set1_epi16(0xff));
+        let biasv = _mm256_set1_epi16(i16::from(bias));
+        // Exact: `h0 < 256`, so a penalty of 256 or more leaves 0 as the true one does.
+        let pen = _mm256_set1_epi16((o_del + e_del * (i + 1)).clamp(0, 256) as i16);
+        let (vmax, vmin) = (_mm256_set1_epi16(i16::MAX), _mm256_set1_epi16(i16::MIN));
+        let (mut gb, mut ge, mut fl, mut fh) = (vmax, zero, vmin, vmax);
+        for o in (0..N).step_by(16) {
+            let tl = ld(tlen.add(o));
+            let a = _mm256_andnot_si256(
+                _mm256_cmpgt_epi16(widen16(done.add(o) as *const u8), zero),
+                _mm256_cmpgt_epi16(tl, iv),
+            );
+            nbits |= bits16(_mm256_and_si256(a, _mm256_cmpgt_epi16(tl, i1))) << o;
+            let wv = ld(w.add(o));
+            let (b0, e0) = (ld(beg.add(o)), ld(end.add(o)));
+            let b = _mm256_max_epi16(b0, _mm256_sub_epi16(iv, wv));
+            let e = _mm256_min_epi16(
+                _mm256_min_epi16(e0, _mm256_add_epi16(_mm256_add_epi16(iv, wv), one)),
+                ld(qlen.add(o)),
+            );
+            st(beg.add(o), sel(a, b, b0));
+            st(end.add(o), sel(a, e, e0));
+            let h = _mm256_max_epi16(_mm256_sub_epi16(ld(h0.add(o)), pen), zero);
+            let hq = _mm256_and_si256(_mm256_and_si256(_mm256_cmpeq_epi16(b, zero), h), a);
+            gb = _mm256_min_epi16(gb, sel(a, b, vmax));
+            ge = _mm256_max_epi16(ge, sel(a, e, zero));
+            fl = _mm256_max_epi16(fl, sel(a, b, vmin));
+            fh = _mm256_min_epi16(fh, sel(a, e, vmax));
+            narrow16(h1.add(o), hq);
+            let xb = _mm256_and_si256(_mm256_xor_si256(_mm256_and_si256(b, ff), biasv), a);
+            let xe = _mm256_and_si256(_mm256_xor_si256(_mm256_and_si256(e, ff), biasv), a);
+            narrow16(beg_lane.add(o), xb);
+            narrow16(end_lane.add(o), xe);
+            narrow16(active_lane.add(o), _mm256_and_si256(a, ff));
+            narrow16(active.add(o) as *mut u8, _mm256_and_si256(a, one));
+        }
+        // The sentinels map back to the i32 ones the scalar arm returns; every real value is
+        // in `0..256`.
+        let wide = |v: i16| match v {
+            i16::MAX => i32::MAX,
+            i16::MIN => i32::MIN,
+            v => i32::from(v),
+        };
+        (
+            wide(hmin(gb)),
+            i32::from(hmax(ge)),
+            wide(hmax(fl)),
+            wide(hmin(fh)),
+            nbits,
+        )
+    }
+
+    /// As `neon_row::epilogue`, over `N` lanes; returns one bit per lane still live.
+    ///
+    /// # Safety
+    /// AVX2; every pointer addresses `N` lanes; `N` is a multiple of 16.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn epilogue<const N: usize>(
+        i: i32,
+        active: *const bool,
+        h1_out: *const u8,
+        rowmax_out: *const u8,
+        mj_out: *const u8,
+        end: *const i16,
+        qlen: *const i16,
+        zdrop: i32,
+        e_del: i32,
+        e_ins: i32,
+        max: *mut i16,
+        max_i: *mut i16,
+        max_j: *mut i16,
+        max_ie: *mut i16,
+        gscore: *mut i16,
+        max_off: *mut i16,
+        done: *mut bool,
+        beg: *const i16,
+        tlen: *const i16,
+        h0: *const i16,
+        stop: Option<(i32, i32)>,
+    ) -> u64 {
+        let iv = _mm256_set1_epi16(i as i16);
+        let zero = _mm256_setzero_si256();
+        let one = _mm256_set1_epi16(1);
+        // The z-drop test as in `neon_row::epilogue`: `L > min(a * e, 256)` (u16 product of
+        // the saturated `a` and `e`), where `L = mx - rm - zdrop < 256`, is exact.
+        let (ed, ei) = (
+            _mm256_set1_epi16(e_del.clamp(0, 255) as i16),
+            _mm256_set1_epi16(e_ins.clamp(0, 255) as i16),
+        );
+        let zd = _mm256_set1_epi16(zdrop.clamp(0, 1024) as i16);
+        let (c255, c256) = (_mm256_set1_epi16(255), _mm256_set1_epi16(256));
+        let zdrop_on = _mm256_set1_epi16(if zdrop > 0 { -1 } else { 0 });
+        // The exact stop's `(max_sc, end_bonus)`, clamped as in `neon_row::epilogue`.
+        let (sc_v, eb_v) = stop.map_or((zero, zero), |(sc, eb)| {
+            (
+                _mm256_set1_epi16(sc.clamp(0, 127) as i16),
+                _mm256_set1_epi16(eb.clamp(0, 1024) as i16),
+            )
+        });
+        let ivp1 = _mm256_set1_epi16(i as i16 + 1);
+        let mut live_bits = 0u64;
+        for o in (0..N).step_by(16) {
+            let a = _mm256_cmpgt_epi16(widen16(active.add(o) as *const u8), zero);
+            let h1 = widen16(h1_out.add(o));
+            let rm = widen16(rowmax_out.add(o));
+            let mj = widen16(mj_out.add(o));
+            let (mx, mi, mjj) = (ld(max.add(o)), ld(max_i.add(o)), ld(max_j.add(o)));
+            let gs = ld(gscore.add(o));
+            let g_upd = _mm256_andnot_si256(
+                _mm256_cmpgt_epi16(gs, h1),
+                _mm256_and_si256(a, _mm256_cmpeq_epi16(ld(end.add(o)), ld(qlen.add(o)))),
+            );
+            st(max_ie.add(o), sel(g_upd, iv, ld(max_ie.add(o))));
+            let gs = sel(g_upd, h1, gs);
+            st(gscore.add(o), gs);
+            let improve = _mm256_and_si256(a, _mm256_cmpgt_epi16(rm, mx));
+            let off = _mm256_abs_epi16(_mm256_sub_epi16(mj, iv));
+            let (di, dj) = (_mm256_sub_epi16(iv, mi), _mm256_sub_epi16(mj, mjj));
+            let ad = _mm256_min_epu16(_mm256_abs_epi16(_mm256_sub_epi16(di, dj)), c255);
+            let dd = _mm256_mullo_epi16(ad, sel(_mm256_cmpgt_epi16(di, dj), ed, ei));
+            let l = _mm256_sub_epi16(_mm256_sub_epi16(mx, rm), zd);
+            let drops = _mm256_cmpgt_epi16(l, _mm256_min_epu16(dd, c256));
+            let mut dead = _mm256_and_si256(
+                a,
+                _mm256_or_si256(
+                    _mm256_cmpeq_epi16(rm, zero),
+                    _mm256_and_si256(_mm256_andnot_si256(improve, zdrop_on), drops),
+                ),
+            );
+            let mo = ld(max_off.add(o));
+            st(
+                max_off.add(o),
+                sel(
+                    _mm256_and_si256(improve, _mm256_cmpgt_epi16(off, mo)),
+                    off,
+                    mo,
+                ),
+            );
+            let mx = sel(improve, rm, mx);
+            if stop.is_some() {
+                // The exact stop (see `exact_stop_enabled`), on the updated `max` and `gscore`.
+                let b = ld(beg.add(o));
+                let rem = _mm256_sub_epi16(ld(tlen.add(o)), ivp1);
+                let steps = _mm256_min_epi16(rem, _mm256_sub_epi16(ld(qlen.add(o)), b));
+                let vmax = sel(
+                    _mm256_cmpeq_epi16(b, zero),
+                    _mm256_max_epi16(rm, ld(h0.add(o))),
+                    rm,
+                );
+                let bound = _mm256_adds_epi16(vmax, _mm256_mullo_epi16(steps, sc_v));
+                let open = _mm256_or_si256(
+                    _mm256_cmpgt_epi16(bound, mx),
+                    _mm256_andnot_si256(
+                        _mm256_cmpgt_epi16(gs, bound),
+                        _mm256_cmpgt_epi16(_mm256_adds_epi16(bound, eb_v), mx),
+                    ),
+                );
+                dead = _mm256_or_si256(dead, _mm256_andnot_si256(open, a));
+            }
+            st(max.add(o), mx);
+            st(max_i.add(o), sel(improve, iv, mi));
+            st(max_j.add(o), sel(improve, mj, mjj));
+            let d = _mm256_or_si256(
+                widen16(done.add(o) as *const u8),
+                _mm256_and_si256(dead, one),
+            );
+            narrow16(done.add(o) as *mut u8, d);
+            live_bits |= bits16(_mm256_andnot_si256(dead, a)) << o;
+        }
+        live_bits
+    }
+
+    /// Where the unpack network of [`t16`] leaves row `c`: vector `BITREV[c]`.
+    const BITREV: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+
+    /// 16x16 byte block transpose: byte `c` of row `l` (the 16 bytes at `src + l * ss`) goes to
+    /// byte `l` of row `c` (at `dst + c * ds`). Four rounds of unpacks pair rows `2k`/`2k + 1` at
+    /// widths 1, 2, 4, 8 bytes; the rows come out in bit-reversed order. SSE2, the x86-64 baseline.
+    ///
+    /// # Safety
+    /// `src` holds 16 rows of 16 bytes at stride `ss`, `dst` 16 at stride `ds`.
+    pub(crate) unsafe fn t16(src: *const u8, ss: usize, dst: *mut u8, ds: usize) {
+        let mut v = [_mm_setzero_si128(); 16];
+        for (l, x) in v.iter_mut().enumerate() {
+            *x = _mm_loadu_si128(src.add(l * ss) as *const __m128i);
+        }
+        t16v(v, dst, ds);
+    }
+
+    /// [`t16`] on 16 rows already in registers: byte `c` of `v[l]` goes to byte `l` of the row at
+    /// `dst + c * ds`.
+    ///
+    /// # Safety
+    /// `dst` holds 16 rows at stride `ds`.
+    #[inline(always)]
+    unsafe fn t16v(v: [__m128i; 16], dst: *mut u8, ds: usize) {
+        macro_rules! round {
+            ($v:ident, $lo:ident, $hi:ident) => {{
+                let mut o = [_mm_setzero_si128(); 16];
+                for k in 0..8 {
+                    o[k] = $lo($v[2 * k], $v[2 * k + 1]);
+                    o[k + 8] = $hi($v[2 * k], $v[2 * k + 1]);
+                }
+                o
+            }};
+        }
+        let v = round!(v, _mm_unpacklo_epi8, _mm_unpackhi_epi8);
+        let v = round!(v, _mm_unpacklo_epi16, _mm_unpackhi_epi16);
+        let v = round!(v, _mm_unpacklo_epi32, _mm_unpackhi_epi32);
+        let v = round!(v, _mm_unpacklo_epi64, _mm_unpackhi_epi64);
+        for (c, &r) in BITREV.iter().enumerate() {
+            _mm_storeu_si128(dst.add(c * ds) as *mut __m128i, v[r]);
+        }
+    }
+
+    /// Bytes `[b, b + 16)` of `seq`, zero past its end, read without touching memory outside
+    /// `seq` (fg-labs/bwa-mem3's `x86_soa_piece16`): a tile inside the sequence is one load, one
+    /// past it is zero, and the boundary tile is the 16 bytes that end at the sequence's end
+    /// shifted down by `pshufb`, or for a sequence under 16 bytes its first and last `a` bytes
+    /// (`a` the largest power of two `<= len`, so the two cover it). `pshufb` zeroes a byte whose
+    /// index has bit 7 set, which is how every byte past the end comes out zero.
+    ///
+    /// # Safety
+    /// SSSE3; `b` a multiple of 16 (so a sequence under 16 bytes has only the tile at 0).
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    pub(crate) unsafe fn piece16(seq: &[u8], b: usize) -> __m128i {
+        debug_assert_eq!(b % 16, 0);
+        let (p, len) = (seq.as_ptr(), seq.len());
+        if b + 16 <= len {
+            return _mm_loadu_si128(p.add(b) as *const __m128i);
+        }
+        if b >= len {
+            return _mm_setzero_si128();
+        }
+        let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let r = len - b;
+        let past = _mm_cmpgt_epi8(iota, _mm_set1_epi8(r as i8 - 1));
+        if len >= 16 {
+            // `seq[b + t]` is byte `t + 16 - r` of the last 16.
+            let idx = _mm_or_si128(_mm_add_epi8(iota, _mm_set1_epi8((16 - r) as i8)), past);
+            return _mm_shuffle_epi8(_mm_loadu_si128(p.add(len - 16) as *const __m128i), idx);
+        }
+        let (lo, hi, a) = super::short_ends(p, len);
+        // Byte `t < a` is byte `t` of `lo`; byte `a <= t < len` is byte `t - (len - a)` of `hi`.
+        let low = _mm_cmplt_epi8(iota, _mm_set1_epi8(a as i8));
+        let idx = _mm_or_si128(
+            _mm_and_si128(low, iota),
+            _mm_andnot_si128(low, _mm_add_epi8(iota, _mm_set1_epi8((8 + a - len) as i8))),
+        );
+        _mm_shuffle_epi8(
+            _mm_set_epi64x(hi as i64, lo as i64),
+            _mm_or_si128(idx, past),
+        )
+    }
+
+    /// Fill a chunk's SoA buffers (`cols` query positions, `rows` target positions, both multiples
+    /// of 16, `N` lanes each) from the jobs, 16 lanes and 16 positions at a time: each lane's tile
+    /// read straight from its sequence ([`piece16`]) and the 16 transposed in registers. Every
+    /// lane is written, lanes past `jobs` with zeros, so the buffers need no clearing first.
+    ///
+    /// # Safety
+    /// SSSE3; `qcode` holds `cols * N` bytes and `tcode` `rows * N`; every sequence fits; `N` is a
+    /// multiple of 16 and `jobs.len() <= N`.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn fill_soa<const N: usize>(
+        jobs: &[bwa_extend::ExtendJob],
+        cols: usize,
+        rows: usize,
+        qcode: *mut u8,
+        tcode: *mut u8,
+    ) {
+        for blk in 0..N / 16 {
+            let js = jobs.get(blk * 16..).unwrap_or(&[]);
+            let q: [&[u8]; 16] = std::array::from_fn(|l| js.get(l).map_or(&[][..], |j| j.query));
+            let t: [&[u8]; 16] = std::array::from_fn(|l| js.get(l).map_or(&[][..], |j| j.target));
+            for (seqs, n, dst) in [(&q, cols, qcode), (&t, rows, tcode)] {
+                for b in (0..n).step_by(16) {
+                    let v = std::array::from_fn(|l| piece16(seqs[l], b));
+                    t16v(v, dst.add(b * N + blk * 16), N);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// The SSE2 transpose against the plain per-byte scatter, 32 lanes over two blocks.
+        #[test]
+        fn fill_soa_matches_scatter() {
+            let mut x = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as usize
+            };
+            let seqs: Vec<(Vec<u8>, Vec<u8>)> = (0..27)
+                .map(|_| {
+                    let q = (0..1 + next() % 90).map(|_| (next() % 5) as u8).collect();
+                    let t = (0..1 + next() % 120).map(|_| (next() % 5) as u8).collect();
+                    (q, t)
+                })
+                .collect();
+            let jobs: Vec<bwa_extend::ExtendJob> = seqs
+                .iter()
+                .map(|(q, t)| bwa_extend::ExtendJob {
+                    query: q,
+                    target: t,
+                    h0: 1,
+                })
+                .collect();
+            let cols = (jobs.iter().map(|j| j.query.len()).max().unwrap() + 1).next_multiple_of(16);
+            let rows =
+                (jobs.iter().map(|j| j.target.len()).max().unwrap() + 1).next_multiple_of(16);
+            const N: usize = 32;
+            let (mut q, mut t) = (vec![0u8; cols * N], vec![0u8; rows * N]);
+            unsafe { super::fill_soa::<N>(&jobs, cols, rows, q.as_mut_ptr(), t.as_mut_ptr()) };
+            let (mut q0, mut t0) = (vec![0u8; cols * N], vec![0u8; rows * N]);
+            for (l, j) in jobs.iter().enumerate() {
+                for (k, &c) in j.query.iter().enumerate() {
+                    q0[k * N + l] = c;
+                }
+                for (k, &c) in j.target.iter().enumerate() {
+                    t0[k * N + l] = c;
+                }
+            }
+            assert_eq!(q, q0);
+            assert_eq!(t, t0);
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod copy_fill_fast_tests {
+    /// Every length up to 40 at every offset in a 64-byte buffer, against `copy_from_slice` and
+    /// `fill`: the bytes in range match, the bytes around it are untouched.
+    #[test]
+    fn match_copy_from_slice_and_fill() {
+        let src: Vec<u8> = (0..64u8).map(|k| k.wrapping_mul(37) | 1).collect();
+        for n in 0..=40usize {
+            for at in 0..=64 - n {
+                let (mut got, mut want) = (vec![0xAAu8; 64], vec![0xAAu8; 64]);
+                super::copy_fast(&mut got[at..at + n], &src[..n]);
+                want[at..at + n].copy_from_slice(&src[..n]);
+                assert_eq!(got, want, "copy n = {n} at = {at}");
+                super::fill_fast(&mut got[at..at + n], 7);
+                want[at..at + n].fill(7);
+                assert_eq!(got, want, "fill n = {n} at = {at}");
+            }
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod piece16_tests {
+    /// Every length up to 40 at every tile start (a multiple of 16), the sequence inside a buffer of `0xAA` guard
+    /// bytes: the tile is the sequence's bytes then zeros, never a guard byte.
+    #[test]
+    fn piece16_is_the_tile_zero_padded() {
+        let mut buf = [0xAAu8; 96];
+        for (k, x) in buf[32..72].iter_mut().enumerate() {
+            *x = (k as u8).wrapping_mul(37) | 1;
+        }
+        for len in 0..=40usize {
+            let seq = &buf[32..32 + len];
+            for b in (0..=len + 16).step_by(16) {
+                let want: Vec<u8> = (b..b + 16)
+                    .map(|i| seq.get(i).copied().unwrap_or(0))
+                    .collect();
+                let mut got = [0u8; 16];
+                // SAFETY: NEON is mandatory on aarch64; on x86_64 the test needs SSSE3.
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    std::arch::aarch64::vst1q_u8(
+                        got.as_mut_ptr(),
+                        super::neon_row::piece16(seq, b),
+                    );
+                }
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_storeu_si128(
+                        got.as_mut_ptr().cast(),
+                        super::x86_row::piece16(seq, b),
+                    );
+                }
+                assert_eq!(&got[..], &want[..], "len {len} b {b}");
+            }
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod tighten_tests {
+    #[cfg(target_arch = "aarch64")]
+    use super::neon_row as row;
+    #[cfg(target_arch = "aarch64")]
+    const N: usize = 16;
+    #[cfg(target_arch = "x86_64")]
+    use super::x86_row as row;
+    #[cfg(target_arch = "x86_64")]
+    const N: usize = 32;
+
+    /// `tighten` against the scalar epilogue's tracker logic, on random lanes.
+    #[test]
+    fn tighten_matches_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: no avx2");
+            return;
+        }
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2000 {
+            let live = next() & next();
+            let qlen: [i16; N] = std::array::from_fn(|_| 1 + (next() % 200) as i16);
+            let end: [i16; N] = std::array::from_fn(|l| (next() % (qlen[l] as u64 + 1)) as i16);
+            let beg0: [i16; N] = std::array::from_fn(|_| (next() % 7) as i16);
+            let first: [u8; N] = std::array::from_fn(|_| (next() % 220) as u8);
+            let last: [u8; N] = std::array::from_fn(|_| (next() % 220) as u8);
+            let seen: [u8; N] = std::array::from_fn(|_| (next() % 2) as u8);
+            let h1: [u8; N] = std::array::from_fn(|_| (next() % 3) as u8);
+            let (mut beg, mut e) = (beg0, end);
+            let sc = unsafe {
+                row::tighten::<N>(
+                    live,
+                    first.as_ptr(),
+                    last.as_ptr(),
+                    seen.as_ptr(),
+                    h1.as_ptr(),
+                    qlen.as_ptr(),
+                    beg.as_mut_ptr(),
+                    e.as_mut_ptr(),
+                )
+            };
+            for l in 0..N {
+                if live >> l & 1 == 0 {
+                    assert_eq!((beg[l], e[l], sc >> l & 1), (beg0[l], end[l], 0));
+                    continue;
+                }
+                let fl = if seen[l] != 0 {
+                    (first[l] as i16).min(end[l])
+                } else {
+                    end[l]
+                };
+                assert_eq!(beg[l], fl);
+                let ll = if h1[l] != 0 {
+                    end[l]
+                } else if seen[l] == 0 {
+                    fl - 1
+                } else if (last[l] as i16) < end[l] {
+                    last[l] as i16
+                } else {
+                    assert_eq!((sc >> l & 1, e[l]), (1, end[l]));
+                    continue;
+                };
+                assert_eq!((sc >> l & 1, e[l]), (0, (ll + 2).min(qlen[l])));
+            }
+        }
+    }
+
+    /// `epilogue` (i16 trackers, clamped z-drop) against the scalar arm's i32 logic, on random
+    /// lanes that include large gap penalties and z-drops, where the clamps matter.
+    #[test]
+    fn epilogue_matches_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: no avx2");
+            return;
+        }
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let pick = |v: u64, c: &[i32]| c[(v % c.len() as u64) as usize];
+        for _ in 0..20000 {
+            let i = (next() % 255) as i32;
+            let zdrop = pick(next(), &[-1, 0, 1, 5, 100, 255, 256, 1000, 5000, i32::MAX]);
+            let e_del = pick(next(), &[0, 1, 2, 7, 100, 255, 300, 100_000]);
+            let e_ins = pick(next(), &[0, 1, 3, 50, 255, 1000]);
+            let r = |m: u64, next: &mut dyn FnMut() -> u64| (next() % m) as i32;
+            let active: [bool; N] = std::array::from_fn(|_| next() % 4 != 0);
+            let h1: [u8; N] = std::array::from_fn(|_| (next() % 256) as u8);
+            let rm: [u8; N] = std::array::from_fn(|_| {
+                if next() % 5 == 0 {
+                    0
+                } else {
+                    (next() % 256) as u8
+                }
+            });
+            let mj: [u8; N] = std::array::from_fn(|_| (next() % 256) as u8);
+            let qlen: [i32; N] = std::array::from_fn(|_| 1 + r(255, &mut next));
+            let end: [i32; N] = std::array::from_fn(|l| {
+                if next() % 2 == 0 {
+                    qlen[l]
+                } else {
+                    r(qlen[l] as u64 + 1, &mut next)
+                }
+            });
+            let max0: [i32; N] = std::array::from_fn(|_| r(256, &mut next));
+            let max_i0: [i32; N] = std::array::from_fn(|_| r(i as u64 + 2, &mut next) - 1);
+            let max_j0: [i32; N] = std::array::from_fn(|_| r(257, &mut next) - 1);
+            let max_ie0: [i32; N] = std::array::from_fn(|_| r(i as u64 + 2, &mut next) - 1);
+            let gscore0: [i32; N] = std::array::from_fn(|_| r(257, &mut next) - 1);
+            let max_off0: [i32; N] = std::array::from_fn(|_| r(256, &mut next));
+            let done0: [bool; N] = std::array::from_fn(|l| !active[l] && next() % 2 == 0);
+            // The exact stop's inputs: the row's `beg <= end`, a target with this row, the seed.
+            let beg: [i32; N] = std::array::from_fn(|l| {
+                if next() % 3 == 0 {
+                    0
+                } else {
+                    r(end[l] as u64 + 1, &mut next)
+                }
+            });
+            let tlen: [i32; N] = std::array::from_fn(|_| i + 1 + r(300, &mut next));
+            let h0: [i32; N] = std::array::from_fn(|_| r(256, &mut next));
+            let stop = (next() % 4 != 0).then(|| {
+                (
+                    pick(next(), &[-3, 0, 1, 2, 5, 127]),
+                    pick(next(), &[-5, 0, 1, 5, 100, 255, 1024, 1025, 100_000]),
+                )
+            });
+            let t = |a: &[i32; N]| -> [i16; N] { a.map(|v| v as i16) };
+            let (end16, qlen16) = (t(&end), t(&qlen));
+            let (mut mx, mut mi, mut mjj) = (t(&max0), t(&max_i0), t(&max_j0));
+            let (mut mie, mut gs, mut mo) = (t(&max_ie0), t(&gscore0), t(&max_off0));
+            let mut done = done0;
+            let live = unsafe {
+                row::epilogue::<N>(
+                    i,
+                    active.as_ptr(),
+                    h1.as_ptr(),
+                    rm.as_ptr(),
+                    mj.as_ptr(),
+                    end16.as_ptr(),
+                    qlen16.as_ptr(),
+                    zdrop,
+                    e_del,
+                    e_ins,
+                    mx.as_mut_ptr(),
+                    mi.as_mut_ptr(),
+                    mjj.as_mut_ptr(),
+                    mie.as_mut_ptr(),
+                    gs.as_mut_ptr(),
+                    mo.as_mut_ptr(),
+                    done.as_mut_ptr(),
+                    t(&beg).as_ptr(),
+                    t(&tlen).as_ptr(),
+                    t(&h0).as_ptr(),
+                    stop,
+                )
+            };
+            for l in 0..N {
+                // The scalar arm, in i32.
+                let (mut e_mx, mut e_mi, mut e_mj) = (max0[l], max_i0[l], max_j0[l]);
+                let (mut e_mie, mut e_gs, mut e_mo) = (max_ie0[l], gscore0[l], max_off0[l]);
+                let mut dead = false;
+                if active[l] {
+                    let (h1_l, rm_l, mj_l) = (i32::from(h1[l]), i32::from(rm[l]), i32::from(mj[l]));
+                    if end[l] == qlen[l] && e_gs <= h1_l {
+                        (e_mie, e_gs) = (i, h1_l);
+                    }
+                    if rm_l == 0 {
+                        dead = true;
+                    } else if rm_l > e_mx {
+                        (e_mx, e_mi, e_mj) = (rm_l, i, mj_l);
+                        e_mo = e_mo.max((mj_l - i).abs());
+                    } else if zdrop > 0 {
+                        let (di, dj) = (i64::from(i - e_mi), i64::from(mj_l - e_mj));
+                        let dd = if di > dj {
+                            (di - dj) * i64::from(e_del)
+                        } else {
+                            (dj - di) * i64::from(e_ins)
+                        };
+                        dead = i64::from(e_mx - rm_l) - dd > i64::from(zdrop);
+                    }
+                    if let (false, Some((sc, eb))) = (dead, stop) {
+                        let vmax = if beg[l] == 0 { rm_l.max(h0[l]) } else { rm_l };
+                        let bound = vmax + sc.max(0) * (tlen[l] - 1 - i).min(qlen[l] - beg[l]);
+                        dead = bound <= e_mx && (bound < e_gs || bound <= e_mx.saturating_sub(eb));
+                    }
+                }
+                let w = i32::from;
+                let got = (w(mx[l]), w(mi[l]), w(mjj[l]), w(mie[l]), w(gs[l]), w(mo[l]));
+                assert_eq!(
+                    got,
+                    (e_mx, e_mi, e_mj, e_mie, e_gs, e_mo),
+                    "lane {l} i {i} zdrop {zdrop} e {e_del}/{e_ins}"
+                );
+                assert_eq!(
+                    live >> l & 1 == 1,
+                    active[l] && !dead,
+                    "lane {l} i {i} zdrop {zdrop} e {e_del}/{e_ins}"
+                );
+                assert_eq!(done[l], done0[l] || (active[l] && dead));
+            }
+        }
+    }
+}
+
+/// The NEON u8 kernel's row prologue and epilogue in i16 vector lanes (`rowvec` in
+/// [`define_sw_kernel!`]): the same per-lane logic as the scalar arms, with every test folded into
+/// a select, over 16 lanes as two `int16x8_t` (`trk = i16`: every index and score is below 256).
+#[cfg(target_arch = "aarch64")]
+mod neon_row {
+    use std::arch::aarch64::*;
+
+    /// As `x86_row::tighten`, over 16 lanes as two `int16x8_t`.
+    ///
+    /// # Safety
+    /// NEON; every pointer addresses 16 lanes.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn tighten<const N: usize>(
+        live: u64,
+        first: *const u8,
+        last: *const u8,
+        seen: *const u8,
+        h1: *const u8,
+        qlen: *const i16,
+        beg: *mut i16,
+        end: *mut i16,
+    ) -> u64 {
+        debug_assert!(N == 16);
+        const LB: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let lv = vcombine_u8(vdup_n_u8(live as u8), vdup_n_u8((live >> 8) as u8));
+        let m = widen_mask(vtstq_u8(lv, vld1q_u8(LB.as_ptr())));
+        let sn = widen_mask(vld1q_u8(seen));
+        let hz = widen_mask(vceqzq_u8(vld1q_u8(h1)));
+        let (fs, ls) = (widen_u8(vld1q_u8(first)), widen_u8(vld1q_u8(last)));
+        let (one, two) = (vdupq_n_s16(1), vdupq_n_s16(2));
+        let mut need = [vdupq_n_s16(0); 2];
+        for k in 0..2 {
+            let e = vld1q_s16(end.add(8 * k));
+            let fl = vbslq_s16(sn[k], vminq_s16(fs[k], e), e);
+            vst1q_s16(
+                beg.add(8 * k),
+                vbslq_s16(m[k], fl, vld1q_s16(beg.add(8 * k))),
+            );
+            let ll = vbslq_s16(hz[k], vbslq_s16(sn[k], ls[k], vsubq_s16(fl, one)), e);
+            let nd = vandq_u16(
+                vandq_u16(m[k], hz[k]),
+                vandq_u16(sn[k], vcgeq_s16(ls[k], e)),
+            );
+            let ne = vminq_s16(vaddq_s16(ll, two), vld1q_s16(qlen.add(8 * k)));
+            vst1q_s16(end.add(8 * k), vbslq_s16(vbicq_u16(m[k], nd), ne, e));
+            need[k] = vreinterpretq_s16_u16(nd);
+        }
+        u64::from(bits(narrow_u8(need)))
+    }
+
+    /// A 16-lane byte mask (0/1 or 0/0xff per lane) widened to two i16 lane masks.
+    #[target_feature(enable = "neon")]
+    unsafe fn widen_mask(m: uint8x16_t) -> [uint16x8_t; 2] {
+        let s = vreinterpretq_s8_u8(vtstq_u8(m, m)); // 0xff where nonzero
+        [
+            vreinterpretq_u16_s16(vmovl_s8(vget_low_s8(s))),
+            vreinterpretq_u16_s16(vmovl_high_s8(s)),
+        ]
+    }
+
+    /// Sixteen bytes widened to two i16 vectors.
+    #[target_feature(enable = "neon")]
+    unsafe fn widen_u8(v: uint8x16_t) -> [int16x8_t; 2] {
+        [
+            vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v))),
+            vreinterpretq_s16_u16(vmovl_high_u8(v)),
+        ]
+    }
+
+    /// Two i16 vectors narrowed to sixteen bytes (the low byte of each lane).
+    #[target_feature(enable = "neon")]
+    unsafe fn narrow_u8(v: [int16x8_t; 2]) -> uint8x16_t {
+        vuzp1q_u8(vreinterpretq_u8_s16(v[0]), vreinterpretq_u8_s16(v[1]))
+    }
+
+    /// Two i16 lane masks as one 16-lane byte mask.
+    #[target_feature(enable = "neon")]
+    unsafe fn narrow_mask(v: [uint16x8_t; 2]) -> uint8x16_t {
+        vuzp1q_u8(vreinterpretq_u8_u16(v[0]), vreinterpretq_u8_u16(v[1]))
+    }
+
+    /// One bit per lane of a 16-lane byte mask.
+    #[target_feature(enable = "neon")]
+    unsafe fn bits(m: uint8x16_t) -> u32 {
+        let n = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+            m,
+        ))));
+        // Four bits per lane; keep the lowest of each nibble.
+        let n = n & 0x1111_1111_1111_1111;
+        let n = (n | n >> 3) & 0x0303_0303_0303_0303;
+        let n = (n | n >> 6) & 0x000f_000f_000f_000f;
+        let n = (n | n >> 12) & 0x0000_00ff_0000_00ff;
+        ((n | n >> 24) & 0xffff) as u32
+    }
+
+    /// The row prologue: `(gbeg, gend, fast_lo, fast_hi, next)` (`next`: the active lanes that
+    /// have a row `i + 1`), with `beg`/`end` intersected with
+    /// row `i`'s band for the active lanes, `h1` the left-edge value, and the lane vectors the
+    /// column loop masks with (`beg`, band width, active).
+    ///
+    /// # Safety
+    /// NEON; every pointer addresses 16 lanes.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn prologue<const N: usize>(
+        i: i32,
+        done: *const bool,
+        tlen: *const i16,
+        qlen: *const i16,
+        w: *const i16,
+        h0: *const i16,
+        beg: *mut i16,
+        end: *mut i16,
+        o_del: i32,
+        e_del: i32,
+        h1: *mut u8,
+        active: *mut bool,
+        beg_lane: *mut u8,
+        end_lane: *mut u8,
+        active_lane: *mut u8,
+        _bias: u8,
+    ) -> (i32, i32, i32, i32, u64) {
+        debug_assert!(N == 16 && _bias == 0);
+        let iv = vdupq_n_s16(i as i16);
+        let i1 = vdupq_n_s16(i as i16 + 1);
+        let zero = vdupq_n_s16(0);
+        let not_done = widen_mask(vceqzq_u8(vld1q_u8(done as *const u8)));
+        // Exact: `h0 < 256`, so a penalty of 256 or more leaves 0 as the true one does.
+        let pen = vdupq_n_s16((o_del + e_del * (i + 1)).clamp(0, 256) as i16);
+        let (mut bq, mut wq, mut hq) = ([zero; 2], [zero; 2], [zero; 2]);
+        let (mut act, mut nxt) = ([vdupq_n_u16(0); 2], [vdupq_n_u16(0); 2]);
+        let (mut gb, mut ge) = ([vdupq_n_s16(i16::MAX); 2], [zero; 2]);
+        let (mut fl, mut fh) = ([vdupq_n_s16(i16::MIN); 2], [vdupq_n_s16(i16::MAX); 2]);
+        for q in 0..2 {
+            let o = 8 * q;
+            let tl = vld1q_s16(tlen.add(o));
+            let a = vandq_u16(not_done[q], vcltq_s16(iv, tl));
+            let wv = vld1q_s16(w.add(o));
+            let (b0, e0) = (vld1q_s16(beg.add(o)), vld1q_s16(end.add(o)));
+            let b = vmaxq_s16(b0, vsubq_s16(iv, wv));
+            let e = vminq_s16(
+                vminq_s16(e0, vaddq_s16(vaddq_s16(iv, wv), vdupq_n_s16(1))),
+                vld1q_s16(qlen.add(o)),
+            );
+            vst1q_s16(beg.add(o), vbslq_s16(a, b, b0));
+            vst1q_s16(end.add(o), vbslq_s16(a, e, e0));
+            let h = vmaxq_s16(vsubq_s16(vld1q_s16(h0.add(o)), pen), zero);
+            hq[q] = vandq_s16(vbslq_s16(vceqzq_s16(b), h, zero), vreinterpretq_s16_u16(a));
+            gb[q] = vbslq_s16(a, b, gb[q]);
+            ge[q] = vbslq_s16(a, e, ge[q]);
+            fl[q] = vbslq_s16(a, b, fl[q]);
+            fh[q] = vbslq_s16(a, e, fh[q]);
+            bq[q] = vandq_s16(b, vreinterpretq_s16_u16(a));
+            wq[q] = vandq_s16(vmaxq_s16(vsubq_s16(e, b), zero), vreinterpretq_s16_u16(a));
+            act[q] = a;
+            nxt[q] = vandq_u16(a, vcltq_s16(i1, tl));
+        }
+        vst1q_u8(h1, narrow_u8(hq));
+        vst1q_u8(beg_lane, narrow_u8(bq));
+        vst1q_u8(end_lane, narrow_u8(wq));
+        let a8 = narrow_mask(act);
+        vst1q_u8(active_lane, a8);
+        vst1q_u8(active as *mut u8, vandq_u8(a8, vdupq_n_u8(1)));
+        // The sentinels map back to the i32 ones the scalar arm returns; every real value is
+        // in `0..256`.
+        let gb = vminvq_s16(vminq_s16(gb[0], gb[1]));
+        let gb = if gb == i16::MAX {
+            i32::MAX
+        } else {
+            i32::from(gb)
+        };
+        let ge = i32::from(vmaxvq_s16(vmaxq_s16(ge[0], ge[1])));
+        let fl = vmaxvq_s16(vmaxq_s16(fl[0], fl[1]));
+        let fl = if fl == i16::MIN {
+            i32::MIN
+        } else {
+            i32::from(fl)
+        };
+        let fh = vminvq_s16(vminq_s16(fh[0], fh[1]));
+        let fh = if fh == i16::MAX {
+            i32::MAX
+        } else {
+            i32::from(fh)
+        };
+        (gb, ge, fl, fh, u64::from(bits(narrow_mask(nxt))))
+    }
+
+    /// Bytes `[b, b + 16)` of `seq`, zero past its end, read without touching memory outside
+    /// `seq` (fg-labs/bwa-mem3's `neon_soa_pack16` tiles): a tile inside the sequence is one load,
+    /// one past it is zero, and the boundary tile is the 16 bytes that end at the sequence's end
+    /// shifted down by `tbl`, or for a sequence under 16 bytes its first and last `a` bytes (`a`
+    /// the largest power of two `<= len`, so the two cover it). `tbl` reads an index past 15 as
+    /// zero, which is how every byte past the end comes out zero.
+    ///
+    /// # Safety
+    /// NEON; `b` a multiple of 16 (so a sequence under 16 bytes has only the tile at 0).
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(crate) unsafe fn piece16(seq: &[u8], b: usize) -> uint8x16_t {
+        debug_assert_eq!(b % 16, 0);
+        let (p, len) = (seq.as_ptr(), seq.len());
+        if b + 16 <= len {
+            return vld1q_u8(p.add(b));
+        }
+        if b >= len {
+            return vdupq_n_u8(0);
+        }
+        const IOTA: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let iota = vld1q_u8(IOTA.as_ptr());
+        if len >= 16 {
+            // `seq[b + t]` is byte `t + 16 - r` of the last 16, `r = len - b`.
+            let idx = vaddq_u8(iota, vdupq_n_u8((16 - (len - b)) as u8));
+            return vqtbl1q_u8(vld1q_u8(p.add(len - 16)), idx);
+        }
+        let (lo, hi, a) = super::short_ends(p, len);
+        // Byte `t < a` is byte `t` of `lo`; byte `a <= t < len` is byte `t - (len - a)` of `hi`.
+        let idx = vbslq_u8(
+            vcltq_u8(iota, vdupq_n_u8(a as u8)),
+            iota,
+            vaddq_u8(iota, vdupq_n_u8((8 + a - len) as u8)),
+        );
+        let idx = vorrq_u8(idx, vcgeq_u8(iota, vdupq_n_u8(len as u8)));
+        vqtbl1q_u8(
+            vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(lo), vcreate_u64(hi))),
+            idx,
+        )
+    }
+
+    /// Fill the chunk's SoA buffers (`cols` query positions, `rows` target positions, both
+    /// multiples of 16, 16 lanes each) from the jobs, 16 positions at a time: each lane's tile
+    /// read straight from its sequence ([`piece16`]) and the 16 transposed in registers. Every
+    /// lane is written, lanes past `jobs` with zeros.
+    ///
+    /// # Safety
+    /// NEON; `qcode` holds `cols * 16` bytes and `tcode` `rows * 16`; every sequence fits.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn fill_soa<const N: usize>(
+        jobs: &[bwa_extend::ExtendJob],
+        cols: usize,
+        rows: usize,
+        qcode: *mut u8,
+        tcode: *mut u8,
+    ) {
+        debug_assert!(N == 16 && jobs.len() <= 16);
+        let q: [&[u8]; 16] = std::array::from_fn(|l| jobs.get(l).map_or(&[][..], |j| j.query));
+        let t: [&[u8]; 16] = std::array::from_fn(|l| jobs.get(l).map_or(&[][..], |j| j.target));
+        for (seqs, n, dst) in [(&q, cols, qcode), (&t, rows, tcode)] {
+            for b in (0..n).step_by(16) {
+                let v = std::array::from_fn(|l| piece16(seqs[l], b));
+                for (k, x) in crate::rescue_band::neon::transpose16(v).iter().enumerate() {
+                    vst1q_u8(dst.add((b + k) * 16), *x);
+                }
+            }
+        }
+    }
+
+    /// The row epilogue's trackers; returns one bit per lane still live (active and not
+    /// terminated by this row).
+    ///
+    /// # Safety
+    /// NEON; every pointer addresses 16 lanes.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn epilogue<const N: usize>(
+        i: i32,
+        active: *const bool,
+        h1_out: *const u8,
+        rowmax_out: *const u8,
+        mj_out: *const u8,
+        end: *const i16,
+        qlen: *const i16,
+        zdrop: i32,
+        e_del: i32,
+        e_ins: i32,
+        max: *mut i16,
+        max_i: *mut i16,
+        max_j: *mut i16,
+        max_ie: *mut i16,
+        gscore: *mut i16,
+        max_off: *mut i16,
+        done: *mut bool,
+        beg: *const i16,
+        tlen: *const i16,
+        h0: *const i16,
+        stop: Option<(i32, i32)>,
+    ) -> u64 {
+        debug_assert!(N == 16);
+        let iv = vdupq_n_s16(i as i16);
+        let act = widen_mask(vld1q_u8(active as *const u8));
+        let h1 = widen_u8(vld1q_u8(h1_out));
+        let rm = widen_u8(vld1q_u8(rowmax_out));
+        let mj = widen_u8(vld1q_u8(mj_out));
+        // The z-drop test `mx - rm - a * e > zdrop`, with `a = |di - dj|` and `e` the gap extend
+        // of the longer side, as `L > 0 && L > a * e` for `L = mx - rm - zdrop`. Exact in 16
+        // bits: `mx - rm < 256`, so a `zdrop` past 1024 never fires either way, and `a` and `e`
+        // saturated at 255 keep `a * e` (u16) on the same side of any `L < 256`.
+        let ed = vdupq_n_u16(e_del.clamp(0, 255) as u16);
+        let ei = vdupq_n_u16(e_ins.clamp(0, 255) as u16);
+        let zd = vdupq_n_s16(zdrop.clamp(0, 1024) as i16);
+        let c255 = vdupq_n_u16(255);
+        let zdrop_on = vdupq_n_u16(if zdrop > 0 { !0 } else { 0 });
+        // The exact stop's `(max_sc, end_bonus)`, clamped where the i16 test keeps its outcome:
+        // `steps <= qlen < 256`, so `max_sc <= 127` keeps `B` below 2^15; past 1024 (or below 0)
+        // the `end_bonus` arm is false (or implied by `B <= max`) either way.
+        let (sc_v, eb_v) = stop.map_or((vdupq_n_s16(0), vdupq_n_s16(0)), |(sc, eb)| {
+            (
+                vdupq_n_s16(sc.clamp(0, 127) as i16),
+                vdupq_n_s16(eb.clamp(0, 1024) as i16),
+            )
+        });
+        let ivp1 = vdupq_n_s16(i as i16 + 1);
+        let mut live = [vdupq_n_u16(0); 2];
+        for q in 0..2 {
+            let o = 8 * q;
+            let a = act[q];
+            let (mx, mi, mjj) = (
+                vld1q_s16(max.add(o)),
+                vld1q_s16(max_i.add(o)),
+                vld1q_s16(max_j.add(o)),
+            );
+            let gs = vld1q_s16(gscore.add(o));
+            let g_upd = vandq_u16(
+                vandq_u16(a, vceqq_s16(vld1q_s16(end.add(o)), vld1q_s16(qlen.add(o)))),
+                vcleq_s16(gs, h1[q]),
+            );
+            vst1q_s16(
+                max_ie.add(o),
+                vbslq_s16(g_upd, iv, vld1q_s16(max_ie.add(o))),
+            );
+            let gs = vbslq_s16(g_upd, h1[q], gs);
+            vst1q_s16(gscore.add(o), gs);
+            let improve = vandq_u16(a, vcgtq_s16(rm[q], mx));
+            // `mj` is meaningful once the row max is positive; a zero row terminates the lane,
+            // and every use of `mj` below is selected away otherwise.
+            let off = vabdq_s16(mj[q], iv);
+            let (di, dj) = (vsubq_s16(iv, mi), vsubq_s16(mj[q], mjj));
+            let ad = vminq_u16(vreinterpretq_u16_s16(vabdq_s16(di, dj)), c255);
+            let dd = vmulq_u16(ad, vbslq_u16(vcgtq_s16(di, dj), ed, ei));
+            let l = vsubq_s16(vsubq_s16(mx, rm[q]), zd);
+            let drops = vandq_u16(vcgtzq_s16(l), vcgtq_u16(vreinterpretq_u16_s16(l), dd));
+            let mut dead = vandq_u16(
+                a,
+                vorrq_u16(
+                    vceqzq_s16(rm[q]),
+                    vandq_u16(vbicq_u16(zdrop_on, improve), drops),
+                ),
+            );
+            let mo = vld1q_s16(max_off.add(o));
+            vst1q_s16(
+                max_off.add(o),
+                vbslq_s16(vandq_u16(improve, vcgtq_s16(off, mo)), off, mo),
+            );
+            let mx = vbslq_s16(improve, rm[q], mx);
+            if stop.is_some() {
+                // The exact stop (see `exact_stop_enabled`), on the updated `max` and `gscore`.
+                let b = vld1q_s16(beg.add(o));
+                let rem = vsubq_s16(vld1q_s16(tlen.add(o)), ivp1);
+                let steps = vminq_s16(rem, vsubq_s16(vld1q_s16(qlen.add(o)), b));
+                let vmax = vbslq_s16(vceqzq_s16(b), vmaxq_s16(rm[q], vld1q_s16(h0.add(o))), rm[q]);
+                let bound = vqaddq_s16(vmax, vmulq_s16(steps, sc_v));
+                let open = vorrq_u16(
+                    vcgtq_s16(bound, mx),
+                    vbicq_u16(vcgtq_s16(vqaddq_s16(bound, eb_v), mx), vcgtq_s16(gs, bound)),
+                );
+                dead = vorrq_u16(dead, vbicq_u16(a, open));
+            }
+            vst1q_s16(max.add(o), mx);
+            vst1q_s16(max_i.add(o), vbslq_s16(improve, iv, mi));
+            vst1q_s16(max_j.add(o), vbslq_s16(improve, mj[q], mjj));
+            live[q] = vbicq_u16(a, dead);
+        }
+        let live8 = narrow_mask(live);
+        // `done |= dead`: a lane active and not live died this row.
+        let d8 = vld1q_u8(done as *const u8);
+        let a8 = vld1q_u8(active as *const u8);
+        vst1q_u8(done as *mut u8, vorrq_u8(d8, vbicq_u8(a8, live8)));
+        u64::from(bits(live8))
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2398,13 +4867,60 @@ mod neon {
         cge = vcgeq_s16,
         ceq = vceqq_s16,
         orru = vorrq_u16,
+        orr = vorrq_s16,
         andu = vandq_u16,
         bsl = vbslq_s16,
         band = band_s16,
         band_bias = 0,
         band_width = false,
         diag = |m, s, bias| vsubq_s16(vaddq_s16(m, s), bias),
-        sbt_bias = |bias| bias
+        sbt_bias = |bias| bias,
+        sbt_tbl = false,
+        tab5 = false,
+        tbl_ld = |_p| vdupq_n_s16(0),
+        tbl = |_t, _k, _q| unreachable!(),
+        rowvec = false,
+        trk = i32,
+        row = neon_row
+    );
+    // The i16 kernel with the 5x5 table (`tab5`), for the `--meth` jobs past the u8 bounds: each
+    // lane's `5 t + q` in its low byte and 0xFF in its high one, which a two-register `TBL` reads
+    // as the table's byte and 0. The table's values are biased scores in `0..=255`, so `tbl_ld`
+    // keeps the low byte of each i16 entry. See [`mat5_extend`].
+    define_sw_kernel!(
+        batched_extend_neon_i16_mat5,
+        i16,
+        u16,
+        8,
+        feat = "neon",
+        dup = vdupq_n_s16,
+        lds = vld1q_s16,
+        sts = vst1q_s16,
+        ldu = vld1q_u16,
+        sub = vsubq_s16,
+        max = vmaxq_s16,
+        ceqz = vceqzq_s16,
+        cge = vcgeq_s16,
+        ceq = vceqq_s16,
+        orru = vorrq_u16,
+        orr = vorrq_s16,
+        andu = vandq_u16,
+        bsl = vbslq_s16,
+        band = band_s16,
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| vsubq_s16(vaddq_s16(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| uint8x16x2_t(vld2q_u8(p).0, vld2q_u8(p.add(32)).0),
+        tbl = |t, k, q| {
+            let i = vorrq_s16(vmlaq_s16(q, k, vdupq_n_s16(5)), vdupq_n_s16(-256));
+            vreinterpretq_s16_u8(vqtbl2q_u8(t, vreinterpretq_u8_s16(i)))
+        },
+        rowvec = false,
+        trk = i32,
+        row = neon_row
     );
 
     // 8-bit kernel: **unsigned** u8 [0,255] with saturating add/sub, so a local extension whose score
@@ -2441,13 +4957,55 @@ mod neon {
         cge = vcgeq_u8,
         ceq = vceqq_u8,
         orru = vorrq_u8,
+        orr = vorrq_u8,
         andu = vandq_u8,
         bsl = vbslq_u8,
         band = band_u8,
         band_bias = 0,
         band_width = true,
         diag = |m, s, _bias| vsqaddq_u8(m, vreinterpretq_s8_u8(s)),
-        sbt_bias = |_bias| 0
+        sbt_bias = |_bias| 0,
+        sbt_tbl = true,
+        tab5 = false,
+        tbl_ld = |p| vld1q_u8(p),
+        tbl = |t, k, q| vqtbl1q_u8(t, veorq_u8(k, q)),
+        rowvec = true,
+        trk = i16,
+        row = neon_row
+    );
+    // The u8 kernel with the 5x5 table (`tab5`), for `--meth`'s neutral and genomic matrices: one
+    // `MLA` forms `q + 5 t` and a two-register `TBL` reads the matrix. See [`mat5_extend`].
+    define_sw_kernel!(
+        batched_extend_neon_u8_mat5,
+        u8,
+        u8,
+        16,
+        feat = "neon",
+        dup = vdupq_n_u8,
+        lds = vld1q_u8,
+        sts = vst1q_u8,
+        ldu = vld1q_u8,
+        sub = vqsubq_u8,
+        max = vmaxq_u8,
+        ceqz = vceqzq_u8,
+        cge = vcgeq_u8,
+        ceq = vceqq_u8,
+        orru = vorrq_u8,
+        orr = vorrq_u8,
+        andu = vandq_u8,
+        bsl = vbslq_u8,
+        band = band_u8,
+        band_bias = 0,
+        band_width = true,
+        diag = |m, s, _bias| vsqaddq_u8(m, vreinterpretq_s8_u8(s)),
+        sbt_bias = |_bias| 0,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| vld1q_u8_x2(p),
+        tbl = |t, k, q| vqtbl2q_u8(t, vmlaq_u8(q, k, vdupq_n_u8(5))),
+        rowvec = true,
+        trk = i16,
+        row = neon_row
     );
 }
 
@@ -2609,13 +5167,77 @@ mod avx2 {
         cge = cge_epi16,
         ceq = _mm256_cmpeq_epi16,
         orru = _mm256_or_si256,
+        orr = _mm256_or_si256,
         andu = _mm256_and_si256,
         bsl = bsl256,
         band = band_epi16,
         band_bias = 0,
         band_width = false,
         diag = |m, s, bias| _mm256_sub_epi16(_mm256_add_epi16(m, s), bias),
-        sbt_bias = |bias| bias
+        sbt_bias = |bias| bias,
+        sbt_tbl = false,
+        tab5 = false,
+        tbl_ld = |_p| _mm256_setzero_si256(),
+        tbl = |_t, _k, _q| unreachable!(),
+        rowvec = false,
+        trk = i32,
+        row = x86_row
+    );
+    // The i16 kernel with the 5x5 table (`tab5`), for the `--meth` jobs past the u8 bounds: the
+    // u8 form's two shuffles on each lane's `5 t + q` in its low byte, with the high byte's sign
+    // bit set so both shuffles read 0 there. The table's values are biased scores in `0..=255`,
+    // so `tbl_ld` packs the i16 entries to bytes exactly. See [`mat5_extend`].
+    define_sw_kernel!(
+        batched_extend_avx2_i16_mat5,
+        i16,
+        u16,
+        16,
+        feat = "avx2",
+        dup = set1_i16,
+        lds = loadu_i16,
+        sts = storeu_i16,
+        ldu = loadu_u16,
+        sub = _mm256_sub_epi16,
+        max = _mm256_max_epi16,
+        ceqz = ceqz16,
+        cge = cge_epi16,
+        ceq = _mm256_cmpeq_epi16,
+        orru = _mm256_or_si256,
+        orr = _mm256_or_si256,
+        andu = _mm256_and_si256,
+        bsl = bsl256,
+        band = band_epi16,
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm256_sub_epi16(_mm256_add_epi16(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| {
+            let ld = |o: usize| _mm_loadu_si128(p.add(o) as *const __m128i);
+            let (lo, hi) = (
+                _mm_packus_epi16(ld(0), ld(16)),
+                _mm_packus_epi16(ld(32), ld(48)),
+            );
+            (
+                _mm256_broadcastsi128_si256(lo),
+                _mm256_broadcastsi128_si256(_mm_xor_si128(lo, hi)),
+            )
+        },
+        tbl = |t, k, q| {
+            let k5 = _mm256_or_si256(
+                _mm256_add_epi16(_mm256_slli_epi16::<2>(k), k),
+                _mm256_set1_epi16(i16::MIN),
+            );
+            let i = _mm256_add_epi16(k5, q);
+            _mm256_xor_si256(
+                _mm256_shuffle_epi8(t.0, i),
+                _mm256_shuffle_epi8(t.1, _mm256_subs_epi8(i, _mm256_set1_epi8(16))),
+            )
+        },
+        rowvec = false,
+        trk = i32,
+        row = x86_row
     );
 
     define_sw_kernel!(
@@ -2634,13 +5256,72 @@ mod avx2 {
         cge = cge_epu8,
         ceq = _mm256_cmpeq_epi8,
         orru = _mm256_or_si256,
+        orr = _mm256_or_si256,
         andu = _mm256_and_si256,
         bsl = bsl256,
         band = band_epi8,
         band_bias = 0x80,
         band_width = false,
         diag = |m, s, bias| _mm256_subs_epu8(_mm256_adds_epu8(m, s), bias),
-        sbt_bias = |bias| bias
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = false,
+        tbl_ld = |p| _mm256_broadcastsi128_si256(_mm_loadu_si128(p as *const __m128i)),
+        tbl = |t, k, q| _mm256_shuffle_epi8(t, _mm256_xor_si256(k, q)),
+        rowvec = true,
+        trk = i16,
+        row = x86_row
+    );
+    // `tab5` (`--meth`'s neutral and genomic matrices, see [`mat5_extend`]): the 32-entry table
+    // as its low half and `low ^ high`, each broadcast per 128-bit lane, read at `i = 5 t + q` by
+    // two in-lane shuffles. The first reads `low[i & 15]`; the second's index is `i - 16`, whose
+    // sign bit zeroes it for `i < 16`, so the XOR is `low[i]` below 16 and `high[i - 16]` above.
+    define_sw_kernel!(
+        batched_extend_avx2_u8_mat5,
+        u8,
+        u8,
+        32,
+        feat = "avx2",
+        dup = set1_u8,
+        lds = loadu_u8,
+        sts = storeu_u8,
+        ldu = loadu_u8,
+        sub = _mm256_subs_epu8,
+        max = _mm256_max_epu8,
+        ceqz = ceqz8,
+        cge = cge_epu8,
+        ceq = _mm256_cmpeq_epi8,
+        orru = _mm256_or_si256,
+        orr = _mm256_or_si256,
+        andu = _mm256_and_si256,
+        bsl = bsl256,
+        band = band_epi8,
+        band_bias = 0x80,
+        band_width = false,
+        diag = |m, s, bias| _mm256_subs_epu8(_mm256_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| {
+            let (lo, hi) = (
+                _mm_loadu_si128(p as *const __m128i),
+                _mm_loadu_si128(p.add(16) as *const __m128i),
+            );
+            (
+                _mm256_broadcastsi128_si256(lo),
+                _mm256_broadcastsi128_si256(_mm_xor_si128(lo, hi)),
+            )
+        },
+        tbl = |t, k, q| {
+            let i = _mm256_add_epi8(_mm256_add_epi8(_mm256_slli_epi16::<2>(k), k), q);
+            _mm256_xor_si256(
+                _mm256_shuffle_epi8(t.0, i),
+                _mm256_shuffle_epi8(t.1, _mm256_subs_epi8(i, _mm256_set1_epi8(16))),
+            )
+        },
+        rowvec = true,
+        trk = i16,
+        row = x86_row
     );
 }
 
@@ -2785,13 +5466,74 @@ mod sse41 {
         cge = cge_epi16,
         ceq = _mm_cmpeq_epi16,
         orru = _mm_or_si128,
+        orr = _mm_or_si128,
         andu = _mm_and_si128,
         bsl = bsl128,
         band = band_epi16,
         band_bias = 0,
         band_width = false,
         diag = |m, s, bias| _mm_sub_epi16(_mm_add_epi16(m, s), bias),
-        sbt_bias = |bias| bias
+        sbt_bias = |bias| bias,
+        sbt_tbl = false,
+        tab5 = false,
+        tbl_ld = |_p| _mm_setzero_si128(),
+        tbl = |_t, _k, _q| unreachable!(),
+        rowvec = false,
+        trk = i32,
+        row = x86_row
+    );
+    // The i16 kernel with the 5x5 table (`tab5`), for the `--meth` jobs past the u8 bounds: the
+    // u8 form's two shuffles on each lane's `5 t + q` in its low byte, with the high byte's sign
+    // bit set so both shuffles read 0 there. The table's values are biased scores in `0..=255`,
+    // so `tbl_ld` packs the i16 entries to bytes exactly. See [`mat5_extend`].
+    define_sw_kernel!(
+        batched_extend_sse41_i16_mat5,
+        i16,
+        u16,
+        8,
+        feat = "sse4.1",
+        dup = set1_i16,
+        lds = loadu_i16,
+        sts = storeu_i16,
+        ldu = loadu_u16,
+        sub = _mm_sub_epi16,
+        max = _mm_max_epi16,
+        ceqz = ceqz16,
+        cge = cge_epi16,
+        ceq = _mm_cmpeq_epi16,
+        orru = _mm_or_si128,
+        orr = _mm_or_si128,
+        andu = _mm_and_si128,
+        bsl = bsl128,
+        band = band_epi16,
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm_sub_epi16(_mm_add_epi16(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| {
+            let ld = |o: usize| _mm_loadu_si128(p.add(o) as *const __m128i);
+            let (lo, hi) = (
+                _mm_packus_epi16(ld(0), ld(16)),
+                _mm_packus_epi16(ld(32), ld(48)),
+            );
+            (lo, _mm_xor_si128(lo, hi))
+        },
+        tbl = |t, k, q| {
+            let k5 = _mm_or_si128(
+                _mm_add_epi16(_mm_slli_epi16::<2>(k), k),
+                _mm_set1_epi16(i16::MIN),
+            );
+            let i = _mm_add_epi16(k5, q);
+            _mm_xor_si128(
+                _mm_shuffle_epi8(t.0, i),
+                _mm_shuffle_epi8(t.1, _mm_subs_epi8(i, _mm_set1_epi8(16))),
+            )
+        },
+        rowvec = false,
+        trk = i32,
+        row = x86_row
     );
 
     define_sw_kernel!(
@@ -2810,13 +5552,69 @@ mod sse41 {
         cge = cge_epu8,
         ceq = _mm_cmpeq_epi8,
         orru = _mm_or_si128,
+        orr = _mm_or_si128,
         andu = _mm_and_si128,
         bsl = bsl128,
         band = band_epi8,
         band_bias = 0x80,
         band_width = false,
         diag = |m, s, bias| _mm_subs_epu8(_mm_adds_epu8(m, s), bias),
-        sbt_bias = |bias| bias
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = false,
+        tbl_ld = |p| _mm_loadu_si128(p as *const __m128i),
+        tbl = |t, k, q| _mm_shuffle_epi8(t, _mm_xor_si128(k, q)),
+        rowvec = false,
+        trk = i32,
+        row = x86_row
+    );
+    // `tab5` (`--meth`'s neutral and genomic matrices, see [`mat5_extend`]): the 32-entry table
+    // as its low half and `low ^ high`, each broadcast per 128-bit lane, read at `i = 5 t + q` by
+    // two in-lane shuffles. The first reads `low[i & 15]`; the second's index is `i - 16`, whose
+    // sign bit zeroes it for `i < 16`, so the XOR is `low[i]` below 16 and `high[i - 16]` above.
+    define_sw_kernel!(
+        batched_extend_sse41_u8_mat5,
+        u8,
+        u8,
+        16,
+        feat = "sse4.1",
+        dup = set1_u8,
+        lds = loadu_u8,
+        sts = storeu_u8,
+        ldu = loadu_u8,
+        sub = _mm_subs_epu8,
+        max = _mm_max_epu8,
+        ceqz = ceqz8,
+        cge = cge_epu8,
+        ceq = _mm_cmpeq_epi8,
+        orru = _mm_or_si128,
+        orr = _mm_or_si128,
+        andu = _mm_and_si128,
+        bsl = bsl128,
+        band = band_epi8,
+        band_bias = 0x80,
+        band_width = false,
+        diag = |m, s, bias| _mm_subs_epu8(_mm_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| {
+            let (lo, hi) = (
+                _mm_loadu_si128(p as *const __m128i),
+                _mm_loadu_si128(p.add(16) as *const __m128i),
+            );
+            (lo, _mm_xor_si128(lo, hi))
+        },
+        tbl = |t, k, q| {
+            let i = _mm_add_epi8(_mm_add_epi8(_mm_slli_epi16::<2>(k), k), q);
+            _mm_xor_si128(
+                _mm_shuffle_epi8(t.0, i),
+                _mm_shuffle_epi8(t.1, _mm_subs_epi8(i, _mm_set1_epi8(16))),
+            )
+        },
+        rowvec = false,
+        trk = i32,
+        row = x86_row
     );
 }
 
@@ -2838,14 +5636,14 @@ mod avx512 {
     /// # Returns
     /// A 512-bit vector whose every byte lane equals `x`. `as i8` is a bit reinterpretation: the u8
     /// kernel treats lanes as unsigned, so values above 127 are intended.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn set1_u8(x: u8) -> __m512i {
         _mm512_set1_epi8(x as i8)
     }
     /// # Returns
     /// A 512-bit vector whose every 16-bit lane equals `x`.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn set1_i16(x: i16) -> __m512i {
         _mm512_set1_epi16(x)
@@ -2853,27 +5651,27 @@ mod avx512 {
 
     // Loads and stores: `p` addresses at least LANES elements of that type (64 u8, or 32 u16/i16),
     // which the kernel guarantees is in bounds. Unaligned forms, 64 bytes moved.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn loadu_u8(p: *const u8) -> __m512i {
         _mm512_loadu_si512(p as *const __m512i)
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn loadu_u16(p: *const u16) -> __m512i {
         _mm512_loadu_si512(p as *const __m512i)
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn loadu_i16(p: *const i16) -> __m512i {
         _mm512_loadu_si512(p as *const __m512i)
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn storeu_u8(p: *mut u8, v: __m512i) {
         _mm512_storeu_si512(p as *mut __m512i, v)
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn storeu_i16(p: *mut i16, v: __m512i) {
         _mm512_storeu_si512(p as *mut __m512i, v)
@@ -2881,40 +5679,40 @@ mod avx512 {
 
     // Comparisons. Each returns the all-ones/all-zero VECTOR the shared macro body expects, built
     // from the opmask with `movm`. `v`/`a`/`b` are vectors of DP values or column indices.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn ceqz8(v: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpeq_epi8_mask(v, _mm512_setzero_si512()))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn ceqz16(v: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(v, _mm512_setzero_si512()))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn ceq8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpeq_epi8_mask(a, b))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn ceq16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(a, b))
     }
     /// Unsigned `a >= b`. Native here, unlike AVX2 where it has to be recovered from `max`.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     /// `(j >= beg) & (j < end)` for the AVX-512 u8 kernel. AVX-512BW HAS native unsigned compares
     /// (`vpcmpltub`, `vpcmpnltub`), and the disassembly confirms LLVM emits them from `cge_epu8` /
     /// `clt_epu8` rather than the max/cmpeq emulation AVX2 gets, so there is nothing to rewrite here
     /// and `band_bias` is 0. That is why its column loop is 38 instructions against AVX2's 54.
-    #[target_feature(enable = "avx512f,avx512bw")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
     unsafe fn band_epu8(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
         _mm512_and_si512(cge_epu8(j, beg), clt_epu8(j, end))
     }
 
     /// `(j >= beg) & (j < end)` for the AVX-512 i16 kernel. Native signed compares, `band_bias` 0.
-    #[target_feature(enable = "avx512f,avx512bw")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
     unsafe fn band_epi16(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
         _mm512_and_si512(cge_epi16(j, beg), clt_epi16(j, end))
     }
@@ -2922,17 +5720,17 @@ mod avx512 {
     unsafe fn cge_epu8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpge_epu8_mask(a, b))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn clt_epu8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmplt_epu8_mask(a, b))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn cge_epi16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpge_epi16_mask(a, b))
     }
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn clt_epi16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmplt_epi16_mask(a, b))
@@ -2941,7 +5739,7 @@ mod avx512 {
     /// `mask ? a : b`, the same convention as NEON's `vbslq`. One `ternarylogic`: the immediate
     /// 0xCA is the truth table of `(mask & a) | (!mask & b)`, and the operation is bitwise so the
     /// 32-bit lane granularity of the intrinsic is irrelevant.
-    #[target_feature(enable = "avx512bw")]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
     unsafe fn bsl512(mask: __m512i, a: __m512i, b: __m512i) -> __m512i {
         _mm512_ternarylogic_epi32(mask, a, b, 0xCA)
@@ -2952,7 +5750,7 @@ mod avx512 {
         i16,
         u16,
         32,
-        feat = "avx512bw",
+        feat = "avx512bw,avx512vl,avx512dq",
         dup = set1_i16,
         lds = loadu_i16,
         sts = storeu_i16,
@@ -2963,13 +5761,59 @@ mod avx512 {
         cge = cge_epi16,
         ceq = ceq16,
         orru = _mm512_or_si512,
+        orr = _mm512_or_si512,
         andu = _mm512_and_si512,
         bsl = bsl512,
         band = band_epi16,
         band_bias = 0,
         band_width = false,
         diag = |m, s, bias| _mm512_sub_epi16(_mm512_add_epi16(m, s), bias),
-        sbt_bias = |bias| bias
+        sbt_bias = |bias| bias,
+        sbt_tbl = false,
+        tab5 = false,
+        tbl_ld = |_p| _mm512_setzero_si512(),
+        tbl = |_t, _k, _q| unreachable!(),
+        rowvec = false,
+        trk = i32,
+        row = x86_row
+    );
+    // The i16 kernel with the 5x5 table (`tab5`), for the `--meth` jobs past the u8 bounds: the
+    // 32 i16 entries fill one register, and `vpermw` reads each lane's at `5 t + q` (its low five
+    // bits; real codes give at most 24). See [`mat5_extend`].
+    define_sw_kernel!(
+        batched_extend_avx512_i16_mat5,
+        i16,
+        u16,
+        32,
+        feat = "avx512bw,avx512vl,avx512dq",
+        dup = set1_i16,
+        lds = loadu_i16,
+        sts = storeu_i16,
+        ldu = loadu_u16,
+        sub = _mm512_sub_epi16,
+        max = _mm512_max_epi16,
+        ceqz = ceqz16,
+        cge = cge_epi16,
+        ceq = ceq16,
+        orru = _mm512_or_si512,
+        orr = _mm512_or_si512,
+        andu = _mm512_and_si512,
+        bsl = bsl512,
+        band = band_epi16,
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm512_sub_epi16(_mm512_add_epi16(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| _mm512_loadu_si512(p as *const _),
+        tbl = |t, k, q| {
+            let i = _mm512_add_epi16(_mm512_add_epi16(_mm512_slli_epi16::<2>(k), k), q);
+            _mm512_permutexvar_epi16(i, t)
+        },
+        rowvec = false,
+        trk = i32,
+        row = x86_row
     );
 
     define_sw_kernel!(
@@ -2977,7 +5821,7 @@ mod avx512 {
         u8,
         u8,
         64,
-        feat = "avx512bw",
+        feat = "avx512bw,avx512vl,avx512dq",
         dup = set1_u8,
         lds = loadu_u8,
         sts = storeu_u8,
@@ -2988,13 +5832,72 @@ mod avx512 {
         cge = cge_epu8,
         ceq = ceq8,
         orru = _mm512_or_si512,
+        orr = _mm512_or_si512,
         andu = _mm512_and_si512,
         bsl = bsl512,
         band = band_epu8,
         band_bias = 0,
         band_width = false,
         diag = |m, s, bias| _mm512_subs_epu8(_mm512_adds_epu8(m, s), bias),
-        sbt_bias = |bias| bias
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = false,
+        tbl_ld = |p| _mm512_broadcast_i32x4(_mm_loadu_si128(p as *const __m128i)),
+        tbl = |t, k, q| _mm512_shuffle_epi8(t, _mm512_xor_si512(k, q)),
+        rowvec = true,
+        trk = i16,
+        row = x86_row
+    );
+    // `tab5` (`--meth`'s neutral and genomic matrices, see [`mat5_extend`]): the 32-entry table
+    // as its low half and `low ^ high`, each broadcast per 128-bit lane, read at `i = 5 t + q` by
+    // two in-lane shuffles. The first reads `low[i & 15]`; the second's index is `i - 16`, whose
+    // sign bit zeroes it for `i < 16`, so the XOR is `low[i]` below 16 and `high[i - 16]` above.
+    define_sw_kernel!(
+        batched_extend_avx512_u8_mat5,
+        u8,
+        u8,
+        64,
+        feat = "avx512bw,avx512vl,avx512dq",
+        dup = set1_u8,
+        lds = loadu_u8,
+        sts = storeu_u8,
+        ldu = loadu_u8,
+        sub = _mm512_subs_epu8,
+        max = _mm512_max_epu8,
+        ceqz = ceqz8,
+        cge = cge_epu8,
+        ceq = ceq8,
+        orru = _mm512_or_si512,
+        orr = _mm512_or_si512,
+        andu = _mm512_and_si512,
+        bsl = bsl512,
+        band = band_epu8,
+        band_bias = 0,
+        band_width = false,
+        diag = |m, s, bias| _mm512_subs_epu8(_mm512_adds_epu8(m, s), bias),
+        sbt_bias = |bias| bias,
+        sbt_tbl = true,
+        tab5 = true,
+        tbl_ld = |p| {
+            let (lo, hi) = (
+                _mm_loadu_si128(p as *const __m128i),
+                _mm_loadu_si128(p.add(16) as *const __m128i),
+            );
+            (
+                _mm512_broadcast_i32x4(lo),
+                _mm512_broadcast_i32x4(_mm_xor_si128(lo, hi)),
+            )
+        },
+        tbl = |t, k, q| {
+            let i = _mm512_add_epi8(_mm512_add_epi8(_mm512_slli_epi16::<2>(k), k), q);
+            _mm512_xor_si512(
+                _mm512_shuffle_epi8(t.0, i),
+                _mm512_shuffle_epi8(t.1, _mm512_subs_epi8(i, _mm512_set1_epi8(16))),
+            )
+        },
+        rowvec = true,
+        trk = i16,
+        row = x86_row
     );
 }
 
@@ -4185,7 +7088,7 @@ mod x86_extend_bench {
                 &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
             )
         });
-        if std::arch::is_x86_feature_detected!("avx512bw") {
+        if bwa_extend::has_avx512() {
             bench("avx512_u8", &|| unsafe {
                 super::avx512::batched_extend_avx512_u8::<true>(
                     &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
@@ -4319,7 +7222,7 @@ mod avx512_verify {
                         h0: h0s[i],
                     })
                     .collect();
-                // SAFETY: `avx512bw` was checked above.
+                // SAFETY: AVX-512 BW/VL/DQ was checked above.
                 let got = unsafe {
                     if big {
                         super::avx512::batched_extend_avx512_i16::<true>(
@@ -4360,5 +7263,768 @@ mod avx512_verify {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mismatch_scan_tests {
+    /// The byte loop `mismatch_scan` replaced, kept as its reference.
+    fn reference(q: &[u8], t: &[u8], x: i32, cap: usize) -> Option<(u128, i32)> {
+        let (mut bits, mut total) = (0u128, 0i32);
+        for col in 0..q.len() {
+            if q[col] >= 4 || t[col] >= 4 {
+                return None;
+            }
+            if q[col] != t[col] {
+                total += 1;
+                if total > x || col >= cap {
+                    return None;
+                }
+                bits |= 1u128 << col;
+            }
+        }
+        Some((bits, total))
+    }
+
+    #[test]
+    fn mismatch_scan_equals_the_byte_loop() {
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |m: u64| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st % m
+        };
+        for _ in 0..200_000 {
+            let n = rnd(200) as usize;
+            let q: Vec<u8> = (0..n).map(|_| rnd(4) as u8).collect();
+            let mut t = q.clone();
+            for _ in 0..rnd(8) {
+                if n > 0 {
+                    let i = rnd(n as u64) as usize;
+                    t[i] = if rnd(40) == 0 { 4 } else { rnd(4) as u8 };
+                }
+            }
+            let x = rnd(10) as i32 - 1;
+            assert_eq!(
+                super::mismatch_scan(&q, &t, x, 128),
+                reference(&q, &t, x, 128),
+                "n={n} x={x}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod ungapped_walk_tests {
+    use bwa_extend::{ExtendJob, ExtendResult};
+
+    /// The column-by-column walk `ungapped_hit` replaced, kept as its reference.
+    fn reference(job: &ExtendJob, a: i32, b: i32, x: i32, zdrop: i32) -> Option<ExtendResult> {
+        let n = job.query.len();
+        if n == 0 || job.h0 <= 0 || job.target.len() < n || x < 0 {
+            return None;
+        }
+        let (bits, total) = super::mismatch_scan(&job.query[..n], &job.target[..n], x, 128)?;
+        if total == 0 {
+            let score = job.h0 + n as i32 * a;
+            let n = n as i32;
+            return Some(ExtendResult {
+                score,
+                qle: n,
+                tle: n,
+                gtle: n,
+                gscore: score,
+                max_off: 0,
+            });
+        }
+        if n > 128 {
+            return None;
+        }
+        let (mut running, mut best, mut best_end) = (job.h0, job.h0, 0i32);
+        for col in 0..n {
+            if running == 0 {
+                continue;
+            }
+            if bits >> col & 1 == 0 {
+                running += a;
+            } else {
+                running = (running - b).max(0);
+            }
+            if running > best {
+                best = running;
+                best_end = col as i32 + 1;
+            } else if zdrop > 0 && best - running > zdrop {
+                return None;
+            }
+        }
+        (running != 0).then_some(ExtendResult {
+            score: best,
+            qle: best_end,
+            tle: best_end,
+            gtle: n as i32,
+            gscore: running,
+            max_off: 0,
+        })
+    }
+
+    #[test]
+    fn ungapped_walk_equals_the_column_loop() {
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |m: u64| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st % m
+        };
+        for _ in 0..200_000 {
+            let n = rnd(160) as usize;
+            let q: Vec<u8> = (0..n).map(|_| rnd(4) as u8).collect();
+            let mut t = q.clone();
+            for _ in 0..rnd(6) {
+                if n > 0 {
+                    let i = rnd(n as u64) as usize;
+                    t[i] = rnd(4) as u8;
+                }
+            }
+            t.extend((0..rnd(3)).map(|_| rnd(4) as u8));
+            let job = ExtendJob {
+                query: &q,
+                target: &t,
+                h0: rnd(30) as i32,
+            };
+            let (a, b) = (1 + rnd(2) as i32, 1 + rnd(5) as i32);
+            let (x, zdrop) = (rnd(6) as i32, rnd(12) as i32);
+            assert_eq!(
+                super::ungapped_hit(&job, a, b, x, zdrop),
+                reference(&job, a, b, x, zdrop),
+                "n={n} a={a} b={b} x={x} zdrop={zdrop}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tight_band_walk_tests {
+    /// The byte walk `tight_band_bound` had before the block walk, kept as the reference.
+    fn reference(q: &[u8], t: &[u8], h0: i32, a: i32, mm: i32, oe: (i32, i32), eb: i32) -> i32 {
+        let min_len = q.len().min(t.len());
+        if min_len == 0 || h0 <= 0 || oe.0 < 0 || oe.1 <= 0 {
+            return i32::MAX;
+        }
+        let (mut h, mut s_best) = (h0, h0);
+        for col in 0..min_len {
+            if q[col] >= 4 || t[col] >= 4 {
+                return i32::MAX;
+            }
+            h += if q[col] == t[col] { a } else { mm };
+            if h <= 0 {
+                break;
+            }
+            s_best = s_best.max(h);
+        }
+        let numer =
+            i64::from(h0) + (min_len as i64) * i64::from(a) - i64::from(s_best) - i64::from(oe.0)
+                + i64::from(eb.max(0));
+        if numer <= 0 {
+            return 2;
+        }
+        let d = i64::from(oe.1);
+        ((((numer + d - 1) / d).min(i64::from(i32::MAX - 1))) as i32).saturating_add(1)
+    }
+
+    #[test]
+    fn block_walk_equals_the_byte_walk() {
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |m: u64| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st % m
+        };
+        for _ in 0..200_000 {
+            let n = rnd(260) as usize;
+            let q: Vec<u8> = (0..n).map(|_| rnd(4) as u8).collect();
+            let mut t: Vec<u8> = q
+                .iter()
+                .map(|&c| if rnd(6) == 0 { rnd(4) as u8 } else { c })
+                .collect();
+            if rnd(10) == 0 && n > 0 {
+                let i = rnd(n as u64) as usize;
+                t[i] = 4;
+            }
+            t.truncate(n.saturating_sub(rnd(5) as usize));
+            let h0 = rnd(40) as i32;
+            let (a, mm) = if rnd(20) == 0 {
+                (0, -4)
+            } else {
+                (1 + rnd(2) as i32, -(rnd(6) as i32))
+            };
+            let args = (h0, a, mm, (6, 1), 5);
+            assert_eq!(
+                super::tight_band_bound(&q, &t, args.0, args.1, args.2, args.3, args.4),
+                reference(&q, &t, args.0, args.1, args.2, args.3, args.4),
+                "n={n} h0={h0} a={a} mm={mm}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod dedup_jobs_tests {
+    use bwa_extend::ExtendJob;
+
+    /// Every job maps to a distinct job with the same `h0`, query and target, and the distinct
+    /// jobs come in first-appearance order.
+    #[test]
+    fn dedup_maps_each_job_to_its_equal() {
+        // Short sequences over a small alphabet, so contents repeat, including across `h0`.
+        let seqs: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| (0..(i % 7 + 1)).map(|j| ((i * 3 + j) % 3) as u8).collect())
+            .collect();
+        let jobs: Vec<ExtendJob> = (0..400u32)
+            .map(|i| ExtendJob {
+                query: &seqs[(i * 7 % 40) as usize],
+                target: &seqs[(i * 13 % 40) as usize],
+                h0: (i % 3) as i32,
+            })
+            .collect();
+        let fps: Vec<u64> = jobs.iter().map(super::job_fingerprint).collect();
+        let (unique, map) = super::dedup_jobs(&jobs, &fps);
+        let same = |a: &ExtendJob, b: &ExtendJob| {
+            a.h0 == b.h0 && a.query == b.query && a.target == b.target
+        };
+        for (j, &u) in jobs.iter().zip(&map) {
+            assert!(same(j, &unique[u as usize]));
+        }
+        for (x, a) in unique.iter().enumerate() {
+            assert!(unique[x + 1..].iter().all(|b| !same(a, b)));
+            assert_eq!(
+                map.iter()
+                    .position(|&u| u as usize == x)
+                    .map(|i| same(&jobs[i], a)),
+                Some(true)
+            );
+        }
+        let first: Vec<usize> = (0..unique.len())
+            .map(|x| map.iter().position(|&u| u as usize == x).unwrap())
+            .collect();
+        assert!(first.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// The fingerprint reads every byte of both sequences at every length: changing any one byte
+    /// changes it (a byte the fold skipped would make all its variants collide).
+    #[test]
+    fn fingerprint_covers_every_byte() {
+        let base: Vec<u8> = (0..200u32).map(|i| (i * 7 % 5) as u8).collect();
+        for n in 0..base.len() {
+            let other = &base[..n.min(40)];
+            for swap in [false, true] {
+                let job = |s: &[u8]| {
+                    let (q, t) = if swap { (other, s) } else { (s, other) };
+                    super::job_fingerprint(&ExtendJob {
+                        query: q,
+                        target: t,
+                        h0: 3,
+                    })
+                };
+                let h = job(&base[..n]);
+                for i in 0..n {
+                    let mut v = base[..n].to_vec();
+                    v[i] ^= 1;
+                    assert_ne!(job(&v), h, "n={n} i={i} swap={swap}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod exact_stop_tests {
+    use bwa_extend::{ExtendJob, ExtendResult};
+
+    /// The SIMD kernels with the exact early stop ([`super::exact_stop_enabled`]) against the
+    /// scalar reference, which runs every row, on what the caller reads: `score`, `qle`, `tle` and
+    /// `max_off` always, the clip decision `gscore > 0 && gscore > score - end_bonus`, and
+    /// `gscore`/`gtle` when that decision goes to the end. The targets run far past the query's
+    /// alignment, mostly as deletion tails, where the stop retires lanes; that it fires at all is
+    /// checked against the same kernels with the stop off.
+    #[test]
+    fn exact_stop_keeps_what_the_caller_reads() {
+        super::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut mat = vec![-4i8; 25];
+        for k in 0..5 {
+            mat[k * 5 + 4] = -1;
+            mat[20 + k] = -1;
+        }
+        for k in 0..4 {
+            mat[k * 6] = 1;
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let run = |jobs: &[ExtendJob], stop, w, eb, zd| {
+            super::EXACT_STOP_TEST.with(|c| c.set(Some(stop)));
+            super::batched_extend(jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd)
+        };
+        let mut fired = 0;
+        for round in 0..300u32 {
+            let (w, eb, zd) = (
+                1 + (next() % 120) as i32,
+                (next() % 12) as i32,
+                [0, 30, 100, 1000][(next() % 4) as usize],
+            );
+            let n = 1 + (next() % 70) as usize;
+            let mut seqs: Vec<(Vec<u8>, Vec<u8>, i32)> = Vec::new();
+            for _ in 0..n {
+                let qlen = if next() % 4 == 0 {
+                    150 + next() % 300
+                } else {
+                    1 + next() % 140
+                } as usize;
+                let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                // A noisy copy of a prefix of the query, then a random tail of up to 300 bases.
+                let (keep, tail) = (
+                    (next() % (qlen as u64 + 1)) as usize,
+                    (next() % 300) as usize,
+                );
+                let mut t: Vec<u8> = Vec::new();
+                for &b in &q[..keep] {
+                    match next() % 50 {
+                        0 => t.push((next() % 4) as u8),
+                        1 => {}
+                        2 => t.extend([b, (next() % 4) as u8]),
+                        _ => t.push(b),
+                    }
+                }
+                t.extend((0..tail).map(|_| (next() % 4) as u8));
+                if t.is_empty() {
+                    t.push(0);
+                }
+                seqs.push((q, t, 1 + (next() % 60) as i32));
+            }
+            let jobs: Vec<ExtendJob> = seqs
+                .iter()
+                .map(|(q, t, h0)| ExtendJob {
+                    query: q,
+                    target: t,
+                    h0: *h0,
+                })
+                .collect();
+            let want = super::batched_extend_scalar(&jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd);
+            let got = run(&jobs, true, w, eb, zd);
+            let full = run(&jobs, false, w, eb, zd);
+            assert_eq!(full, want, "round {round}: the kernels with the stop off");
+            let seen = |r: &ExtendResult| {
+                let glob = r.gscore > 0 && r.gscore > r.score - eb;
+                (
+                    r.score,
+                    r.qle,
+                    r.tle,
+                    r.max_off,
+                    glob,
+                    glob.then_some((r.gscore, r.gtle)),
+                )
+            };
+            for (k, (g, e)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(seen(g), seen(e), "round {round} job {k}: {g:?} vs {e:?}");
+                fired += usize::from(g != e);
+            }
+        }
+        super::EXACT_STOP_TEST.with(|c| c.set(None));
+        assert!(
+            fired > 0,
+            "the stop never moved an unread field: was it reached?"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clamp_band_tests {
+    /// The C's double-precision form, as [`super::clamp_band`] had it.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(w0: i32, qlen: usize, a: i32, eb: i32, oi: i32, ei: i32, od: i32, ed: i32) -> i32 {
+        let max_ins = (((qlen as f64 * f64::from(a) + f64::from(eb) - f64::from(oi))
+            / f64::from(ei))
+            + 1.0) as i32;
+        let max_del = (((qlen as f64 * f64::from(a) + f64::from(eb) - f64::from(od))
+            / f64::from(ed))
+            + 1.0) as i32;
+        w0.min(max_ins.max(1)).min(max_del.max(1))
+    }
+
+    #[test]
+    fn integer_clamp_matches_the_double_one() {
+        for qlen in (0..400).chain([1000, 10_000, 100_000, 1_000_000]) {
+            for a in [1, 2, 5] {
+                for eb in [0, 5, 30] {
+                    for (o, e) in [
+                        (0, 1),
+                        (6, 1),
+                        (5, 3),
+                        (40, 1),
+                        (11, 7),
+                        (100, 13),
+                        (3000, 2),
+                    ] {
+                        for w0 in [1, 10, 100, 1000, i32::MAX] {
+                            assert_eq!(
+                                super::clamp_band(w0, qlen, a, eb, o, e, e + 5, o / 2 + 1),
+                                reference(w0, qlen, a, eb, o, e, e + 5, o / 2 + 1),
+                                "w0 {w0} qlen {qlen} a {a} eb {eb} o {o} e {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod mat5_tests {
+    use bwa_extend::ExtendJob;
+
+    /// Targets of 256 to ~1300 bases on the u8 kernels (standard matrix through `dispatch_bins`,
+    /// a `--meth` genomic matrix through `mat5_extend`), every field against the scalar reference:
+    /// [`super::U8_TLEN`] lets them in. Queries of 100 to 249 bases with `h0` under the u8 cell
+    /// bound; the targets hold the query with a 20 to 90 base insertion, so the best cell and the
+    /// query end (`max_i`, `max_ie`) fall on rows past 255, and a random tail past that.
+    #[test]
+    fn u8_extend_takes_long_targets_exactly() {
+        super::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut genomic = vec![-4i8; 25];
+        for k in 0..5 {
+            genomic[k * 5 + 4] = -1;
+            genomic[20 + k] = -1;
+        }
+        for k in 0..4 {
+            genomic[k * 6] = 1;
+        }
+        genomic[5 + 3] = 1; // reference C, read T (OT, genomic)
+        let mut standard = genomic.clone();
+        standard[5 + 3] = -4;
+        let (mut long, mut deep) = (0usize, 0usize);
+        for (name, mat) in [("standard", &standard), ("genomic", &genomic)] {
+            for round in 0..24u32 {
+                let n = 1 + (next() % 40) as usize;
+                let mut seqs: Vec<(Vec<u8>, Vec<u8>, i32)> = Vec::new();
+                for _ in 0..n {
+                    let qlen = 100 + (next() % 150) as usize;
+                    let q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+                    let cut = (next() as usize) % qlen;
+                    let mut t: Vec<u8> = Vec::new();
+                    for (k, &b) in q.iter().enumerate() {
+                        if k == cut {
+                            t.extend((0..20 + next() % 70).map(|_| (next() % 4) as u8));
+                        }
+                        t.push(if next() % 30 == 0 {
+                            (next() % 4) as u8
+                        } else {
+                            b
+                        });
+                    }
+                    t.extend((0..next() % 1000).map(|_| (next() % 4) as u8));
+                    // `h0 + qlen` plus the matrix's headroom (4 + 1) stays under 256.
+                    let h0 = 1 + (next() % (250 - qlen as u64)) as i32;
+                    long += usize::from(t.len() >= 256);
+                    seqs.push((q, t, h0));
+                }
+                let jobs: Vec<ExtendJob> = seqs
+                    .iter()
+                    .map(|(q, t, h0)| ExtendJob {
+                        query: q,
+                        target: t,
+                        h0: *h0,
+                    })
+                    .collect();
+                let (w, eb, zd) = (
+                    [50, 100, 200][(next() % 3) as usize],
+                    (next() % 12) as i32,
+                    [0, 100, 300][(next() % 3) as usize],
+                );
+                let want = super::batched_extend_scalar(&jobs, 5, mat, 6, 1, 6, 1, w, eb, zd);
+                deep += want.iter().filter(|r| r.tle > 256 || r.gtle > 256).count();
+                let got = super::batched_extend(&jobs, 5, mat, 6, 1, 6, 1, w, eb, zd);
+                assert_eq!(got, want, "{name} round {round} w {w} zdrop {zd}");
+            }
+        }
+        assert!(long > 500 && deep > 100, "long {long} deep {deep}");
+    }
+
+    /// [`super::dead_seed`] equals the scalar DP wherever it answers: `h0` from -6 to 0, `a` from 1
+    /// to 3 (so some first cells go positive and it must decline), empty query or target, bands
+    /// that do and do not reach the query's end.
+    #[test]
+    fn dead_seed_matches_scalar() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |m: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m
+        };
+        let (mut took, mut declined) = (0, 0);
+        for round in 0..3000 {
+            let a = 1 + (round % 3) as i8;
+            let mut mat = [-3i8; 25];
+            (0..5).for_each(|k| (mat[k * 5 + 4], mat[20 + k]) = (-1, -1));
+            (0..4).for_each(|k| mat[k * 6] = a);
+            let q: Vec<u8> = (0..next(13)).map(|_| next(5) as u8).collect();
+            let t: Vec<u8> = (0..next(13)).map(|_| next(4) as u8).collect();
+            let job = ExtendJob {
+                query: &q,
+                target: &t,
+                h0: -(next(7) as i32),
+            };
+            let (w0, eb) = (1 + next(15) as i32, next(6) as i32);
+            let w = super::clamp_band(w0, q.len(), i32::from(a), eb, 6, 1, 6, 1);
+            let want = super::batched_extend_scalar(&[job], 5, &mat, 6, 1, 6, 1, w0, eb, 100)[0];
+            match super::dead_seed(&job, 5, &mat, w) {
+                Some(got) => (took, _) = (took + 1, assert_eq!(got, want, "round {round}")),
+                None => declined += 1,
+            }
+        }
+        assert!(
+            took > 1000 && declined > 50,
+            "took {took} declined {declined}"
+        );
+    }
+
+    /// `--meth`'s matrices (neutral and genomic through the `tab5` kernel, collapsed through the
+    /// rewrite to the uniform matrix) against the scalar reference: noisy copies of the query with
+    /// its C (or G) converted, N on both sides, ragged lengths, `h0` from -9 to 40. Every fourth
+    /// round has queries of 230 to 429 bases, past the u8 bounds, for the i16 `tab5` kernels.
+    #[test]
+    fn meth_matrices_extend_like_scalar() {
+        // Field-level gate: pin the full band (see `tight_band_enabled`).
+        super::FULL_BAND_FOR_FIELD_GATES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mut base = vec![-4i8; 25];
+        for k in 0..5 {
+            base[k * 5 + 4] = -1;
+            base[20 + k] = -1;
+        }
+        for k in 0..4 {
+            base[k * 6] = 1;
+        }
+        // (ref base, read base) freed: OT C->T, OB G->A; freed score 0 (neutral) or 1 (genomic),
+        // and mirrored (collapsed).
+        let mut walked = 0;
+        for (r, q) in [(1usize, 3usize), (2, 0)] {
+            for (conv, mirror) in [(0i8, false), (1, false), (1, true)] {
+                let mut mat = base.clone();
+                mat[r * 5 + q] = conv;
+                if mirror {
+                    mat[q * 5 + r] = 1;
+                }
+                for round in 0..40u32 {
+                    let n = 1 + (next() % 70) as usize;
+                    let mut seqs: Vec<(Vec<u8>, Vec<u8>, i32)> = Vec::new();
+                    for i in 0..n {
+                        // Every other job nearly clean, so the ungapped walk takes some.
+                        let noise = if i % 2 == 0 { 40 } else { 600 };
+                        let qlen = if round % 4 == 3 { 230 } else { 1 } + (next() % 200) as usize;
+                        let qs: Vec<u8> = (0..qlen)
+                            .map(|_| {
+                                if next() % 40 == 0 {
+                                    4
+                                } else {
+                                    (next() % 4) as u8
+                                }
+                            })
+                            .collect();
+                        let mut t: Vec<u8> = Vec::new();
+                        for &b in &qs {
+                            match next() % noise {
+                                0 => {}
+                                1 => t.extend([b, (next() % 4) as u8]),
+                                2 => t.push((next() % 5) as u8),
+                                _ => t.push(if b as usize == q && next() % 2 == 0 {
+                                    r as u8
+                                } else {
+                                    b
+                                }),
+                            }
+                        }
+                        t.extend((0..next() % 60).map(|_| (next() % 4) as u8));
+                        // `h0 <= 0` too: a `--meth` seed can score that.
+                        seqs.push((qs, t, (next() % 50) as i32 - 9));
+                    }
+                    let jobs: Vec<ExtendJob> = seqs
+                        .iter()
+                        .map(|(q, t, h0)| ExtendJob {
+                            query: q,
+                            target: t,
+                            h0: *h0,
+                        })
+                        .collect();
+                    let (w, eb, zd) = (1 + (next() % 120) as i32, (next() % 12) as i32, 100);
+                    if !mirror {
+                        walked += jobs
+                            .iter()
+                            .filter(|j| super::ungapped_hit_mat(j, &mat, 7, zd).is_some())
+                            .count();
+                    }
+                    let want = super::batched_extend_scalar(&jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd);
+                    // Every i16 `tab5` kernel on every job it takes (`h0 > 0`; all fit i16).
+                    {
+                        let fit16: Vec<ExtendJob> =
+                            jobs.iter().copied().filter(|j| j.h0 > 0).collect();
+                        let want =
+                            super::batched_extend_scalar(&fit16, 5, &mat, 6, 1, 6, 1, w, eb, zd);
+                        let tag = format!("freed ({r},{q}) conv {conv} round {round} i16");
+                        super::EXACT_STOP_TEST.with(|c| c.set(Some(false)));
+                        // SAFETY: NEON on aarch64; SSE4.1 and AVX2 as below, AVX-512 checked;
+                        // every job inside the i16 bounds; the matrix is `tab5`'s.
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            assert_eq!(
+                                super::neon::batched_extend_neon_i16_mat5::<false>(
+                                    &fit16, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} neon"
+                            );
+                        }
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            assert_eq!(
+                                super::sse41::batched_extend_sse41_i16_mat5::<true>(
+                                    &fit16, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} sse41"
+                            );
+                            assert_eq!(
+                                super::avx2::batched_extend_avx2_i16_mat5::<false>(
+                                    &fit16, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} avx2"
+                            );
+                            if bwa_extend::has_avx512() {
+                                assert_eq!(
+                                    super::avx512::batched_extend_avx512_i16_mat5::<true>(
+                                        &fit16, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                    ),
+                                    want,
+                                    "{tag} avx512"
+                                );
+                            }
+                        }
+                    }
+                    // Every x86 `tab5` tier on the jobs it takes (`mat5_extend`'s u8 bounds),
+                    // whatever the calibration picks. AVX2 needs an AVX2 executor (Rosetta is one).
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let fit: Vec<ExtendJob> = jobs
+                            .iter()
+                            .copied()
+                            .filter(|j| {
+                                j.h0 > 0
+                                    && j.query.len() < 256
+                                    && j.target.len() < 256
+                                    && super::cell_bound(j, 1) + 5 < 256
+                            })
+                            .collect();
+                        let want =
+                            super::batched_extend_scalar(&fit, 5, &mat, 6, 1, 6, 1, w, eb, zd);
+                        super::EXACT_STOP_TEST.with(|c| c.set(Some(false)));
+                        // SAFETY: SSE4.1 is in every x86_64 this runs on, AVX2 in the executor,
+                        // AVX-512 checked; `fit` holds the u8 bounds; the matrix is `tab5`'s.
+                        unsafe {
+                            let tag = format!("freed ({r},{q}) conv {conv} round {round}");
+                            assert_eq!(
+                                super::sse41::batched_extend_sse41_u8_mat5::<true>(
+                                    &fit, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} sse41"
+                            );
+                            assert_eq!(
+                                super::avx2::batched_extend_avx2_u8_mat5::<false>(
+                                    &fit, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} avx2"
+                            );
+                            assert_eq!(
+                                super::avx2::batched_extend_avx2_u8_mat5::<true>(
+                                    &fit, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                ),
+                                want,
+                                "{tag} avx2 inline"
+                            );
+                            if bwa_extend::has_avx512() {
+                                assert_eq!(
+                                    super::avx512::batched_extend_avx512_u8_mat5::<true>(
+                                        &fit, 5, &mat, 6, 1, 6, 1, w, eb, zd
+                                    ),
+                                    want,
+                                    "{tag} avx512"
+                                );
+                            }
+                        }
+                    }
+                    let run = |stop| {
+                        super::EXACT_STOP_TEST.with(|c| c.set(Some(stop)));
+                        super::batched_extend(&jobs, 5, &mat, 6, 1, 6, 1, w, eb, zd)
+                    };
+                    let tag = format!("freed ({r},{q}) conv {conv} mirror {mirror} round {round}");
+                    assert_eq!(run(false), want, "{tag}, exact stop off");
+                    // With the stop on, what the caller reads (as `exact_stop_keeps_what_the_caller_reads`).
+                    let seen = |r: &bwa_extend::ExtendResult| {
+                        let glob = r.gscore > 0 && r.gscore > r.score - eb;
+                        let g = glob.then_some((r.gscore, r.gtle));
+                        (r.score, r.qle, r.tle, r.max_off, glob, g)
+                    };
+                    for (k, (g, e)) in run(true).iter().zip(&want).enumerate() {
+                        assert_eq!(seen(g), seen(e), "{tag} job {k}");
+                    }
+                    // The kernel's tight band under `tab5` (the gates above pin it off): the
+                    // scalar reference inside that band reads the same.
+                    if !mirror {
+                        for (k, (j, e)) in jobs.iter().zip(&want).enumerate() {
+                            let (a, mm) = (i32::from(mat[0]), i32::from(mat[1]));
+                            let b =
+                                super::tight_band_bound(j.query, j.target, j.h0, a, mm, (6, 1), eb);
+                            let t = super::batched_extend_scalar(
+                                &[*j],
+                                5,
+                                &mat,
+                                6,
+                                1,
+                                6,
+                                1,
+                                w.min(b),
+                                eb,
+                                zd,
+                            );
+                            assert_eq!(seen(&t[0]), seen(e), "{tag} job {k}, tight band {b}");
+                        }
+                    }
+                    super::EXACT_STOP_TEST.with(|c| c.set(None));
+                }
+            }
+        }
+        assert!(walked >= 200, "the ungapped walk took {walked} jobs");
     }
 }

@@ -27,7 +27,7 @@ bwa-index = { workspace = true }
 bwa-mem = { workspace = true }
 bwa-neon = { workspace = true }
 clap = { workspace = true }
-mimalloc = { workspace = true, optional = true }
+libmimalloc-sys = { workspace = true, optional = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 bgzf = { workspace = true }
@@ -107,7 +107,7 @@ hts-output = ["dep:rust-htslib"]
 # `#[global_allocator]` is a whole-program decision and this crate now has a
 # library target: an embedder that links `bwa_mem4` should not have one chosen
 # for it. Nothing in the library uses it.
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:libmimalloc-sys"]
 fast-gzip = ["bwa-io/fast-gzip"]
 # Parallel inflate for gzipped FASTQ, ON by default. Turning it off falls back to the single-thread
 # zlib-rs inflater, which is still on its own thread. See crates/bwa-io/Cargo.toml for the measured

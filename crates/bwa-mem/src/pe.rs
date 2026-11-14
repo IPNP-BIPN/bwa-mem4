@@ -69,12 +69,14 @@ use std::io::{self, Write};
 use bwa_core::MemOpt;
 use bwa_extend::{ksw_align2, KswAlignResult};
 use bwa_index::{BntSeq, FmIndex};
-use bwa_neon::{batched_mate_rescue, KswJob};
+use bwa_neon::{batched_mate_rescue, batched_mate_rescue_lazy, KswJob, SCORE2_PENDING};
 
 use crate::alt::mem_gen_alt;
 use crate::cigar::{reg2aln, MemAln};
+use crate::meth::MethEmit;
 use crate::primary::{
     hash_64, insert_into_settled, mem_approx_mapq_se, mem_mark_primary_se, mem_sort_dedup_patch,
+    same_region,
 };
 use crate::MemAlnReg;
 
@@ -270,6 +272,35 @@ pub(crate) fn bns_fetch_seq(
     (rb, re, rid, seq)
 }
 
+/// [`bns_fetch_seq`] appending the window to `out` instead of allocating it.
+pub(crate) fn bns_fetch_seq_into(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    rb: i64,
+    mid: i64,
+    re: i64,
+    out: &mut Vec<u8>,
+) -> (i64, i64, i32) {
+    let (mut rb, mut re) = if re < rb { (re, rb) } else { (rb, re) };
+    let (fwd_mid, is_rev) = bns.depos(mid);
+    let rid = bns.pos2rid(fwd_mid);
+    let (mut far_beg, mut far_end) = if rid >= 0 {
+        let contig = &bns.contigs[rid as usize];
+        (contig.offset, contig.offset + i64::from(contig.len))
+    } else {
+        (0, bns.l_pac << 1)
+    };
+    if is_rev {
+        let old_far_beg = far_beg;
+        far_beg = (bns.l_pac << 1) - far_end;
+        far_end = (bns.l_pac << 1) - old_far_beg;
+    }
+    rb = rb.max(far_beg);
+    re = re.min(far_end);
+    fm.bases_append(rb, re, out);
+    (rb, re, rid)
+}
+
 /// Smith-Waterman mate rescue: given an anchor region `a` for one read, try to align the mate `ms`
 /// (nt4) in each insert-consistent orientation not already satisfied, appending any hit to `ma`.
 /// Port of `mem_matesw` (`bwamem_pair.cpp:150-283`, the `#if !MATE_SORT` branches; bwa-mem2 ships
@@ -295,6 +326,7 @@ pub(crate) fn bns_fetch_seq(
 /// INVARIANT: `ma` is kept sorted by score descending throughout, both by the manual insertion
 /// below and by `mem_sort_dedup_patch`. Later anchors' skip test therefore sees earlier inserts,
 /// which is what forces the round-by-round structure of [`batch_mate_rescue`].
+#[allow(clippy::too_many_arguments)]
 fn mem_matesw(
     fm: &FmIndex,
     bns: &BntSeq,
@@ -303,6 +335,8 @@ fn mem_matesw(
     a: &MemAlnReg,
     ms: &[u8],
     ma: &mut Vec<MemAlnReg>,
+    // `--meth`: the mate's chemistry (read 1 = C->T); unused otherwise.
+    mate_ot: bool,
 ) -> i32 {
     // `l_pac`: packed reference length, so the doubled coordinate space is [0, 2*l_pac).
     // `l_ms`: the mate's length in bases, the length of every query built below and the amount by
@@ -427,8 +461,14 @@ fn mem_matesw(
                 // `aln`: ksw's verdict for this orientation. `score`/`score2` are the best and
                 // second-best local scores, `qb`/`qe` and `tb`/`te` the CLOSED start/end offsets
                 // into `seq` and `refseq`, and `qb < 0` means "nothing scored above `minsc`".
+                // `--meth`: a mate aligned reverse-complemented reads its conversion on the other
+                // strand, so it takes the other chemistry's matrix.
+                let mat = match &opt.meth {
+                    Some(meth) => &meth.mats[usize::from(mate_ot ^ is_rev)],
+                    None => &opt.mat,
+                };
                 let aln = ksw_align2(
-                    &seq, &refseq, 5, &opt.mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc,
+                    &seq, &refseq, 5, mat, opt.o_del, opt.e_del, opt.o_ins, opt.e_ins, minsc,
                     opt.a, lanes,
                 );
                 if dump_pestat() {
@@ -480,8 +520,8 @@ fn mem_matesw(
                     let seedcov = ((b_re - b_rb).min(i64::from(qe - qb)) >> 1) as i32;
                     // The C `memset`s the whole `mem_alnreg_t` to zero and then fills six fields,
                     // so every field left at 0 / -1 / 0.0 below is that memset, not an oversight:
-                    // `truesc`, `sub`, `sub_n`, `seedlen0`, `secondary_all`, `w`, `frac_rep`,
-                    // `hash` and `n_comp` are all zero for a rescued region, and `secondary` is the
+                    // `truesc`, `sub`, `sub_n`, `seedlen0`, `secondary_all`, `w`, `frac_rep` and
+                    // `hash` are all zero for a rescued region, and `secondary` is the
                     // one field the C sets to -1 explicitly. `csub` carries ksw's second-best score
                     // (KSW_XSUBO), which later caps the paired MAPQ at the tandem-repeat score.
                     let b = MemAlnReg {
@@ -504,8 +544,6 @@ fn mem_matesw(
                         is_alt: a.is_alt,
                         // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                         alt_sc: 0,
-                        hash: 0,
-                        n_comp: 0,
                     };
                     // ---- step 4: insert the accepted hit, keeping `ma` score-sorted ----
                     // Insert keeping `ma` sorted by score descending (bwa's manual insertion at
@@ -518,6 +556,7 @@ fn mem_matesw(
                     while ins < ma.len() && ma[ins].score >= b.score {
                         ins += 1;
                     }
+                    grow_one(ma);
                     ma.insert(ins, b);
                 }
                 n += 1;
@@ -540,11 +579,12 @@ fn mem_matesw(
 /// One insert-consistent orientation's mate-rescue local-SW job (built by [`matesw_collect`]): the
 /// mate `query` in this orientation vs the `target` window, plus the coordinates needed to place the
 /// hit ([`matesw_apply`]).
+#[derive(Clone, Copy)]
 struct Orient {
-    /// The mate in this orientation: `ms` as sequenced, or its reverse complement when `is_rev`.
-    query: Vec<u8>,
-    /// The fetched reference window, already clamped to the anchor's contig by `bns_fetch_seq`.
-    target: Vec<u8>,
+    /// The fetched reference window, already clamped to the anchor's contig by `bns_fetch_seq`:
+    /// its `(offset, length)` in the round's arena. The mate in this orientation is `ms` as
+    /// sequenced, or the call's `rc` when `is_rev`.
+    target: (u32, u32),
     /// The window's start in the doubled coordinate space *after* clamping. Every ksw target
     /// coordinate is relative to this, so it must travel with the job.
     rb: i64,
@@ -556,6 +596,16 @@ struct Orient {
 /// One anchor's mate rescue, split into the SW-independent `collect` (which orientations to run) and
 /// the SW-dependent `apply` (insert the hits). Mirrors [`mem_matesw`] exactly but lets the SW of many
 /// anchors, across the whole pair batch, run through one vectorized [`batched_mate_rescue`].
+/// What [`matesw_collect`] reads of an anchor region: its position, contig and ALT flag. The
+/// anchors of a whole pair batch sit in one flat vector, which the rescue rounds index.
+#[derive(Clone, Copy)]
+pub(crate) struct Anchor {
+    rb: i64,
+    rid: i32,
+    is_alt: bool,
+}
+
+#[derive(Clone, Copy)]
 struct RescueCall {
     /// `skip[r] != 0` means orientation `r` runs no SW. `matesw_apply` re-walks this so its
     /// per-orientation dedup fires on exactly the same iterations as the C's loop.
@@ -564,6 +614,10 @@ struct RescueCall {
     /// or landed on the wrong contig. `skip[r] == 0` with `per_r[r] == None` is the C's "window
     /// rejected": no SW, and `n` is not incremented.
     per_r: [Option<Orient>; 4],
+    /// The mate's reverse complement in the round's arena, `(offset, length)`, built once per call
+    /// when a reverse orientation runs (length 0 when none did). The windows live there too: one
+    /// arena per round instead of two allocations per call.
+    rc: (u32, u32),
     /// Mate length in bases, needed to flip query coordinates for the reverse orientations.
     l_ms: i64,
     /// The anchor's `rid` and `is_alt`, copied into every region this call produces. Captured at
@@ -595,52 +649,338 @@ struct RescueCall {
 /// `min_seed_len` (the minimum usable window width), `pes` the per-orientation insert windows, `a`
 /// the anchor region of the other read, `ms` this read's nt4 sequence, `ma` this read's current
 /// regions (used solely for the `skip` test).
+/// Fewer regions than this and the per-anchor scans stay linear: a view costs an allocation and a
+/// sort, and a short list is walked faster than it is indexed.
+const VIEW_MIN: usize = 16;
+
+/// A rescue target's regions indexed for the two per-anchor scans, the skip test of
+/// [`matesw_collect`] (any region at a proper-pair distance of the anchor) and the settled insert
+/// of [`matesw_apply`] (any region overlapping the hit). Both are range queries on `rb`, so the
+/// linear scans (1.4G rows per 2M pairs: repetitive mates carry a hundred regions and fifty
+/// anchors) become binary searches.
+#[derive(Default)]
+pub(crate) struct RegionView {
+    /// `(rb, re, qb, qe)` of every region, ascending by `rb` up to `sorted`, then the few pushed
+    /// since, unordered. Meaningful only while `built`.
+    by_rb: Vec<(i64, i64, i32, i32)>,
+    sorted: usize,
+    /// Longest `re - rb` in `by_rb`: how far left of a hit an overlapping region's `rb` can lie.
+    max_len: i64,
+    built: bool,
+    /// Every region has `rid >= 0` and `re > rb`: what lets the insert scan visit only the regions
+    /// overlapping the hit, since [`insert_into_settled`] declines on any other kind.
+    clean: bool,
+    /// Whether the list is what `mem_sort_dedup_patch` left (see [`insert_into_settled`]).
+    pub(crate) settled: bool,
+    /// Hits [`insert_settled_view`] appended past the list's sorted prefix, put in place by
+    /// [`settle_order`] before anything that reads the order.
+    pending: usize,
+    /// Bumped by [`matesw_apply`] whenever a rescue hit may have changed the list: a skip set
+    /// computed at an unchanged version still holds.
+    version: u32,
+}
+
+thread_local! {
+    /// [`RegionView::ensure`]'s tuples and sort keys, kept per thread: a view lives one batch, so
+    /// buffers of its own were two allocations per view built.
+    static VIEW_SCRATCH: std::cell::RefCell<ViewScratch> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// `(rb, re, qb, qe)` per region, then the packed sort keys.
+type ViewScratch = (Vec<(i64, i64, i32, i32)>, Vec<u64>);
+
+impl RegionView {
+    /// Index `ma` unless it is short; returns whether the view is usable for it.
+    fn ensure(&mut self, ma: &[MemAlnReg]) -> bool {
+        if ma.len() < VIEW_MIN {
+            return false;
+        }
+        if !self.built {
+            let t_build = crate::rescue_split::start();
+            if t_build.is_some() {
+                crate::rescue_split::VIEW_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::rescue_split::VIEW_BUILD_ROWS
+                    .fetch_add(ma.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            // One pass over the 96-byte regions for everything the view needs; the sort then works
+            // on the 24-byte tuples alone. Three passes (keys, max length, cleanliness) plus a
+            // gather back through `ma` in sorted order were most of `batch_mate_rescue` on x86.
+            let (mut max_len, mut clean, mut packable) = (0i64, true, ma.len() < 1 << 24);
+            VIEW_SCRATCH.with_borrow_mut(|(tuples, keys)| {
+                tuples.clear();
+                tuples.extend(ma.iter().map(|q| {
+                    max_len = max_len.max(q.re - q.rb);
+                    clean &= q.rid >= 0 && q.re > q.rb;
+                    packable &= (0..1 << 40).contains(&q.rb);
+                    (q.rb, q.re, q.qb, q.qe)
+                }));
+                self.by_rb.clear();
+                // Sorted as packed `rb << 24 | index` words: a primitive sort, not a keyed tuple one.
+                if packable {
+                    keys.clear();
+                    keys.extend(
+                        tuples
+                            .iter()
+                            .enumerate()
+                            .map(|(i, q)| (q.0 as u64) << 24 | i as u64),
+                    );
+                    keys.sort_unstable();
+                    self.by_rb
+                        .extend(keys.iter().map(|&k| tuples[(k & 0xff_ffff) as usize]));
+                } else {
+                    self.by_rb.extend_from_slice(tuples);
+                    self.by_rb.sort_unstable_by_key(|q| q.0);
+                }
+            });
+            self.sorted = self.by_rb.len();
+            self.max_len = max_len;
+            self.clean = clean;
+            self.built = true;
+            crate::rescue_split::stop(&crate::rescue_split::VIEW_BUILD_NS, t_build);
+        }
+        true
+    }
+
+    /// Whether some region's `rb` lies in `[lo, hi]` (none when `lo > hi`).
+    fn any_rb_in(&self, lo: i64, hi: i64) -> bool {
+        let (head, tail) = self.by_rb.split_at(self.sorted);
+        let i = head.partition_point(|q| q.0 < lo);
+        (i < head.len() && head[i].0 <= hi) || tail.iter().any(|q| (lo..=hi).contains(&q.0))
+    }
+
+    /// Mirror an insertion into `ma`.
+    fn push(&mut self, q: &MemAlnReg) {
+        if self.built {
+            // Appended, and sorted in once more than 16 wait: a sorted insert per hit was a memmove.
+            self.by_rb.push((q.rb, q.re, q.qb, q.qe));
+            if self.by_rb.len() - self.sorted > 16 {
+                // Stable: a sorted run plus a short tail is merged in near-linear time.
+                self.by_rb.sort_by_key(|q| q.0);
+                self.sorted = self.by_rb.len();
+            }
+            self.max_len = self.max_len.max(q.re - q.rb);
+        }
+    }
+}
+
+/// The skip scan of [`mem_matesw`] on the view: orientation `r` is already paired when some region
+/// of the mate is at distance `[low, high]` of the anchor in that orientation. The linear loop's
+/// `mem_infer_dir` test, inverted: the `p2` range that gives `r` with a distance in range, mapped
+/// back to an `rb` range on the strand `r` names. `skip[r]` is only ever set, never cleared.
+fn skip_from_view(
+    view: &RegionView,
+    l_pac: i64,
+    a_rb: i64,
+    pes: &[PeStat; 4],
+    skip: &mut [i32; 4],
+) {
+    let a_rev = a_rb >= l_pac;
+    for r in 0..4 {
+        if skip[r] != 0 {
+            continue;
+        }
+        let (lo, hi) = (i64::from(pes[r].low), i64::from(pes[r].high));
+        // `mem_infer_dir`: `r = opposite_strands ^ (if p2 > b1 { 0 } else { 3 })`.
+        let opposite = r == 1 || r == 2;
+        let (p_lo, p_hi) = if r == 0 || r == 1 {
+            (a_rb + lo.max(1), a_rb + hi)
+        } else {
+            (a_rb - hi, a_rb - lo.max(0))
+        };
+        // `p2` is `rb` on the anchor's strand and `2 * l_pac - 1 - rb` on the other.
+        let (rb_lo, rb_hi) = if opposite {
+            ((l_pac << 1) - 1 - p_hi, (l_pac << 1) - 1 - p_lo)
+        } else {
+            (p_lo, p_hi)
+        };
+        let (s_lo, s_hi) = if a_rev != opposite {
+            (l_pac, (l_pac << 1) - 1)
+        } else {
+            (0, l_pac - 1)
+        };
+        if view.any_rb_in(rb_lo.max(s_lo), rb_hi.min(s_hi)) {
+            skip[r] = 1;
+        }
+    }
+}
+
+/// [`insert_into_settled`] through a built, clean view: its overlap test needs `or_ > 0` when
+/// `0 <= mask_level_redun`, so only the regions overlapping `b` in reference coordinates can pass
+/// it or decline the insert, and the scan visits those alone. Same answer, same `ma` afterwards.
+fn insert_settled_view(
+    opt: &MemOpt,
+    ma: &mut Vec<MemAlnReg>,
+    view: &mut RegionView,
+    b: MemAlnReg,
+) -> Result<(), MemAlnReg> {
+    let mask_level_redun = opt.mask_level_redun;
+    if ma.is_empty() || b.rid < 0 || b.qe <= b.qb || b.re <= b.rb {
+        return Err(b);
+    }
+    let mut identical = false;
+    let (head, tail) = view.by_rb.split_at(view.sorted);
+    let start = head.partition_point(|q| q.0 <= b.rb - view.max_len);
+    let near = head[start..].iter().take_while(|q| q.0 < b.re);
+    for &(rb, re, qb, qe) in near.chain(tail) {
+        if rb >= b.re || re <= b.rb {
+            continue;
+        }
+        let or_ = if re <= b.re { re - b.rb } else { b.re - rb };
+        let oq = if re <= b.re {
+            if qb < b.qb {
+                qe - b.qb
+            } else {
+                b.qe - qb
+            }
+        } else if b.qb < qb {
+            b.qe - qb
+        } else {
+            qe - b.qb
+        };
+        let mr = (re - rb).min(b.re - b.rb);
+        let mq = (qe - qb).min(b.qe - b.qb);
+        if or_ as f32 > mask_level_redun * mr as f32 && oq as f32 > mask_level_redun * mq as f32 {
+            // The identity test needs the whole region; every `ma` entry with these coordinates
+            // passed the overlap test above the same way.
+            let same = ma
+                .iter()
+                .filter(|q| q.rb == rb && q.re == re && q.qb == qb && q.qe == qe)
+                .all(|q| same_region(q, &b));
+            if !same {
+                return Err(b);
+            }
+            identical = true;
+        }
+    }
+    if !identical {
+        view.push(&b);
+        // Appended, not inserted: a rescued hit lands near the front of a long score-descending
+        // list, and shifting ~100 96-byte regions per hit was 2 s of memmove per 2M pairs. Until
+        // `settle_order`, only order-blind readers see the list (the skip scan, this function).
+        grow_one(ma);
+        ma.push(b);
+        view.pending += 1;
+    }
+    Ok(())
+}
+
+/// Put the `*pending` hits appended past `ma`'s sorted prefix where [`insert_into_settled`]'s
+/// `partition_point` insert would have put them one by one: by `(score desc, rb, qb)`, each before
+/// the regions with its key, so among equal keys the later hit first. One backward merge.
+fn settle_order(ma: &mut Vec<MemAlnReg>, pending: &mut usize) {
+    if *pending == 0 {
+        return;
+    }
+    let key = |r: &MemAlnReg| (-i64::from(r.score), r.rb, r.qb);
+    let mut a = ma.len() - *pending;
+    *pending = 0;
+    let mut tail = ma.split_off(a);
+    // Stable on the reversed hits: equal keys come out later hit first.
+    tail.reverse();
+    tail.sort_by_key(key);
+    ma.extend_from_slice(&tail);
+    let mut k = ma.len();
+    for t in tail.into_iter().rev() {
+        while a > 0 && key(&ma[a - 1]) >= key(&t) {
+            k -= 1;
+            a -= 1;
+            ma[k] = ma[a].clone();
+        }
+        k -= 1;
+        ma[k] = t;
+    }
+}
+
+/// Prefetch the reference windows [`matesw_collect`] would fetch for anchor `a`, in each
+/// orientation the insert-size model has not failed. A hint: the contig clamp is left out.
+fn prefetch_windows(fm: &FmIndex, l_pac: i64, pes: &[PeStat; 4], a: &Anchor, ms: &[u8]) {
+    let l_ms = ms.len() as i64;
+    for (r, pe) in pes.iter().enumerate() {
+        if pe.failed {
+            continue;
+        }
+        let is_rev = (r >> 1) != (r & 1);
+        let is_larger = (r >> 1) == 0;
+        let (lo, hi) = (i64::from(pe.low), i64::from(pe.high));
+        let rb = if is_larger { a.rb + lo } else { a.rb - hi };
+        let re = if is_larger { a.rb + hi } else { a.rb - lo };
+        let (rb, re) = if is_rev {
+            (rb - l_ms, re)
+        } else {
+            (rb, re + l_ms)
+        };
+        fm.prefetch_pac(rb.max(0), re.min(l_pac << 1));
+    }
+}
+
+/// The orientations `r` that need no rescue for an anchor at `a_rb`: `pes[r]` failed, or some
+/// region of `ma` already sits at a proper-pair distance of the anchor in that orientation.
+fn skip_set(
+    view: &mut RegionView,
+    ma: &[MemAlnReg],
+    l_pac: i64,
+    a_rb: i64,
+    pes: &[PeStat; 4],
+) -> [i32; 4] {
+    let mut skip = [0i32; 4];
+    for (r, skip_r) in skip.iter_mut().enumerate() {
+        *skip_r = i32::from(pes[r].failed);
+    }
+    let t_skip = crate::rescue_split::start();
+    if view.ensure(ma) {
+        skip_from_view(view, l_pac, a_rb, pes, &mut skip);
+    } else {
+        for existing in ma.iter() {
+            let (r, dist) = mem_infer_dir(l_pac, a_rb, existing.rb);
+            if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
+                skip[r] = 1;
+            }
+        }
+    }
+    if t_skip.is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::rescue_split::COLLECT_CALLS.fetch_add(1, Relaxed);
+        crate::rescue_split::COLLECT_SKIP_ROWS.fetch_add(ma.len() as u64, Relaxed);
+    }
+    crate::rescue_split::stop(&crate::rescue_split::COLLECT_SKIP_NS, t_skip);
+    skip
+}
+
+#[allow(clippy::too_many_arguments)]
 fn matesw_collect(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
     pes: &[PeStat; 4],
-    a: &MemAlnReg,
+    a: &Anchor,
     ms: &[u8],
     ma: &[MemAlnReg],
+    view: &mut RegionView,
+    arena: &mut Vec<u8>,
 ) -> Option<RescueCall> {
     // `l_pac`: packed reference length (doubled space is [0, 2*l_pac)). `l_ms`: mate length in
     // bases, stored into the returned call because `matesw_apply` needs it to flip query
     // coordinates. `skip[r] != 0`: orientation `r` needs no rescue (failed, or already paired).
     let l_pac = bns.l_pac;
     let l_ms = ms.len() as i64;
-    let mut skip = [0i32; 4];
-    for (r, skip_r) in skip.iter_mut().enumerate() {
-        *skip_r = i32::from(pes[r].failed);
-    }
-    for existing in ma.iter() {
-        let (r, dist) = mem_infer_dir(l_pac, a.rb, existing.rb);
-        if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
-            skip[r] = 1;
-        }
-    }
+    let skip = skip_set(view, ma, l_pac, a.rb, pes);
     if skip.iter().sum::<i32>() == 4 {
         return None;
     }
+    let t_fetch = crate::rescue_split::start();
     // `per_r[r]`: the SW job for orientation `r`, left `None` when `r` is skipped or its window was
     // rejected. Every binding inside the loop below (`is_rev`, `is_larger`, `seq`, `lo`/`hi`,
     // `rb0`/`re0`, `rb`/`re`/`rid`/`refseq`) has the same meaning as in [`mem_matesw`], which
     // carries the explanations; this copy stops at building the job instead of calling ksw.
     let mut per_r: [Option<Orient>; 4] = [None, None, None, None];
+    let mut rc = (0u32, 0u32);
     for r in 0..4 {
         if skip[r] != 0 {
             continue;
         }
         let is_rev = (r >> 1) != (r & 1);
         let is_larger = (r >> 1) == 0;
-        let seq: Vec<u8> = if is_rev {
-            ms.iter()
-                .rev()
-                .map(|&b| if b < 4 { 3 - b } else { 4 })
-                .collect()
-        } else {
-            ms.to_vec()
-        };
         let (lo, hi) = (i64::from(pes[r].low), i64::from(pes[r].high));
         let (rb0, re0) = if !is_rev {
             let rb = if is_larger { a.rb + lo } else { a.rb - hi };
@@ -654,7 +994,8 @@ fn matesw_collect(
         let rb0 = rb0.max(0);
         let re0 = re0.min(l_pac << 1);
         if rb0 < re0 {
-            let (rb, re, rid, refseq) = bns_fetch_seq(fm, bns, rb0, (rb0 + re0) >> 1, re0);
+            let off = arena.len();
+            let (rb, re, rid) = bns_fetch_seq_into(fm, bns, rb0, (rb0 + re0) >> 1, re0, arena);
             if dump_pestat() {
                 eprintln!(
                     "[MSW_R] anchor={} r={r} rb={rb} re={re} rid={rid} a_rid={}",
@@ -662,18 +1003,26 @@ fn matesw_collect(
                 );
             }
             if a.rid == rid && re - rb >= i64::from(opt.min_seed_len) {
+                let wlen = (arena.len() - off) as u32;
+                if is_rev && rc.1 == 0 {
+                    rc = (arena.len() as u32, ms.len() as u32);
+                    arena.extend(ms.iter().rev().map(|&b| if b < 4 { 3 - b } else { 4 }));
+                }
                 per_r[r] = Some(Orient {
-                    query: seq,
-                    target: refseq,
+                    target: (off as u32, wlen),
                     rb,
                     is_rev,
                 });
+            } else {
+                arena.truncate(off);
             }
         }
     }
+    crate::rescue_split::stop(&crate::rescue_split::COLLECT_FETCH_NS, t_fetch);
     Some(RescueCall {
         skip,
         per_r,
+        rc,
         l_ms,
         rid: a.rid,
         is_alt: a.is_alt,
@@ -687,14 +1036,59 @@ fn matesw_collect(
 /// the entire contract between the two halves: there is no index stored in the job, so if either
 /// side changed its traversal the results would be silently mismatched to the wrong orientation.
 ///
-/// PARAMETERS: `call` is one anchor's collected rescue, borrowed for as long as the iterator lives
-/// (the jobs hold slices into its `Orient`s, they copy nothing).
+/// PARAMETERS: `call` is one anchor's collected rescue and `ms` the mate it was collected for,
+/// borrowed for as long as the iterator lives (the jobs hold slices, they copy nothing).
 ///
 /// RETURNS between 0 and 4 jobs, one per `Some` entry in `call.per_r`, ascending in orientation.
-fn rescue_jobs(call: &RescueCall) -> impl Iterator<Item = KswJob<'_>> {
-    call.per_r.iter().flatten().map(|o| KswJob {
-        query: &o.query,
-        target: &o.target,
+/// [`batched_mate_rescue`] over `jobs`, each scored with the matrix its mate gets in
+/// [`mem_matesw`]: `opt.mat` outside `--meth`; under it `MethOpt::mats[group[i]]`, where
+/// `group[i]` is the rescued mate's chemistry (read 1 is C->T) XOR the job's `is_rev`. The two
+/// groups run as two kernel calls, results back in `jobs` order.
+fn rescue_kernel(opt: &MemOpt, jobs: &[KswJob], group: &[bool]) -> Vec<KswAlignResult> {
+    let run = |jobs: &[KswJob], mat: &[i8]| {
+        batched_mate_rescue(
+            jobs,
+            5,
+            mat,
+            opt.o_del,
+            opt.e_del,
+            opt.o_ins,
+            opt.e_ins,
+            opt.min_seed_len * opt.a,
+            opt.a,
+        )
+    };
+    let Some(meth) = &opt.meth else {
+        return run(jobs, &opt.mat);
+    };
+    let mut out: Vec<Option<KswAlignResult>> = vec![None; jobs.len()];
+    for g in [false, true] {
+        let idx: Vec<usize> = (0..jobs.len()).filter(|&i| group[i] == g).collect();
+        if idx.is_empty() {
+            continue;
+        }
+        let sub: Vec<KswJob> = idx.iter().map(|&i| jobs[i]).collect();
+        for (i, r) in idx.into_iter().zip(run(&sub, &meth.mats[usize::from(g)])) {
+            out[i] = Some(r);
+        }
+    }
+    out.into_iter()
+        .map(|r| r.expect("every job is in one group"))
+        .collect()
+}
+
+fn rescue_jobs<'a>(
+    call: &'a RescueCall,
+    ms: &'a [u8],
+    arena: &'a [u8],
+) -> impl Iterator<Item = KswJob<'a>> {
+    call.per_r.iter().flatten().map(move |o| KswJob {
+        query: if o.is_rev {
+            &arena[call.rc.0 as usize..(call.rc.0 + call.rc.1) as usize]
+        } else {
+            ms
+        },
+        target: &arena[o.target.0 as usize..(o.target.0 + o.target.1) as usize],
     })
 }
 
@@ -716,7 +1110,9 @@ fn rescue_jobs(call: &RescueCall) -> impl Iterator<Item = KswJob<'_>> {
 /// results for that call's jobs, in orientation order. `ma` is the mate's region vector, mutated in
 /// place and left sorted score-descending. `ma_settled` says whether `ma` is what
 /// [`insert_into_settled`] requires, starts false for a list fresh from the first dedup, and is kept
-/// up to date here.
+/// up to date here. `pend`, when given, takes the jobs of results whose `score2` is pending (see
+/// [`batch_mate_rescue`]), `read` naming the rescued end (0 or 1) for [`PendS2::fetch`].
+#[allow(clippy::too_many_arguments)]
 fn matesw_apply(
     fm: &FmIndex,
     bns: &BntSeq,
@@ -724,7 +1120,9 @@ fn matesw_apply(
     call: &RescueCall,
     alns: &[KswAlignResult],
     ma: &mut Vec<MemAlnReg>,
-    ma_settled: &mut bool,
+    view: &mut RegionView,
+    mut pend: Option<&mut Vec<PendS2>>,
+    read: u8,
 ) {
     let l_pac = bns.l_pac;
     let l_ms = call.l_ms;
@@ -756,7 +1154,7 @@ fn matesw_apply(
     // settled comes from the single-end dedup, which ran WITH the query and so may have patched two
     // regions into one that now contains a third; the first null-query pass drops that third, so it
     // must run even when no hit was inserted (1 read in 173M of HG002 30x lost an XA hit to this).
-    let mut dirty = !*ma_settled;
+    let mut dirty = !view.settled;
     for r in 0..4 {
         if call.skip[r] != 0 {
             continue;
@@ -766,6 +1164,13 @@ fn matesw_apply(
             let aln = alns[ai];
             ai += 1;
             if aln.score >= opt.min_seed_len && aln.qb >= 0 {
+                // Every change to `ma` below (insert, or the dedup that needs `n > 0`) follows this.
+                view.version = view.version.wrapping_add(1);
+                let t_ins = crate::rescue_split::start();
+                if t_ins.is_some() {
+                    crate::rescue_split::APPLY_HITS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 // `rb`: doubled-space start of the window `aln`'s target offsets are relative to.
                 // `is_rev`: whether the query was reverse complemented, so both axes must be
                 // mirrored below. Every binding that follows mirrors [`mem_matesw`] exactly.
@@ -791,6 +1196,19 @@ fn matesw_apply(
                     rb + i64::from(aln.te) + 1
                 };
                 let seedcov = ((b_re - b_rb).min(i64::from(qe - qb)) >> 1) as i32;
+                // A lazy kernel's pending `score2` names this window in the chunk's table.
+                let csub = if aln.score2 == SCORE2_PENDING {
+                    let pend = pend.as_deref_mut().expect("a pending score2 needs a table");
+                    pend.push(PendS2 {
+                        rb,
+                        len: o.target.1,
+                        rev: is_rev,
+                        read,
+                    });
+                    crate::lazy_csub::encode(pend.len() - 1)
+                } else {
+                    aln.score2
+                };
                 let b = MemAlnReg {
                     rb: b_rb,
                     re: b_re,
@@ -800,7 +1218,7 @@ fn matesw_apply(
                     score: aln.score,
                     truesc: 0,
                     sub: 0,
-                    csub: aln.score2,
+                    csub,
                     sub_n: 0,
                     seedcov,
                     seedlen0: 0,
@@ -811,14 +1229,22 @@ fn matesw_apply(
                     is_alt: call.is_alt,
                     // Set only by the ALT branch of mem_mark_primary_se; 0 everywhere it is constructed.
                     alt_sc: 0,
-                    hash: 0,
-                    n_comp: 0,
                 };
                 // A settled list can often take the hit without the full pass. See the function.
-                let b = if *ma_settled {
-                    match insert_into_settled(opt, ma, b) {
+                let b = if view.settled {
+                    let r = if view.ensure(ma)
+                        && view.clean
+                        && (0.0..1.0).contains(&opt.mask_level_redun)
+                    {
+                        insert_settled_view(opt, ma, view, b)
+                    } else {
+                        settle_order(ma, &mut view.pending);
+                        insert_into_settled(opt, ma, b)
+                    };
+                    match r {
                         Ok(()) => {
                             n += 1;
+                            crate::rescue_split::stop(&crate::rescue_split::APPLY_INSERT_NS, t_ins);
                             continue;
                         }
                         Err(b) => b,
@@ -826,12 +1252,15 @@ fn matesw_apply(
                 } else {
                     b
                 };
+                settle_order(ma, &mut view.pending);
                 let mut ins = 0;
                 while ins < ma.len() && ma[ins].score >= b.score {
                     ins += 1;
                 }
+                grow_one(ma);
                 ma.insert(ins, b);
                 dirty = true;
+                crate::rescue_split::stop(&crate::rescue_split::APPLY_INSERT_NS, t_ins);
             }
             n += 1;
         }
@@ -842,14 +1271,78 @@ fn matesw_apply(
                 crate::rescue_split::APPLY_DEDUP_CALLS.fetch_add(1, Relaxed);
                 crate::rescue_split::APPLY_DEDUP_ROWS.fetch_add(ma.len() as u64, Relaxed);
             }
+            settle_order(ma, &mut view.pending);
             let taken = std::mem::take(ma);
             // Below two regions the pass returns its input as it found it, so that proves nothing.
-            *ma_settled = taken.len() >= 2;
+            view.settled = taken.len() >= 2;
+            view.built = false;
             *ma = mem_sort_dedup_patch(fm, opt, &[], taken);
             crate::rescue_split::stop(&crate::rescue_split::APPLY_DEDUP_NS, t_dd);
             dirty = false;
         }
     }
+}
+
+/// The rescue job behind a pending `csub` ([`crate::lazy_csub`]): the window `rb..rb + len` in the
+/// doubled coordinate space, already clamped to its contig, and the mate that was aligned in it,
+/// read `read` (0 or 1) as sequenced, reverse complemented when `rev`. Rerunning that job through
+/// [`batched_mate_rescue`] gives the `score2` that becomes `csub`.
+#[derive(Clone, Copy, Debug)]
+pub struct PendS2 {
+    pub rb: i64,
+    pub len: u32,
+    pub rev: bool,
+    pub read: u8,
+}
+
+impl PendS2 {
+    /// The job's query and target, appended to `arena`: `(query start, target start)`; the query
+    /// ends where the target starts and the target runs to the arena's end.
+    pub fn fetch(&self, fm: &FmIndex, seqs: &[&[u8]; 2], arena: &mut Vec<u8>) -> (usize, usize) {
+        let q0 = arena.len();
+        let ms = seqs[self.read as usize];
+        if self.rev {
+            arena.extend(ms.iter().rev().map(|&b| if b < 4 { 3 - b } else { 4 }));
+        } else {
+            arena.extend_from_slice(ms);
+        }
+        let t0 = arena.len();
+        fm.bases_append(self.rb, self.rb + i64::from(self.len), arena);
+        (q0, t0)
+    }
+}
+
+/// `score2` of each pending job, by [`batched_mate_rescue`] over the same windows the rescue ran.
+pub fn resolve_pending(fm: &FmIndex, opt: &MemOpt, jobs: &[(PendS2, [&[u8]; 2])]) -> Vec<i32> {
+    let mut arena = Vec::new();
+    let spans: Vec<(usize, usize, usize)> = jobs
+        .iter()
+        .map(|(p, seqs)| {
+            let (q0, t0) = p.fetch(fm, seqs, &mut arena);
+            (q0, t0, arena.len())
+        })
+        .collect();
+    let kj: Vec<KswJob> = spans
+        .iter()
+        .map(|&(q0, t0, t1)| KswJob {
+            query: &arena[q0..t0],
+            target: &arena[t0..t1],
+        })
+        .collect();
+    batched_mate_rescue(
+        &kj,
+        5,
+        &opt.mat,
+        opt.o_del,
+        opt.e_del,
+        opt.o_ins,
+        opt.e_ins,
+        opt.min_seed_len * opt.a,
+        opt.a,
+    )
+    .into_iter()
+    .map(|r| r.score2)
+    .collect()
 }
 
 /// One read pair's rescue inputs for [`batch_mate_rescue`]: the two mates' nt4 codes and their
@@ -865,291 +1358,43 @@ pub struct PairRescueData<'a> {
     pub a1: &'a mut Vec<MemAlnReg>,
 }
 
-/// `BWA4_RESCUE_ROUNDS=1` probe: is the per-ROUND batching starving the rescue kernel's SIMD lanes?
-///
-/// [`batch_mate_rescue`] issues ONE [`batched_mate_rescue`] call per round, and a round only holds the
-/// pairs whose anchor list is still that deep. Round 0 batches every pair; round 20 batches only the
-/// few with 20+ anchors. `fg-labs/bwa-mem3` instead flattens every (pair, anchor) into a single array
-/// and calls its kernel once (`mem_sam_pe_batch_pre`, `bwamem_pair.cpp:733-745`), which cannot empty
-/// out that way -- and which it can afford because it is not byte-identical to bwa-mem2, whereas our
-/// rounds exist precisely to reproduce the C's insertion order.
-///
-/// Whether that costs us anything depends on a number nobody has measured: the DISTRIBUTION of jobs
-/// per kernel call. A round carrying 4 jobs wastes 12 of a NEON u8 kernel's 16 lanes; a round carrying
-/// 400 wastes nothing. This records that histogram, and the round index each call came from, so the
-/// waste can be computed rather than assumed.
-///
-/// It also explains why this never showed up before: on wgsim, anchor lists are shallow, so there are
-/// one or two rounds and the flattening would buy nothing. `docs/perf-levers.md` has the measurement
-/// of how badly that read set understates this stage.
-///
-/// Counters are relaxed atomics on a per-KERNEL-CALL path (not per job, not per read), so the probe
-/// costs one fetch-add per SW batch. Still gated: `enabled()` is checked before any of them is touched.
-pub mod rescue_rounds {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-
-    /// Upper edges of the jobs-per-call histogram buckets. Chosen around the kernel's lane counts:
-    /// NEON runs 16 lanes at u8 and 8 at i16, AVX-512 runs 64 and 32, so a call under 16 jobs is
-    /// leaving lanes idle on every ISA we ship, and one under 64 is leaving them idle on AVX-512.
-    pub const EDGES: [u64; 8] = [3, 7, 15, 31, 63, 127, 511, u64::MAX];
-    /// Number of kernel calls whose job count fell in each bucket.
-    pub static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-    /// Number of JOBS in the calls of each bucket, so the histogram can be weighted by work rather
-    /// than by call count (a thousand 2-job calls matter less than one 100k-job call).
-    pub static JOBS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-    /// Jobs issued from round 0 only, i.e. the part that flattening could not improve.
-    pub static ROUND0_JOBS: AtomicU64 = AtomicU64::new(0);
-    /// Sum of `max_rounds` over every chunk, and the chunk count, giving the mean round depth.
-    pub static ROUNDS_SUM: AtomicU64 = AtomicU64::new(0);
-    /// Largest `max_rounds` seen, i.e. how deep the deepest anchor list in any chunk went.
-    pub static ROUNDS_MAX: AtomicU64 = AtomicU64::new(0);
-    /// Chunks processed, the denominator for `ROUNDS_SUM`.
-    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
-
-    /// Whether `BWA4_RESCUE_ROUNDS` is set. Read once and cached, like every other probe here.
-    pub fn enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_ROUNDS").is_some())
-    }
-
-    /// Record one kernel call carrying `n_jobs` jobs, issued from round `round`.
-    pub fn record_call(round: usize, n_jobs: usize) {
-        if !enabled() {
-            return;
-        }
-        let n = n_jobs as u64;
-        // First bucket whose upper edge the count fits under; the last edge is `u64::MAX`, so this
-        // always finds one.
-        let b = EDGES
-            .iter()
-            .position(|&e| n <= e)
-            .unwrap_or(EDGES.len() - 1);
-        CALLS[b].fetch_add(1, Ordering::Relaxed);
-        JOBS[b].fetch_add(n, Ordering::Relaxed);
-        if round == 0 {
-            ROUND0_JOBS.fetch_add(n, Ordering::Relaxed);
-        }
-    }
-
-    /// Rescue windows seen, and rows the kernel actually walked for them.
-    pub static WIN_COUNT: AtomicU64 = AtomicU64::new(0);
-    pub static WIN_ROWS: AtomicU64 = AtomicU64::new(0);
-    /// Rows a window-sharing kernel would walk instead: per overlap cluster, `W + A * T_BOUND`.
-    pub static SHARED_ROWS: AtomicU64 = AtomicU64::new(0);
-    /// Overlap clusters, and the histogram of their size `A` (windows per cluster).
-    pub static CLUSTERS: AtomicU64 = AtomicU64::new(0);
-    pub static CLUSTER_A: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-    /// Windows lying in a cluster of each size, so the histogram can be weighted by work.
-    pub static CLUSTER_A_WIN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-    pub static CLUSTER_A_MAX: AtomicU64 = AtomicU64::new(0);
-    /// The same two totals restricted to clusters of `A >= 2`, i.e. the only ones a shared DP could
-    /// help. Singletons are left on today's path in that accounting.
-    pub static WIN_ROWS_MULTI: AtomicU64 = AtomicU64::new(0);
-    pub static SHARED_ROWS_MULTI: AtomicU64 = AtomicU64::new(0);
-
-    /// Upper edges of the cluster-size histogram: 1, 2-3, 4-7, 8-15, 16-31, 32+.
-    pub const A_EDGES: [u64; 6] = [1, 3, 7, 15, 31, u64::MAX];
-
-    /// The alignment-span bound of issue #50: an alignment reaching `minsc` cannot span more than
-    /// this many target rows under bwa's defaults. Used here only to price the counterfactual, never
-    /// to truncate anything.
-    pub const T_BOUND: u64 = 271;
-
-    /// Whether `BWA4_RESCUE_CLUSTER` is set. Read once and cached.
-    pub fn cluster_enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_CLUSTER").is_some())
-    }
-
-    /// Record one kernel call's rescue windows as `(rid, begin, end)` on the reference, and price
-    /// the window-sharing counterfactual of issue #50B against them.
-    ///
-    /// Windows are clustered by overlap on the same contig: sorted by `(rid, begin)`, a window joins
-    /// the running cluster when it starts at or before the cluster's current end. For a cluster of
-    /// `A` windows spanning `W` reference bases, today's kernel walks the sum of the windows' own
-    /// lengths, while a shared-DP kernel would walk `W + A * T_BOUND` rows. The ratio of the two
-    /// totals is the ceiling on what #50B could win, before any implementation cost.
-    pub fn record_windows(win: &mut Vec<(i32, i64, i64)>) {
-        if !cluster_enabled() || win.is_empty() {
-            return;
-        }
-        win.sort_unstable();
-        WIN_COUNT.fetch_add(win.len() as u64, Ordering::Relaxed);
-        WIN_ROWS.fetch_add(
-            win.iter().map(|&(_, b, e)| (e - b).max(0) as u64).sum(),
-            Ordering::Relaxed,
-        );
-        let (mut c_rid, mut c_beg, mut c_end, mut c_a) = (win[0].0, win[0].1, win[0].2, 0u64);
-        let mut c_rows = 0u64;
-        let flush = |rid: i32, beg: i64, end: i64, a: u64, rows: u64| {
-            let _ = rid;
-            CLUSTERS.fetch_add(1, Ordering::Relaxed);
-            let shared = (end - beg).max(0) as u64 + a * T_BOUND;
-            SHARED_ROWS.fetch_add(shared, Ordering::Relaxed);
-            if a >= 2 {
-                WIN_ROWS_MULTI.fetch_add(rows, Ordering::Relaxed);
-                SHARED_ROWS_MULTI.fetch_add(shared, Ordering::Relaxed);
-            }
-            let b = A_EDGES.iter().position(|&e| a <= e).unwrap_or(5);
-            CLUSTER_A[b].fetch_add(1, Ordering::Relaxed);
-            CLUSTER_A_WIN[b].fetch_add(a, Ordering::Relaxed);
-            CLUSTER_A_MAX.fetch_max(a, Ordering::Relaxed);
-        };
-        for &(rid, beg, end) in win.iter() {
-            if rid == c_rid && beg <= c_end {
-                c_end = c_end.max(end);
-                c_a += 1;
-                c_rows += (end - beg).max(0) as u64;
-            } else {
-                flush(c_rid, c_beg, c_end, c_a, c_rows);
-                c_rid = rid;
-                c_beg = beg;
-                c_end = end;
-                c_a = 1;
-                c_rows = (end - beg).max(0) as u64;
-            }
-        }
-        flush(c_rid, c_beg, c_end, c_a, c_rows);
-    }
-
-    /// Print the clustering result, once, after the workers have joined. No-op unless enabled.
-    pub fn dump_clusters() {
-        if !cluster_enabled() {
-            return;
-        }
-        let (w, rows, shared, cl) = (
-            WIN_COUNT.load(Ordering::Relaxed),
-            WIN_ROWS.load(Ordering::Relaxed),
-            SHARED_ROWS.load(Ordering::Relaxed),
-            CLUSTERS.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "[rescue-cluster] {w} windows in {cl} overlap clusters, mean A = {:.2}, largest A = {}",
-            w as f64 / cl.max(1) as f64,
-            CLUSTER_A_MAX.load(Ordering::Relaxed)
-        );
-        eprintln!(
-            "[rescue-cluster] rows walked {rows}, shared-DP counterfactual {shared} \
-             (W + A*{T_BOUND} per cluster) -> {:.2}x",
-            rows as f64 / shared.max(1) as f64
-        );
-        let (rm, sm) = (
-            WIN_ROWS_MULTI.load(Ordering::Relaxed),
-            SHARED_ROWS_MULTI.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "[rescue-cluster] restricted to A >= 2 clusters: rows {rm} ({:.1}% of all), shared {sm} \
-             -> whole-kernel rows {:.4}x",
-            100.0 * rm as f64 / rows.max(1) as f64,
-            rows as f64 / (rows - rm + sm).max(1) as f64
-        );
-        eprintln!(
-            "[rescue-cluster] {:>10}  {:>10}  {:>12}  {:>7}",
-            "A", "clusters", "windows", "%_win"
-        );
-        let mut lo = 1u64;
-        for b in 0..A_EDGES.len() {
-            let (c, j) = (
-                CLUSTER_A[b].load(Ordering::Relaxed),
-                CLUSTER_A_WIN[b].load(Ordering::Relaxed),
-            );
-            let label = if A_EDGES[b] == u64::MAX {
-                format!("{lo}+")
-            } else if A_EDGES[b] == lo {
-                format!("{lo}")
-            } else {
-                format!("{lo}-{}", A_EDGES[b])
-            };
-            if c != 0 {
-                eprintln!(
-                    "[rescue-cluster] {label:>10}  {c:>10}  {j:>12}  {:>6.1}%",
-                    100.0 * j as f64 / w.max(1) as f64
-                );
-            }
-            lo = A_EDGES[b].saturating_add(1);
-        }
-    }
-
-    /// Record one chunk's round depth.
-    pub fn record_chunk(max_rounds: usize) {
-        if !enabled() {
-            return;
-        }
-        CHUNKS.fetch_add(1, Ordering::Relaxed);
-        ROUNDS_SUM.fetch_add(max_rounds as u64, Ordering::Relaxed);
-        ROUNDS_MAX.fetch_max(max_rounds as u64, Ordering::Relaxed);
-    }
-
-    /// Print the histogram to stderr once, after the worker threads have joined. No-op unless enabled.
-    pub fn dump() {
-        if !enabled() {
-            return;
-        }
-        let total_jobs: u64 = JOBS.iter().map(|j| j.load(Ordering::Relaxed)).sum();
-        let total_calls: u64 = CALLS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        let chunks = CHUNKS.load(Ordering::Relaxed).max(1);
-        eprintln!(
-            "[rescue-rounds] {total_calls} kernel calls, {total_jobs} jobs, {chunks} chunks, \
-             mean max_rounds {:.1}, deepest {}",
-            ROUNDS_SUM.load(Ordering::Relaxed) as f64 / chunks as f64,
-            ROUNDS_MAX.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "[rescue-rounds] round 0 carries {} of {} jobs ({:.1}%); the rest is what flattening could refill",
-            ROUND0_JOBS.load(Ordering::Relaxed),
-            total_jobs,
-            100.0 * ROUND0_JOBS.load(Ordering::Relaxed) as f64 / total_jobs.max(1) as f64,
-        );
-        eprintln!(
-            "[rescue-rounds] {:>12}  {:>10}  {:>12}  {:>7}",
-            "jobs/call", "calls", "jobs", "%_jobs"
-        );
-        // Running label for each bucket, e.g. "8-15".
-        let mut lo = 1u64;
-        for b in 0..EDGES.len() {
-            let (c, j) = (
-                CALLS[b].load(Ordering::Relaxed),
-                JOBS[b].load(Ordering::Relaxed),
-            );
-            let label = if EDGES[b] == u64::MAX {
-                format!("{lo}+")
-            } else {
-                format!("{lo}-{}", EDGES[b])
-            };
-            if c != 0 {
-                eprintln!(
-                    "[rescue-rounds] {label:>12}  {c:>10}  {j:>12}  {:>6.1}%",
-                    100.0 * j as f64 / total_jobs.max(1) as f64
-                );
-            }
-            lo = EDGES[b].saturating_add(1);
-        }
-    }
-}
-
 /// Batched mate rescue across a whole pair batch: identical to running [`mem_matesw`] inside each
-/// pair's `mem_sam_pe`, but every anchor's insert-window SW (across all pairs) runs in one vectorized
-/// [`batched_mate_rescue`], filling the SIMD lanes that a single pair's <=4 orientations cannot.
+/// pair's `mem_sam_pe`, but the insert-window SWs of many pairs' anchors run in one vectorized
+/// [`batched_mate_rescue`] call, filling the SIMD lanes that a single pair's <=4 orientations cannot.
 ///
-/// bwa-mem2's rescue snapshots each read's near-best regions as anchors (before any rescue), then, per
-/// anchor, SW-rescues the mate in each missing orientation. Anchors of one read against one mate are
-/// applied in order (later anchors' `skip` sees earlier inserts), so this proceeds in **rounds**: round
-/// `k` collects the `k`-th anchor of every (pair, direction), batches their SW, then applies, keeping
-/// the per-array insertion order byte-identical to the per-pair path. The two directions target
-/// disjoint arrays (`a1` vs `a0`), and different pairs are independent, so a round batches freely.
+/// bwa-mem2's rescue snapshots each read's near-best regions as anchors (before any rescue), then,
+/// per anchor in order, SW-rescues the mate in each orientation that `skip` (a mate region already
+/// at a proper-pair distance) leaves open. Later anchors' `skip` sees earlier anchors' inserts. This
+/// runs bwa-mem2's own batched shape (`mem_sam_pe_batch_pre` / `_post`), per block of pairs:
+/// 1. collect: every anchor of every pair in the block, `skip` read from the mate's list as it was
+///    before any rescue;
+/// 2. one kernel call for the whole block, identical windows of one (pair, direction) computed once;
+/// 3. apply, anchor by anchor in bwa's order: `skip` is read again from the CURRENT list, and the
+///    orientations it now closes drop their result. Skip sets only grow with inserts, so a job is
+///    never missing; when a dedup removed a region and reopened an orientation, the anchor is
+///    collected and computed again on the spot, which is exactly the per-pair path.
+///
+/// Blocks hold whole pairs and about [`RESCUE_BLOCK_ANCHORS`] anchors: the one-call batch is what
+/// lets the K-mer filter reuse a mate's table across its anchors and the band kernel group jobs of
+/// like width, and the bound keeps the windows' arena small. The two directions target disjoint
+/// arrays (`a1` vs `a0`) and different pairs are independent, so only the per-(pair, direction)
+/// anchor order matters, and it is kept.
 ///
 /// PARAMETERS: `fm`/`bns` are the reference. `opt` supplies `max_matesw` (`-m`, the anchor cap),
 /// `pen_unpaired` (`-U`, doubling as the anchor score window) and the ksw scoring parameters. `pes`
 /// is the batch's insert-size estimate, which must already be final: it is read by every collect.
 /// `pairs` is the whole batch, mutated in place, and must be the same pairs, in the same order, that
-/// [`mem_sam_pe`] will later be called on with `rescue_done = true`.
+/// [`mem_sam_pe`] will later be called on with `rescue_done = true`. `pend`, when given, makes
+/// `score2` lazy: a rescued region whose `score2` the kernel left pending gets
+/// `csub = lazy_csub::encode(i)` with `pend[i]` the job to rerun, through [`resolve_pending`], if
+/// SAM emit reads that `csub`.
 pub fn batch_mate_rescue(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
     pes: &[PeStat; 4],
     pairs: &mut [PairRescueData],
+    mut pend: Option<&mut Vec<PendS2>>,
 ) {
     // `-m` (`opt->max_matesw`, default 50): at most this many anchors per end. bwa expresses it as
     // the loop bound `j < opt->max_matesw`, so a value of 0 disables rescue entirely, and negative
@@ -1159,156 +1404,386 @@ pub fn batch_mate_rescue(
     if anchor_cap == 0 {
         return;
     }
+    // shortcut: `--meth` rescues eagerly; the lazy rerun (`resolve_pending`) scores with `opt.mat`,
+    // not the per-strand matrices. Make it matrix-aware if --meth rescue time matters.
+    if opt.meth.is_some() {
+        pend = None;
+    }
     // `-U` (`opt->pen_unpaired`, default 17): the phred-scaled penalty for not pairing. It doubles
     // here as the anchor window: any region within `pen` of the best is plausible enough that its
     // mate is worth rescuing.
     let pen = opt.pen_unpaired;
 
     // Snapshot near-best anchors per (pair, direction), before any rescue. dir 0: read-1 anchors that
-    // rescue read 2 (`a1`); dir 1: read-2 anchors that rescue read 1 (`a0`).
-    //
-    // `anchors[pi][dir]`: pair `pi`'s anchor list for that direction, score-descending, at most
-    // `anchor_cap` long. Frozen here and never updated, which is what makes the rounds well defined:
-    // regions inserted by rescue must NOT themselves become anchors, and in bwa they cannot, because
-    // the C snapshots `b[i]` before its own anchor loop too.
-    // `max_rounds`: the longest anchor list seen, i.e. how many rounds the loop below needs.
-    let mut anchors: Vec<[Vec<MemAlnReg>; 2]> = Vec::with_capacity(pairs.len());
-    let mut max_rounds = 0usize;
+    // rescue read 2 (`a1`); dir 1: read-2 anchors that rescue read 1 (`a0`). `spans[pi][dir]` is
+    // that list's `(start, len)` in `anchors`, score-descending, at most `anchor_cap` long. Frozen
+    // here: regions inserted by rescue must NOT themselves become anchors, and in bwa they cannot,
+    // because the C snapshots `b[i]` before its own anchor loop too.
+    // Sized for every region the cap lets in: grown by doubling it was a realloc and a copy.
+    let most = |regs: &[MemAlnReg]| regs.len().min(anchor_cap);
+    let mut anchors: Vec<Anchor> =
+        Vec::with_capacity(pairs.iter().map(|p| most(p.a0) + most(p.a1)).sum());
+    let mut spans: Vec<[(u32, u32); 2]> = Vec::with_capacity(pairs.len());
     for p in pairs.iter() {
         // Each side is snapshotted on its own: bwa gates only on MEM_F_NO_RESCUE, never on both
-        // reads having regions. A read with no regions simply contributes no anchors -- but it is
-        // still the *rescue target* of the other read's anchors, which is exactly how an unmapped
-        // mate gets rescued. Requiring both sides non-empty leaves it unmapped.
-        let near_best = |regs: &[MemAlnReg]| -> Vec<MemAlnReg> {
+        // reads having regions. A read with no regions contributes no anchors but is still the
+        // rescue target of the other read's anchors, which is how an unmapped mate gets rescued.
+        let mut near_best = |regs: &[MemAlnReg]| -> (u32, u32) {
+            let start = anchors.len() as u32;
             let Some(best) = regs.first().map(|r| r.score) else {
-                return Vec::new();
+                return (start, 0);
             };
-            // bwa builds `b[i]` from the *whole* region vector and only then caps the anchor loop
-            // at `max_matesw`; taking `anchor_cap` during the filter is the same set because the
-            // vector is
-            // already sorted score-descending, so the near-best regions are a prefix.
-            regs.iter()
-                .filter(|r| r.score >= best - pen)
-                .take(anchor_cap)
-                .cloned()
-                .collect()
+            // The vector is sorted score-descending, so the near-best regions are a prefix and
+            // capping during the filter keeps the same set as bwa's cap on the anchor loop.
+            anchors.extend(
+                regs.iter()
+                    .filter(|r| r.score >= best - pen)
+                    .take(anchor_cap)
+                    .map(|r| Anchor {
+                        rb: r.rb,
+                        rid: r.rid,
+                        is_alt: r.is_alt,
+                    }),
+            );
+            (start, anchors.len() as u32 - start)
         };
-        // `b0`/`b1`: this pair's read-1 and read-2 anchors (bwa's `b[0]`/`b[1]`). Cloned, not
-        // borrowed, because the arrays they came from are about to be mutated by rescue.
         let b0 = near_best(p.a0);
         let b1 = near_best(p.a1);
-        max_rounds = max_rounds.max(b0.len()).max(b1.len());
-        anchors.push([b0, b1]);
+        spans.push([b0, b1]);
+    }
+    anchor_spread::record(&anchors, &spans);
+
+    let mut views: Vec<[RegionView; 2]> = (0..pairs.len()).map(|_| Default::default()).collect();
+    // `arena`: the block's windows and reverse-complemented mates, back to back. `calls`: what
+    // collect made of each anchor. Both kept between calls (see [`RESCUE_BUFS`]).
+    let (mut arena, mut calls) = RESCUE_BUFS.take();
+    // The block's anchors in apply order, `(pair, dir, anchor index)`.
+    let mut todo: Vec<(u32, u8, u32)> = Vec::new();
+    // Per anchor, `(start, count)` in `job_of`; per collected orientation, its kernel job.
+    let mut call_jobs: Vec<(u32, u32)> = Vec::new();
+    // Each todo entry's view version at collect time.
+    let mut vers: Vec<u32> = Vec::new();
+    let mut job_of: Vec<u32> = Vec::new();
+    let mut kept: Vec<KswAlignResult> = Vec::with_capacity(4);
+    // Identical windows of one (pair, direction): two anchors in identical repeat copies fetch the
+    // same bytes, and the query is that direction's mate, so the job is the same. Found through
+    // `head` by (pair, dir, length, orientation, window hash), chained through `Seen::next`; a hash
+    // match is only a candidate, confirmed byte for byte against the earlier window in the arena.
+    let mut head: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<PassHash>> =
+        Default::default();
+    let mut seen: Vec<Seen> = Vec::new();
+    // dir 0 is bwa's `i = 0`: read-1 anchors, mate `s[!i]` = read 2.
+    fn mate<'a>(p: &PairRescueData<'a>, dir: usize) -> &'a [u8] {
+        if dir == 0 {
+            p.seq1
+        } else {
+            p.seq0
+        }
     }
 
-    anchor_spread::record(&anchors);
-
-    // Round k processes the k-th anchor of every (pair, direction) that still has one. Pairs with
-    // fewer anchors simply drop out of later rounds; the loop count is the deepest anchor list.
-    rescue_rounds::record_chunk(max_rounds);
-    // Whether each pair's `[a1, a0]` is settled in the sense of `matesw_apply`, indexed by `dir`.
-    let mut settled = vec![[false; 2]; pairs.len()];
-    for round in 0..max_rounds {
-        // Collect this round's rescue calls across all pairs and both directions.
-        // `calls`: every rescue this round will perform, tagged with the pair index and direction it
-        // must be applied back to. Order is (pair ascending, then dir), which is also the order the
-        // apply loop below walks, so inserts land in the same sequence as the per-pair path.
-        let t_collect = crate::rescue_split::start();
-        let mut calls: Vec<(usize, usize, RescueCall)> = Vec::new(); // (pair, dir, call)
-        for (pi, p) in pairs.iter().enumerate() {
+    let block = rescue_block_anchors();
+    let mut p0 = 0usize;
+    while p0 < pairs.len() {
+        // Whole pairs, until the block holds `block` anchors.
+        todo.clear();
+        let mut p1 = p0;
+        while p1 < pairs.len() && todo.len() < block {
             for dir in 0..2 {
-                let anchor_list = &anchors[pi][dir];
-                if round >= anchor_list.len() {
-                    continue;
-                }
-                // dir 0 is bwa's `i = 0`: read-1 anchors, mate `s[!i]` = read 2, target `a[!i]` = a1.
-                let (ms, target): (&[u8], &Vec<MemAlnReg>) = if dir == 0 {
-                    (p.seq1, p.a1)
-                } else {
-                    (p.seq0, p.a0)
-                };
-                if let Some(call) =
-                    matesw_collect(fm, bns, opt, pes, &anchor_list[round], ms, target)
-                {
-                    calls.push((pi, dir, call));
-                }
+                todo.extend((0..spans[p1][dir].1).map(|k| (p1 as u32, dir as u8, k)));
             }
+            p1 += 1;
         }
-        if calls.is_empty() {
-            continue;
+        let anchor_of = |&(pi, dir, k): &(u32, u8, u32)| -> &Anchor {
+            &anchors[(spans[pi as usize][dir as usize].0 + k) as usize]
+        };
+
+        // ---- 1. collect, against each mate list as it was before any rescue ----
+        let t_collect = crate::rescue_split::start();
+        arena.clear();
+        calls.clear();
+        vers.clear();
+        for (t, at) in todo.iter().enumerate() {
+            // The windows two anchors ahead are random DRAM misses: hint them now.
+            if let Some(ahead) = todo.get(t + 2) {
+                let q = &pairs[ahead.0 as usize];
+                prefetch_windows(
+                    fm,
+                    bns.l_pac,
+                    pes,
+                    anchor_of(ahead),
+                    mate(q, ahead.1 as usize),
+                );
+            }
+            let (pi, dir) = (at.0 as usize, at.1 as usize);
+            let p = &pairs[pi];
+            let target: &[MemAlnReg] = if dir == 0 { p.a1 } else { p.a0 };
+            vers.push(views[pi][dir].version);
+            calls.push(matesw_collect(
+                fm,
+                bns,
+                opt,
+                pes,
+                anchor_of(at),
+                mate(p, dir),
+                target,
+                &mut views[pi][dir],
+                &mut arena,
+            ));
         }
-        // Flatten every call's orientation jobs into one batch (spans map each call to its slice).
-        // `jobs`: every orientation's SW, from every call, in one flat batch.
-        // `spans[idx]`: `(start, count)` of call `idx`'s jobs within `jobs`, hence within `alns`.
-        // The two vectors are index-parallel with `calls`.
+        // Every collected orientation's job, identical windows of one (pair, dir) merged.
         let mut jobs: Vec<KswJob> = Vec::new();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (_, _, call) in &calls {
-            let start = jobs.len();
-            jobs.extend(rescue_jobs(call));
-            spans.push((start, jobs.len() - start));
-        }
-        // No `lanes` argument here, unlike the scalar [`mem_matesw`] call, which passes 16 or 8 from
-        // bwa's `l_ms * a < 250` KSW_XBYTE test. `batched_mate_rescue` instead bins jobs by length
-        // internally and its u8 kernel uses *unsigned* saturating lanes, so it covers scores in
-        // [128, 255] that bwa-mem2 would have routed to int16 (see the `define_sw_kernel!` u8
-        // instantiation in `bwa-neon/src/batched.rs`). The batched kernels are documented there as
-        // exact, i.e. width does not change the reported score, which is what makes dropping the
-        // explicit `lanes` safe. UNVERIFIED: that exactness is asserted by `bwa-neon`'s own docs and
-        // tests; it has not been re-derived here.
-        // The number this probe exists for: how many jobs this round's single kernel call carries.
-        rescue_rounds::record_call(round, jobs.len());
-        // Issue #50B asks whether the rescue windows of one kernel call overlap enough for a shared
-        // DP to be worth writing. That is a property of the data, so it gets measured before
-        // anything is implemented. Reference coordinates come from the `Orient`s, not from the jobs,
-        // which carry only slices.
-        if rescue_rounds::cluster_enabled() {
-            let mut win: Vec<(i32, i64, i64)> = Vec::with_capacity(jobs.len());
-            for (_, _, call) in &calls {
-                for o in call.per_r.iter().flatten() {
-                    win.push((call.rid, o.rb, o.rb + o.target.len() as i64));
+        // `--meth`: each job's matrix group (see `rescue_kernel`).
+        let mut group: Vec<bool> = Vec::new();
+        call_jobs.clear();
+        job_of.clear();
+        head.clear();
+        seen.clear();
+        for (at, call) in todo.iter().zip(&calls) {
+            let start = job_of.len() as u32;
+            if let Some(call) = call {
+                let slot = 2 * at.0 as usize + at.1 as usize;
+                let ms = mate(&pairs[at.0 as usize], at.1 as usize);
+                for (job, o) in rescue_jobs(call, ms, &arena).zip(call.per_r.iter().flatten()) {
+                    let (len, h) = (o.target.1, window_hash(job.target));
+                    let key = seen_key(slot, len, o.is_rev, h);
+                    let first = head.get(&key).copied().unwrap_or(u32::MAX);
+                    let mut e = first;
+                    let mut hit = None;
+                    while e != u32::MAX {
+                        let c = &seen[e as usize];
+                        if c.slot == slot as u32
+                            && c.len == len
+                            && c.is_rev == o.is_rev
+                            && c.hash == h
+                            && (c.rb == o.rb
+                                || arena[c.off as usize..(c.off + len) as usize] == *job.target)
+                        {
+                            hit = Some(c.job);
+                            break;
+                        }
+                        e = c.next;
+                    }
+                    job_of.push(hit.unwrap_or_else(|| {
+                        seen.push(Seen {
+                            next: first,
+                            slot: slot as u32,
+                            len,
+                            is_rev: o.is_rev,
+                            hash: h,
+                            rb: o.rb,
+                            off: o.target.0,
+                            job: jobs.len() as u32,
+                        });
+                        head.insert(key, (seen.len() - 1) as u32);
+                        jobs.push(job);
+                        group.push((at.1 == 1) ^ o.is_rev);
+                        (jobs.len() - 1) as u32
+                    }));
                 }
             }
-            rescue_rounds::record_windows(&mut win);
+            call_jobs.push((start, job_of.len() as u32 - start));
         }
         crate::rescue_split::stop(&crate::rescue_split::COLLECT_NS, t_collect);
+
+        // ---- 2. one kernel call for the block ----
+        // No `lanes` argument, unlike the scalar [`mem_matesw`] call: `batched_mate_rescue` bins jobs
+        // by length and its u8 kernel uses unsigned saturating lanes, documented exact in
+        // `bwa-neon/src/batched.rs`, so width never changes the reported score.
         let t_kernel = crate::rescue_split::start();
-        // `alns`: one result per job, index-aligned with `jobs`.
-        let alns = batched_mate_rescue(
-            &jobs,
-            5,
-            &opt.mat,
-            opt.o_del,
-            opt.e_del,
-            opt.o_ins,
-            opt.e_ins,
-            opt.min_seed_len * opt.a,
-            opt.a,
-        );
-        crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
-        let t_apply = crate::rescue_split::start();
-        for (idx, (pi, dir, call)) in calls.iter().enumerate() {
-            let (start, count) = spans[idx];
-            // `target`: the region vector this call's hits are inserted into, i.e. the MATE's array
-            // (dir 0 rescued read 2, so it writes `a1`). Re-borrowed per call because the two
-            // directions of one pair touch different arrays.
-            let target = if *dir == 0 {
-                &mut *pairs[*pi].a1
+        let alns = if jobs.is_empty() {
+            Vec::new()
+        } else {
+            if pend.is_some() {
+                batched_mate_rescue_lazy(
+                    &jobs,
+                    5,
+                    &opt.mat,
+                    opt.o_del,
+                    opt.e_del,
+                    opt.o_ins,
+                    opt.e_ins,
+                    opt.min_seed_len * opt.a,
+                    opt.a,
+                )
             } else {
-                &mut *pairs[*pi].a0
+                rescue_kernel(opt, &jobs, &group)
+            }
+        };
+        drop(jobs);
+        crate::rescue_split::stop(&crate::rescue_split::KERNEL_NS, t_kernel);
+
+        // ---- 3. apply in bwa's order, `skip` re-read from the current lists ----
+        let t_apply = crate::rescue_split::start();
+        for (t, at) in todo.iter().enumerate() {
+            let (pi, dir) = (at.0 as usize, at.1 as usize);
+            let a = *anchor_of(at);
+            let p = &mut pairs[pi];
+            let ms = mate(p, dir);
+            let target = if dir == 0 { &mut *p.a1 } else { &mut *p.a0 };
+            let view = &mut views[pi][dir];
+            // No hit applied to this list since its collect: the skip set collect computed holds.
+            let skip = match &calls[t] {
+                Some(c) if vers[t] == view.version => c.skip,
+                _ => skip_set(view, target, bns.l_pac, a.rb, pes),
             };
+            let was = calls[t].as_ref().map_or([1; 4], |c| c.skip);
+            if (0..4).any(|r| skip[r] == 0 && was[r] != 0) {
+                // A dedup removed the region that closed an orientation: the per-pair path, here.
+                let mut own = Vec::new();
+                if let Some(call) =
+                    matesw_collect(fm, bns, opt, pes, &a, ms, target, view, &mut own)
+                {
+                    let jobs: Vec<KswJob> = rescue_jobs(&call, ms, &own).collect();
+                    let group: Vec<bool> = call
+                        .per_r
+                        .iter()
+                        .flatten()
+                        .map(|o| (dir == 1) ^ o.is_rev)
+                        .collect();
+                    let alns = rescue_kernel(opt, &jobs, &group);
+                    matesw_apply(fm, bns, opt, &call, &alns, target, view, None, 0);
+                }
+                continue;
+            }
+            let Some(call) = &calls[t] else {
+                continue; // all four closed then and now
+            };
+            // This anchor's results in orientation order, without the ones `skip` has since closed.
+            let (start, _) = call_jobs[t];
+            kept.clear();
+            let mut ai = start as usize;
+            for r in 0..4 {
+                if call.per_r[r].is_some() {
+                    if skip[r] == 0 {
+                        kept.push(alns[job_of[ai] as usize]);
+                    }
+                    ai += 1;
+                }
+            }
+            let call = RescueCall { skip, ..*call };
+            // dir 0 rescues read 2 (index 1), dir 1 read 1.
+            let read = (dir == 0) as u8;
             matesw_apply(
                 fm,
                 bns,
                 opt,
-                call,
-                &alns[start..start + count],
+                &call,
+                &kept,
                 target,
-                &mut settled[*pi][*dir],
+                view,
+                pend.as_deref_mut(),
+                read,
             );
         }
         crate::rescue_split::stop(&crate::rescue_split::APPLY_NS, t_apply);
+        p0 = p1;
     }
+    for (p, v) in pairs.iter_mut().zip(&mut views) {
+        settle_order(p.a1, &mut v[0].pending);
+        settle_order(p.a0, &mut v[1].pending);
+    }
+    RESCUE_BUFS.set((arena, calls));
+}
+
+thread_local! {
+    /// [`batch_mate_rescue`]'s window arena and per-anchor calls, kept between calls: grown from
+    /// empty each time they were a sixth of the run's realloc copies (chr21, 200k pairs: 0.23 of
+    /// 1.29 GB). Cleared per block before use.
+    static RESCUE_BUFS: std::cell::Cell<(Vec<u8>, Vec<Option<RescueCall>>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+}
+
+/// Anchors per [`batch_mate_rescue`] block; `BWA4_RESCUE_BLOCK` overrides it for measurement.
+fn rescue_block_anchors() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BWA4_RESCUE_BLOCK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(RESCUE_BLOCK_ANCHORS)
+    })
+}
+
+/// See [`batch_mate_rescue`].
+const RESCUE_BLOCK_ANCHORS: usize = 4096;
+
+/// One collected rescue job of a [`batch_mate_rescue`] block, for the identical-window lookup: its
+/// window's length, mate orientation, [`window_hash`], start and arena offset, its kernel job, and
+/// the list's next entry.
+#[derive(Clone, Copy)]
+struct Seen {
+    next: u32,
+    slot: u32,
+    len: u32,
+    is_rev: bool,
+    hash: u64,
+    rb: i64,
+    off: u32,
+    job: u32,
+}
+
+/// Room for one more region, growing by an eighth rather than doubling. A batch holds every read's
+/// regions until SAM emit, and doubling on the rescued hit left a few-region list half empty: 0.15
+/// GB of chr21's 2.2 GB peak. An eighth keeps repeat-heavy lists (hundreds of regions, many rescued
+/// hits each) amortized.
+fn grow_one(ma: &mut Vec<MemAlnReg>) {
+    if ma.len() == ma.capacity() {
+        ma.reserve_exact(1 + ma.len() / 8);
+    }
+}
+
+/// [`Seen`]'s lookup key: the slot, length and orientation mixed into the window hash.
+fn seen_key(slot: usize, len: u32, is_rev: bool, h: u64) -> u64 {
+    const M: u64 = 0x9E37_79B9_7F4A_7C15;
+    (h ^ (slot as u64) << 33 ^ u64::from(len) << 1 ^ u64::from(is_rev)).wrapping_mul(M)
+}
+
+/// A hasher that passes an already mixed `u64` key through.
+#[derive(Default)]
+struct PassHash(u64);
+impl std::hash::Hasher for PassHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0 ^ u64::from(x)).wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+/// A 64-bit hash of a rescue window's bytes, four independent multiply lanes over 8-byte words.
+/// Only selects candidates for [`batch_mate_rescue`]'s repeat lookup, which then compares bytes.
+fn window_hash(b: &[u8]) -> u64 {
+    const M: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = [b.len() as u64, 1, 2, 3];
+    let (words, rest) = b.as_chunks::<32>();
+    for w in words {
+        for (l, x) in h.iter_mut().zip(w.as_chunks::<8>().0) {
+            *l = (*l ^ u64::from_le_bytes(*x))
+                .wrapping_mul(M)
+                .rotate_left(31);
+        }
+    }
+    let (tail_words, tail) = rest.as_chunks::<8>();
+    for (l, x) in h.iter_mut().zip(tail_words) {
+        *l = (*l ^ u64::from_le_bytes(*x))
+            .wrapping_mul(M)
+            .rotate_left(31);
+    }
+    if !tail.is_empty() {
+        // The last eight bytes, overlapping the words before; the length is already in `h[0]`.
+        let x = match b.len().checked_sub(8) {
+            Some(at) => u64::from_le_bytes(b[at..].try_into().unwrap()),
+            None => tail.iter().rev().fold(0, |v, &x| v << 8 | u64::from(x)),
+        };
+        h[3] = (h[3] ^ x).wrapping_mul(M).rotate_left(31);
+    }
+    (h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48)).wrapping_mul(M)
 }
 
 /// bwa's `id << 8`, reproduced with its C integer width.
@@ -1428,7 +1903,13 @@ fn dump_pestat() -> bool {
 /// RETURNS the four `PeStat`s by orientation code (FF, FR, RF, RR). Orientations with too little
 /// support come back `failed`, which downstream code treats as "never pair or rescue this way".
 pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4] {
-    let mut pes = [PeStat::default(); 4];
+    mem_pestat_from(pestat_samples(opt, l_pac, regs))
+}
+
+/// [`mem_pestat`]'s step 1 alone: the insert sizes it fits, one list per orientation. A caller may
+/// collect them over slices of the batch (an even number of reads each) and concatenate the lists
+/// in any order, since [`mem_pestat_from`] sorts them.
+pub fn pestat_samples(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [Vec<i64>; 4] {
     // One insert-size sample list per orientation. bwa uses `uint64_v`; the values are distances so
     // they are non-negative, and we keep them as i64 to avoid signed/unsigned comparison hazards in
     // the inlier tests below.
@@ -1471,7 +1952,13 @@ pub fn mem_pestat(opt: &MemOpt, l_pac: i64, regs: &[&[MemAlnReg]]) -> [PeStat; 4
             insert_sizes[dir].push(ins_size);
         }
     }
+    insert_sizes
+}
 
+/// [`mem_pestat`]'s step 2: the four orientations' fit, from [`pestat_samples`]' lists in any
+/// order (each is sorted here, a no-op on a sorted list).
+pub fn mem_pestat_from(mut insert_sizes: [Vec<i64>; 4]) -> [PeStat; 4] {
+    let mut pes = [PeStat::default(); 4];
     if dump_pestat() {
         eprintln!(
             "[PE] # candidate unique pairs for (FF, FR, RF, RR): ({}, {}, {}, {})",
@@ -1633,6 +2120,97 @@ fn mem_pair(
     a: &[&[MemAlnReg]; 2],
     id: u64,
 ) -> Option<PairResult> {
+    thread_local! {
+        /// `v` and `u` below, kept per thread: two or three allocations per pair otherwise. And
+        /// the insert-size penalties, kept across the pairs of a batch.
+        static PAIR_LISTS: std::cell::RefCell<PairScratch> =
+            const { std::cell::RefCell::new(([Vec::new(), Vec::new()], PairPenalty::new())) };
+    }
+    PAIR_LISTS.with(|c| {
+        let ([v, u], pen) = &mut *c.borrow_mut();
+        v.clear();
+        u.clear();
+        pen.reset_for(pes, opt.a);
+        mem_pair_in(bns, opt, pes, a, id, [v, u], pen)
+    })
+}
+
+/// [`mem_pair`]'s per-thread lists `v` and `u`, and its penalty memo.
+type PairScratch = ([Vec<(u64, u64)>; 2], PairPenalty);
+
+/// What [`PairPenalty`] was filled for: `(low, high, avg bits, std bits)` per orientation, and
+/// `opt.a`.
+type PairPenaltyKey = ([(i32, i32, u64, u64); 4], i32);
+
+/// [`mem_pair`]'s insert-size penalty, `INV_LOG4 * ln(2 * erfc(|ns| / sqrt 2)) * a`, by orientation
+/// and insert size, which is all it depends on: libm's `erfc` and `log` per candidate pair were
+/// ~0.3% of an x86 PE run. Valid for one batch's statistics and one `opt.a` (`key`). A slot is NaN
+/// until computed; a penalty that is NaN itself (`a == 0`) is simply recomputed each time.
+struct PairPenalty {
+    key: Option<PairPenaltyKey>,
+    /// Per orientation, the penalty at insert size `low + k` in slot `k`.
+    vals: [Vec<f64>; 4],
+}
+
+impl PairPenalty {
+    /// Insert sizes per orientation the memo covers; a wider `[low, high]` computes the rest.
+    const SPAN: i32 = 1 << 16;
+
+    const fn new() -> Self {
+        PairPenalty {
+            key: None,
+            vals: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        }
+    }
+
+    /// Empty every slot unless `pes` and `a` are the ones the slots were computed for.
+    fn reset_for(&mut self, pes: &[PeStat; 4], a: i32) {
+        let key = (
+            std::array::from_fn(|d| {
+                let p = &pes[d];
+                (p.low, p.high, p.avg.to_bits(), p.std.to_bits())
+            }),
+            a,
+        );
+        if self.key == Some(key) {
+            return;
+        }
+        for (v, p) in self.vals.iter_mut().zip(pes) {
+            v.clear();
+            v.resize((p.high - p.low + 1).clamp(0, Self::SPAN) as usize, f64::NAN);
+        }
+        self.key = Some(key);
+    }
+
+    /// The penalty of an insert of `dist`, which lies in `[pes.low, pes.high]`, in orientation `dir`.
+    fn get(&mut self, pes: &PeStat, dir: usize, dist: i64, a: i32) -> f64 {
+        match self.vals[dir].get_mut((dist - i64::from(pes.low)) as usize) {
+            Some(p) if !p.is_nan() => *p,
+            slot => {
+                // `ns` is bwa's name for the z-score of this insert size.
+                let ns = (dist as f64 - pes.avg) / pes.std;
+                // SAFETY: libm's `erfc` is a pure function of its argument.
+                let erfc_term = unsafe { erfc(ns.abs() * M_SQRT1_2) };
+                let pen = INV_LOG4 * (2.0 * erfc_term).ln() * f64::from(a);
+                if let Some(p) = slot {
+                    *p = pen;
+                }
+                pen
+            }
+        }
+    }
+}
+
+/// [`mem_pair`] on the caller's two empty lists `v` and `u`.
+fn mem_pair_in(
+    bns: &BntSeq,
+    opt: &MemOpt,
+    pes: &[PeStat; 4],
+    a: &[&[MemAlnReg]; 2],
+    id: u64,
+    [v, u]: [&mut Vec<(u64, u64)>; 2],
+    pen: &mut PairPenalty,
+) -> Option<PairResult> {
     let l_pac = bns.l_pac;
     // `v`: every candidate placement of either read, packed into two u64s so that a plain sort by
     // `x` orders them by genomic position. bwa's `pair64_t` is exactly this pair of fields.
@@ -1649,7 +2227,6 @@ fn mem_pair(
     // fields are recovered later by masking (`y & 1` = read, `y >> 1 & 1` = strand,
     // `y << 32 >> 34` = region index).
     // ---- step 1: flatten both reads' regions into one position-sortable list ----
-    let mut v: Vec<(u64, u64)> = Vec::new();
     for (r, regs) in a.iter().enumerate() {
         for (i, reg) in regs.iter().enumerate() {
             // Fold the doubled coordinate back onto the forward strand so both strands' placements
@@ -1663,7 +2240,7 @@ fn mem_pair(
             // low half of `x` is a within-contig offset and always fits in 32 bits.
             let off = bns.contigs[reg.rid as usize].offset;
             let x = (u64::from(reg.rid as u32) << 32) | (fpos - off) as u64;
-            // `reg.score` is a positive i32 well under 2^31, so the `as u64` shift matches C's
+            // `reg.score` is an i32 (negative only under --meth), so the `as u64` shift matches C's
             // `(uint64_t)e->score << 32`. `i << 2` leaves the two low bits for strand and read,
             // which caps the region index at 2^30 (never approached).
             let y = ((reg.score as u64) << 32)
@@ -1683,7 +2260,6 @@ fn mem_pair(
     // element rather than at 0.
     //
     // ---- step 2: sweep left to right, emitting one scored candidate per compatible look-back ----
-    let mut u: Vec<(u64, u64)> = Vec::new();
     let mut y: [i64; 4] = [-1, -1, -1, -1];
     for i in 0..v.len() {
         for r in 0..2u64 {
@@ -1735,16 +2311,19 @@ fn mem_pair(
                 // f64 throughout and the *system* libm `erfc`: this is the single most
                 // parity-sensitive expression in the file. A Rust-side erfc implementation, or f32
                 // anywhere in the chain, changes `q` by one on boundary pairs and silently reorders
-                // `u`, picking a different "best pair".
-                // `ns` is bwa's name for the z-score of this insert size.
-                let ns = (dist as f64 - pes[dir].avg) / pes[dir].std;
-                let erfc_term = unsafe { erfc(ns.abs() * M_SQRT1_2) };
+                // `u`, picking a different "best pair". The memo holds that same f64.
+                let penalty = pen.get(&pes[dir], dir, dist, opt.a);
                 // `v[..].1 >> 32` recovers each end's alignment score from the packed `y`. The
-                // `+ 0.499` is C's round-half-up, applied once to the whole sum, not per term.
-                let q = ((v[i].1 >> 32) as f64
-                    + (v[ku].1 >> 32) as f64
-                    + INV_LOG4 * (2.0 * erfc_term).ln() * f64::from(opt.a)
-                    + 0.499) as i64;
+                // `+ 0.499` is C's round-half-up, applied once to the whole sum, not per term; the
+                // additions run in the C's order. Read the scores back signed: only --meth regions
+                // score below zero, and the fork gives such a pair q = 0 (still pushed, so it counts
+                // toward `sub` / `n_sub`).
+                let (sc_i, sc_k) = ((v[i].1 >> 32) as u32 as i32, (v[ku].1 >> 32) as u32 as i32);
+                let q = if sc_i < 0 || sc_k < 0 {
+                    0
+                } else {
+                    (f64::from(sc_i) + f64::from(sc_k) + penalty + 0.499) as i64
+                };
                 // A pair whose insert penalty exceeds its alignment scores floors at 0 rather than
                 // going negative, so it can still be selected if nothing better exists.
                 let q = q.max(0) as u64;
@@ -1776,11 +2355,9 @@ fn mem_pair(
     tie_margin = tie_margin
         .max(opt.o_del + opt.e_del)
         .max(opt.o_ins + opt.e_ins);
-    // Ascending sort, so the BEST pair is the LAST element (bwa reads `u.a[u.n-1]`). The high half
-    // of `px` is the score and the low half the hash, so this is "score, then hash tie-break".
-    u.sort_unstable();
-    // The winning candidate pair: highest `q`, hash-tie-broken. `u` is non-empty by the check above.
-    let last = *u.last().unwrap();
+    // The winning candidate pair (highest `q`, hash-tie-broken), the runner-up score and how many
+    // others sit within `tie_margin` of it. `u` is non-empty by the check above.
+    let (last, sub, n_sub) = best_pair(u, tie_margin);
     // Unpack the two `v` indices from `py`. `i` was the current placement, `k` the partner.
     let i = (last.1 >> 32) as usize;
     let k = (last.1 & 0xffff_ffff) as usize;
@@ -1796,33 +2373,35 @@ fn mem_pair(
     z[(v[k].1 & 1) as usize] = (v[k].1 << 32 >> 34) as usize;
     // Winning pair's combined score, already floored at 0 when it was packed.
     let score = (last.0 >> 32) as i32;
-    // Runner-up score. Note `u` holds one entry per candidate *pairing*, so the runner-up is very
-    // often the same two regions paired through a different intermediate, not a genuinely different
-    // locus. That is intentional: the caller uses `sub` only to damp MAPQ.
-    let sub = if u.len() > 1 {
-        (u[u.len() - 2].0 >> 32) as i32
-    } else {
-        0
-    };
-    // Count runner-ups within `tie_margin` of `sub`. bwa's loop is `for (i = u.n - 2; i >= 0; --i)`, i.e.
-    // it starts at the runner-up itself (so `n_sub` is at least 1 whenever `u.len() >= 2`) and
-    // walks down to index 0. Since `u` is ascending, later iterations only ever see smaller scores,
-    // but the C does NOT break out on the first failure, so neither do we. The reversed iterator
-    // over `u[..len-1]` is that same traversal.
-    let mut n_sub = 0;
-    if u.len() >= 2 {
-        for cand in u[..u.len() - 1].iter().rev() {
-            if sub - (cand.0 >> 32) as i32 <= tie_margin {
-                n_sub += 1;
-            }
-        }
-    }
     Some(PairResult {
         score,
         sub,
         n_sub,
         z,
     })
+}
+
+/// `mem_pair`'s pick from its non-empty candidate list `u`: the best `(px, py)`, the runner-up score
+/// `sub` and `n_sub`, the count of other candidates within `tie_margin` of `sub`. bwa sorts `u`
+/// ascending and reads `u[n-1]`, `u[n-2]` and every score below; nothing else sees the order, so
+/// one scan for the maximum gives the same three answers.
+///
+/// Note `u` holds one entry per candidate *pairing*, so the runner-up is very often the same two
+/// regions paired through a different intermediate, not a genuinely different locus. That is
+/// intentional: the caller uses `sub` only to damp MAPQ.
+fn best_pair(u: &[(u64, u64)], tie_margin: i32) -> ((u64, u64), i32, i32) {
+    let best = (0..u.len()).max_by_key(|&j| u[j]).unwrap();
+    let others = || {
+        u.iter()
+            .enumerate()
+            .filter(move |&(j, _)| j != best)
+            .map(|(_, c)| (c.0 >> 32) as i32)
+    };
+    // The sorted list's second-to-last entry, i.e. the top score among the others.
+    let sub = others().max().unwrap_or(0);
+    // bwa's loop over `u.a[0 .. u.n-2]`: every entry but the best, so `n_sub >= 1` once `n >= 2`.
+    let n_sub = others().filter(|&q| sub - q <= tie_margin).count() as i32;
+    (u[best], sub, n_sub)
 }
 
 /// Convert a score margin into a phred-scaled mapping quality. Port of the `raw_mapq` macro
@@ -1938,10 +2517,10 @@ pub(crate) fn add_cigar(cigar: &[u32], hard_clip: bool, out: &mut Vec<u8>) {
 #[allow(clippy::too_many_arguments)]
 fn mem_aln2sam(
     bns: &BntSeq,
-    name: &str,
+    name: &[u8],
     seq: &[u8],
     qual: Option<&[u8]>,
-    comment: Option<&str>,
+    comment: Option<&[u8]>,
     list: &[MemAln],
     which: usize,
     m: Option<&MemAln>,
@@ -1952,6 +2531,8 @@ fn mem_aln2sam(
     // `-V` (MEM_F_REF_HDR): close the record with the contig's FASTA comment. Passed in for the same
     // reason as `softclip`.
     ref_hdr: bool,
+    // `--meth`: the read's chemistry and what XM:Z needs; `None` for every other run.
+    meth: Option<&MethEmit>,
     out: &mut Vec<u8>,
 ) {
     // `p`: the alignment being printed, and `m` the mate's. bwa works on private copies
@@ -2012,9 +2593,16 @@ fn mem_aln2sam(
     if m.is_some() && m_is_rev {
         p_flag |= 0x20;
     }
+    // `--meth`: a mapped record's conversion strand (XG:Z:CT when `top`), and the QC rules that
+    // may change its FLAG and MAPQ before they are printed.
+    let mut mapq = p.mapq;
+    let top = meth.filter(|_| p.rid >= 0).map(|e| e.ot ^ p.is_rev);
+    if let (Some(e), Some(top)) = (meth, top) {
+        e.qc(top, &p.cigar, seq.len(), &mut p_flag, &mut mapq);
+    }
 
     // ---- step 2: QNAME, FLAG ----
-    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(name);
     out.push(b'\t');
     // Bit 0x10000 is bwa-internal, not SAM: `mem_reg2sam` sets it instead of 0x800 under `-M`
     // (MEM_F_NO_MULTI) to mark "supplementary, but report it as secondary". Here it is masked off
@@ -2032,7 +2620,7 @@ fn mem_aln2sam(
         out.push(b'\t');
         crate::emit::push_int(out, p_pos + 1);
         out.push(b'\t');
-        crate::emit::push_int(out, i64::from(p.mapq));
+        crate::emit::push_int(out, i64::from(mapq));
         out.push(b'\t');
         add_cigar(p_cigar, which != 0 && !softclip && !p.is_alt, out);
     } else {
@@ -2086,6 +2674,8 @@ fn mem_aln2sam(
     // ---- step 5: SEQ, QUAL ----
     // Secondary records (0x100) omit both, per SAM convention and to keep file size
     // sane; the read's bases are already on its primary record.
+    // Where SEQ lands in `out`, for XM:Z. Empty when SEQ is `*`.
+    let mut seq_span = 0..0;
     if p_flag & 0x100 != 0 {
         out.extend_from_slice(b"*\t*");
     } else {
@@ -2129,6 +2719,7 @@ fn mem_aln2sam(
         // Written a block at a time rather than a base at a time: see `crate::emit`, and the x86
         // profile that motivated it (`sam_emit` is 5.15x slower per pair there than on an M4, the
         // worst-scaling stage we have). Same bytes, same alphabets, same order.
+        seq_span = out.len()..out.len() + (qe - qb);
         if !p_is_rev {
             crate::emit::push_seq_fwd(out, &seq[qb..qe]);
             out.push(b'\t');
@@ -2165,6 +2756,10 @@ fn mem_aln2sam(
         if !m_cigar.is_empty() {
             out.extend_from_slice(b"\tMC:Z:");
             add_cigar(m_cigar, which != 0 && !softclip && !mate.is_alt, out);
+        }
+        if meth.is_some() {
+            out.extend_from_slice(b"\tMQ:i:");
+            crate::emit::push_int(out, i64::from(mate.mapq));
         }
     }
     // AS/XS are gated on `>= 0`, not on `> 0`, which is why an unmapped record (built from a zeroed
@@ -2227,6 +2822,28 @@ fn mem_aln2sam(
         out.extend_from_slice(b"\tXA:Z:");
         out.extend_from_slice(xa.as_bytes());
     }
+    if let Some(e) = meth {
+        if p.hn >= 0 {
+            out.extend_from_slice(b"\tHN:i:");
+            crate::emit::push_int(out, i64::from(p.hn));
+        }
+        let emitted_seq = out[seq_span].to_vec();
+        let hard = which != 0 && !softclip && !p.is_alt;
+        e.push_tags(
+            bns,
+            out,
+            top,
+            p.rid,
+            p.pos,
+            &p.cigar,
+            hard,
+            &emitted_seq,
+            // The comment is raw bytes now; the tag parser reads text, as it did before.
+            comment.map(String::from_utf8_lossy).as_deref(),
+        );
+        out.push(b'\n');
+        return;
+    }
     // `-C`: the FASTQ comment closes the record, after every tag.
     bwa_core::rg::append_comment(out, comment);
     // `-V`, after even the comment (`bwamem.cpp:1721`). Tested on the rewritten `rid`, so an unmapped
@@ -2253,18 +2870,22 @@ fn mem_aln2sam(
 /// records. `extra_flag` is OR-ed into every record's FLAG (0x1 plus 0x40/0x80, and 0x2 when the
 /// caller inferred a proper pair). `m` is the mate's chosen alignment for RNEXT/PNEXT/TLEN, or
 /// `None`. `out` receives one or more complete records, appended.
+///
+/// `meth` is the `--meth` record context (`None` otherwise); `opt` must then carry the read's
+/// chemistry matrix ([`crate::meth::read_opt`]).
 #[allow(clippy::too_many_arguments)]
-fn mem_reg2sam(
+pub fn mem_reg2sam(
     fm: &FmIndex,
     bns: &BntSeq,
     opt: &MemOpt,
-    name: &str,
+    name: &[u8],
     seq: &[u8],
     qual: Option<&[u8]>,
-    comment: Option<&str>,
+    comment: Option<&[u8]>,
     a: &[MemAlnReg],
     extra_flag: u32,
     m: Option<&MemAln>,
+    meth: Option<&MethEmit>,
     out: &mut Vec<u8>,
 ) {
     // `-Y` and `-V`, read once here and threaded into every `mem_aln2sam` call below.
@@ -2286,9 +2907,15 @@ fn mem_reg2sam(
     // `-a` (MEM_F_ALL): emit every alignment, including the shadowed ones, and emit no XA.
     let all = opt.flag & bwa_core::opt::flags::ALL != 0;
     let xa = if all {
-        vec![None; a.len()]
+        crate::alt::XaTags::default()
     } else {
         mem_gen_alt(fm, bns, opt, a, seq.len() as i32, seq)
+    };
+    // `--meth` only: HN:i per region, absent under `-a` like XA.
+    let hn = if meth.is_some() && !all {
+        crate::alt::hit_counts(opt, a)
+    } else {
+        vec![-1; a.len()]
     };
     // ---- step 1: turn the surviving regions into records ----
     // `emitted` is bwa's `aa`, the records to emit; `n_emitted` is its `l`, the count accepted so
@@ -2324,7 +2951,8 @@ fn mem_reg2sam(
         }
         // The printable form of region `p`: CIGAR, POS, MAPQ, NM and MD, all derived here.
         let mut aln = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
-        aln.xa = xa[k].clone();
+        aln.xa = xa.get(k);
+        aln.hn = hn[k];
         aln.flag |= extra_flag;
         // Suppress XS on a secondary (`sub < 0` gates the tag in `mem_aln2sam`). Unreachable here
         // for the same reason as the drop-ratio test above.
@@ -2381,12 +3009,13 @@ fn mem_reg2sam(
             m,
             softclip,
             ref_hdr,
+            meth,
             out,
         );
     } else {
         for k in 0..emitted.len() {
             mem_aln2sam(
-                bns, name, seq, qual, comment, &emitted, k, m, softclip, ref_hdr, out,
+                bns, name, seq, qual, comment, &emitted, k, m, softclip, ref_hdr, meth, out,
             );
         }
     }
@@ -2434,10 +3063,8 @@ thread_local! {
 ///
 /// RETURNS whatever `w` reported; the only failure mode is the write itself.
 ///
-/// UNVERIFIED: the C aborts with `err_fatal` when the two ends' names differ ("paired reads have
-/// different names"). No equivalent check was found anywhere in this workspace, so mismatched pairs
-/// appear to be emitted silently rather than rejected. That affects diagnostics only, not the
-/// output of well-formed input.
+/// The C aborts here with `err_fatal` when the two ends' names differ ("paired reads have different
+/// names"). The same refusal lives earlier in this port, in `PairedFastqReader::next_batch`.
 #[allow(clippy::too_many_arguments)]
 pub fn mem_sam_pe<W: Write>(
     fm: &FmIndex,
@@ -2445,10 +3072,10 @@ pub fn mem_sam_pe<W: Write>(
     opt: &MemOpt,
     pes: &[PeStat; 4],
     id: u64,
-    names: &[&str; 2],
+    names: &[&[u8]; 2],
     seqs: &[&[u8]; 2],
     quals: &[Option<&[u8]>; 2],
-    comments: &[Option<&str>; 2],
+    comments: &[Option<&[u8]>; 2],
     a0: &mut Vec<MemAlnReg>,
     a1: &mut Vec<MemAlnReg>,
     rescue_done: bool,
@@ -2460,6 +3087,15 @@ pub fn mem_sam_pe<W: Write>(
     // MATE_SORT rescue block in mem_sam_pe (bwamem_pair.cpp lines 378-414). Skipped when the caller
     // already ran it batched across the whole pair batch ([`batch_mate_rescue`]).
     // ---- stage 1: mate rescue ----
+    // `--meth`: each end's own chemistry matrix (read 1 C->T, read 2 G->A) and record context.
+    // Plain runs borrow `opt` and carry no context.
+    let ropt = [
+        crate::meth::read_opt(opt, true),
+        crate::meth::read_opt(opt, false),
+    ];
+    let emit = opt.meth.as_ref().map_or([None, None], |meth| {
+        [true, false].map(|ot| Some(MethEmit { fm, meth, ot }))
+    });
     if !rescue_done {
         // `-U`: any region within this of the best is a plausible anchor. `-m`: anchor cap.
         let pen = opt.pen_unpaired;
@@ -2482,10 +3118,10 @@ pub fn mem_sam_pe<W: Write>(
         let b0 = near_best(a0);
         let b1 = near_best(a1);
         for anchor in b0.iter().take(anchor_cap) {
-            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1);
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[1], a1, false);
         }
         for anchor in b1.iter().take(anchor_cap) {
-            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0);
+            mem_matesw(fm, bns, opt, pes, anchor, seqs[0], a0, true);
         }
     }
 
@@ -2553,11 +3189,21 @@ pub fn mem_sam_pe<W: Write>(
                 // pair and the unpaired alternative. `q_pe`: the pair-level MAPQ, still unclamped
                 // and undamped at this point, shared by both ends.
                 let subo = pr.sub.max(score_un);
-                let mut q_pe = raw_mapq(pr.score - subo, opt.a);
+                let mut qdiff = pr.score - subo;
+                // `--meth`: each end's second-best primary also caps the pair's margin, so a
+                // repeat on either end deflates the pair MAPQ (fg-labs/bwa-mem3 0.16).
+                if opt.meth.is_some() {
+                    let second =
+                        |a: &[MemAlnReg], n_pri: usize| if n_pri > 1 { a[1].score } else { 0 };
+                    let cap = pr.score + 4 * opt.a - (second(a0, n_pri0) + second(a1, n_pri1));
+                    qdiff = qdiff.min(cap).max(0);
+                }
+                let mut q_pe = raw_mapq(qdiff, opt.a);
                 // Crowded runner-up field discounts the MAPQ, by `10*log10(n_sub+1)` phred units
                 // (see [`DECIBANS_PER_NAT`]).
                 if pr.n_sub > 0 {
-                    q_pe -= (DECIBANS_PER_NAT * f64::from(pr.n_sub + 1).ln() + 0.499) as i32;
+                    q_pe -=
+                        (DECIBANS_PER_NAT * crate::primary::ln_int(pr.n_sub + 1) + 0.499) as i32;
                 }
                 // Clamp BEFORE the repeat scaling, not after: bwa's order, and the two differ.
                 q_pe = q_pe.clamp(0, MAX_MAPQ);
@@ -2586,7 +3232,10 @@ pub fn mem_sam_pe<W: Write>(
                     // front instead, purely to satisfy the borrow checker. Equivalent because that
                     // loop only writes `sub` and `secondary`, never `score` or `csub`.
                     let chosen_score = [a0[z[0]].score, a1[z[1]].score];
-                    let chosen_csub = [a0[z[0]].csub, a1[z[1]].csub];
+                    let chosen_csub = [
+                        crate::lazy_csub::get(a0[z[0]].csub),
+                        crate::lazy_csub::get(a1[z[1]].csub),
+                    ];
                     for i in 0..2 {
                         let a = if i == 0 { &mut *a0 } else { &mut *a1 };
                         let zi = z[i];
@@ -2676,19 +3325,19 @@ pub fn mem_sam_pe<W: Write>(
                 let softclip = opt.flag & bwa_core::opt::flags::SOFTCLIP != 0;
                 let ref_hdr = opt.flag & bwa_core::opt::flags::REF_HDR != 0;
                 let all = opt.flag & bwa_core::opt::flags::ALL != 0;
-                let (xa0, xa1) = if all {
-                    (vec![None; a0.len()], vec![None; a1.len()])
+                let (mut xa0, mut xa1) = if all {
+                    (crate::alt::XaTags::default(), crate::alt::XaTags::default())
                 } else {
                     (
                         crate::emit_split::measure(
                             &crate::emit_split::ALT_NS,
                             &crate::emit_split::ALT_CALLS,
-                            || mem_gen_alt(fm, bns, opt, a0, seqs[0].len() as i32, seqs[0]),
+                            || mem_gen_alt(fm, bns, &ropt[0], a0, seqs[0].len() as i32, seqs[0]),
                         ),
                         crate::emit_split::measure(
                             &crate::emit_split::ALT_NS,
                             &crate::emit_split::ALT_CALLS,
-                            || mem_gen_alt(fm, bns, opt, a1, seqs[1].len() as i32, seqs[1]),
+                            || mem_gen_alt(fm, bns, &ropt[1], a1, seqs[1].len() as i32, seqs[1]),
                         ),
                     )
                 };
@@ -2706,18 +3355,32 @@ pub fn mem_sam_pe<W: Write>(
                 // and what bwa prints when it does, has not been checked against a real run.
                 // `h0`/`h1`: the single record emitted for read 1 and read 2. Each is also handed to
                 // the other's `mem_aln2sam` call as the mate.
+                // `--meth` only: HN:i per region, absent under `-a` like XA.
+                let hn = [&*a0, &*a1].map(|a| {
+                    if opt.meth.is_some() && !all {
+                        crate::alt::hit_counts(opt, a)
+                    } else {
+                        vec![-1; a.len()]
+                    }
+                });
                 let h0 = {
-                    let mut h = reg2aln(fm, bns, opt, seqs[0].len() as i32, seqs[0], &a0[z[0]]);
+                    let mut h =
+                        reg2aln(fm, bns, &ropt[0], seqs[0].len() as i32, seqs[0], &a0[z[0]]);
                     h.mapq = q_se[0].max(0) as u32;
                     h.flag |= 0x40 | extra_flag;
-                    h.xa = xa0[z[0]].clone();
+                    // Moved, not cloned: `z[0] < n_pri0`, and `alt_extra` reads only `xa0[n_pri0]`.
+                    h.xa = xa0.take(z[0]);
+                    h.hn = hn[0][z[0]];
                     h
                 };
                 let h1 = {
-                    let mut h = reg2aln(fm, bns, opt, seqs[1].len() as i32, seqs[1], &a1[z[1]]);
+                    let mut h =
+                        reg2aln(fm, bns, &ropt[1], seqs[1].len() as i32, seqs[1], &a1[z[1]]);
                     h.mapq = q_se[1].max(0) as u32;
                     h.flag |= 0x80 | extra_flag;
-                    h.xa = xa1[z[1]].clone();
+                    // Moved, not cloned: `z[1] < n_pri1`, and `alt_extra` reads only `xa1[n_pri1]`.
+                    h.xa = xa1.take(z[1]);
+                    h.hn = hn[1][z[1]];
                     h
                 };
                 // ---- The ALT hit, if this end has one worth reporting (`bwamem_pair.cpp:496`) --
@@ -2730,9 +3393,10 @@ pub fn mem_sam_pe<W: Write>(
                 // primary-assembly prefix, i.e. the best-scoring ALT hit. It is dropped unless it
                 // clears `-T`, is unshadowed, and really is ALT. Nothing is emitted at all when the
                 // index has no ALT contigs, since then `n_pri == a.len()`.
-                let alt_extra = |a: &[MemAlnReg],
+                let alt_extra = |i: usize,
+                                 a: &[MemAlnReg],
                                  n_pri: usize,
-                                 xa: &[Option<String>],
+                                 xa: &crate::alt::XaTags,
                                  seq: &[u8],
                                  flag_bit: u32|
                  -> Option<MemAln> {
@@ -2743,16 +3407,17 @@ pub fn mem_sam_pe<W: Write>(
                     if p.score < opt.t || p.secondary >= 0 || !p.is_alt {
                         return None;
                     }
-                    let mut g = reg2aln(fm, bns, opt, seq.len() as i32, seq, p);
+                    let mut g = reg2aln(fm, bns, &ropt[i], seq.len() as i32, seq, p);
                     g.flag |= 0x800 | flag_bit | extra_flag;
-                    g.xa = xa[n_pri].clone();
+                    g.xa = xa.get(n_pri);
+                    g.hn = hn[i][n_pri];
                     Some(g)
                 };
                 // bwa's `aa[i]`: every record emitted for this end, primary first. Its LENGTH is
                 // what makes the difference downstream, because `mem_aln2sam` uses it to decide
                 // whether an `SA:Z` is owed and how to clip.
-                let extra0 = alt_extra(a0, n_pri0, &xa0, seqs[0], 0x40);
-                let extra1 = alt_extra(a1, n_pri1, &xa1, seqs[1], 0x80);
+                let extra0 = alt_extra(0, a0, n_pri0, &xa0, seqs[0], 0x40);
+                let extra1 = alt_extra(1, a1, n_pri1, &xa1, seqs[1], 0x80);
                 // Backing storage for the TWO-record case only. On an index with no ALT contigs
                 // `alt_extra` returns `None` for every read, so `aa0`/`aa1` borrow `h0`/`h1` in
                 // place and nothing is allocated or copied. They used to be
@@ -2797,6 +3462,7 @@ pub fn mem_sam_pe<W: Write>(
                         Some(&h1),
                         softclip,
                         ref_hdr,
+                        emit[0].as_ref(),
                         &mut buf,
                     );
                 }
@@ -2812,8 +3478,12 @@ pub fn mem_sam_pe<W: Write>(
                         Some(&h0),
                         softclip,
                         ref_hdr,
+                        emit[1].as_ref(),
                         &mut buf,
                     );
+                }
+                if opt.meth.as_ref().is_some_and(|m| m.may_qcfail()) {
+                    crate::meth::propagate_qcfail(&mut buf);
                 }
                 let wrote = w.write_all(&buf);
                 SCRATCH_SAM.with(|c| *c.borrow_mut() = buf);
@@ -2851,7 +3521,7 @@ pub fn mem_sam_pe<W: Write>(
         reg2aln(
             fm,
             bns,
-            opt,
+            &ropt[0],
             seqs[0].len() as i32,
             seqs[0],
             &a0[w0 as usize],
@@ -2863,7 +3533,7 @@ pub fn mem_sam_pe<W: Write>(
         reg2aln(
             fm,
             bns,
-            opt,
+            &ropt[1],
             seqs[1].len() as i32,
             seqs[1],
             &a1[w1 as usize],
@@ -2898,7 +3568,7 @@ pub fn mem_sam_pe<W: Write>(
     mem_reg2sam(
         fm,
         bns,
-        opt,
+        &ropt[0],
         names[0],
         seqs[0],
         quals[0],
@@ -2906,12 +3576,13 @@ pub fn mem_sam_pe<W: Write>(
         a0,
         0x41 | extra_flag,
         Some(&h1),
+        emit[0].as_ref(),
         &mut buf,
     );
     mem_reg2sam(
         fm,
         bns,
-        opt,
+        &ropt[1],
         names[1],
         seqs[1],
         quals[1],
@@ -2919,8 +3590,12 @@ pub fn mem_sam_pe<W: Write>(
         a1,
         0x81 | extra_flag,
         Some(&h0),
+        emit[1].as_ref(),
         &mut buf,
     );
+    if opt.meth.as_ref().is_some_and(|m| m.may_qcfail()) {
+        crate::meth::propagate_qcfail(&mut buf);
+    }
     let wrote = w.write_all(&buf);
     SCRATCH_SAM.with(|c| *c.borrow_mut() = buf);
     wrote
@@ -2928,7 +3603,38 @@ pub fn mem_sam_pe<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::mem_infer_dir;
+    use super::{best_pair, mem_infer_dir};
+
+    /// [`best_pair`] answers what bwa reads off the sorted candidate list, including heavy score ties.
+    #[test]
+    fn best_pair_matches_sorted_list() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for n in [1usize, 2, 3, 7, 40, 300] {
+            for spread in [2u64, 9, 1000] {
+                let u: Vec<(u64, u64)> = (0..n as u64)
+                    .map(|j| ((next() % spread) << 32 | next() & 0xffff, j))
+                    .collect();
+                let mut s = u.clone();
+                s.sort_unstable();
+                let sub = if n > 1 { (s[n - 2].0 >> 32) as i32 } else { 0 };
+                let n_sub = s[..n - 1]
+                    .iter()
+                    .filter(|c| sub - (c.0 >> 32) as i32 <= 5)
+                    .count() as i32;
+                assert_eq!(
+                    best_pair(&u, 5),
+                    (s[n - 1], sub, n_sub),
+                    "n={n} spread={spread}"
+                );
+            }
+        }
+    }
 
     /// Pins the FF/FR/RF/RR encoding of [`mem_infer_dir`], which every `pes[4]` lookup in this file
     /// depends on. Getting the code wrong would silently swap two orientations' insert windows,
@@ -2946,6 +3652,60 @@ mod tests {
         // Both reverse: RR (3).
         let (dir, _) = mem_infer_dir(l_pac, (l_pac << 1) - 1 - 100, (l_pac << 1) - 1 - 500);
         assert_eq!(dir, 3, "both reverse is RR (3)");
+    }
+}
+
+#[cfg(test)]
+mod pair_penalty_tests {
+    use super::*;
+
+    /// The memo returns exactly the expression it replaced, on a miss, on a hit, past its span and
+    /// after the statistics change (a new batch), and `ln_int` is libm's `ln` bit for bit.
+    #[test]
+    fn memo_matches_direct_formula() {
+        let direct = |p: &PeStat, dist: i64, a: i32| {
+            let ns = (dist as f64 - p.avg) / p.std;
+            INV_LOG4 * (2.0 * unsafe { erfc(ns.abs() * M_SQRT1_2) }).ln() * f64::from(a)
+        };
+        let mut pes = [PeStat::default(); 4];
+        pes[1] = PeStat {
+            low: 50,
+            high: 900,
+            failed: false,
+            avg: 412.25,
+            std: 61.5,
+        };
+        pes[2] = PeStat {
+            low: 0,
+            high: PairPenalty::SPAN + 10,
+            failed: false,
+            avg: 3e4,
+            std: 9e3,
+        };
+        let mut memo = PairPenalty::new();
+        for (round, a) in [(0, 1), (1, 1), (2, 2)] {
+            if round == 1 {
+                pes[1].avg += 1.0;
+            }
+            memo.reset_for(&pes, a);
+            for _hit in 0..2 {
+                for dist in [50, 51, 412, 899, 900] {
+                    let (want, got) = (direct(&pes[1], dist, a), memo.get(&pes[1], 1, dist, a));
+                    assert_eq!(got.to_bits(), want.to_bits(), "round {round} dist {dist}");
+                }
+                let far = i64::from(PairPenalty::SPAN) + 5;
+                let (want, got) = (direct(&pes[2], far, a), memo.get(&pes[2], 2, far, a));
+                assert_eq!(got.to_bits(), want.to_bits(), "past the span");
+            }
+        }
+        for n in [-3, 0, 1, 2, 149, 150, 1023, 1024, 5000, i32::MAX] {
+            let want = f64::from(n).ln();
+            assert_eq!(
+                crate::primary::ln_int(n).to_bits(),
+                want.to_bits(),
+                "ln_int({n})"
+            );
+        }
     }
 }
 
@@ -2977,7 +3737,7 @@ mod id_shift_tests {
 /// `UNION` is the width of their union per (pair, direction). `SPAN / UNION` is the ceiling of the
 /// idea; anything near 1.0 means the anchors are scattered and there is nothing to share.
 pub mod anchor_spread {
-    use crate::MemAlnReg;
+    use super::Anchor;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::OnceLock;
     /// Summed per-anchor window widths, in bases.
@@ -2999,13 +3759,14 @@ pub mod anchor_spread {
     ///
     /// The window width is approximated by a constant 1400 bases, the measured mean; the exact width
     /// depends on `pes[r].high - pes[r].low + l_ms` and does not change the shape of the answer.
-    pub fn record(anchors: &[[Vec<MemAlnReg>; 2]]) {
+    pub(crate) fn record(anchors: &[Anchor], spans: &[[(u32, u32); 2]]) {
         if !enabled() {
             return;
         }
         const W: i64 = 1400;
-        for per_pair in anchors {
-            for list in per_pair {
+        for per_pair in spans {
+            for &(start, len) in per_pair {
+                let list = &anchors[start as usize..(start + len) as usize];
                 if list.len() < 2 {
                     continue;
                 }
@@ -3057,6 +3818,136 @@ pub mod anchor_spread {
 }
 
 #[cfg(test)]
+mod region_view_tests {
+    use super::*;
+
+    fn xorshift() -> impl FnMut(u64) -> u64 {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        }
+    }
+
+    /// Regions on both strands of a 100 kb reference, short and long, clustered so that overlaps
+    /// and proper-pair distances are the common case.
+    fn region(next: &mut dyn FnMut(u64) -> u64) -> MemAlnReg {
+        let l_pac = 100_000i64;
+        let rb = next(2) as i64 * l_pac + next(60) as i64 * 5 + next(3) as i64 * 400;
+        let len = 20 + next(6) as i64 * 30;
+        let qb = next(4) as i32 * 10;
+        let qlen = (len as i32 + next(3) as i32 * 2).min(148 - qb);
+        MemAlnReg {
+            rb,
+            re: rb + len,
+            qb,
+            qe: qb + qlen,
+            rid: 0,
+            score: 30 + next(5) as i32 * 5,
+            truesc: 0,
+            sub: 0,
+            csub: next(3) as i32,
+            sub_n: 0,
+            seedcov: next(2) as i32,
+            seedlen0: 0,
+            secondary: -1,
+            secondary_all: 0,
+            w: 0,
+            frac_rep: 0.0,
+            is_alt: false,
+            alt_sc: 0,
+        }
+    }
+
+    #[test]
+    fn skip_from_view_equals_the_linear_scan() {
+        let l_pac = 100_000i64;
+        let mut next = xorshift();
+        let mut pes = [PeStat::default(); 4];
+        for _ in 0..300 {
+            for p in pes.iter_mut() {
+                p.low = next(3) as i32 * 200 - 100;
+                p.high = p.low + next(4) as i32 * 300;
+                p.failed = next(5) == 0;
+            }
+            let n = VIEW_MIN + next(100) as usize;
+            let ma: Vec<MemAlnReg> = (0..n).map(|_| region(&mut next)).collect();
+            let mut view = RegionView::default();
+            assert!(view.ensure(&ma));
+            for _ in 0..8 {
+                let a_rb = region(&mut next).rb;
+                let mut want = [0i32; 4];
+                for (r, s) in want.iter_mut().enumerate() {
+                    *s = i32::from(pes[r].failed);
+                }
+                let mut got = want;
+                for existing in &ma {
+                    let (r, dist) = mem_infer_dir(l_pac, a_rb, existing.rb);
+                    if dist >= i64::from(pes[r].low) && dist <= i64::from(pes[r].high) {
+                        want[r] = 1;
+                    }
+                }
+                skip_from_view(&view, l_pac, a_rb, &pes, &mut got);
+                assert_eq!(got, want, "anchor {a_rb} pes {pes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn insert_settled_view_equals_insert_into_settled() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let fm = FmIndex::load(std::path::Path::new(prefix)).unwrap();
+        let opt = MemOpt::default();
+        let mut next = xorshift();
+        let same = |x: &[MemAlnReg], y: &[MemAlnReg]| format!("{x:?}") == format!("{y:?}");
+        let (mut taken, mut declined) = (0u32, 0u32);
+        for _ in 0..400 {
+            let n = VIEW_MIN + next(100) as usize;
+            let pool: Vec<MemAlnReg> = (0..n).map(|_| region(&mut next)).collect();
+            let settled = mem_sort_dedup_patch(&fm, &opt, &[], pool);
+            if settled.len() < VIEW_MIN {
+                continue;
+            }
+            let mut fast = settled.clone();
+            let mut full = settled.clone();
+            let mut view = RegionView::default();
+            // Several inserts in a row: the view must follow its own pushes.
+            for _ in 0..6 {
+                let mut b = region(&mut next);
+                if next(2) == 0 {
+                    b = full[next(full.len() as u64) as usize].clone();
+                    match next(4) {
+                        0 => b.csub += 1,
+                        1 => b.re += 1,
+                        2 => b.score += 1,
+                        _ => {}
+                    }
+                }
+                assert!(view.ensure(&fast) && view.clean);
+                let want = insert_into_settled(&opt, &mut full, b.clone());
+                let got = insert_settled_view(&opt, &mut fast, &mut view, b.clone());
+                assert_eq!(got.is_ok(), want.is_ok(), "b {b:?}");
+                // `fast` keeps its hits pending across the inserts, as a rescue round does.
+                let (mut chk, mut pending) = (fast.clone(), view.pending);
+                settle_order(&mut chk, &mut pending);
+                assert!(same(&chk, &full), "b {b:?}\nfast {chk:?}\nfull {full:?}");
+                if got.is_ok() {
+                    taken += 1;
+                } else {
+                    declined += 1;
+                }
+            }
+        }
+        assert!(
+            taken > 100 && declined > 100,
+            "taken {taken} declined {declined}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod matesw_apply_tests {
     use super::*;
 
@@ -3088,8 +3979,6 @@ mod matesw_apply_tests {
             frac_rep: 0.0,
             is_alt: false,
             alt_sc: 0,
-            hash: 0,
-            n_comp: 0,
         };
         let ma0 = vec![region(90), region(80)];
         let want = mem_sort_dedup_patch(&fm, &opt, &[], ma0.clone());
@@ -3102,8 +3991,7 @@ mod matesw_apply_tests {
             skip: [0, 1, 1, 1],
             per_r: [
                 Some(Orient {
-                    query: vec![0; 20],
-                    target: vec![0; 40],
+                    target: (0, 40),
                     rb: 0,
                     is_rev: false,
                 }),
@@ -3111,6 +3999,7 @@ mod matesw_apply_tests {
                 None,
                 None,
             ],
+            rc: (0, 0),
             l_ms: 20,
             rid: 0,
             is_alt: false,
@@ -3124,8 +4013,55 @@ mod matesw_apply_tests {
             score2: -1,
             te2: -1,
         };
-        let (mut ma, mut settled) = (ma0, false);
-        matesw_apply(&fm, &bns, &opt, &call, &[miss], &mut ma, &mut settled);
+        let (mut ma, mut view) = (ma0, RegionView::default());
+        matesw_apply(&fm, &bns, &opt, &call, &[miss], &mut ma, &mut view, None, 0);
         assert_eq!(format!("{ma:?}"), format!("{want:?}"));
+    }
+
+    /// Under --meth a region can score below zero. The fork scores a pair with such an end q = 0
+    /// (bwamem_pair.cpp, mem_pair); reading the packed score back unsigned made it the best pair.
+    #[test]
+    fn negative_score_end_pairs_at_zero() {
+        let prefix = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tiny/tiny.fa");
+        let bns = BntSeq::load(std::path::Path::new(prefix)).unwrap();
+        let opt = MemOpt::default();
+        let reg = |rb: i64, score: i32| MemAlnReg {
+            rb,
+            re: rb + 150,
+            qb: 0,
+            qe: 150,
+            rid: 0,
+            score,
+            truesc: score,
+            sub: 0,
+            csub: 0,
+            sub_n: 0,
+            seedcov: 50,
+            seedlen0: 0,
+            secondary: -1,
+            secondary_all: 0,
+            w: 0,
+            frac_rep: 0.0,
+            is_alt: false,
+            alt_sc: 0,
+        };
+        let pes = [PeStat {
+            low: 1,
+            high: 10_000,
+            failed: false,
+            avg: 300.0,
+            std: 50.0,
+        }; 4];
+        // read 1 forward at 100, read 2 reverse ending at forward 400: one FR candidate.
+        let rev = 2 * bns.l_pac - 400;
+        let score = |sc2| {
+            let (a0, a1) = ([reg(100, 20)], [reg(rev, sc2)]);
+            mem_pair(&bns, &opt, &pes, &[&a0, &a1], 7).map(|p| p.score)
+        };
+        assert!(
+            score(5).is_some_and(|q| q > 0),
+            "the setup must form a pair"
+        );
+        assert_eq!(score(-5), Some(0));
     }
 }
