@@ -1777,12 +1777,28 @@ impl FmIndex {
                 i64::from(hit && (!A0 || c.k != self.sentinel_index)),
             )
         } else {
-            let o = self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx);
-            (
-                count_a + o,
-                self.occ_hoisted::<WIDE, A0>(cp, c.k + c.s, a, hx, lx) - o,
-            )
+            self.konly_two::<WIDE, A0>(cp, c, a, count_a, hx, lx)
         }
+    }
+
+    /// [`konly_hoisted`](Self::konly_hoisted) from the counts at both ends, right for any `s`: the
+    /// candidates after a round's first have `s >= 2` (distinct sizes, nested intervals) but for a
+    /// copy of the first, so they skip the one-row test.
+    #[inline(always)]
+    fn konly_two<const WIDE: bool, const A0: bool>(
+        &self,
+        cp: &[CpOcc],
+        c: &Smem,
+        a: usize,
+        count_a: i64,
+        hx: u64,
+        lx: u64,
+    ) -> (i64, i64) {
+        let o = self.occ_hoisted::<WIDE, A0>(cp, c.k, a, hx, lx);
+        (
+            count_a + o,
+            self.occ_hoisted::<WIDE, A0>(cp, c.k + c.s, a, hx, lx) - o,
+        )
     }
 
     /// One outer iteration of the SMEM search's backward phase (bwa's two loops in
@@ -1905,7 +1921,7 @@ impl FmIndex {
                     // Kept in place until the first duplicate: only `k`, `s` and `m` change, where
                     // the copy below also reloads and stores `l` and `n`.
                     while r < end {
-                        let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                        let (k, s) = self.konly_two::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
                         debug_assert!(s >= min_intv);
                         if s == curr_s {
                             break;
@@ -1922,7 +1938,7 @@ impl FmIndex {
                     r = r.add(usize::from(r < end));
                 }
                 while r < end {
-                    let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                    let (k, s) = self.konly_two::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
                     debug_assert!(s >= min_intv);
                     if s != curr_s {
                         curr_s = s;
@@ -1934,7 +1950,7 @@ impl FmIndex {
                 }
             } else {
                 while r < end {
-                    let (k, s) = self.konly_hoisted::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
+                    let (k, s) = self.konly_two::<WIDE, A0>(cp, &*r, a, count_a, hx, lx);
                     if s >= min_intv && s != curr_s {
                         curr_s = s;
                         *w = Smem { k, s, m, ..*r };
