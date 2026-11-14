@@ -1373,6 +1373,32 @@ const BGZF_SINK_BUFFER_BYTES: usize = 1 << 20;
 /// at 1 MiB it is ~400. Output bytes are identical either way, only the syscall count changes.
 const PLAIN_SINK_BUFFER_BYTES: usize = 1 << 20;
 
+impl Output {
+    /// One batch's SAM pieces, in order. The plain sink takes them 1024 at a time through
+    /// `write_vectored`: a group larger than the `BufWriter` goes straight to the file or pipe
+    /// (`writev`) instead of being copied into the buffer first, a memcpy of the whole output.
+    fn write_pieces(&mut self, pieces: &[Vec<u8>]) -> io::Result<()> {
+        let Output::Plain(w) = self else {
+            return pieces.iter().try_for_each(|p| self.write_all(p));
+        };
+        for group in pieces.chunks(1024) {
+            let mut slices: Vec<io::IoSlice<'_>> =
+                group.iter().map(|p| io::IoSlice::new(p)).collect();
+            let mut bufs = &mut slices[..];
+            io::IoSlice::advance_slices(&mut bufs, 0);
+            while !bufs.is_empty() {
+                match w.write_vectored(bufs) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => io::IoSlice::advance_slices(&mut bufs, n),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Write for Output {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -1817,9 +1843,7 @@ fn run_pipeline<B: Send>(
                 let t1 = probe.then(std::time::Instant::now);
                 // In order, so the concatenation of the pieces is exactly the batch's SAM text.
                 // `Output`'s buffering is what turns these back into few, large syscalls.
-                for piece in &pieces {
-                    out.write_all(piece)?;
-                }
+                out.write_pieces(&pieces)?;
                 if let (Some(t0), Some(t1)) = (t0, t1) {
                     blocked += t1.duration_since(t0).as_secs_f64();
                     writing += t1.elapsed().as_secs_f64();
