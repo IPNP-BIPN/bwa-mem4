@@ -1160,7 +1160,9 @@ pub fn build_chains_from_resolved(
 /// [`build_chains_from_resolved`] then [`mem_chain_flt`], the same chains in the same order, but
 /// only the chains the filter keeps get a seed vector: the weights and spans are read off the
 /// seeds laid back to back in one reused array, where a vector per chain was an allocation for
-/// every chain the filter then dropped.
+/// every chain the filter then dropped. The chains are appended to `out`, which the caller reuses
+/// from read to read.
+#[allow(clippy::too_many_arguments)]
 pub fn build_filtered_chains(
     bns: &BntSeq,
     opt: &MemOpt,
@@ -1169,7 +1171,8 @@ pub fn build_filtered_chains(
     smems: &[bwa_index::Smem],
     counts: &[i64],
     rbegs: &[i64],
-) -> Vec<MemChain> {
+    out: &mut Vec<MemChain>,
+) {
     let t_total = chain_time::enabled().then(std::time::Instant::now);
     let frac = frac_rep(opt, smems, codes);
     let mut chains = CHAINS.take();
@@ -1224,23 +1227,20 @@ pub fn build_filtered_chains(
     if !ranked.is_empty() {
         flt_ranked(opt, &mut ranked);
     }
-    let out = ranked
-        .iter()
-        .map(|f| {
-            let c = &chains[f.idx as usize];
-            MemChain {
-                seqid: c.seqid,
-                rid: c.rid,
-                pos: c.pos,
-                w: f.w,
-                kept: f.kept,
-                is_alt: c.is_alt,
-                first: f.first,
-                frac_rep: frac,
-                seeds: seeds_from(seeds_of(f.idx as usize)),
-            }
-        })
-        .collect();
+    out.extend(ranked.iter().map(|f| {
+        let c = &chains[f.idx as usize];
+        MemChain {
+            seqid: c.seqid,
+            rid: c.rid,
+            pos: c.pos,
+            w: f.w,
+            kept: f.kept,
+            is_alt: c.is_alt,
+            first: f.first,
+            frac_rep: frac,
+            seeds: seeds_from(seeds_of(f.idx as usize)),
+        }
+    }));
     POOL.set((pool, n_seeds));
     FLAT.set((flat, end, ranked));
     chains.clear();
@@ -1251,7 +1251,6 @@ pub fn build_filtered_chains(
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    out
 }
 
 /// `ChainSeeds::from_slice`, minus its variable-length `memcpy` call for the inline case: one or
@@ -2409,7 +2408,8 @@ mod tests {
                 &opt,
                 build_chains_from_resolved(&bns, &opt, &codes, 7, &smems, &counts, &rbegs),
             );
-            let fused = build_filtered_chains(&bns, &opt, &codes, 7, &smems, &counts, &rbegs);
+            let mut fused = Vec::new();
+            build_filtered_chains(&bns, &opt, &codes, 7, &smems, &counts, &rbegs, &mut fused);
             assert!(!two.is_empty());
             assert_eq!(key(fused), key(two));
         }
