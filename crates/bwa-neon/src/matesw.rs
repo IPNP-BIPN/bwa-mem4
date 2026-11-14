@@ -1063,7 +1063,7 @@ pub(crate) fn batched_align(
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let mut banded_rev = false;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if band_avail
+    if (if revband_enabled() { band_avail } else { band_ok })
         && !rev_jobs.is_empty()
         // shortcut: all or nothing per batch; split it if mixed-length batches ever matter.
         && rev_jobs
@@ -1209,6 +1209,15 @@ fn revbound_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_REVBOUND").is_none_or(|v| v != "0"))
+}
+
+/// Whether the reverse pass bands without the prune. `BWA4_RESCUE_REVBAND=0` bands it only where
+/// the prune runs, as before: a same-host A/B of the lever. Read once, cached.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn revband_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BWA4_RESCUE_REVBAND").is_none_or(|v| v != "0"))
 }
 
 /// The most target rows an alignment of at most `qlen` query bases can span while still scoring
