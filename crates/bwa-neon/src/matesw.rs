@@ -773,6 +773,7 @@ pub(crate) fn batched_align(
             })
             .map(|&(s, shb, _, _)| (s, hb as i32 - shb as i32))
     };
+    let gate = |qlen| prune_max_hits(qlen, rel.is_some());
     for &(_, i) in &ord {
         let (i, j) = (i as usize, &jobs[i as usize]);
         // Jobs of one mate share its slice: the pointer test skips the byte compare for them.
@@ -787,7 +788,7 @@ pub(crate) fn batched_align(
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             Some(p) if band_ok && u8_job_fits(j.query.len(), j.target.len(), mat, max_sc) => {
                 let quanta = ksw_padded_qlen(j.query.len(), max_sc);
-                let (d, t1) = band.decide(j.target, j.query, &p, prune_max_hits(), rel);
+                let (d, t1) = band.decide(j.target, j.query, &p, gate(j.query.len()), rel);
                 if let Some((hb, n)) = kept(&d, j.target.len()) {
                     let fp = window_fp(&j.target[hb..hb + n]);
                     if let Some((src, sh)) = find(&group, j, hb, n, fp) {
@@ -810,8 +811,10 @@ pub(crate) fn batched_align(
             }
             Some(p) => {
                 let d = match rel {
-                    Some(r) => rescue_prune::decide_rel(j.target, j.query, &p, prune_max_hits(), r),
-                    None => rescue_prune::decide(j.target, j.query, &p, prune_max_hits()),
+                    Some(r) => {
+                        rescue_prune::decide_rel(j.target, j.query, &p, gate(j.query.len()), r)
+                    }
+                    None => rescue_prune::decide(j.target, j.query, &p, gate(j.query.len())),
                 };
                 if let Some((hb, n)) = kept(&d, j.target.len()) {
                     let fp = window_fp(&j.target[hb..hb + n]);
@@ -1191,16 +1194,21 @@ fn prune_params(
 /// mate runs in full, because enumerating them would cost more than the rows the bound could save.
 /// 1000 is the best of {400, 1000, 2000} on real GIAB reads with the banded kernel (2M HG002 pairs,
 /// M4: 90.6 s of mate-rescue CPU at 1000, 117.6 at 400, 93.7 at 2000; a 1.4 kb window shares ~600
-/// 5-mer hits with its mate). Changes speed only, never output. `BWA4_RESCUE_PRUNE_MAX_HITS`
-/// overrides it.
-fn prune_max_hits() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
+/// 5-mer hits with its mate). Under a relation (`--meth` TAPS, 5-base) a read T also hits a
+/// reference C, so random hits are ~3x denser and a dense window's band is the whole window: the
+/// gate is 3 hits per mate base there, the best of a sweep at both lengths (M4 TAPS 200k pairs,
+/// instructions vs 1000: 150 bp best at 400-480, -6.0%, cycles -5%; 250 bp best at 700, -0.6%,
+/// cycles -2%, and +9% at 400). Changes speed only, never output. `BWA4_RESCUE_PRUNE_MAX_HITS`
+/// overrides both.
+fn prune_max_hits(qlen: usize, rel: bool) -> usize {
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    let env = *N.get_or_init(|| {
         std::env::var("BWA4_RESCUE_PRUNE_MAX_HITS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1000)
-    })
+    });
+    // shortcut: 3 per base fitted at 150 and 250 bp only; re-sweep before tuning longer mates.
+    env.unwrap_or(if rel { 3 * qlen } else { 1000 })
 }
 
 /// Whether the reverse (`KSW_XSTART`) pass truncates its target by the alignment-span bound

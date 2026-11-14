@@ -212,7 +212,10 @@ reach those kernels in three ways:
   does, so x86 prunes only from a mean mate length of 200 bp per 32 lanes: 200 bp on AVX2, 400 bp
   on AVX-512 (TAPS `-t1`, ours / fork: EPYC 7763 150 bp 0.92 pruned against 0.83 unpruned, 250 bp
   0.80 against 0.82; EPYC 9V74 150 bp 0.91 against 0.81). NEON prunes at every length.
-  `BWA4_RESCUE_PRUNE=1` prunes anyway. bwa-mem3 does not prune `--meth` on x86.
+  `BWA4_RESCUE_PRUNE=1` prunes anyway. bwa-mem3 does not prune `--meth` on x86. A window
+  sharing more hits with its mate than the gate runs in full (its band would be the whole window).
+  The plain gate is 1000 hits; relation hits are ~3x denser, so under a relation it is 3 per mate
+  base (M4 TAPS 150 bp: -6% instructions, -5% cycles; 250 bp: -0.4% instructions).
 - **EM-seq is not pruned**: its collapsed mismatch (2a) is below the bound's (K-1)a for any useful
   K. A better bound would not pay either: on 20,000 simulated chr21 pairs, 70% of the rescue jobs
   reach `minsc`, and in those windows 65% of the rows do (the three-letter alphabet is
@@ -246,14 +249,14 @@ Each cell is bwa-mem4 / bwa-mem3 0.16, the faster of two runs of each.
 The machine was loaded (load average 6 to 9) during these runs. Cycles and instructions are the
 steadier comparison.
 
-100,000 pairs simulated from chr21 at 150 and 250 bp, same machine (commit ce7ac2a, load average
-3 to 6, `-t1`, the faster of three runs of each). Cycles (G), bwa-mem4 / bwa-mem3, then the
-ratio; the load moves wall times by up to 2x, cycles much less. The SAM output was identical:
+100,000 pairs simulated from chr21 at 150 and 250 bp, same machine (commit 7ac2c9e, `-t1`, the
+faster of three interleaved runs of each). Cycles (G), bwa-mem4 / bwa-mem3, then the ratio; load
+moves wall times by up to 2x, cycles much less. The SAM output was identical:
 
 | Set | 150 bp | 250 bp |
 |---|---|---|
-| EM-seq | 17.4 / 26.3 (0.66) | 25.0 / 45.4 (0.55) |
-| TAPS | 16.7 / 24.1 (0.69) | 20.8 / 38.5 (0.54) |
+| EM-seq | 17.3 / 27.0 (0.64) | 24.4 / 45.5 (0.54) |
+| TAPS | 16.8 / 24.2 (0.69) | 20.7 / 38.3 (0.54) |
 
 On x86, `.github/workflows/perf-profile-x86.yml` with `read_set=meth` times both binaries on
 200,000 pairs simulated from chr21, on the runner's CPU. Each cell is the wall-time ratio
