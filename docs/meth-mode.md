@@ -224,8 +224,13 @@ reach those kernels in three ways:
   since the band stops at the score as a byte. `BWA4_RESCUE_REVBAND=0` bands it only where the
   prune runs, for a same-host A/B.
 
-A seed that scores 0 or less under the read's matrix (a pair it matched only in converted space)
-extends on the scalar kernel, as in bwa-mem3.
+A seed's starting score sums the read's matrix over the seed, 16 bases at a time (`TBL` on NEON,
+two `PSHUFB` on x86); the scalar sum was 1.4% of an M4 EM-seq run (now -1.7% cycles at 150 bp).
+A seed that scores 0 or less (a pair it matched only in converted space) extends on the scalar
+kernel, as in bwa-mem3, unless its first cell cannot go positive, which is always the case at
+match score 1. Then the DP stops at its first row having consumed nothing, so its result is
+written directly. TAPS has about one such seed per read (M4: 250 bp -2.3% instructions, 150 bp
+-1.3%).
 
 200,000 simulated pairs on chr20 + chr22 + chrM, Apple M4 Max, `/usr/bin/time -l`:
 

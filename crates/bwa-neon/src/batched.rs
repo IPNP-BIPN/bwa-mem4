@@ -175,6 +175,23 @@ pub fn batched_extend(
         let (low, pos): (Vec<usize>, Vec<usize>) = (0..jobs.len()).partition(|&k| jobs[k].h0 <= 0);
         let pick = |idx: &[usize]| idx.iter().map(|&k| jobs[k]).collect::<Vec<_>>();
         let mut out = vec![default_result(); jobs.len()];
+        let max_sc = mat[..m * m].iter().copied().max().unwrap_or(0) as i32;
+        let low: Vec<usize> = (low.into_iter())
+            .filter(|&k| {
+                let j = &jobs[k];
+                let w = clamp_band(
+                    w0,
+                    j.query.len(),
+                    max_sc,
+                    end_bonus,
+                    o_ins,
+                    e_ins,
+                    o_del,
+                    e_del,
+                );
+                dead_seed(j, m, mat, w).map(|r| out[k] = r).is_none()
+            })
+            .collect();
         let got = batched_extend_scalar(
             &pick(&low),
             m,
@@ -1973,6 +1990,34 @@ pub fn batched_extend_scalar(
 /// An [`ExtendResult`] with every field 0. Note this is *not* the "no alignment" encoding the DP
 /// itself produces: a real empty extension reports `gscore = -1`, not 0. Nothing may read these
 /// zeros as if they meant something.
+/// [`batched_extend_scalar`]'s result for a seed scoring `h0 <= 0` whose first cell cannot go
+/// positive (`h0 == 0` blocks the diagonal, else `h0 + S(t[0], q[0]) <= 0`; always so at `a = 1`):
+/// row 0 is all zeros, so the DP stops there (`ksw.cpp:508`) having consumed nothing, and row 0
+/// scores the query's end 0 only when its band (`w`, clamped) reaches it. `--meth` TAPS made ~1.3
+/// such jobs a read, each a whole scalar chunk setup. `None` when the DP has work to do.
+fn dead_seed(job: &ExtendJob, m: usize, mat: &[i8], w: i32) -> Option<ExtendResult> {
+    let (q, t, h0) = (job.query, job.target, job.h0);
+    let blocked =
+        |&q0: &u8, &t0: &u8| h0 == 0 || h0 + i32::from(mat[t0 as usize * m + q0 as usize]) <= 0;
+    if h0 > 0
+        || !q
+            .first()
+            .zip(t.first())
+            .is_none_or(|(q0, t0)| blocked(q0, t0))
+    {
+        return None;
+    }
+    let reach = !t.is_empty() && q.len() as i32 <= w + 1;
+    Some(ExtendResult {
+        score: h0,
+        qle: 0,
+        tle: 0,
+        gtle: i32::from(reach),
+        gscore: if reach { 0 } else { -1 },
+        max_off: 0,
+    })
+}
+
 fn default_result() -> ExtendResult {
     ExtendResult {
         score: 0,
@@ -7716,6 +7761,45 @@ mod mat5_tests {
             }
         }
         assert!(long > 500 && deep > 100, "long {long} deep {deep}");
+    }
+
+    /// [`super::dead_seed`] equals the scalar DP wherever it answers: `h0` from -6 to 0, `a` from 1
+    /// to 3 (so some first cells go positive and it must decline), empty query or target, bands
+    /// that do and do not reach the query's end.
+    #[test]
+    fn dead_seed_matches_scalar() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |m: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m
+        };
+        let (mut took, mut declined) = (0, 0);
+        for round in 0..3000 {
+            let a = 1 + (round % 3) as i8;
+            let mut mat = [-3i8; 25];
+            (0..5).for_each(|k| (mat[k * 5 + 4], mat[20 + k]) = (-1, -1));
+            (0..4).for_each(|k| mat[k * 6] = a);
+            let q: Vec<u8> = (0..next(13)).map(|_| next(5) as u8).collect();
+            let t: Vec<u8> = (0..next(13)).map(|_| next(4) as u8).collect();
+            let job = ExtendJob {
+                query: &q,
+                target: &t,
+                h0: -(next(7) as i32),
+            };
+            let (w0, eb) = (1 + next(15) as i32, next(6) as i32);
+            let w = super::clamp_band(w0, q.len(), i32::from(a), eb, 6, 1, 6, 1);
+            let want = super::batched_extend_scalar(&[job], 5, &mat, 6, 1, 6, 1, w0, eb, 100)[0];
+            match super::dead_seed(&job, 5, &mat, w) {
+                Some(got) => (took, _) = (took + 1, assert_eq!(got, want, "round {round}")),
+                None => declined += 1,
+            }
+        }
+        assert!(
+            took > 1000 && declined > 50,
+            "took {took} declined {declined}"
+        );
     }
 
     /// `--meth`'s matrices (neutral and genomic through the `tab5` kernel, collapsed through the
