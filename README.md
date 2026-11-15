@@ -303,7 +303,8 @@ the rules for changing this code without breaking parity.
 
 Since 4.5.0, `bwa-mem4 index --meth` and `bwa-mem4 mem --meth[=emseq|taps|5base]` align
 directional bisulfite, EM-seq, TAPS and Illumina 5-base reads with the methylation mode of
-fg-labs/bwa-mem3 0.16, ported to Rust, options spelled as in bwa-mem3. Its SAM output is
+fg-labs/bwa-mem3 0.16, ported to Rust, options spelled as in bwa-mem3. `--pbat` (or
+`--meth=pbat`) adds PBAT libraries, which bwa-mem3 does not have. Its SAM output is
 byte-identical to bwa-mem3 0.16 on the test sets, at 0.53-0.66 of its CPU cycles on Apple M4
 (150 and 250 bp, `-t1`) and 0.67-0.89 of its wall time on x86. Without `--meth` nothing changes.
 Details, options and validation: [docs/meth-mode.md](docs/meth-mode.md).
