@@ -70,6 +70,9 @@ pub struct MethOpt {
     pub set_as_failed: Option<u8>,
     /// `--chimera-qc`: bwameth's longest-M < 44% rule.
     pub chimera_qc: bool,
+    /// `--pbat`: read 1 (or a single-end read) carries G->A and read 2 C->T, the reverse of a
+    /// directional library.
+    pub pbat: bool,
     /// Scoring matrices by hypothesis, `[ref * 5 + read]`: `[0]` frees G->A (read 2, OB),
     /// `[1]` frees C->T (read 1, OT). Filled by [`MethOpt::fill_mats`] from the plain matrix.
     pub mats: [[i8; 25]; 2],
@@ -89,8 +92,14 @@ impl MethOpt {
             prune: Prune::Spec30,
             set_as_failed: None,
             chimera_qc: false,
+            pbat: false,
             mats: [[0; 25]; 2],
         }
+    }
+
+    /// Whether read `read` (0 = read 1 or single-end, 1 = read 2) carries C->T (OT/OB origin).
+    pub fn read_ot(&self, read: usize) -> bool {
+        (read == 0) != self.pbat
     }
 
     /// `mem_opt_fill_meth_mat`: the two matrices from the plain one (`mat`, after `-A`/`-B`).
@@ -130,11 +139,13 @@ impl MethOpt {
 /// `--meth[=CHEM]`. Case-sensitive, as in the fork.
 pub fn parse_chem(s: &str) -> Result<Chem, String> {
     match s {
-        "emseq" | "em-seq" | "bisulfite" => Ok(Chem::EmSeq),
+        // `wgbs` and `rrbs` are ours, not the fork's: both are bisulfite, which aligns as EM-seq
+        // (RRBS's MspI end-repair bases are a trimming matter, not an aligner one).
+        "emseq" | "em-seq" | "bisulfite" | "wgbs" | "rrbs" => Ok(Chem::EmSeq),
         "taps" | "5base" | "5-base" => Ok(Chem::Taps),
         _ => Err(format!(
-            "--meth accepts 'emseq' (default; aliases em-seq, bisulfite), 'taps', or '5base' \
-             (alias 5-base), got '{s}'"
+            "--meth accepts 'emseq' (default; aliases em-seq, bisulfite, wgbs, rrbs), 'taps', or \
+             '5base' (alias 5-base), got '{s}'"
         )),
     }
 }
@@ -277,6 +288,25 @@ mod tests {
         m.fill_mats(&mat, 1);
         assert_eq!((m.mats[1][5 + 3], m.mats[1][3 * 5 + 1]), (0, -4));
         assert_eq!(MethOpt::new(Chem::Taps).scoring, Scoring::Neutral);
+    }
+
+    #[test]
+    fn chem_names() {
+        for s in ["emseq", "em-seq", "bisulfite", "wgbs", "rrbs"] {
+            assert_eq!(parse_chem(s), Ok(Chem::EmSeq), "{s}");
+        }
+        for s in ["taps", "5base", "5-base"] {
+            assert_eq!(parse_chem(s), Ok(Chem::Taps), "{s}");
+        }
+        assert!(parse_chem("pbat").is_err());
+    }
+
+    #[test]
+    fn pbat_swaps_which_read_is_ct() {
+        let mut m = MethOpt::new(Chem::EmSeq);
+        assert_eq!((m.read_ot(0), m.read_ot(1)), (true, false));
+        m.pbat = true;
+        assert_eq!((m.read_ot(0), m.read_ot(1)), (false, true));
     }
 
     #[test]

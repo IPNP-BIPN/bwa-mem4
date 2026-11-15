@@ -22,16 +22,23 @@ bwa-mem4 mem --meth genome.fa R1.fq.gz R2.fq.gz > out.sam
 
 | Library | Command |
 |---|---|
-| Bisulfite, EM-seq (unmethylated C reads as T) | `mem --meth` (= `--meth=emseq`, aliases `em-seq`, `bisulfite`) |
+| Bisulfite (WGBS, RRBS), EM-seq (unmethylated C reads as T) | `mem --meth` (= `--meth=emseq`, aliases `em-seq`, `bisulfite`, and bwa-mem4's own `wgbs`, `rrbs`) |
 | TAPS (methylated C reads as T) | `mem --meth=taps` |
 | Illumina 5-base | `mem --meth=5base` (alias `5-base`; TAPS chemistry) |
+| PBAT (any of the above) | add `--pbat`; `--meth=pbat` is `--meth --pbat` |
 
 The chemistry binds only with `=`, as in bwa-mem3. In `--meth taps`, `taps` would be read as the
 index.
 
 The library must be directional: read 1 (or a single-end read) carries C→T and comes from the
-original top (OT) or original bottom (OB) strand, and read 2 carries G→A. Non-directional
-libraries (CTOT/CTOB) and PBAT are not aligned as such.
+original top (OT) or original bottom (OB) strand, and read 2 carries G→A. Under `--pbat` (Bismark's
+`--pbat`) it is the reverse: read 1 carries G→A and comes from the complementary strands (CTOT,
+CTOB; `XR:Z:GA`), read 2 carries C→T. Non-directional libraries, where either read can carry
+either conversion, are not aligned as such.
+
+A PBAT pair is a directional pair with its mates swapped. On simulated EM-seq and TAPS pairs (150
+and 250 bp), `--pbat` on (R2, R1) places as many reads correctly as the directional mode on (R1, R2),
+to 0.02%. The records differ only where bwa breaks a tie with a hash of the read's mate number.
 
 ### Index
 
@@ -305,6 +312,9 @@ more perf samples than bwa-mem3's; extension makes up for it.
 
 None of these differences shows up on the test set.
 
+- **`--meth=wgbs` and `--meth=rrbs` are accepted** as aliases of `--meth=emseq`; bwa-mem3 refuses
+  them. RRBS-specific handling (MspI end-repair bases) belongs to the trimmer.
+- **`--pbat` and `--meth=pbat` are bwa-mem4's own**; bwa-mem3 has no PBAT mode.
 - **`--meth-context cpg` is refused.** The CpG-only scoring model (`meth_model.cpp`) is not
   ported, because Bismark runs `all`.
 - **The `BWAMEM3_METH_*` environment variables are ignored.** These are `SEED_PRUNE`,
@@ -334,9 +344,9 @@ bwa-mem4:
   (`bismark` configuration above). Bismark also clears `BWAMEM3_METH_SEED_PRUNE`, which bwa-mem4
   ignores anyway.
 - **Version gate.** Bismark runs `<binary> version` and reads stdout, rejecting anything below
-  0.16.0 and warning on anything else. `bwa-mem4 version` prints `4.4.1` and exits 0. So the gate
-  passes with a "not the validated release" warning. A bwa-mem4 engine would need its own
-  minimum, the first bwa-mem4 release with `--meth`.
+  0.16.0 and warning on anything else. `bwa-mem4 version` prints its version (`4.5.0`) and exits
+  0. So the gate passes with a "not the validated release" warning. A bwa-mem4 engine would need
+  its own minimum: 4.5.0, the first bwa-mem4 release with `--meth`.
 - **Binary name and `@PG`.** The engine is named `bwa-mem3`, and Bismark writes
   `@PG ID:bwa-mem3 PN:bwa-mem3 VN:<detected>` into its BAM. Running bwa-mem4 through it works if
   the path given to Bismark points at the bwa-mem4 binary. Recording the right provenance needs a
@@ -348,5 +358,22 @@ bwa-mem4:
 - **Speed.** See [Speed](#speed): on Apple Silicon bwa-mem4 is faster than bwa-mem3 0.16 and
   uses less memory. On x86 see the per-CPU table there.
 
-Bismark itself was not run here. The above comes from reading #1209 and the Bismark
-documentation.
+### Run through Bismark
+
+Bismark's Rust suite at its `dev` branch (ab7d686, the first with #1209), on 15 Nov 2026, Apple
+M4 Max: `bismark --illumina_5base --bwamem3 --path_to_bwamem3 <dir> --five_base_index <fa> -p 8`
+on TAPS/5-base pairs simulated from chr21 (`scripts/meth_sim.py --taps`), with `<dir>` holding
+either bwa-mem3 0.16.0 or the bwa-mem4 4.5.0 binary named `bwa-mem3`, against one
+`bwa-mem3 index --meth` index (kept outside the `--genome` folder, which Bismark requires):
+
+- 20,000 pairs: Bismark's BAM records are identical (38,618 records, same md5 without the
+  header), its alignment report differs only in the version line, and every
+  `bismark_methylation_extractor` output (CpG/CHG/CHH per strand, M-bias, bedGraph, coverage) is
+  identical.
+- 200,000 pairs, whole Bismark run, two interleaved repetitions: 4.11-4.12 s against 4.72-4.75 s
+  wall, 11.1 s against 15.8-16.0 s CPU, 1.01-1.02 GB against 1.25-1.27 GB peak RSS, BAM records
+  identical. The wall time gains less than the CPU time because Bismark's own steps are part of it.
+
+Bismark accepts bwa-mem4 with one warning ("detected bwa-mem3 4.5.0; Bismark's 5-Base engine is
+validated against 0.16.0") and records `@PG ID:bwa-mem3 PN:bwa-mem3 VN:4.5.0`: the version is
+right, the program name is not, which is the Bismark change described above.
