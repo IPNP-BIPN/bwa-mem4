@@ -98,18 +98,24 @@ of two:
 
 Against 0.16.0 (14 Nov) the same runs gave 1.50x, 1.37x and 1.68x; 0.17.0 mostly cut its memory.
 
-On x86_64 (`head-to-head` workflow, 15 Nov 2026, a 4-core AMD EPYC 9V45 (Zen 5, AVX-512) GitHub
-runner, chr21, 2M pairs, 4.5.0's code, bwa-mem3 0.17.0 and bwa-mem2 2.3 from bioconda, best of
-three interleaved reps, the same records from all three):
+On other CPUs (`head-to-head` workflow, 15 Nov 2026, 4-vCPU GitHub runners, chr21, 2M pairs,
+4.5.0's code, bwa-mem3 0.17.0 and bwa-mem2 2.3 from bioconda, the same records from all three;
+bwa-mem4 built for `x86-64-v3` on x86 and plain `--release` on arm64; best of three interleaved
+reps, and of two runs per CPU except Zen 5):
 
-| reads | bwa-mem4 `x86-64-v3` | bwa-mem4 baseline | bwa-mem3 0.17.0 | bwa-mem2 2.3 |
-|---|---|---|---|---|
-| real (GIAB) | **25.8 s** | 29.7 s | 27.3 s | 164.8 s |
-| simulated | **28.7 s** | 32.5 s | 36.1 s | 175.7 s |
+| CPU | reads | bwa-mem4 | bwa-mem3 0.17.0 | bwa-mem2 2.3 | vs bwa-mem3 | vs bwa-mem2 |
+|---|---|---|---|---|---|---|
+| AMD EPYC 7763 (Zen 3, AVX2) | real (GIAB) | **42.5 s** | 48.9 s | 230.7 s | 1.15x | 5.4x |
+| | simulated | **48.8 s** | 73.2 s | 322.4 s | 1.50x | 6.6x |
+| AMD EPYC 9V74 (Zen 4, AVX-512) | real (GIAB) | **35.5 s** | 40.9 s | 217.5 s | 1.15x | 6.1x |
+| | simulated | **39.2 s** | 52.9 s | 254.2 s | 1.35x | 6.5x |
+| AMD EPYC 9V45 (Zen 5, AVX-512) | real (GIAB) | **25.8 s** | 27.3 s | 164.8 s | 1.06x | 6.4x |
+| | simulated | **28.7 s** | 36.1 s | 175.7 s | 1.26x | 6.1x |
+| Arm Neoverse N2 (SVE2) | real (GIAB) | **25.9 s** | 28.7 s | 223.7 s | 1.11x | 8.6x |
+| | simulated | **33.6 s** | 53.8 s | 306.4 s | 1.60x | 9.1x |
 
-The `x86-64-v3` build is 1.06x the fork on real reads and 1.26x on simulated ones, and 6.1-6.4x
-bwa-mem2; a build for the plain x86-64 baseline is 8% behind the fork on real reads. One host, one
-day: x86 ratios move with the CPU (see the AVX-512 table below). A CPU-by-CPU sample count on EPYC 7763, 9V74, Xeon 6975P-C and Neoverse N2
+A build for the plain x86-64 baseline (no `target-cpu`) is about 12% slower than `x86-64-v3`: at
+parity with the fork on real reads on Zen 3 and Zen 4, 8% behind it on Zen 5. A CPU-by-CPU sample count on EPYC 7763, 9V74, Xeon 6975P-C and Neoverse N2
 put bwa-mem4 13-19% under the fork's CPU time; seeding (SMEM) is the one stage still behind the fork
 on x86 and N2, at parity on Apple Silicon.
 
