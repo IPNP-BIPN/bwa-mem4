@@ -25,6 +25,7 @@
 //! | `match` on text | multi-way branch on the argument's value: the `"--json"` arm consumes two entries, the catch-all arm one. |
 //! | `Option<String>` | the `--json` destination: either a path or nothing. |
 //! | `while` with a manual cursor | used instead of a `for` loop because a flag consumes TWO arguments, and a `for` loop cannot skip ahead. |
+#![forbid(unsafe_code)]
 
 use std::path::Path;
 use std::process::ExitCode;

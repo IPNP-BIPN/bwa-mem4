@@ -3674,6 +3674,7 @@ mod pair_penalty_tests {
     fn memo_matches_direct_formula() {
         let direct = |p: &PeStat, dist: i64, a: i32| {
             let ns = (dist as f64 - p.avg) / p.std;
+            // SAFETY: `erfc` is libm's, pure on any `f64`.
             INV_LOG4 * (2.0 * unsafe { erfc(ns.abs() * M_SQRT1_2) }).ln() * f64::from(a)
         };
         let mut pes = [PeStat::default(); 4];

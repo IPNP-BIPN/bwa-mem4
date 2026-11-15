@@ -44,36 +44,48 @@ struct MiMalloc;
 unsafe impl std::alloc::GlobalAlloc for MiMalloc {
     #[inline]
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-        use libmimalloc_sys::{mi_malloc, mi_malloc_aligned};
-        if l.align() <= 8 {
-            mi_malloc(l.size()).cast()
-        } else {
-            mi_malloc_aligned(l.size(), l.align()).cast()
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            use libmimalloc_sys::{mi_malloc, mi_malloc_aligned};
+            if l.align() <= 8 {
+                mi_malloc(l.size()).cast()
+            } else {
+                mi_malloc_aligned(l.size(), l.align()).cast()
+            }
         }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
-        use libmimalloc_sys::{mi_zalloc, mi_zalloc_aligned};
-        if l.align() <= 8 {
-            mi_zalloc(l.size()).cast()
-        } else {
-            mi_zalloc_aligned(l.size(), l.align()).cast()
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            use libmimalloc_sys::{mi_zalloc, mi_zalloc_aligned};
+            if l.align() <= 8 {
+                mi_zalloc(l.size()).cast()
+            } else {
+                mi_zalloc_aligned(l.size(), l.align()).cast()
+            }
         }
     }
 
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, _: std::alloc::Layout) {
-        libmimalloc_sys::mi_free(p.cast());
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            libmimalloc_sys::mi_free(p.cast());
+        }
     }
 
     #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, size: usize) -> *mut u8 {
-        use libmimalloc_sys::{mi_realloc, mi_realloc_aligned};
-        if l.align() <= 8 {
-            mi_realloc(p.cast(), size).cast()
-        } else {
-            mi_realloc_aligned(p.cast(), size, l.align()).cast()
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            use libmimalloc_sys::{mi_realloc, mi_realloc_aligned};
+            if l.align() <= 8 {
+                mi_realloc(p.cast(), size).cast()
+            } else {
+                mi_realloc_aligned(p.cast(), size, l.align()).cast()
+            }
         }
     }
 }

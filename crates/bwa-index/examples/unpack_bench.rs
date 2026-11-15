@@ -24,6 +24,7 @@ fn unpack_scalar(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
 /// The block loop the fix adds, in the same shape as the one in `fmindex.rs`.
 #[cfg(target_arch = "x86_64")]
 fn unpack_vector(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
     out.clear();
     out.reserve(len + 16);
@@ -34,6 +35,7 @@ fn unpack_vector(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
         pos += 1;
     }
     if std::is_x86_feature_detected!("ssse3") {
+        // SAFETY: ssse3 detected just above; every load and store is in bounds of `pac` and `out`.
         unsafe {
             let spread = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
             let three = _mm_set1_epi8(3);
@@ -53,7 +55,7 @@ fn unpack_vector(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
                     three,
                 );
                 let n = out.len();
-                _mm_storeu_si128(out.as_mut_ptr().add(n) as *mut __m128i, out_v);
+                st128(out, n, out_v);
                 out.set_len(n + 16);
                 pos += 16;
             }

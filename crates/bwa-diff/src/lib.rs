@@ -48,6 +48,7 @@
 //! | `flag & BIT != 0` | a bit test: true when that one bit is set. `&` is bitwise AND, not a borrow, in this position. |
 //! | `continue` | skip to the next iteration of the loop. |
 //! | `u32`, `i64` | unsigned 32-bit and signed 64-bit integers. Widths follow what SAM can hold. |
+#![forbid(unsafe_code)]
 
 use std::collections::HashMap;
 use std::path::Path;

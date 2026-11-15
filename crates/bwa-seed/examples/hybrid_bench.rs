@@ -76,6 +76,7 @@ fn load_sa(path: &str, len: usize) -> Vec<i64> {
     // intermediate copy or per-element decode. Assumes little-endian, which matches the dump format
     // and every host this runs on.
     let bytes: &mut [u8] =
+        // SAFETY: the byte view covers exactly the `len` `i64`s of `sa`, and any bytes are a valid `i64`.
         unsafe { std::slice::from_raw_parts_mut(sa.as_mut_ptr() as *mut u8, len * 8) };
     // 16 MB read buffer (1 << 24): large enough that a ~50 GB sequential read is not dominated by
     // syscall overhead. The value is a throughput tuning knob only, nothing depends on it.

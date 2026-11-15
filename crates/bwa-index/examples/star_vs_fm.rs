@@ -94,12 +94,15 @@ fn fwd_ext(fm: &FmIndex, s: Smem, a: usize) -> Smem {
 /// harmless, but forming the pointer is not.
 #[inline(always)]
 unsafe fn prefetch(p: *const u8) {
-    #[cfg(target_arch = "aarch64")]
-    std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
-    #[cfg(target_arch = "x86_64")]
-    std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = p;
+    // SAFETY: the caller upholds this function's `# Safety` contract.
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+        #[cfg(target_arch = "x86_64")]
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = p;
+    }
 }
 
 fn main() {
@@ -122,10 +125,12 @@ fn main() {
     // The flat SA is mmapped rather than read: it is ~49.6 GB on GRCh38, so the OS pages in only the
     // entries the binary searches actually probe. `f` must outlive `mm`, and `mm` outlive `sa`.
     let f = std::fs::File::open(&sa_path).expect("open flat sa");
+    // SAFETY: the file is opened read-only here and not modified while mapped.
     let mm = unsafe { memmap2::Mmap::map(&f).expect("mmap flat sa") };
     // `sa[i]` is the reference POSITION of the suffix at SA ROW `i`: the mapping from row space to
     // position space, and the same function `FmIndex::get_sa(i)` computes by LF-walking. Arm B uses
     // it directly, which is exactly the tradeoff under test (one big table vs a walk).
+    // SAFETY: the mapping is page-aligned and `mm.len() / 8` whole `i64`s, any bit pattern valid; `mm` outlives `sa`.
     let sa: &[i64] = unsafe { std::slice::from_raw_parts(mm.as_ptr().cast(), mm.len() / 8) };
     println!("flat SA: {} entries (ref_seq_len {})", sa.len(), n);
     assert_eq!(sa.len() as i64, n, "flat SA does not match this index");
@@ -381,6 +386,7 @@ fn main() {
                     if l[i] < h[i] {
                         mid[i] = (l[i] + h[i]) / 2;
                         any = true;
+                        // SAFETY: a prefetch only; `mid[i] < sa.len()`.
                         unsafe {
                             prefetch(sa.as_ptr().add(mid[i] as usize) as *const u8);
                         }
@@ -400,6 +406,7 @@ fn main() {
                         pos[i] = sa[mid[i] as usize];
                         let r = (pos[i] + K as i64) as usize;
                         if r < refseq.len() {
+                            // SAFETY: a prefetch only; `r < refseq.len()`.
                             unsafe {
                                 prefetch(refseq.as_ptr().add(r));
                             }
