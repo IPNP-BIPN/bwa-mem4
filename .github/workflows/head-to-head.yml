@@ -37,7 +37,7 @@ on:
       # where our 512-bit kernels are the ones that run and the fork's tier builds meet ours on
       # different ground.
       runner:
-        description: "Runner image (ubuntu-22.04 | ubuntu-24.04)"
+        description: "Runner image (ubuntu-22.04 | ubuntu-24.04 | ubuntu-24.04-arm)"
         default: "ubuntu-22.04"
         required: false
       require_avx512:
@@ -66,8 +66,10 @@ on:
         default: false
         required: false
 
+# A push re-run supersedes the previous one; manual dispatches do not cancel each other, so several
+# runners (and several draws of one image, which land on different CPUs) can run at once.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'push' }}
   cancel-in-progress: true
 
 jobs:
@@ -89,7 +91,7 @@ jobs:
         env:
           REQUIRE_AVX512: ${{ github.event.inputs.require_avx512 }}
         run: |
-          echo "model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo "model: $( (grep -m1 'model name' /proc/cpuinfo || lscpu | grep -m1 'Model name') | cut -d: -f2-)"
           # No `-m1`: with `-o` it counts matches, not lines, so it printed one flag out of the
           # several on the same `flags` line and hid an AVX-512 host for a whole run elsewhere.
           echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
@@ -149,8 +151,9 @@ jobs:
           # dependency tree has had this runner reclaimed under it twice.
           RUSTFLAGS="" cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-isa
           cp target-isa/release/bwa-mem4 ./mem4-baseline
-          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked -p bwa-mem4 --jobs 2 \
-            --target-dir target-isa
+          # On arm64 there is no v3 level: "v3" is then the same default build, timed twice.
+          V3=""; [ "$(uname -m)" = x86_64 ] && V3="-C target-cpu=x86-64-v3"
+          RUSTFLAGS="$V3" cargo build --release --locked -p bwa-mem4 --jobs 2 --target-dir target-isa
           cp target-isa/release/bwa-mem4 ./mem4-v3
           ls -la mem4-baseline mem4-v3
 
