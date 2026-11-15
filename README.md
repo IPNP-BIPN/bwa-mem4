@@ -18,9 +18,9 @@ code tells you not to use them.
 | Single-end | byte-identical on **353,517,767** records |
 | Paired-end | byte-identical on **707,312,349** records |
 | ALT contigs | byte-identical on the real GRCh38 analysis set, 261 ALT contigs |
-| Speed | SE **3.63x**, PE **3.49x** vs bwa-mem2 2.3 on the full 30x sample at `-t12` (4.4.0); **1.29x (SE) to 1.46x (PE)** faster than fg-labs/bwa-mem3 0.17 on GIAB, see [below](#against-fg-labsbwa-mem3); index build **3.69x** |
+| Speed | SE **8.4x**, PE **9.3x** vs bwa-mem2 2.3 on 2M GIAB pairs at `-t12` (4.5.0; 3.63x and 3.49x on the full 30x sample with 4.4.0); **1.29x (SE) to 1.46x (PE)** faster than fg-labs/bwa-mem3 0.17 on GIAB, see [below](#against-fg-labsbwa-mem3); index build **3.69x** |
 | Memory vs bwa-mem3 | peak RSS **9.4 GB vs 13.3** (PE) and **8.9 vs 12.6** (SE) on 2M GIAB pairs at `-t8` against 0.17, same SAM bytes |
-| Memory | peak RSS SE **11.7 GB** vs 25.0, PE **13.9 GB** vs 32.8; index build 73.8 GB vs 74.4 |
+| Memory | peak RSS on the full 30x sample (4.4.0) SE **11.7 GB** vs 25.0, PE **13.9 GB** vs 32.8 against bwa-mem2; index build 73.8 GB vs 74.4 |
 | Output | SAM, BGZF-compressed SAM, BAM, CRAM |
 | Option surface | all three subcommands, and **every one of the 35 options `bwa-mem2 mem` accepts**; 64 of 64 per-option SAM parity cases pass |
 
@@ -36,10 +36,16 @@ once:
 | index build, GRCh38 | 551.5 s | 149.5 s | 3.69x | 74.4 / 73.8 GB | 5 files identical |
 | 2M pairs SE, median of 5 | 30.0 s | 7.8 s | 3.86x | 21.1 / 11.0 GB | identical |
 | 2M pairs PE, median of 5 | 102.9 s | 29.0 s | 3.55x | 21.4 / 13.3 GB | identical |
+| **4.5.0, 15 Nov:** 2M pairs SE, median of 5 | 30.5 s | 3.61 s | **8.45x** | 21.1 / 9.0 GB | identical |
+| **4.5.0, 15 Nov:** 2M pairs PE, median of 5 | 110.3 s | 11.8 s | **9.35x** | 21.5 / 9.5 GB | identical |
 | full 30x SE, 353,517,767 records | 4854.5 s | 1335.7 s | 3.63x | 25.0 / 11.7 GB | identical |
 | full 30x PE, 707,312,349 records | 16476.0 s | 4725.3 s | 3.49x | 32.8 / 13.9 GB | identical |
 
-What that run is and is not:
+The two 4.5.0 rows were run on 15 Nov on the same host, same reads and options, interleaved, with a
+plain `cargo build --release` of 4.5.0 (no PGO); the other rows are the 5 Nov run of 4.4.0, whose
+full 30x sample has not been re-run (bwa-mem2 alone takes 4.6 h on it in PE).
+
+What the 5 Nov run is and is not:
 
 - Apple M4 Max (12P + 4E, 128 GiB), `-t12 -K 100000000`, bwa-mem2 2.3 from Homebrew (its
   `version` prints 2.2.1). bwa-mem4 is
@@ -97,10 +103,18 @@ of two:
 
 Against 0.16.0 (14 Nov) the same runs gave 1.50x, 1.37x and 1.68x; 0.17.0 mostly cut its memory.
 
-On x86_64 (`head-to-head` workflow, 13 Nov 2026, a 4-core Intel Xeon GitHub runner, chr21, 2M
-pairs, bwa-mem4 built for `x86-64-v3`), before the last round of changes: 44.1 s against the fork's
-51.5 s on real reads and 58.3 s against 75.4 s on simulated ones (1.17x and 1.29x), with bwa-mem2 at
-244-250 s and 325-328 s. A CPU-by-CPU sample count on EPYC 7763, 9V74, Xeon 6975P-C and Neoverse N2
+On x86_64 (`head-to-head` workflow, 15 Nov 2026, a 4-core AMD EPYC 9V45 (Zen 5, AVX-512) GitHub
+runner, chr21, 2M pairs, 4.5.0's code, bwa-mem3 0.17.0 and bwa-mem2 2.3 from bioconda, best of
+three interleaved reps, the same records from all three):
+
+| reads | bwa-mem4 `x86-64-v3` | bwa-mem4 baseline | bwa-mem3 0.17.0 | bwa-mem2 2.3 |
+|---|---|---|---|---|
+| real (GIAB) | **25.8 s** | 29.7 s | 27.3 s | 164.8 s |
+| simulated | **28.7 s** | 32.5 s | 36.1 s | 175.7 s |
+
+The `x86-64-v3` build is 1.06x the fork on real reads and 1.26x on simulated ones, and 6.1-6.4x
+bwa-mem2; a build for the plain x86-64 baseline is 8% behind the fork on real reads. One host, one
+day: x86 ratios move with the CPU (see the AVX-512 table below). A CPU-by-CPU sample count on EPYC 7763, 9V74, Xeon 6975P-C and Neoverse N2
 put bwa-mem4 13-19% under the fork's CPU time; seeding (SMEM) is the one stage still behind the fork
 on x86 and N2, at parity on Apple Silicon.
 
