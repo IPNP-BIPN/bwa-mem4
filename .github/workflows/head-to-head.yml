@@ -94,7 +94,7 @@ jobs:
           echo "model: $( (grep -m1 'model name' /proc/cpuinfo || lscpu | grep -m1 'Model name') | cut -d: -f2-)"
           # No `-m1`: with `-o` it counts matches, not lines, so it printed one flag out of the
           # several on the same `flags` line and hid an AVX-512 host for a whole run elsewhere.
-          echo -n "simd: "; grep -o -E 'avx2|avx512bw|avx512f|avx512vl' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo -n "simd: "; { grep -o -E 'avx2|avx512bw|avx512f|avx512vl|asimd|sve2?' /proc/cpuinfo || true; } | sort -u | tr '\n' ' '; echo
           echo "nproc: $(nproc)"
           if [ "$REQUIRE_AVX512" = "true" ]; then
             grep -q avx512bw /proc/cpuinfo || {
