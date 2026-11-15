@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `--meth` oracle diff: bwa-mem4 against fg-labs/bwa-mem3 0.16 (the fork, its prebuilt binary) on
+# `--meth` oracle diff: bwa-mem4 against fg-labs/bwa-mem3 0.17 (the fork, its binary) on
 # simulated directional bisulfite and TAPS reads over a small reference. Every configuration must
 # give the same SAM byte for byte, @PG lines excepted (they name each tool).
 #
@@ -103,6 +103,7 @@ run emseq_se "${E[0]}" -- --meth -K 10000000 -t1
 run taps_pe "${T[@]}" -- --meth=taps -K 10000000 -t1
 run taps_se "${T[0]}" -- --meth=taps -K 10000000 -t1
 run genomic "${E[@]}" -- --meth --meth-scoring genomic -K 10000000 -t1
+run collapsed "${E[@]}" -- --meth --meth-scoring collapsed -K 10000000 -t1
 run neutral "${E[@]}" -- --meth=bisulfite --meth-scoring=neutral --meth-tags=^XM -K 10000000 -t1
 run tags_xr_xg "${E[@]}" -- --meth --meth-tags XR,XG -K 10000000 -t1
 run prune_off "${E[@]}" -- --meth --meth-seed-prune=off -K 10000000 -t1

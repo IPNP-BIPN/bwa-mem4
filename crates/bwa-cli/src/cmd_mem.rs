@@ -536,7 +536,7 @@ pub struct MemArgs {
     /// Where a conversion is free: all [all]. `cpg` is not supported by this port.
     #[arg(long = "meth-context", value_name = "all|cpg")]
     pub meth_context: Option<String>,
-    /// collapsed (EM-seq default, sets -B 2), genomic, or neutral (TAPS default).
+    /// genomic (EM-seq default), collapsed (sets -B 2), or neutral (TAPS default).
     #[arg(long = "meth-scoring", value_name = "MODE")]
     pub meth_scoring: Option<String>,
     /// Bismark tags to emit: all [all], none, XR,XG,... or exclusions ^XM / -XM.
@@ -1153,6 +1153,15 @@ fn build_meth(args: &MemArgs, opt: &mut MemOpt) -> anyhow::Result<Option<bwa_cor
         };
     }
     m.chimera_qc = args.chimera_qc;
+    // bwa-mem3 0.17 (#734): neutral scoring loses em-seq's conversion-rich reads; warn, as it does.
+    if m.chem == meth::Chem::EmSeq && m.scoring == meth::Scoring::Neutral {
+        eprintln!(
+            "WARNING: --meth-scoring neutral with em-seq/bisulfite chemistry (--meth, --meth=emseq, \
+             --meth=bisulfite) scores each conversion 0, and em-seq converts most cytosines, so short \
+             reads are left unmapped or misplaced and unmethylated reads are lost first, biasing \
+             methylation upward. Use the em-seq default (genomic) or --meth-scoring collapsed."
+        );
+    }
     if args.read_type.is_some() {
         anyhow::bail!("--meth cannot be combined with -x");
     }

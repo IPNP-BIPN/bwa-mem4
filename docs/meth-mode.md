@@ -1,9 +1,14 @@
 # Methylation mode (`--meth`)
 
 bwa-mem4 aligns directional bisulfite, EM-seq, TAPS and Illumina 5-base reads with the
-methylation mode of [fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.16, ported to
+methylation mode of [fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.17, ported to
 Rust. The options are spelled as in bwa-mem3, so a bwa-mem3 command line runs unchanged. On the
-test set, the SAM output is byte-identical to bwa-mem3 0.16 (see [Validation](#validation)).
+test set, the SAM output is byte-identical to bwa-mem3 0.17 (see [Validation](#validation)).
+
+Since 4.6.0, bare `--meth` scores EM-seq and bisulfite reads as `genomic`, as bwa-mem3 0.17 does
+(its #756: fewer confident mismappings). 4.5.0 and bwa-mem3 0.16 used `collapsed`; pass
+`--meth-scoring collapsed` to get their output. TAPS and 5-base keep `neutral`, so Bismark, which
+sets `--meth-scoring neutral` itself, is not affected.
 
 The port is a Rust reimplementation of bwa-mem3's `meth_*.cpp`, `bwamem.cpp` and
 `bwamem_pair.cpp` meth paths, Copyright (C) 2026 Fulcrum Genomics LLC, MIT licensed. The notice
@@ -65,8 +70,8 @@ nf-core's `bwamem3/index`) works as is.
 | Option | Default | Effect |
 |---|---|---|
 | `--meth[=CHEM]` | off; `emseq` when given bare | turns the mode on: `emseq`, `taps` or `5base` |
-| `--meth-scoring MODE` | `collapsed` (EM-seq), `neutral` (TAPS, 5-base) | how a conversion scores: `collapsed` treats C/T (G/A) as a match in both directions, `genomic` treats it as a match only in the conversion's direction, `neutral` scores it 0 |
-| `--meth-context all\|cpg` | `all` | where a conversion is free. Only `all` is supported (see [Differences](#differences-from-bwa-mem3-016)) |
+| `--meth-scoring MODE` | `genomic` (EM-seq), `neutral` (TAPS, 5-base) | how a conversion scores: `collapsed` treats C/T (G/A) as a match in both directions, `genomic` treats it as a match only in the conversion's direction, `neutral` scores it 0 |
+| `--meth-context all\|cpg` | `all` | where a conversion is free. Only `all` is supported (see [Differences](#differences-from-bwa-mem3-017)) |
 | `--meth-tags SPEC` | `all` | which of `XR`, `XG`, `XM` to write: `all`, `none`, a list `XR,XG`, or exclusions `^XM` / `-XM`. A tag left out is not computed |
 | `--meth-seed-prune[=MODE]` | `spec30` | drops short repetitive SMEMs before SA lookup: `spec30`, `baseline` or `off` |
 | `--set-as-failed f\|r` | off | sets 0x200 on records of conversion strand `f` (`XG:Z:CT`) or `r` (`XG:Z:GA`) |
@@ -141,7 +146,7 @@ is cleared.
 ## Validation
 
 `scripts/meth_oracle_diff.sh` builds a small reference, then compares bwa-mem4 against the
-bwa-mem3 0.16 binary. The reference is chr20:44.0-44.4M and chr22:20.0-20.2M of GRCh38, with an
+bwa-mem3 0.17 binary. The reference is chr20:44.0-44.4M and chr22:20.0-20.2M of GRCh38, with an
 injected 30-N run and a 200-base soft-masked run, plus chrM.
 
 It indexes the reference with both tools and checks that the index files are identical. It then
@@ -154,13 +159,13 @@ simulates 5,000 EM-seq and 5,000 TAPS pairs with `scripts/meth_sim.py`. The simu
 - random pairs;
 - FASTQ comments.
 
-Fifteen configurations are run, and each must give the same SAM, `@PG` excepted:
+Sixteen configurations are run, and each must give the same SAM, `@PG` excepted:
 
 | Configuration | Options |
 |---|---|
 | Bismark | the exact options of Bismark#1209 |
 | EM-seq, TAPS | PE and SE each |
-| scoring | `genomic`, `neutral` |
+| scoring | `genomic`, `collapsed`, `neutral` |
 | tags | `^XM`, `XR,XG` |
 | seed prune | `off`, `baseline` |
 | QC | `--set-as-failed r --chimera-qc` |
@@ -189,10 +194,11 @@ unit tests:
 extension, and batched mate rescue with K-mer pruning and the banded kernel. The meth matrices
 reach those kernels in three ways:
 
-- **Collapsed scoring** (the EM-seq default) frees C/T in both directions at the match score. It
+- **Collapsed scoring** (`--meth-scoring collapsed`, the EM-seq default up to 4.5.0) frees C/T in both directions at the match score. It
   is exactly the uniform matrix on copies of both sequences with T rewritten as C (A as G for OB),
   so extension and rescue run the plain kernels on those copies.
-- **Genomic and neutral scoring** (the TAPS and 5-base default) go through a 5×5 table. The
+- **Genomic and neutral scoring** (the defaults: genomic for EM-seq, neutral for TAPS and
+  5-base) go through a 5×5 table. The
   extension and band kernels look up `5 × reference + read`: a two-register `TBL` on NEON, two
   `PSHUFB` on SSE4.1, AVX2 and AVX-512 (one `VPERMW` in the AVX-512 i16 extension kernel). The
   NEON rescue kernels do the same. The x86 rescue kernels give each base a 4-bit code such that
@@ -224,7 +230,7 @@ reach those kernels in three ways:
   sharing more hits with its mate than the gate runs in full (its band would be the whole window).
   The plain gate is 1000 hits; relation hits are ~3x denser, so under a relation it is 3 per mate
   base (M4 TAPS 150 bp: -6% instructions, -5% cycles; 250 bp: -0.4% instructions).
-- **EM-seq is not pruned**: its collapsed mismatch (2a) is below the bound's (K-1)a for any useful
+- **Collapsed scoring is not pruned**: its mismatch (2a) is below the bound's (K-1)a for any useful
   K. A better bound would not pay either: on 20,000 simulated chr21 pairs, 70% of the rescue jobs
   reach `minsc`, and in those windows 65% of the rows do (the three-letter alphabet is
   low-complexity). An exact, free filter would still have to run 57% of the cells.
@@ -308,7 +314,7 @@ the 9V74 and the 6975P-C, and `BWA4_RESCUE_PRUNE=1` at 150 bp on the 9V74 costs 
 code, its `-t1` ratio was 0.94 to 1.00. On that CPU, bwa-mem4's seeding takes
 more perf samples than bwa-mem3's; extension makes up for it.
 
-## Differences from bwa-mem3 0.16
+## Differences from bwa-mem3 0.17
 
 None of these differences shows up on the test set.
 
