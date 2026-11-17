@@ -599,13 +599,18 @@ pub(crate) fn gen_cigar2(
                 if i >= len {
                     break;
                 }
+                // `--meth`: NM counts only what the read's matrix penalises, so a conversion is
+                // not an edit (fg-labs/bwa-mem3 `nm_from_mat`). MD lists it unless `--md short`,
+                // which keeps it in the match run.
+                let edit = opt.meth.is_none() || opt.mat[r[i] as usize * 5 + q[i] as usize] < 0;
+                if !edit && opt.md == bwa_core::opt::MdMode::Short {
+                    match_run += 1;
+                    i += 1;
+                    continue;
+                }
                 crate::emit::push_int_str(&mut md, i64::from(match_run));
                 md.push(base_char(r[i]));
-                // `--meth`: MD stays literal, but NM counts only what the read's matrix
-                // penalises, so a conversion is not an edit (fg-labs/bwa-mem3 `nm_from_mat`).
-                if opt.meth.is_none() || opt.mat[r[i] as usize * 5 + q[i] as usize] < 0 {
-                    n_mm += 1;
-                }
+                n_mm += i32::from(edit);
                 match_run = 0;
                 i += 1;
             }
@@ -636,6 +641,10 @@ pub(crate) fn gen_cigar2(
     // MD always ends with a run length, even when that run is empty ("0"), matching the final
     // `kputw(u, &str)` at bwa.cpp:336.
     crate::emit::push_int_str(&mut md, i64::from(match_run));
+    // `--md none`: an empty MD is the writers' sign to emit no MD:Z (a built one is never empty).
+    if opt.md == bwa_core::opt::MdMode::None {
+        md.clear();
+    }
     // Hand both buffers back for the next record on this thread. There is no early return between
     // here and where they were taken, so this runs on every path that took them.
     SCRATCH_QUERY.with(|c| *c.borrow_mut() = std::mem::take(&mut query));

@@ -38,4 +38,8 @@ Notes on the recipe:
   libraries.
 - `RUSTFLAGS=""` in `build.sh` overrides the repo's `-C target-cpu=native`,
   which would bake in the build host's CPU and SIGILL on older ones. The SIMD
-  kernels are chosen at runtime, so nothing is lost.
+  kernels are chosen at runtime. The rest of the code is not, so on x86_64 the
+  recipe also installs an `x86-64-v3` build as `bwa-mem4-x86-64-v3`, which the
+  baseline binary execs on AVX2-class CPUs (`exec_v3` in
+  `crates/bwa-cli/src/main.rs`). Without it the bioconda binary ran about 11%
+  slower, which put it behind bwa-mem3 0.17 on Zen 5.
