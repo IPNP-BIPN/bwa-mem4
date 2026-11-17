@@ -18,37 +18,38 @@ code tells you not to use them.
 | Single-end | byte-identical on **353,517,767** records |
 | Paired-end | byte-identical on **707,312,349** records |
 | ALT contigs | byte-identical on the real GRCh38 analysis set, 261 ALT contigs |
-| Speed | SE **3.63x**, PE **3.49x** vs bwa-mem2 2.3 on the full 30x sample at `-t12` (4.4.0); since 4.5.0, **1.37x (SE) to 1.50x (PE)** faster than fg-labs/bwa-mem3 0.16 on GIAB, see [below](#against-fg-labsbwa-mem3); index build **3.69x** |
-| Memory vs bwa-mem3 | peak RSS **9.3 GB vs 13.7** (PE) and **8.9 vs 13.3** (SE) on 2M GIAB pairs at `-t8`, same SAM bytes |
-| Memory | peak RSS SE **11.7 GB** vs 25.0, PE **13.9 GB** vs 32.8; index build 73.8 GB vs 74.4 |
+| Speed | SE **8.04x**, PE **8.81x** vs bwa-mem2 2.3 on the full 30x sample at `-t12` (4.5.0); **1.29x (SE) to 1.46x (PE)** faster than fg-labs/bwa-mem3 0.17 on GIAB, see [below](#against-fg-labsbwa-mem3); index build **3.57x** |
+| Memory vs bwa-mem3 | peak RSS **9.4 GB vs 13.3** (PE) and **8.9 vs 12.6** (SE) on 2M GIAB pairs at `-t8` against 0.17, same SAM bytes |
+| Memory | peak RSS on the full 30x sample SE **9.5 GB** vs 23.2, PE **9.8 GB** vs 22.8 against bwa-mem2; index build 73.8 GB vs 78.7 |
 | Output | SAM, BGZF-compressed SAM, BAM, CRAM |
 | Option surface | all three subcommands, and **every one of the 35 options `bwa-mem2 mem` accepts**; 64 of 64 per-option SAM parity cases pass |
 
 Measured on a real 32.9x human WGS (GIAB HG002, 2x150), not simulated reads and not a sampled
-subset, on 5 Nov 2026 with `scripts/giab_publication.sh` (raw log and per-run table in
-[docs/bench/giab-hg002-2026-11-05](docs/bench/giab-hg002-2026-11-05/)). Each tool builds its own
-GRCh38 index from the same FASTA (the five files compare identical) and aligns against it. Every run
-records wall, CPU, peak RSS and the md5 of its records, so identity is checked on each run, not
-once:
+subset, on 15 Nov 2026 with `scripts/giab_publication.sh` and bwa-mem4 4.5.0 (raw log and per-run
+table in [docs/bench/giab-hg002-2026-11-15](docs/bench/giab-hg002-2026-11-15/)). Each tool builds
+its own GRCh38 index from the same FASTA (the five files compare identical) and aligns against it.
+Every run records wall, CPU, peak RSS and the md5 of its records, so identity is checked on each
+run, not once:
 
 | run | bwa-mem2 | bwa-mem4 | speedup | peak RSS, bwa-mem2 / bwa-mem4 | output |
 |---|---|---|---|---|---|
-| index build, GRCh38 | 551.5 s | 149.5 s | 3.69x | 74.4 / 73.8 GB | 5 files identical |
-| 2M pairs SE, median of 5 | 30.0 s | 7.8 s | 3.86x | 21.1 / 11.0 GB | identical |
-| 2M pairs PE, median of 5 | 102.9 s | 29.0 s | 3.55x | 21.4 / 13.3 GB | identical |
-| full 30x SE, 353,517,767 records | 4854.5 s | 1335.7 s | 3.63x | 25.0 / 11.7 GB | identical |
-| full 30x PE, 707,312,349 records | 16476.0 s | 4725.3 s | 3.49x | 32.8 / 13.9 GB | identical |
+| index build, GRCh38 | 499.4 s | 140.1 s | 3.57x | 78.7 / 73.8 GB | 5 files identical |
+| 2M pairs SE, median of 5 | 29.5 s | 3.5 s | 8.55x | 20.6 / 9.0 GB | identical |
+| 2M pairs PE, median of 5 | 101.6 s | 9.6 s | 10.64x | 20.9 / 9.5 GB | identical |
+| full 30x SE, 353,517,767 records | 4776.6 s | 594.1 s | **8.04x** | 23.2 / 9.5 GB | identical |
+| full 30x PE, 707,312,349 records | 17114.8 s | 1941.7 s | **8.81x** | 22.8 / 9.8 GB | identical |
 
 What that run is and is not:
 
 - Apple M4 Max (12P + 4E, 128 GiB), `-t12 -K 100000000`, bwa-mem2 2.3 from Homebrew (its
-  `version` prints 2.2.1). bwa-mem4 is
-  the PGO build from `scripts/pgo.sh` (sha256 `6f10b250...`), not a plain `cargo build --release`;
-  the log's build line said otherwise, a bug since fixed.
-- The full sample ran once per tool. The 2M-pair subset ran 5 times, interleaved, and each tool's
-  fastest and slowest reps are within 7%.
-- No wait for an idle host: the 1-min load average was 13-22 at each run's start, which is mostly
-  the previous 12-thread run winding down. Both tools ran interleaved under the same conditions.
+  `version` prints 2.2.1). bwa-mem4 is a plain `cargo build --release` of 4.5.0 (sha256
+  `51c5320c...`), not PGO.
+- The full sample ran once per tool. The 2M-pair subset ran 5 times, interleaved.
+- Each run waited for a 1-min load average under 6 before starting (5.1-6.0 at the starts); an idle
+  desktop with the other apps open sits at 4-5.
+- The previous run, 5 Nov with 4.4.0 (PGO build, started at load 13-22), gave 3.63x (SE) and 3.49x
+  (PE) on the full sample: bwa-mem4 took 1335.7 s and 4725.3 s then, 2.25x and 2.43x longer than
+  4.5.0. Its log is in [docs/bench/giab-hg002-2026-11-05](docs/bench/giab-hg002-2026-11-05/).
 
 Speed is on an Apple M4 Max. The ratio is not constant across thread counts: it decays as `-t`
 rises, so quote it with the thread count attached.
@@ -81,23 +82,40 @@ cloud runners, not the headline ratio.
 
 ### Against fg-labs/bwa-mem3
 
-[fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.16.0 run with `--compat=bwa-mem2`, its
+[fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.17.0 run with `--compat=bwa-mem2`, its
 mode that reproduces bwa-mem2. Every row below produces the same SAM bytes from both tools, and
 the same bytes as bwa-mem2 on GIAB (md5 checked on each run).
 
-Apple M4 Max, 14 Nov 2026, bwa-mem4 4.5.0 (plain `cargo build --release`, not PGO), `-t8
--K 100000000`, the two tools interleaved, best of two:
+Apple M4 Max, 15 Nov 2026, bwa-mem4 4.5.0 (plain `cargo build --release`, not PGO) and bwa-mem3
+0.17.0 (built from its tag with `make arm64`), `-t8 -K 100000000`, the two tools interleaved, best
+of two:
 
-| reads | bwa-mem4 | bwa-mem3 0.16.0 | speedup | CPU cycles, mem4 / mem3 | peak RSS, mem4 / mem3 |
+| reads | bwa-mem4 | bwa-mem3 0.17.0 | speedup | CPU cycles, mem4 / mem3 | peak RSS, mem4 / mem3 |
 |---|---|---|---|---|---|
-| GIAB HG002, 2M pairs PE | 14.1 s | 21.2 s | **1.50x** | 404 / 630 G | 9.3 / 13.7 GB |
-| GIAB HG002, 2M reads SE | 4.61 s | 6.32 s | **1.37x** | 123 / 178 G | 8.9 / 13.3 GB |
-| chr21, 1M simulated pairs | 4.97 s | 8.34 s | **1.68x** | 139 / 247 G | 1.6 / 2.1 GB |
+| GIAB HG002, 2M pairs PE | 14.2 s | 20.7 s | **1.46x** | 402 / 617 G | 9.4 / 13.3 GB |
+| GIAB HG002, 2M reads SE | 4.61 s | 5.93 s | **1.29x** | 125 / 177 G | 8.9 / 12.6 GB |
+| chr21, 1M simulated pairs | 4.90 s | 8.10 s | **1.65x** | 139 / 245 G | 1.6 / 1.6 GB |
 
-On x86_64 (`head-to-head` workflow, 13 Nov 2026, a 4-core Intel Xeon GitHub runner, chr21, 2M
-pairs, bwa-mem4 built for `x86-64-v3`), before the last round of changes: 44.1 s against the fork's
-51.5 s on real reads and 58.3 s against 75.4 s on simulated ones (1.17x and 1.29x), with bwa-mem2 at
-244-250 s and 325-328 s. A CPU-by-CPU sample count on EPYC 7763, 9V74, Xeon 6975P-C and Neoverse N2
+Against 0.16.0 (14 Nov) the same runs gave 1.50x, 1.37x and 1.68x; 0.17.0 mostly cut its memory.
+
+On other CPUs (`head-to-head` workflow, 15 Nov 2026, 4-vCPU GitHub runners, chr21, 2M pairs,
+4.5.0's code, bwa-mem3 0.17.0 and bwa-mem2 2.3 from bioconda, the same records from all three;
+bwa-mem4 built for `x86-64-v3` on x86 and plain `--release` on arm64; best of three interleaved
+reps, and of two runs per CPU except Zen 5):
+
+| CPU | reads | bwa-mem4 | bwa-mem3 0.17.0 | bwa-mem2 2.3 | vs bwa-mem3 | vs bwa-mem2 |
+|---|---|---|---|---|---|---|
+| AMD EPYC 7763 (Zen 3, AVX2) | real (GIAB) | **42.5 s** | 48.9 s | 230.7 s | 1.15x | 5.4x |
+| | simulated | **48.8 s** | 73.2 s | 322.4 s | 1.50x | 6.6x |
+| AMD EPYC 9V74 (Zen 4, AVX-512) | real (GIAB) | **35.5 s** | 40.9 s | 217.5 s | 1.15x | 6.1x |
+| | simulated | **39.2 s** | 52.9 s | 254.2 s | 1.35x | 6.5x |
+| AMD EPYC 9V45 (Zen 5, AVX-512) | real (GIAB) | **25.8 s** | 27.3 s | 164.8 s | 1.06x | 6.4x |
+| | simulated | **28.7 s** | 36.1 s | 175.7 s | 1.26x | 6.1x |
+| Arm Neoverse N2 (SVE2) | real (GIAB) | **25.9 s** | 28.7 s | 223.7 s | 1.11x | 8.6x |
+| | simulated | **33.6 s** | 53.8 s | 306.4 s | 1.60x | 9.1x |
+
+A build for the plain x86-64 baseline (no `target-cpu`) is about 12% slower than `x86-64-v3`: at
+parity with the fork on real reads on Zen 3 and Zen 4, 8% behind it on Zen 5. A CPU-by-CPU sample count on EPYC 7763, 9V74, Xeon 6975P-C and Neoverse N2
 put bwa-mem4 13-19% under the fork's CPU time; seeding (SMEM) is the one stage still behind the fork
 on x86 and N2, at parity on Apple Silicon.
 
@@ -303,10 +321,12 @@ the rules for changing this code without breaking parity.
 
 Since 4.5.0, `bwa-mem4 index --meth` and `bwa-mem4 mem --meth[=emseq|taps|5base]` align
 directional bisulfite, EM-seq, TAPS and Illumina 5-base reads with the methylation mode of
-fg-labs/bwa-mem3 0.16, ported to Rust, options spelled as in bwa-mem3. `--pbat` (or
-`--meth=pbat`) adds PBAT libraries, which bwa-mem3 does not have. Its SAM output is
-byte-identical to bwa-mem3 0.16 on the test sets, at 0.53-0.66 of its CPU cycles on Apple M4
-(150 and 250 bp, `-t1`) and 0.67-0.89 of its wall time on x86. Without `--meth` nothing changes.
+fg-labs/bwa-mem3, ported to Rust, options spelled as in bwa-mem3. `--pbat` (or `--meth=pbat`)
+adds PBAT libraries, which bwa-mem3 does not have. Its SAM output is byte-identical to bwa-mem3
+0.17 on the test sets; as in 0.17, bare `--meth` now scores EM-seq as `genomic`, and
+`--meth-scoring collapsed` gives 4.5.0's output (bwa-mem3 0.16's). Against 0.16 it ran at
+0.53-0.66 of bwa-mem3's CPU cycles on Apple M4 (150 and 250 bp, `-t1`) and 0.67-0.89 of its wall
+time on x86. Without `--meth` nothing changes.
 Details, options and validation: [docs/meth-mode.md](docs/meth-mode.md).
 
 ## GPU
