@@ -347,6 +347,12 @@ pub struct MemOpt {
     pub tie_break_name: bool,
     /// `--md` (fg-labs/bwa-mem3 0.17): how the MD tag is written. [`MdMode::Full`] by default.
     pub md: MdMode,
+    /// `--alt-project` (fg-labs/bwa-mem3 0.18): the ALT -> primary liftover table. `None` (the
+    /// default) leaves every ALT region where it is, byte-identical to bwa-mem2.
+    pub alt_lift: Option<std::sync::Arc<crate::alt_lift::AltLift>>,
+    /// `--alt-project primary`: drop the ALT regions the lift left behind, so no record names an
+    /// ALT contig. `false` is `keep-alt`.
+    pub alt_project_primary: bool,
 }
 
 /// `--md full|short|none`. `Full` is bwa's literal MD. `Short` lists only the mismatches NM counts,
@@ -417,6 +423,8 @@ impl Default for MemOpt {
             meth: None,
             tie_break_name: false,
             md: MdMode::Full,
+            alt_lift: None,
+            alt_project_primary: false,
         }
     }
 }

@@ -324,6 +324,7 @@ pub mod lazy_csub {
 
 pub mod across;
 pub mod alt;
+pub mod alt_lift;
 pub mod cigar;
 pub mod emit;
 pub mod meth;
@@ -391,7 +392,9 @@ pub struct MemAlnReg {
     /// Total seed length contained inside `[qb,qe) x [rb,re)`, a proxy for how much of the region
     /// is supported by exact seed matches. Used by MAPQ and by the dedup pass.
     pub seedcov: i32,
-    /// Length of the seed this region was grown from, before any extension.
+    /// Length of the seed this region was grown from, before any extension. Nothing reads it after
+    /// dedup, so a region `--alt-project` lifted reuses it for the ALT contig it came from (the
+    /// fork's `union { seedlen0; alt_source_rid; }`), told apart by `alt_bw != 0`.
     pub seedlen0: i32,
     /// -1 for a primary region, otherwise the index of the region it is secondary to. The value
     /// -2 is used as a sentinel by the PE path to mark a record that must still be emitted.
@@ -416,10 +419,17 @@ pub struct MemAlnReg {
     /// `pa:f` tag (`bwamem.cpp:1714`, printed as `score / alt_sc`). Stays 0 on an index with no
     /// ALT contigs, which is why `pa:f` never appears without a `.alt` file.
     pub alt_sc: i32,
+    /// `--alt-project`: 0 for a region that was not lifted; for a lifted one, 1 + the band floor
+    /// its re-alignment to the primary assembly needs (the widest diagonal excursion of the ALT's
+    /// indels inside it, at most [`alt_lift::ALT_BW_MAX`]). In the struct's padding: 80 bytes.
+    pub alt_bw: u16,
     // No `hash` (bwa's tie-break): only primary marking reads it, so `sort_hlt` derives it from
     // the read id and the region's index there. The batch holds every region until SAM emit, and
     // the 8 bytes took a region from 80 to 88.
 }
+
+// The batch holds every region until SAM emit: its size is a perf lever (see `alt_bw`).
+const _: () = assert!(std::mem::size_of::<MemAlnReg>() == 80);
 
 /// Longest gap worth allowing for a `qlen`-base extension, i.e. how far the reference window must
 /// reach beyond the seed. Port of `cal_max_gap` (`bwamem.cpp:66-75`).
@@ -835,6 +845,7 @@ pub(crate) fn mem_chain2aln_meta(
                 sub_n: 0,
                 seedcov: 0,
                 seedlen0: chain.seeds[seed_idx].len,
+                alt_bw: 0,
                 secondary: -1,
                 secondary_all: -1,
                 w: opt.w,
@@ -863,6 +874,7 @@ pub(crate) fn mem_chain2aln_meta(
             sub_n: 0,
             seedcov: 0,
             seedlen0: seed.len,
+            alt_bw: 0,
             secondary: -1,
             secondary_all: -1,
             w: opt.w,

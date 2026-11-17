@@ -537,6 +537,7 @@ fn mem_matesw(
                         sub_n: 0,
                         seedcov,
                         seedlen0: 0,
+                        alt_bw: 0,
                         secondary: -1,
                         secondary_all: 0,
                         w: 0,
@@ -1228,6 +1229,7 @@ fn matesw_apply(
                     sub_n: 0,
                     seedcov,
                     seedlen0: 0,
+                    alt_bw: 0,
                     secondary: -1,
                     secondary_all: 0,
                     w: 0,
@@ -2826,6 +2828,16 @@ fn mem_aln2sam(
         out.extend_from_slice(b"\tpa:f:");
         out.extend_from_slice(crate::cigar::format_pa(p.score, p.alt_sc).as_bytes());
     }
+    // `--alt-project`: XL:Z (the ALT a lifted record came from), then OA:Z (an unmapped end's
+    // best unlifted ALT hit), before XA as in the fork's `mem_aln2sam`.
+    if p.alt_source >= 0 && p_flag & 4 == 0 {
+        out.extend_from_slice(b"\tXL:Z:");
+        out.extend_from_slice(bns.contigs[p.alt_source as usize].name.as_bytes());
+    }
+    if let Some(oa) = &p.oa {
+        out.extend_from_slice(b"\tOA:Z:");
+        out.extend_from_slice(oa);
+    }
     // XA:Z (alternate hits), after SA/pa per mem_aln2sam.
     if let Some(xa) = &p.xa {
         out.extend_from_slice(b"\tXA:Z:");
@@ -2895,6 +2907,7 @@ pub fn mem_reg2sam(
     extra_flag: u32,
     m: Option<&MemAln>,
     meth: Option<&MethEmit>,
+    oa: Option<&[u8]>,
     out: &mut Vec<u8>,
 ) {
     // `-Y` and `-V`, read once here and threaded into every `mem_aln2sam` call below.
@@ -3007,6 +3020,7 @@ pub fn mem_reg2sam(
         // A zeroed alignment: rid -1, no CIGAR, MAPQ 0, score 0. Printed as the read's only record.
         let mut unmapped = MemAln::unmapped();
         unmapped.flag |= extra_flag;
+        unmapped.oa = oa.map(<[u8]>::to_vec);
         mem_aln2sam(
             bns,
             name,
@@ -3088,6 +3102,7 @@ pub fn mem_sam_pe<W: Write>(
     a0: &mut Vec<MemAlnReg>,
     a1: &mut Vec<MemAlnReg>,
     rescue_done: bool,
+    oa: [Option<&[u8]>; 2],
     w: &mut W,
 ) -> io::Result<()> {
     let id = crate::primary::tie_break_id(opt, names[0], id);
@@ -3596,6 +3611,7 @@ pub fn mem_sam_pe<W: Write>(
         0x41 | extra_flag,
         Some(&h1),
         emit[0].as_ref(),
+        oa[0],
         &mut buf,
     );
     mem_reg2sam(
@@ -3610,6 +3626,7 @@ pub fn mem_sam_pe<W: Write>(
         0x81 | extra_flag,
         Some(&h0),
         emit[1].as_ref(),
+        oa[1],
         &mut buf,
     );
     if opt.meth.as_ref().is_some_and(|m| m.may_qcfail()) {
@@ -3879,6 +3896,7 @@ mod region_view_tests {
             sub_n: 0,
             seedcov: next(2) as i32,
             seedlen0: 0,
+            alt_bw: 0,
             secondary: -1,
             secondary_all: 0,
             w: 0,
@@ -4000,6 +4018,7 @@ mod matesw_apply_tests {
             sub_n: 0,
             seedcov: 50,
             seedlen0: 0,
+            alt_bw: 0,
             secondary: -1,
             secondary_all: 0,
             w: 0,
@@ -4065,6 +4084,7 @@ mod matesw_apply_tests {
             sub_n: 0,
             seedcov: 50,
             seedlen0: 0,
+            alt_bw: 0,
             secondary: -1,
             secondary_all: 0,
             w: 0,
