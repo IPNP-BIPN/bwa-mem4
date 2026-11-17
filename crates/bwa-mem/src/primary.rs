@@ -1273,7 +1273,10 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
     // that deficit into an equivalent number of mismatches (a mismatch costs `a + b`: you lose the
     // match reward and pay the mismatch penalty). Dividing again by `l` turns a mismatch count into
     // a mismatch rate. Gaps get charged at the mismatch rate too, which is why this is approximate.
-    let identity = 1.0 - f64::from(l * opt.a - a.score) / f64::from(opt.a + opt.b) / f64::from(l);
+    let identity = 1.0
+        - (i64::from(l) * i64::from(opt.a) - i64::from(a.score)) as f64
+            / f64::from(opt.a + opt.b)
+            / f64::from(l);
     // ---- The MAPQ formula itself --------------------------------------------------------------
     // The running MAPQ in phred units. Unclamped and possibly negative until the `clamp` below,
     // because the `sub_n` penalty is subtracted first.
@@ -1308,7 +1311,9 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         //
         // The C reuses `tmp` for this product; we give the two values distinct names.
         let weight = len_discount * identity * identity;
-        mapq = (MAPQ_SCORE_COEF * f64::from(a.score - sub) / f64::from(opt.a) * weight * weight
+        mapq = (MAPQ_SCORE_COEF * (i64::from(a.score) - i64::from(sub)) as f64 / f64::from(opt.a)
+            * weight
+            * weight
             + ROUND_BIAS) as i32;
     }
     // ---- Penalties and clamping ---------------------------------------------------------------

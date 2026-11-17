@@ -2429,8 +2429,9 @@ fn best_pair(u: &[(u64, u64)], tie_margin: i32) -> ((u64, u64), i32, i32) {
 /// RETURNS an unclamped phred-scaled quality.
 #[inline]
 #[must_use]
-fn raw_mapq(diff: i32, a: i32) -> i32 {
-    (MAPQ_PER_MATCHED_BASE * f64::from(diff) / f64::from(a) + 0.499) as i32
+// `i64` and the saturating `as i32`: fg-labs/bwa-mem3 #743's bound, where bwa's int overflows.
+fn raw_mapq(diff: i64, a: i32) -> i32 {
+    (MAPQ_PER_MATCHED_BASE * diff as f64 / f64::from(a) + 0.499) as i32
 }
 
 /// Reference length consumed by a CIGAR (M/D ops). Port of `get_rlen` (`bwamem.cpp:1820-1829`).
@@ -3196,18 +3197,21 @@ pub fn mem_sam_pe<W: Write>(
                 // best scores, minus the `-U` unpaired penalty. This is the bar the proper pair has
                 // to clear, both for MAPQ (as a floor on the sub-optimal) and, further down, for
                 // deciding whether to use the paired placement at all.
-                let score_un = a0[0].score + a1[0].score - opt.pen_unpaired;
+                // In i64, so a huge `-U`/`-A` cannot wrap an inferior pair into a proper one.
+                let score_un =
+                    i64::from(a0[0].score) + i64::from(a1[0].score) - i64::from(opt.pen_unpaired);
                 // `subo`: the score the paired MAPQ is measured against, the better of the runner-up
                 // pair and the unpaired alternative. `q_pe`: the pair-level MAPQ, still unclamped
                 // and undamped at this point, shared by both ends.
-                let subo = pr.sub.max(score_un);
-                let mut qdiff = pr.score - subo;
+                let subo = i64::from(pr.sub).max(score_un);
+                let mut qdiff = i64::from(pr.score) - subo;
                 // `--meth`: each end's second-best primary also caps the pair's margin, so a
                 // repeat on either end deflates the pair MAPQ (fg-labs/bwa-mem3 0.16).
                 if opt.meth.is_some() {
                     let second =
                         |a: &[MemAlnReg], n_pri: usize| if n_pri > 1 { a[1].score } else { 0 };
-                    let cap = pr.score + 4 * opt.a - (second(a0, n_pri0) + second(a1, n_pri1));
+                    let cap = i64::from(pr.score) + 4 * i64::from(opt.a)
+                        - (i64::from(second(a0, n_pri0)) + i64::from(second(a1, n_pri1)));
                     qdiff = qdiff.min(cap).max(0);
                 }
                 let mut q_pe = raw_mapq(qdiff, opt.a);
@@ -3238,7 +3242,7 @@ pub fn mem_sam_pe<W: Write>(
                 // independently? If yes, keep `pr.z` and flag 0x2 (proper pair). If no, fall back
                 // to each end's own best hit (`z = [0, 0]`) and DO NOT set 0x2, while still writing
                 // the two records through the paired emitter.
-                if pr.score > score_un {
+                if i64::from(pr.score) > score_un {
                     // The C keeps pointers `c[0]`/`c[1]` into the two vectors and reads
                     // `c[i]->score` / `c[i]->csub` after the loop below; we copy the two values up
                     // front instead, purely to satisfy the borrow checker. Equivalent because that
@@ -3280,7 +3284,10 @@ pub fn mem_sam_pe<W: Write>(
                         // local alignment (ksw's KSW_XSUBO), so a small `score - csub` means the
                         // locus itself is internally repetitive and the placement within it is
                         // arbitrary, however good the pairing looks.
-                        let mapq_cap = raw_mapq(chosen_score[i] - chosen_csub[i], opt.a);
+                        let mapq_cap = raw_mapq(
+                            i64::from(chosen_score[i]) - i64::from(chosen_csub[i]),
+                            opt.a,
+                        );
                         q_se[i] = q_se[i].min(mapq_cap);
                     }
                     // 0x2, proper pair. Only set on this branch.
@@ -3615,7 +3622,15 @@ pub fn mem_sam_pe<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::{best_pair, mem_infer_dir};
+    use super::{best_pair, mem_infer_dir, raw_mapq};
+
+    /// fg-labs/bwa-mem3 #743: a margin past `i32` saturates instead of wrapping.
+    #[test]
+    fn raw_mapq_saturates_wide_margins() {
+        assert_eq!(raw_mapq(10, 1), 60);
+        assert_eq!(raw_mapq(1 << 40, 1), i32::MAX);
+        assert_eq!(raw_mapq(-(1 << 40), 1), i32::MIN);
+    }
 
     /// [`best_pair`] answers what bwa reads off the sorted candidate list, including heavy score ties.
     #[test]
