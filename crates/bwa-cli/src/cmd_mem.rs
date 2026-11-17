@@ -2392,7 +2392,18 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let (fm, mut bns) = if opt.meth.is_some() {
         load_meth_index(&args.index_prefix)?
     } else {
-        let fm = FmIndex::load(&args.index_prefix)?;
+        let fm = FmIndex::load(&args.index_prefix).map_err(|e| {
+            let seed = format!("{}.meth.bwt.2bit.64", args.index_prefix.display());
+            if std::path::Path::new(&seed).exists() {
+                anyhow::anyhow!(
+                    "{e}\nThis may be a --meth-only index: use mem --meth for methylation \
+                     alignment, or rebuild with index --meth --force (without --meth-only) for \
+                     ordinary alignment."
+                )
+            } else {
+                e.into()
+            }
+        })?;
         let bns = BntSeq::load(&args.index_prefix)?;
         // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
         anyhow::ensure!(
