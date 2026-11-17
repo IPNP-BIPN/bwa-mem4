@@ -831,6 +831,7 @@ pub(crate) fn same_region(x: &MemAlnReg, y: &MemAlnReg) -> bool {
         && x.frac_rep.to_bits() == y.frac_rep.to_bits()
         && x.is_alt == y.is_alt
         && x.alt_sc == y.alt_sc
+        && x.alt_bw == y.alt_bw
 }
 
 /// Assign each region a primary, or promote it to primary itself. Port of
@@ -1614,6 +1615,7 @@ mod tests {
             sub_n,
             seedcov,
             seedlen0: 0,
+            alt_bw: 0,
             secondary: -1,
             secondary_all: -1,
             w: 0,

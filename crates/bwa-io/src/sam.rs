@@ -199,6 +199,7 @@ pub fn write_header<W: Write>(
 ///   unmapped record has no reference strand to be relative to.
 /// - `qual`: SAM column 11, Phred+33, same length and same order as `seq`. `None` (FASTA input) or
 ///   an empty slice both write `*`.
+/// - `oa`: the `OA:Z` value (`--alt-project primary`), written after RG:Z; `None` otherwise.
 /// - `comment`: `Record::comment`, the FASTQ header past the QNAME. Appended as the last
 ///   tab-separated field, and only when `-C` was given; `append_comment` makes that decision, so
 ///   passing `Some(..)` without `-C` still emits nothing.
@@ -215,6 +216,7 @@ pub fn write_unmapped<W: Write>(
     qname: &[u8],
     seq: &[u8],
     qual: Option<&[u8]>,
+    oa: Option<&[u8]>,
     comment: Option<&[u8]>,
 ) -> io::Result<()> {
     // ---- Columns 1..9: QNAME, then the fixed unmapped middle (FLAG 4, no RNAME/POS/MAPQ/CIGAR,
@@ -248,6 +250,11 @@ pub fn write_unmapped<W: Write>(
     let mut trailing_tags = Vec::new();
     // `-R`: bwa stamps RG:Z on every record, unmapped ones included.
     bwa_core::rg::append_rg_tag(&mut trailing_tags);
+    // `--alt-project primary`: the best unlifted ALT hit of a read written unmapped for it.
+    if let Some(oa) = oa {
+        trailing_tags.extend_from_slice(b"\tOA:Z:");
+        trailing_tags.extend_from_slice(oa);
+    }
     // `-C`: the comment is last, after RG:Z.
     bwa_core::rg::append_comment(&mut trailing_tags, comment);
     w.write_all(&trailing_tags)?;
@@ -455,7 +462,7 @@ mod tests {
     #[test]
     fn unmapped_record_shape() {
         let mut buf = Vec::new();
-        write_unmapped(&mut buf, b"r1", b"ACGT", Some(b"IIII"), None).unwrap();
+        write_unmapped(&mut buf, b"r1", b"ACGT", Some(b"IIII"), None, None).unwrap();
         assert_eq!(
             &buf,
             b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tAS:i:0\tXS:i:0\n"
@@ -465,7 +472,7 @@ mod tests {
     #[test]
     fn unmapped_missing_qual_is_star() {
         let mut buf = Vec::new();
-        write_unmapped(&mut buf, b"r1", b"ACGT", None, None).unwrap();
+        write_unmapped(&mut buf, b"r1", b"ACGT", None, None, None).unwrap();
         assert_eq!(
             &buf,
             b"r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\tAS:i:0\tXS:i:0\n"
