@@ -56,8 +56,9 @@ if [ -z "${OURS:-}" ]; then
 fi
 
 echo "[index] fork and ours, --meth"
-for t in fork ours; do cp "$W/ref.fa" "$W/$t/ref.fa"; done
-"$FORK" index --meth "$W/fork/ref.fa" > /dev/null 2>&1
+# From 0.18 the fork refuses to overwrite an index (`--force`) and deletes `.meth.fa` unless kept.
+for t in fork ours; do rm -f "$W/$t/ref.fa".*; cp "$W/ref.fa" "$W/$t/ref.fa"; done
+"$FORK" index --meth --keep-meth-fasta "$W/fork/ref.fa" > /dev/null 2>&1
 "$OURS" index --meth "$W/ours/ref.fa" 2> /dev/null
 for f in ref.fa.meth.fa ref.fa.pac ref.fa.ann ref.fa.amb ref.fa.meth.pac ref.fa.meth.ann ref.fa.meth.amb; do
   cmp -s "$W/fork/$f" "$W/ours/$f" || { echo "  index file $f DIFFERS" >&2; exit 1; }
@@ -113,5 +114,8 @@ run threads "${E[@]}" -- --meth -K 10000000 -t4
 run scaled "${E[@]}" -- --meth -A2 -K 10000000 -t1
 run all_alns "${E[0]}" -- --meth -a -K 10000000 -t1
 run softclip "${E[@]}" -- --meth -Y -K 10000000 -t1
+run md_short "${E[@]}" -- --meth --md short -K 10000000 -t1
+run md_none "${E[0]}" -- --meth --md none -K 10000000 -t1
+run tie_name "${E[@]}" -- --meth --tie-break name -K 10000000 -t1
 
 if [ "$fail" = 0 ]; then echo "PASS: every configuration identical"; else echo "FAIL" >&2; exit 1; fi

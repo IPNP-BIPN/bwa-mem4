@@ -340,6 +340,24 @@ pub struct MemOpt {
     /// `--meth`: the methylation mode's settings and its two per-chemistry matrices (see
     /// [`crate::meth`]). `None` for every run without `--meth`, which then never reads it.
     pub meth: Option<crate::meth::MethOpt>,
+
+    /// `--tie-break name` (fg-labs/bwa-mem3 0.18): seed the equal-score tie-breaks from a hash of
+    /// the read name instead of its input position, so reordered or sharded input does not move
+    /// tied reads. `false` (`--tie-break index`, the default) is bwa's input-position seed.
+    pub tie_break_name: bool,
+    /// `--md` (fg-labs/bwa-mem3 0.17): how the MD tag is written. [`MdMode::Full`] by default.
+    pub md: MdMode,
+}
+
+/// `--md full|short|none`. `Full` is bwa's literal MD. `Short` lists only the mismatches NM counts,
+/// so under `--meth` a conversion the matrix frees reads as a match; without `--meth` it equals
+/// `Full`. `None` writes no MD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MdMode {
+    #[default]
+    Full,
+    Short,
+    None,
 }
 
 impl Default for MemOpt {
@@ -397,6 +415,8 @@ impl Default for MemOpt {
             max_xa_hits_alt: 200,
             mat,
             meth: None,
+            tie_break_name: false,
+            md: MdMode::Full,
         }
     }
 }

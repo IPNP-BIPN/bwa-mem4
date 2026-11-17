@@ -306,6 +306,19 @@ fn presort_dump_id() -> &'static Option<u64> {
 /// The mixed 64-bit hash, used only as a sort key (`alnreg_hlt`'s last tie-break). The exact bit
 /// pattern is part of the output contract: change the mixing and a different one of two
 /// equal-scoring regions becomes primary, changing the SAM bytes.
+/// `mem_tie_break_id` (fg-labs/bwa-mem3 0.18): the id that seeds a read's (or pair's) equal-score
+/// tie-breaks. `index_id`, the input position, unless `--tie-break name`; then FNV-1a-64 of the read
+/// name mixed by [`hash_64`] and masked to 23 bits, so `mem_pair`'s `id << 8` still fits an `i32`.
+pub fn tie_break_id(opt: &MemOpt, name: &[u8], index_id: u64) -> u64 {
+    if !opt.tie_break_name {
+        return index_id;
+    }
+    let h = name.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| {
+        (h ^ c as u64).wrapping_mul(0x0100_0000_01b3)
+    });
+    hash_64(h) & 0x7F_FFFF
+}
+
 pub fn hash_64(mut key: u64) -> u64 {
     key = key.wrapping_add(!(key << 32));
     key ^= key >> 22;
@@ -1550,6 +1563,24 @@ mod tests {
         // Distinct inputs give distinct, well-mixed outputs (sanity).
         assert_ne!(hash_64(0), hash_64(1));
         assert_ne!(hash_64(1000), hash_64(1001));
+    }
+
+    #[test]
+    fn tie_break_id_matches_fork_golden_values() {
+        let mut opt = MemOpt::default();
+        assert_eq!(
+            tie_break_id(&opt, b"read1", 12345),
+            12345,
+            "index mode passes the id through"
+        );
+        opt.tie_break_name = true;
+        // fg-labs/bwa-mem3 0.18 test/unit/test_tie_break_id.cpp: part of the output contract.
+        assert_eq!(tie_break_id(&opt, b"read1", 0), 1317512);
+        assert_eq!(
+            tie_break_id(&opt, b"A00744:46:HV3C3DSXX:2:2330:14281:12633", 7),
+            5557930
+        );
+        assert_eq!(tie_break_id(&opt, b"", 0), 7727541);
     }
 
     /// Build a minimal region for MAPQ tests: one full-length, forward-strand hit on rid 0 with no

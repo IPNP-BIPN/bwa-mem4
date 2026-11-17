@@ -2751,8 +2751,10 @@ fn mem_aln2sam(
     if !p_cigar.is_empty() {
         out.extend_from_slice(b"\tNM:i:");
         crate::emit::push_int(out, i64::from(p.nm));
-        out.extend_from_slice(b"\tMD:Z:");
-        out.extend_from_slice(p.md.as_bytes());
+        if !p.md.is_empty() {
+            out.extend_from_slice(b"\tMD:Z:");
+            out.extend_from_slice(p.md.as_bytes());
+        }
     }
     // MC:Z is the MATE's CIGAR, but note it is rendered with THIS record's `which`
     // (`bwamem.cpp:1689` passes `which` straight through), so on a supplementary record the mate's
@@ -3087,6 +3089,7 @@ pub fn mem_sam_pe<W: Write>(
     rescue_done: bool,
     w: &mut W,
 ) -> io::Result<()> {
+    let id = crate::primary::tie_break_id(opt, names[0], id);
     // Mate rescue (mem_matesw), before primary marking. Snapshot each read's near-best regions as
     // anchors, then SW-rescue the other read's mate in any missing insert-consistent orientation.
     // On concordant pairs every orientation is skipped, so this is a no-op. Port of the non-

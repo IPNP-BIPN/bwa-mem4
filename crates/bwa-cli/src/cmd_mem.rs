@@ -95,7 +95,7 @@ use rust_htslib::bam;
 #[cfg(feature = "hts-output")]
 use rust_htslib::htslib;
 
-use bwa_core::opt::flags;
+use bwa_core::opt::{flags, MdMode};
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, InterleavedFastqReader, PairedFastqReader, Record, SqRecord};
@@ -103,7 +103,7 @@ use bwa_mem::{
     align_reads_batched, alt::mem_gen_alt, batch_mate_rescue, cigar::cigar_string_which,
     cigar::MemAln, cigar_string, lazy_csub, mem_approx_mapq_se, mem_mark_primary_se,
     mem_pestat_from, mem_sam_pe, mem_sort_dedup_patch, pe::resolve_pending, pestat_samples,
-    reg2aln, MemAlnReg, PairRescueData, PeStat, PendS2,
+    reg2aln, tie_break_id, MemAlnReg, PairRescueData, PeStat, PendS2,
 };
 use bwa_neon::NeonBackend;
 
@@ -556,6 +556,16 @@ pub struct MemArgs {
     /// is `--meth --pbat`. Not in bwa-mem3.
     #[arg(long = "pbat")]
     pub pbat: bool,
+
+    /// What seeds the choice among equal-score alignments and pairings: index (the read's input
+    /// position, as bwa) or name (a hash of the read name, so reordered, subset or sharded input
+    /// keeps each read's pick; paired-end also needs -I). From fg-labs/bwa-mem3 0.18. [index]
+    #[arg(long = "tie-break", value_name = "index|name")]
+    pub tie_break: Option<String>,
+    /// MD tag: full (literal), short (only the mismatches NM counts; under --meth, no
+    /// conversions) or none. From fg-labs/bwa-mem3 0.17. [full]
+    #[arg(long = "md", value_name = "full|short|none")]
+    pub md: Option<String>,
 }
 
 /// Parse bwa's `INT[,INT]` pair syntax. bwa reads the first integer with `strtol`, then takes a
@@ -1090,6 +1100,17 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     //
     // From the POST-rescale a/b. Doing this earlier would leave the SIMD kernel scoring with
     // pre-rescale values while the gap logic used post-rescale scalars.
+    opt.tie_break_name = match args.tie_break.as_deref() {
+        None | Some("index") => false,
+        Some("name") => true,
+        Some(other) => anyhow::bail!("unknown --tie-break '{other}' (index|name)"),
+    };
+    opt.md = match args.md.as_deref() {
+        None | Some("full") => MdMode::Full,
+        Some("short") => MdMode::Short,
+        Some("none") => MdMode::None,
+        Some(other) => anyhow::bail!("unknown --md '{other}' (full|short|none)"),
+    };
     let meth = build_meth(args, &mut opt)?;
     opt.fill_scmat();
     if let Some(mut meth) = meth {
@@ -2777,7 +2798,7 @@ fn finish_se_meth(
         eprintln!("=== read {} ===", String::from_utf8_lossy(rec.name()));
         bwa_mem::dump_regs(bns, "meth pre-mark", &regs);
     }
-    mem_mark_primary_se(opt, &mut regs, read_id);
+    mem_mark_primary_se(opt, &mut regs, tie_break_id(opt, rec.name(), read_id));
     if opt.flag & flags::PRIMARY5 != 0 {
         bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);
     }
@@ -2859,7 +2880,7 @@ fn finish_se(
         regs = mem_sort_dedup_patch(fm, opt, codes, regs);
         bwa_mem::stamp_is_alt(bns, &mut regs);
     }
-    mem_mark_primary_se(opt, &mut regs, read_id);
+    mem_mark_primary_se(opt, &mut regs, tie_break_id(opt, rec.name(), read_id));
     // `-5` (`MEM_F_PRIMARY5`): make the 5'-most segment of a split alignment the primary, which
     // score-ranking would not. Runs here, immediately after the marking and before anything reads
     // the region order.
@@ -3139,7 +3160,10 @@ fn write_aln_se(
     // separator before the block. Empty is legal (an alignment with no cigar and a negative score).
     let mut tags = String::new();
     if !aln.cigar.is_empty() {
-        tags.push_str(&format!("NM:i:{}\tMD:Z:{}", aln.nm, aln.md));
+        tags.push_str(&format!("NM:i:{}", aln.nm));
+        if !aln.md.is_empty() {
+            tags.push_str(&format!("\tMD:Z:{}", aln.md));
+        }
     }
     if aln.score >= 0 {
         tags.push_str(&format!("\tAS:i:{}", aln.score));
