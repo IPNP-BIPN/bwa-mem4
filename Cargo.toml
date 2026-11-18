@@ -56,6 +56,7 @@ bwa-extend = { package = "bwa-mem4-extend", path = "crates/bwa-extend", version 
 bwa-mem = { package = "bwa-mem4-mem", path = "crates/bwa-mem", version = "4.5.0" }
 bwa-diff = { package = "bwa-mem4-diff", path = "crates/bwa-diff", version = "4.5.0" }
 bwa-neon = { package = "bwa-mem4-neon", path = "crates/bwa-neon", version = "4.5.0" }
+bwa-metal = { package = "bwa-mem4-metal", path = "crates/bwa-metal", version = "4.5.0" }
 # --- external ---
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

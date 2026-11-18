@@ -359,6 +359,17 @@ impl Batch {
         ];
         let tbl = crate::matesw::u8_score_table(mat);
         self.work.mat5 = mat5_of(mat);
+        // A band device takes bwa's uniform matrix only (`mat_is_standard`: N scores -1).
+        let dev_sc =
+            crate::matesw::mat_is_standard(5, mat).then_some(crate::offload::BandScoring {
+                a: i32::from(mat[0]),
+                b: i32::from(mat[1]),
+                n: -1,
+                oe_del: o_del + e_del,
+                e_del,
+                oe_ins: o_ins + e_ins,
+                e_ins,
+            });
         let probe = crate::matesw::cells::enabled();
         let t_all = probe.then(std::time::Instant::now);
         let cells0 = self.work.cells;
@@ -368,7 +379,7 @@ impl Batch {
         for pi in 0..self.parents.len() {
             self.add_jobs(pi, 1, false, 0, 0);
         }
-        self.run_jobs(jobs, &tbl, gaps, minsc, max_sc);
+        self.run_jobs(jobs, &tbl, gaps, minsc, max_sc, dev_sc.as_ref());
         self.r2.clear();
         for pi in 0..self.parents.len() {
             self.finish(pi, minsc, max_sc);
@@ -417,7 +428,7 @@ impl Batch {
             let zh = (sh + max_sc - 1) / max_sc;
             self.add_jobs(pi, 2, sh >= minsc, teh - zh, teh);
         }
-        self.run_jobs(jobs, &tbl, gaps, minsc, max_sc);
+        self.run_jobs(jobs, &tbl, gaps, minsc, max_sc, dev_sc.as_ref());
         for i in 0..self.r2.len() {
             let pi = self.r2[i] as usize;
             self.finish(pi, minsc, max_sc);
@@ -473,7 +484,10 @@ impl Batch {
         }
     }
 
-    /// Run the queued jobs in groups of 16 and merge each lane into its parent.
+    /// Run the queued jobs in groups of 16 and merge each lane into its parent. With a band device
+    /// registered ([`crate::offload`]), it takes the widest share of the jobs first; this thread
+    /// runs the rest, then takes the device's jobs back from the wide end until the device is done.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn run_jobs(
         &mut self,
         jobs: &[KswJob],
@@ -481,6 +495,7 @@ impl Batch {
         gaps: [u8; 4],
         minsc: i32,
         max_sc: i32,
+        dev_sc: Option<&crate::offload::BandScoring>,
     ) {
         let n = self.jobs.len();
         self.order.clear();
@@ -492,24 +507,157 @@ impl Batch {
         );
         self.order.sort_unstable();
         let gl = self.work.lanes();
+        if crate::matesw::cells::enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            for j in &self.jobs {
+                let w = j.band.dhi - j.band.dlo + 1;
+                let c = [64, 128, 256, 512, 1024]
+                    .iter()
+                    .position(|&x| w <= x)
+                    .unwrap_or(5);
+                let cells = i64::from(j.band.r1 - j.band.r0 + 1) * i64::from(w);
+                crate::offload::probe::BY_W[c].fetch_add(cells as u64, Relaxed);
+                crate::offload::probe::N_BY_W[c].fetch_add(1, Relaxed);
+            }
+        }
+        let thr = minsc.clamp(0, 255) as u8;
+        let dev = crate::offload::band_offload().zip(dev_sc);
+        let Some((dev, sc)) = dev.filter(|_| n >= 4 * gl) else {
+            self.run_range(jobs, tbl, gaps, minsc, max_sc, 0, n);
+            return;
+        };
+        // The device's range `[lo, hi)`: the widest jobs it takes, up to its share of the cells.
+        // A row costs its live diagonals, at most the padded query.
+        let cells = |me: &Self, x: usize| {
+            let t = me.task(jobs, x, thr);
+            t.t.len() as i64 * i64::from(t.w.min(t.quanta))
+        };
+        let total: i64 = (0..n).map(|x| cells(self, x)).sum();
+        let want = (total as f64 * dev.band_share()) as i64;
+        let mut hi = n;
+        while hi > 0 && !dev.takes(&self.task(jobs, hi - 1, thr), sc) {
+            hi -= 1;
+        }
+        let (mut lo, mut got) = (hi, 0i64);
+        while lo > 0 && got < want && dev.takes(&self.task(jobs, lo - 1, thr), sc) {
+            lo -= 1;
+            got += cells(self, lo);
+        }
+        let probe = crate::matesw::cells::enabled();
+        let t0 = probe.then(std::time::Instant::now);
+        let pending = (hi - lo >= gl)
+            .then(|| {
+                let tasks: Vec<_> = (lo..hi).map(|x| self.task(jobs, x, thr)).collect();
+                dev.submit(&tasks, sc)
+            })
+            .flatten();
+        let range_cells =
+            |me: &Self, a: usize, b: usize| -> u64 { (a..b).map(|x| cells(me, x) as u64).sum() };
+        if let (Some(t0), true) = (t0, pending.is_some()) {
+            use crate::offload::probe::*;
+            use std::sync::atomic::Ordering::Relaxed;
+            SUBMIT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            CALLS.fetch_add(1, Relaxed);
+            SENT.fetch_add(range_cells(self, lo, hi), Relaxed);
+        }
+        let Some(pending) = pending else {
+            self.run_range(jobs, tbl, gaps, minsc, max_sc, 0, n);
+            return;
+        };
+        self.run_range(jobs, tbl, gaps, minsc, max_sc, 0, lo);
+        self.run_range(jobs, tbl, gaps, minsc, max_sc, hi, n);
+        let mut s = hi;
+        while s > lo && !pending.is_done() {
+            let a = s.saturating_sub(gl).max(lo);
+            self.run_range(jobs, tbl, gaps, minsc, max_sc, a, s);
+            s = a;
+        }
+        if probe {
+            use crate::offload::probe::*;
+            use std::sync::atomic::Ordering::Relaxed;
+            STOLEN.fetch_add(range_cells(self, s, hi), Relaxed);
+            DELIVERED.fetch_add(range_cells(self, lo, s), Relaxed);
+        }
+        if s == lo {
+            return; // `pending` drops; the device's results are not needed
+        }
+        let t0 = probe.then(std::time::Instant::now);
+        let got = pending.wait();
+        if let Some(t0) = t0 {
+            crate::offload::probe::WAIT_NS.fetch_add(
+                t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        match got {
+            Some((outs, rows)) => {
+                let mut off = 0usize;
+                for (x, o) in (lo..s).zip(&outs) {
+                    let ji = self.order[x] as u32 as usize;
+                    let nrows = (self.jobs[ji].band.r1 - self.jobs[ji].band.r0 + 1) as usize;
+                    let g8 = i32::from(o.gmax);
+                    merge(
+                        &mut self.parents,
+                        &mut self.pool,
+                        &self.jobs[ji],
+                        g8,
+                        o.te,
+                        o.qe,
+                        &rows[off..off + nrows],
+                        minsc,
+                        max_sc,
+                    );
+                    off += nrows;
+                }
+            }
+            None => self.run_range(jobs, tbl, gaps, minsc, max_sc, lo, s),
+        }
+    }
+
+    /// Job `order[x]` as a lane of its own (no group widening).
+    fn task<'a>(&self, jobs: &[KswJob<'a>], x: usize, thr: u8) -> crate::offload::BandTask<'a> {
+        let j = &self.jobs[self.order[x] as u32 as usize];
+        let b = &j.band;
+        let kj = &jobs[self.parents[j.parent as usize].job as usize];
+        crate::offload::BandTask {
+            q: kj.query,
+            t: &kj.target[b.r0 as usize..=b.r1 as usize],
+            quanta: kj.query.len().div_ceil(16) as i32 * 16,
+            o: b.r0 - b.dlo,
+            w: b.dhi - b.dlo + 1,
+            thr,
+        }
+    }
+
+    /// Run the jobs `order[a..b]` in groups of the kernel's width and merge each lane.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_range(
+        &mut self,
+        jobs: &[KswJob],
+        tbl: &[u8; 16],
+        gaps: [u8; 4],
+        minsc: i32,
+        max_sc: i32,
+        a: usize,
+        b: usize,
+    ) {
+        let gl = self.work.lanes();
         // Once per call, not per group (a `memset` of the whole array each time): a group writes
         // and reads only its first `nl` lanes.
         let mut lanes = [kernel::Lane::default(); kernel::L];
-        for g in (0..n).step_by(gl) {
-            let nl = gl.min(n - g);
+        for g in (a..b).step_by(gl) {
+            let nl = gl.min(b - g);
             let (mut wmax, mut omax) = (1, i32::MIN);
             for l in 0..nl {
-                let j = &self.jobs[self.order[g + l] as u32 as usize];
-                let b = &j.band;
-                let kj = &jobs[self.parents[j.parent as usize].job as usize];
+                let t = self.task(jobs, g + l, minsc.clamp(0, 255) as u8);
                 lanes[l] = kernel::Lane {
-                    q: kj.query,
-                    t: &kj.target[b.r0 as usize..=b.r1 as usize],
-                    quanta: kj.query.len().div_ceil(16) as i32 * 16,
-                    o: b.r0 - b.dlo,
-                    w: b.dhi - b.dlo + 1,
+                    q: t.q,
+                    t: t.t,
+                    quanta: t.quanta,
+                    o: t.o,
+                    w: t.w,
                     target: 0,
-                    thr: minsc.clamp(0, 255) as u8,
+                    thr: t.thr,
                 };
                 wmax = wmax.max(lanes[l].w);
                 omax = omax.max(lanes[l].o);
@@ -528,46 +676,20 @@ impl Batch {
             }
             for l in 0..nl {
                 let ji = self.order[g + l] as u32 as usize;
-                let (pi, b) = (self.jobs[ji].parent as usize, self.jobs[ji].band);
-                let p = &mut self.parents[pi];
-                let g8 = i32::from(self.work.gmax[l]);
-                let (te, qe) = if g8 > 0 {
-                    (b.r0 + self.work.te[l], i32::from(self.work.qe[l]))
-                } else {
-                    (-1, 0)
-                };
+                let b = self.jobs[ji].band;
                 let nrows = (b.r1 - b.r0 + 1) as usize;
-                if p.lazy {
-                    // No row maxima: `score2` is the caller's to compute.
-                    if g8 > p.s || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)))
-                    {
-                        (p.s, p.te, p.qe) = (g8, te, qe);
-                    }
-                    continue;
-                }
-                let rl = self.work.lane_rows(l, nrows);
-                if p.buf < 0 {
-                    // The parent's only band: its outputs are the parent's.
-                    (p.s, p.te, p.qe) = (g8, te, qe);
-                    (p.s2, p.te2) = if g8 >= minsc {
-                        score2(rl, b.r0, g8, te, minsc, max_sc)
-                    } else {
-                        (-1, -1)
-                    };
-                } else {
-                    // Every row of a band below `minsc` is too (`g8` is their max), and `score2`
-                    // reads no row below `minsc`: such a band would leave it unchanged.
-                    if g8 >= minsc {
-                        let buf = &mut self.pool[p.buf as usize + (b.r0 - p.hb) as usize..];
-                        for (x, &v) in buf[..nrows].iter_mut().zip(rl) {
-                            *x = (*x).max(v);
-                        }
-                    }
-                    if g8 > p.s || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)))
-                    {
-                        (p.s, p.te, p.qe) = (g8, te, qe);
-                    }
-                }
+                let g8 = i32::from(self.work.gmax[l]);
+                merge(
+                    &mut self.parents,
+                    &mut self.pool,
+                    &self.jobs[ji],
+                    g8,
+                    self.work.te[l],
+                    self.work.qe[l],
+                    self.work.lane_rows(l, nrows),
+                    minsc,
+                    max_sc,
+                );
             }
         }
     }
@@ -1012,6 +1134,59 @@ pub(crate) fn score2_lane<R: Copy + Into<i32>>(
         (t.s2, t.te2)
     } else {
         (-1, -1)
+    }
+}
+
+/// Merge one band lane (best `g8` at band row `te_rel`, column `qe`, row maxima `rl`) into its
+/// parent. Order-free: row maxima merge by max, `(s, te, qe)` by a lexicographic max.
+#[allow(clippy::too_many_arguments)]
+fn merge(
+    parents: &mut [Parent],
+    pool: &mut [u8],
+    job: &Job,
+    g8: i32,
+    te_rel: i32,
+    qe: u8,
+    rl: &[u8],
+    minsc: i32,
+    max_sc: i32,
+) {
+    let (pi, b) = (job.parent as usize, job.band);
+    let p = &mut parents[pi];
+    let (te, qe) = if g8 > 0 {
+        (b.r0 + te_rel, i32::from(qe))
+    } else {
+        (-1, 0)
+    };
+    let nrows = (b.r1 - b.r0 + 1) as usize;
+    let better = g8 > p.s || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)));
+    if p.lazy {
+        // No row maxima: `score2` is the caller's to compute.
+        if better {
+            (p.s, p.te, p.qe) = (g8, te, qe);
+        }
+        return;
+    }
+    if p.buf < 0 {
+        // The parent's only band: its outputs are the parent's.
+        (p.s, p.te, p.qe) = (g8, te, qe);
+        (p.s2, p.te2) = if g8 >= minsc {
+            score2(rl, b.r0, g8, te, minsc, max_sc)
+        } else {
+            (-1, -1)
+        };
+    } else {
+        // Every row of a band below `minsc` is too (`g8` is their max), and `score2` reads no row
+        // below `minsc`: such a band would leave it unchanged.
+        if g8 >= minsc {
+            let buf = &mut pool[p.buf as usize + (b.r0 - p.hb) as usize..];
+            for (x, &v) in buf[..nrows].iter_mut().zip(rl) {
+                *x = (*x).max(v);
+            }
+        }
+        if better {
+            (p.s, p.te, p.qe) = (g8, te, qe);
+        }
     }
 }
 
@@ -2725,6 +2900,93 @@ mod tests {
                 score2_lane(&rm, lanes, 1, n, &bits, nb, (s, te0), minsc, max_sc),
                 tr.finish(s, te0, max_sc),
                 "lane: rows {rows:?} te {te0} minsc {minsc} extra {extra}"
+            );
+        }
+    }
+
+    /// [`crate::offload::band_reference`] against this machine's band kernel, one lane per group (no
+    /// widening): best score, its row, `qe` and every row maximum. The reference is what a device
+    /// kernel must reproduce, so it is pinned to the CPU kernel here.
+    #[test]
+    fn band_reference_matches_kernel() {
+        use crate::offload::{band_reference, BandScoring, BandTask};
+        if !kernel_available() {
+            return;
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mat = scmat(1, 4);
+        let tbl = crate::matesw::u8_score_table(&mat);
+        let sc = BandScoring {
+            a: 1,
+            b: -4,
+            n: -1,
+            oe_del: 7,
+            e_del: 1,
+            oe_ins: 7,
+            e_ins: 1,
+        };
+        let gaps = [7u8, 1, 7, 1];
+        let mut work = kernel::Work::default();
+        for round in 0..3000 {
+            let qlen = 1 + next() % 250;
+            let quanta = qlen.div_ceil(16) as i32 * 16;
+            let mut q: Vec<u8> = (0..qlen).map(|_| (next() % 4) as u8).collect();
+            if round % 17 == 0 {
+                q[next() % qlen] = 4;
+            }
+            let w = 1 + (next() % 200) as i32;
+            let o = (next() % (quanta as usize + w as usize + 20)) as i32 - w - 10;
+            let nr = 1 + next() % 700;
+            let mut t: Vec<u8> = (0..nr).map(|_| (next() % 4) as u8).collect();
+            // Plant the query along a diagonal of the band (`k0`), with a few edits.
+            let k0 = (next() % w as usize) as i32;
+            for (r, b) in t.iter_mut().enumerate() {
+                let j = r as i32 + o - k0;
+                if (0..qlen as i32).contains(&j) && next() % 12 != 0 {
+                    *b = q[j as usize];
+                }
+            }
+            if round % 23 == 0 {
+                t[next() % nr] = 4;
+            }
+            let thr = (next() % 40) as u8;
+            let task = BandTask {
+                q: &q,
+                t: &t,
+                quanta,
+                o,
+                w,
+                thr,
+            };
+            let lane = kernel::Lane {
+                q: &q,
+                t: &t,
+                quanta,
+                o,
+                w,
+                target: 0,
+                thr,
+            };
+            // SAFETY: `kernel_available` checked above.
+            unsafe { work.run(&[lane], w as usize, &tbl, gaps) };
+            let (want, rows) = band_reference(&task, &sc);
+            let got_te = if work.gmax[0] > 0 { work.te[0] } else { -1 };
+            let qe = if work.gmax[0] >= thr { work.qe[0] } else { 0 };
+            assert_eq!(
+                (work.gmax[0], got_te, qe),
+                (want.gmax, want.te, want.qe),
+                "round {round}: qlen {qlen} w {w} o {o} nr {nr} thr {thr}"
+            );
+            assert_eq!(
+                work.lane_rows(0, nr),
+                &rows[..],
+                "round {round}: row maxima"
             );
         }
     }

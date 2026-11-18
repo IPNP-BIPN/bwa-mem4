@@ -1,11 +1,150 @@
 # Adding a GPU, without giving up byte-identity
 
+## Status on 2026-11-18: built a third time, as a co-processor, byte-identical, a few percent
+
+Everything below this section is the August plan and its history; this section supersedes the
+parts it contradicts. The research behind it, and the line-by-line errata of this file, are in
+[gpu-research-2026-11.md](gpu-research-2026-11.md).
+
+**The ceiling moved.** On the current binary (`24f9e1b`, 2026-11-14, M4 human PE) the DP kernels
+are ~35% of cycles: mate rescue's `rescue_band::Work::run` 19.3%, seed extension (u8) 15.5%. A free
+offload of all of it is ~1.54x, not the 2.45x of #52, and extension alone is ~1.18x.
+
+**What exists.** `crates/bwa-metal` (feature `metal`, macOS only, off by default) is a seed
+extension kernel in the layout the November research pointed to: **16 lanes per job**, rows in
+lockstep, the whole `eh` rail in registers (stale entries included, which `ksw_extend2` reads), F as
+an exact exclusive prefix max over four shuffles, int32 throughout (Apple GPUs run 16- and 32-bit
+integers at the same rate, so there is no u8/i16 tier to reproduce, and no saturation trap). It is
+**field-exact** against `ksw_extend2`, a stricter contract than NEON's, whose tight band moves
+`gscore`/`gtle` inside the window the caller never reads. Queries over 255 bases, matrices not of
+bwa's uniform shape and scores too large for its row-max key stay on the CPU.
+
+`bwa-mem4 mem` uses it only when built with `--features metal` and run with `BWA4_GPU=metal`. Each
+extension call gives the GPU its longest `BWA4_GPU_SHARE` (default 0.25) of the jobs and the NEON
+kernels the rest, all inside the fixed `-K` batch. A worker that finishes first **never waits**: it
+takes the GPU's jobs back from the far end, 64 at a time, until the GPU is done, and the GPU's
+results are used only for what it has not reached (#57, without the EMA). A GPU error recomputes on
+the CPU. `BWA4_GPU_VERIFY` recomputes every GPU result with `ksw_extend2` and panics on a mismatch.
+
+**Identity.** The five `assert_backend_*` gates; 24 random batches of ~1 000 jobs covering every
+bucket, narrow bands, z-drop, `h0 <= 0` and the qlen > 255 fallback; the hybrid at shares 0.3 and
+0.97 (the second forces the CPU to race the GPU through most of its share); and GIAB HG002 2M pairs
+against GRCh38, `-K 100000000`: PE md5 `42e1a795...` equal to bwa-mem2 2.3's at shares 0.15, 0.25,
+0.4 and 1.0.
+
+**Kernel throughput**, M4 Max (40-core GPU), synthetic 150 bp extension jobs (query 1-150, target
+query + 20-100, 3% mismatches), GPU kernel time after a sustained warm-up:
+
+| jobs per call | 1 024 | 4 096 | 8 192 | 32 768 |
+|---|---|---|---|---|
+| this kernel, Gcell/s | 44 | 78 | 85 | 92 |
+| August one-thread-per-job kernel | | | 9.1 (10.8k jobs) | 22.4 |
+| this kernel, 16 workers submitting at once (aggregate) | 8.6 | 24 | 38 | 65 |
+| NEON, 16 threads, same jobs | 67 | 160 | 210 | 270 |
+
+The layout fixed what it was meant to fix: 4x the August kernel at 32k jobs and 9x at production
+sizes. Two host details were worth as much as the kernel: the eight query-length buckets must be
+dispatched **concurrently** (a serial encoder made each wait for the previous bucket's longest job,
+2-3x at 1k-8k jobs), and the GPU must be measured warm, since it clocks down between bursts. The
+reopen bar of 150 Gcell/s at production sizes is still missed by half. Counted per cell, the int32
+recurrence costs ~45 GPU lane-operations where NEON u8 spends about half a vector instruction, so
+on this machine the GPU reaches about a quarter to a third of the 16 CPU cores on the same work.
+
+**End to end**, GIAB 2M PE, `-t12`, three interleaved rounds, load average 10-16 from other work on
+the host (means; every run md5-identical to bwa-mem2):
+
+| run | wall | user CPU |
+|---|---|---|
+| PE `-t12`, CPU only | 10.76 s | 124.1 s |
+| PE `-t12`, GPU share 0.15 | 10.29 s | 119.1 s |
+| PE `-t12`, GPU share 0.25 | 10.21 s (-5.1%) | 117.8 s (-5.1%) |
+| PE `-t12`, GPU share 0.40 | 10.58 s | 121.8 s |
+| SE `-t12`, CPU only | 4.40 s | 45.9 s |
+| SE `-t12`, GPU share 0.25 | 4.15 s (-5.7%) | 42.5 s (-7.4%) |
+| PE `-t16`, CPU only | 10.75 s | 146.3 s |
+| PE `-t16`, GPU share 0.25 | 11.25 s (+4.7%) | 146.8 s |
+
+The first `-t16` pair ran with a load average of 19-28, with the 16 cores oversubscribed. That GPU
+path allocated its buffers on every call, which cost +1 to +1.7 s of system time, and together with
+packing the jobs this host work cost about what the GPU saves.
+
+**After reusing the buffers** (a pool of shared buffers, one per call, returned when the GPU is done), GIAB 2M
+PE, three interleaved rounds, load average 12-31 (means; every run md5-identical to bwa-mem2):
+
+| run | wall | user CPU | system |
+|---|---|---|---|
+| PE `-t12`, CPU only | 10.84 s | 121.4 s | 4.32 s |
+| PE `-t12`, GPU share 0.25 | 10.50 s (-3.1%) | 117.4 s (-3.3%) | 4.77 s |
+| PE `-t16`, CPU only | 10.91 s | 130.0 s | 4.97 s |
+| PE `-t16`, GPU share 0.25 | 10.17 s (-6.8%) | 126.8 s (-2.5%) | 5.57 s |
+
+With the pool, the GPU path costs +0.5 to +0.6 s of system time, where it cost +1 to +1.7 s before,
+and `-t16` now gains too: the GPU won 3 of 3 rounds. The `-t12` gain is smaller than in the first
+table, but this run had twice the host load. The honest summary is 3-7% of wall at `-t12` and
+`-t16`, and every run identical.
+
+**Mate rescue on the GPU too (2026-11-18).** The larger DP share, `rescue_band::Work::run`, now
+has a GPU path as well. What runs there is the band pass of a pruned rescue job: one band of
+diagonals of the window, whose best score, its row, the first column reaching it and every row's
+maximum are merged into the parent job on the CPU.
+
+* **The contract** is `bwa_neon::offload::band_reference`, the NEON band cell for one lane without
+  group widening (gaps open from `G = max(diag + s, E)`, u8-saturating at 0). It is pinned to the
+  NEON kernel by a test (3000 random bands: N, pad columns, `thr`, bands past either end of the
+  query), and the GPU kernel is pinned to it field for field and row for row. Merging a lane into
+  its parent is a max (row maxima) and a lexicographic max (`(score, -te, -qe)`), so which lanes ran
+  where cannot move a byte. The end-to-end gate runs `batched_mate_rescue` (and its lazy form) with
+  the GPU hook registered against `ksw_align2` on the full window; a `BWA4_GPU_VERIFY` run on GIAB 2M
+  rechecks every GPU band against the reference.
+* **Geometry: query columns, not diagonals.** The first kernel gave lanes diagonals and took bands
+  up to 256 wide; it got 11% of the cells. Counted as rows x width, 2.8 T of the "cells" are in
+  bands wider than 1024 diagonals (1.28 M of 7.4 M bands, nearly whole windows), but the CPU kernel
+  computes only each row's live diagonals, at most the padded query: 362 G cells in all. So the
+  GPU kernel gives each lane query columns (`C = quanta / 16`), and the band only bounds a row's
+  columns, `r + o - w + 1 <= j <= r + o`. Diagonal from `j - 1`, E from `j`, F an exact exclusive
+  prefix max (`h0` does not read F): the extension kernel's layout, and every band fits whatever
+  its width.
+* **Batching across workers.** One 1400-row band takes 1.8 ms on the GPU (1.3 us a row, latency
+  bound), so throughput needs many in flight: 31 Gcell/s at 256 bands, 101 at 1024, 126 at 4096. A
+  call holds ~150. And command buffers barely overlap on this GPU, even from separate queues: 8
+  batches of 256 in flight take 8.0 ms, against 1.8 ms for one. So each call's bands are staged,
+  and whatever is staged leaves as one command buffer whenever fewer than two are on the GPU; a
+  call whose bands the CPU took back entirely is cancelled before it is sent.
+* **The split.** The GPU takes the widest bands of a call, up to `BWA4_GPU_BAND_SHARE` of its live
+  cells; the worker runs the rest, then takes the GPU's bands back from the wide end, 16 at a time,
+  until the GPU is done. At share 0.4 the GPU delivered 109 G of the 362 G cells and the CPU took
+  27 G back; the CPU band kernel's time fell from 20.5 s to 16.3 s.
+
+**End to end it is within noise.** GIAB 2M PE, every run md5-identical to bwa-mem2 (42 runs,
+plus the verify run). The host was shared with another session's benchmarks the whole night (load
+average 10 to 92), so only the rounds run at load 10-14 count:
+
+| run (user CPU, wall) | extension only | + bands 0.25 | + bands 0.40 |
+|---|---|---|---|
+| PE `-t16`, round at load 10-13 | 127.4 s, 11.64 s | 123.2 s, 10.44 s | 122.2 s, 11.43 s |
+| PE `-t16`, round at load 11-14 | 118.8 s, 10.18 s | | 117.6 s, 9.35 s |
+| PE `-t12`, round at load 10-12 | 110.9 s, 9.49 s | 111.7 s, 9.59 s | 110.6 s, 9.51 s |
+
+So 1-4% of CPU at `-t16`, nothing at `-t12`, and no wall gain that survives the noise. Share 0.7
+was worse in every round. The bands the GPU takes are the widest, which the CPU runs best; the
+narrow ones it keeps run at 15.5 Gcell/s instead of 17.6. `BWA4_GPU_BAND_SHARE` therefore
+defaults to 0: the path is there, gated and identical, and off.
+
+**Decision.** Kept, opt-in, off by default. It is the first GPU attempt here that gains at
+`-t16`, and it costs nothing when unused. It is not a reason to change the default: the
+gain is the size of the extension stage's share. The cooperative rescue kernel is now built
+too (above) and does not change that on this machine: what is left is a discrete GPU or a DP share
+back above ~45%. CUDA and ROCm
+are not built: nothing here can test them, and the layout and the co-scheduler carry over as they
+are (int32 first; DPX `s16x2` only on sm_90 and sm_120).
+
 The 2026-08-08/09 research into whether a GPU can accelerate this aligner while keeping the SAM
 bytes identical to bwa-mem2, and what it would take to build. It lived as GitHub issues #52 to #57
 until 2026-08-18; the issues are closed and the plan is here, for the same reason the kernel
 research moved in `kernel-ceiling-and-dead-ends.md`: a plan nobody can find is not a plan, and an
 issue tracker is where documents go to be forgotten. **Closing those issues was a filing decision
-and not a rejection.** Nothing here has been refuted; none of it has been built either.
+and not a rejection.** It has since been built three times (July, August, November); the status
+section above says which of its numbers the measurements refuted.
 
 Read the first section for the number that decides whether any of this is worth doing (2.45x, and
 an integrated GPU already reaches it), then the prerequisites, then the barrier that must exist
@@ -80,7 +219,7 @@ Notre contrat de sortie coute ~1,6x le score seul (mesure : 15,75 operations par
 
 1. **Aucun flottant, nulle part.** CUDASW++4.0 tire ses 5,01 TCUPS sur L40S en `half2`. Notre recurrence est en entiers satures ; un `half` ne reproduit pas la saturation a 255 ni les egalites exactes. Les seuls types admissibles sont `int32`, les octets satures SIMD-dans-le-registre (`__vaddus4` / `__vsubus4` / `__vmaxu4`), et `s16x2` avec DPX.
 2. **Le tri des regions ne va pas sur GPU.** La permutation de `ks_introsort` est observable : `mem_sort_dedup_patch` trie sur `re` seul puis tue, parmi des regions a egalite, celle que le tri a mise en premier. Remplacer par pdqsort change le md5 du SAM, c'est verifie. Un tri GPU (radix, bitonic) change la permutation par definition.
-3. **Les egalites d'argmax.** Le noyau met a jour la colonne avec un `>` strict : le **premier** maximum gagne. Tout portage doit refaire ce test dans ce sens.
+3. **Les egalites d'argmax : quatre regles, pas une.** Le rescue garde le **premier** maximum (`>` strict). L'extension (`ksw_extend2`) en a trois autres : dans une ligne, la **derniere** colonne qui atteint le max gagne (`mj = m > h ? mj : j`) ; entre lignes, la **premiere** ligne gagne (`>` strict), et `max_off` ne bouge que sur une ligne strictement meilleure ; pour `gscore`, la **derniere** ligne gagne (`gscore <= h1`). Tout portage doit refaire chaque test dans son sens (`sw.rs:388-439`, `lib.rs:600-601`).
 4. **La boucle de reprise de bande reste au CPU.** `across.rs` execute les rounds `w`, puis `2w`, avec un test d'acceptation sur `max_off` et une requeue des jobs non converges. Le GPU calcule, le CPU decide. Cette structure est deja exactement celle que veut un GPU : deux passes, la seconde sur les survivants.
 
 ### 4. La concurrence, pour situer la cible
@@ -219,9 +358,9 @@ CUDASW++4.0 atteint 5,01 TCUPS sur L40S en `half2` et 1,94 sur A100 en `half2`. 
 
 **Test :** un `static_assert` de type dans le noyau, plus une relecture du PTX / de l'IR Metal cherchant toute instruction flottante dans la boucle interne.
 
-#### 2. L'egalite d'argmax : le premier maximum gagne
+#### 2. Les egalites d'argmax : quatre regles
 
-Le noyau NEON met a jour la colonne par `col = bsl(vcgtq(h, imax), j, col)`, c'est-a-dire un `>` **strict** : a egalite, la colonne deja enregistree est conservee, donc **le premier maximum rencontre gagne**. Un portage qui ecrit `>=` produit des `te`/`qe` differents sur les repetitions parfaites, ou les egalites sont la norme et pas l'exception.
+Le noyau de rescue met a jour la colonne par `col = bsl(vcgtq(h, imax), j, col)`, c'est-a-dire un `>` **strict** : a egalite, la colonne deja enregistree est conservee, donc **le premier maximum rencontre gagne**. L'extension fait l'inverse dans une ligne (`$cge`, non strict, `ksw.cpp:491` : la **derniere** colonne gagne), garde la **premiere** ligne entre lignes (`>` strict, et `max_off` ne bouge qu'avec elle), et la **derniere** ligne pour `gscore` (`gscore <= h1`). Un portage qui inverse l'une de ces quatre comparaisons produit les memes scores et des `te`/`qe`/`gtle` differents sur les repetitions parfaites, ou les egalites sont la norme et pas l'exception (`sw.rs:388-439`, `lib.rs:600-601`).
 
 **Test :** un generateur qui produit des cibles periodiques (`ACGTACGTACGT...`) contre des requetes en phase, ou tous les maxima sont a egalite. Comparer `te`, `qe`, `te2` a l'implementation scalaire.
 

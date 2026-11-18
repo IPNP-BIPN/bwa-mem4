@@ -25,6 +25,12 @@ the literature offers, and the interesting question is what survives it.
 ideas that would matter most (QuadRank's smaller rank structure, WFA's cell count) are both already
 on file with the number or the blocker that stops them.
 
+GPU and other accelerators (CUDA, ROCm, Metal, FPGA, PIM; GPU-kallisto, Accelign, GASAL2, G-ALN,
+WGSExtract, Parabricks and the rest) were surveyed on 2026-11-17 in
+[gpu-research-2026-11.md](gpu-research-2026-11.md). What came out of it, a 16-lane-per-job Metal
+extension kernel run as an opt-in co-processor, is measured in the first section of
+[gpu-plan.md](gpu-plan.md): byte-identical, 3-7% of wall at `-t12` and `-t16`.
+
 ## Where our own numbers say the remaining upside is
 
 The x86 profile changed the picture more than the literature did.
