@@ -81,7 +81,8 @@ unsafe impl std::alloc::GlobalAlloc for MiMalloc {
 /// mimalloc returns freed pages to the OS a second after they empty (`purge_delay`), and the
 /// next chunk faults them back in: on Linux that is `MADV_DONTNEED` plus a zeroed page per touch,
 /// measured at 1.8% of the cycles on a Neoverse N2 (0.5% on an M4), for +8% peak RSS on chr21 and
-/// none on a human index. Never purging keeps them; `MIMALLOC_PURGE_DELAY` still overrides.
+/// none on a human index. Never purging keeps them (`mem` only); `MIMALLOC_PURGE_DELAY` still
+/// overrides.
 #[cfg(feature = "mimalloc")]
 fn keep_freed_pages() {
     extern "C" {
@@ -206,11 +207,16 @@ fn main() -> anyhow::Result<()> {
     // reads the environment (which allocates) and the allocator must never do that itself; every
     // allocation before this line goes uncounted, which is clap's parsing and nothing else.
     bwa_mem4::stage_alloc::init();
-    #[cfg(feature = "mimalloc")]
-    keep_freed_pages();
     match Cli::parse().cmd {
+        // `index` keeps mimalloc's purge: each stage frees arrays the size of the genome (the
+        // FASTA, the forward codes, a whole plain index before the `--meth` one), and kept they
+        // sit under the suffix array's peak.
         Cmd::Index(args) => cmd_index::run(args),
-        Cmd::Mem(args) => cmd_mem::run(args, &argv),
+        Cmd::Mem(args) => {
+            #[cfg(feature = "mimalloc")]
+            keep_freed_pages();
+            cmd_mem::run(args, &argv)
+        }
         Cmd::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
