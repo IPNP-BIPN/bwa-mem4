@@ -415,6 +415,29 @@ pub mod cells {
                 BAND_OTHER_NS.load(Ordering::Relaxed) as f64 / 1e9,
                 BAND_R2.load(Ordering::Relaxed),
             );
+            {
+                use crate::offload::probe::*;
+                let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+                eprintln!(
+                    "[matesw] band cells by width <=64/128/256/512/1024/wider: {:?} G, bands {:?}",
+                    BY_W.iter()
+                        .map(|a| ld(a) / 1_000_000_000)
+                        .collect::<Vec<_>>(),
+                    N_BY_W.iter().map(ld).collect::<Vec<_>>()
+                );
+                if ld(&SENT) > 0 {
+                    eprintln!(
+                        "[matesw] band device: {} calls, {} cells sent, {} delivered, {} taken back; \
+                         submit {:.2}s, wait {:.2}s",
+                        ld(&CALLS),
+                        ld(&SENT),
+                        ld(&DELIVERED),
+                        ld(&STOLEN),
+                        ld(&SUBMIT_NS) as f64 / 1e9,
+                        ld(&WAIT_NS) as f64 / 1e9,
+                    );
+                }
+            }
             eprintln!(
                 "[matesw] prune: {fail} proven failing, {hull} narrowed (rows kept {:.1}%), {band} banded, \
                  {full} full, of {} filtered, in {:.2}s CPU ({:.2} us/job)",

@@ -3342,7 +3342,8 @@ soit** `-t` : au-dela de `-t8` c'est le GPU qui est le chemin critique, et lui d
 gros deplace le plafond sans le lever. La projection etait faite a partir du debit a saturation
 (22,4 Gcell/s) sans tenir compte du fait que saturer le noyau et saturer la machine sont deux
 choses. Ce qui leverait le plafond est le paquetage `uchar4` (plafond mesure ~330 Gcell/s), pas la
-taille de lot.
+taille de lot. (Refute plus loin dans ce fichier : le `uchar4` mesure 0,97x, `4e6b750`. Ce qui l'a
+leve en novembre est la disposition a 16 voies par job, voir `docs/gpu-plan.md`.)
 
 **Le chiffre a retenir** est la colonne CPU-s, stable a **-20 % a tous les `-t`** : le GPU prend un
 cinquieme du travail CPU. Sur une machine dediee ou seul le mur compte, cela ne vaut que jusqu'a
@@ -3359,25 +3360,29 @@ au coeur-heure, machine partagee), et aucun n'est le cas d'usage vise. Les crate
 
 **Pourquoi Parabricks n'est pas un contre-exemple (2026-08-09).** Le resultat ci-dessus (-20 % de
 CPU, bascule vers `-t8`) est ce qu'on attend d'un GPU **integre** avec **un seul etage porte**, et il
-ne contredit pas les 20-25 min par genome 30x annoncees sur 8x A100 :
+ne contredit pas les 20-25 min par genome 30x annoncees sur 8x A100 (chiffre d'epoque ; la table
+v4.8.0 de Parabricks donne 5,65 min sur 4 RTX PRO 6000) :
 
 1. **Materiel.** Memoire unifiee et pas de tensor core utile en DP entier, contre du HBM a 2-3 TB/s.
    L'ecart de debit brut est d'un a deux ordres de grandeur, donc leur bascule n'existe pas.
 2. **Amdahl.** Ici seule l'extension part sur le GPU ; seeding FM, chaining et sortie SAM restent
    CPU. Le profil dit que le seeding pese **41 %** du busy et l'extension 23 % : meme une extension
    gratuite ne rendrait que 23 %. Parabricks porte la chaine entiere (alignement, tri, duplicats,
-   BQSR) en VRAM sans aller-retour disque, et une bonne part de leur gain vient de la fusion des
-   etages, pas du noyau.
+   BQSR), et une bonne part de leur gain vient de la fusion des etages, pas du noyau. Pas toute en
+   VRAM toutefois : le CIGAR est calcule par le CPU par defaut, a 16 threads par GPU, avec un chemin
+   de reprise CPU (fq2bam v4.8.0).
 3. **Ce qu'ils vendent** est le delai de restitution, pas le debit par dollar. Une machine a 200 k$
    perd souvent en $/genome et gagne en heures, ce qui est le bon arbitrage en clinique.
-4. **Occupancy.** Leur lot est de l'ordre du million de lectures. Le notre est dimensionne par
-   l'ordonnanceur de l'hote, ce qui est precisement le plafond mesure ci-dessus.
-5. **La contrainte qu'ils n'ont pas.** Parabricks est *equivalent* a BWA-MEM, pas *identique* : ils
-   divergent sur les egalites de score. Nous n'avons pas cette liberte, ce qui interdit la
-   reassociation, les heuristiques approchees et la demi-precision. Elle vaut cher en perf.
+4. **Occupancy.** Notre lot est dimensionne par l'ordonnanceur de l'hote, ce qui est precisement
+   le plafond mesure ci-dessus. (La taille de lot de Parabricks n'est pas documentee.)
+5. **La contrainte qu'ils n'ont pas.** Parabricks se dit *equivalent* a bwa 0.7.17 (v4.8.0 ;
+   « identique » a 0.7.15 jusqu'a v4.7.1), jamais compare a bwa-mem2. Les ecarts documentes
+   viennent de `-K`, de l'ordre et de l'arrondi du tag PA, du tag MC et de l'ordre des non-mappees.
+   Nous n'avons pas cette liberte, ce qui interdit la reassociation, les heuristiques approchees et
+   la demi-precision. Elle vaut cher en perf.
 
-S'en approcher demanderait de porter aussi le chaining et le seeding et d'accepter du
-non-determinisme, c'est-a-dire de renoncer au critere d'acceptation du projet. Ce n'est pas un
+S'en approcher demanderait de porter aussi le chaining et le seeding et d'accepter des sorties
+seulement equivalentes, c'est-a-dire de renoncer au critere d'acceptation du projet. Ce n'est pas un
 arbitrage de performance, c'est un changement de projet.
 
 Un chiffre manque pour completer le dossier : le debit d'**un cœur NEON** sur le noyau d'extension.
@@ -3392,7 +3397,17 @@ coup est ecrit ci-dessus : le paquetage `uchar4`, pas une taille de lot.
 
 ## Phase 9b (GPU) : abandonnee, backend retire
 
-Un backend Metal a existe et a ete **supprime** (`c20867d`). Raison : sur un genome entier le kernel
+**Mise a jour 2026-11-17.** Le profil ci-dessous (« ~4 % SW, ~78 % seeding ») date de l'ere index
+regional et wgsim. Sur le binaire courant (`24f9e1b`, 2026-11-14) le DP pese ~35 % des cycles
+(rescue 19,3 %, extension 15,5 %), soit un plafond de ~1,54x pour tout offload DP. Un troisieme
+backend Metal existe depuis le 2026-11-17, en coprocesseur d'extension opt-in (`crates/bwa-metal`,
+`--features metal`, `BWA4_GPU=metal`) : octet-identique, 3-7 % de mur en moins sur
+GIAB `-t12` et `-t16` (`-t16` gagne depuis la reutilisation des buffers). Le
+rescue (bandes) a aussi son chemin GPU depuis le 2026-11-18 (`BWA4_GPU_BAND_SHARE`, 0 par defaut) :
+identique, mais 1-4 % de CPU a `-t16` et rien a `-t12`, dans le bruit. Statut, mesures et decision : `docs/gpu-plan.md`, premiere
+section.
+
+Un backend Metal a existe et a ete **supprime** (`9228eaf`). Raison : sur un genome entier le kernel
 Smith-Waterman fait **~4 %** du temps, le seeding ~78 %. Amdahl plafonne tout offload SW a quelques
 pourcents, et chaque backend ajoute une surface d'octet-identite a prouver contre le scalaire. Le
 shader Metal avait justement livre un vrai bug (il ouvrait les gaps depuis `H` au lieu de `M`) parce
@@ -3409,8 +3424,9 @@ a son propre mappeur materiel), donc « octet-identique a bwa-mem2 » **et** « 
 contraintes en tension.
 
 **Cadrage retenu.** La cible est **le plus rapide des aligneurs octet-identiques a bwa-mem2**, pas
-DRAGEN. La voie GPU est fermee pour une raison independante de DRAGEN : le kernel SW ne fait que ~4 %
-du temps genome, donc il n'y a rien a offloader (voir phase 9b). Une « classe DRAGEN » exigerait de
+DRAGEN. La voie GPU etait fermee pour une raison independante de DRAGEN : le kernel SW ne faisait que
+~4 % du temps genome a l'ere de l'index regional (~35 % de DP sur le binaire de novembre, voir phase
+9b). Une « classe DRAGEN » exigerait de
 porter le **seeding** sur accelerateur, ce qui est un autre projet.
 
 ## Les deux fichiers d'une paire sont lus en parallele (2026-08-11)
@@ -5394,6 +5410,12 @@ passante, ni l'emission d'acces, ni le gather de query**.
    2026-08-27, 100,83-101,07 s contre 102,00-104,16 s.
 4. **La veine du travail duplique est epuisee**, et le fichier des impasses porte tout ce qui a ete
    essaye et refuse, avec les chiffres. Ne pas re-fouiller sans une donnee nouvelle.
+5. **Le GPU (2026-11-17) : construit, opt-in, gele.** `crates/bwa-metal`, extension a 16 voies par
+   job, octet-identique, 3-7 % de mur en moins sur GIAB `-t12` et `-t16` (M4 Max). Le noyau fait 85-92 Gcell/s aux
+   tailles de lot de production, la moitie de la barre de 150. A rouvrir seulement avec une machine
+   cible a GPU discret ou une part DP revenue au-dessus de ~45 % du profil (le noyau de rescue
+   cooperatif, construit le 2026-11-18, reste dans le bruit). Le profil de reference est celui du 2026-11-14 (`24f9e1b`,
+   M4 humain PE) : rescue 19,3 %, extension u8 15,5 %, SMEM et SA a parite avec le fork.
 
 Etat des courses contre fg-labs/bwa-mem3, entrelacees, sortie octet-identique a bwa-mem2 :
 

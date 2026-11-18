@@ -1,0 +1,36 @@
+[package]
+name = "bwa-mem4-metal"
+description = "Metal backend for bwa-mem4's seed extension (ksw_extend2) and mate-rescue bands, byte-identical to the CPU kernels. Apple Silicon, off by default."
+readme = "../../README.md"
+keywords = ["bioinformatics", "alignment", "genomics", "gpu", "metal"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "bwa_metal"
+
+[dependencies]
+bwa-extend = { workspace = true }
+
+# Optional and off by default, like `libsais-rs` and `caps-sa` for the indexer. Without the `metal`
+# feature (or off macOS) this crate has no system dependency and `MetalExtend::new` returns `None`.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
+# The mate-rescue band hook (`bwa_neon::offload`) this crate implements.
+bwa-neon = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The CPU backend the throughput probe compares against.
+bwa-neon = { workspace = true }
+
+[features]
+default = []
+metal = ["dep:metal", "dep:bwa-neon"]
+
+[lints]
+workspace = true

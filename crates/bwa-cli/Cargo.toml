@@ -26,6 +26,8 @@ bwa-io = { workspace = true }
 bwa-index = { workspace = true }
 bwa-mem = { workspace = true }
 bwa-neon = { workspace = true }
+# The GPU extension co-processor, behind the `metal` feature (macOS only, off by default).
+bwa-metal = { workspace = true, optional = true }
 clap = { workspace = true }
 libmimalloc-sys = { workspace = true, optional = true }
 anyhow = { workspace = true }
@@ -87,6 +89,15 @@ capsa = ["bwa-index/capsa"]
 #     brew install libomp
 #     cargo build --release -p bwa-mem4 --features libsais-c-omp
 libsais-c-omp = ["bwa-index/libsais-c-omp"]
+
+# Seed extension on the Apple GPU next to the NEON kernels (`crates/bwa-metal`), for `BWA4_GPU=metal`
+# runs. Off by default: it adds the `metal` crate and a run-time MSL compile, for 3-7% of wall at
+# `-t12` and `-t16` on an M4 Max (docs/gpu-plan.md, first section). Without the variable
+# the binary does not touch the GPU; with it, output is unchanged byte for byte (every job's result
+# is the GPU's or the CPU's, both held to ksw_extend2 by the same gates).
+#
+#     cargo build --release -p bwa-mem4 --features metal
+metal = ["dep:bwa-metal", "bwa-metal/metal"]
 
 # Fast gzip input passthrough. ON by default through `bwa-io`'s own default; this entry exists so
 # the binary's build line can still name it, and so `--no-default-features` has something to turn
