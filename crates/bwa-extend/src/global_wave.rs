@@ -15,6 +15,7 @@
 //! in-band cells, so the 16-lane kernel takes bands of [`WIDE_MIN`] and up, which need two 8-lane
 //! chunks per diagonal, and the 32-lane one bands of [`wide512_min`] and up.
 
+use bwa_core::simd::*;
 #[cfg(target_arch = "x86_64")]
 use sse::*;
 #[cfg(target_arch = "aarch64")]
@@ -25,40 +26,46 @@ use std::arch::aarch64::*;
 type Table = uint8x16x2_t;
 #[cfg(target_arch = "aarch64")]
 unsafe fn load_table(tab: &[u8; 32]) -> Table {
-    uint8x16x2_t(vld1q_u8(tab.as_ptr()), vld1q_u8(tab.as_ptr().add(16)))
+    uint8x16x2_t(ld_u8(tab, 0), ld_u8(tab, 16))
 }
 
 /// Lane `l`'s score `mat[t[l] * 5 + q[7 - l]]`, sign-extended: `tp` and `qp` point at 8 bytes.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> int16x8_t {
-    let idx = vmla_u8(vrev64_u8(vld1_u8(qp)), vld1_u8(tp), vdup_n_u8(5));
-    vmovl_s8(vreinterpret_s8_u8(vqtbl2_u8(*table, idx)))
+    // SAFETY: the caller upholds this function's `# Safety` contract.
+    unsafe {
+        let idx = vmla_u8(vrev64_u8(vld1_u8(qp)), vld1_u8(tp), vdup_n_u8(5));
+        vmovl_s8(vreinterpret_s8_u8(vqtbl2_u8(*table, idx)))
+    }
 }
 
 /// The eight direction bytes of `d` (each lane `< 64`) at `p`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn store_dirs(p: *mut u8, d: int16x8_t) {
-    vst1_u8(p, vmovn_u16(vreinterpretq_u16_s16(d)));
+    // SAFETY: the caller upholds this function's `# Safety` contract.
+    unsafe {
+        vst1_u8(p, vmovn_u16(vreinterpretq_u16_s16(d)));
+    }
 }
 
 /// SSE4.1 under the NEON names the kernel uses; masks are all-ones / all-zeros int16 lanes.
 #[cfg(target_arch = "x86_64")]
 mod sse {
+    use bwa_core::simd::*;
     pub(super) use std::arch::x86_64::*;
     type V = __m128i;
     macro_rules! shim {
         ($($name:ident($($a:ident: $t:ty),*) -> $r:ty $body:block)*) => {$(
             #[inline]
             #[target_feature(enable = "sse4.1")]
-            pub(super) unsafe fn $name($($a: $t),*) -> $r $body
+            pub(super) fn $name($($a: $t),*) -> $r $body
         )*};
     }
     shim! {
         vdupq_n_s16(x: i16) -> V { _mm_set1_epi16(x) }
-        vld1q_s16(p: *const i16) -> V { _mm_loadu_si128(p.cast()) }
-        vst1q_s16(p: *mut i16, v: V) -> () { _mm_storeu_si128(p.cast(), v) }
+        ld_s16(s: &[i16], i: usize) -> V { ld128(s, i) }
         vaddq_s16(a: V, b: V) -> V { _mm_add_epi16(a, b) }
         vsubq_s16(a: V, b: V) -> V { _mm_sub_epi16(a, b) }
         vmulq_s16(a: V, b: V) -> V { _mm_mullo_epi16(a, b) }
@@ -72,17 +79,30 @@ mod sse {
         vandq_u16(a: V, b: V) -> V { _mm_and_si128(a, b) }
         vorrq_s16(a: V, b: V) -> V { _mm_or_si128(a, b) }
     }
+    /// # Safety
+    /// `p` valid for one vector read; the CPU has `sse4.1`.
+    #[inline]
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn vld1q_s16(p: *const i16) -> V {
+        // SAFETY: the caller's contract.
+        unsafe { _mm_loadu_si128(p.cast()) }
+    }
+    /// # Safety
+    /// `p` valid for one vector write; the CPU has `sse4.1`.
+    #[inline]
+    #[target_feature(enable = "sse4.1")]
+    pub(super) unsafe fn vst1q_s16(p: *mut i16, v: V) {
+        // SAFETY: the caller's contract.
+        unsafe { _mm_storeu_si128(p.cast(), v) }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 type Table = (__m128i, __m128i);
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
-unsafe fn load_table(tab: &[u8; 32]) -> Table {
-    (
-        _mm_loadu_si128(tab.as_ptr().cast()),
-        _mm_loadu_si128(tab.as_ptr().add(16).cast()),
-    )
+fn load_table(tab: &[u8; 32]) -> Table {
+    (ld128(tab, 0), ld128(tab, 16))
 }
 
 /// As the NEON one: indices `t * 5 + q < 25` look up both halves with `pshufb`, which reads the
@@ -91,25 +111,31 @@ unsafe fn load_table(tab: &[u8; 32]) -> Table {
 #[inline]
 #[target_feature(enable = "sse4.1")]
 unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> __m128i {
-    let rev = _mm_setr_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -1, -1, -1, -1, -1, -1, -1);
-    let q = _mm_shuffle_epi8(_mm_loadl_epi64(qp.cast()), rev);
-    let t = _mm_cvtepu8_epi16(_mm_loadl_epi64(tp.cast()));
-    let i16x = _mm_add_epi16(_mm_mullo_epi16(t, _mm_set1_epi16(5)), _mm_cvtepu8_epi16(q));
-    let idx = _mm_packus_epi16(i16x, i16x);
-    let hi = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));
-    let s = _mm_blendv_epi8(
-        _mm_shuffle_epi8(table.0, idx),
-        _mm_shuffle_epi8(table.1, idx),
-        hi,
-    );
-    _mm_cvtepi8_epi16(s)
+    // SAFETY: the caller upholds this function's `# Safety` contract.
+    unsafe {
+        let rev = _mm_setr_epi8(7, 6, 5, 4, 3, 2, 1, 0, -1, -1, -1, -1, -1, -1, -1, -1);
+        let q = _mm_shuffle_epi8(_mm_loadl_epi64(qp.cast()), rev);
+        let t = _mm_cvtepu8_epi16(_mm_loadl_epi64(tp.cast()));
+        let i16x = _mm_add_epi16(_mm_mullo_epi16(t, _mm_set1_epi16(5)), _mm_cvtepu8_epi16(q));
+        let idx = _mm_packus_epi16(i16x, i16x);
+        let hi = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));
+        let s = _mm_blendv_epi8(
+            _mm_shuffle_epi8(table.0, idx),
+            _mm_shuffle_epi8(table.1, idx),
+            hi,
+        );
+        _mm_cvtepi8_epi16(s)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "sse4.1")]
 unsafe fn store_dirs(p: *mut u8, d: __m128i) {
-    _mm_storel_epi64(p.cast(), _mm_packus_epi16(d, d));
+    // SAFETY: the caller upholds this function's `# Safety` contract.
+    unsafe {
+        _mm_storel_epi64(p.cast(), _mm_packus_epi16(d, d));
+    }
 }
 
 /// Int16 "minus infinity": its own decrement cannot wrap and no feasible score reaches it ([`safe`]).
@@ -313,7 +339,7 @@ macro_rules! wave_fill {
             unsafe {
                 let table = load_table(&tab);
                 let vminf = vdupq_n_s16(VMINF);
-                let laneid = vld1q_s16(IOTA.as_ptr());
+                let laneid = ld_s16(&IOTA, 0);
                 let (hb, eb, fb) = (sc.hb.as_mut_ptr(), sc.eb.as_mut_ptr(), sc.fb.as_mut_ptr());
                 let (tp, qp, z) = (
                     sc.tpad.as_ptr().add(PAD),
@@ -441,19 +467,19 @@ wave_fill!(
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use super::{Scratch, IOTA, PAD, VMINF};
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
     type V = __m256i;
     macro_rules! shim {
         ($($name:ident($($a:ident: $t:ty),*) -> $r:ty $body:block)*) => {$(
             #[inline]
             #[target_feature(enable = "avx2")]
-            unsafe fn $name($($a: $t),*) -> $r $body
+            fn $name($($a: $t),*) -> $r $body
         )*};
     }
     shim! {
         vdupq_n_s16(x: i16) -> V { _mm256_set1_epi16(x) }
-        vld1q_s16(p: *const i16) -> V { _mm256_loadu_si256(p.cast()) }
-        vst1q_s16(p: *mut i16, v: V) -> () { _mm256_storeu_si256(p.cast(), v) }
+        ld_s16(s: &[i16], i: usize) -> V { ld256(s, i) }
         vaddq_s16(a: V, b: V) -> V { _mm256_add_epi16(a, b) }
         vsubq_s16(a: V, b: V) -> V { _mm256_sub_epi16(a, b) }
         vmulq_s16(a: V, b: V) -> V { _mm256_mullo_epi16(a, b) }
@@ -467,14 +493,27 @@ mod avx2 {
         vandq_u16(a: V, b: V) -> V { _mm256_and_si256(a, b) }
         vorrq_s16(a: V, b: V) -> V { _mm256_or_si256(a, b) }
     }
+    /// # Safety
+    /// `p` valid for one vector read; the CPU has `avx2`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn vld1q_s16(p: *const i16) -> V {
+        // SAFETY: the caller's contract.
+        unsafe { _mm256_loadu_si256(p.cast()) }
+    }
+    /// # Safety
+    /// `p` valid for one vector write; the CPU has `avx2`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn vst1q_s16(p: *mut i16, v: V) {
+        // SAFETY: the caller's contract.
+        unsafe { _mm256_storeu_si256(p.cast(), v) }
+    }
 
     type Table = (__m128i, __m128i);
     #[target_feature(enable = "avx2")]
-    unsafe fn load_table(tab: &[u8; 32]) -> Table {
-        (
-            _mm_loadu_si128(tab.as_ptr().cast()),
-            _mm_loadu_si128(tab.as_ptr().add(16).cast()),
-        )
+    fn load_table(tab: &[u8; 32]) -> Table {
+        (ld128(tab, 0), ld128(tab, 16))
     }
 
     /// Lane `l`'s score `mat[t[l] * 5 + q[15 - l]]`, sign-extended: `tp` and `qp` point at 16 bytes.
@@ -482,26 +521,32 @@ mod avx2 {
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> V {
-        let rev = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
-        let q = _mm_shuffle_epi8(_mm_loadu_si128(qp.cast()), rev);
-        let t = _mm_loadu_si128(tp.cast());
-        let t4 = _mm_add_epi8(_mm_add_epi8(t, t), _mm_add_epi8(t, t));
-        let idx = _mm_add_epi8(_mm_add_epi8(t4, t), q);
-        let hi = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));
-        let s = _mm_blendv_epi8(
-            _mm_shuffle_epi8(table.0, idx),
-            _mm_shuffle_epi8(table.1, idx),
-            hi,
-        );
-        _mm256_cvtepi8_epi16(s)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let rev = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+            let q = _mm_shuffle_epi8(_mm_loadu_si128(qp.cast()), rev);
+            let t = _mm_loadu_si128(tp.cast());
+            let t4 = _mm_add_epi8(_mm_add_epi8(t, t), _mm_add_epi8(t, t));
+            let idx = _mm_add_epi8(_mm_add_epi8(t4, t), q);
+            let hi = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));
+            let s = _mm_blendv_epi8(
+                _mm_shuffle_epi8(table.0, idx),
+                _mm_shuffle_epi8(table.1, idx),
+                hi,
+            );
+            _mm256_cvtepi8_epi16(s)
+        }
     }
 
     /// The sixteen direction bytes of `d` (each lane `< 64`) at `p`.
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn store_dirs(p: *mut u8, d: V) {
-        let b = _mm_packus_epi16(_mm256_castsi256_si128(d), _mm256_extracti128_si256::<1>(d));
-        _mm_storeu_si128(p.cast(), b);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let b = _mm_packus_epi16(_mm256_castsi256_si128(d), _mm256_extracti128_si256::<1>(d));
+            _mm_storeu_si128(p.cast(), b);
+        }
     }
 
     wave_fill!(
@@ -521,19 +566,19 @@ mod avx2 {
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use super::{Scratch, IOTA, PAD, VMINF};
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
     type V = __m512i;
     macro_rules! shim {
         ($($name:ident($($a:ident: $t:ty),*) -> $r:ty $body:block)*) => {$(
             #[inline]
             #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-            unsafe fn $name($($a: $t),*) -> $r $body
+            fn $name($($a: $t),*) -> $r $body
         )*};
     }
     shim! {
         vdupq_n_s16(x: i16) -> V { _mm512_set1_epi16(x) }
-        vld1q_s16(p: *const i16) -> V { _mm512_loadu_si512(p.cast()) }
-        vst1q_s16(p: *mut i16, v: V) -> () { _mm512_storeu_si512(p.cast(), v) }
+        ld_s16(s: &[i16], i: usize) -> V { ld512(s, i) }
         vaddq_s16(a: V, b: V) -> V { _mm512_add_epi16(a, b) }
         vsubq_s16(a: V, b: V) -> V { _mm512_sub_epi16(a, b) }
         vmulq_s16(a: V, b: V) -> V { _mm512_mullo_epi16(a, b) }
@@ -547,12 +592,28 @@ mod avx512 {
         vandq_u16(a: V, b: V) -> V { _mm512_and_si512(a, b) }
         vorrq_s16(a: V, b: V) -> V { _mm512_or_si512(a, b) }
     }
+    /// # Safety
+    /// `p` valid for one vector read; the CPU has `avx512bw,avx512vl,avx512dq`.
+    #[inline]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
+    pub(super) unsafe fn vld1q_s16(p: *const i16) -> V {
+        // SAFETY: the caller's contract.
+        unsafe { _mm512_loadu_si512(p.cast()) }
+    }
+    /// # Safety
+    /// `p` valid for one vector write; the CPU has `avx512bw,avx512vl,avx512dq`.
+    #[inline]
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
+    pub(super) unsafe fn vst1q_s16(p: *mut i16, v: V) {
+        // SAFETY: the caller's contract.
+        unsafe { _mm512_storeu_si512(p.cast(), v) }
+    }
 
     /// The 25 scores sign-extended to words (the rest of the 32 bytes are zero).
     type Table = V;
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-    unsafe fn load_table(tab: &[u8; 32]) -> Table {
-        _mm512_cvtepi8_epi16(_mm256_loadu_si256(tab.as_ptr().cast()))
+    fn load_table(tab: &[u8; 32]) -> Table {
+        _mm512_cvtepi8_epi16(ld256(tab, 0))
     }
 
     /// Word `l` is `31 - l`: the permute that reverses the query's 32 lanes.
@@ -566,20 +627,26 @@ mod avx512 {
     #[inline]
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     unsafe fn score_lanes(table: &Table, tp: *const u8, qp: *const u8) -> V {
-        let q = _mm512_permutexvar_epi16(
-            _mm512_loadu_si512(REV.as_ptr().cast()),
-            _mm512_cvtepu8_epi16(_mm256_loadu_si256(qp.cast())),
-        );
-        let t = _mm512_cvtepu8_epi16(_mm256_loadu_si256(tp.cast()));
-        let idx = _mm512_add_epi16(_mm512_add_epi16(_mm512_slli_epi16::<2>(t), t), q);
-        _mm512_permutexvar_epi16(idx, *table)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let q = _mm512_permutexvar_epi16(
+                ld512(&REV, 0),
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(qp.cast())),
+            );
+            let t = _mm512_cvtepu8_epi16(_mm256_loadu_si256(tp.cast()));
+            let idx = _mm512_add_epi16(_mm512_add_epi16(_mm512_slli_epi16::<2>(t), t), q);
+            _mm512_permutexvar_epi16(idx, *table)
+        }
     }
 
     /// The 32 direction bytes of `d` (each lane `< 64`) at `p`.
     #[inline]
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     unsafe fn store_dirs(p: *mut u8, d: V) {
-        _mm256_storeu_si256(p.cast(), _mm512_cvtepi16_epi8(d));
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            _mm256_storeu_si256(p.cast(), _mm512_cvtepi16_epi8(d));
+        }
     }
 
     wave_fill!(
@@ -609,41 +676,44 @@ unsafe fn wave16(
     w: usize,
     lanes: usize,
 ) -> (i32, Vec<u32>) {
-    let (qlen, tlen) = (query.len(), target.len());
-    let maxlen = qlen.max(tlen);
-    if sc.stride < maxlen + 1 + 32 {
-        // Grown, never cleared between calls: no in-band cell reads a value this call did not write
-        // (stale ring lanes are masked by `evalid`/`freset`, LEMMA 7).
-        sc.stride = maxlen + 1 + 32;
-        sc.hb = vec![VMINF; 3 * sc.stride];
-        sc.eb = vec![VMINF; 2 * sc.stride];
-        sc.fb = vec![VMINF; 2 * sc.stride];
-        sc.tpad = vec![0; maxlen + 2 * PAD];
-        sc.qpad = vec![0; maxlen + 2 * PAD];
+    // SAFETY: the caller upholds this function's `# Safety` contract.
+    unsafe {
+        let (qlen, tlen) = (query.len(), target.len());
+        let maxlen = qlen.max(tlen);
+        if sc.stride < maxlen + 1 + 32 {
+            // Grown, never cleared between calls: no in-band cell reads a value this call did not write
+            // (stale ring lanes are masked by `evalid`/`freset`, LEMMA 7).
+            sc.stride = maxlen + 1 + 32;
+            sc.hb = vec![VMINF; 3 * sc.stride];
+            sc.eb = vec![VMINF; 2 * sc.stride];
+            sc.fb = vec![VMINF; 2 * sc.stride];
+            sc.tpad = vec![0; maxlen + 2 * PAD];
+            sc.qpad = vec![0; maxlen + 2 * PAD];
+        }
+        let sdim = tlen + qlen - 1;
+        let zneed = qlen.min(2 * w + 1) * (tlen + qlen) + 64;
+        if sc.z.len() < zneed {
+            sc.z.resize(zneed, 0);
+        }
+        if sc.zoff.len() < sdim {
+            sc.zoff.resize(sdim, 0);
+            sc.zis.resize(sdim, 0);
+        }
+        sc.tpad[PAD..PAD + tlen].copy_from_slice(target);
+        sc.qpad[PAD..PAD + qlen].copy_from_slice(query);
+        #[cfg(target_arch = "x86_64")]
+        let score = match lanes {
+            32 => avx512::fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
+            16 => avx2::fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
+            _ => fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let score = {
+            let _ = lanes;
+            fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w)
+        };
+        (score, traceback(sc, qlen, tlen, w))
     }
-    let sdim = tlen + qlen - 1;
-    let zneed = qlen.min(2 * w + 1) * (tlen + qlen) + 64;
-    if sc.z.len() < zneed {
-        sc.z.resize(zneed, 0);
-    }
-    if sc.zoff.len() < sdim {
-        sc.zoff.resize(sdim, 0);
-        sc.zis.resize(sdim, 0);
-    }
-    sc.tpad[PAD..PAD + tlen].copy_from_slice(target);
-    sc.qpad[PAD..PAD + qlen].copy_from_slice(query);
-    #[cfg(target_arch = "x86_64")]
-    let score = match lanes {
-        32 => avx512::fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
-        16 => avx2::fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
-        _ => fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w),
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let score = {
-        let _ = lanes;
-        fill(sc, qlen, tlen, mat, o_del, e_del, o_ins, e_ins, w)
-    };
-    (score, traceback(sc, qlen, tlen, w))
 }
 
 /// The traceback (LEMMA 10): the scalar's walk over the direction bytes [`wave_fill`] stored,

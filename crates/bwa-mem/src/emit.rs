@@ -16,7 +16,7 @@
 //! fg-labs/bwa-mem3 fixed the second one with a 16-byte `_mm_shuffle_epi8` / `vqtbl1q_u8` lookup
 //! (`src/sam_encode.cpp`, compiled at five ISA tiers and dispatched at runtime) and the first one
 //! by never building a string in the first place. This file does the same two things: integers
-//! written straight into reserved capacity, and SEQ/QUAL 16 bytes per shuffle ([`encode16`]: NEON
+//! formatted in a stack buffer and appended in one copy, and SEQ/QUAL 16 bytes per shuffle ([`encode16`]: NEON
 //! on aarch64, SSSE3 in the x86-64-v3 build, a byte loop elsewhere).
 //!
 //! **Nothing here may change a byte of output.** Every function writes exactly the bytes the code
@@ -41,7 +41,6 @@
 //! | `Vec::reserve` | grows the buffer's capacity ONCE, up front, so the per-byte writes that follow cannot each trigger a reallocation. |
 //! | `extend_from_slice` | appends a whole slice in one `memcpy`, rather than a loop of pushes with a capacity check each. |
 //! | `[u8; N]` on the stack | a fixed-size array living in the function's frame: one encoded block of 16 bytes, appended in one fixed-size copy. |
-//! | `spare_capacity_mut` + `set_len` | writes into the reserved bytes past the end, then declares them part of the vector: how a number's digits land in place with no copy. |
 //! | `const fn` | a function the compiler can evaluate at compile time, here to build a 256-entry lookup table as a constant rather than at startup. |
 //! | `as_chunks::<N>()` / `as_rchunks::<N>()` | a slice as `&[[u8; N]]` blocks from the front / from the back, with the remainder handed back separately. |
 //! | `#[cfg(target_arch = ...)]` + `std::arch` | the per-ISA shuffle in [`encode16`], chosen at compile time; the byte loop is the fallback. |
@@ -60,25 +59,30 @@
 ///   requires.
 #[inline]
 pub fn push_int(out: &mut Vec<u8>, value: i64) {
+    let (buf, total) = int_digits(value);
+    // All 20 bytes, then trimmed: a fixed-size copy, where `buf[..total]` was a `memmove` call.
+    let len = out.len();
+    out.extend_from_slice(&buf);
+    out.truncate(len + total);
+}
+
+/// `value` in decimal: the text is `buf[..total]`. 20 bytes hold `i64::MIN`, 19 digits and a sign.
+#[inline(always)]
+fn int_digits(value: i64) -> ([u8; 20], usize) {
     // `unsigned_abs`, not `abs`: `i64::MIN.abs()` overflows, and TLEN can legitimately be very
     // negative. The sign is remembered separately and written first.
     let negative = value < 0;
     let mut n = value.unsigned_abs();
     let digits = n.checked_ilog10().map_or(1, |d| d as usize + 1);
     let total = digits + usize::from(negative);
-    out.reserve(total);
-    let spare = &mut out.spare_capacity_mut()[..total];
-    if negative {
-        spare[0].write(b'-');
-    }
+    let mut buf = [b'-'; 20];
     // Backward from the end: the loop produces the least-significant digit first. Zero writes one
-    // '0'.
-    for slot in spare[usize::from(negative)..].iter_mut().rev() {
-        slot.write(b'0' + (n % 10) as u8);
+    // '0'; a negative value keeps the '-' in `buf[0]`.
+    for slot in buf[usize::from(negative)..total].iter_mut().rev() {
+        *slot = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    // SAFETY: the `total` bytes past the old length were all written above.
-    unsafe { out.set_len(out.len() + total) };
+    (buf, total)
 }
 
 /// Same as [`push_int`] for a `String`, which the MD:Z and CIGAR builders accumulate into.
@@ -89,9 +93,9 @@ pub fn push_int(out: &mut Vec<u8>, value: i64) {
 /// - `value`: the number to write.
 #[inline]
 pub fn push_int_str(out: &mut String, value: i64) {
-    // SAFETY: `push_int` appends ASCII digits and an optional '-', so the string stays UTF-8. The
-    // checked `from_utf8` cost 0.5G cycles per 2M pairs.
-    push_int(unsafe { out.as_mut_vec() }, value);
+    let (buf, total) = int_digits(value);
+    // Checks only the at most 20 new bytes; checking the whole string cost 0.5G cycles per 2M pairs.
+    out.push_str(std::str::from_utf8(&buf[..total]).unwrap_or_default());
 }
 
 /// Build a 256-entry table mapping an nt4 code to its SAM character, so the encoders below need no
@@ -160,26 +164,28 @@ static REV16: [u8; 16] = shuffle_table(b"TGCAN");
 #[inline(always)]
 fn encode16<const REV: bool, const LOOKUP: bool>(table16: &[u8; 16], src: &[u8; 16]) -> [u8; 16] {
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline; every load and store is of 16 in-bounds bytes.
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
+        use bwa_core::simd::*;
         use std::arch::aarch64::*;
-        let mut v = vld1q_u8(src.as_ptr());
+        let mut v = ld_u8(src, 0);
         if REV {
             v = vrev64q_u8(v);
             v = vextq_u8::<8>(v, v);
         }
         if LOOKUP {
-            v = vqtbl1q_u8(vld1q_u8(table16.as_ptr()), vminq_u8(v, vdupq_n_u8(4)));
+            v = vqtbl1q_u8(ld_u8(table16, 0), vminq_u8(v, vdupq_n_u8(4)));
         }
         let mut out = [0u8; 16];
-        vst1q_u8(out.as_mut_ptr(), v);
+        st_u8(&mut out, 0, v);
         out
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
-    // SAFETY: SSSE3 is enabled at compile time (the x86-64-v3 build); unaligned 16-byte accesses.
+    // SAFETY: SSSE3 is enabled at compile time (the x86-64-v3 build).
     unsafe {
+        use bwa_core::simd::*;
         use std::arch::x86_64::*;
-        let mut v = _mm_loadu_si128(src.as_ptr().cast());
+        let mut v = ld128(src, 0);
         if REV {
             v = _mm_shuffle_epi8(
                 v,
@@ -187,11 +193,11 @@ fn encode16<const REV: bool, const LOOKUP: bool>(table16: &[u8; 16], src: &[u8; 
             );
         }
         if LOOKUP {
-            let t = _mm_loadu_si128(table16.as_ptr().cast());
+            let t = ld128(table16, 0);
             v = _mm_shuffle_epi8(t, _mm_min_epu8(v, _mm_set1_epi8(4)));
         }
         let mut out = [0u8; 16];
-        _mm_storeu_si128(out.as_mut_ptr().cast(), v);
+        st128(&mut out, 0, v);
         out
     }
     #[cfg(not(any(

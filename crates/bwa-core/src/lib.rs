@@ -36,6 +36,7 @@ pub mod error;
 pub mod meth;
 pub mod opt;
 pub mod rg;
+pub mod simd;
 pub mod sysram;
 
 // Re-exported at the crate root because these three are what downstream crates name constantly:

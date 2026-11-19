@@ -257,6 +257,7 @@ dependencies = [
 name = "bwa-mem4-extend"
 version = "4.5.0"
 dependencies = [
+ "bwa-mem4-core",
  "gungraun",
  "hyalite",
 ]
@@ -301,6 +302,7 @@ dependencies = [
 name = "bwa-mem4-neon"
 version = "4.5.0"
 dependencies = [
+ "bwa-mem4-core",
  "bwa-mem4-extend",
 ]
 

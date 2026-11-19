@@ -397,26 +397,35 @@ impl<A> Counting<A> {
 // re-enter the allocator, and it never inspects or writes the returned block.
 unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = self.inner.alloc(layout);
-        if enabled() && !p.is_null() {
-            record_alloc(layout.size());
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let p = self.inner.alloc(layout);
+            if enabled() && !p.is_null() {
+                record_alloc(layout.size());
+            }
+            p
         }
-        p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if enabled() {
-            record_free(layout.size());
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            if enabled() {
+                record_free(layout.size());
+            }
+            self.inner.dealloc(ptr, layout)
         }
-        self.inner.dealloc(ptr, layout)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = self.inner.alloc_zeroed(layout);
-        if enabled() && !p.is_null() {
-            record_alloc(layout.size());
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let p = self.inner.alloc_zeroed(layout);
+            if enabled() && !p.is_null() {
+                record_alloc(layout.size());
+            }
+            p
         }
-        p
     }
 
     // Counted as a free of the old block plus a fresh allocation of the whole new size, NOT as the
@@ -426,12 +435,15 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
     // allocator does grow in place the volume column overstates by the old size; the LIVE column is
     // exact either way, since it moves by the difference.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = self.inner.realloc(ptr, layout, new_size);
-        if enabled() && !p.is_null() {
-            record_free(layout.size());
-            record_alloc(new_size);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let p = self.inner.realloc(ptr, layout, new_size);
+            if enabled() && !p.is_null() {
+                record_free(layout.size());
+                record_alloc(new_size);
+            }
+            p
         }
-        p
     }
 }
 

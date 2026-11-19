@@ -23,3 +23,6 @@ gungraun = "=0.19.3"
 [[bench]]
 name = "global_icount"
 harness = false
+
+[dependencies]
+bwa-core = { workspace = true }
