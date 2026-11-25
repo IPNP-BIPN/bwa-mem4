@@ -202,7 +202,8 @@ jobs:
           set -euo pipefail
           cd work
           T="$(nproc)"; [ "$T" -gt 8 ] && T=8
-          timed() { /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
+          # Each arm's start goes to stderr, so a run that hangs names the arm it hung in.
+          timed() { echo "  [$(date +%T)] ${*:1:3}" >&2; /usr/bin/time -f '%e' -o t.txt "$@" > /dev/null 2>/dev/null; cat t.txt; }
           for set in sim real; do
             r1="${set}1.fq"; r2="${set}2.fq"
             echo; echo "===== $set reads ====="
