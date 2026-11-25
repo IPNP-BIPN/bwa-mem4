@@ -137,7 +137,7 @@ jobs:
               - bioconda
           create-args: >-
             bwa-mem2
-            bwa-mem3=0.17.0
+            bwa-mem3=0.18.0
             wgsim
             samtools
           init-shell: bash
