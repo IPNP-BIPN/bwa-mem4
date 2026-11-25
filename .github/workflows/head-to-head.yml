@@ -168,8 +168,9 @@ jobs:
           # mistake here cannot silently time the wrong binary as ours.
           git fetch --depth=50 origin "$BASE_REF"
           git worktree add /tmp/base FETCH_HEAD
+          V3=""; [ "$(uname -m)" = x86_64 ] && V3="-C target-cpu=x86-64-v3"
           ( cd /tmp/base
-            RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked -p bwa-mem4 \
+            RUSTFLAGS="$V3" cargo build --release --locked -p bwa-mem4 \
               --jobs 2 --target-dir /tmp/base-target )
           cp /tmp/base-target/release/bwa-mem4 ./mem4-base-ref
           echo "base ref: $(git -C /tmp/base rev-parse --short HEAD)"
