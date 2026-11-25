@@ -160,6 +160,50 @@ static ROWS_BEFORE2: [[u64; 2]; 128] = {
     t
 };
 
+/// The block offset `cp_count` is measured at. Outside AArch64 a 128-bit count is two scalar
+/// popcounts, so the counts are taken at the block's middle (row 64) and a row's count is one
+/// popcount of one plane word, added or subtracted (+6-7% wall on x86 otherwise). NEON counts 128
+/// bits in one instruction and keeps the block-start counts.
+#[cfg(not(target_arch = "aarch64"))]
+const MID: i64 = 64;
+#[cfg(target_arch = "aarch64")]
+const MID: i64 = 0;
+
+/// For offset `y` of a 128-row block, the rows between `y` and [`MID`], as a mask of word `y / 64`:
+/// rows `y..64` of word 0 (subtracted) or rows `64..y` of word 1 (added).
+#[cfg(not(target_arch = "aarch64"))]
+static ROWS_FROM_MID: [u64; 128] = {
+    let mut t = [0u64; 128];
+    let mut y = 0;
+    while y < 128 {
+        t[y] = if y < 64 {
+            !rows_before(y as i64)
+        } else {
+            rows_before(y as i64 - 64)
+        };
+        y += 1;
+    }
+    t
+};
+
+/// Move each block's start counts to [`MID`] by adding word 0's counts as the planes read it
+/// (sentinel and padding as A), so `mid - rows y..64` equals `start + rows 0..y` for every `y`:
+/// every count, the sentinel correction included, is unchanged. A no-op on AArch64.
+fn to_mid_counts(cp_occ: &mut [CpOcc]) {
+    if MID == 0 {
+        return;
+    }
+    cp_occ.par_iter_mut().for_each(|b| {
+        let t = (b.hi[0] & b.lo[0]).count_ones();
+        let g = b.hi[0].count_ones() - t;
+        let c = b.lo[0].count_ones() - t;
+        let add = [64 - t - g - c, c, g, t];
+        for (n, a) in b.cp_count.iter_mut().zip(add) {
+            *n = n.wrapping_add(a);
+        }
+    });
+}
+
 /// `log2` of the rows one `FmIndex::count_base` entry spans. A 32-bit [`CpOcc::cp_count`] measured
 /// from that span's start cannot overflow, because a span has fewer than 2^32 rows.
 const COUNT_SPAN_SHIFT: i64 = 32;
@@ -1099,6 +1143,7 @@ impl FmIndex {
             )?;
         // SAFETY: the `try_for_each_init` above returned Ok, so every record was written.
         unsafe { cp_occ.set_len(cp_size) };
+        to_mid_counts(&mut cp_occ);
 
         // Differences of adjacent `count` entries are the per-base totals, and a total below 2^32
         // means every count below it fits too.
@@ -1501,7 +1546,7 @@ impl FmIndex {
         // not. `wrapping_sub(1)` of the bit is all ones for 0 and zero for 1.
         let hx = ((c as u64 >> 1) & 1).wrapping_sub(1);
         let lx = (c as u64 & 1).wrapping_sub(1);
-        let rows = Self::masked_pop(block, pp, |h, l| (h ^ hx) & (l ^ lx)) as i64;
+        let rows = i64::from(Self::masked_pop(block, pp, |h, l| (h ^ hx) & (l ^ lx)));
         let mut occ = i64::from(block.cp_count[c]) + rows;
         if WIDE {
             occ += self.count_base[(pp >> self.count_span_shift) as usize][c];
@@ -1533,10 +1578,10 @@ impl FmIndex {
     #[inline(always)]
     fn occ4(&self, block: &CpOcc, row: i64) -> [i64; 4] {
         let y = row & CP_MASK;
-        let t = Self::masked_pop(block, row, |h, l| h & l) as i64;
-        let g = Self::masked_pop(block, row, |h, _| h) as i64 - t;
-        let c = Self::masked_pop(block, row, |_, l| l) as i64 - t;
-        let mut a = y - t - g - c;
+        let t = i64::from(Self::masked_pop(block, row, |h, l| h & l));
+        let g = i64::from(Self::masked_pop(block, row, |h, _| h)) - t;
+        let c = i64::from(Self::masked_pop(block, row, |_, l| l)) - t;
+        let mut a = (y - MID) - t - g - c;
         if row >> CP_SHIFT == self.sentinel_block {
             a -= self.sentinel_before(row, 0);
         }
@@ -1619,13 +1664,31 @@ impl FmIndex {
         ((hi as i64) << 32) + i64::from(self.sa_ls_word[idx])
     }
 
-    /// Popcount of `f(hi, lo)` over the rows of `b` before row `row`'s offset in it.
+    /// Popcount of `f(hi, lo)` over the rows of `b` between [`MID`] and row `row`'s offset in it,
+    /// negative for rows before the middle: what to add to `cp_count`.
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
-    fn masked_pop(b: &CpOcc, row: i64, f: impl Fn(u64, u64) -> u64) -> u32 {
-        {
-            let m = &ROWS_BEFORE2[(row & CP_MASK) as usize];
-            (f(b.hi[0], b.lo[0]) & m[0]).count_ones() + (f(b.hi[1], b.lo[1]) & m[1]).count_ones()
-        }
+    fn masked_pop(b: &CpOcc, row: i64, f: impl Fn(u64, u64) -> u64) -> i32 {
+        let m = &ROWS_BEFORE2[(row & CP_MASK) as usize];
+        ((f(b.hi[0], b.lo[0]) & m[0]).count_ones() + (f(b.hi[1], b.lo[1]) & m[1]).count_ones())
+            as i32
+    }
+
+    /// Popcount of `f(hi, lo)` over the rows of `b` between [`MID`] and row `row`'s offset in it,
+    /// negative for rows before the middle: what to add to `cp_count`. One word, one popcount.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[inline(always)]
+    fn masked_pop(b: &CpOcc, row: i64, f: impl Fn(u64, u64) -> u64) -> i32 {
+        let y = (row & CP_MASK) as usize;
+        let w = y >> 6;
+        // SAFETY: `w < 2` and `y < 128`, the arrays' lengths.
+        let p = unsafe {
+            (f(*b.hi.get_unchecked(w), *b.lo.get_unchecked(w)) & ROWS_FROM_MID.get_unchecked(y))
+                .count_ones() as i32
+        };
+        // `p` for word 1, `-p` for word 0, without a branch on a random row.
+        let neg = w as i32 - 1;
+        (p ^ neg) - neg
     }
 
     /// The first `hi` word of a block (the concurrency probe's dependent value).
@@ -1771,10 +1834,10 @@ impl FmIndex {
                 ),
                 vld1q_u64(ROWS_BEFORE2.as_ptr().add((pp & CP_MASK) as usize).cast()),
             );
-            u32::from(vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(x))))
+            i64::from(vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(x))))
         };
         #[cfg(not(target_arch = "aarch64"))]
-        let rows = Self::masked_pop(b, pp, |h, l| (h ^ hx) & (l ^ lx));
+        let rows = i64::from(Self::masked_pop(b, pp, |h, l| (h ^ hx) & (l ^ lx)));
         self.occ_from_rows::<WIDE, A0>(b, pp, a, rows)
     }
 
@@ -1786,9 +1849,9 @@ impl FmIndex {
         b: &CpOcc,
         pp: i64,
         a: usize,
-        rows: u32,
+        rows: i64,
     ) -> i64 {
-        let mut o = i64::from(b.cp_count[a]) + i64::from(rows);
+        let mut o = i64::from(b.cp_count[a]) + rows;
         if WIDE {
             o += self.count_base[(pp >> self.count_span_shift) as usize][a];
         }
@@ -1818,7 +1881,7 @@ impl FmIndex {
             // in vector registers, where the hit test would have to cross back.)
             #[cfg(not(target_arch = "aarch64"))]
             let (o, hit) = {
-                let rows = Self::masked_pop(b, c.k, |h, l| (h ^ hx) & (l ^ lx));
+                let rows = i64::from(Self::masked_pop(b, c.k, |h, l| (h ^ hx) & (l ^ lx)));
                 (
                     self.occ_from_rows::<WIDE, A0>(b, c.k, a, rows),
                     Self::base_at(b, c.k) == a,
@@ -2104,11 +2167,11 @@ impl FmIndex {
             };
             let (msp, mep) = (sp, ep);
             let occ = |b: &CpOcc, row: i64, _m: i64| {
-                let rows = Self::masked_pop(b, row, |h, l| (h ^ hx) & (l ^ lx));
+                let rows = i64::from(Self::masked_pop(b, row, |h, l| (h ^ hx) & (l ^ lx)));
                 self.occ_from_rows::<false, true>(b, row, c, rows)
             };
             let above = |b: &CpOcc, row: i64| {
-                Self::masked_pop(b, row, |h, l| (h & mh) | (l & ml) | (h & l & mhl))
+                Self::masked_pop(b, row, |h, l| (h & mh) | (l & ml) | (h & l & mhl)) as u32
             };
             // Wrapping u32 is exact: the rows above `c` in `[sp, ep)` are at most `s`, which for an
             // interval of one or more bases is one base's count, below 2^32 when not `wide`.
@@ -3411,6 +3474,7 @@ mod tests {
         let count_base: Vec<[i64; 4]> = (0..=n_blocks >> (span_shift - CP_SHIFT))
             .map(|span| full(span << (span_shift - CP_SHIFT)))
             .collect();
+        to_mid_counts(&mut cp_occ);
         rebase_counts(&mut cp_occ, &count_base, span_shift);
         let fm = FmIndex {
             ref_seq_len: (n_blocks as i64) << CP_SHIFT,
