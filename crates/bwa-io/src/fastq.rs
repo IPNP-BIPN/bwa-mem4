@@ -927,101 +927,67 @@ impl std::io::Read for InflatedBlocks {
 /// the same reason: the point is the overlap, not the decompression. See the call site for the
 /// measurement that motivates it.
 fn spawn_plain(path: &std::path::Path) -> Result<InflatedBlocks> {
-    use std::io::Read;
     let file =
         std::fs::File::open(path).map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
-    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(INFLATE_DEPTH);
-    std::thread::spawn(move || {
-        let mut src = std::io::BufReader::with_capacity(1 << 20, file);
-        loop {
-            let mut block = vec![0u8; INFLATE_BLOCK];
-            // Fill each block completely unless the file ends, so the parser is handed whole blocks
-            // rather than whatever length a single `read` happened to return.
-            let mut filled = 0;
-            let mut failed = None;
-            while filled < INFLATE_BLOCK {
-                match src.read(&mut block[filled..]) {
-                    Ok(0) => break,
-                    Ok(k) => filled += k,
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
-                }
-            }
-            let last = filled < INFLATE_BLOCK;
-            block.truncate(filled);
-            if filled > 0 && tx.send(Ok(block)).is_err() {
-                return; // consumer went away
-            }
-            if let Some(e) = failed {
-                let _ = tx.send(Err(e));
-                return;
-            }
-            if last {
-                return;
-            }
-        }
-    });
-    Ok(InflatedBlocks {
-        rx,
-        cur: Vec::new(),
-        pos: 0,
-        done: false,
-    })
+    Ok(spawn_blocks(std::io::BufReader::with_capacity(
+        1 << 20,
+        file,
+    )))
 }
 
 /// Open `path`, inflate it on a fresh thread, and return the decompressed stream.
+#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
+fn spawn_inflate(path: &std::path::Path) -> Result<InflatedBlocks> {
+    let file =
+        std::fs::File::open(path).map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+    // `MultiGzDecoder`, not `GzDecoder`: a FASTQ may be several gzip members concatenated, and
+    // stopping at the first one would silently truncate the file. Same choice needletail makes.
+    Ok(spawn_blocks(flate2::read::MultiGzDecoder::new(
+        std::io::BufReader::with_capacity(1 << 20, file),
+    )))
+}
+
+/// Read `src` on a fresh thread in whole `INFLATE_BLOCK` blocks and return them as a stream.
 ///
 /// The thread is not joined: dropping the returned value drops the receiver, the next `send` fails
 /// and the thread returns. That is the whole shutdown protocol, and it is why no handle is kept.
-#[cfg(all(feature = "fast-gzip", not(feature = "parallel-gzip")))]
-fn spawn_inflate(path: &std::path::Path) -> Result<InflatedBlocks> {
-    use std::io::Read;
-    let file =
-        std::fs::File::open(path).map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
+fn spawn_blocks(mut src: impl std::io::Read + Send + 'static) -> InflatedBlocks {
     let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(INFLATE_DEPTH);
-    std::thread::spawn(move || {
-        // `MultiGzDecoder`, not `GzDecoder`: a FASTQ may be several gzip members concatenated, and
-        // stopping at the first one would silently truncate the file. Same choice needletail makes.
-        let mut dec =
-            flate2::read::MultiGzDecoder::new(std::io::BufReader::with_capacity(1 << 20, file));
-        loop {
-            let mut block = vec![0u8; INFLATE_BLOCK];
-            // Fill the block completely unless the stream ends, so the parser is not handed a
-            // trickle of short reads at whatever size the decoder felt like returning.
-            let mut filled = 0;
-            let mut failed = None;
-            while filled < INFLATE_BLOCK {
-                match dec.read(&mut block[filled..]) {
-                    Ok(0) => break,
-                    Ok(k) => filled += k,
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
+    std::thread::spawn(move || loop {
+        let mut block = vec![0u8; INFLATE_BLOCK];
+        // Fill the block completely unless the stream ends, so the parser is not handed a trickle
+        // of short reads at whatever size the source felt like returning.
+        let mut filled = 0;
+        let mut failed = None;
+        while filled < INFLATE_BLOCK {
+            match src.read(&mut block[filled..]) {
+                Ok(0) => break,
+                Ok(k) => filled += k,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
                 }
             }
-            let last = filled < INFLATE_BLOCK;
-            block.truncate(filled);
-            if filled > 0 && tx.send(Ok(block)).is_err() {
-                return; // consumer went away
-            }
-            if let Some(e) = failed {
-                let _ = tx.send(Err(e));
-                return;
-            }
-            if last {
-                return;
-            }
+        }
+        let last = filled < INFLATE_BLOCK;
+        block.truncate(filled);
+        if filled > 0 && tx.send(Ok(block)).is_err() {
+            return; // consumer went away
+        }
+        if let Some(e) = failed {
+            let _ = tx.send(Err(e));
+            return;
+        }
+        if last {
+            return;
         }
     });
-    Ok(InflatedBlocks {
+    InflatedBlocks {
         rx,
         cur: Vec::new(),
         pos: 0,
         done: false,
-    })
+    }
 }
 
 impl FastqReader {

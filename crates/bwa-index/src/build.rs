@@ -532,7 +532,7 @@ pub fn build_index_parts(
 ///
 /// `<prefix>.<ext>`. This APPENDS rather than replacing any existing extension, so `ref.fa` becomes
 /// `ref.fa.pac`, not `ref.pac`. Operates on `OsString` bytes so non-UTF-8 paths survive intact.
-fn sibling(prefix: &Path, ext: &str) -> PathBuf {
+pub(crate) fn sibling(prefix: &Path, ext: &str) -> PathBuf {
     let mut s: OsString = prefix.as_os_str().to_owned();
     s.push(".");
     s.push(ext);
