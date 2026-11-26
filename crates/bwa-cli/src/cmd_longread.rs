@@ -130,7 +130,8 @@ pub fn run(
     out: &mut dyn Write,
     argv: &[String],
 ) -> Result<()> {
-    let fasta = reference_fasta(prefix)?;
+    // Not `?` yet: a cached `.mmi` (`index -p P --mmi`) needs no FASTA beside the prefix.
+    let fasta = reference_fasta(prefix);
     eprintln!(
         "[M::main_mem] -x {mode} is a long-read preset. bwa-mem2's own code calls its long-read \
          modes unusable; this run is mapped by rammap (minimap2-equivalent) with preset {preset:?}, \
@@ -138,7 +139,7 @@ pub fn run(
          rammap. Use -x intractg or drop -x for the bwa-identical paths."
     );
 
-    let aligner = load_or_build_index(preset, prefix, &fasta)?;
+    let aligner = load_or_build_index(preset, prefix, fasta)?;
 
     // SAM, with CIGAR. The remaining toggles are minimap2's optional tags, left off so the records
     // carry what a bwa user expects; `split_mode` is rammap's multi-part index feature, unused here.
@@ -326,19 +327,20 @@ pub fn build_mmi(preset: Preset, fasta: &Path, path: &Path) -> Result<()> {
 /// # Parameters
 /// - `preset`: decides both the index parameters and the cache filename.
 /// - `prefix`: the index prefix, i.e. where the cache is written.
-/// - `fasta`: the resolved reference sequences.
+/// - `fasta`: the resolved reference sequences, or why none was found. Without one a cache is
+///   trusted as is, and the error is returned only if a build is needed.
 ///
 /// # Returns
 /// A ready `Aligner`, from the cache when one is usable and from a fresh build otherwise.
-fn load_or_build_index(preset: Preset, prefix: &Path, fasta: &Path) -> Result<Aligner> {
+fn load_or_build_index(
+    preset: Preset,
+    prefix: &Path,
+    fasta: Result<std::path::PathBuf>,
+) -> Result<Aligner> {
     let cache = mmi_path(prefix, preset);
     let cache_str = cache
         .to_str()
         .context("index cache path is not valid UTF-8")?
-        .to_owned();
-    let fasta_str = fasta
-        .to_str()
-        .context("reference path is not valid UTF-8")?
         .to_owned();
 
     // Reuse the cache only if it is at least as new as the FASTA. A cache that cannot be read at all
@@ -346,9 +348,11 @@ fn load_or_build_index(preset: Preset, prefix: &Path, fasta: &Path) -> Result<Al
     if cache.is_file() {
         let fresh = match (
             cache.metadata().and_then(|m| m.modified()),
-            fasta.metadata().and_then(|m| m.modified()),
+            fasta
+                .as_ref()
+                .map(|f| f.metadata().and_then(|m| m.modified())),
         ) {
-            (Ok(c), Ok(f)) => c >= f,
+            (Ok(c), Ok(Ok(f))) => c >= f,
             // No usable timestamps: trust the cache rather than rebuild on every run.
             _ => true,
         };
@@ -376,6 +380,11 @@ fn load_or_build_index(preset: Preset, prefix: &Path, fasta: &Path) -> Result<Al
         }
     }
 
+    let fasta = fasta?;
+    let fasta_str = fasta
+        .to_str()
+        .context("reference path is not valid UTF-8")?
+        .to_owned();
     eprintln!(
         "[M::main_mem] building the rammap minimizer index from {} (bwa's FM-index cannot be \\
          reused; this happens once and is cached as {})",
