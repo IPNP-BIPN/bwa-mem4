@@ -165,6 +165,11 @@ pub struct MemAln {
     pub xa: Option<String>,
     /// `HN:i`, emitted under `--meth` only, when >= 0 (see `alt::hit_counts`). -1 otherwise.
     pub hn: i32,
+    /// `--alt-project`: the ALT contig a lifted record was projected from (`XL:Z`), or -1.
+    pub alt_source: i32,
+    /// `--alt-project primary`: the `OA:Z` value of an unmapped record whose read had only
+    /// unlifted ALT hits, or `None`.
+    pub oa: Option<Vec<u8>>,
 }
 
 /// Format the `pa:f` payload the way C's `printf("%.3f", (double)score / alt_sc)` does
@@ -228,6 +233,8 @@ impl MemAln {
             is_alt: false,
             xa: None,
             hn: -1,
+            alt_source: -1,
+            oa: None,
         }
     }
 }
@@ -291,8 +298,11 @@ fn band_width_trace_enabled() -> bool {
 /// early-return case where it is exactly `0`. A returned `0` is a signal, not just a small number:
 /// [`gen_cigar2`] takes its no-DP ungapped fast path only when it receives `w_ == 0`.
 #[must_use]
-fn infer_bw(l1: i32, l2: i32, score: i32, a: i32, q: i32, r: i32) -> i32 {
-    if l1 == l2 && l1 * a - score < (q + r - a) << 1 {
+///
+/// `no_shortcut` turns the early return off for a region whose `score` was not earned on this
+/// window (an `--alt-project` lifted region, whose score is the ALT's).
+fn infer_bw(l1: i32, l2: i32, score: i32, a: i32, q: i32, r: i32, no_shortcut: bool) -> i32 {
+    if !no_shortcut && l1 == l2 && l1 * a - score < (q + r - a) << 1 {
         return 0;
     }
     // The f64 round-trip is not cosmetic: C computes `((double)(...) / r + 2.)` and then truncates
@@ -357,6 +367,48 @@ impl Drop for MemAln {
             s.set(v);
         });
     }
+}
+
+/// The band `gen_cigar2` aligns a gapped region of `l_query` query and `rlen` reference bases with,
+/// given the caller's band `w_`, before the certified-band narrowing (which keeps the score and the
+/// CIGAR). The fork's `bwa_gen_cigar_band`: `--alt-project`'s lift gate calls it too, so it checks
+/// the band the lifted region's re-alignment will really get.
+pub(crate) fn gen_cigar_band(opt: &MemOpt, w_: i32, l_query: i32, rlen: i32) -> i32 {
+    // `mat[0]` is the A/A cell of the 5x5 scoring matrix, i.e. the match score `opt.a`. bwa reads
+    // it out of the matrix rather than using `opt->a` directly, and we copy that.
+    let match_score = i32::from(opt.mat[0]);
+    // Derive an internal band from affordability, then intersect it with the caller's `w_`.
+    // `((l_query+1)>>1) * match_score` is the score of matching *half* the query: bwa's
+    // heuristic is that a gap can never be worth more than half the read's best-case score.
+    // Subtract the gap open penalty and divide by the extend penalty to get a maximum gap
+    // length. Insertions and deletions get separate budgets because their penalties can differ.
+    //
+    // `max_ins` / `max_del`: longest insertion / deletion, in bases, that half the query's
+    // best-case score could still pay for. Can come out zero or negative on very short queries,
+    // which is what the `.max(1)` below is for.
+    let max_ins = (f64::from(((l_query + 1) >> 1) * match_score - opt.o_ins) / f64::from(opt.e_ins)
+        + 1.0) as i32;
+    let max_del = (f64::from(((l_query + 1) >> 1) * match_score - opt.o_del) / f64::from(opt.e_del)
+        + 1.0) as i32;
+    // `max_gap`: the affordable gap length in bases, taking whichever gap type is cheaper.
+    // `.max(1)`: a zero or negative budget would produce a nonsensical band.
+    let max_gap = max_ins.max(max_del).max(1);
+    // Half-width: the band must cover the length difference plus the affordable gap, and `>> 1`
+    // converts a full width into a half-width. `+1` rounds up before the shift.
+    //
+    // `w` holds the band half-width in bases that will actually be handed to the DP, after the
+    // two clamps below. It starts as this function's own estimate, is capped by the caller's
+    // `w_`, then floored at `min_w`.
+    let mut w = (max_gap + (rlen - l_query).abs() + 1) >> 1;
+    // Clamp down to what the caller allows, then clamp back *up* to `min_w`. The order is not
+    // interchangeable: `min_w` wins over `w_`, so a caller-supplied band is silently widened
+    // when it is too narrow to even span the length difference. Without that floor the global
+    // alignment would be infeasible (no path reaches the far corner) rather than merely poor.
+    w = w.min(w_);
+    // `min_w`: the narrowest band in which a global alignment is even feasible, the length
+    // difference the band must absorb plus 3 bases of slack (bwa's constant, not derived).
+    let min_w = (rlen - l_query).abs() + 3;
+    w.max(min_w)
 }
 
 /// Global-align `query_codes` (the seed-region query slice) to reference `[rb, re)` and compute the
@@ -451,10 +503,6 @@ pub(crate) fn gen_cigar2(
         query.reverse();
         rseq.reverse();
     }
-    // `mat[0]` is the A/A cell of the 5x5 scoring matrix, i.e. the match score `opt.a`. bwa reads
-    // it out of the matrix rather than using `opt->a` directly, and we copy that.
-    let match_score = i32::from(opt.mat[0]);
-
     // -------------------------------------------------------------------------------------
     // 3. Produce the alignment itself: either the ungapped fast path or a banded global DP.
     // -------------------------------------------------------------------------------------
@@ -474,40 +522,7 @@ pub(crate) fn gen_cigar2(
         // `(len << 4) | 0`: op 0 is M, so the `| 0` is elided.
         (diagonal_score, ungapped_cigar(l_query, spare_cigar))
     } else {
-        // Derive an internal band from affordability, then intersect it with the caller's `w_`.
-        // `((l_query+1)>>1) * match_score` is the score of matching *half* the query: bwa's
-        // heuristic is that a gap can never be worth more than half the read's best-case score.
-        // Subtract the gap open penalty and divide by the extend penalty to get a maximum gap
-        // length. Insertions and deletions get separate budgets because their penalties can differ.
-        //
-        // `max_ins` / `max_del`: longest insertion / deletion, in bases, that half the query's
-        // best-case score could still pay for. Can come out zero or negative on very short queries,
-        // which is what the `.max(1)` below is for.
-        let max_ins = (f64::from(((l_query + 1) >> 1) * match_score - opt.o_ins)
-            / f64::from(opt.e_ins)
-            + 1.0) as i32;
-        let max_del = (f64::from(((l_query + 1) >> 1) * match_score - opt.o_del)
-            / f64::from(opt.e_del)
-            + 1.0) as i32;
-        // `max_gap`: the affordable gap length in bases, taking whichever gap type is cheaper.
-        // `.max(1)`: a zero or negative budget would produce a nonsensical band.
-        let max_gap = max_ins.max(max_del).max(1);
-        // Half-width: the band must cover the length difference plus the affordable gap, and `>> 1`
-        // converts a full width into a half-width. `+1` rounds up before the shift.
-        //
-        // `w` holds the band half-width in bases that will actually be handed to the DP, after the
-        // two clamps below. It starts as this function's own estimate, is capped by the caller's
-        // `w_`, then floored at `min_w`.
-        let mut w = (max_gap + (rlen - l_query).abs() + 1) >> 1;
-        // Clamp down to what the caller allows, then clamp back *up* to `min_w`. The order is not
-        // interchangeable: `min_w` wins over `w_`, so a caller-supplied band is silently widened
-        // when it is too narrow to even span the length difference. Without that floor the global
-        // alignment would be infeasible (no path reaches the far corner) rather than merely poor.
-        w = w.min(w_);
-        // `min_w`: the narrowest band in which a global alignment is even feasible, the length
-        // difference the band must absorb plus 3 bases of slack (bwa's constant, not derived).
-        let min_w = (rlen - l_query).abs() + 3;
-        w = w.max(min_w);
+        let w = gen_cigar_band(opt, w_, l_query, rlen);
         crate::emit_split::measure(
             &crate::emit_split::GLOBAL_NS,
             &crate::emit_split::GLOBAL_CALLS,
@@ -599,13 +614,18 @@ pub(crate) fn gen_cigar2(
                 if i >= len {
                     break;
                 }
+                // `--meth`: NM counts only what the read's matrix penalises, so a conversion is
+                // not an edit (fg-labs/bwa-mem3 `nm_from_mat`). MD lists it unless `--md short`,
+                // which keeps it in the match run.
+                let edit = opt.meth.is_none() || opt.mat[r[i] as usize * 5 + q[i] as usize] < 0;
+                if !edit && opt.md == bwa_core::opt::MdMode::Short {
+                    match_run += 1;
+                    i += 1;
+                    continue;
+                }
                 crate::emit::push_int_str(&mut md, i64::from(match_run));
                 md.push(base_char(r[i]));
-                // `--meth`: MD stays literal, but NM counts only what the read's matrix
-                // penalises, so a conversion is not an edit (fg-labs/bwa-mem3 `nm_from_mat`).
-                if opt.meth.is_none() || opt.mat[r[i] as usize * 5 + q[i] as usize] < 0 {
-                    n_mm += 1;
-                }
+                n_mm += i32::from(edit);
                 match_run = 0;
                 i += 1;
             }
@@ -636,6 +656,10 @@ pub(crate) fn gen_cigar2(
     // MD always ends with a run length, even when that run is empty ("0"), matching the final
     // `kputw(u, &str)` at bwa.cpp:336.
     crate::emit::push_int_str(&mut md, i64::from(match_run));
+    // `--md none`: an empty MD is the writers' sign to emit no MD:Z (a built one is never empty).
+    if opt.md == bwa_core::opt::MdMode::None {
+        md.clear();
+    }
     // Hand both buffers back for the next record on this thread. There is no early return between
     // here and where they were taken, so this runs on every path that took them.
     SCRATCH_QUERY.with(|c| *c.borrow_mut() = std::mem::take(&mut query));
@@ -722,6 +746,14 @@ pub fn reg2aln(
     // (bwamem.cpp:1752-1754).
     //
     // `bw_del`: band half-width in bases sufficient if the length difference is all deletions.
+    // `--alt-project`: a lifted region's band floor (`alt_bw - 1`), or -1. Its truesc is the ALT
+    // score, so ALT indels that cancel inside the read would otherwise infer a zero band and write
+    // one <len>M full of false mismatches (`mem_reg2aln_global` in the fork).
+    let lift_bw = if opt.alt_lift.is_some() {
+        i32::from(reg.alt_bw) - 1
+    } else {
+        -1
+    };
     let bw_del = infer_bw(
         qe - qb,
         (re - rb) as i32,
@@ -729,6 +761,7 @@ pub fn reg2aln(
         opt.a,
         opt.o_del,
         opt.e_del,
+        lift_bw >= 0,
     );
     // `w2`: the working band half-width, widened by the retry loop below.
     let mut w2 = infer_bw(
@@ -738,6 +771,7 @@ pub fn reg2aln(
         opt.a,
         opt.o_ins,
         opt.e_ins,
+        lift_bw >= 0,
     )
     .max(bw_del);
     // `if (w2 > opt->w) w2 = w2 < ar->w? w2 : ar->w;` (bwamem.cpp:1756). Read carefully: the
@@ -748,6 +782,7 @@ pub fn reg2aln(
     if w2 > opt.w {
         w2 = w2.min(reg.w);
     }
+    w2 = w2.max(lift_bw);
 
     if band_width_trace_enabled() {
         eprintln!(
@@ -927,6 +962,13 @@ pub fn reg2aln(
         // XA generation calls back into `reg2aln` and would recurse.
         xa: None,
         hn: -1,
+        // The fork's `mem_reg2aln`: only a lifted region (`alt_bw != 0`) names its source.
+        alt_source: if opt.alt_lift.is_some() && reg.alt_bw != 0 {
+            reg.seedlen0
+        } else {
+            -1
+        },
+        oa: None,
     }
 }
 
