@@ -436,7 +436,11 @@ pub fn build_index_parts(
         }
         // `len` is this contig's base count: every raw byte produced exactly one code, including
         // the ambiguous ones (they were replaced, not dropped), so this equals `c.seq.len()`.
-        let len = (forward.len() - start) as i32;
+        // `.ann` stores it as an int32 (bwa-mem2 too, which wraps); refuse rather than write a
+        // negative `@SQ LN:`.
+        let len = i32::try_from(forward.len() - start).map_err(|_| {
+            Error::IndexFormat(format!("contig {} is longer than 2^31-1 bases", c.name))
+        })?;
         let anno = if c.comment.is_empty() {
             b"(null)".to_vec()
         } else {
