@@ -728,6 +728,11 @@ fn open_reader(path: &std::path::Path) -> Result<Option<Box<dyn FastxReader>>> {
     // and produced NO records, so `bwa-mem4 mem ref <(zcat r1.gz)` wrote a header and zero
     // alignments with no error at all. bwa-mem2 reads that input, so this was a parity gap as well
     // as a wrong answer. Non-seekable input now keeps its first two bytes and never reopens.
+    // `-` is stdin, as in bwa's `kopen` (`samtools fastq x.bam | bwa-mem4 mem ref -`).
+    if path == std::path::Path::new("-") {
+        let stream = unwrap_multiline_fastq(std::io::stdin())?;
+        return parsed(needletail::parse_fastx_reader(stream));
+    }
     let seekable = std::fs::metadata(path).is_ok_and(|m| m.is_file());
     let mut opened =
         std::fs::File::open(path).map_err(|e| Error::Fastq(format!("{}: {e}", path.display())))?;
