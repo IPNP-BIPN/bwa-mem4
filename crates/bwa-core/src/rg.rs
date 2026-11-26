@@ -168,7 +168,8 @@ pub fn escape(s: &str) -> String {
     // Rust: `with_capacity` reserves the buffer up front instead of growing it repeatedly. `mut` is
     // required on both bindings; without it the compiler refuses every push and every increment,
     // because a binding is read-only unless declared otherwise.
-    let mut out = String::with_capacity(s.len());
+    // Bytes, not chars: the C copies a UTF-8 `-R` (`SM:Müller`) through byte for byte.
+    let mut out = Vec::with_capacity(s.len());
     let mut pos = 0;
     // A hand-written index loop rather than an iterator, because an escape consumes TWO bytes and
     // an iterator walking one at a time cannot express that without extra state.
@@ -179,10 +180,10 @@ pub fn escape(s: &str) -> String {
         if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
             pos += 1;
             match bytes[pos] {
-                b't' => out.push('\t'),
-                b'n' => out.push('\n'),
-                b'r' => out.push('\r'),
-                b'\\' => out.push('\\'),
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b'\\' => out.push(b'\\'),
                 // bwa writes nothing for an unknown escape.
                 //
                 // Rust: `_` is the catch-all pattern, "any other value", and `{}` is an empty body.
@@ -193,15 +194,13 @@ pub fn escape(s: &str) -> String {
             }
             pos += 1;
         } else {
-            // An ordinary byte, copied through. `as char` widens the byte to a character; this is
-            // only correct because a `-R` line is ASCII, and it is what keeps the C's byte-at-a-time
-            // scan reproducible here.
-            out.push(bytes[pos] as char);
+            // An ordinary byte, copied through.
+            out.push(bytes[pos]);
             pos += 1;
         }
     }
-    // No semicolon: the accumulated string is the return value.
-    out
+    // Lossy only for `\` before a multibyte char, where the C drops the lead byte too.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Parse and install a `-R` read-group line, returning the escaped line to put in the header.
@@ -257,4 +256,15 @@ pub fn set_rg(s: &str) -> Result<String, String> {
     // single `-R` means that cannot legitimately happen. First writer wins if it ever does.
     let _ = RG_ID.set(id);
     Ok(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape;
+
+    #[test]
+    fn escape_keeps_utf8_bytes() {
+        assert_eq!(escape(r"@RG\tID:gé\tSM:Müller"), "@RG\tID:gé\tSM:Müller");
+        assert_eq!(escape(r"a\\b\qc\"), "a\\bc\\");
+    }
 }
