@@ -30,6 +30,7 @@
 //! which handful of names are common enough to deserve a shortcut at the top level.
 
 pub mod alloc_probe;
+pub mod alt_lift;
 pub mod cpu;
 pub mod dna;
 pub mod error;

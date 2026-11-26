@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `--meth` oracle diff: bwa-mem4 against fg-labs/bwa-mem3 0.16 (the fork, its prebuilt binary) on
+# `--meth` oracle diff: bwa-mem4 against fg-labs/bwa-mem3 0.18 (the fork, its binary) on
 # simulated directional bisulfite and TAPS reads over a small reference. Every configuration must
 # give the same SAM byte for byte, @PG lines excepted (they name each tool).
 #
@@ -56,9 +56,10 @@ if [ -z "${OURS:-}" ]; then
 fi
 
 echo "[index] fork and ours, --meth"
-for t in fork ours; do cp "$W/ref.fa" "$W/$t/ref.fa"; done
-"$FORK" index --meth "$W/fork/ref.fa" > /dev/null 2>&1
-"$OURS" index --meth "$W/ours/ref.fa" 2> /dev/null
+# From 0.18 the fork refuses to overwrite an index (`--force`) and deletes `.meth.fa` unless kept.
+for t in fork ours; do rm -f "$W/$t/ref.fa".*; cp "$W/ref.fa" "$W/$t/ref.fa"; done
+"$FORK" index --meth --keep-meth-fasta "$W/fork/ref.fa" > /dev/null 2>&1
+"$OURS" index --meth --keep-meth-fasta "$W/ours/ref.fa" 2> /dev/null
 for f in ref.fa.meth.fa ref.fa.pac ref.fa.ann ref.fa.amb ref.fa.meth.pac ref.fa.meth.ann ref.fa.meth.amb; do
   cmp -s "$W/fork/$f" "$W/ours/$f" || { echo "  index file $f DIFFERS" >&2; exit 1; }
 done
@@ -68,6 +69,17 @@ for f in ref.fa.bwt.2bit.64 ref.fa.meth.bwt.2bit.64; do
   head -c "$n" "$W/fork/$f" | cmp -s - "$W/ours/$f" || { echo "  index file $f DIFFERS" >&2; exit 1; }
 done
 echo "  identical (bwt files up to the fork's footer)"
+echo "[index] --meth-only, -p elsewhere"
+mkdir -p "$W/fork_min" "$W/ours_min"
+rm -f "$W"/fork_min/ref.* "$W"/ours_min/ref.*
+"$FORK" index --meth --meth-only -p "$W/fork_min/ref" "$W/ref.fa" > /dev/null 2>&1
+"$OURS" index --meth --meth-only -p "$W/ours_min/ref" "$W/ref.fa" 2> /dev/null
+[ "$(ls "$W/fork_min")" = "$(ls "$W/ours_min")" ] || { echo "  --meth-only file sets DIFFER" >&2; exit 1; }
+for f in $(ls "$W/ours_min"); do
+  n=$(stat -f %z "$W/ours_min/$f" 2>/dev/null || stat -c %s "$W/ours_min/$f")
+  head -c "$n" "$W/fork_min/$f" | cmp -s - "$W/ours_min/$f" || { echo "  --meth-only $f DIFFERS" >&2; exit 1; }
+done
+echo "  identical: $(ls "$W/ours_min" | wc -l | tr -d ' ') files"
 
 echo "[sim] $PAIRS EM-seq pairs, $PAIRS TAPS pairs"
 python3 scripts/meth_sim.py "$W/ref.fa" "$W/sim/em" --pairs "$PAIRS" --seed 11
@@ -103,6 +115,7 @@ run emseq_se "${E[0]}" -- --meth -K 10000000 -t1
 run taps_pe "${T[@]}" -- --meth=taps -K 10000000 -t1
 run taps_se "${T[0]}" -- --meth=taps -K 10000000 -t1
 run genomic "${E[@]}" -- --meth --meth-scoring genomic -K 10000000 -t1
+run collapsed "${E[@]}" -- --meth --meth-scoring collapsed -K 10000000 -t1
 run neutral "${E[@]}" -- --meth=bisulfite --meth-scoring=neutral --meth-tags=^XM -K 10000000 -t1
 run tags_xr_xg "${E[@]}" -- --meth --meth-tags XR,XG -K 10000000 -t1
 run prune_off "${E[@]}" -- --meth --meth-seed-prune=off -K 10000000 -t1
@@ -112,5 +125,12 @@ run threads "${E[@]}" -- --meth -K 10000000 -t4
 run scaled "${E[@]}" -- --meth -A2 -K 10000000 -t1
 run all_alns "${E[0]}" -- --meth -a -K 10000000 -t1
 run softclip "${E[@]}" -- --meth -Y -K 10000000 -t1
+run md_short "${E[@]}" -- --meth --md short -K 10000000 -t1
+run md_none "${E[0]}" -- --meth --md none -K 10000000 -t1
+run tie_name "${E[@]}" -- --meth --tie-break name -K 10000000 -t1
+# Ours on the --meth-only index against the fork on its full one: the same records.
+"$OURS" mem --meth -K 10000000 -t1 "$W/ours_min/ref" "${E[@]}" 2> /dev/null | grep -v '^@' \
+  | cmp -s - <(grep -v '^@' "$W/out/emseq_pe.fork.sam") \
+  && echo "  meth_only    identical" || { echo "  meth_only    DIFFER" >&2; fail=1; }
 
 if [ "$fail" = 0 ]; then echo "PASS: every configuration identical"; else echo "FAIL" >&2; exit 1; fi

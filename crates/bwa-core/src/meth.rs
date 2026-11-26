@@ -79,14 +79,15 @@ pub struct MethOpt {
 }
 
 impl MethOpt {
-    /// `--meth[=CHEM]` defaults: collapsed for EM-seq, neutral for TAPS, spec30 pruning, all tags.
+    /// `--meth[=CHEM]` defaults: genomic for EM-seq (bwa-mem3 0.17, its #756), neutral for TAPS,
+    /// spec30 pruning, all tags.
     pub fn new(chem: Chem) -> Self {
         MethOpt {
             chem,
             scoring: if chem == Chem::Taps {
                 Scoring::Neutral
             } else {
-                Scoring::Collapsed
+                Scoring::Genomic
             },
             tags: TAG_ALL,
             prune: Prune::Spec30,
@@ -280,6 +281,8 @@ mod tests {
             }
         }
         let mut m = MethOpt::new(Chem::EmSeq);
+        assert_eq!(m.scoring, Scoring::Genomic);
+        m.scoring = Scoring::Collapsed;
         m.fill_mats(&mat, 1);
         let [ob, ot] = m.mats;
         assert_eq!((ot[5 + 3], ot[3 * 5 + 1], ot[2 * 5]), (1, 1, -4));

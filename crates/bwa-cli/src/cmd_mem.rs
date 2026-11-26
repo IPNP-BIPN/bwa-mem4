@@ -95,7 +95,7 @@ use rust_htslib::bam;
 #[cfg(feature = "hts-output")]
 use rust_htslib::htslib;
 
-use bwa_core::opt::flags;
+use bwa_core::opt::{flags, MdMode};
 use bwa_core::MemOpt;
 use bwa_index::{BntSeq, FmIndex};
 use bwa_io::{sam, FastqReader, InterleavedFastqReader, PairedFastqReader, Record, SqRecord};
@@ -103,7 +103,7 @@ use bwa_mem::{
     align_reads_batched, alt::mem_gen_alt, batch_mate_rescue, cigar::cigar_string_which,
     cigar::MemAln, cigar_string, lazy_csub, mem_approx_mapq_se, mem_mark_primary_se,
     mem_pestat_from, mem_sam_pe, mem_sort_dedup_patch, pe::resolve_pending, pestat_samples,
-    reg2aln, MemAlnReg, PairRescueData, PeStat, PendS2,
+    reg2aln, tie_break_id, MemAlnReg, PairRescueData, PeStat, PendS2,
 };
 use bwa_neon::NeonBackend;
 
@@ -536,7 +536,7 @@ pub struct MemArgs {
     /// Where a conversion is free: all [all]. `cpg` is not supported by this port.
     #[arg(long = "meth-context", value_name = "all|cpg")]
     pub meth_context: Option<String>,
-    /// collapsed (EM-seq default, sets -B 2), genomic, or neutral (TAPS default).
+    /// genomic (EM-seq default), collapsed (sets -B 2), or neutral (TAPS default).
     #[arg(long = "meth-scoring", value_name = "MODE")]
     pub meth_scoring: Option<String>,
     /// Bismark tags to emit: all [all], none, XR,XG,... or exclusions ^XM / -XM.
@@ -556,6 +556,29 @@ pub struct MemArgs {
     /// is `--meth --pbat`. Not in bwa-mem3.
     #[arg(long = "pbat")]
     pub pbat: bool,
+
+    /// What seeds the choice among equal-score alignments and pairings: index (the read's input
+    /// position, as bwa) or name (a hash of the read name, so reordered, subset or sharded input
+    /// keeps each read's pick; paired-end also needs -I). From fg-labs/bwa-mem3 0.18. [index]
+    #[arg(long = "tie-break", value_name = "index|name")]
+    pub tie_break: Option<String>,
+    /// MD tag: full (literal), short (only the mismatches NM counts; under --meth, no
+    /// conversions) or none. From fg-labs/bwa-mem3 0.17. [full]
+    #[arg(long = "md", value_name = "full|short|none")]
+    pub md: Option<String>,
+    /// Let ALT haplotypes decide placement: lift alignments to ALT contigs onto the primary
+    /// assembly through <idxbase>.alt before pairing and MAPQ, keep one hit per locus, and write
+    /// the read on the primary assembly (re-aligned there; AS keeps the ALT score, XL:Z names the
+    /// ALT). keep-alt writes a hit that cannot lift on its ALT; primary drops it, leaves the ALT
+    /// @SQ out, and writes a read left with no hit unmapped with OA:Z. Needs a .alt; not with -j
+    /// or --meth. From fg-labs/bwa-mem3 0.18. [off]
+    #[arg(long = "alt-project", value_name = "keep-alt|primary")]
+    pub alt_project: Option<String>,
+    /// With --alt-project, skip each .alt alignment whose primary-assembly footprint (POS through
+    /// its M/D/N/=/X bases) overlaps any FILE interval by at least 1 bp. FILE is BED (plain or
+    /// gzip, not stdin) on primary contigs named as in the index. From fg-labs/bwa-mem3 0.18.
+    #[arg(long = "alt-project-exclude-bed", value_name = "FILE")]
+    pub alt_project_exclude_bed: Option<std::path::PathBuf>,
 }
 
 /// Parse bwa's `INT[,INT]` pair syntax. bwa reads the first integer with `strtol`, then takes a
@@ -1090,6 +1113,17 @@ pub fn build_opt(args: &MemArgs) -> anyhow::Result<MemOpt> {
     //
     // From the POST-rescale a/b. Doing this earlier would leave the SIMD kernel scoring with
     // pre-rescale values while the gap logic used post-rescale scalars.
+    opt.tie_break_name = match args.tie_break.as_deref() {
+        None | Some("index") => false,
+        Some("name") => true,
+        Some(other) => anyhow::bail!("unknown --tie-break '{other}' (index|name)"),
+    };
+    opt.md = match args.md.as_deref() {
+        None | Some("full") => MdMode::Full,
+        Some("short") => MdMode::Short,
+        Some("none") => MdMode::None,
+        Some(other) => anyhow::bail!("unknown --md '{other}' (full|short|none)"),
+    };
     let meth = build_meth(args, &mut opt)?;
     opt.fill_scmat();
     if let Some(mut meth) = meth {
@@ -1153,6 +1187,15 @@ fn build_meth(args: &MemArgs, opt: &mut MemOpt) -> anyhow::Result<Option<bwa_cor
         };
     }
     m.chimera_qc = args.chimera_qc;
+    // bwa-mem3 0.17 (#734): neutral scoring loses em-seq's conversion-rich reads; warn, as it does.
+    if m.chem == meth::Chem::EmSeq && m.scoring == meth::Scoring::Neutral {
+        eprintln!(
+            "WARNING: --meth-scoring neutral with em-seq/bisulfite chemistry (--meth, --meth=emseq, \
+             --meth=bisulfite) scores each conversion 0, and em-seq converts most cytosines, so short \
+             reads are left unmapped or misplaced and unmethylated reads are lost first, biasing \
+             methylation upward. Use the em-seq default (genomic) or --meth-scoring collapsed."
+        );
+    }
     if args.read_type.is_some() {
         anyhow::bail!("--meth cannot be combined with -x");
     }
@@ -2259,6 +2302,7 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
 
     // Every tunable, final and immutable from here on: shared by reference with every worker.
     let opt = build_opt(&args)?;
+    let alt_project = check_alt_project(&args)?;
     // `-t` clamped to >= 1, as a usize for the pool builders. Same value as `opt.n_threads`.
     let n_threads = args.threads.max(1) as usize;
 
@@ -2362,7 +2406,18 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let (fm, mut bns) = if opt.meth.is_some() {
         load_meth_index(&args.index_prefix)?
     } else {
-        let fm = FmIndex::load(&args.index_prefix)?;
+        let fm = FmIndex::load(&args.index_prefix).map_err(|e| {
+            let seed = format!("{}.meth.bwt.2bit.64", args.index_prefix.display());
+            if std::path::Path::new(&seed).exists() {
+                anyhow::anyhow!(
+                    "{e}\nThis may be a --meth-only index: use mem --meth for methylation \
+                     alignment, or rebuild with index --meth --force (without --meth-only) for \
+                     ordinary alignment."
+                )
+            } else {
+                e.into()
+            }
+        })?;
         let bns = BntSeq::load(&args.index_prefix)?;
         // `FmIndex::load` already ties `.pac` to the `.bwt`; this ties `.ann` to both.
         anyhow::ensure!(
@@ -2380,6 +2435,10 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     if args.ignore_alt {
         bns.ignore_alt();
     }
+    let opt = match alt_project {
+        Some(primary) => load_alt_project(&args, &bns, opt, primary)?,
+        None => opt,
+    };
     // bwa prints this at load time (`bwa.cpp:419`). Kept behind the same verbosity gate as bwa's
     // other progress chatter: it goes to stderr and never touches the SAM bytes.
     if args.verbose.unwrap_or(3) >= 3 && bns.n_alt() > 0 {
@@ -2397,6 +2456,7 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     let sqs: Vec<SqRecord> = bns
         .contigs
         .iter()
+        .filter(|contig| !(opt.alt_project_primary && contig.is_alt))
         .map(|contig| SqRecord {
             name: contig.name.clone(),
             len: i64::from(contig.len),
@@ -2412,6 +2472,28 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         None
     } else {
         Some(hdr_parts.join("\n"))
+    };
+    // `--alt-project primary`: the output names no ALT contig, so a `-H` @SQ for one goes too
+    // (the fork's `drop_alt_SQ`; the `.alt`, not AH, decides what is ALT).
+    let hdr_lines = match hdr_lines {
+        Some(h) if opt.alt_project_primary => {
+            let alt: std::collections::HashSet<&str> = bns
+                .contigs
+                .iter()
+                .filter(|c| c.is_alt)
+                .map(|c| c.name.as_str())
+                .collect();
+            let is_alt_sq = |l: &str| {
+                l.strip_prefix("@SQ\t").is_some_and(|f| {
+                    f.split('\t')
+                        .find_map(|t| t.strip_prefix("SN:"))
+                        .is_some_and(|sn| alt.contains(sn))
+                })
+            };
+            let kept: Vec<&str> = h.split('\n').filter(|l| !is_alt_sq(l)).collect();
+            (!kept.is_empty()).then(|| kept.join("\n"))
+        }
+        h => h,
     };
 
     // `-I` fixes the insert-size distribution instead of inferring it per batch.
@@ -2497,6 +2579,7 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         stage_time::barrier::dump();
         // Where the BYTES went, next to where the wall clock went.
         crate::stage_alloc::dump();
+        report_demoted(&opt);
         forget_index(fm, bns);
         return Ok(());
     }
@@ -2581,6 +2664,7 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     // all of them. Runs on the main thread, where the stage accumulators live.
     stage_time::dump(t_run.elapsed());
     crate::stage_alloc::dump();
+    report_demoted(&opt);
     forget_index(fm, bns);
     Ok(())
 }
@@ -2704,6 +2788,160 @@ fn batched_regs(
     })
 }
 
+/// `--alt-project` and `--alt-project-exclude-bed`, refused before the index loads where the fork
+/// refuses them, with its messages. `Some(primary)` when projection is on.
+fn check_alt_project(args: &MemArgs) -> anyhow::Result<Option<bool>> {
+    let mode = match args.alt_project.as_deref() {
+        None => None,
+        Some("keep-alt") => Some(false),
+        Some("primary") => Some(true),
+        Some(other) => anyhow::bail!(
+            "--alt-project takes a mode, keep-alt or primary (got '{other}'; e.g. --alt-project \
+             keep-alt <idxbase> <reads>)"
+        ),
+    };
+    if mode.is_some() && (args.ignore_alt || args.meth.is_some()) {
+        anyhow::bail!(
+            "--alt-project cannot be combined with {}",
+            if args.ignore_alt {
+                "-j (it needs the ALT contigs)"
+            } else {
+                "--meth"
+            }
+        );
+    }
+    if let Some(bed) = &args.alt_project_exclude_bed {
+        if bed.as_os_str().is_empty() || bed.as_os_str() == "-" {
+            anyhow::bail!("--alt-project-exclude-bed requires a named BED file (not stdin)");
+        }
+        if mode.is_none() {
+            anyhow::bail!("--alt-project-exclude-bed requires --alt-project");
+        }
+        if let Err(e) = std::fs::File::open(bed) {
+            anyhow::bail!(
+                "--alt-project-exclude-bed {}: cannot read: {e}",
+                bed.display()
+            );
+        }
+    }
+    if mode.is_some() {
+        let alt = format!("{}.alt", args.index_prefix.display());
+        if let Err(e) = std::fs::File::open(&alt) {
+            anyhow::bail!(
+                "--alt-project needs {}.alt: {e} (it reads the ALT contigs' alignments to the \
+                 primary assembly from that file, which must sit next to the index; drop \
+                 --alt-project to align without it)",
+                args.index_prefix.display()
+            );
+        }
+    }
+    Ok(mode)
+}
+
+/// Load `<idxbase>.alt`'s alignments (and the exclusion BED) onto `opt`, with the fork's refusals
+/// and startup lines.
+fn load_alt_project(
+    args: &MemArgs,
+    bns: &BntSeq,
+    mut opt: MemOpt,
+    primary: bool,
+) -> anyhow::Result<MemOpt> {
+    use bwa_mem::alt_lift::FailedInput;
+    let alt = std::path::PathBuf::from(format!("{}.alt", args.index_prefix.display()));
+    let bed = args.alt_project_exclude_bed.as_deref();
+    let (table, st) =
+        bwa_mem::alt_lift::load(&alt, bns, bed).map_err(|(which, e)| match which {
+            FailedInput::Bed => anyhow::anyhow!("--alt-project-exclude-bed: {e}"),
+            FailedInput::Sidecar => anyhow::anyhow!("--alt-project: {e}"),
+        })?;
+    if let Some(b) = bed {
+        let b = b.display();
+        // No usable line at all falls through to the error below, ahead of the BED checks.
+        if table.n_lift > 0 || st.excluded > 0 {
+            anyhow::ensure!(
+                st.merged_intervals > 0,
+                "--alt-project-exclude-bed {b} has no nonempty intervals ({} zero-width ignored), \
+                 so it would exclude nothing; omit the option for unrestricted projection",
+                st.zero_width_intervals
+            );
+            anyhow::ensure!(
+                table.n_lift > 0,
+                "--alt-project-exclude-bed {b} excludes all {} usable ALT alignments in {}, so \
+                 nothing would be projected. Omitting --alt-project gives ordinary ALT-aware \
+                 mapping, not primary-only mapping",
+                st.excluded,
+                alt.display()
+            );
+            anyhow::ensure!(
+                st.excluded > 0,
+                "--alt-project-exclude-bed {b} excludes no usable ALT alignment in {} (no primary \
+                 footprint overlaps its {} merged interval(s)); omit the option for unrestricted \
+                 projection",
+                alt.display(),
+                st.merged_intervals
+            );
+        }
+    }
+    anyhow::ensure!(
+        table.n_lift > 0,
+        "--alt-project: no ALT contig in {} has a usable alignment (see any [W::alt_lift_load] \
+         warnings above for the lines it skipped)",
+        alt.display()
+    );
+    if args.verbose.unwrap_or(3) >= 3 {
+        eprintln!(
+            "[M::main_mem] alt-project: {} ALT contigs lift onto the primary assembly",
+            table.n_lift
+        );
+        if let Some(b) = bed {
+            eprintln!(
+                "[M::main_mem] alt-project: exclusion BED {}: input={} merged={} zero_width={} \
+                 excluded={} retained={}",
+                b.display(),
+                st.input_intervals,
+                st.merged_intervals,
+                st.zero_width_intervals,
+                st.excluded,
+                table.n_lift
+            );
+        }
+    }
+    opt.alt_lift = Some(std::sync::Arc::new(table));
+    opt.alt_project_primary = primary;
+    Ok(opt)
+}
+
+/// `--alt-project primary`: read ends written unmapped with `OA:Z` (a pair with both counts 2).
+static ALT_DEMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pair `i`'s two `OA:Z` values, or none when projection is off.
+fn pair_oa(oa_all: &[[Option<Vec<u8>>; 2]], i: usize) -> [Option<&[u8]>; 2] {
+    oa_all
+        .get(i)
+        .map_or([None, None], |o| [o[0].as_deref(), o[1].as_deref()])
+}
+
+/// The fork's closing line under `--alt-project primary`.
+fn report_demoted(opt: &MemOpt) {
+    if opt.alt_project_primary {
+        let n = ALT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[M::main_mem] alt-project primary: {n} read end{} had only unlifted ALT hits and {} \
+             written unmapped with OA:Z",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "was" } else { "were" }
+        );
+    }
+}
+
+/// Count the `OA:Z` tags in finished SAM text into [`ALT_DEMOTED`].
+fn count_demoted(sam: &[u8]) {
+    let n = sam.windows(6).filter(|w| w == b"\tOA:Z:").count() as u64;
+    if n > 0 {
+        ALT_DEMOTED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The `--meth` index: `<prefix>.ann/.amb/.pac` of the original genome and the converted seed
 /// index `<prefix>.meth.bwt.2bit.64` (`index --meth`). A prefix given as `<ref>.meth` is taken to
 /// mean `<ref>`, as in the fork.
@@ -2768,7 +3006,7 @@ fn finish_se_meth(
         eprintln!("=== read {} ===", String::from_utf8_lossy(rec.name()));
         bwa_mem::dump_regs(bns, "meth pre-mark", &regs);
     }
-    mem_mark_primary_se(opt, &mut regs, read_id);
+    mem_mark_primary_se(opt, &mut regs, tie_break_id(opt, rec.name(), read_id));
     if opt.flag & flags::PRIMARY5 != 0 {
         bwa_mem::primary::mem_reorder_primary5(opt.t, &mut regs);
     }
@@ -2788,6 +3026,7 @@ fn finish_se_meth(
         0,
         None,
         Some(&emit),
+        None,
         &mut buf,
     );
     if meth.may_qcfail() {
@@ -2850,7 +3089,13 @@ fn finish_se(
         regs = mem_sort_dedup_patch(fm, opt, codes, regs);
         bwa_mem::stamp_is_alt(bns, &mut regs);
     }
-    mem_mark_primary_se(opt, &mut regs, read_id);
+    // `--alt-project`: right after the stamp, before primary marking reads `is_alt`.
+    let oa = if opt.alt_lift.is_some() {
+        bwa_mem::alt_lift::project_read(fm, bns, opt, codes, &mut regs)
+    } else {
+        None
+    };
+    mem_mark_primary_se(opt, &mut regs, tie_break_id(opt, rec.name(), read_id));
     // `-5` (`MEM_F_PRIMARY5`): make the 5'-most segment of a split alignment the primary, which
     // score-ranking would not. Runs here, immediately after the marking and before anything reads
     // the region order.
@@ -2950,9 +3195,13 @@ fn finish_se(
             rec.name(),
             &sam_seq(codes, false),
             rec.qual(),
+            oa.as_deref(),
             rec.comment(),
         )
         .expect("write to Vec");
+        if oa.is_some() {
+            ALT_DEMOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return buf;
     }
     for which in 0..alns.len() {
@@ -3130,7 +3379,10 @@ fn write_aln_se(
     // separator before the block. Empty is legal (an alignment with no cigar and a negative score).
     let mut tags = String::new();
     if !aln.cigar.is_empty() {
-        tags.push_str(&format!("NM:i:{}\tMD:Z:{}", aln.nm, aln.md));
+        tags.push_str(&format!("NM:i:{}", aln.nm));
+        if !aln.md.is_empty() {
+            tags.push_str(&format!("\tMD:Z:{}", aln.md));
+        }
     }
     if aln.score >= 0 {
         tags.push_str(&format!("\tAS:i:{}", aln.score));
@@ -3178,6 +3430,11 @@ fn write_aln_se(
     if !emit.secondary && aln.alt_sc > 0 {
         tags.push_str("\tpa:f:");
         tags.push_str(&bwa_mem::cigar::format_pa(aln.score, aln.alt_sc));
+    }
+    // `--alt-project`: the ALT a lifted record was projected from, before XA as in the fork.
+    if aln.alt_source >= 0 {
+        tags.push_str("\tXL:Z:");
+        tags.push_str(&bns.contigs[aln.alt_source as usize].name);
     }
     if let Some(xa_string) = &emit.xa {
         tags.push_str("\tXA:Z:");
@@ -3369,6 +3626,26 @@ fn run_pe(
                     .map(|_| (regs_iter.next().unwrap(), regs_iter.next().unwrap()))
                     .collect()
             });
+        // `--alt-project`: lift each end's regions before pestat, rescue and pairing read them.
+        // Under `primary`, the `OA:Z` each end carries if it ends up unmapped, by pair; empty
+        // when projection is off.
+        let oa_all: Vec<[Option<Vec<u8>>; 2]> = if opt.alt_lift.is_some() {
+            paired
+                .par_iter_mut()
+                .zip(batch.par_iter())
+                .map_init(Vec::new, |codes, ((r1, r2), (rec1, rec2))| {
+                    let mut end = |rec: &Record, regs: &mut Vec<MemAlnReg>| {
+                        codes.clear();
+                        rec.codes_into(codes);
+                        bwa_mem::alt_lift::project_read(fm, bns, opt, codes, regs)
+                    };
+                    [end(rec1, r1), end(rec2, r2)]
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let oa_all = &oa_all;
 
         // ---- Insert-size distribution, estimated once over the WHOLE batch. This is why batch
         //      boundaries (`-K`) are visible in paired-end output ----
@@ -3477,7 +3754,7 @@ fn run_pe(
                 let n = recs.len();
                 let resolve = |prev: &mut Vec<(Vec<u8>, Vec<Deferred>)>| {
                     if prev.iter().any(|(_, d)| !d.is_empty()) {
-                        emit_deferred(fm, bns, opt, &pes, base_pair, &pend_tables, prev);
+                        emit_deferred(fm, bns, opt, &pes, base_pair, &pend_tables, oa_all, prev);
                     }
                 };
                 let emit = || -> Vec<(Vec<u8>, Vec<Deferred>)> {
@@ -3532,6 +3809,7 @@ fn run_pe(
                                     // rescue_done: true when nothing further should rescue -- either the batched
                                     // pass already did it, or BWA4_NO_RESCUE suppressed it outright.
                                     !scalar_rescue || no_rescue,
+                                    pair_oa(oa_all, pair_in_batch),
                                     &mut buf,
                                 )
                                 .expect("write to Vec");
@@ -3551,6 +3829,9 @@ fn run_pe(
                                             ids,
                                         });
                                     }
+                                }
+                                if opt.alt_project_primary {
+                                    count_demoted(&buf[at..]);
                                 }
                                 (buf, codes, deferred)
                             })
@@ -3605,6 +3886,7 @@ fn emit_deferred(
     pes: &[PeStat; 4],
     base_pair: u64,
     pend_tables: &[(usize, Vec<PendS2>)],
+    oa_all: &[[Option<Vec<u8>>; 2]],
     bufs: &mut [(Vec<u8>, Vec<Deferred>)],
 ) {
     let table = |pair: usize| &pend_tables[pend_tables.partition_point(|t| t.0 <= pair) - 1].1;
@@ -3654,6 +3936,7 @@ fn emit_deferred(
                     pes,
                     base_pair,
                     table(d.pair),
+                    pair_oa(oa_all, d.pair),
                     d,
                     vals,
                     &mut out,
@@ -3675,6 +3958,7 @@ fn emit_resolved(
     pes: &[PeStat; 4],
     base_pair: u64,
     table: &[PendS2],
+    oa: [Option<&[u8]>; 2],
     d: Deferred,
     mut vals: Vec<(u32, i32)>,
     out: &mut Vec<u8>,
@@ -3704,12 +3988,16 @@ fn emit_resolved(
             &mut regs1,
             &mut regs2,
             true,
+            oa,
             out,
         )
         .expect("write to Vec");
         let mut more = Vec::new();
         lazy_csub::take(&mut more);
         if more.is_empty() {
+            if opt.alt_project_primary {
+                count_demoted(&out[at..]);
+            }
             return;
         }
         out.truncate(at);

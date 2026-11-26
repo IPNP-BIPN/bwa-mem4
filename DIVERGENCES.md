@@ -4,9 +4,28 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
 
 ## Acceptees (par conception)
 
-- **Mode `--meth` : l'oracle est bwa-mem3 0.16, pas bwa-mem2.** bwa-mem2 n'a pas de mode
-  methylation. Parite octet a octet avec bwa-mem3 0.16 via `scripts/meth_oracle_diff.sh` ; les
+- **Mode `--meth` : l'oracle est bwa-mem3 0.18, pas bwa-mem2.** bwa-mem2 n'a pas de mode
+  methylation. Parite octet a octet avec bwa-mem3 0.18 via `scripts/meth_oracle_diff.sh` ; les
   ecarts restants (hors jeu de test) sont listes dans `docs/meth-mode.md`.
+
+- **`--tie-break name` et `--md short|none` : options de bwa-mem3, hors bwa-mem2. ACCEPTE, opt-in.**
+  `--tie-break name` (bwa-mem3 0.18) tire les egalites de score du nom du read au lieu de sa position
+  dans l'entree ; `--md none` (bwa-mem3 0.17) n'ecrit pas MD:Z, `--md short` n'y liste que ce que NM
+  compte (identique a `full` hors `--meth`). Sans ces options, la sortie ne change pas. Avec elles,
+  parite octet a octet avec bwa-mem3 0.18 `--compat=bwa-mem2 --compat-allow-divergent` (GIAB, SE et
+  PE) et avec son `--meth` (`scripts/meth_oracle_diff.sh`).
+
+- **`--alt-project keep-alt|primary` et `--alt-project-exclude-bed` : options de bwa-mem3 0.18 (#775,
+  #802), hors bwa-mem2. ACCEPTE, opt-in.** Les hits sur un contig ALT sont projetes sur l'assemblage
+  primaire via `<idxbase>.alt` avant le marquage primaire, pestat, le rescue et l'appariement (tag
+  `XL:Z`) ; `primary` retire les hits ALT non projetes, les `@SQ` ALT, et ecrit `OA:Z` sur un read
+  rendu non aligne. Sans l'option, la sortie ne change pas. Avec elle, parite octet a octet avec
+  bwa-mem3 0.18 sur ses propres fixtures ALT (`scripts/alt_project_diff.sh` : 85 executions, off,
+  keep-alt, primary, SE et PE, avec et sans BED), en retirant `@PG`, `@HD` et les tags `HN:i`/`MQ:i`
+  que le fork ecrit par defaut. Non portes : `--alt-project-min-gap` (experimental, 0 par defaut
+  dans le fork), `BWAMEM3_ALT_PROJECT_PAIR_GAP` et `BWAMEM3_ALT_PROJECT_TRACE` (developpeur), la
+  sortie `--bam` du fork (filtre de la table des contigs), le `.hdr`/`.dict` d'index (non lu par
+  bwa-mem4). Les messages d'erreur reprennent le texte du fork, prefixe `Error:`.
 
 - **Scoring non defaut (`-A 2`) : bwa-mem2 ne s'accorde pas avec lui-meme, et nous suivons son build
   arm64. FIGE (2026-08-18).** Sous un score de match non defaut, les builds x86_64 et arm64 de

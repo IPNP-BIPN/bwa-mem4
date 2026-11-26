@@ -354,6 +354,7 @@ mod tests {
             sub_n: 0,
             seedcov: 0,
             seedlen0: 0,
+            alt_bw: 0,
             secondary,
             secondary_all: secondary,
             w: 0,
