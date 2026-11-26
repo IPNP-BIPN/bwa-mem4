@@ -2019,7 +2019,11 @@ fn run_pipeline<B: Send>(
                 let t1 = probe.then(std::time::Instant::now);
                 // In order, so the concatenation of the pieces is exactly the batch's SAM text.
                 // `Output`'s buffering is what turns these back into few, large syscalls.
-                out.write_pieces(&pieces)?;
+                // A failed BGZF write surfaces here only as "pipeline stopped"; the real io::Error
+                // (ENOSPC, EIO) is what `finish` returns, so report that one.
+                if let Err(e) = out.write_pieces(&pieces) {
+                    return Err(out.finish().err().unwrap_or_else(|| e.into()));
+                }
                 if let (Some(t0), Some(t1)) = (t0, t1) {
                     blocked += t1.duration_since(t0).as_secs_f64();
                     writing += t1.elapsed().as_secs_f64();
