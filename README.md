@@ -349,12 +349,22 @@ without the BED (`scripts/alt_project_diff.sh`); without the option nothing chan
 
 ## GPU
 
-There is none, deliberately. A Metal backend existed and was removed: on a whole genome the
-Smith-Waterman kernel is about **4%** of runtime, while seeding is about 78%. Amdahl caps any
-SW-offload backend at a few percent, and each one adds a byte-identity surface that must be proven
-against the scalar reference. The Metal shader had shipped a real bug (it opened gaps from `H`
-instead of `M`) precisely because that proof was too weak. It is in the git history if the profile
-ever changes.
+Optional and off by default. Built with `--features metal` (macOS) and run with `BWA4_GPU=metal`,
+seed extension runs on the Apple GPU next to the NEON kernels: each extension call gives the GPU a
+share of its jobs (`BWA4_GPU_SHARE`, default 0.25), and a CPU worker that finishes first takes the
+GPU's jobs back instead of waiting. The kernel gives each job 16 GPU lanes and is field-exact against
+`ksw_extend2`, so the output is byte-identical to bwa-mem2 at any share (checked on 2M GIAB pairs);
+`BWA4_GPU_VERIFY` rechecks every GPU result on the CPU. On an M4 Max it saves 3-7% of wall on real reads at
+`-t12` and `-t16`. The mate-rescue bands have a GPU path too
+(`BWA4_GPU_BAND_SHARE`, off by default): identical output, but within noise on this machine.
+
+The gain is small because the profile says it must be: on the current binary the DP kernels are
+~35% of cycles (mate rescue 19%, extension 16%), so even a free offload of both is ~1.5x, and the GPU
+reaches about a third of the 16 CPU cores' extension throughput. This is the third Metal backend:
+the first (July, removed in `9228eaf`) opened extension gaps from `H` instead of `M`, a real bug,
+because its identity proof was too weak; the mate-rescue kernel does open from `H`, by
+specification. The second (August, one thread per alignment, parked on branch `gpu`) was memory
+bound. Details: [docs/gpu-plan.md](docs/gpu-plan.md).
 
 ## Output formats
 
@@ -465,10 +475,10 @@ killed with the reason for each, is in
 before proposing a kernel change: several of those levers were proposed twice by different people in
 the same session, and the file says what would have to be new for one to be worth a third look.
 
-Whether a GPU could help without giving up byte-identity, how much (2.45x, and an integrated GPU
-already reaches it), and what would have to be built first, is in
-[docs/gpu-plan.md](docs/gpu-plan.md). None of it is on this branch: the Metal backend is parked on
-branch `gpu`.
+Whether a GPU can help without giving up byte-identity, what was built (three Metal backends) and
+what each one measured, is in [docs/gpu-plan.md](docs/gpu-plan.md); its first section is the current
+status. The survey of the GPU and accelerator literature behind the November attempt, with what this
+project can and cannot borrow, is in [docs/gpu-research-2026-11.md](docs/gpu-research-2026-11.md).
 
 A read of fg-labs/bwa-mem3's source, asking why it is faster than us on x86_64 while we are at
 parity on Apple Silicon, is in [docs/fork-teardown.md](docs/fork-teardown.md). The short answer is

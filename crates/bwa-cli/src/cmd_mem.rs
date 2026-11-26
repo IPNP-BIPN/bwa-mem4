@@ -2669,6 +2669,63 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The GPU co-processor for seed extension: built with `--features metal` and run with
+/// `BWA4_GPU=metal`, the Metal kernel takes `BWA4_GPU_SHARE` (default 0.25) of each extension call
+/// and the NEON kernels the rest; `BWA4_GPU_VERIFY` also recomputes every GPU result on the CPU
+/// and stops the run at the first mismatch. `None`, and the CPU path, otherwise.
+#[cfg(feature = "metal")]
+fn gpu_extend() -> Option<&'static bwa_metal::Hybrid<NeonBackend>> {
+    static GPU: std::sync::OnceLock<Option<bwa_metal::Hybrid<NeonBackend>>> =
+        std::sync::OnceLock::new();
+    let h = GPU
+        .get_or_init(|| {
+            if std::env::var("BWA4_GPU").ok().as_deref() != Some("metal") {
+                return None;
+            }
+            let share = std::env::var("BWA4_GPU_SHARE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.25);
+            let Some(gpu) = bwa_metal::MetalExtend::new() else {
+                eprintln!(
+                    "[W::mem] BWA4_GPU=metal: no usable Metal device, extension stays on the CPU"
+                );
+                return None;
+            };
+            eprintln!(
+                "[M::mem] seed extension: {} takes {share} of each batch, the CPU the rest",
+                gpu.device_name()
+            );
+            let band = std::env::var("BWA4_GPU_BAND_SHARE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                // Off by default: on a shared M4 Max the measured gain is 1-4% of CPU at -t16 and
+                // nothing at -t12 (docs/gpu-plan.md, first section).
+                .unwrap_or(0.0);
+            if band > 0.0 {
+                eprintln!("[M::mem] mate-rescue bands: the GPU takes {band} of each call's cells");
+            }
+            let verify = std::env::var_os("BWA4_GPU_VERIFY").is_some();
+            Some(bwa_metal::Hybrid::new(gpu, NeonBackend, share, verify).with_band_share(band))
+        })
+        .as_ref();
+    // The rescue bands reach the GPU through `bwa_neon::offload`; registered on the first call,
+    // which comes before the first batch's rescue.
+    static BANDS: std::sync::Once = std::sync::Once::new();
+    if let Some(h) = h {
+        BANDS.call_once(|| {
+            bwa_neon::offload::set_band_offload(h);
+        });
+    }
+    h
+}
+
+/// CPU-only build: no GPU backend to offer.
+#[cfg(not(feature = "metal"))]
+fn gpu_extend() -> Option<&'static NeonBackend> {
+    None
+}
+
 /// Seed + chain + batched extension + dedup for a whole read batch, returning each read's regions
 /// (byte-identical to `align_read` per read). Chunked across the rayon pool so extension batches run
 /// in parallel; per-read results are independent of the chunking.
@@ -2739,7 +2796,10 @@ fn batched_regs(
                     })
                     .collect();
                 let mut regs = match meth {
-                    None => align_reads_batched(fm, bns, opt, &codes, &NeonBackend),
+                    None => match gpu_extend() {
+                        Some(gpu) => align_reads_batched(fm, bns, opt, &codes, gpu),
+                        None => align_reads_batched(fm, bns, opt, &codes, &NeonBackend),
+                    },
                     // `--meth`: seed the chunk's converted copies, align the reads themselves.
                     Some(ot) => {
                         let conv: Vec<Vec<u8>> = codes
