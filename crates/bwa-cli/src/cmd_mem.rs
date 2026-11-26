@@ -1350,13 +1350,10 @@ impl HtsTranscoder {
             self.header_text.push(b'\n');
             return Ok(());
         }
-        let writer = self.open_writer()?;
-        // `from_sam` is htslib's own `sam_parse1`, i.e. the same parser samtools uses when it reads
-        // our SAM file back. That equivalence is the point: whatever samtools would make of the
-        // text, the BAM/CRAM holds.
-        let rec = bam::Record::from_sam(&writer.header, line)?;
-        writer.write(&rec)?;
-        Ok(())
+        // htslib's own `sam_parse1`, i.e. the same parser samtools uses when it reads our SAM
+        // file back. That equivalence is the point: whatever samtools would make of the text, the
+        // BAM/CRAM holds.
+        self.open_writer()?.write_sam_line(line)
     }
 
     /// The writer, opening the file on first use now that `header_text` is complete.
@@ -1417,6 +1414,11 @@ struct HtsWriter {
     /// The parsed header. Owned here because `sam_write1` needs it on every record (it maps RNAME
     /// to a numeric tid) and `Record::from_sam` needs it to parse one.
     header: bam::HeaderView,
+    /// One record and one line buffer reused for every line: `Record::from_sam` allocated both
+    /// per record on this single thread, and `unwrap`ped `from_utf8` on its error path (a panic,
+    /// so an abort and a BAM without EOF block, on a non-UTF-8 QNAME htslib rejects).
+    rec: bam::Record,
+    line: Vec<u8>,
 }
 
 // SAFETY: `htsFile` is not shared, only moved: the sink is created on the main thread and handed to
@@ -1469,6 +1471,8 @@ impl HtsWriter {
         let this = HtsWriter {
             fp,
             header: bam::HeaderView::from_bytes(header_text),
+            rec: bam::Record::new(),
+            line: Vec::new(),
         };
         if let Some(reference) = reference {
             let cref = std::ffi::CString::new(reference.as_os_str().as_encoded_bytes())
@@ -1500,9 +1504,33 @@ impl HtsWriter {
 
     /// Write one record. The header must be the one it was parsed against: `sam_write1` reads the
     /// record's numeric `tid`, which only means anything relative to that header's @SQ order.
-    fn write(&mut self, rec: &bam::Record) -> anyhow::Result<()> {
+    fn write_sam_line(&mut self, line: &[u8]) -> anyhow::Result<()> {
+        // NUL-terminated copy, passed exactly as `Record::from_sam` passes it (`l` = `m` = len + 1).
+        self.line.clear();
+        self.line.extend_from_slice(line);
+        self.line.push(0);
+        let mut ks = htslib::kstring_t {
+            s: self.line.as_mut_ptr().cast(),
+            l: self.line.len(),
+            m: self.line.len(),
+        };
+        // SAFETY: `ks` points at `self.line`, live for the call; the header and record are live
+        // and owned here. `sam_parse1` resets the record it fills, as in samtools' read loop.
+        let parsed = unsafe {
+            htslib::sam_parse1(
+                &mut ks,
+                self.header.inner_ptr() as *mut htslib::bam_hdr_t,
+                self.rec.inner_mut(),
+            )
+        };
+        if parsed < 0 {
+            anyhow::bail!(
+                "htslib could not parse SAM line: {}",
+                String::from_utf8_lossy(line)
+            );
+        }
         // SAFETY: all three pointers are live, and htslib only reads the header and the record.
-        if unsafe { htslib::sam_write1(self.fp, self.header.inner_ptr(), rec.inner()) } < 0 {
+        if unsafe { htslib::sam_write1(self.fp, self.header.inner_ptr(), self.rec.inner()) } < 0 {
             anyhow::bail!("writing a BAM/CRAM record failed");
         }
         Ok(())
