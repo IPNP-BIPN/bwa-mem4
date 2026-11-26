@@ -734,6 +734,13 @@ pub(crate) fn unpack_pac_range_append(pac: &[u8], l_pac: i64, rb: i64, re: i64, 
     if len == 0 {
         return;
     }
+    // The SIMD unpackers below index `pac` unchecked, so a range outside the reference must stop
+    // here, not read out of bounds (`FmIndex::bases*` are public). One compare per window.
+    assert!(
+        rb >= 0 && re <= 2 * l_pac,
+        "reference range [{rb}, {re}) outside [0, {})",
+        2 * l_pac
+    );
     let len0 = out.len();
     out.reserve(len + 16);
     if re <= l_pac {
@@ -764,6 +771,13 @@ pub(crate) fn unpack_pac_range_append_rev(
     if len == 0 {
         return;
     }
+    // The SIMD unpackers below index `pac` unchecked, so a range outside the reference must stop
+    // here, not read out of bounds (`FmIndex::bases*` are public). One compare per window.
+    assert!(
+        rb >= 0 && re <= 2 * l_pac,
+        "reference range [{rb}, {re}) outside [0, {})",
+        2 * l_pac
+    );
     let len0 = out.len();
     out.reserve(len + 16);
     if re <= l_pac {
@@ -2783,6 +2797,21 @@ impl FmIndex {
 
 #[cfg(test)]
 mod tests {
+    /// A range outside `[0, 2 * l_pac)` stops at the assert instead of reaching the unchecked
+    /// SIMD unpackers.
+    #[test]
+    #[should_panic(expected = "outside")]
+    fn range_before_the_reference_is_refused() {
+        let pac = vec![0u8; 64];
+        super::unpack_pac_range_append(&pac, 200, -68, 0, &mut Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "outside")]
+    fn range_past_the_reverse_strand_is_refused() {
+        let pac = vec![0u8; 64];
+        super::unpack_pac_range_append_rev(&pac, 200, 390, 410, &mut Vec::new());
+    }
 
     /// The vectorised range unpack must equal the per-base one, byte for byte, in both halves of
     /// the doubled coordinate space and at every alignment of the range against the 4-base packing.
