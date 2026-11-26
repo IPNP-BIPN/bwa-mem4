@@ -1,5 +1,3 @@
-# local-only graphify state (interpreter path, scan root, cache, run costs)
-cache/
-.graphify_*
-cost.json
-manifest.json
+# machine-specific graphify state (absolute interpreter path and scan root)
+.graphify_python
+.graphify_root
