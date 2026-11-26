@@ -511,7 +511,7 @@ pub fn build_index_parts(
     // `forward` is now captured in bref; free it before the suffix array (~3 GB at genome scale).
     drop(forward);
     if unpacked {
-        File::create(sibling(prefix, "0123")).and_then(|f| BufWriter::new(f).write_all(&bref))?;
+        std::fs::write(sibling(prefix, "0123"), &bref)?;
     }
 
     // 5. Build and write the FM-index (.bwt.2bit.64).
