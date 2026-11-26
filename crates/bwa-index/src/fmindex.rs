@@ -50,8 +50,8 @@
 //! 5. [`FmIndex::get_sa`]: turning a row back into a reference position.
 //! 6. [`FmIndex::get_sa_batch`] and [`FmIndex::prefetch_occ`]: latency hiding only, no new logic.
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use crate::build::sibling;
+use std::path::Path;
 
 use bwa_core::{Error, Result};
 use memmap2::Mmap;
@@ -799,27 +799,6 @@ fn unpack_pac_rev<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut V
     out[len0..].reverse();
 }
 
-/// Build the path `<prefix>.<ext>`, the naming convention every index file follows.
-///
-/// # Parameters
-/// * `prefix`: the FASTA path given at index-build time, e.g. `/data/hg38.fa`. Used verbatim as a
-///   string prefix, NOT as a directory: the extension is appended to the whole path, so
-///   `hg38.fa` + `bwt.2bit.64` gives `hg38.fa.bwt.2bit.64`. Supplied by the caller of
-///   [`FmIndex::load`], ultimately the `-x`/positional index argument on the command line.
-/// * `ext`: the extension to append, WITHOUT a leading dot (the dot is added here). Only
-///   `"bwt.2bit.64"` and `"0123"` are used in this module.
-///
-/// # Returns
-/// The concatenated path. Existence is not checked; the caller's `File::open` reports a missing
-/// file. Works on non-UTF-8 paths because the join happens at the `OsString` level.
-fn sibling(prefix: &Path, ext: &str) -> PathBuf {
-    // Byte-level path concatenation, so a prefix that is not valid UTF-8 survives the round trip.
-    let mut s: OsString = prefix.as_os_str().to_owned();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
-}
-
 /// Read one little-endian `i64` at `*p` and advance the cursor. Every scalar in `.bwt.2bit.64` is
 /// LE `i64`, so this is the whole header decoder.
 ///
@@ -830,8 +809,8 @@ fn sibling(prefix: &Path, ext: &str) -> PathBuf {
 ///   sequence of `rd_i64` calls decodes consecutive fields in file order.
 ///
 /// # Returns
-/// The decoded value. Panics on a truncated file, because the slice `[*cursor .. *cursor + 8]`
-/// goes out of bounds; there is no format validation anywhere in this module.
+/// The decoded value. Panics if `bytes` is shorter than `*cursor + 8`; `FmIndex::load` checks the
+/// file size before decoding.
 fn rd_i64(bytes: &[u8], cursor: &mut usize) -> i64 {
     // The 8 bytes at the cursor, reinterpreted LE. `try_into` cannot fail: the slice is 8 long.
     let v = i64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
@@ -917,20 +896,19 @@ impl FmIndex {
     ///
     /// The cursor arithmetic below IS the format spec: header (`i64` + 5 x `i64`), then
     /// `cp_size = (N >> 6) + 1` 64-byte checkpoints, then `sa_size = (N >> 3) + 1` `i8`s, then
-    /// `sa_size` `u32`s, then the trailing sentinel `i64`. Nothing is self-describing, so a
-    /// truncated or foreign-endian file is not detected here; it simply produces wrong answers or
-    /// panics on the slice bounds.
+    /// `sa_size` `u32`s, then the trailing sentinel `i64`. The file size must be the one the row
+    /// count implies, so a truncated or mixed file is refused; a foreign-endian one is not detected.
     ///
     /// # Parameters
     /// * `prefix`: the index prefix, i.e. the FASTA path used at build time. Both `.bwt.2bit.64`
     ///   and `.0123` must already exist next to it (see [`crate::build`]); this function only
-    ///   reads. Comes from the command line, so it is untrusted as a PATH but trusted as CONTENT:
-    ///   a corrupt file is not detected.
+    ///   reads. Comes from the command line, so it is untrusted as a PATH; its content is checked
+    ///   for size and row-count shape only.
     ///
     /// # Returns
     /// A fully usable `FmIndex` holding two live memory maps, so the returned value keeps the
-    /// index files open for its whole lifetime. `Err` only for I/O failures (missing file,
-    /// permission, `mmap` refusal); a truncated file panics instead.
+    /// index files open for its whole lifetime. `Err` for I/O failures (missing file, permission,
+    /// `mmap` refusal) and for a file whose size or row count does not fit the format.
     pub fn load(prefix: &Path) -> Result<Self> {
         // Load the BWT with plain reads straight into aligned buffers, NOT mmap + copy. mmap would
         // fault the whole ~10 GB file into OUR resident set while we copy it out, so peak RSS
@@ -989,7 +967,7 @@ impl FmIndex {
         // `sa_size` = one sampled suffix-array entry per 8 rows, `+1` for the same edge row.
         // A garbage header would size the allocations below; an even or non-positive row count is
         // not `2L + 1`.
-        if ref_seq_len < 1 || ref_seq_len % 2 == 0 {
+        if ref_seq_len % 2 == 0 {
             return Err(Error::IndexFormat(format!(
                 "{}: row count {ref_seq_len} is not 2L+1",
                 sibling(prefix, "bwt.2bit.64").display()
@@ -1000,7 +978,7 @@ impl FmIndex {
         // The file size is fixed by the row count (see `build::write_fm_index`). A short file is a
         // build that died mid-write; a long one belongs to another reference.
         let want = 48 + 64 * cp_size as u64 + 5 * sa_size as u64 + 8;
-        let got = bwt_file.metadata()?.len();
+        let got = bwt_len;
         // fg-labs/bwa-mem3 appends an 8-byte format word (3) that nothing here reads: accept its
         // index files (nf-core's `bwamem3/index` builds them) as they are.
         if got != want && got != want + 8 {
@@ -1016,12 +994,6 @@ impl FmIndex {
         const FILE_CP_BYTES: usize = 64;
         let cp_bytes = cp_size * FILE_CP_BYTES;
         let ls_bytes = sa_size * 4;
-        let bwt_need = HEADER_BYTES + cp_bytes as u64 + sa_size as u64 + ls_bytes as u64 + 8;
-        if bwt_len < bwt_need {
-            return Err(damaged(format!(
-                ".bwt.2bit.64 is {bwt_len} bytes and its header needs {bwt_need}"
-            )));
-        }
 
         // Trailing header field, read first because the checkpoints are built with it in hand:
         // the one BWT ROW (not a reference position) whose suffix is the whole text, i.e. the row

@@ -61,8 +61,9 @@
 //! | `#[derive(Debug, Clone)]` on the records | `Debug` gives `{:?}` printing, used by test failure messages; `Clone` an explicit deep copy. Neither is implicit in Rust, which is why they are requested by name. |
 //! | `.iter().filter(..).count()` | an iterator chain that reads as a sentence and compiles to the loop you would have written. No intermediate vector is built: `filter` yields lazily and `count` consumes. |
 
+use crate::build::sibling;
 use bwa_core::{Error, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// One reference contig (from `.ann`), the C's `bntann1_t`.
 #[derive(Debug, Clone)]
@@ -478,25 +479,6 @@ impl BntSeq {
             -1
         }
     }
-}
-
-/// Build the path `<prefix>.<ext>`, the naming scheme every bwa index file follows.
-///
-/// # Parameters
-///
-/// * `prefix`: the index prefix (the indexed FASTA's path), as given on the command line.
-/// * `ext`: the extension WITHOUT its leading dot, e.g. `"ann"` or `"amb"`.
-///
-/// # Returns
-///
-/// `prefix` with `"." + ext` appended. It appends to the OS string rather than using
-/// `Path::with_extension`, which would REPLACE an existing extension: `ref.fa` must become
-/// `ref.fa.ann`, not `ref.ann`.
-fn sibling(prefix: &Path, ext: &str) -> PathBuf {
-    let mut s = prefix.as_os_str().to_owned();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
 }
 
 /// Wrap a description of a malformed index file into the crate's error type.

@@ -240,6 +240,20 @@ pub(crate) fn bns_fetch_seq(
     mid: i64,
     re: i64,
 ) -> (i64, i64, i32, Vec<u8>) {
+    let mut seq = Vec::new();
+    let (rb, re, rid) = bns_fetch_seq_into(fm, bns, rb, mid, re, &mut seq);
+    (rb, re, rid, seq)
+}
+
+/// [`bns_fetch_seq`] appending the window to `out` instead of allocating it.
+pub(crate) fn bns_fetch_seq_into(
+    fm: &FmIndex,
+    bns: &BntSeq,
+    rb: i64,
+    mid: i64,
+    re: i64,
+    out: &mut Vec<u8>,
+) -> (i64, i64, i32) {
     let (mut rb, mut re) = if re < rb { (re, rb) } else { (rb, re) };
     // `depos` folds `mid` back onto the forward strand and reports whether it came from the reverse
     // half; `pos2rid` then binary-searches the contig offsets in that forward space.
@@ -265,38 +279,9 @@ pub(crate) fn bns_fetch_seq(
     }
     rb = rb.max(far_beg);
     re = re.min(far_end);
-    // `bns_get_seq` unpacks 2-bit bases; `fm.base` does the same per position, including the
+    // `bns_get_seq` unpacks 2-bit bases; `fm.bases_append` does the same per position, including the
     // reverse-complement fold for `p >= l_pac`. The C asserts the returned length equals `re - rb`,
     // which holds here by construction.
-    let seq: Vec<u8> = fm.bases(rb, re);
-    (rb, re, rid, seq)
-}
-
-/// [`bns_fetch_seq`] appending the window to `out` instead of allocating it.
-pub(crate) fn bns_fetch_seq_into(
-    fm: &FmIndex,
-    bns: &BntSeq,
-    rb: i64,
-    mid: i64,
-    re: i64,
-    out: &mut Vec<u8>,
-) -> (i64, i64, i32) {
-    let (mut rb, mut re) = if re < rb { (re, rb) } else { (rb, re) };
-    let (fwd_mid, is_rev) = bns.depos(mid);
-    let rid = bns.pos2rid(fwd_mid);
-    let (mut far_beg, mut far_end) = if rid >= 0 {
-        let contig = &bns.contigs[rid as usize];
-        (contig.offset, contig.offset + i64::from(contig.len))
-    } else {
-        (0, bns.l_pac << 1)
-    };
-    if is_rev {
-        let old_far_beg = far_beg;
-        far_beg = (bns.l_pac << 1) - far_end;
-        far_end = (bns.l_pac << 1) - old_far_beg;
-    }
-    rb = rb.max(far_beg);
-    re = re.min(far_end);
     fm.bases_append(rb, re, out);
     (rb, re, rid)
 }
