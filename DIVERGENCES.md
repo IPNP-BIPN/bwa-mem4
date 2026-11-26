@@ -15,6 +15,18 @@ Suivi de la traine de parite. Chaque entree : champ concerne, cause, statut, pla
   parite octet a octet avec bwa-mem3 0.18 `--compat=bwa-mem2 --compat-allow-divergent` (GIAB, SE et
   PE) et avec son `--meth` (`scripts/meth_oracle_diff.sh`).
 
+- **`--alt-project keep-alt|primary` et `--alt-project-exclude-bed` : options de bwa-mem3 0.18 (#775,
+  #802), hors bwa-mem2. ACCEPTE, opt-in.** Les hits sur un contig ALT sont projetes sur l'assemblage
+  primaire via `<idxbase>.alt` avant le marquage primaire, pestat, le rescue et l'appariement (tag
+  `XL:Z`) ; `primary` retire les hits ALT non projetes, les `@SQ` ALT, et ecrit `OA:Z` sur un read
+  rendu non aligne. Sans l'option, la sortie ne change pas. Avec elle, parite octet a octet avec
+  bwa-mem3 0.18 sur ses propres fixtures ALT (`scripts/alt_project_diff.sh` : 85 executions, off,
+  keep-alt, primary, SE et PE, avec et sans BED), en retirant `@PG`, `@HD` et les tags `HN:i`/`MQ:i`
+  que le fork ecrit par defaut. Non portes : `--alt-project-min-gap` (experimental, 0 par defaut
+  dans le fork), `BWAMEM3_ALT_PROJECT_PAIR_GAP` et `BWAMEM3_ALT_PROJECT_TRACE` (developpeur), la
+  sortie `--bam` du fork (filtre de la table des contigs), le `.hdr`/`.dict` d'index (non lu par
+  bwa-mem4). Les messages d'erreur reprennent le texte du fork, prefixe `Error:`.
+
 - **Scoring non defaut (`-A 2`) : bwa-mem2 ne s'accorde pas avec lui-meme, et nous suivons son build
   arm64. FIGE (2026-08-18).** Sous un score de match non defaut, les builds x86_64 et arm64 de
   bwa-mem2 2.3 produisent des alignements differents sur les memes reads. Ce n'est pas une

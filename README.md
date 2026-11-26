@@ -280,6 +280,7 @@ IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \
 
 ```sh
 bash scripts/alt_parity.sh     # ALT contigs: real GRCh38 analysis set + the real bwakit .alt
+bash scripts/alt_project_diff.sh   # --alt-project against bwa-mem3 0.18 on the fork's ALT fixtures
 bash scripts/giab_publication.sh   # the real thing: index + full 30x SE/PE, both tools, ~8 h
 ```
 
@@ -331,6 +332,20 @@ writes the fork's seven files; as in 0.17, bare `--meth` scores EM-seq as `genom
 0.53-0.66 of bwa-mem3's CPU cycles on Apple M4 (150 and 250 bp, `-t1`) and 0.67-0.89 of its wall
 time on x86. Without `--meth` nothing changes.
 Details, options and validation: [docs/meth-mode.md](docs/meth-mode.md).
+
+## ALT projection (`--alt-project`)
+
+`mem --alt-project keep-alt|primary [--alt-project-exclude-bed FILE]` is fg-labs/bwa-mem3 0.18's
+ALT projection (#775, #802): alignments to ALT contigs are lifted onto the primary assembly through
+`<idxbase>.alt` before pairing and MAPQ, so an ALT haplotype can decide where a read goes. A lifted
+record is re-aligned to the primary reference, keeps the ALT score as AS and names its ALT in
+`XL:Z`. A hit the lift cannot describe (an `.alt` clip, an end in an ALT insertion, less than half
+aligned, ALT indels wider than `-w`, 1022 or the re-alignment band) stays on its ALT under
+`keep-alt`; `primary` drops it, leaves the ALT `@SQ` out, and writes a read left with no hit
+unmapped with `OA:Z`. `--alt-project-exclude-bed` (plain or gzipped BED) skips each `.alt` line
+whose primary footprint overlaps an interval. Refused with `-j` and `--meth`. Output is
+byte-identical to bwa-mem3 0.18 on the fork's own ALT fixtures, both modes, SE and PE, with and
+without the BED (`scripts/alt_project_diff.sh`); without the option nothing changes.
 
 ## GPU
 
