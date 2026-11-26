@@ -1,0 +1,5 @@
+# local-only graphify state (interpreter path, scan root, cache, run costs)
+cache/
+.graphify_*
+cost.json
+manifest.json
