@@ -462,9 +462,13 @@ pub fn build_index_parts(
     // A rebuild writes .pac/.ann/.amb long before the .bwt (the suffix array, the step that runs
     // out of memory, sits between them). Drop the old .bwt first, so a build that dies there
     // leaves no index rather than a new .pac beside an old .bwt that `mem` would happily load.
-    match std::fs::remove_file(sibling(prefix, "bwt.2bit.64")) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-        _ => {}
+    // The others are unlinked too, never truncated in place: a running `mem` has the old .pac
+    // mmapped, and truncating that inode would SIGBUS it. Unlinked, it keeps the old file.
+    for ext in ["bwt.2bit.64", "pac", "ann", "amb", "0123"] {
+        match std::fs::remove_file(sibling(prefix, ext)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
     }
 
     // 2. Write .pac (2-bit packed forward reference).
@@ -1147,6 +1151,29 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rebuild replaces each file with a new inode, so a running `mem` that mmapped the old .pac
+    /// keeps reading the old bytes instead of a truncated file (SIGBUS).
+    #[test]
+    #[cfg(unix)]
+    fn rebuild_never_truncates_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("bwa-reidx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fasta = dir.join("t.fa");
+        std::fs::write(&fasta, b">c\nACGTACGTTTGACCA\n").unwrap();
+        build_index(&fasta).unwrap();
+        let old = std::fs::File::open(dir.join("t.fa.pac")).unwrap();
+        let old_bytes = std::fs::read(dir.join("t.fa.pac")).unwrap();
+        build_index(&fasta).unwrap();
+        for ext in ["pac", "ann", "amb", "0123", "bwt.2bit.64"] {
+            assert!(dir.join(format!("t.fa.{ext}")).exists(), "{ext}");
+        }
+        let new_ino = std::fs::metadata(dir.join("t.fa.pac")).unwrap().ino();
+        assert_ne!(old.metadata().unwrap().ino(), new_ino);
+        assert_eq!(old.metadata().unwrap().len(), old_bytes.len() as u64);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Whitespace inside a sequence line is a base for bwa-mem2 (kseq keeps it; `nt4` makes it
     /// ambiguous); only the newline, one trailing `\r` and empty lines vanish. Measured against
