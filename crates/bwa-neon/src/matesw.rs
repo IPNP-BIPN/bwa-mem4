@@ -1527,7 +1527,11 @@ fn ksw_padded_qlen(qlen: usize, max_sc: i32) -> usize {
 /// stays [`ksw_padded_qlen`]'s, bwa's own.
 fn u8_job_fits(qlen: usize, tlen: usize, mat: &[i8], max_sc: i32) -> bool {
     let ceiling = qlen.min(tlen) as i32 * max_sc;
-    ceiling - i32::from(mat[1]) + i32::from(mat[0]) <= 255 && ksw_padded_qlen(qlen, max_sc) <= 256
+    // The u8 kernels keep the best row as an i16 (`te`), so a longer window (mate-pair inserts)
+    // would wrap it negative.
+    ceiling - i32::from(mat[1]) + i32::from(mat[0]) <= 255
+        && ksw_padded_qlen(qlen, max_sc) <= 256
+        && tlen <= i16::MAX as usize
 }
 
 /// Batched forward local-SW pass: `out[i] = (score, te, qe, score2, te2)` for `jobs[i]`, each equal to
@@ -8334,6 +8338,51 @@ mod tests {
         for (k, (j, g)) in jobs.iter().zip(&got).enumerate() {
             let w = bwa_extend::ksw_align2(j.query, j.target, 5, &mat, 6, 1, 6, 1, 19, 1, 8);
             assert_eq!(*g, w, "job {k}");
+        }
+    }
+
+    /// A rescue window past 32767 rows (mate-pair insert sizes): the u8 kernels keep the row in 16
+    /// bits, so these jobs must go to i16/scalar and still match the scalar kernel, best hit at the end.
+    #[test]
+    fn matesw_long_window_equals_scalar() {
+        let mut state = 0x5eed_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let mat = scmat(1, 4);
+        let bufs: Vec<(Vec<u8>, Vec<u8>)> = [33_000usize, 40_000]
+            .iter()
+            .map(|&tlen| {
+                let t: Vec<u8> = (0..tlen).map(|_| (next() % 4) as u8).collect();
+                (t[tlen - 120..tlen - 20].to_vec(), t)
+            })
+            .collect();
+        let jobs: Vec<FwdJob> = bufs
+            .iter()
+            .map(|(q, t)| FwdJob {
+                query: q,
+                target: t,
+                minsc: 30,
+                endsc: i32::MAX,
+            })
+            .collect();
+        let want = fwd_local_sw_scalar(&jobs, 5, &mat, 6, 1, 6, 1, 1);
+        assert!(want.iter().all(|w| w.1 > i16::MAX as i32));
+        assert_eq!(fwd_local_sw_batch(&jobs, 5, &mat, 6, 1, 6, 1, 1), want);
+        let rjobs: Vec<_> = bufs
+            .iter()
+            .map(|(q, t)| KswJob {
+                query: q,
+                target: t,
+            })
+            .collect();
+        let got = batched_mate_rescue(&rjobs, 5, &mat, 6, 1, 6, 1, 19, 1);
+        for (j, g) in rjobs.iter().zip(&got) {
+            let w = bwa_extend::ksw_align2(j.query, j.target, 5, &mat, 6, 1, 6, 1, 19, 1, 8);
+            assert_eq!(*g, w);
         }
     }
 
