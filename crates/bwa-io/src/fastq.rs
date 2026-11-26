@@ -1094,7 +1094,9 @@ impl FastqReader {
                 } else {
                     // A base two bits cannot hold (N, IUPAC, junk): one code a byte instead.
                     buf.truncate(name.len());
-                    buf.reserve_exact(seq.len() - seq_bytes);
+                    // Relative to the truncated length: room for the codes AND the qual and comment
+                    // still to come, so this is the record's one reallocation, not two.
+                    buf.reserve_exact(seq.len() + qual.map_or(0, <[u8]>::len) + comment_len);
                     buf.extend_from_slice(&seq);
                     bwa_core::dna::nt4_in_place(&mut buf[name.len()..]);
                     Bases::Codes
