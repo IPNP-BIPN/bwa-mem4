@@ -2373,6 +2373,26 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         .unwrap_or(opt.chunk_size * i64::from(opt.n_threads))
         .max(1) as usize;
 
+    // ================= Check the cheap arguments before the index load =================
+    //
+    // A bad `-R`/`-H`/`-I` or an unwritable `-o` fails here, not after seconds of index load (bwa
+    // fopens `-o` during getopt).
+    let hdr_parts = extra_header_lines(&args)?;
+    // `-I` fixes the insert-size distribution instead of inferring it per batch.
+    // `Some` = use these four orientation stats for every batch, `None` = call `mem_pestat` per
+    // batch. Single-end runs ignore it entirely.
+    let pes0 = match &args.insert_size {
+        Some(s) => Some(parse_insert_size(s)?),
+        None => None,
+    };
+    // The sink. Written to directly for the header below, then MOVED into the pipeline's writer
+    // thread, which is the only thread that touches it afterwards.
+    let mut out = Output::open(args.output.as_deref(), n_threads, args.reference.as_deref())
+        .map_err(|e| match &args.output {
+            Some(path) => anyhow::anyhow!("-o {}: {e}", path.display()),
+            None => e,
+        })?;
+
     // ================= Start reading before loading the index =================
     //
     // The reader opens the FASTQ, inflates it if gzipped and parses records; at the default `-K` on
@@ -2464,8 +2484,6 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         })
         .collect();
 
-    // ================= Assemble the SAM header =================
-    let hdr_parts = extra_header_lines(&args)?;
     // The extra header block as one newline-joined string, or `None` for "no extra lines" (which is
     // what `write_header` needs to distinguish, since an empty string would emit a blank line).
     let hdr_lines = if hdr_parts.is_empty() {
@@ -2496,18 +2514,7 @@ pub fn run(mut args: MemArgs, argv: &[String]) -> anyhow::Result<()> {
         h => h,
     };
 
-    // `-I` fixes the insert-size distribution instead of inferring it per batch.
-    // `Some` = use these four orientation stats for every batch, `None` = call `mem_pestat` per
-    // batch. Single-end runs ignore it entirely.
-    let pes0 = match &args.insert_size {
-        Some(s) => Some(parse_insert_size(s)?),
-        None => None,
-    };
-
-    // ================= Open the sink and write the header =================
-    // The sink. Written to directly for the header here, then MOVED into the pipeline's writer
-    // thread, which is the only thread that touches it afterwards.
-    let mut out = Output::open(args.output.as_deref(), n_threads, args.reference.as_deref())?;
+    // ================= Write the header =================
     // The raw command line for `@PG CL:`. Single-space joined, so a quoted argument containing
     // spaces is not re-quoted; that matches what bwa writes.
     //
