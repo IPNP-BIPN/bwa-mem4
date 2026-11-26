@@ -450,8 +450,9 @@ pub struct MemArgs {
     // lines are inserted. Interaction with the generated header: supplying any `@SQ` line here
     // SUPPRESSES all the generated `@SQ` lines (`bwa_print_sam_hdr`, `bwa.cpp:523`).
     /// Insert STR into the header if it starts with @, or insert the lines of FILE.
-    #[arg(short = 'H')]
-    pub header_insert: Option<String>,
+    /// Repeatable: every `-H` is kept, in order, as `bwa_insert_header` does.
+    #[arg(short = 'H', action = clap::ArgAction::Append)]
+    pub header_insert: Vec<String>,
     // `-I FLOAT[,FLOAT[,INT[,INT]]]` -> `pes[1]` and `aux.pes0` (`fastmap.cpp:777-793`).
     // mean,stddev,max,min of the insert size, in bases. Fixes the distribution instead of inferring
     // it per batch, so it also removes `-K`'s influence on paired-end output. Only the FR
@@ -2181,7 +2182,7 @@ fn forget_index(fm: bwa_index::FmIndex, bns: bwa_index::BntSeq) {
 /// neither option was given. Errors on an unreadable `-H` file or a malformed `-R`.
 fn extra_header_lines(args: &MemArgs) -> anyhow::Result<Vec<String>> {
     let mut hdr_parts: Vec<String> = Vec::new();
-    if let Some(header_arg) = &args.header_insert {
+    for header_arg in &args.header_insert {
         if let Some(rest) = header_arg.strip_prefix('@') {
             hdr_parts.push(bwa_core::rg::escape(&format!("@{rest}")));
         } else {
