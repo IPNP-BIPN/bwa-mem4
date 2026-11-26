@@ -368,7 +368,9 @@ pub fn build_index_parts(
     fm_index: bool,
 ) -> Result<()> {
     let contigs = read_fasta(fasta)?;
-    if contigs.is_empty() {
+    // Headers with no bases (`>a\n>b\n`) too: bwa-mem2 asserts `seq_len > 0`, and an index with
+    // `l_pac = 0` would make `mem` print `@SQ LN:0`.
+    if contigs.iter().all(|c| c.seq.is_empty()) {
         return Err(Error::Other("empty FASTA".into()));
     }
 
@@ -551,13 +553,16 @@ fn sibling(prefix: &Path, ext: &str) -> PathBuf {
 /// One [`FastaContig`] per `>` header, in FILE order, which is the order that fixes every contig's
 /// forward offset. Sequence lines appearing before any header are silently dropped (there is no
 /// `contigs.last_mut()` to append to). An empty or headerless file yields an empty vector, which
-/// [`build_index`] rejects. Records with a header but no sequence lines are kept with `seq` empty.
+/// [`build_index`] rejects. Records with a header but no sequence lines are kept with `seq` empty
+/// (rejected too when every record is).
 /// `index --meth`'s seed FASTA (`meth_index_build` in fg-labs/bwa-mem3 0.16, MIT): every contig
 /// of `fasta` twice, `r<name>` with G->A then `f<name>` with C->T, uppercased first, 100 bases a
 /// line. Its index (`<ref>.meth.*`) is what `mem --meth` seeds on.
 pub fn write_meth_fasta(fasta: &Path, out: &Path) -> Result<()> {
     let contigs = read_fasta(fasta)?;
-    if contigs.is_empty() {
+    // Headers with no bases (`>a\n>b\n`) too: bwa-mem2 asserts `seq_len > 0`, and an index with
+    // `l_pac = 0` would make `mem` print `@SQ LN:0`.
+    if contigs.iter().all(|c| c.seq.is_empty()) {
         return Err(Error::Other("empty FASTA".into()));
     }
     let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
@@ -1147,6 +1152,18 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Headers with no bases are refused, as bwa-mem2 refuses them (`seq_len > 0`).
+    #[test]
+    fn headers_only_fasta_is_refused() {
+        let dir = std::env::temp_dir().join(format!("bwa-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fasta = dir.join("t.fa");
+        std::fs::write(&fasta, b">a\n>b\n").unwrap();
+        assert!(build_index(&fasta).is_err());
+        assert!(!dir.join("t.fa.pac").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Whitespace inside a sequence line is a base for bwa-mem2 (kseq keeps it; `nt4` makes it
     /// ambiguous); only the newline, one trailing `\r` and empty lines vanish. Measured against
