@@ -367,11 +367,6 @@ pub fn build_index_parts(
     unpacked: bool,
     fm_index: bool,
 ) -> Result<()> {
-    let contigs = read_fasta(fasta)?;
-    if contigs.is_empty() {
-        return Err(Error::Other("empty FASTA".into()));
-    }
-
     // 1. Encode the forward reference to 2-bit codes, randomizing N via lrand48, and collect the
     //    contig annotations and ambiguous-base holes (as bwa-mem2's add1 does).
     //
@@ -385,14 +380,19 @@ pub fn build_index_parts(
     // moment is the absolute forward (1L) position of the next base to be written. `anns` gets one
     // record per contig, `ambs` one per ambiguous RUN, both in ascending position order.
     let mut rng = Rand48::srand48(SEED as i64);
-    let mut forward: Vec<u8> = Vec::new();
+    // Reserved for the whole 2L array (step 4 grows `forward` into `bref` in place): a FASTA has
+    // at least one byte per base, so twice its size always fits, and the pages never touched cost
+    // no memory. One array instead of `forward` plus a copy keeps a freed genome-sized buffer from
+    // sitting under the suffix array's peak.
+    let mut forward: Vec<u8> = Vec::with_capacity(2 * std::fs::metadata(fasta)?.len() as usize);
     let mut anns: Vec<AnnRec> = Vec::new();
     let mut ambs: Vec<AmbRec> = Vec::new();
 
     // Loop invariant at the top of each contig iteration: `forward` holds the codes for every base
     // of every PRECEDING contig and nothing else; `ambs` holds every hole that ended before this
     // contig; `rng` has been advanced exactly once per ambiguous base seen so far.
-    for c in &contigs {
+    // One contig in memory at a time: the FASTA is never held whole.
+    let n_contigs = for_each_contig(fasta, |c| {
         // `start` is this contig's first forward (1L) position, which becomes its `AnnRec::offset`.
         let start = forward.len();
         // Ambiguous RUNS seen so far in THIS contig (reset per contig, unlike `ambs`).
@@ -449,15 +449,16 @@ pub fn build_index_parts(
             len,
             n_ambs,
         });
+        Ok(())
+    })?;
+    if n_contigs == 0 {
+        return Err(Error::Other("empty FASTA".into()));
     }
 
     // `l_pac` is L: the total forward reference length in bases, the sum of all contig lengths.
     // `n_seqs` is the contig count. Both are header fields of `.ann` and `.amb`.
     let l_pac = forward.len() as i64;
     let n_seqs = anns.len() as i32;
-    // `contigs` is no longer needed (names/annotations are copied into `anns`); drop it before the
-    // memory-heavy suffix-array stage.
-    drop(contigs);
 
     // A rebuild writes .pac/.ann/.amb long before the .bwt (the suffix array, the step that runs
     // out of memory, sits between them). Drop the old .bwt first, so a build that dies there
@@ -497,8 +498,8 @@ pub fn build_index_parts(
     // `bref[0..L)` is the forward strand, `bref[L..2L)` the reverse complement. Indices into it are
     // 2L-space POSITIONS, never suffix-array rows.
     let forward_len = forward.len();
-    let mut bref = vec![0u8; 2 * forward_len];
-    bref[..forward_len].copy_from_slice(&forward);
+    let mut bref = forward;
+    bref.resize(2 * forward_len, 0);
     // `fwd_half` aliases `bref[0..L)` (already filled, read-only from here), `rc_half` the empty
     // `bref[L..2L)` being written. Splitting is what lets the RC half be filled in parallel.
     let (fwd_half, rc_half) = bref.split_at_mut(forward_len);
@@ -508,14 +509,13 @@ pub fn build_index_parts(
         let code = fwd_half[forward_len - 1 - i];
         *dst = if code < 4 { 3 - code } else { code };
     });
-    // `forward` is now captured in bref; free it before the suffix array (~3 GB at genome scale).
-    drop(forward);
+    // `bref` grew from `forward` in place (step 4), so there is no second copy to free here.
     if unpacked {
         File::create(sibling(prefix, "0123")).and_then(|f| BufWriter::new(f).write_all(&bref))?;
     }
 
     // 5. Build and write the FM-index (.bwt.2bit.64).
-    write_fm_index(&sibling(prefix, "bwt.2bit.64"), &bref)?;
+    write_fm_index(&sibling(prefix, "bwt.2bit.64"), bref)?;
 
     Ok(())
 }
@@ -539,12 +539,30 @@ fn sibling(prefix: &Path, ext: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// `index --meth`'s seed FASTA (`meth_index_build` in fg-labs/bwa-mem3 0.16, MIT): every contig
+/// of `fasta` twice, `r<name>` with G->A then `f<name>` with C->T, uppercased first, 100 bases a
+/// line. Its index (`<ref>.meth.*`) is what `mem --meth` seeds on.
+pub fn write_meth_fasta(fasta: &Path, out: &Path) -> Result<()> {
+    let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+    // One contig at a time, so the genome is never held whole just before the `--meth` index.
+    let n_contigs = for_each_contig(fasta, |c| {
+        bwa_core::meth::write_converted(&mut w, 'r', &c.name, &c.seq, b'G', b'A')?;
+        bwa_core::meth::write_converted(&mut w, 'f', &c.name, &c.seq, b'C', b'T')?;
+        Ok(())
+    })?;
+    if n_contigs == 0 {
+        return Err(Error::Other("empty FASTA".into()));
+    }
+    std::io::Write::flush(&mut w)?;
+    Ok(())
+}
+
 /// Minimal plain-text FASTA reader (name, comment, concatenated sequence).
 ///
 /// # Parameters
 ///
-/// * `path`: the FASTA to read. Must be plain text (no gzip/bgzf support here) and must fit in
-///   memory: the whole file is slurped, then borrowed line by line.
+/// * `path`: the FASTA to read. Must be plain text (no gzip/bgzf support here) and every
+///   contig is kept, so the whole genome is in memory (see [`for_each_contig`] to stream).
 ///
 /// # Returns
 ///
@@ -552,63 +570,64 @@ fn sibling(prefix: &Path, ext: &str) -> PathBuf {
 /// forward offset. Sequence lines appearing before any header are silently dropped (there is no
 /// `contigs.last_mut()` to append to). An empty or headerless file yields an empty vector, which
 /// [`build_index`] rejects. Records with a header but no sequence lines are kept with `seq` empty.
-/// `index --meth`'s seed FASTA (`meth_index_build` in fg-labs/bwa-mem3 0.16, MIT): every contig
-/// of `fasta` twice, `r<name>` with G->A then `f<name>` with C->T, uppercased first, 100 bases a
-/// line. Its index (`<ref>.meth.*`) is what `mem --meth` seeds on.
-pub fn write_meth_fasta(fasta: &Path, out: &Path) -> Result<()> {
-    let contigs = read_fasta(fasta)?;
-    if contigs.is_empty() {
-        return Err(Error::Other("empty FASTA".into()));
-    }
-    let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
-    for c in &contigs {
-        bwa_core::meth::write_converted(&mut w, 'r', &c.name, &c.seq, b'G', b'A')?;
-        bwa_core::meth::write_converted(&mut w, 'f', &c.name, &c.seq, b'C', b'T')?;
-    }
-    std::io::Write::flush(&mut w)?;
-    Ok(())
+#[cfg(test)]
+fn read_fasta(path: &Path) -> Result<Vec<FastaContig>> {
+    let mut contigs = Vec::new();
+    for_each_contig(path, |c| {
+        contigs.push(c);
+        Ok(())
+    })?;
+    Ok(contigs)
 }
 
-fn read_fasta(path: &Path) -> Result<Vec<FastaContig>> {
-    let text = std::fs::read(path)?;
-    let mut contigs: Vec<FastaContig> = Vec::new();
-    for line in text.split(|&b| b == b'\n') {
+/// [`read_fasta`] one contig at a time: `f` gets each contig as soon as its last line is read, and
+/// only that contig is in memory. Returns the contig count. Same parsing, same errors.
+fn for_each_contig(path: &Path, mut f: impl FnMut(FastaContig) -> Result<()>) -> Result<usize> {
+    use std::io::BufRead;
+    let mut input = std::io::BufReader::with_capacity(1 << 20, File::open(path)?);
+    let mut cur: Option<FastaContig> = None;
+    let mut n = 0;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if input.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if let Some(header) = line.strip_prefix(b">") {
-            // `header` is the line minus the leading `>`. Split at the FIRST space or tab: name
-            // before it, comment after it (comments may contain further spaces, names may not).
             let (name, comment) = match header.iter().position(|&b| b == b' ' || b == b'\t') {
                 Some(i) => (&header[..i], header[i + 1..].to_vec()),
                 None => (header, Vec::new()),
             };
-            // The name goes to `@SQ SN:` and every RNAME, which are text throughout this tool.
             let name = String::from_utf8(name.to_vec()).map_err(|_| {
                 Error::IndexFormat(format!(
                     "contig name is not UTF-8: {}",
                     String::from_utf8_lossy(name)
                 ))
             })?;
-            contigs.push(FastaContig {
+            if let Some(done) = cur.replace(FastaContig {
                 name,
                 comment,
                 seq: Vec::new(),
-            });
-        } else if let Some(cur) = contigs.last_mut() {
-            // Not DNA, and nothing to match: the C indexes its table with a signed `char`
-            // (`bntseq.cpp:265`), so such a byte reads outside it.
+            }) {
+                f(done)?;
+            }
+            n += 1;
+        } else if let Some(cur) = cur.as_mut() {
             if !line.is_ascii() {
                 return Err(Error::IndexFormat(format!(
                     "non-ASCII byte in the sequence of contig {}",
                     cur.name
                 )));
             }
-            // Kept byte for byte, spaces and tabs included: kseq only drops the newline and a
-            // trailing `\r` (stripped above), so bwa-mem2 indexes any other whitespace byte as an
-            // ambiguous base. Measured: `ACGT ACGT` is 9 bases there, and must be here too.
             cur.seq.extend_from_slice(line);
         }
     }
-    Ok(contigs)
+    if let Some(done) = cur {
+        f(done)?;
+    }
+    Ok(n)
 }
 
 /// `.pac`: 2-bit packed FORWARD reference (first base in the high bits of each byte); the file is
@@ -755,6 +774,26 @@ fn write_amb(path: &Path, l_pac: i64, n_seqs: i32, ambs: &[AmbRec]) -> Result<()
     Ok(())
 }
 
+/// `i64` words per checkpoint block in `.bwt.2bit.64`: 4 counts, then 4 one-hot masks.
+const CP_WORDS: usize = 8;
+
+/// What [`write_fm_index`] serializes, in the space the suffix array occupied.
+struct FmParts {
+    /// `buf[..nb]`: the BWT, row `i` in byte `i % 8` (little-endian) of `buf[i / 8]`. `buf[nb..]`
+    /// is free room, at least [`CP_WORDS`] words per checkpoint block, which the checkpoints reuse.
+    buf: Vec<i64>,
+    nb: usize,
+    sentinel_index: i64,
+    /// `sa[8k]` as the file stores it: `nb` bytes of bits 32..40 (`sa_ms_byte`), then `nb`
+    /// little-endian `u32`s of the low 32 bits (`sa_ls_word`), `5 nb` bytes in all.
+    samples: Vec<u8>,
+}
+
+/// Row `i`'s BWT symbol in [`FmParts::buf`]'s packed words.
+fn bwt_at(packed: &[i64], i: usize) -> u8 {
+    (packed[i / SA_SAMPLE_STRIDE] >> (8 * (i % SA_SAMPLE_STRIDE))) as u8
+}
+
 /// The BWT, the sentinel row and the sampled suffix array: everything downstream needs from the
 /// suffix array, produced without committing to how the suffix array itself is held.
 ///
@@ -783,50 +822,117 @@ fn write_amb(path: &Path, l_pac: i64, n_seqs: i32, ambs: &[AmbRec]) -> Result<()
 ///
 /// # Returns
 ///
-/// `(bwt, sentinel_index, sa_samples)`. Errors only on the `capsa` path, which does file I/O.
+/// The three outputs packed as a [`FmParts`]. Errors only on the `capsa` path, which does file
+/// I/O.
 ///
 /// # Panics
 ///
 /// If `bref` is empty (there is then no row 0 predecessor), or if the suffix array contains no
 /// row with `sa[i] == 0`, which would mean the constructor is broken.
 #[cfg(not(feature = "capsa"))]
-fn build_bwt_and_samples(
-    bref: &[u8],
-    n: usize,
-    sa_count: usize,
-) -> Result<(Vec<u8>, i64, Vec<i64>)> {
+fn build_bwt_and_samples(bref: Vec<u8>, n: usize, sa_count: usize) -> Result<FmParts> {
     // Length N = 2L+1, sa[0] = 2L. Default: in-tree memory-efficient SA-IS. With `--features
     // libsais` the same array is produced by libsais-rs instead (faster build; a suffix array is
     // UNIQUE so the result is byte-identical, gated by scripts/index_diff.sh).
     #[cfg(all(not(feature = "libsais"), not(feature = "libsais-c")))]
-    let sa = suffix_array_inplace(bref);
+    let mut sa = suffix_array_inplace(&bref);
     #[cfg(any(feature = "libsais", feature = "libsais-c"))]
-    let sa = suffix_array_libsais(bref);
+    let mut sa = suffix_array_libsais(&bref);
     debug_assert_eq!(sa.len(), n, "suffix array must have N = 2L + 1 rows");
 
-    // Each entry is independent of every other, so fill in parallel. The initial `DUMMY_CHAR` (6,
-    // `FMI_search.h:44`) is overwritten for all `n` rows; it documents the padding the checkpoint
-    // loop applies to rows past the end.
-    let mut bwt = vec![DUMMY_CHAR; n];
-    bwt.par_iter_mut()
-        .zip(sa.par_iter())
-        .for_each(|(bwt_symbol, &sa_value)| {
-            *bwt_symbol = if sa_value == 0 {
-                SENTINEL_CODE
-            } else {
-                bref[(sa_value - 1) as usize]
-            };
-        });
-    // `position_any` is safe despite its unordered name because exactly one element satisfies this.
+    // Everything below happens INSIDE `sa`'s 8n bytes, so the build peaks at the suffix array plus
+    // `bref` (9n) instead of also holding a separate BWT and sample array beside them (11n, 136 GB
+    // for a GRCh38 `--meth` index). `position_any` is safe despite its name: exactly one row is 0.
     let sentinel_index = sa
         .par_iter()
         .position_any(|&sa_value| sa_value == 0)
         .expect("suffix array must contain the sentinel (0)") as i64;
-    let sa_samples: Vec<i64> = (0..sa_count)
-        .into_par_iter()
-        .map(|k| sa[k * SA_SAMPLE_STRIDE])
-        .collect();
-    Ok((bwt, sentinel_index, sa_samples))
+    // Pass 1, row by row: the row's BWT symbol in the low 3 bits, and for a sampled row its SA
+    // value above them (values are < 2^60). The textbook transform: row `i` ends with the base
+    // PRECEDING suffix `sa[i]`; the empty suffix has none. Mirrors `FMI_search.cpp:170-199`.
+    sa.par_iter_mut().enumerate().for_each(|(row, e)| {
+        let sa_value = *e;
+        let symbol = if sa_value == 0 {
+            SENTINEL_CODE
+        } else {
+            bref[(sa_value - 1) as usize]
+        };
+        let sample = if row.is_multiple_of(SA_SAMPLE_STRIDE) {
+            sa_value << 3
+        } else {
+            0
+        };
+        *e = i64::from(symbol) | sample;
+    });
+    // `bref` is spent: its buffer takes the samples, so they add nothing to the peak.
+    pack_rows(sa, bref, n, sa_count, sentinel_index)
+}
+
+/// Pass 2 of [`build_bwt_and_samples`]: element `j` of `rows` (pass 1's per-row words) becomes the
+/// 8 BWT symbols of rows `8j..8j+8`, little-endian, and the sample of row `8j` moves to the sample
+/// arrays. Element `j` is written only after elements `8j..8j+8` are read, and in a round over
+/// `j in lo..hi` with `hi <= 8 lo` every read is at an index `>= 8 lo >= hi`: `split_at_mut(8 lo)`
+/// hands the writes and the reads disjoint borrows, so each round runs in parallel.
+#[cfg(not(feature = "capsa"))]
+fn pack_rows(
+    mut rows: Vec<i64>,
+    mut samples: Vec<u8>,
+    n: usize,
+    sa_count: usize,
+    sentinel_index: i64,
+) -> Result<FmParts> {
+    let nb = n.div_ceil(SA_SAMPLE_STRIDE);
+    debug_assert_eq!(
+        nb, sa_count,
+        "n = 2L + 1 is odd, so every block has a sampled row"
+    );
+    samples.resize(5 * nb, 0);
+    let (sa_ms_byte, sa_ls_word) = samples.split_at_mut(nb);
+    let pack = |src: &[i64], dst: &mut i64, ls: &mut [u8], ms: &mut u8| {
+        let mut symbols = [DUMMY_CHAR; SA_SAMPLE_STRIDE];
+        for (s, &w) in symbols.iter_mut().zip(src) {
+            *s = (w & 7) as u8;
+        }
+        let sample = (src[0] >> 3) as u64;
+        ls.copy_from_slice(&((sample & 0xFFFF_FFFF) as u32).to_le_bytes());
+        *ms = ((sample >> 32) & 0xFF) as u8;
+        *dst = i64::from_le_bytes(symbols);
+    };
+    // Element 0 reads its own slot, so it goes through a copy.
+    let first: Vec<i64> = rows[..n.min(SA_SAMPLE_STRIDE)].to_vec();
+    pack(
+        &first,
+        &mut rows[0],
+        &mut sa_ls_word[..4],
+        &mut sa_ms_byte[0],
+    );
+    let mut lo = 1;
+    while lo < nb {
+        let hi = (lo * SA_SAMPLE_STRIDE).min(nb);
+        let (dst, src) = rows.split_at_mut(lo * SA_SAMPLE_STRIDE);
+        dst[lo..hi]
+            .par_iter_mut()
+            .zip(sa_ls_word[4 * lo..4 * hi].par_chunks_mut(4))
+            .zip(&mut sa_ms_byte[lo..hi])
+            .enumerate()
+            .for_each(|(t, ((d, ls), ms))| {
+                let at = (lo + t) * SA_SAMPLE_STRIDE - lo * SA_SAMPLE_STRIDE;
+                let end = ((lo + t + 1) * SA_SAMPLE_STRIDE).min(n) - lo * SA_SAMPLE_STRIDE;
+                pack(&src[at..end], d, ls, ms);
+            });
+        lo = hi;
+    }
+    // The checkpoints go after the BWT words; tiny references can lack the room.
+    let need = nb + CP_WORDS * ((n >> 6) + 1);
+    if rows.len() < need {
+        rows.resize(need, 0);
+    }
+    Ok(FmParts {
+        buf: rows,
+        nb,
+        sentinel_index,
+        samples,
+    })
 }
 
 /// Streaming (`--features capsa`) counterpart of [`build_bwt_and_samples`]: the same three outputs,
@@ -837,11 +943,8 @@ fn build_bwt_and_samples(
 /// `k`-th call carries our `sa[k + 1]`. Our row 0 is the empty suffix (`sa[0] = 2L`), which the
 /// callback never sees, so it is filled before the walk starts.
 #[cfg(feature = "capsa")]
-fn build_bwt_and_samples(
-    bref: &[u8],
-    n: usize,
-    sa_count: usize,
-) -> Result<(Vec<u8>, i64, Vec<i64>)> {
+fn build_bwt_and_samples(bref: Vec<u8>, n: usize, sa_count: usize) -> Result<FmParts> {
+    let bref = &bref[..];
     let two_l = bref.len();
     assert!(two_l > 0, "reference must be non-empty");
     debug_assert_eq!(n, two_l + 1);
@@ -881,7 +984,31 @@ fn build_bwt_and_samples(
         sentinel_index >= 0,
         "suffix array must contain the sentinel (0)"
     );
-    Ok((bwt, sentinel_index, sa_samples))
+    // shortcut: packs into a fresh buffer, so this path keeps its bwt + samples peak; it streams
+    // the suffix array, which is the term that matters.
+    let nb = n.div_ceil(SA_SAMPLE_STRIDE);
+    let mut buf = vec![0i64; nb + CP_WORDS * ((n >> 6) + 1)];
+    buf[..nb].par_iter_mut().enumerate().for_each(|(j, w)| {
+        let mut symbols = [DUMMY_CHAR; SA_SAMPLE_STRIDE];
+        for (k, s) in symbols.iter_mut().enumerate() {
+            if let Some(&b) = bwt.get(j * SA_SAMPLE_STRIDE + k) {
+                *s = b;
+            }
+        }
+        *w = i64::from_le_bytes(symbols);
+    });
+    let mut samples = vec![0u8; 5 * nb];
+    let (ms, ls) = samples.split_at_mut(nb);
+    for ((&v, m), l) in sa_samples.iter().zip(ms).zip(ls.chunks_mut(4)) {
+        *m = ((v as u64 >> 32) & 0xFF) as u8;
+        l.copy_from_slice(&((v as u64 & 0xFFFF_FFFF) as u32).to_le_bytes());
+    }
+    Ok(FmParts {
+        buf,
+        nb,
+        sentinel_index,
+        samples,
+    })
 }
 
 /// `.bwt.2bit.64`: `[ref_seq_len:i64 | count[5]:i64 | CP_OCC[] | sa_ms_byte[]:i8 | sa_ls_word[]:u32
@@ -968,7 +1095,7 @@ fn build_bwt_and_samples(
 ///   in `0..=3`, length exactly `2 * l_pac` and even. Indices into it are 2L-space POSITIONS. A
 ///   code >= 4 here would be counted into no histogram bucket and would silently desynchronize
 ///   `count[]` from the BWT.
-fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
+fn write_fm_index(path: &Path, bref: Vec<u8>) -> Result<()> {
     // ---- Step A: suffix array ----------------------------------------------------------------
     // `two_l` = 2L, the number of real bases (no sentinel). `sa` maps ROW -> 2L-space POSITION:
     // `sa[row]` is where the suffix ranked `row`-th starts. `n` = N = 2L+1 is the ROW count, one
@@ -1027,7 +1154,12 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     // byte/row). Both backends produce byte-identical output (a suffix array is UNIQUE). `bwt` is
     // indexed by ROW (length N); out-of-range tail rows keep `DUMMY_CHAR` (6), the C's aligned-buffer
     // padding, which the checkpoint loop below substitutes for rows past the end.
-    let (bwt, sentinel_index, sa_samples) = build_bwt_and_samples(bref, n, sa_count)?;
+    let FmParts {
+        mut buf,
+        nb,
+        sentinel_index,
+        samples,
+    } = build_bwt_and_samples(bref, n, sa_count)?;
 
     // CP_OCC checkpoints, one per 64-base block. `one_hot[block_index]` is independent per block; `cp_count[block_index]`
     // is the running base-count prefix over prior blocks. Compute both per block in parallel, then a
@@ -1048,13 +1180,14 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     // `cp_count[b][c]` starts as the count of base `c` WITHIN block `b` and is rewritten below into
     // the prefix count before block `b`. `one_hot[b][c]` is the block's 64-row bitmap for base `c`.
     let n_blocks = (n >> 6) + 1;
-    let mut cp_count = vec![[0i64; 4]; n_blocks];
-    let mut one_hot = vec![[0u64; 4]; n_blocks];
-    cp_count
-        .par_iter_mut()
-        .zip(one_hot.par_iter_mut())
+    // Each block's record lands in the room `buf` keeps after the BWT words: 4 counts, 4 masks.
+    let (bwt, cp) = buf.split_at_mut(nb);
+    let cp = &mut cp[..CP_WORDS * n_blocks];
+    cp.par_chunks_mut(CP_WORDS)
         .enumerate()
-        .for_each(|(block_index, (block_count, block_one_hot))| {
+        .for_each(|(block_index, slot)| {
+            let mut block_count = [0i64; 4];
+            let mut block_one_hot = [0u64; 4];
             // `block_first_row` is this block's first BWT ROW. Loop invariant at the top of
             // iteration `j`: the four words hold rows `block_first_row .. block_first_row + j`
             // left-aligned at bit 63, and `block_count` counts those same rows.
@@ -1064,7 +1197,11 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
                 let idx = block_first_row + j;
                 // Past the end of the BWT, feed `DUMMY_CHAR` (6) so those bit positions stay 0 in
                 // all four words, exactly as the C reads its 6-padded aligned buffer.
-                let c = if idx < n { bwt[idx] } else { DUMMY_CHAR };
+                let c = if idx < n {
+                    bwt_at(bwt, idx)
+                } else {
+                    DUMMY_CHAR
+                };
                 // Shift ALL FOUR words every row, then set the one bit for this row's base. Shifting
                 // first is what makes row `j` land at bit `63 - j` (MSB-first), the convention
                 // `get_occ`'s mask table and `get_sa`'s `63 - (sp & 63)` both depend on. The
@@ -1080,16 +1217,20 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
                     block_count[c as usize] += 1;
                 }
             }
+            slot[..4].copy_from_slice(&block_count);
+            for (w, m) in slot[4..].iter_mut().zip(block_one_hot) {
+                *w = m as i64;
+            }
         });
     // Sequential prefix sum over blocks (n/64 iterations): cp_count[block_index] becomes the count of each
     // base in bwt[0..bi*64), matching the original running-total semantics.
     // `running[c]` is the invariant: at the top of iteration `b` it holds the number of `c`s in
     // `bwt[0 .. b*64)`, which is exactly the value block `b` must store.
     let mut running = [0i64; 4];
-    for block_count in cp_count.iter_mut() {
+    for slot in cp.chunks_mut(CP_WORDS) {
         // Save this block's OWN counts before overwriting the slot with the prefix.
-        let block = *block_count;
-        *block_count = running;
+        let block = [slot[0], slot[1], slot[2], slot[3]];
+        slot[..4].copy_from_slice(&running);
         for k in 0..4 {
             running[k] += block[k];
         }
@@ -1103,17 +1244,10 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     // position is never set, but it does mean a reader MUST sign-extend consistently (we mirror it
     // with `i8` in `FmIndex`, not `u8`).
     // ---- Step E: the sampled suffix array ------------------------------------------------------
-    // `sa_samples[k]` is already `sa[8k]`, produced by `build_bwt_and_samples` above (which is what
-    // lets the streaming backend avoid ever holding `sa`). All that remains is the 40-bit split.
-    let (sa_ls_word, sa_ms_byte): (Vec<u32>, Vec<u8>) = sa_samples
-        .par_iter()
-        .map(|&sample| {
-            // `v` is a 2L-space reference POSITION (the suffix start for row `8k`), not a row.
-            let v = sample as u64;
-            ((v & 0xFFFF_FFFF) as u32, ((v >> 32) & 0xFF) as u8)
-        })
-        .unzip();
-    debug_assert_eq!(sa_ms_byte.len(), sa_count);
+    // `samples` already holds `sa[8k]`'s 40-bit split, produced by
+    // `build_bwt_and_samples` above (which is what lets the streaming backend avoid ever holding
+    // `sa`).
+    debug_assert_eq!(samples.len(), 5 * sa_count);
 
     // Serialize. Field ORDER here is the format: header, counts, all checkpoints, then the two SA
     // arrays as separate blocks (ms_byte first, then ls_word: the C writes them in that order at
@@ -1127,18 +1261,12 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     for c in count {
         out.write_all(&c.to_le_bytes())?;
     }
-    for (block_count, block_one_hot) in cp_count.iter().zip(one_hot.iter()) {
-        for &v in block_count {
-            out.write_all(&v.to_le_bytes())?;
-        }
-        for &v in block_one_hot {
-            out.write_all(&v.to_le_bytes())?;
-        }
-    }
-    out.write_all(&sa_ms_byte)?;
-    for &v in &sa_ls_word {
+    // A mask written as its `i64` bits has the same little-endian bytes as the `u64`.
+    for &v in cp.iter() {
         out.write_all(&v.to_le_bytes())?;
     }
+    // `sa_ms_byte`, then `sa_ls_word`, already laid out as the file wants them.
+    out.write_all(&samples)?;
     out.write_all(&sentinel_index.to_le_bytes())?;
     out.flush()?;
     Ok(())
