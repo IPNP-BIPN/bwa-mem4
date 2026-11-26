@@ -93,7 +93,7 @@ pub struct Record {
     /// reverse-complemented and soft-clip-sliced) SAM column 10 (SEQ).
     seq_len: u32,
     /// Bytes of `buf` holding the kseq `comment`, at the end. 0 means no comment, which is the same
-    /// thing here: [`split_id`] only reports a comment when it has at least one non-whitespace byte.
+    /// thing here: [`split_id`] only reports a comment when the rest of the line is non-empty.
     ///
     /// From FASTQ line 1, after the QNAME field. Under `-C` it is appended verbatim as the LAST
     /// tab-separated field of the SAM line, after every tag including RG:Z/SA:Z/XA:Z; it is not a
@@ -1471,8 +1471,8 @@ fn first_le_space(b: &[u8]) -> usize {
 ///
 /// `(name, comment)`. `name` is the header up to the first whitespace with a trailing `/<digit>`
 /// trimmed, which is what makes the two mates of a pair share one QNAME. `comment` is everything
-/// from the first non-whitespace byte after that field to the end of the line, or `None` when the
-/// header is a bare name or ends in whitespace.
+/// after the ONE whitespace byte that ends that field, verbatim (kseq's `comment`), or `None` when
+/// that is empty.
 fn split_id(id: &[u8]) -> (&[u8], Option<&[u8]>) {
     // One past the last QNAME byte: the first whitespace, or the whole slice for a bare-name
     // header (which is the common case for simulated reads).
@@ -1496,12 +1496,9 @@ fn split_id(id: &[u8]) -> (&[u8], Option<&[u8]>) {
     {
         name = &name[..name.len() - READNO_SUFFIX_LEN];
     }
-    // Skip the whole run of whitespace after the name, not just one byte. Nothing left means the
-    // header ended in whitespace and so carries no comment.
-    let comment = id[name_end..]
-        .iter()
-        .position(|c| !c.is_ascii_whitespace())
-        .map(|offset| &id[name_end + offset..]);
+    // kseq skips exactly one delimiter and keeps the rest, extra whitespace included: bwa-mem2 -C
+    // writes `@r1  BX:Z:A` as `\t BX:Z:A`.
+    let comment = id.get(name_end + 1..).filter(|c| !c.is_empty());
     (name, comment)
 }
 
@@ -2032,8 +2029,10 @@ mod tests {
             split_id(b"20:2000000-2200000_50861_51313_0:0:0_0:1:0_0"),
             (&b"20:2000000-2200000_50861_51313_0:0:0_0:1:0_0"[..], None)
         );
-        // Trailing whitespace is not a comment, and `/12` is not a read number.
-        assert_eq!(split_id(b"read1   "), (&b"read1"[..], None));
+        // One delimiter is skipped, the rest kept verbatim; `/12` is not a read number.
+        assert_eq!(split_id(b"read1 "), (&b"read1"[..], None));
+        assert_eq!(split_id(b"read1   "), (&b"read1"[..], Some(&b"  "[..])));
+        assert_eq!(split_id(b"r\t BX:Z:A"), (&b"r"[..], Some(&b" BX:Z:A"[..])));
         assert_eq!(split_id(b"read/12"), (&b"read/12"[..], None));
     }
 }
