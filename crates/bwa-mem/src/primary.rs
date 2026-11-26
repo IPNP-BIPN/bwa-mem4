@@ -306,6 +306,19 @@ fn presort_dump_id() -> &'static Option<u64> {
 /// The mixed 64-bit hash, used only as a sort key (`alnreg_hlt`'s last tie-break). The exact bit
 /// pattern is part of the output contract: change the mixing and a different one of two
 /// equal-scoring regions becomes primary, changing the SAM bytes.
+/// `mem_tie_break_id` (fg-labs/bwa-mem3 0.18): the id that seeds a read's (or pair's) equal-score
+/// tie-breaks. `index_id`, the input position, unless `--tie-break name`; then FNV-1a-64 of the read
+/// name mixed by [`hash_64`] and masked to 23 bits, so `mem_pair`'s `id << 8` still fits an `i32`.
+pub fn tie_break_id(opt: &MemOpt, name: &[u8], index_id: u64) -> u64 {
+    if !opt.tie_break_name {
+        return index_id;
+    }
+    let h = name.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| {
+        (h ^ c as u64).wrapping_mul(0x0100_0000_01b3)
+    });
+    hash_64(h) & 0x7F_FFFF
+}
+
 pub fn hash_64(mut key: u64) -> u64 {
     key = key.wrapping_add(!(key << 32));
     key ^= key >> 22;
@@ -818,6 +831,7 @@ pub(crate) fn same_region(x: &MemAlnReg, y: &MemAlnReg) -> bool {
         && x.frac_rep.to_bits() == y.frac_rep.to_bits()
         && x.is_alt == y.is_alt
         && x.alt_sc == y.alt_sc
+        && x.alt_bw == y.alt_bw
 }
 
 /// Assign each region a primary, or promote it to primary itself. Port of
@@ -1260,7 +1274,10 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
     // that deficit into an equivalent number of mismatches (a mismatch costs `a + b`: you lose the
     // match reward and pay the mismatch penalty). Dividing again by `l` turns a mismatch count into
     // a mismatch rate. Gaps get charged at the mismatch rate too, which is why this is approximate.
-    let identity = 1.0 - f64::from(l * opt.a - a.score) / f64::from(opt.a + opt.b) / f64::from(l);
+    let identity = 1.0
+        - (i64::from(l) * i64::from(opt.a) - i64::from(a.score)) as f64
+            / f64::from(opt.a + opt.b)
+            / f64::from(l);
     // ---- The MAPQ formula itself --------------------------------------------------------------
     // The running MAPQ in phred units. Unclamped and possibly negative until the `clamp` below,
     // because the `sub_n` penalty is subtracted first.
@@ -1295,7 +1312,9 @@ pub fn mem_approx_mapq_se(opt: &MemOpt, a: &MemAlnReg) -> u32 {
         //
         // The C reuses `tmp` for this product; we give the two values distinct names.
         let weight = len_discount * identity * identity;
-        mapq = (MAPQ_SCORE_COEF * f64::from(a.score - sub) / f64::from(opt.a) * weight * weight
+        mapq = (MAPQ_SCORE_COEF * (i64::from(a.score) - i64::from(sub)) as f64 / f64::from(opt.a)
+            * weight
+            * weight
             + ROUND_BIAS) as i32;
     }
     // ---- Penalties and clamping ---------------------------------------------------------------
@@ -1552,6 +1571,24 @@ mod tests {
         assert_ne!(hash_64(1000), hash_64(1001));
     }
 
+    #[test]
+    fn tie_break_id_matches_fork_golden_values() {
+        let mut opt = MemOpt::default();
+        assert_eq!(
+            tie_break_id(&opt, b"read1", 12345),
+            12345,
+            "index mode passes the id through"
+        );
+        opt.tie_break_name = true;
+        // fg-labs/bwa-mem3 0.18 test/unit/test_tie_break_id.cpp: part of the output contract.
+        assert_eq!(tie_break_id(&opt, b"read1", 0), 1317512);
+        assert_eq!(
+            tie_break_id(&opt, b"A00744:46:HV3C3DSXX:2:2330:14281:12633", 7),
+            5557930
+        );
+        assert_eq!(tie_break_id(&opt, b"", 0), 7727541);
+    }
+
     /// Build a minimal region for MAPQ tests: one full-length, forward-strand hit on rid 0 with no
     /// repeat content, so only the scoring fields vary.
     ///
@@ -1578,6 +1615,7 @@ mod tests {
             sub_n,
             seedcov,
             seedlen0: 0,
+            alt_bw: 0,
             secondary: -1,
             secondary_all: -1,
             w: 0,

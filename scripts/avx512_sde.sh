@@ -20,9 +20,9 @@ cd "$(dirname "$0")/.."
 
 # Pinned by URL and by content. An emulator that changed under us would turn a green run back into
 # the thing this script exists to prevent: a claim with nothing behind it. Bump deliberately.
-SDE_URL="https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz"
-SDE_SHA256="3173d2a5369e3385226b488d8b75403951bc14af601435fe707d9f83e0b533e6"
-SDE_DIR_NAME="sde-external-9.48.0-2024-11-25-lin"
+SDE_URL="https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz"
+SDE_SHA256="94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50"
+SDE_DIR_NAME="sde-external-10.13.1-2026-07-28-lin"
 # Two chips, and the pair is the point. `-skx` is the ISA FLOOR: the runtime dispatch selects these
 # kernels on `avx512bw` alone, and Skylake-X has `avx512bw` without VBMI or VNNI, so an instruction
 # from a newer set inside a BW-gated block faults here instead of in a user's alignment. `-spr` is
