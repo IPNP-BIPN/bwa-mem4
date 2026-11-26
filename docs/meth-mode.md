@@ -1,9 +1,9 @@
 # Methylation mode (`--meth`)
 
 bwa-mem4 aligns directional bisulfite, EM-seq, TAPS and Illumina 5-base reads with the
-methylation mode of [fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.17, ported to
+methylation mode of [fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.18, ported to
 Rust. The options are spelled as in bwa-mem3, so a bwa-mem3 command line runs unchanged. On the
-test set, the SAM output is byte-identical to bwa-mem3 0.17 (see [Validation](#validation)).
+test set, the SAM output is byte-identical to bwa-mem3 0.18 (see [Validation](#validation)).
 
 Since 4.6.0, bare `--meth` scores EM-seq and bisulfite reads as `genomic`, as bwa-mem3 0.17 does
 (its #756: fewer confident mismappings). 4.5.0 and bwa-mem3 0.16 used `collapsed`; pass
@@ -53,14 +53,16 @@ genome:
 | File | Content |
 |---|---|
 | `genome.fa.{amb,ann,pac,bwt.2bit.64}` | the plain index (RNAME, `@SQ`, `MD`, XM context) |
-| `genome.fa.meth.fa` | for each contig, `>r<name>` (G→A) then `>f<name>` (C→T), upper-cased, 100-base lines |
+| `genome.fa.meth.fa` | only with `--keep-meth-fasta`: for each contig, `>r<name>` (G→A) then `>f<name>` (C→T), upper-cased, 100-base lines |
 | `genome.fa.meth.{amb,ann,pac,bwt.2bit.64}` | the index of `genome.fa.meth.fa` (seeding) |
 
-After indexing, `genome.fa.meth.fa` and `genome.fa.bwt.2bit.64` are not read and can be
-deleted. `mem` needs `genome.fa.{amb,ann,pac}` and `genome.fa.meth.{amb,ann,pac,bwt.2bit.64}`.
-You may also pass the `.meth` prefix itself as the index.
+`mem --meth` needs `genome.fa.{amb,ann,pac}` and `genome.fa.meth.{amb,ann,pac,bwt.2bit.64}`.
+`index --meth --meth-only` writes just those seven, without `genome.fa.bwt.2bit.64`, which only
+plain `mem` reads. Neither index gets a `.0123`. `-p PREFIX` writes the index elsewhere and copies
+the FASTA's `.alt` beside it. An existing index is refused unless `--force`. You may also pass the
+`.meth` prefix itself as the index.
 
-These are the same files bwa-mem3 0.16 writes. They are byte-identical except for the 8-byte
+These are the same files bwa-mem3 0.18 writes. They are byte-identical except for the 8-byte
 footer that bwa-mem3 appends to `.bwt.2bit.64` and the format does not need. Each tool loads the
 other's index and gives the same SAM. So an index built by `bwa-mem3 index --meth` (for example by
 nf-core's `bwamem3/index`) works as is.
@@ -71,8 +73,10 @@ nf-core's `bwamem3/index`) works as is.
 |---|---|---|
 | `--meth[=CHEM]` | off; `emseq` when given bare | turns the mode on: `emseq`, `taps` or `5base` |
 | `--meth-scoring MODE` | `genomic` (EM-seq), `neutral` (TAPS, 5-base) | how a conversion scores: `collapsed` treats C/T (G/A) as a match in both directions, `genomic` treats it as a match only in the conversion's direction, `neutral` scores it 0 |
-| `--meth-context all\|cpg` | `all` | where a conversion is free. Only `all` is supported (see [Differences](#differences-from-bwa-mem3-017)) |
+| `--meth-context all\|cpg` | `all` | where a conversion is free. Only `all` is supported (see [Differences](#differences-from-bwa-mem3-018)) |
 | `--meth-tags SPEC` | `all` | which of `XR`, `XG`, `XM` to write: `all`, `none`, a list `XR,XG`, or exclusions `^XM` / `-XM`. A tag left out is not computed |
+| `--md full\|short\|none` | `full` | `short` leaves the conversions out of MD (only what NM counts); `none` writes no MD. Works without `--meth` too |
+| `--tie-break index\|name` | `index` | `name` breaks score ties from the read name, so subset or sharded runs place tied reads as the full run does |
 | `--meth-seed-prune[=MODE]` | `spec30` | drops short repetitive SMEMs before SA lookup: `spec30`, `baseline` or `off` |
 | `--set-as-failed f\|r` | off | sets 0x200 on records of conversion strand `f` (`XG:Z:CT`) or `r` (`XG:Z:GA`) |
 | `--chimera-qc` | off | bwameth's rule: when the longest `M` covers less than 44% of the read, sets 0x200, clears 0x2 and caps MAPQ at 1 |
@@ -146,7 +150,7 @@ is cleared.
 ## Validation
 
 `scripts/meth_oracle_diff.sh` builds a small reference, then compares bwa-mem4 against the
-bwa-mem3 0.17 binary. The reference is chr20:44.0-44.4M and chr22:20.0-20.2M of GRCh38, with an
+bwa-mem3 0.18 binary. The reference is chr20:44.0-44.4M and chr22:20.0-20.2M of GRCh38, with an
 injected 30-N run and a 200-base soft-masked run, plus chrM.
 
 It indexes the reference with both tools and checks that the index files are identical. It then
@@ -314,7 +318,7 @@ the 9V74 and the 6975P-C, and `BWA4_RESCUE_PRUNE=1` at 150 bp on the 9V74 costs 
 code, its `-t1` ratio was 0.94 to 1.00. On that CPU, bwa-mem4's seeding takes
 more perf samples than bwa-mem3's; extension makes up for it.
 
-## Differences from bwa-mem3 0.17
+## Differences from bwa-mem3 0.18
 
 None of these differences shows up on the test set.
 

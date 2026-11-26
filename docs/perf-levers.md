@@ -1660,3 +1660,23 @@ RAM, same run: peak live heap 9.06 GB, of which 6.8 GB index and run-long buffer
 maps 6.4 GB (one-read run). Footprint 11.6-12.2 GB with batch overlap, 10.1 GB with
 `BWA4_NO_BATCH_OVERLAP=1`. mimalloc purge options (`MIMALLOC_PURGE_DELAY=0`, `PURGE_DECOMMITS=1`) do
 not lower it and triple sys time.
+
+## bwa-mem3 0.17 perf PRs against this tree (2026-11-17, at the 0.18 catch-up)
+
+0.17 shipped 17 perf PRs; 0.18 none (its own table: 1.00x of 0.17). Triage against our code:
+
+| PR | What | Here |
+|---|---|---|
+| #720 #708 #711 #715 | 16-bit extension kernel: lane compaction, in-cell query end, counted trim, per-call pair order | already done (compaction on every tier; row-level max), or no jobs: our u8 tier takes every query under 256 bp, so the i16 tier is empty at 150 bp |
+| #710 #717 | AVX-512BW 8-bit / u8 rescue per-row work | already done (row trackers, pad columns, backward block scan) |
+| #695 #698 #719 | ungapped probe rungs, chains filtered in cache | already done (one call sorted by band class, exact per-lane bound, per-read chain filter) |
+| #739 | NEON CIGAR walks | already done (`diag_score` vqtbl2, 8-byte `common_prefix`) |
+| #727 #709 | BGZF sync, THP smaps walk | no such code path |
+| #716 | `--huge-pages` (1 GB hugetlb occ table) | not ported: Linux-only, needs an admin page pool, fork measured +0.7% on SPR and noise on Zen 4 |
+| **#718** | prune filter returns FULL every 64 rows once the gate is passed | **ported**: M4, 500k GIAB pairs, -t8: cycles -0.6% (B ahead in all 3 pairs), instructions -0.2% |
+| #696 | ungapped tail in one 16-byte load | tried on NEON (overlapping load ending at `n`): -0.1% cycles, noise. Dropped |
+| #741 | integers two digits per step | tried in `push_int`: +0.2% cycles, +0.3% instructions. Dropped: our digit count is known up front and SAM integers are short |
+| #740 | XA only for printed SE records | not tried: `gen_cigar2` for XA is ~1.8% of a run and this skips a sliver of it (est. 0.1%) |
+
+What held the lead on x86 was not a kernel: the bioconda recipe built only the baseline x86-64
+binary, 11% slower than the `x86-64-v3` one `exec_v3` hands over to. The recipe now ships both.
