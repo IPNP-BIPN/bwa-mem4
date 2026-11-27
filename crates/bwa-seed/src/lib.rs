@@ -2748,4 +2748,106 @@ mod tests {
             assert_eq!(sm.s, naive_occ(&reference, sub));
         }
     }
+
+    /// Reads a FASTQ and bwa-mem2's SMEM dump (`scripts/smem_capture.sh`), then checks every
+    /// read's SMEMs against the oracle, through both the per-read and the batched path. Both sides
+    /// are sorted: round order differs by design (bwa-mem2 sorts by `(m, n)` before chaining), and
+    /// comparing sorted `Vec`s keeps multiplicity. `l` is left out ([`sans_l`]): our walks do not
+    /// maintain it and nothing reads it after seeding. Returns `(reads, smems, reads with round-2
+    /// SMEMs, reads with round-3 SMEMs)` so callers can see what the fixture exercised.
+    fn smem_replay(fm: &FmIndex, fq: &str, tsv: &str) -> (usize, usize, usize, usize) {
+        let text = std::fs::read_to_string(fq).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // Names as bwa-mem2 prints them: the first word, without a `/1` or `/2` mate suffix.
+        let names: Vec<&str> = lines
+            .iter()
+            .step_by(4)
+            .map(|l| {
+                let w = l[1..].split_whitespace().next().unwrap_or("");
+                w.strip_suffix("/1").or(w.strip_suffix("/2")).unwrap_or(w)
+            })
+            .collect();
+        let reads: Vec<Vec<u8>> = lines
+            .iter()
+            .skip(1)
+            .step_by(4)
+            .map(|l| l.bytes().map(bwa_core::dna::nt4).collect())
+            .collect();
+        // Reads with no SMEM have no line in the dump; they expect an empty set.
+        let mut want: std::collections::HashMap<&str, Vec<_>> =
+            names.iter().map(|n| (*n, Vec::new())).collect();
+        assert_eq!(want.len(), names.len(), "read names must be unique");
+        let dump = std::fs::read_to_string(tsv).unwrap();
+        for line in dump.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 6, "bad dump line {line:?}");
+            let p = |i: usize| f[i].parse::<i64>().unwrap();
+            // The dump's `l` (field 4) is skipped, as in `sans_l`.
+            want.get_mut(f[0])
+                .unwrap_or_else(|| panic!("dump read {} not in FASTQ", f[0]))
+                .push((p(1) as u32, p(2) as u32, p(3), p(5)));
+        }
+        let opt = MemOpt::default();
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        let batched = mem_collect_smem_batched(fm, &refs, &opt);
+        let (mut total, mut r2, mut r3) = (0, 0, 0);
+        for (i, codes) in reads.iter().enumerate() {
+            let want = want.get_mut(names[i]).unwrap();
+            want.sort_unstable();
+            for (path, got) in [
+                ("per-read", mem_collect_smem(fm, codes, &opt)),
+                ("batched", batched[i].clone()),
+            ] {
+                let mut got: Vec<_> = got.iter().map(sans_l).collect();
+                got.sort_unstable();
+                assert_eq!(
+                    &got, want,
+                    "{path} SMEMs differ from bwa-mem2 on read {}",
+                    names[i]
+                );
+            }
+            // Coverage: how many SMEMs each round added on this read.
+            let mut v = collect_smems(fm, codes, opt.min_seed_len, 1);
+            let n1 = v.len();
+            smem_round_2(fm, codes, &opt, &mut v);
+            r2 += usize::from(v.len() > n1);
+            r3 += usize::from(want.len() > v.len());
+            total += want.len();
+        }
+        (reads.len(), total, r2, r3)
+    }
+
+    /// Seeding replay against bwa-mem2 on the checked-in fixture (`testdata/smem`, recorded on the
+    /// tiny index by `scripts/smem_capture.sh`).
+    #[test]
+    fn smem_replay_tiny() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/smem");
+        let (reads, smems, r2, r3) = smem_replay(
+            &tiny(),
+            &format!("{dir}/reads.fq"),
+            &format!("{dir}/oracle.tsv"),
+        );
+        eprintln!("SMEM replay (tiny): {reads} reads, {smems} SMEMs, round 2 on {r2} reads, round 3 on {r3}");
+        // A fixture that only exercised round 1 would guard little.
+        assert!(
+            reads == 600 && smems > 0 && r2 > 0 && r3 > 0,
+            "{reads} {smems} {r2} {r3}"
+        );
+    }
+
+    /// The same replay on any index and dump (absolute paths: the test runs in the crate dir):
+    /// `scripts/smem_capture.sh work/region.fa work/r1.fq work/r1.smem` then
+    /// `BWA4_SMEM_REPLAY=$PWD/work/region.fa,$PWD/work/r1.fq,$PWD/work/r1.smem cargo test --release
+    /// -p bwa-mem4-seed smem_replay_env -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn smem_replay_env() {
+        let Ok(spec) = std::env::var("BWA4_SMEM_REPLAY") else {
+            return;
+        };
+        let p: Vec<&str> = spec.split(',').collect();
+        let fm = FmIndex::load(Path::new(p[0])).unwrap();
+        let (reads, smems, r2, r3) = smem_replay(&fm, p[1], p[2]);
+        eprintln!("SMEM replay: {reads} reads, {smems} SMEMs match bwa-mem2 (round 2 on {r2} reads, round 3 on {r3})");
+    }
 }

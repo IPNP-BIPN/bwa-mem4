@@ -1,0 +1,321 @@
+bwa-mem2 v2.3, patched for scripts/smem_capture.sh. Two parts:
+  1. Homebrew's arm64 patch (bwa-mem2 PR #281, sse2neon), as the Homebrew oracle is built.
+  2. An env-guarded dump in bwamem.cpp: BWA2_SMEM_DUMP=<file> writes every read's SMEMs
+     (name m n k l s, after all three rounds) right after mem_collect_smem. Off when unset.
+Build (arm64 macOS, `brew install sse2neon`):
+  git clone --recursive --branch v2.3 https://github.com/bwa-mem2/bwa-mem2 reference/bwa-mem2
+  cd reference/bwa-mem2 && git apply ../../scripts/bwa-mem2-smem-dump.patch
+  mkdir -p ext/sse2neon && ln -sf "$(brew --prefix sse2neon)/include/sse2neon.h" ext/sse2neon/
+  make all arch=-march=armv8-a CC=clang CXX=clang++ CFLAGS="-Iinclude -fPIC -O2 -DSTDC_HEADERS"
+Checked: its SAM on work/ (SE and PE) is byte-identical to Homebrew's bwa-mem2 2.3.
+
+diff --git a/src/FMI_search.h b/src/FMI_search.h
+diff --git a/src/FMI_search.h b/src/FMI_search.h
+index 25c4d0d..24c38cb 100644
+--- a/src/FMI_search.h
++++ b/src/FMI_search.h
+@@ -34,7 +34,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <string.h>
+-#include <immintrin.h>
++#include "simd_compat.h"
+ #include <limits.h>
+ #include <fstream>
+ 
+diff --git a/src/bandedSWA.h b/src/bandedSWA.h
+index c81552b..1026357 100644
+--- a/src/bandedSWA.h
++++ b/src/bandedSWA.h
+@@ -35,14 +35,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
+ #include <stdint.h>
+ #include <assert.h>
+ #include "macro.h"
+-
+-#if (__AVX512BW__ || __AVX2__)
+-#include <immintrin.h>
+-#else
+-#include <smmintrin.h>  // for SSE4.1
+-#define __mmask8 uint8_t
+-#define __mmask16 uint16_t
+-#endif
++#include "simd_compat.h"
+ 
+ #define MAX_SEQ_LEN_REF 256
+ #define MAX_SEQ_LEN_QER 128
+diff --git a/src/bwamem.cpp b/src/bwamem.cpp
+index 511200b..63d0699 100755
+--- a/src/bwamem.cpp
++++ b/src/bwamem.cpp
+@@ -1050,6 +1050,17 @@ int mem_kernel1_core(FMI_search *fmi,
+         exit(EXIT_FAILURE);
+     }
+     printf_(VER, "6. Done! mem_collect_smem, num_smem: %ld\n", num_smem);
++    // bwa-mem4 SMEM replay capture: BWA2_SMEM_DUMP=<file>, run with -t1 only.
++    if (const char *dump_path = getenv("BWA2_SMEM_DUMP")) {
++        static FILE *dump = fopen(dump_path, "w");
++        for (int64_t i = 0; i < num_smem; i++) {
++            const SMEM &p = matchArray[i];
++            fprintf(dump, "%s\t%u\t%u\t%lld\t%lld\t%lld\n", seq_[p.rid].name, p.m, p.n,
++                    (long long)p.k, (long long)p.l, (long long)p.s);
++        }
++        fflush(dump);
++    }
++
+     tprof[MEM_COLLECT][tid] += __rdtsc() - tim;
+ 
+ 
+@@ -2026,7 +2037,10 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
+ {
+ 
+     int32_t i;
+-#if ((!__AVX512BW__) & (__AVX2__ | __SSE2__))
++#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
++    // ARM: use simple loop
++    for(i = 0; i <= MAX_SEQ_LEN16; i++) hist[i] = 0;
++#elif ((!__AVX512BW__) & (__AVX2__ | __SSE2__))
+     for(i = 0; i <= MAX_SEQ_LEN16; i++) hist[i] = 0;
+ #else
+     __m512i zero512 = _mm512_setzero_si512();
+diff --git a/src/fastmap.cpp b/src/fastmap.cpp
+index 5cbb2dc..945b45d 100644
+--- a/src/fastmap.cpp
++++ b/src/fastmap.cpp
+@@ -49,9 +49,11 @@ extern uint64_t tprof[LIM_R][LIM_C];
+ // ---------------
+ 
+ void __cpuid(unsigned int i, unsigned int cpuid[4]) {
+-#ifdef _WIN32
++#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
++    // On ARM, cpuid doesn't exist - just zero out the array
++    cpuid[0] = cpuid[1] = cpuid[2] = cpuid[3] = 0;
++#elif defined(_WIN32)
+     __cpuid((int *) cpuid, (int)i);
+-
+ #else
+     asm volatile
+         ("cpuid" : "=a" (cpuid[0]), "=b" (cpuid[1]), "=c" (cpuid[2]), "=d" (cpuid[3])
+@@ -62,6 +64,11 @@ void __cpuid(unsigned int i, unsigned int cpuid[4]) {
+ 
+ int HTStatus()
+ {
++#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
++    // ARM doesn't have HyperThreading - just return 0
++    fprintf(stderr, "Platform: ARM64/AArch64\n");
++    return 0;
++#else
+     unsigned int cpuid[4];
+     char platform_vendor[12];
+     __cpuid(0, cpuid);
+@@ -93,6 +100,7 @@ int HTStatus()
+         fprintf(stderr, "CPUs support hyperThreading !!\n");
+ 
+     return ht;
++#endif
+ }
+ 
+ 
+diff --git a/src/ksw.cpp b/src/ksw.cpp
+index ad9bc50..f167816 100644
+--- a/src/ksw.cpp
++++ b/src/ksw.cpp
+@@ -30,7 +30,7 @@
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <assert.h>
+-#include <emmintrin.h>
++#include "simd_compat.h"
+ #include "ksw.h"
+ #include "macro.h"
+ 
+diff --git a/src/ksw.h b/src/ksw.h
+index 54bcef8..7bcb9ab 100644
+--- a/src/ksw.h
++++ b/src/ksw.h
+@@ -26,7 +26,7 @@
+ #define __AC_KSW_H
+ 
+ #include <stdint.h>
+-#include <emmintrin.h>
++#include "simd_compat.h"
+ 
+ #define KSW_XBYTE  0x10000
+ #define KSW_XSTOP  0x20000
+diff --git a/src/kswv.h b/src/kswv.h
+index 11da4d7..4935ee4 100644
+--- a/src/kswv.h
++++ b/src/kswv.h
+@@ -39,7 +39,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
+ #include "ksw.h"
+ #include "bandedSWA.h"
+ #else
+-#include <immintrin.h>
++#include "simd_compat.h"
+ #endif
+ 
+ #ifdef __GNUC__
+diff --git a/src/memcpy_bwamem.h b/src/memcpy_bwamem.h
+index 0d53d93..0caa7a6 100644
+--- a/src/memcpy_bwamem.h
++++ b/src/memcpy_bwamem.h
+@@ -35,7 +35,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+-#include "safe_mem_lib.h"
++#include "safe_mem_compat.h"
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/read_index_ele.cpp b/src/read_index_ele.cpp
+index 5bfe932..55ffb17 100644
+--- a/src/read_index_ele.cpp
++++ b/src/read_index_ele.cpp
+@@ -31,7 +31,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+-#include "safe_mem_lib.h"
++#include "safe_mem_compat.h"
+ #include "safe_str_lib.h"
+ #ifdef __cplusplus
+ }
+diff --git a/src/runsimd.cpp b/src/runsimd.cpp
+index 03c0e91..b241df9 100644
+--- a/src/runsimd.cpp
++++ b/src/runsimd.cpp
+@@ -37,6 +37,8 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
++// Avoid macOS memset_s prototype conflict inside safestringlib headers
++#include "safe_mem_compat.h"
+ #include "safe_str_lib.h"
+ #ifdef __cplusplus
+ }
+@@ -57,7 +59,10 @@ extern "C" {
+ // adapted from https://github.com/01org/linux-sgx/blob/master/common/inc/internal/linux/cpuid_gnu.h
+ void __cpuidex(int cpuid[4], int func_id, int subfunc_id)
+ {
+-#if defined(__x86_64__)
++#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
++	// ARM doesn't have cpuid, just zero out
++	cpuid[0] = cpuid[1] = cpuid[2] = cpuid[3] = 0;
++#elif defined(__x86_64__)
+ 	__asm__ volatile ("cpuid"
+ 			: "=a" (cpuid[0]), "=b" (cpuid[1]), "=c" (cpuid[2]), "=d" (cpuid[3])
+ 			: "0" (func_id), "2" (subfunc_id));
+@@ -191,12 +196,20 @@ int main(int argc, char *argv[])
+ 	strcpy_s(prefix, PATH_MAX, buf);
+ 	strcat_s(prefix, PATH_MAX, &argv0[base_st]);
+ 	//prefix_len = strlen(prefix);
++	
++#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
++	// On ARM, use the .arm64 binary
++	test_and_launch(argv, prefix, ".arm64");
++#else
++	// On x86, detect SIMD capabilities
+ 	simd = x86_simd();
+ 	if (simd & SIMD_AVX512BW) test_and_launch(argv, prefix, ".avx512bw");
+ 	if (simd & SIMD_AVX2) test_and_launch(argv, prefix, ".avx2");
+ 	if (simd & SIMD_AVX) test_and_launch(argv, prefix, ".avx");
+ 	if (simd & SIMD_SSE4_2) test_and_launch(argv, prefix, ".sse42");
+ 	if (simd & SIMD_SSE4_1) test_and_launch(argv, prefix, ".sse41");
++#endif
++	
+ 	free(prefix);
+ 	fprintf(stderr, "ERROR: fail to find the right executable\n");
+ 	return 2;
+diff --git a/src/safe_mem_compat.h b/src/safe_mem_compat.h
+new file mode 100644
+index 0000000..d2b8c70
+--- /dev/null
++++ b/src/safe_mem_compat.h
+@@ -0,0 +1,20 @@
++/*************************************************************************************
++ ARM/macOS compatibility wrapper for safestringlib's safe_mem_lib.h
++
++ - On macOS, the system provides memset_s with a different signature.
++   To avoid prototype conflicts when including safe_mem_lib.h, we remap
++   memset_s to a private name for the purpose of including the header.
++
++ This header should be included instead of <safe_mem_lib.h> within this project.
++*************************************************************************************/
++#ifndef SAFE_MEM_COMPAT_H
++#define SAFE_MEM_COMPAT_H
++
++#if defined(__APPLE__) && defined(__MACH__)
++  // Remap memset_s symbol in the header to avoid conflicting declaration
++  #define memset_s memset_s_safeclib_header_only
++#endif
++
++#include "safe_mem_lib.h"
++
++#endif // SAFE_MEM_COMPAT_H
+diff --git a/src/simd_compat.h b/src/simd_compat.h
+new file mode 100644
+index 0000000..18b7ec4
+--- /dev/null
++++ b/src/simd_compat.h
+@@ -0,0 +1,61 @@
++/*************************************************************************************
++                           The MIT License
++
++   BWA-MEM2  (Sequence alignment using Burrows-Wheeler Transform),
++   Copyright (C) 2019  Intel Corporation, Heng Li.
++
++   Permission is hereby granted, free of charge, to any person obtaining
++   a copy of this software and associated documentation files (the
++   "Software"), to deal in the Software without restriction, including
++   without limitation the rights to use, copy, modify, merge, publish,
++   distribute, sublicense, and/or sell copies of the Software, and to
++   permit persons to whom the Software is furnished to do so, subject to
++   the following conditions:
++
++   The above copyright notice and this permission notice shall be
++   included in all copies or substantial portions of the Software.
++
++   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++   SOFTWARE.
++
++Authors: ARM compatibility wrapper
++*****************************************************************************************/
++
++#ifndef SIMD_COMPAT_H
++#define SIMD_COMPAT_H
++
++// Detect ARM architecture
++#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
++    #define SSE2NEON_PRECISE_DIV 1
++    #define SSE2NEON_PRECISE_SQRT 1
++    #include "../ext/sse2neon/sse2neon.h"
++    #ifndef __mmask8
++        #define __mmask8 uint8_t
++    #endif
++    #ifndef __mmask16
++        #define __mmask16 uint16_t
++    #endif
++    // Map __rdtsc (x86) to _rdtsc (ARM via sse2neon)
++    #define __rdtsc _rdtsc
++    // On ARM, override _mm_prefetch to use __builtin_prefetch directly
++    // since sse2neon's version might have compatibility issues
++    #undef _mm_prefetch
++    #define _mm_prefetch(addr, hint) __builtin_prefetch((const char*)(addr), 0, 3)
++#else
++    // x86/x64 architecture - use native intrinsics
++    #if (__AVX512BW__ || __AVX2__)
++        #include <immintrin.h>
++    #else
++        #include <smmintrin.h>  // for SSE4.1
++        #define __mmask8 uint8_t
++        #define __mmask16 uint16_t
++    #endif
++#endif
++
++#endif // SIMD_COMPAT_H
