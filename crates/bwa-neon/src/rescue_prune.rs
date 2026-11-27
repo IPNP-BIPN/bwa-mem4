@@ -941,6 +941,10 @@ mod neon {
                 nm = pack(&mut s.mj, nm, mv, mm);
                 idx = vaddq_u16(idx, k8);
                 k0 += 8;
+                // Every 64 rows: the total only grows, so a passed gate is final (bwa-mem3 #718).
+                if k0 & 63 == 0 && k0 < np && k0 + vaddvq_u32(extra) as usize > max_hits {
+                    return None;
+                }
             }
         }
         let nhits = np + vaddvq_u32(extra) as usize;
@@ -1378,6 +1382,13 @@ mod sse {
                 nm = pack(&mut s.mj, nm, mv, mm);
                 idx = _mm_add_epi16(idx, k8);
                 k0 += 8;
+                // Every 64 rows: the total only grows, so a passed gate is final (bwa-mem3 #718).
+                if k0 & 63 == 0 && k0 < np {
+                    let ex: [u32; 4] = std::mem::transmute(extra);
+                    if k0 + ex.iter().map(|&x| x as usize).sum::<usize>() > max_hits {
+                        return None;
+                    }
+                }
             }
         }
         let ex: [u32; 4] = std::mem::transmute(extra);

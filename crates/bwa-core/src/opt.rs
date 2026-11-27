@@ -340,6 +340,30 @@ pub struct MemOpt {
     /// `--meth`: the methylation mode's settings and its two per-chemistry matrices (see
     /// [`crate::meth`]). `None` for every run without `--meth`, which then never reads it.
     pub meth: Option<crate::meth::MethOpt>,
+
+    /// `--tie-break name` (fg-labs/bwa-mem3 0.18): seed the equal-score tie-breaks from a hash of
+    /// the read name instead of its input position, so reordered or sharded input does not move
+    /// tied reads. `false` (`--tie-break index`, the default) is bwa's input-position seed.
+    pub tie_break_name: bool,
+    /// `--md` (fg-labs/bwa-mem3 0.17): how the MD tag is written. [`MdMode::Full`] by default.
+    pub md: MdMode,
+    /// `--alt-project` (fg-labs/bwa-mem3 0.18): the ALT -> primary liftover table. `None` (the
+    /// default) leaves every ALT region where it is, byte-identical to bwa-mem2.
+    pub alt_lift: Option<std::sync::Arc<crate::alt_lift::AltLift>>,
+    /// `--alt-project primary`: drop the ALT regions the lift left behind, so no record names an
+    /// ALT contig. `false` is `keep-alt`.
+    pub alt_project_primary: bool,
+}
+
+/// `--md full|short|none`. `Full` is bwa's literal MD. `Short` lists only the mismatches NM counts,
+/// so under `--meth` a conversion the matrix frees reads as a match; without `--meth` it equals
+/// `Full`. `None` writes no MD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MdMode {
+    #[default]
+    Full,
+    Short,
+    None,
 }
 
 impl Default for MemOpt {
@@ -397,6 +421,10 @@ impl Default for MemOpt {
             max_xa_hits_alt: 200,
             mat,
             meth: None,
+            tie_break_name: false,
+            md: MdMode::Full,
+            alt_lift: None,
+            alt_project_primary: false,
         }
     }
 }

@@ -351,6 +351,22 @@ pub fn build_index(fasta: &Path) -> Result<()> {
 /// - `prefix`: the path the five output files are named after. Its directory must exist and be
 ///   writable; nothing here creates it.
 pub fn build_index_with_prefix(fasta: &Path, prefix: &Path) -> Result<()> {
+    build_index_parts(fasta, prefix, true, true)
+}
+
+/// [`build_index_with_prefix`] with the two big files optional, for `index --meth`
+/// (fg-labs/bwa-mem3 0.18). `.pac`, `.ann` and `.amb` are always written, identical either way.
+///
+/// - `unpacked`: also write `.0123`. Only `bwa-mem2 index` byte-identity needs it; no loader
+///   reads it, so the seed index (`<prefix>.meth.*`) skips it, as the fork does.
+/// - `fm_index`: also build `.bwt.2bit.64`. Off for `--meth-only`'s original reference, which
+///   `mem --meth` reads only through `.pac`/`.ann`/`.amb`.
+pub fn build_index_parts(
+    fasta: &Path,
+    prefix: &Path,
+    unpacked: bool,
+    fm_index: bool,
+) -> Result<()> {
     let contigs = read_fasta(fasta)?;
     if contigs.is_empty() {
         return Err(Error::Other("empty FASTA".into()));
@@ -457,6 +473,9 @@ pub fn build_index_with_prefix(fasta: &Path, prefix: &Path) -> Result<()> {
     // 3. Write .ann and .amb.
     write_ann(&sibling(prefix, "ann"), l_pac, n_seqs, &anns)?;
     write_amb(&sibling(prefix, "amb"), l_pac, n_seqs, &ambs)?;
+    if !fm_index {
+        return Ok(());
+    }
 
     // 4. Build the forward++reverse-complement binary reference and write .0123. The RC half is
     //    filled in parallel: bref[L + i] = complement(forward[L - 1 - i]).
@@ -491,7 +510,9 @@ pub fn build_index_with_prefix(fasta: &Path, prefix: &Path) -> Result<()> {
     });
     // `forward` is now captured in bref; free it before the suffix array (~3 GB at genome scale).
     drop(forward);
-    File::create(sibling(prefix, "0123")).and_then(|f| BufWriter::new(f).write_all(&bref))?;
+    if unpacked {
+        File::create(sibling(prefix, "0123")).and_then(|f| BufWriter::new(f).write_all(&bref))?;
+    }
 
     // 5. Build and write the FM-index (.bwt.2bit.64).
     write_fm_index(&sibling(prefix, "bwt.2bit.64"), &bref)?;
