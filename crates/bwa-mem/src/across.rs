@@ -147,8 +147,8 @@ const ALPHABET_SIZE: usize = 5;
 /// and decides who survives a score tie. Without it the fake bounds shifted real regions across ties.
 ///
 /// The skip is sound rather than lucky: it fires only when the seed is contained, on the same
-/// diagonal, in a *longer* seed of the same chain. That container is extended earlier (descending
-/// score order), its region covers the seed, the shared diagonal makes `qd - rd == 0` trivially
+/// diagonal, in a *longer* seed of the same chain that is extended earlier (descending
+/// `(score, index)`, checked: rescoring can put a shorter seed first), its region covers the seed, the shared diagonal makes `qd - rd == 0` trivially
 /// within the band, and the `seedlen0` guard cannot fire because the container is longer -- so the
 /// discard pass would purge this seed anyway. nh13's test is a conservative subset of the purge.
 ///
@@ -207,14 +207,20 @@ pub(crate) fn seed_ext_redundant(seeds: &[MemSeed], si: usize) -> bool {
     // when this differs by zero, i.e. one can be reached from the other with no indel. `qbeg` is i32
     // and `rbeg` i64 (a position in the 2*l_pac forward+reverse concatenation), hence the widening.
     let cand_diag = cand.rbeg - i64::from(cand.qbeg);
+    // The extension loop's order key, bwa-mem2's `srt[i] = score<<32 | i` walked from the top. The
+    // container must come FIRST in it: `mem_flt_chained_seeds` rescores seeds on long reads, so a
+    // shorter nested seed can outrank its container, and bwa-mem2 then keeps the shorter seed's
+    // region (its `seedlen0`) and purges the container instead.
+    let order_key = |s: &MemSeed, i: usize| (u64::from(s.score as u32) << 32) | i as u64;
+    let cand_key = order_key(&cand, si);
 
     // ---- step 1: is there a strictly longer, same-diagonal seed that contains the candidate? ----
     // Invariant at the top of each iteration: false means no seed among `seeds[..j]` qualified as a
     // container. The loop breaks the moment one does, so the flag is only ever set once.
     let mut has_container = false;
     for (j, container) in seeds.iter().enumerate() {
-        if j == si || container.len <= cand.len {
-            continue; // must be strictly longer
+        if j == si || container.len <= cand.len || order_key(container, j) < cand_key {
+            continue; // must be strictly longer, and extended before the candidate
         }
         if container.rbeg - i64::from(container.qbeg) != cand_diag {
             continue; // must be the same diagonal
@@ -2441,6 +2447,28 @@ mod tests {
     use crate::align_read;
     use bwa_neon::NeonBackend;
     use std::path::Path;
+
+    /// The pre-skip needs the container to be extended first. With `score = len` it is; once a
+    /// rescore puts the shorter nested seed ahead, bwa-mem2 extends that one, so it may not be
+    /// skipped.
+    #[test]
+    fn skip_contained_requires_container_first() {
+        let seed = |qbeg, len, score| bwa_seed::MemSeed {
+            rbeg: 1000 + i64::from(qbeg),
+            qbeg,
+            len,
+            score,
+        };
+        let plain = [seed(0, 100, 100), seed(20, 30, 30)];
+        assert!(seed_ext_redundant(&plain, 1));
+        let rescored = [seed(0, 100, 80), seed(20, 30, 90)];
+        assert!(!seed_ext_redundant(&rescored, 1));
+        // A score tie goes to the higher index, as in the C's `score<<32 | i`.
+        let tie_after = [seed(20, 30, 50), seed(0, 100, 50)];
+        assert!(seed_ext_redundant(&tie_after, 0));
+        let tie_before = [seed(0, 100, 50), seed(20, 30, 50)];
+        assert!(!seed_ext_redundant(&tie_before, 1));
+    }
 
     /// Load the checked-in toy index. Small enough that 400 reads exercise every branch quickly,
     /// large enough that chains carry several seeds (which is what the discard pass needs).
