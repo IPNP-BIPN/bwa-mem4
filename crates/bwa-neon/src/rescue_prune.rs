@@ -159,9 +159,12 @@ pub(crate) enum Decision {
 struct Scratch {
     /// Per K-mer code, 0 when the cached query does not hold it, else
     /// `n << 16 | (n > 1) << 15 | j`: `n` occurrences, the latest ending at query position `j`.
-    /// `touched` lists the codes set, so the next query clears only those.
+    /// `touched[..nt]` lists the codes set, so the next query clears only those. `touched` keeps
+    /// [`TCAP`] slots: the loads write a slot per position branch-free and advance `nt` only for
+    /// a new code.
     tab: Vec<u32>,
     touched: Vec<u16>,
+    nt: usize,
     /// Previous query position with the same K-mer code, or -1.
     nxt: Vec<i16>,
     /// The query the table describes, its K, and whether it holds an N.
@@ -228,6 +231,8 @@ struct Scratch {
 /// Most relation entries a query may take (a T-rich mate under C/T enters up to `2^K` per
 /// position); past it the job is not filtered.
 const ECAP: usize = 8192;
+/// `touched`'s slots: one past the most distinct codes either load can set.
+const TCAP: usize = if QCAP > ECAP { QCAP } else { ECAP } + 1;
 
 /// [`Scratch::tab`]'s flag for a code the query holds more than once, and its position field.
 const TAB_MULTI: u32 = 1 << 15;
@@ -237,7 +242,8 @@ impl Scratch {
     fn new() -> Scratch {
         Scratch {
             tab: Vec::new(),
-            touched: Vec::with_capacity(QCAP),
+            touched: vec![0; TCAP],
+            nt: 0,
             nxt: vec![-1; QCAP],
             qcache: Vec::with_capacity(QCAP),
             qk: 0,
@@ -291,12 +297,12 @@ impl Scratch {
         let ncode = 1usize << (2 * k);
         if self.tab.len() != ncode {
             self.tab = vec![0; ncode];
-            self.touched.clear();
+            self.nt = 0;
         }
-        for &c in &self.touched {
+        for &c in &self.touched[..self.nt] {
             self.tab[c as usize] = 0;
         }
-        self.touched.clear();
+        self.nt = 0;
         self.pres = [0; 128];
         if self.q_has_n {
             return;
@@ -306,31 +312,25 @@ impl Scratch {
         for &b in &q[..k - 1] {
             code = (code << 2) | b as u32;
         }
-        // Branch-free and unchecked: a query is rebuilt for nearly every rescue job (a round holds
-        // about one job per mate), and whether a code repeats is data, not a predictable branch.
-        // `code <= mask < tab.len()`, `j < q.len() <= QCAP = nxt.len()`, and `touched` keeps
-        // QCAP capacity, more than the distinct codes of one query.
-        debug_assert!(q.len() <= self.nxt.len() && q.len() <= self.touched.capacity());
-        let (tab, nxt) = (self.tab.as_mut_ptr(), self.nxt.as_mut_ptr());
-        let touched = self.touched.as_mut_ptr();
+        // Branch-free: a query is rebuilt for nearly every rescue job (a round holds about one job
+        // per mate), and whether a code repeats is data, not a predictable branch.
+        let (tab, nxt) = (&mut self.tab[..], &mut self.nxt[..q.len()]);
+        let touched = &mut self.touched[..q.len()];
         let mut nt = 0usize;
-        // SAFETY: the bounds above.
-        unsafe {
-            for j in k - 1..q.len() {
-                code = ((code << 2) | u32::from(*q.get_unchecked(j))) & mask;
-                let v = *tab.add(code as usize);
-                if k == 5 {
-                    self.pres[(code >> 3) as usize] |= 1 << (code & 7);
-                }
-                let seen = v != 0;
-                *touched.add(nt) = code as u16;
-                nt += usize::from(!seen);
-                *nxt.add(j) = if seen { (v & TAB_POS) as i16 } else { -1 };
-                *tab.add(code as usize) =
-                    ((v >> 16) + 1) << 16 | if seen { TAB_MULTI } else { 0 } | j as u32;
+        for j in k - 1..q.len() {
+            code = ((code << 2) | u32::from(q[j])) & mask;
+            let v = tab[code as usize];
+            if k == 5 {
+                self.pres[(code >> 3) as usize] |= 1 << (code & 7);
             }
-            self.touched.set_len(nt);
+            let seen = v != 0;
+            touched[nt] = code as u16;
+            nt += usize::from(!seen);
+            nxt[j] = if seen { (v & TAB_POS) as i16 } else { -1 };
+            tab[code as usize] =
+                ((v >> 16) + 1) << 16 | if seen { TAB_MULTI } else { 0 } | j as u32;
         }
+        self.nt = nt;
     }
 
     /// [`Scratch::load_query`] under a relation: target base `x` also hits query base `y` (one
@@ -348,14 +348,14 @@ impl Scratch {
         let ncode = 1usize << (2 * k);
         if self.tab.len() != ncode {
             self.tab = vec![0; ncode];
-            self.touched.clear();
+            self.nt = 0;
         }
         // Read only where `tab` is set, which this load writes first.
         self.ehead.resize(ncode, -1);
-        for &c in &self.touched {
+        for &c in &self.touched[..self.nt] {
             self.tab[c as usize] = 0;
         }
-        self.touched.clear();
+        self.nt = 0;
         self.ent_j.clear();
         self.ent_nxt.clear();
         self.pres = [0; 128];
@@ -367,12 +367,8 @@ impl Scratch {
         let (mut code, mut ym) = (0u32, 0u32);
         self.ent_j.reserve(ECAP);
         self.ent_nxt.reserve(ECAP);
-        // One past the distinct codes: a seen code still writes (unused) at slot `nt`.
-        self.touched.reserve(ECAP.min(ncode) + 1);
-        debug_assert!(self.ehead.len() == ncode && self.tab.len() == ncode);
-        let (tab, eh) = (self.tab.as_mut_ptr(), self.ehead.as_mut_ptr());
-        let (ej, en) = (self.ent_j.as_mut_ptr(), self.ent_nxt.as_mut_ptr());
-        let touched = self.touched.as_mut_ptr();
+        let (tab, eh) = (&mut self.tab[..ncode], &mut self.ehead[..ncode]);
+        let touched = &mut self.touched[..];
         let (mut ne, mut nt) = (0usize, 0usize);
         for (j, &b) in q.iter().enumerate() {
             code = (code << 2 | u32::from(b)) & mask;
@@ -381,47 +377,34 @@ impl Scratch {
                 continue;
             }
             // Every subset of the `y` positions read as `x`: `flip` is one bit per 2-bit slot.
-            // Branch-free and unchecked, as in `load_query`: whether a code was seen is data.
-            // `c <= mask < tab.len() == ehead.len()`, `ne < ECAP` before each write into the
-            // ECAP-reserved entry vectors, and `touched` holds at most one slot per code and per
-            // entry. SAFETY: those bounds.
+            // Branch-free, as in `load_query`: whether a code was seen is data.
             let mut sub = ym;
-            unsafe {
-                loop {
-                    let c = (code ^ sub) as usize;
-                    if ne == ECAP {
-                        self.ent_j.set_len(ne);
-                        self.ent_nxt.set_len(ne);
-                        self.touched.set_len(nt);
-                        self.q_has_n = true;
-                        return;
-                    }
-                    let v = *tab.add(c);
-                    let seen = v != 0;
-                    *ej.add(ne) = j as i16;
-                    *en.add(ne) = if seen { *eh.add(c) } else { -1 };
-                    *eh.add(c) = ne as i16;
-                    *touched.add(nt) = c as u16;
-                    nt += usize::from(!seen);
-                    if k == 5 {
-                        self.pres[c >> 3] |= 1 << (c & 7);
-                    }
-                    *tab.add(c) =
-                        ((v >> 16) + 1) << 16 | if seen { TAB_MULTI } else { 0 } | j as u32;
-                    ne += 1;
-                    if sub == 0 {
-                        break;
-                    }
-                    sub = (sub - 1) & ym;
+            loop {
+                let c = (code ^ sub) as usize;
+                if ne == ECAP {
+                    self.nt = nt;
+                    self.q_has_n = true;
+                    return;
                 }
+                let v = tab[c];
+                let seen = v != 0;
+                self.ent_j.push(j as i16);
+                self.ent_nxt.push(if seen { eh[c] } else { -1 });
+                eh[c] = ne as i16;
+                touched[nt] = c as u16;
+                nt += usize::from(!seen);
+                if k == 5 {
+                    self.pres[c >> 3] |= 1 << (c & 7);
+                }
+                tab[c] = ((v >> 16) + 1) << 16 | if seen { TAB_MULTI } else { 0 } | j as u32;
+                ne += 1;
+                if sub == 0 {
+                    break;
+                }
+                sub = (sub - 1) & ym;
             }
         }
-        // SAFETY: `ne` entries and `nt` codes were written above, within the reservations.
-        unsafe {
-            self.ent_j.set_len(ne);
-            self.ent_nxt.set_len(ne);
-            self.touched.set_len(nt);
-        }
+        self.nt = nt;
     }
 }
 
@@ -727,13 +710,16 @@ mod neon {
     /// Writes 8 lanes: `out` needs 8 lanes of slack past the last packed one.
     #[inline(always)]
     unsafe fn pack(out: &mut [u16], at: usize, v: uint16x8_t, m: u32) -> usize {
-        debug_assert!(at + 8 <= out.len());
-        let sh = vld1q_u8(SHUF[m as usize].as_ptr());
-        let x = vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(v), sh));
-        vst1q_u16(out.as_mut_ptr().add(at), x);
-        // A table, not `count_ones`: the cursor chains every pack on the previous, and a scalar
-        // popcount crosses to the vector unit and back (fg-labs/bwa-mem3's `pc[]`).
-        at + PC[m as usize] as usize
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            debug_assert!(at + 8 <= out.len());
+            let sh = vld1q_u8(SHUF[m as usize].as_ptr());
+            let x = vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(v), sh));
+            vst1q_u16(out.as_mut_ptr().add(at), x);
+            // A table, not `count_ones`: the cursor chains every pack on the previous, and a scalar
+            // popcount crosses to the vector unit and back (fg-labs/bwa-mem3's `pc[]`).
+            at + PC[m as usize] as usize
+        }
     }
 
     /// `PC[m]`: the number of lanes set in `m`.
@@ -766,324 +752,328 @@ mod neon {
         max_hits: usize,
         rel: Option<(u8, u8)>,
     ) -> Option<usize> {
-        const K: usize = 5;
-        let (len1, len2) = (t.len(), q.len());
-        match rel {
-            Some(r) => s.load_query_rel(q, K, r),
-            None => s.load_query(q, K),
-        }
-        // ---- 1. N check while copying the window into a zero-padded buffer, so the 16-row code
-        //      blocks never read past it ----
-        // One pass: copy 16 bytes, OR them in. `rbuf` keeps `len1 + 32` bytes, the last 32 zero.
-        if s.rbuf.len() < len1 + 32 {
-            s.rbuf.resize(len1 + 32, 0);
-        }
-        let rb = s.rbuf.as_mut_ptr();
-        let mut ov = vdupq_n_u8(0);
-        // Stored through an opaque zero: a plain load-store loop is turned into a `memcpy` call
-        // plus a second pass for the OR (0.1% of M4 PE in the call alone).
-        let z = std::hint::black_box(vdupq_n_u8(0));
-        let mut i = 0;
-        while i + 16 <= len1 {
-            let x = vld1q_u8(t.as_ptr().add(i));
-            ov = vorrq_u8(ov, x);
-            vst1q_u8(rb.add(i), vorrq_u8(x, z));
-            i += 16;
-        }
-        let mut tail = 0u8;
-        while i < len1 {
-            tail |= t[i];
-            *rb.add(i) = t[i];
-            i += 1;
-        }
-        vst1q_u8(rb.add(len1), vdupq_n_u8(0));
-        vst1q_u8(rb.add(len1 + 16), vdupq_n_u8(0));
-        if s.q_has_n || (vmaxvq_u8(ov) | tail) & !3 != 0 {
-            return None;
-        }
-        let off = len2.div_ceil(16) * 16;
-        let nd = len1 + off + 1;
-        let nw = nd.div_ceil(64);
-        let span = nw * 64;
-        s.occ_bits.clear();
-        s.occ_bits.resize(nw, 0);
-        s.occ_stale = false;
-        // ---- 3. hit rows, 16 at a time: 5-mer codes and a presence-bitmap lookup (two 64-byte
-        //      TBLs), the rows with a hit and their codes left-packed ----
-        let nrow = len1 + 1 - K;
-        grow(&mut s.hrow, nrow + 16);
-        grow(&mut s.hcode, nrow + 16);
-        let mut np = 0usize;
-        {
-            let pr = s.pres.as_ptr();
-            let plo = uint8x16x4_t(
-                vld1q_u8(pr),
-                vld1q_u8(pr.add(16)),
-                vld1q_u8(pr.add(32)),
-                vld1q_u8(pr.add(48)),
-            );
-            let phi = uint8x16x4_t(
-                vld1q_u8(pr.add(64)),
-                vld1q_u8(pr.add(80)),
-                vld1q_u8(pr.add(96)),
-                vld1q_u8(pr.add(112)),
-            );
-            const P2: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
-            const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-            let (p2, bw) = (vld1q_u8(P2.as_ptr()), vld1q_u8(BW.as_ptr()));
-            let (k64, k7, k8) = (vdupq_n_u8(64), vdupq_n_u8(7), vdupq_n_u16(8));
-            let mut pos = vld1q_u16(IO.as_ptr());
-            let rb = s.rbuf.as_ptr();
-            let mut b = 0usize;
-            while b < nrow {
-                let buf = rb.add(b);
-                let a0 = vld1q_u8(buf);
-                let a1 = vld1q_u8(buf.add(1));
-                let a2 = vld1q_u8(buf.add(2));
-                let a3 = vld1q_u8(buf.add(3));
-                let a4 = vld1q_u8(buf.add(4));
-                // code & 255 = a1 a2 a3 a4 (2 bits each), code >> 8 = a0
-                let lo = vsliq_n_u8::<6>(vsliq_n_u8::<4>(vsliq_n_u8::<2>(a4, a3), a2), a1);
-                let idx = vsraq_n_u8::<3>(vshlq_n_u8::<5>(a0), lo); // code >> 3
-                                                                    // idx >= 64 wraps to >= 192 under the subtraction for idx < 64, which TBX leaves
-                let byte = vqtbx4q_u8(vqtbl4q_u8(plo, idx), phi, vsubq_u8(idx, k64));
-                let hit = vtstq_u8(byte, vqtbl1q_u8(p2, vandq_u8(lo, k7)));
-                let mut m = vandq_u8(hit, bw);
-                m = vpaddq_u8(m, m);
-                m = vpaddq_u8(m, m);
-                m = vpaddq_u8(m, m);
-                let mut m16 = u32::from(vgetq_lane_u16::<0>(vreinterpretq_u16_u8(m)));
-                if b + 16 > nrow {
-                    m16 &= (1u32 << (nrow - b)) - 1;
-                }
-                let c0 = vreinterpretq_u16_u8(vzip1q_u8(lo, a0));
-                let c1 = vreinterpretq_u16_u8(vzip2q_u8(lo, a0));
-                let (ml, mh) = (m16 & 0xFF, m16 >> 8);
-                let at = pack(&mut s.hrow, np, pos, ml);
-                pack(&mut s.hcode, np, c0, ml);
-                let pos8 = vaddq_u16(pos, k8);
-                np = pack(&mut s.hrow, at, pos8, mh);
-                pack(&mut s.hcode, at, c1, mh);
-                pos = vaddq_u16(pos8, k8);
-                b += 16;
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            const K: usize = 5;
+            let (len1, len2) = (t.len(), q.len());
+            match rel {
+                Some(r) => s.load_query_rel(q, K, r),
+                None => s.load_query(q, K),
             }
-        }
-        if np == 0 {
-            return Some(nd);
-        }
-        // Every hit row holds at least one hit, so the gate can already refuse: the densest jobs
-        // then skip layer 1, their most expensive part.
-        if np > max_hits {
-            return None;
-        }
-        // ---- 4. layer 1, 8 hit rows at a time: each row's hit at the latest query occurrence of
-        //      its code, d = row + K - 1 + off - j. A row continuing the previous row's run
-        //      (row + 1, same diagonal) is no boundary; boundaries are left-packed as (list index,
-        //      diagonal, row), rows of repeated codes as (row, j). The exact hit total comes out of
-        //      the same pass ----
-        grow(&mut s.rb_idx, np + 16);
-        grow(&mut s.rb_d, np + 16);
-        grow(&mut s.rb_r, np + 16);
-        grow(&mut s.mrow, np + 16);
-        grow(&mut s.mj, np + 16);
-        let (mut nb, mut nm) = (0usize, 0usize);
-        let mut extra = vdupq_n_u32(0);
-        {
-            const WL: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
-            const WH: [u16; 8] = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
-            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-            let (wl, wh) = (vld1q_u16(WL.as_ptr()), vld1q_u16(WH.as_ptr()));
-            let mut idx = vld1q_u16(IO.as_ptr());
-            let (k8, one) = (vdupq_n_u16(8), vdupq_n_u16(1));
-            let koff = vdupq_n_u16((off + K - 1) as u16);
-            let kpos = vdupq_n_u16(TAB_POS as u16);
-            let kmulti = vdupq_n_u16(TAB_MULTI as u16);
-            let vn = vdupq_n_u16(np as u16);
-            let (mut prev_r, mut prev_d) = (vdupq_n_u16(0), vdupq_n_u16(0xFFFF));
-            let tab = s.tab.as_ptr();
-            // Codes past `np` are stale but in range (< 1024); their lanes are masked.
-            let look4 = |c: *const u16| -> uint16x8_t {
-                let x = (c as *const u64).read_unaligned();
-                let e = |sh: u32| u64::from(*tab.add(((x >> sh) & 1023) as usize));
-                let a = e(0) | e(16) << 32;
-                let b = e(32) | e(48) << 32;
-                vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(a), vcreate_u64(b)))
-            };
-            let mut k0 = 0usize;
-            while k0 < np {
-                let r = vld1q_u16(s.hrow.as_ptr().add(k0));
-                let e0 = look4(s.hcode.as_ptr().add(k0));
-                let e1 = look4(s.hcode.as_ptr().add(k0 + 4));
-                let (lo, occ) = (vuzp1q_u16(e0, e1), vuzp2q_u16(e0, e1));
-                let j = vandq_u16(lo, kpos);
-                let d = vsubq_u16(vaddq_u16(r, koff), j);
-                let rp = vextq_u16::<7>(prev_r, r);
-                let dp = vextq_u16::<7>(prev_d, d);
-                (prev_r, prev_d) = (r, d);
-                let valid = vcltq_u16(idx, vn);
-                let cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one)), vceqq_u16(d, dp));
-                let bd = vbicq_u16(valid, cont);
-                let mu = vandq_u16(vtstq_u16(lo, kmulti), valid);
-                extra = vpadalq_u16(extra, vandq_u16(vsubq_u16(occ, one), valid));
-                let m = u32::from(vaddvq_u16(vorrq_u16(vandq_u16(bd, wl), vandq_u16(mu, wh))));
-                let (mb, mm) = (m & 0xFF, m >> 8);
-                pack(&mut s.rb_idx, nb, idx, mb);
-                pack(&mut s.rb_d, nb, d, mb);
-                nb = pack(&mut s.rb_r, nb, r, mb);
-                pack(&mut s.mrow, nm, r, mm);
-                // Under a relation the code: its entry chain starts at `ehead` (below).
-                let mv = if rel.is_some() {
-                    vld1q_u16(s.hcode.as_ptr().add(k0))
-                } else {
-                    j
-                };
-                nm = pack(&mut s.mj, nm, mv, mm);
-                idx = vaddq_u16(idx, k8);
-                k0 += 8;
-                // Every 64 rows: the total only grows, so a passed gate is final (bwa-mem3 #718).
-                if k0 & 63 == 0 && k0 < np && k0 + vaddvq_u32(extra) as usize > max_hits {
-                    return None;
+            // ---- 1. N check while copying the window into a zero-padded buffer, so the 16-row code
+            //      blocks never read past it ----
+            // One pass: copy 16 bytes, OR them in. `rbuf` keeps `len1 + 32` bytes, the last 32 zero.
+            if s.rbuf.len() < len1 + 32 {
+                s.rbuf.resize(len1 + 32, 0);
+            }
+            let rb = s.rbuf.as_mut_ptr();
+            let mut ov = vdupq_n_u8(0);
+            // Stored through an opaque zero: a plain load-store loop is turned into a `memcpy` call
+            // plus a second pass for the OR (0.1% of M4 PE in the call alone).
+            let z = std::hint::black_box(vdupq_n_u8(0));
+            let mut i = 0;
+            while i + 16 <= len1 {
+                let x = vld1q_u8(t.as_ptr().add(i));
+                ov = vorrq_u8(ov, x);
+                vst1q_u8(rb.add(i), vorrq_u8(x, z));
+                i += 16;
+            }
+            let mut tail = 0u8;
+            while i < len1 {
+                tail |= t[i];
+                *rb.add(i) = t[i];
+                i += 1;
+            }
+            vst1q_u8(rb.add(len1), vdupq_n_u8(0));
+            vst1q_u8(rb.add(len1 + 16), vdupq_n_u8(0));
+            if s.q_has_n || (vmaxvq_u8(ov) | tail) & !3 != 0 {
+                return None;
+            }
+            let off = len2.div_ceil(16) * 16;
+            let nd = len1 + off + 1;
+            let nw = nd.div_ceil(64);
+            let span = nw * 64;
+            s.occ_bits.clear();
+            s.occ_bits.resize(nw, 0);
+            s.occ_stale = false;
+            // ---- 3. hit rows, 16 at a time: 5-mer codes and a presence-bitmap lookup (two 64-byte
+            //      TBLs), the rows with a hit and their codes left-packed ----
+            let nrow = len1 + 1 - K;
+            grow(&mut s.hrow, nrow + 16);
+            grow(&mut s.hcode, nrow + 16);
+            let mut np = 0usize;
+            {
+                let pr = s.pres.as_ptr();
+                let plo = uint8x16x4_t(
+                    vld1q_u8(pr),
+                    vld1q_u8(pr.add(16)),
+                    vld1q_u8(pr.add(32)),
+                    vld1q_u8(pr.add(48)),
+                );
+                let phi = uint8x16x4_t(
+                    vld1q_u8(pr.add(64)),
+                    vld1q_u8(pr.add(80)),
+                    vld1q_u8(pr.add(96)),
+                    vld1q_u8(pr.add(112)),
+                );
+                const P2: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+                const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+                const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                let (p2, bw) = (vld1q_u8(P2.as_ptr()), vld1q_u8(BW.as_ptr()));
+                let (k64, k7, k8) = (vdupq_n_u8(64), vdupq_n_u8(7), vdupq_n_u16(8));
+                let mut pos = vld1q_u16(IO.as_ptr());
+                let rb = s.rbuf.as_ptr();
+                let mut b = 0usize;
+                while b < nrow {
+                    let buf = rb.add(b);
+                    let a0 = vld1q_u8(buf);
+                    let a1 = vld1q_u8(buf.add(1));
+                    let a2 = vld1q_u8(buf.add(2));
+                    let a3 = vld1q_u8(buf.add(3));
+                    let a4 = vld1q_u8(buf.add(4));
+                    // code & 255 = a1 a2 a3 a4 (2 bits each), code >> 8 = a0
+                    let lo = vsliq_n_u8::<6>(vsliq_n_u8::<4>(vsliq_n_u8::<2>(a4, a3), a2), a1);
+                    let idx = vsraq_n_u8::<3>(vshlq_n_u8::<5>(a0), lo); // code >> 3
+                                                                        // idx >= 64 wraps to >= 192 under the subtraction for idx < 64, which TBX leaves
+                    let byte = vqtbx4q_u8(vqtbl4q_u8(plo, idx), phi, vsubq_u8(idx, k64));
+                    let hit = vtstq_u8(byte, vqtbl1q_u8(p2, vandq_u8(lo, k7)));
+                    let mut m = vandq_u8(hit, bw);
+                    m = vpaddq_u8(m, m);
+                    m = vpaddq_u8(m, m);
+                    m = vpaddq_u8(m, m);
+                    let mut m16 = u32::from(vgetq_lane_u16::<0>(vreinterpretq_u16_u8(m)));
+                    if b + 16 > nrow {
+                        m16 &= (1u32 << (nrow - b)) - 1;
+                    }
+                    let c0 = vreinterpretq_u16_u8(vzip1q_u8(lo, a0));
+                    let c1 = vreinterpretq_u16_u8(vzip2q_u8(lo, a0));
+                    let (ml, mh) = (m16 & 0xFF, m16 >> 8);
+                    let at = pack(&mut s.hrow, np, pos, ml);
+                    pack(&mut s.hcode, np, c0, ml);
+                    let pos8 = vaddq_u16(pos, k8);
+                    np = pack(&mut s.hrow, at, pos8, mh);
+                    pack(&mut s.hcode, at, c1, mh);
+                    pos = vaddq_u16(pos8, k8);
+                    b += 16;
                 }
             }
-        }
-        let nhits = np + vaddvq_u32(extra) as usize;
-        s.nhits = nhits;
-        if nhits > max_hits {
-            return None;
-        }
-        // Early fail: no interval can beat `base + a * nhits - c` (see the scalar counter).
-        if p.base() + p.a * nhits as i32 - p.c < p.minsc {
-            return Some(nd);
-        }
-        // Zeroed only now: the returns above leave no diagonal occupied, and `cnt`/`minrow` are
-        // read only under an `occ_bits` bit.
-        s.cnt.clear();
-        s.cnt.resize(span, 0);
-        if s.minrow.len() < span {
-            s.minrow.resize(span, 0);
-        }
-        // ---- 5. layer 1's runs, last to first: rows descend, so the last store to `minrow[d]`
-        //      is the diagonal's earliest row. Then the repeated codes' other occurrences ----
-        s.rb_idx[nb] = np as u16;
-        {
-            // Unchecked: every `d` is a diagonal below `nd`, and `cnt` and `minrow` span the
-            // rounded-up `nd`; `rb_idx` holds `nb + 1` entries.
-            let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
-            let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
-            for x in (0..nb).rev() {
-                let d = *bd.add(x) as usize;
-                *cnt.add(d) += *bi.add(x + 1) - *bi.add(x);
-                *minrow.add(d) = *br.add(x);
+            if np == 0 {
+                return Some(nd);
             }
-        }
-        // ---- Layers >= 2: layer L holds each row whose code occurs at least L times, with its
-        //      L-th latest occurrence. Within a layer, rows still ascend, so runs collapse as in
-        //      layer 1; `minrow` takes the min. The next layer (rows whose chain continues) is
-        //      packed in the same pass ----
-        let nxt = s.nxt.as_ptr();
-        // `nxt` of four query positions (past the list's end the lanes are stale, masked to stay
-        // in `nxt`, whose QCAP entries cover every query position).
-        let nxt4 = |j: *const u16| -> u64 {
-            let x = (j as *const u64).read_unaligned();
-            let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
-            e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
-        };
-        // Under a relation `js` holds entries: position `ent_j[e]`, next `ent_nxt[e]`. Past the
-        // list's end the lanes are stale, clamped to stay in the entry arrays.
-        let (ej, en) = (s.ent_j.as_ptr(), s.ent_nxt.as_ptr());
-        let elast = s.ent_j.len().saturating_sub(1) as u64;
-        let gather4 = |a: *const i16, e: *const u16| -> u64 {
-            let x = (e as *const u64).read_unaligned();
-            let g = |sh: u32| u64::from(*a.add(((x >> sh) & 0xFFFF).min(elast) as usize) as u16);
-            g(0) | g(16) << 16 | g(32) << 32 | g(48) << 48
-        };
-        if rel.is_some() {
-            for x in 0..nm {
-                s.mj[x] = s.ent_nxt[s.ehead[s.mj[x] as usize] as usize] as u16;
+            // Every hit row holds at least one hit, so the gate can already refuse: the densest jobs
+            // then skip layer 1, their most expensive part.
+            if np > max_hits {
+                return None;
             }
-        } else {
-            for x in 0..nm {
-                s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
-            }
-        }
-        let mut n = nm;
-        grow(&mut s.hrow, n + 16);
-        grow(&mut s.hcode, n + 16);
-        let (mut rows, mut js) = (std::mem::take(&mut s.mrow), std::mem::take(&mut s.mj));
-        let (mut rows2, mut js2) = (std::mem::take(&mut s.hrow), std::mem::take(&mut s.hcode));
-        {
-            const WL: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
-            const WH: [u16; 8] = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
-            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-            let (wl, wh) = (vld1q_u16(WL.as_ptr()), vld1q_u16(WH.as_ptr()));
-            let (k8, one) = (vdupq_n_u16(8), vdupq_n_u16(1));
-            let koff = vdupq_n_u16((off + K - 1) as u16);
-            while n > 0 {
-                let vn = vdupq_n_u16(n as u16);
+            // ---- 4. layer 1, 8 hit rows at a time: each row's hit at the latest query occurrence of
+            //      its code, d = row + K - 1 + off - j. A row continuing the previous row's run
+            //      (row + 1, same diagonal) is no boundary; boundaries are left-packed as (list index,
+            //      diagonal, row), rows of repeated codes as (row, j). The exact hit total comes out of
+            //      the same pass ----
+            grow(&mut s.rb_idx, np + 16);
+            grow(&mut s.rb_d, np + 16);
+            grow(&mut s.rb_r, np + 16);
+            grow(&mut s.mrow, np + 16);
+            grow(&mut s.mj, np + 16);
+            let (mut nb, mut nm) = (0usize, 0usize);
+            let mut extra = vdupq_n_u32(0);
+            {
+                const WL: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+                const WH: [u16; 8] = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+                const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                let (wl, wh) = (vld1q_u16(WL.as_ptr()), vld1q_u16(WH.as_ptr()));
                 let mut idx = vld1q_u16(IO.as_ptr());
+                let (k8, one) = (vdupq_n_u16(8), vdupq_n_u16(1));
+                let koff = vdupq_n_u16((off + K - 1) as u16);
+                let kpos = vdupq_n_u16(TAB_POS as u16);
+                let kmulti = vdupq_n_u16(TAB_MULTI as u16);
+                let vn = vdupq_n_u16(np as u16);
                 let (mut prev_r, mut prev_d) = (vdupq_n_u16(0), vdupq_n_u16(0xFFFF));
-                let (mut nb, mut n2) = (0usize, 0usize);
+                let tab = s.tab.as_ptr();
+                // Codes past `np` are stale but in range (< 1024); their lanes are masked.
+                let look4 = |c: *const u16| -> uint16x8_t {
+                    let x = (c as *const u64).read_unaligned();
+                    let e = |sh: u32| u64::from(*tab.add(((x >> sh) & 1023) as usize));
+                    let a = e(0) | e(16) << 32;
+                    let b = e(32) | e(48) << 32;
+                    vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(a), vcreate_u64(b)))
+                };
                 let mut k0 = 0usize;
-                while k0 < n {
-                    let r = vld1q_u16(rows.as_ptr().add(k0));
-                    let (e0, e1) = (js.as_ptr().add(k0), js.as_ptr().add(k0 + 4));
-                    let (j, jn) = if rel.is_some() {
-                        let j = vcombine_u64(
-                            vcreate_u64(gather4(ej, e0)),
-                            vcreate_u64(gather4(ej, e1)),
-                        );
-                        let jn = vcombine_u64(
-                            vcreate_u64(gather4(en, e0)),
-                            vcreate_u64(gather4(en, e1)),
-                        );
-                        (vreinterpretq_u16_u64(j), vreinterpretq_s16_u64(jn))
-                    } else {
-                        let jn = vcombine_u64(vcreate_u64(nxt4(e0)), vcreate_u64(nxt4(e1)));
-                        (vld1q_u16(e0), vreinterpretq_s16_u64(jn))
-                    };
+                while k0 < np {
+                    let r = vld1q_u16(s.hrow.as_ptr().add(k0));
+                    let e0 = look4(s.hcode.as_ptr().add(k0));
+                    let e1 = look4(s.hcode.as_ptr().add(k0 + 4));
+                    let (lo, occ) = (vuzp1q_u16(e0, e1), vuzp2q_u16(e0, e1));
+                    let j = vandq_u16(lo, kpos);
                     let d = vsubq_u16(vaddq_u16(r, koff), j);
                     let rp = vextq_u16::<7>(prev_r, r);
                     let dp = vextq_u16::<7>(prev_d, d);
                     (prev_r, prev_d) = (r, d);
                     let valid = vcltq_u16(idx, vn);
                     let cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one)), vceqq_u16(d, dp));
-                    let keep = vandq_u16(vcgezq_s16(jn), valid);
-                    let m = u32::from(vaddvq_u16(vorrq_u16(
-                        vandq_u16(vbicq_u16(valid, cont), wl),
-                        vandq_u16(keep, wh),
-                    )));
-                    let (mb, mk) = (m & 0xFF, m >> 8);
+                    let bd = vbicq_u16(valid, cont);
+                    let mu = vandq_u16(vtstq_u16(lo, kmulti), valid);
+                    extra = vpadalq_u16(extra, vandq_u16(vsubq_u16(occ, one), valid));
+                    let m = u32::from(vaddvq_u16(vorrq_u16(vandq_u16(bd, wl), vandq_u16(mu, wh))));
+                    let (mb, mm) = (m & 0xFF, m >> 8);
                     pack(&mut s.rb_idx, nb, idx, mb);
                     pack(&mut s.rb_d, nb, d, mb);
                     nb = pack(&mut s.rb_r, nb, r, mb);
-                    pack(&mut rows2, n2, r, mk);
-                    n2 = pack(&mut js2, n2, vreinterpretq_u16_s16(jn), mk);
+                    pack(&mut s.mrow, nm, r, mm);
+                    // Under a relation the code: its entry chain starts at `ehead` (below).
+                    let mv = if rel.is_some() {
+                        vld1q_u16(s.hcode.as_ptr().add(k0))
+                    } else {
+                        j
+                    };
+                    nm = pack(&mut s.mj, nm, mv, mm);
                     idx = vaddq_u16(idx, k8);
                     k0 += 8;
+                    // Every 64 rows: the total only grows, so a passed gate is final (bwa-mem3 #718).
+                    if k0 & 63 == 0 && k0 < np && k0 + vaddvq_u32(extra) as usize > max_hits {
+                        return None;
+                    }
                 }
-                s.rb_idx[nb] = n as u16;
-                // Unchecked as in layer 1.
+            }
+            let nhits = np + vaddvq_u32(extra) as usize;
+            s.nhits = nhits;
+            if nhits > max_hits {
+                return None;
+            }
+            // Early fail: no interval can beat `base + a * nhits - c` (see the scalar counter).
+            if p.base() + p.a * nhits as i32 - p.c < p.minsc {
+                return Some(nd);
+            }
+            // Zeroed only now: the returns above leave no diagonal occupied, and `cnt`/`minrow` are
+            // read only under an `occ_bits` bit.
+            s.cnt.clear();
+            s.cnt.resize(span, 0);
+            if s.minrow.len() < span {
+                s.minrow.resize(span, 0);
+            }
+            // ---- 5. layer 1's runs, last to first: rows descend, so the last store to `minrow[d]`
+            //      is the diagonal's earliest row. Then the repeated codes' other occurrences ----
+            s.rb_idx[nb] = np as u16;
+            {
+                // Unchecked: every `d` is a diagonal below `nd`, and `cnt` and `minrow` span the
+                // rounded-up `nd`; `rb_idx` holds `nb + 1` entries.
                 let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
                 let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
-                for x in 0..nb {
-                    let (d, row) = (*bd.add(x) as usize, *br.add(x));
-                    let c = *cnt.add(d);
-                    // A stale `minrow` (c == 0) ORed to u16::MAX: one `min`, no branch. Written
-                    // as `if`, LLVM sank the load into a branch on `c`, mispredicted per run.
-                    let stale = u16::from(c == 0).wrapping_neg();
-                    *minrow.add(d) = (*minrow.add(d) | stale).min(row);
-                    *cnt.add(d) = c + *bi.add(x + 1) - *bi.add(x);
+                for x in (0..nb).rev() {
+                    let d = *bd.add(x) as usize;
+                    *cnt.add(d) += *bi.add(x + 1) - *bi.add(x);
+                    *minrow.add(d) = *br.add(x);
                 }
-                n = n2;
-                std::mem::swap(&mut rows, &mut rows2);
-                std::mem::swap(&mut js, &mut js2);
             }
+            // ---- Layers >= 2: layer L holds each row whose code occurs at least L times, with its
+            //      L-th latest occurrence. Within a layer, rows still ascend, so runs collapse as in
+            //      layer 1; `minrow` takes the min. The next layer (rows whose chain continues) is
+            //      packed in the same pass ----
+            let nxt = s.nxt.as_ptr();
+            // `nxt` of four query positions (past the list's end the lanes are stale, masked to stay
+            // in `nxt`, whose QCAP entries cover every query position).
+            let nxt4 = |j: *const u16| -> u64 {
+                let x = (j as *const u64).read_unaligned();
+                let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
+                e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
+            };
+            // Under a relation `js` holds entries: position `ent_j[e]`, next `ent_nxt[e]`. Past the
+            // list's end the lanes are stale, clamped to stay in the entry arrays.
+            let (ej, en) = (s.ent_j.as_ptr(), s.ent_nxt.as_ptr());
+            let elast = s.ent_j.len().saturating_sub(1) as u64;
+            let gather4 = |a: *const i16, e: *const u16| -> u64 {
+                let x = (e as *const u64).read_unaligned();
+                let g =
+                    |sh: u32| u64::from(*a.add(((x >> sh) & 0xFFFF).min(elast) as usize) as u16);
+                g(0) | g(16) << 16 | g(32) << 32 | g(48) << 48
+            };
+            if rel.is_some() {
+                for x in 0..nm {
+                    s.mj[x] = s.ent_nxt[s.ehead[s.mj[x] as usize] as usize] as u16;
+                }
+            } else {
+                for x in 0..nm {
+                    s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+                }
+            }
+            let mut n = nm;
+            grow(&mut s.hrow, n + 16);
+            grow(&mut s.hcode, n + 16);
+            let (mut rows, mut js) = (std::mem::take(&mut s.mrow), std::mem::take(&mut s.mj));
+            let (mut rows2, mut js2) = (std::mem::take(&mut s.hrow), std::mem::take(&mut s.hcode));
+            {
+                const WL: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+                const WH: [u16; 8] = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+                const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                let (wl, wh) = (vld1q_u16(WL.as_ptr()), vld1q_u16(WH.as_ptr()));
+                let (k8, one) = (vdupq_n_u16(8), vdupq_n_u16(1));
+                let koff = vdupq_n_u16((off + K - 1) as u16);
+                while n > 0 {
+                    let vn = vdupq_n_u16(n as u16);
+                    let mut idx = vld1q_u16(IO.as_ptr());
+                    let (mut prev_r, mut prev_d) = (vdupq_n_u16(0), vdupq_n_u16(0xFFFF));
+                    let (mut nb, mut n2) = (0usize, 0usize);
+                    let mut k0 = 0usize;
+                    while k0 < n {
+                        let r = vld1q_u16(rows.as_ptr().add(k0));
+                        let (e0, e1) = (js.as_ptr().add(k0), js.as_ptr().add(k0 + 4));
+                        let (j, jn) = if rel.is_some() {
+                            let j = vcombine_u64(
+                                vcreate_u64(gather4(ej, e0)),
+                                vcreate_u64(gather4(ej, e1)),
+                            );
+                            let jn = vcombine_u64(
+                                vcreate_u64(gather4(en, e0)),
+                                vcreate_u64(gather4(en, e1)),
+                            );
+                            (vreinterpretq_u16_u64(j), vreinterpretq_s16_u64(jn))
+                        } else {
+                            let jn = vcombine_u64(vcreate_u64(nxt4(e0)), vcreate_u64(nxt4(e1)));
+                            (vld1q_u16(e0), vreinterpretq_s16_u64(jn))
+                        };
+                        let d = vsubq_u16(vaddq_u16(r, koff), j);
+                        let rp = vextq_u16::<7>(prev_r, r);
+                        let dp = vextq_u16::<7>(prev_d, d);
+                        (prev_r, prev_d) = (r, d);
+                        let valid = vcltq_u16(idx, vn);
+                        let cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one)), vceqq_u16(d, dp));
+                        let keep = vandq_u16(vcgezq_s16(jn), valid);
+                        let m = u32::from(vaddvq_u16(vorrq_u16(
+                            vandq_u16(vbicq_u16(valid, cont), wl),
+                            vandq_u16(keep, wh),
+                        )));
+                        let (mb, mk) = (m & 0xFF, m >> 8);
+                        pack(&mut s.rb_idx, nb, idx, mb);
+                        pack(&mut s.rb_d, nb, d, mb);
+                        nb = pack(&mut s.rb_r, nb, r, mb);
+                        pack(&mut rows2, n2, r, mk);
+                        n2 = pack(&mut js2, n2, vreinterpretq_u16_s16(jn), mk);
+                        idx = vaddq_u16(idx, k8);
+                        k0 += 8;
+                    }
+                    s.rb_idx[nb] = n as u16;
+                    // Unchecked as in layer 1.
+                    let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
+                    let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
+                    for x in 0..nb {
+                        let (d, row) = (*bd.add(x) as usize, *br.add(x));
+                        let c = *cnt.add(d);
+                        // A stale `minrow` (c == 0) ORed to u16::MAX: one `min`, no branch. Written
+                        // as `if`, LLVM sank the load into a branch on `c`, mispredicted per run.
+                        let stale = u16::from(c == 0).wrapping_neg();
+                        *minrow.add(d) = (*minrow.add(d) | stale).min(row);
+                        *cnt.add(d) = c + *bi.add(x + 1) - *bi.add(x);
+                    }
+                    n = n2;
+                    std::mem::swap(&mut rows, &mut rows2);
+                    std::mem::swap(&mut js, &mut js2);
+                }
+            }
+            (s.mrow, s.mj, s.hrow, s.hcode) = (rows, js, rows2, js2);
+            // `occ_bits` is derived from `cnt` only if the sparse scan runs (`occ_ready`).
+            s.occ_stale = true;
+            Some(nd)
         }
-        (s.mrow, s.mj, s.hrow, s.hcode) = (rows, js, rows2, js2);
-        // `occ_bits` is derived from `cnt` only if the sparse scan runs (`occ_ready`).
-        s.occ_stale = true;
-        Some(nd)
     }
 
     /// `occ_bits` from `cnt` in one pass, not per run: consecutive runs mostly land in one
@@ -1092,22 +1082,25 @@ mod neon {
     /// # Safety
     /// NEON; `cnt` spans `occ_bits.len() * 64` diagonals.
     pub(super) unsafe fn occ_from_cnt(s: &mut Scratch) {
-        const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-        let bw = vld1q_u8(BW.as_ptr());
-        let c = s.cnt.as_ptr();
-        for (w, word) in s.occ_bits.iter_mut().enumerate() {
-            let mut bits = 0u64;
-            for g in 0..4 {
-                let p = c.add(w * 64 + g * 16);
-                let (a, b) = (vld1q_u16(p), vld1q_u16(p.add(8)));
-                let m = vcombine_u8(vmovn_u16(vtstq_u16(a, a)), vmovn_u16(vtstq_u16(b, b)));
-                let mut x = vandq_u8(m, bw);
-                x = vpaddq_u8(x, x);
-                x = vpaddq_u8(x, x);
-                x = vpaddq_u8(x, x);
-                bits |= u64::from(vgetq_lane_u16::<0>(vreinterpretq_u16_u8(x))) << (16 * g);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let bw = vld1q_u8(BW.as_ptr());
+            let c = s.cnt.as_ptr();
+            for (w, word) in s.occ_bits.iter_mut().enumerate() {
+                let mut bits = 0u64;
+                for g in 0..4 {
+                    let p = c.add(w * 64 + g * 16);
+                    let (a, b) = (vld1q_u16(p), vld1q_u16(p.add(8)));
+                    let m = vcombine_u8(vmovn_u16(vtstq_u16(a, a)), vmovn_u16(vtstq_u16(b, b)));
+                    let mut x = vandq_u8(m, bw);
+                    x = vpaddq_u8(x, x);
+                    x = vpaddq_u8(x, x);
+                    x = vpaddq_u8(x, x);
+                    bits |= u64::from(vgetq_lane_u16::<0>(vreinterpretq_u16_u8(x))) << (16 * g);
+                }
+                *word = bits;
             }
-            *word = bits;
         }
     }
 }
@@ -1159,13 +1152,16 @@ mod sse {
     /// Writes 8 lanes: `out` needs 8 lanes of slack past the last packed one.
     #[inline(always)]
     unsafe fn pack(out: &mut [u16], at: usize, v: __m128i, m: u32) -> usize {
-        debug_assert!(at + 8 <= out.len());
-        let sh = _mm_loadu_si128(SHUF[m as usize].as_ptr() as *const __m128i);
-        _mm_storeu_si128(
-            out.as_mut_ptr().add(at) as *mut __m128i,
-            _mm_shuffle_epi8(v, sh),
-        );
-        at + PC[m as usize] as usize
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            debug_assert!(at + 8 <= out.len());
+            let sh = _mm_loadu_si128(SHUF[m as usize].as_ptr() as *const __m128i);
+            _mm_storeu_si128(
+                out.as_mut_ptr().add(at) as *mut __m128i,
+                _mm_shuffle_epi8(v, sh),
+            );
+            at + PC[m as usize] as usize
+        }
     }
 
     #[inline(always)]
@@ -1177,19 +1173,22 @@ mod sse {
 
     #[inline(always)]
     unsafe fn ld(p: *const u8) -> __m128i {
-        _mm_loadu_si128(p as *const __m128i)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm_loadu_si128(p as *const __m128i) }
     }
 
     /// Eight u16 lanes from two u64s (low lanes first).
     #[inline(always)]
     unsafe fn from2(a: u64, b: u64) -> __m128i {
-        _mm_set_epi64x(b as i64, a as i64)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm_set_epi64x(b as i64, a as i64) }
     }
 
     /// Lanes `(prev[7], cur[0..7])`, NEON's `vextq_u16::<7>(prev, cur)`.
     #[inline(always)]
     unsafe fn shift_in(prev: __m128i, cur: __m128i) -> __m128i {
-        _mm_alignr_epi8::<14>(cur, prev)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm_alignr_epi8::<14>(cur, prev) }
     }
 
     /// See [`super::neon::count_hits`]; same results, under a relation too (the same entry
@@ -1206,266 +1205,154 @@ mod sse {
         max_hits: usize,
         rel: Option<(u8, u8)>,
     ) -> Option<usize> {
-        const K: usize = 5;
-        let (len1, len2) = (t.len(), q.len());
-        match rel {
-            Some(r) => s.load_query_rel(q, K, r),
-            None => s.load_query(q, K),
-        }
-        // ---- 1. N check while copying the window into a zero-padded buffer ----
-        if s.rbuf.len() < len1 + 32 {
-            s.rbuf.resize(len1 + 32, 0);
-        }
-        let rb = s.rbuf.as_mut_ptr();
-        let mut ov = _mm_setzero_si128();
-        // Through an opaque zero, or the loop becomes a `memcpy` call (see the NEON version).
-        let z = std::hint::black_box(_mm_setzero_si128());
-        let mut i = 0;
-        while i + 16 <= len1 {
-            let x = ld(t.as_ptr().add(i));
-            ov = _mm_or_si128(ov, x);
-            _mm_storeu_si128(rb.add(i) as *mut __m128i, _mm_or_si128(x, z));
-            i += 16;
-        }
-        let mut tail = 0u8;
-        while i < len1 {
-            tail |= t[i];
-            *rb.add(i) = t[i];
-            i += 1;
-        }
-        _mm_storeu_si128(rb.add(len1) as *mut __m128i, _mm_setzero_si128());
-        _mm_storeu_si128(rb.add(len1 + 16) as *mut __m128i, _mm_setzero_si128());
-        if s.q_has_n || _mm_testz_si128(ov, _mm_set1_epi8(!3)) == 0 || tail & !3 != 0 {
-            return None;
-        }
-        let off = len2.div_ceil(16) * 16;
-        let nd = len1 + off + 1;
-        let nw = nd.div_ceil(64);
-        let span = nw * 64;
-        s.occ_bits.clear();
-        s.occ_bits.resize(nw, 0);
-        s.occ_stale = false;
-        // ---- 3. hit rows, 16 at a time ----
-        let nrow = len1 + 1 - K;
-        grow(&mut s.hrow, nrow + 16);
-        grow(&mut s.hcode, nrow + 16);
-        let mut np = 0usize;
-        {
-            let pr = s.pres.as_ptr();
-            let pt: [__m128i; 8] = std::array::from_fn(|x| ld(pr.add(16 * x)));
-            const P2: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
-            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-            let p2 = ld(P2.as_ptr());
-            let (k7, k1f, k8) = (_mm_set1_epi8(7), _mm_set1_epi8(0x1F), _mm_set1_epi16(8));
-            let mut pos = ld(IO.as_ptr() as *const u8);
-            let rb = s.rbuf.as_ptr();
-            let mut b = 0usize;
-            while b < nrow {
-                let buf = rb.add(b);
-                let a0 = ld(buf);
-                let (a1, a2, a3, a4) = (
-                    ld(buf.add(1)),
-                    ld(buf.add(2)),
-                    ld(buf.add(3)),
-                    ld(buf.add(4)),
-                );
-                // Bases are 0..=3, so the 16-bit shifts never carry across bytes.
-                let lo = _mm_or_si128(
-                    _mm_or_si128(_mm_slli_epi16::<6>(a1), _mm_slli_epi16::<4>(a2)),
-                    _mm_or_si128(_mm_slli_epi16::<2>(a3), a4),
-                );
-                // code >> 3 = a0 << 5 | lo >> 3, below 128
-                let idx = _mm_or_si128(
-                    _mm_slli_epi16::<5>(a0),
-                    _mm_and_si128(_mm_srli_epi16::<3>(lo), k1f),
-                );
-                // PSHUFB reads index bits 0-3 (bit 7 is clear); bits 4, 5, 6 pick the table,
-                // each moved to bit 7 for BLENDV (the 16-bit shifts only spill into lower bits).
-                let t: [__m128i; 8] = std::array::from_fn(|x| _mm_shuffle_epi8(pt[x], idx));
-                let (s4, s5, s6) = (
-                    _mm_slli_epi16::<3>(idx),
-                    _mm_slli_epi16::<2>(idx),
-                    _mm_slli_epi16::<1>(idx),
-                );
-                let u0 = _mm_blendv_epi8(t[0], t[1], s4);
-                let u1 = _mm_blendv_epi8(t[2], t[3], s4);
-                let u2 = _mm_blendv_epi8(t[4], t[5], s4);
-                let u3 = _mm_blendv_epi8(t[6], t[7], s4);
-                let v0 = _mm_blendv_epi8(u0, u1, s5);
-                let v1 = _mm_blendv_epi8(u2, u3, s5);
-                let byte = _mm_blendv_epi8(v0, v1, s6);
-                let bit = _mm_shuffle_epi8(p2, _mm_and_si128(lo, k7));
-                let hit = _mm_cmpeq_epi8(_mm_and_si128(byte, bit), bit);
-                let mut m16 = _mm_movemask_epi8(hit) as u32;
-                if b + 16 > nrow {
-                    m16 &= (1u32 << (nrow - b)) - 1;
-                }
-                let c0 = _mm_unpacklo_epi8(lo, a0);
-                let c1 = _mm_unpackhi_epi8(lo, a0);
-                let (ml, mh) = (m16 & 0xFF, m16 >> 8);
-                let at = pack(&mut s.hrow, np, pos, ml);
-                pack(&mut s.hcode, np, c0, ml);
-                let pos8 = _mm_add_epi16(pos, k8);
-                np = pack(&mut s.hrow, at, pos8, mh);
-                pack(&mut s.hcode, at, c1, mh);
-                pos = _mm_add_epi16(pos8, k8);
-                b += 16;
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            const K: usize = 5;
+            let (len1, len2) = (t.len(), q.len());
+            match rel {
+                Some(r) => s.load_query_rel(q, K, r),
+                None => s.load_query(q, K),
             }
-        }
-        if np == 0 {
-            return Some(nd);
-        }
-        if np > max_hits {
-            return None;
-        }
-        // ---- 4. layer 1, 8 hit rows at a time (see the NEON counter) ----
-        grow(&mut s.rb_idx, np + 16);
-        grow(&mut s.rb_d, np + 16);
-        grow(&mut s.rb_r, np + 16);
-        grow(&mut s.mrow, np + 16);
-        grow(&mut s.mj, np + 16);
-        let (mut nb, mut nm) = (0usize, 0usize);
-        let mut extra = _mm_setzero_si128();
-        {
-            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-            let mut idx = ld(IO.as_ptr() as *const u8);
-            let (k8, one) = (_mm_set1_epi16(8), _mm_set1_epi16(1));
-            let koff = _mm_set1_epi16((off + K - 1) as i16);
-            let kpos = _mm_set1_epi16(TAB_POS as i16);
-            let kmulti = _mm_set1_epi16(TAB_MULTI as u16 as i16);
-            let low16 = _mm_set1_epi32(0xFFFF);
-            // Below 32768 (np <= WCAP), so the signed compare is the unsigned one.
-            let vn = _mm_set1_epi16(np as i16);
-            let (mut prev_r, mut prev_d) = (_mm_setzero_si128(), _mm_set1_epi16(-1));
-            let tab = s.tab.as_ptr();
-            // Codes past `np` are stale but in range (< 1024); their lanes are masked.
-            let look4 = |c: *const u16| -> __m128i {
-                let x = (c as *const u64).read_unaligned();
-                let e = |sh: u32| u64::from(*tab.add(((x >> sh) & 1023) as usize));
-                from2(e(0) | e(16) << 32, e(32) | e(48) << 32)
-            };
-            let mut k0 = 0usize;
-            while k0 < np {
-                let r = ld(s.hrow.as_ptr().add(k0) as *const u8);
-                let e0 = look4(s.hcode.as_ptr().add(k0));
-                let e1 = look4(s.hcode.as_ptr().add(k0 + 4));
-                let lo = _mm_packus_epi32(_mm_and_si128(e0, low16), _mm_and_si128(e1, low16));
-                let occ = _mm_packus_epi32(_mm_srli_epi32::<16>(e0), _mm_srli_epi32::<16>(e1));
-                let j = _mm_and_si128(lo, kpos);
-                let d = _mm_sub_epi16(_mm_add_epi16(r, koff), j);
-                let rp = shift_in(prev_r, r);
-                let dp = shift_in(prev_d, d);
-                (prev_r, prev_d) = (r, d);
-                let valid = _mm_cmplt_epi16(idx, vn);
-                let cont = _mm_and_si128(
-                    _mm_cmpeq_epi16(r, _mm_add_epi16(rp, one)),
-                    _mm_cmpeq_epi16(d, dp),
-                );
-                let bd = _mm_andnot_si128(cont, valid);
-                let mu = _mm_and_si128(_mm_cmpeq_epi16(_mm_and_si128(lo, kmulti), kmulti), valid);
-                extra = _mm_add_epi32(
-                    extra,
-                    _mm_madd_epi16(_mm_and_si128(_mm_sub_epi16(occ, one), valid), one),
-                );
-                let m = _mm_movemask_epi8(_mm_packs_epi16(bd, mu)) as u32;
-                let (mb, mm) = (m & 0xFF, m >> 8);
-                pack(&mut s.rb_idx, nb, idx, mb);
-                pack(&mut s.rb_d, nb, d, mb);
-                nb = pack(&mut s.rb_r, nb, r, mb);
-                pack(&mut s.mrow, nm, r, mm);
-                // Under a relation the code: its entry chain starts at `ehead` (below).
-                let mv = if rel.is_some() {
-                    ld(s.hcode.as_ptr().add(k0) as *const u8)
-                } else {
-                    j
-                };
-                nm = pack(&mut s.mj, nm, mv, mm);
-                idx = _mm_add_epi16(idx, k8);
-                k0 += 8;
-                // Every 64 rows: the total only grows, so a passed gate is final (bwa-mem3 #718).
-                if k0 & 63 == 0 && k0 < np {
-                    let ex: [u32; 4] = std::mem::transmute(extra);
-                    if k0 + ex.iter().map(|&x| x as usize).sum::<usize>() > max_hits {
-                        return None;
+            // ---- 1. N check while copying the window into a zero-padded buffer ----
+            if s.rbuf.len() < len1 + 32 {
+                s.rbuf.resize(len1 + 32, 0);
+            }
+            let rb = s.rbuf.as_mut_ptr();
+            let mut ov = _mm_setzero_si128();
+            // Through an opaque zero, or the loop becomes a `memcpy` call (see the NEON version).
+            let z = std::hint::black_box(_mm_setzero_si128());
+            let mut i = 0;
+            while i + 16 <= len1 {
+                let x = ld(t.as_ptr().add(i));
+                ov = _mm_or_si128(ov, x);
+                _mm_storeu_si128(rb.add(i) as *mut __m128i, _mm_or_si128(x, z));
+                i += 16;
+            }
+            let mut tail = 0u8;
+            while i < len1 {
+                tail |= t[i];
+                *rb.add(i) = t[i];
+                i += 1;
+            }
+            _mm_storeu_si128(rb.add(len1) as *mut __m128i, _mm_setzero_si128());
+            _mm_storeu_si128(rb.add(len1 + 16) as *mut __m128i, _mm_setzero_si128());
+            if s.q_has_n || _mm_testz_si128(ov, _mm_set1_epi8(!3)) == 0 || tail & !3 != 0 {
+                return None;
+            }
+            let off = len2.div_ceil(16) * 16;
+            let nd = len1 + off + 1;
+            let nw = nd.div_ceil(64);
+            let span = nw * 64;
+            s.occ_bits.clear();
+            s.occ_bits.resize(nw, 0);
+            s.occ_stale = false;
+            // ---- 3. hit rows, 16 at a time ----
+            let nrow = len1 + 1 - K;
+            grow(&mut s.hrow, nrow + 16);
+            grow(&mut s.hcode, nrow + 16);
+            let mut np = 0usize;
+            {
+                let pr = s.pres.as_ptr();
+                let pt: [__m128i; 8] = std::array::from_fn(|x| ld(pr.add(16 * x)));
+                const P2: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+                const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                let p2 = ld(P2.as_ptr());
+                let (k7, k1f, k8) = (_mm_set1_epi8(7), _mm_set1_epi8(0x1F), _mm_set1_epi16(8));
+                let mut pos = ld(IO.as_ptr() as *const u8);
+                let rb = s.rbuf.as_ptr();
+                let mut b = 0usize;
+                while b < nrow {
+                    let buf = rb.add(b);
+                    let a0 = ld(buf);
+                    let (a1, a2, a3, a4) = (
+                        ld(buf.add(1)),
+                        ld(buf.add(2)),
+                        ld(buf.add(3)),
+                        ld(buf.add(4)),
+                    );
+                    // Bases are 0..=3, so the 16-bit shifts never carry across bytes.
+                    let lo = _mm_or_si128(
+                        _mm_or_si128(_mm_slli_epi16::<6>(a1), _mm_slli_epi16::<4>(a2)),
+                        _mm_or_si128(_mm_slli_epi16::<2>(a3), a4),
+                    );
+                    // code >> 3 = a0 << 5 | lo >> 3, below 128
+                    let idx = _mm_or_si128(
+                        _mm_slli_epi16::<5>(a0),
+                        _mm_and_si128(_mm_srli_epi16::<3>(lo), k1f),
+                    );
+                    // PSHUFB reads index bits 0-3 (bit 7 is clear); bits 4, 5, 6 pick the table,
+                    // each moved to bit 7 for BLENDV (the 16-bit shifts only spill into lower bits).
+                    let t: [__m128i; 8] = std::array::from_fn(|x| _mm_shuffle_epi8(pt[x], idx));
+                    let (s4, s5, s6) = (
+                        _mm_slli_epi16::<3>(idx),
+                        _mm_slli_epi16::<2>(idx),
+                        _mm_slli_epi16::<1>(idx),
+                    );
+                    let u0 = _mm_blendv_epi8(t[0], t[1], s4);
+                    let u1 = _mm_blendv_epi8(t[2], t[3], s4);
+                    let u2 = _mm_blendv_epi8(t[4], t[5], s4);
+                    let u3 = _mm_blendv_epi8(t[6], t[7], s4);
+                    let v0 = _mm_blendv_epi8(u0, u1, s5);
+                    let v1 = _mm_blendv_epi8(u2, u3, s5);
+                    let byte = _mm_blendv_epi8(v0, v1, s6);
+                    let bit = _mm_shuffle_epi8(p2, _mm_and_si128(lo, k7));
+                    let hit = _mm_cmpeq_epi8(_mm_and_si128(byte, bit), bit);
+                    let mut m16 = _mm_movemask_epi8(hit) as u32;
+                    if b + 16 > nrow {
+                        m16 &= (1u32 << (nrow - b)) - 1;
                     }
+                    let c0 = _mm_unpacklo_epi8(lo, a0);
+                    let c1 = _mm_unpackhi_epi8(lo, a0);
+                    let (ml, mh) = (m16 & 0xFF, m16 >> 8);
+                    let at = pack(&mut s.hrow, np, pos, ml);
+                    pack(&mut s.hcode, np, c0, ml);
+                    let pos8 = _mm_add_epi16(pos, k8);
+                    np = pack(&mut s.hrow, at, pos8, mh);
+                    pack(&mut s.hcode, at, c1, mh);
+                    pos = _mm_add_epi16(pos8, k8);
+                    b += 16;
                 }
             }
-        }
-        let ex: [u32; 4] = std::mem::transmute(extra);
-        let nhits = np + ex.iter().map(|&x| x as usize).sum::<usize>();
-        s.nhits = nhits;
-        if nhits > max_hits {
-            return None;
-        }
-        if p.base() + p.a * nhits as i32 - p.c < p.minsc {
-            return Some(nd);
-        }
-        s.cnt.clear();
-        s.cnt.resize(span, 0);
-        if s.minrow.len() < span {
-            s.minrow.resize(span, 0);
-        }
-        // ---- 5. layer 1's runs, last to first; then the repeated codes' other occurrences ----
-        s.rb_idx[nb] = np as u16;
-        {
-            let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
-            let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
-            for x in (0..nb).rev() {
-                let d = *bd.add(x) as usize;
-                *cnt.add(d) += *bi.add(x + 1) - *bi.add(x);
-                *minrow.add(d) = *br.add(x);
+            if np == 0 {
+                return Some(nd);
             }
-        }
-        let nxt = s.nxt.as_ptr();
-        let nxt4 = |j: *const u16| -> u64 {
-            let x = (j as *const u64).read_unaligned();
-            let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
-            e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
-        };
-        // Under a relation `js` holds entries: position `ent_j[e]`, next `ent_nxt[e]`. Past the
-        // list's end the lanes are stale, clamped to stay in the entry arrays.
-        let (ej, en) = (s.ent_j.as_ptr(), s.ent_nxt.as_ptr());
-        let elast = s.ent_j.len().saturating_sub(1) as u64;
-        let gather4 = |a: *const i16, e: *const u16| -> u64 {
-            let x = (e as *const u64).read_unaligned();
-            let g = |sh: u32| u64::from(*a.add(((x >> sh) & 0xFFFF).min(elast) as usize) as u16);
-            g(0) | g(16) << 16 | g(32) << 32 | g(48) << 48
-        };
-        if rel.is_some() {
-            for x in 0..nm {
-                s.mj[x] = s.ent_nxt[s.ehead[s.mj[x] as usize] as usize] as u16;
+            if np > max_hits {
+                return None;
             }
-        } else {
-            for x in 0..nm {
-                s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
-            }
-        }
-        let mut n = nm;
-        grow(&mut s.hrow, n + 16);
-        grow(&mut s.hcode, n + 16);
-        let (mut rows, mut js) = (std::mem::take(&mut s.mrow), std::mem::take(&mut s.mj));
-        let (mut rows2, mut js2) = (std::mem::take(&mut s.hrow), std::mem::take(&mut s.hcode));
-        {
-            const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-            let (k8, one, neg1) = (_mm_set1_epi16(8), _mm_set1_epi16(1), _mm_set1_epi16(-1));
-            let koff = _mm_set1_epi16((off + K - 1) as i16);
-            while n > 0 {
-                let vn = _mm_set1_epi16(n as i16);
+            // ---- 4. layer 1, 8 hit rows at a time (see the NEON counter) ----
+            grow(&mut s.rb_idx, np + 16);
+            grow(&mut s.rb_d, np + 16);
+            grow(&mut s.rb_r, np + 16);
+            grow(&mut s.mrow, np + 16);
+            grow(&mut s.mj, np + 16);
+            let (mut nb, mut nm) = (0usize, 0usize);
+            let mut extra = _mm_setzero_si128();
+            {
+                const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
                 let mut idx = ld(IO.as_ptr() as *const u8);
+                let (k8, one) = (_mm_set1_epi16(8), _mm_set1_epi16(1));
+                let koff = _mm_set1_epi16((off + K - 1) as i16);
+                let kpos = _mm_set1_epi16(TAB_POS as i16);
+                let kmulti = _mm_set1_epi16(TAB_MULTI as u16 as i16);
+                let low16 = _mm_set1_epi32(0xFFFF);
+                // Below 32768 (np <= WCAP), so the signed compare is the unsigned one.
+                let vn = _mm_set1_epi16(np as i16);
                 let (mut prev_r, mut prev_d) = (_mm_setzero_si128(), _mm_set1_epi16(-1));
-                let (mut nb, mut n2) = (0usize, 0usize);
+                let tab = s.tab.as_ptr();
+                // Codes past `np` are stale but in range (< 1024); their lanes are masked.
+                let look4 = |c: *const u16| -> __m128i {
+                    let x = (c as *const u64).read_unaligned();
+                    let e = |sh: u32| u64::from(*tab.add(((x >> sh) & 1023) as usize));
+                    from2(e(0) | e(16) << 32, e(32) | e(48) << 32)
+                };
                 let mut k0 = 0usize;
-                while k0 < n {
-                    let r = ld(rows.as_ptr().add(k0) as *const u8);
-                    let (e0, e1) = (js.as_ptr().add(k0), js.as_ptr().add(k0 + 4));
-                    let (j, jn) = if rel.is_some() {
-                        (
-                            from2(gather4(ej, e0), gather4(ej, e1)),
-                            from2(gather4(en, e0), gather4(en, e1)),
-                        )
-                    } else {
-                        (ld(e0 as *const u8), from2(nxt4(e0), nxt4(e1)))
-                    };
+                while k0 < np {
+                    let r = ld(s.hrow.as_ptr().add(k0) as *const u8);
+                    let e0 = look4(s.hcode.as_ptr().add(k0));
+                    let e1 = look4(s.hcode.as_ptr().add(k0 + 4));
+                    let lo = _mm_packus_epi32(_mm_and_si128(e0, low16), _mm_and_si128(e1, low16));
+                    let occ = _mm_packus_epi32(_mm_srli_epi32::<16>(e0), _mm_srli_epi32::<16>(e1));
+                    let j = _mm_and_si128(lo, kpos);
                     let d = _mm_sub_epi16(_mm_add_epi16(r, koff), j);
                     let rp = shift_in(prev_r, r);
                     let dp = shift_in(prev_d, d);
@@ -1475,36 +1362,154 @@ mod sse {
                         _mm_cmpeq_epi16(r, _mm_add_epi16(rp, one)),
                         _mm_cmpeq_epi16(d, dp),
                     );
-                    let keep = _mm_and_si128(_mm_cmpgt_epi16(jn, neg1), valid);
-                    let m = _mm_movemask_epi8(_mm_packs_epi16(_mm_andnot_si128(cont, valid), keep))
-                        as u32;
-                    let (mb, mk) = (m & 0xFF, m >> 8);
+                    let bd = _mm_andnot_si128(cont, valid);
+                    let mu =
+                        _mm_and_si128(_mm_cmpeq_epi16(_mm_and_si128(lo, kmulti), kmulti), valid);
+                    extra = _mm_add_epi32(
+                        extra,
+                        _mm_madd_epi16(_mm_and_si128(_mm_sub_epi16(occ, one), valid), one),
+                    );
+                    let m = _mm_movemask_epi8(_mm_packs_epi16(bd, mu)) as u32;
+                    let (mb, mm) = (m & 0xFF, m >> 8);
                     pack(&mut s.rb_idx, nb, idx, mb);
                     pack(&mut s.rb_d, nb, d, mb);
                     nb = pack(&mut s.rb_r, nb, r, mb);
-                    pack(&mut rows2, n2, r, mk);
-                    n2 = pack(&mut js2, n2, jn, mk);
+                    pack(&mut s.mrow, nm, r, mm);
+                    // Under a relation the code: its entry chain starts at `ehead` (below).
+                    let mv = if rel.is_some() {
+                        ld(s.hcode.as_ptr().add(k0) as *const u8)
+                    } else {
+                        j
+                    };
+                    nm = pack(&mut s.mj, nm, mv, mm);
                     idx = _mm_add_epi16(idx, k8);
                     k0 += 8;
+                    // Every 64 rows: the total only grows, so a passed gate is final (bwa-mem3 #718).
+                    if k0 & 63 == 0 && k0 < np {
+                        let ex: [u32; 4] = std::mem::transmute(extra);
+                        if k0 + ex.iter().map(|&x| x as usize).sum::<usize>() > max_hits {
+                            return None;
+                        }
+                    }
                 }
-                s.rb_idx[nb] = n as u16;
+            }
+            let ex: [u32; 4] = std::mem::transmute(extra);
+            let nhits = np + ex.iter().map(|&x| x as usize).sum::<usize>();
+            s.nhits = nhits;
+            if nhits > max_hits {
+                return None;
+            }
+            if p.base() + p.a * nhits as i32 - p.c < p.minsc {
+                return Some(nd);
+            }
+            s.cnt.clear();
+            s.cnt.resize(span, 0);
+            if s.minrow.len() < span {
+                s.minrow.resize(span, 0);
+            }
+            // ---- 5. layer 1's runs, last to first; then the repeated codes' other occurrences ----
+            s.rb_idx[nb] = np as u16;
+            {
                 let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
                 let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
-                for x in 0..nb {
-                    let (d, row) = (*bd.add(x) as usize, *br.add(x));
-                    let c = *cnt.add(d);
-                    let stale = u16::from(c == 0).wrapping_neg();
-                    *minrow.add(d) = (*minrow.add(d) | stale).min(row);
-                    *cnt.add(d) = c + *bi.add(x + 1) - *bi.add(x);
+                for x in (0..nb).rev() {
+                    let d = *bd.add(x) as usize;
+                    *cnt.add(d) += *bi.add(x + 1) - *bi.add(x);
+                    *minrow.add(d) = *br.add(x);
                 }
-                n = n2;
-                std::mem::swap(&mut rows, &mut rows2);
-                std::mem::swap(&mut js, &mut js2);
             }
+            let nxt = s.nxt.as_ptr();
+            let nxt4 = |j: *const u16| -> u64 {
+                let x = (j as *const u64).read_unaligned();
+                let e = |sh: u32| u64::from(*nxt.add(((x >> sh) & 1023) as usize) as u16);
+                e(0) | e(16) << 16 | e(32) << 32 | e(48) << 48
+            };
+            // Under a relation `js` holds entries: position `ent_j[e]`, next `ent_nxt[e]`. Past the
+            // list's end the lanes are stale, clamped to stay in the entry arrays.
+            let (ej, en) = (s.ent_j.as_ptr(), s.ent_nxt.as_ptr());
+            let elast = s.ent_j.len().saturating_sub(1) as u64;
+            let gather4 = |a: *const i16, e: *const u16| -> u64 {
+                let x = (e as *const u64).read_unaligned();
+                let g =
+                    |sh: u32| u64::from(*a.add(((x >> sh) & 0xFFFF).min(elast) as usize) as u16);
+                g(0) | g(16) << 16 | g(32) << 32 | g(48) << 48
+            };
+            if rel.is_some() {
+                for x in 0..nm {
+                    s.mj[x] = s.ent_nxt[s.ehead[s.mj[x] as usize] as usize] as u16;
+                }
+            } else {
+                for x in 0..nm {
+                    s.mj[x] = *nxt.add(s.mj[x] as usize) as u16;
+                }
+            }
+            let mut n = nm;
+            grow(&mut s.hrow, n + 16);
+            grow(&mut s.hcode, n + 16);
+            let (mut rows, mut js) = (std::mem::take(&mut s.mrow), std::mem::take(&mut s.mj));
+            let (mut rows2, mut js2) = (std::mem::take(&mut s.hrow), std::mem::take(&mut s.hcode));
+            {
+                const IO: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                let (k8, one, neg1) = (_mm_set1_epi16(8), _mm_set1_epi16(1), _mm_set1_epi16(-1));
+                let koff = _mm_set1_epi16((off + K - 1) as i16);
+                while n > 0 {
+                    let vn = _mm_set1_epi16(n as i16);
+                    let mut idx = ld(IO.as_ptr() as *const u8);
+                    let (mut prev_r, mut prev_d) = (_mm_setzero_si128(), _mm_set1_epi16(-1));
+                    let (mut nb, mut n2) = (0usize, 0usize);
+                    let mut k0 = 0usize;
+                    while k0 < n {
+                        let r = ld(rows.as_ptr().add(k0) as *const u8);
+                        let (e0, e1) = (js.as_ptr().add(k0), js.as_ptr().add(k0 + 4));
+                        let (j, jn) = if rel.is_some() {
+                            (
+                                from2(gather4(ej, e0), gather4(ej, e1)),
+                                from2(gather4(en, e0), gather4(en, e1)),
+                            )
+                        } else {
+                            (ld(e0 as *const u8), from2(nxt4(e0), nxt4(e1)))
+                        };
+                        let d = _mm_sub_epi16(_mm_add_epi16(r, koff), j);
+                        let rp = shift_in(prev_r, r);
+                        let dp = shift_in(prev_d, d);
+                        (prev_r, prev_d) = (r, d);
+                        let valid = _mm_cmplt_epi16(idx, vn);
+                        let cont = _mm_and_si128(
+                            _mm_cmpeq_epi16(r, _mm_add_epi16(rp, one)),
+                            _mm_cmpeq_epi16(d, dp),
+                        );
+                        let keep = _mm_and_si128(_mm_cmpgt_epi16(jn, neg1), valid);
+                        let m =
+                            _mm_movemask_epi8(_mm_packs_epi16(_mm_andnot_si128(cont, valid), keep))
+                                as u32;
+                        let (mb, mk) = (m & 0xFF, m >> 8);
+                        pack(&mut s.rb_idx, nb, idx, mb);
+                        pack(&mut s.rb_d, nb, d, mb);
+                        nb = pack(&mut s.rb_r, nb, r, mb);
+                        pack(&mut rows2, n2, r, mk);
+                        n2 = pack(&mut js2, n2, jn, mk);
+                        idx = _mm_add_epi16(idx, k8);
+                        k0 += 8;
+                    }
+                    s.rb_idx[nb] = n as u16;
+                    let (cnt, minrow) = (s.cnt.as_mut_ptr(), s.minrow.as_mut_ptr());
+                    let (bd, bi, br) = (s.rb_d.as_ptr(), s.rb_idx.as_ptr(), s.rb_r.as_ptr());
+                    for x in 0..nb {
+                        let (d, row) = (*bd.add(x) as usize, *br.add(x));
+                        let c = *cnt.add(d);
+                        let stale = u16::from(c == 0).wrapping_neg();
+                        *minrow.add(d) = (*minrow.add(d) | stale).min(row);
+                        *cnt.add(d) = c + *bi.add(x + 1) - *bi.add(x);
+                    }
+                    n = n2;
+                    std::mem::swap(&mut rows, &mut rows2);
+                    std::mem::swap(&mut js, &mut js2);
+                }
+            }
+            (s.mrow, s.mj, s.hrow, s.hcode) = (rows, js, rows2, js2);
+            s.occ_stale = true;
+            Some(nd)
         }
-        (s.mrow, s.mj, s.hrow, s.hcode) = (rows, js, rows2, js2);
-        s.occ_stale = true;
-        Some(nd)
     }
 }
 
@@ -1525,32 +1530,35 @@ mod dense {
     /// Transpose 8 vectors of 8 lanes.
     #[inline(always)]
     unsafe fn tr8(v: &mut [int16x8_t; 8]) {
-        let a: [int16x8_t; 8] = [
-            vtrn1q_s16(v[0], v[1]),
-            vtrn2q_s16(v[0], v[1]),
-            vtrn1q_s16(v[2], v[3]),
-            vtrn2q_s16(v[2], v[3]),
-            vtrn1q_s16(v[4], v[5]),
-            vtrn2q_s16(v[4], v[5]),
-            vtrn1q_s16(v[6], v[7]),
-            vtrn2q_s16(v[6], v[7]),
-        ];
-        let w = |x: int16x8_t| vreinterpretq_s32_s16(x);
-        let b = [
-            vtrn1q_s32(w(a[0]), w(a[2])),
-            vtrn1q_s32(w(a[1]), w(a[3])),
-            vtrn2q_s32(w(a[0]), w(a[2])),
-            vtrn2q_s32(w(a[1]), w(a[3])),
-            vtrn1q_s32(w(a[4]), w(a[6])),
-            vtrn1q_s32(w(a[5]), w(a[7])),
-            vtrn2q_s32(w(a[4]), w(a[6])),
-            vtrn2q_s32(w(a[5]), w(a[7])),
-        ];
-        let d = |x: int32x4_t| vreinterpretq_s64_s32(x);
-        let r = |x: int64x2_t| vreinterpretq_s16_s64(x);
-        for k in 0..4 {
-            v[k] = r(vtrn1q_s64(d(b[k]), d(b[k + 4])));
-            v[k + 4] = r(vtrn2q_s64(d(b[k]), d(b[k + 4])));
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let a: [int16x8_t; 8] = [
+                vtrn1q_s16(v[0], v[1]),
+                vtrn2q_s16(v[0], v[1]),
+                vtrn1q_s16(v[2], v[3]),
+                vtrn2q_s16(v[2], v[3]),
+                vtrn1q_s16(v[4], v[5]),
+                vtrn2q_s16(v[4], v[5]),
+                vtrn1q_s16(v[6], v[7]),
+                vtrn2q_s16(v[6], v[7]),
+            ];
+            let w = |x: int16x8_t| vreinterpretq_s32_s16(x);
+            let b = [
+                vtrn1q_s32(w(a[0]), w(a[2])),
+                vtrn1q_s32(w(a[1]), w(a[3])),
+                vtrn2q_s32(w(a[0]), w(a[2])),
+                vtrn2q_s32(w(a[1]), w(a[3])),
+                vtrn1q_s32(w(a[4]), w(a[6])),
+                vtrn1q_s32(w(a[5]), w(a[7])),
+                vtrn2q_s32(w(a[4]), w(a[6])),
+                vtrn2q_s32(w(a[5]), w(a[7])),
+            ];
+            let d = |x: int32x4_t| vreinterpretq_s64_s32(x);
+            let r = |x: int64x2_t| vreinterpretq_s16_s64(x);
+            for k in 0..4 {
+                v[k] = r(vtrn1q_s64(d(b[k]), d(b[k + 4])));
+                v[k + 4] = r(vtrn2q_s64(d(b[k]), d(b[k + 4])));
+            }
         }
     }
 
@@ -1561,83 +1569,87 @@ mod dense {
     /// # Safety
     /// NEON; `s.cnt` holds the count of `nd` diagonals, zero up to the next multiple of 64.
     pub(super) unsafe fn bounds(s: &mut Scratch, p: &Params, nd: usize) -> Option<bool> {
-        let l = nd.div_ceil(64) * 8;
-        let nt = 8 * l;
-        // |P| stays under a hits + c (NT + L): every value below fits `i16` with room to spare.
-        if i64::from(p.a) * s.nhits as i64 + i64::from(p.c) * (nt + l) as i64 > 32000 {
-            return None;
-        }
-        debug_assert!(s.cnt.len() >= nt && s.minrow.len() >= nt);
-        for v in [&mut s.dp, &mut s.dm, &mut s.bnd] {
-            if v.len() < nt {
-                v.resize(nt, 0);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let l = nd.div_ceil(64) * 8;
+            let nt = 8 * l;
+            // |P| stays under a hits + c (NT + L): every value below fits `i16` with room to spare.
+            if i64::from(p.a) * s.nhits as i64 + i64::from(p.c) * (nt + l) as i64 > 32000 {
+                return None;
             }
-        }
-        let (zero, big, small) = (vdupq_n_s16(0), vdupq_n_s16(i16::MAX), vdupq_n_s16(i16::MIN));
-        let (wa, wc) = (vdupq_n_s16(p.a as i16), vdupq_n_s16(p.c as i16));
-        let cnt = s.cnt.as_ptr() as *const i16;
-        let (dp, dm) = (s.dp.as_mut_ptr(), s.dm.as_mut_ptr());
-        // Per segment: P before it (`cp`), min(0, P before it) (`mb`), max P after it (`xa`).
-        let (cp, mb, xa);
-        {
-            let (mut pv, mut rm, mut mx, mut bestl) = (zero, big, small, small);
-            let mut t = 0;
-            while t < l {
-                let mut c: [int16x8_t; 8] = std::array::from_fn(|k| vld1q_s16(cnt.add(k * l + t)));
-                tr8(&mut c);
-                for (k, &ck) in c.iter().enumerate() {
-                    pv = vaddq_s16(pv, vsubq_s16(vmulq_s16(ck, wa), wc));
-                    vst1q_s16(dp.add((t + k) * 8), pv);
-                    // The segment's exclusive running minimum.
-                    vst1q_s16(dm.add((t + k) * 8), rm);
-                    bestl = vmaxq_s16(bestl, vqsubq_s16(pv, rm));
-                    rm = vminq_s16(rm, pv);
-                    mx = vmaxq_s16(mx, pv);
+            debug_assert!(s.cnt.len() >= nt && s.minrow.len() >= nt);
+            for v in [&mut s.dp, &mut s.dm, &mut s.bnd] {
+                if v.len() < nt {
+                    v.resize(nt, 0);
                 }
-                t += 8;
             }
-            // Across lanes: exclusive prefix sum of the totals, exclusive prefix min (with 0) of
-            // the minima, exclusive suffix max of the maxima.
-            let mut x = pv;
-            x = vaddq_s16(x, vextq_s16::<7>(zero, x));
-            x = vaddq_s16(x, vextq_s16::<6>(zero, x));
-            x = vaddq_s16(x, vextq_s16::<4>(zero, x));
-            cp = vextq_s16::<7>(zero, x);
-            let mut g = vaddq_s16(cp, rm);
-            g = vminq_s16(g, vextq_s16::<7>(big, g));
-            g = vminq_s16(g, vextq_s16::<6>(big, g));
-            g = vminq_s16(g, vextq_s16::<4>(big, g));
-            mb = vminq_s16(vextq_s16::<7>(zero, g), zero);
-            let h = vaddq_s16(cp, mx);
-            let mut hs = vmaxq_s16(h, vextq_s16::<1>(h, small));
-            hs = vmaxq_s16(hs, vextq_s16::<2>(hs, small));
-            hs = vmaxq_s16(hs, vextq_s16::<4>(hs, small));
-            xa = vextq_s16::<1>(hs, small);
-            let best = vmaxq_s16(bestl, vsubq_s16(h, mb));
-            if p.base() + i32::from(vmaxvq_s16(best)) < p.minsc {
-                return Some(false);
+            let (zero, big, small) = (vdupq_n_s16(0), vdupq_n_s16(i16::MAX), vdupq_n_s16(i16::MIN));
+            let (wa, wc) = (vdupq_n_s16(p.a as i16), vdupq_n_s16(p.c as i16));
+            let cnt = s.cnt.as_ptr() as *const i16;
+            let (dp, dm) = (s.dp.as_mut_ptr(), s.dm.as_mut_ptr());
+            // Per segment: P before it (`cp`), min(0, P before it) (`mb`), max P after it (`xa`).
+            let (cp, mb, xa);
+            {
+                let (mut pv, mut rm, mut mx, mut bestl) = (zero, big, small, small);
+                let mut t = 0;
+                while t < l {
+                    let mut c: [int16x8_t; 8] =
+                        std::array::from_fn(|k| vld1q_s16(cnt.add(k * l + t)));
+                    tr8(&mut c);
+                    for (k, &ck) in c.iter().enumerate() {
+                        pv = vaddq_s16(pv, vsubq_s16(vmulq_s16(ck, wa), wc));
+                        vst1q_s16(dp.add((t + k) * 8), pv);
+                        // The segment's exclusive running minimum.
+                        vst1q_s16(dm.add((t + k) * 8), rm);
+                        bestl = vmaxq_s16(bestl, vqsubq_s16(pv, rm));
+                        rm = vminq_s16(rm, pv);
+                        mx = vmaxq_s16(mx, pv);
+                    }
+                    t += 8;
+                }
+                // Across lanes: exclusive prefix sum of the totals, exclusive prefix min (with 0) of
+                // the minima, exclusive suffix max of the maxima.
+                let mut x = pv;
+                x = vaddq_s16(x, vextq_s16::<7>(zero, x));
+                x = vaddq_s16(x, vextq_s16::<6>(zero, x));
+                x = vaddq_s16(x, vextq_s16::<4>(zero, x));
+                cp = vextq_s16::<7>(zero, x);
+                let mut g = vaddq_s16(cp, rm);
+                g = vminq_s16(g, vextq_s16::<7>(big, g));
+                g = vminq_s16(g, vextq_s16::<6>(big, g));
+                g = vminq_s16(g, vextq_s16::<4>(big, g));
+                mb = vminq_s16(vextq_s16::<7>(zero, g), zero);
+                let h = vaddq_s16(cp, mx);
+                let mut hs = vmaxq_s16(h, vextq_s16::<1>(h, small));
+                hs = vmaxq_s16(hs, vextq_s16::<2>(hs, small));
+                hs = vmaxq_s16(hs, vextq_s16::<4>(hs, small));
+                xa = vextq_s16::<1>(hs, small);
+                let best = vmaxq_s16(bestl, vsubq_s16(h, mb));
+                if p.base() + i32::from(vmaxvq_s16(best)) < p.minsc {
+                    return Some(false);
+                }
             }
+            // Backward, in each segment's own frame: bnd = base + max(sx, Xa - CP) - min(Mb - CP, TM).
+            let basev = vdupq_n_s16(p.base() as i16);
+            let ml = vsubq_s16(mb, cp);
+            let mut sx = vqsubq_s16(xa, cp);
+            let bnd = s.bnd.as_mut_ptr();
+            let mut t = l;
+            while t > 0 {
+                t -= 8;
+                let mut bd = [zero; 8];
+                for k in (0..8).rev() {
+                    let o = (t + k) * 8;
+                    sx = vmaxq_s16(sx, vld1q_s16(dp.add(o)));
+                    bd[k] = vaddq_s16(basev, vsubq_s16(sx, vminq_s16(ml, vld1q_s16(dm.add(o)))));
+                }
+                tr8(&mut bd);
+                for (k, &b) in bd.iter().enumerate() {
+                    vst1q_s16(bnd.add(k * l + t), b);
+                }
+            }
+            Some(true)
         }
-        // Backward, in each segment's own frame: bnd = base + max(sx, Xa - CP) - min(Mb - CP, TM).
-        let basev = vdupq_n_s16(p.base() as i16);
-        let ml = vsubq_s16(mb, cp);
-        let mut sx = vqsubq_s16(xa, cp);
-        let bnd = s.bnd.as_mut_ptr();
-        let mut t = l;
-        while t > 0 {
-            t -= 8;
-            let mut bd = [zero; 8];
-            for k in (0..8).rev() {
-                let o = (t + k) * 8;
-                sx = vmaxq_s16(sx, vld1q_s16(dp.add(o)));
-                bd[k] = vaddq_s16(basev, vsubq_s16(sx, vminq_s16(ml, vld1q_s16(dm.add(o)))));
-            }
-            tr8(&mut bd);
-            for (k, &b) in bd.iter().enumerate() {
-                vst1q_s16(bnd.add(k * l + t), b);
-            }
-        }
-        Some(true)
     }
 
     /// The components at `tau`, from the bounds [`bounds`] left: each run of diagonals whose bound
@@ -1653,121 +1665,125 @@ mod dense {
         nd: usize,
         out: &mut Vec<Comp>,
     ) {
-        out.clear();
-        let nw = nd.div_ceil(64);
-        for v in [&mut s.mw, &mut s.hw] {
-            v.clear();
-            v.resize(nw, 0);
-        }
-        const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-        let bw = vld1q_u8(BW.as_ptr());
-        let tv = vdupq_n_s16(tau.clamp(-32768, 32767) as i16);
-        let (bnd, cnt) = (s.bnd.as_ptr(), s.cnt.as_ptr());
-        // 64 byte masks to 64 bits: weigh each byte by its bit, then three rounds of pairwise
-        // adds fold the four vectors into bytes 0..8 in diagonal order.
-        let bits64 = |g: [uint8x16_t; 4]| -> u64 {
-            let x01 = vpaddq_u8(vandq_u8(g[0], bw), vandq_u8(g[1], bw));
-            let x23 = vpaddq_u8(vandq_u8(g[2], bw), vandq_u8(g[3], bw));
-            let x = vpaddq_u8(x01, x23);
-            vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(x, x)))
-        };
-        for w in 0..nw {
-            let (mut ge, mut gh) = ([vdupq_n_u8(0); 4], [vdupq_n_u8(0); 4]);
-            for g in 0..4 {
-                let at = w * 64 + g * 16;
-                ge[g] = vcombine_u8(
-                    vmovn_u16(vcgeq_s16(vld1q_s16(bnd.add(at)), tv)),
-                    vmovn_u16(vcgeq_s16(vld1q_s16(bnd.add(at + 8)), tv)),
-                );
-                let (c0, c1) = (vld1q_u16(cnt.add(at)), vld1q_u16(cnt.add(at + 8)));
-                let hit = vcombine_u8(vmovn_u16(vtstq_u16(c0, c0)), vmovn_u16(vtstq_u16(c1, c1)));
-                gh[g] = vandq_u8(ge[g], hit);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            out.clear();
+            let nw = nd.div_ceil(64);
+            for v in [&mut s.mw, &mut s.hw] {
+                v.clear();
+                v.resize(nw, 0);
             }
-            s.mw[w] = bits64(ge);
-            s.hw[w] = bits64(gh);
-        }
-        if !nd.is_multiple_of(64) {
-            let keep = (1u64 << (nd % 64)) - 1;
-            s.mw[nw - 1] &= keep;
-            s.hw[nw - 1] &= keep;
-        }
-        // The first diagonal at or after `from` whose `bits ^ inv` bit is set, or `nd`.
-        let next = |bits: &[u64], from: usize, inv: u64| -> usize {
-            let mut w = from / 64;
-            if w >= nw {
-                return nd;
-            }
-            let mut x = (bits[w] ^ inv) & (!0u64 << (from % 64));
-            loop {
-                if x != 0 {
-                    return (w * 64 + x.trailing_zeros() as usize).min(nd);
+            const BW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let bw = vld1q_u8(BW.as_ptr());
+            let tv = vdupq_n_s16(tau.clamp(-32768, 32767) as i16);
+            let (bnd, cnt) = (s.bnd.as_ptr(), s.cnt.as_ptr());
+            // 64 byte masks to 64 bits: weigh each byte by its bit, then three rounds of pairwise
+            // adds fold the four vectors into bytes 0..8 in diagonal order.
+            let bits64 = |g: [uint8x16_t; 4]| -> u64 {
+                let x01 = vpaddq_u8(vandq_u8(g[0], bw), vandq_u8(g[1], bw));
+                let x23 = vpaddq_u8(vandq_u8(g[2], bw), vandq_u8(g[3], bw));
+                let x = vpaddq_u8(x01, x23);
+                vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(x, x)))
+            };
+            for w in 0..nw {
+                let (mut ge, mut gh) = ([vdupq_n_u8(0); 4], [vdupq_n_u8(0); 4]);
+                for g in 0..4 {
+                    let at = w * 64 + g * 16;
+                    ge[g] = vcombine_u8(
+                        vmovn_u16(vcgeq_s16(vld1q_s16(bnd.add(at)), tv)),
+                        vmovn_u16(vcgeq_s16(vld1q_s16(bnd.add(at + 8)), tv)),
+                    );
+                    let (c0, c1) = (vld1q_u16(cnt.add(at)), vld1q_u16(cnt.add(at + 8)));
+                    let hit =
+                        vcombine_u8(vmovn_u16(vtstq_u16(c0, c0)), vmovn_u16(vtstq_u16(c1, c1)));
+                    gh[g] = vandq_u8(ge[g], hit);
                 }
-                w += 1;
+                s.mw[w] = bits64(ge);
+                s.hw[w] = bits64(gh);
+            }
+            if !nd.is_multiple_of(64) {
+                let keep = (1u64 << (nd % 64)) - 1;
+                s.mw[nw - 1] &= keep;
+                s.hw[nw - 1] &= keep;
+            }
+            // The first diagonal at or after `from` whose `bits ^ inv` bit is set, or `nd`.
+            let next = |bits: &[u64], from: usize, inv: u64| -> usize {
+                let mut w = from / 64;
                 if w >= nw {
                     return nd;
                 }
-                x = bits[w] ^ inv;
-            }
-        };
-        const IO: [i16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-        let io = vld1q_s16(IO.as_ptr());
-        let minrow = s.minrow.as_ptr();
-        let mut d = next(&s.mw, 0, 0);
-        while d < nd {
-            let (a, b) = (d, next(&s.mw, d, !0));
-            // The last hit diagonal of [a, b).
-            let mut dmax = None;
-            let mut w = (b - 1) / 64;
-            loop {
-                let lo_mask = if w == a / 64 { !0u64 << (a % 64) } else { !0 };
-                let hi_mask = if w == (b - 1) / 64 {
-                    !0u64 >> (63 - (b - 1) % 64)
-                } else {
-                    !0
-                };
-                let x = s.hw[w] & lo_mask & hi_mask;
-                if x != 0 {
-                    dmax = Some(w * 64 + 63 - x.leading_zeros() as usize);
-                    break;
+                let mut x = (bits[w] ^ inv) & (!0u64 << (from % 64));
+                loop {
+                    if x != 0 {
+                        return (w * 64 + x.trailing_zeros() as usize).min(nd);
+                    }
+                    w += 1;
+                    if w >= nw {
+                        return nd;
+                    }
+                    x = bits[w] ^ inv;
                 }
-                if w == a / 64 {
-                    break;
+            };
+            const IO: [i16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let io = vld1q_s16(IO.as_ptr());
+            let minrow = s.minrow.as_ptr();
+            let mut d = next(&s.mw, 0, 0);
+            while d < nd {
+                let (a, b) = (d, next(&s.mw, d, !0));
+                // The last hit diagonal of [a, b).
+                let mut dmax = None;
+                let mut w = (b - 1) / 64;
+                loop {
+                    let lo_mask = if w == a / 64 { !0u64 << (a % 64) } else { !0 };
+                    let hi_mask = if w == (b - 1) / 64 {
+                        !0u64 >> (63 - (b - 1) % 64)
+                    } else {
+                        !0
+                    };
+                    let x = s.hw[w] & lo_mask & hi_mask;
+                    if x != 0 {
+                        dmax = Some(w * 64 + 63 - x.leading_zeros() as usize);
+                        break;
+                    }
+                    if w == a / 64 {
+                        break;
+                    }
+                    w -= 1;
                 }
-                w -= 1;
-            }
-            if let Some(dmax) = dmax {
-                let (va, vb) = (vdupq_n_s16(a as i16), vdupq_n_s16(b as i16));
-                let (mut mx, mut mn) = (vdupq_n_s16(i16::MIN), vdupq_n_u16(u16::MAX));
-                let mut x = a & !7;
-                while x < b {
-                    let pos = vaddq_s16(io, vdupq_n_s16(x as i16));
-                    let inr = vandq_u16(vcgeq_s16(pos, va), vcltq_s16(pos, vb));
-                    let c = vld1q_u16(cnt.add(x));
-                    mx = vmaxq_s16(
-                        mx,
-                        vbslq_s16(inr, vld1q_s16(bnd.add(x)), vdupq_n_s16(i16::MIN)),
-                    );
-                    mn = vminq_u16(
-                        mn,
-                        vbslq_u16(
-                            vandq_u16(inr, vtstq_u16(c, c)),
-                            vld1q_u16(minrow.add(x)),
-                            vdupq_n_u16(u16::MAX),
-                        ),
-                    );
-                    x += 8;
+                if let Some(dmax) = dmax {
+                    let (va, vb) = (vdupq_n_s16(a as i16), vdupq_n_s16(b as i16));
+                    let (mut mx, mut mn) = (vdupq_n_s16(i16::MIN), vdupq_n_u16(u16::MAX));
+                    let mut x = a & !7;
+                    while x < b {
+                        let pos = vaddq_s16(io, vdupq_n_s16(x as i16));
+                        let inr = vandq_u16(vcgeq_s16(pos, va), vcltq_s16(pos, vb));
+                        let c = vld1q_u16(cnt.add(x));
+                        mx = vmaxq_s16(
+                            mx,
+                            vbslq_s16(inr, vld1q_s16(bnd.add(x)), vdupq_n_s16(i16::MIN)),
+                        );
+                        mn = vminq_u16(
+                            mn,
+                            vbslq_u16(
+                                vandq_u16(inr, vtstq_u16(c, c)),
+                                vld1q_u16(minrow.add(x)),
+                                vdupq_n_u16(u16::MAX),
+                            ),
+                        );
+                        x += 8;
+                    }
+                    out.push(Comp {
+                        ub: i32::from(vmaxvq_s16(mx)),
+                        i0: i32::from(vminvq_u16(mn)),
+                        dlo: a as i32 - off,
+                        dhi: b as i32 - 1 - off,
+                        dmaxhit: dmax as i32 - off,
+                        kf: 0,
+                        kl: 0,
+                    });
                 }
-                out.push(Comp {
-                    ub: i32::from(vmaxvq_s16(mx)),
-                    i0: i32::from(vminvq_u16(mn)),
-                    dlo: a as i32 - off,
-                    dhi: b as i32 - 1 - off,
-                    dmaxhit: dmax as i32 - off,
-                    kf: 0,
-                    kl: 0,
-                });
+                d = next(&s.mw, b, 0);
             }
-            d = next(&s.mw, b, 0);
         }
     }
 }
@@ -1782,29 +1798,32 @@ mod dense {
     /// Transpose 8 vectors of 8 lanes.
     #[inline(always)]
     unsafe fn tr8(v: &mut [__m128i; 8]) {
-        let a = [
-            _mm_unpacklo_epi16(v[0], v[1]),
-            _mm_unpackhi_epi16(v[0], v[1]),
-            _mm_unpacklo_epi16(v[2], v[3]),
-            _mm_unpackhi_epi16(v[2], v[3]),
-            _mm_unpacklo_epi16(v[4], v[5]),
-            _mm_unpackhi_epi16(v[4], v[5]),
-            _mm_unpacklo_epi16(v[6], v[7]),
-            _mm_unpackhi_epi16(v[6], v[7]),
-        ];
-        let b = [
-            _mm_unpacklo_epi32(a[0], a[2]),
-            _mm_unpackhi_epi32(a[0], a[2]),
-            _mm_unpacklo_epi32(a[1], a[3]),
-            _mm_unpackhi_epi32(a[1], a[3]),
-            _mm_unpacklo_epi32(a[4], a[6]),
-            _mm_unpackhi_epi32(a[4], a[6]),
-            _mm_unpacklo_epi32(a[5], a[7]),
-            _mm_unpackhi_epi32(a[5], a[7]),
-        ];
-        for k in 0..4 {
-            v[2 * k] = _mm_unpacklo_epi64(b[k], b[k + 4]);
-            v[2 * k + 1] = _mm_unpackhi_epi64(b[k], b[k + 4]);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let a = [
+                _mm_unpacklo_epi16(v[0], v[1]),
+                _mm_unpackhi_epi16(v[0], v[1]),
+                _mm_unpacklo_epi16(v[2], v[3]),
+                _mm_unpackhi_epi16(v[2], v[3]),
+                _mm_unpacklo_epi16(v[4], v[5]),
+                _mm_unpackhi_epi16(v[4], v[5]),
+                _mm_unpacklo_epi16(v[6], v[7]),
+                _mm_unpackhi_epi16(v[6], v[7]),
+            ];
+            let b = [
+                _mm_unpacklo_epi32(a[0], a[2]),
+                _mm_unpackhi_epi32(a[0], a[2]),
+                _mm_unpacklo_epi32(a[1], a[3]),
+                _mm_unpackhi_epi32(a[1], a[3]),
+                _mm_unpacklo_epi32(a[4], a[6]),
+                _mm_unpackhi_epi32(a[4], a[6]),
+                _mm_unpacklo_epi32(a[5], a[7]),
+                _mm_unpackhi_epi32(a[5], a[7]),
+            ];
+            for k in 0..4 {
+                v[2 * k] = _mm_unpacklo_epi64(b[k], b[k + 4]);
+                v[2 * k + 1] = _mm_unpackhi_epi64(b[k], b[k + 4]);
+            }
         }
     }
 
@@ -1817,26 +1836,33 @@ mod dense {
 
     #[inline(always)]
     unsafe fn ld(p: *const i16) -> __m128i {
-        _mm_loadu_si128(p as *const __m128i)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm_loadu_si128(p as *const __m128i) }
     }
 
     #[inline(always)]
     unsafe fn st(p: *mut i16, v: __m128i) {
-        _mm_storeu_si128(p as *mut __m128i, v)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm_storeu_si128(p as *mut __m128i, v) }
     }
 
     /// Signed `a >= b` per lane.
     #[inline(always)]
     unsafe fn cge(a: __m128i, b: __m128i) -> __m128i {
-        _mm_cmpeq_epi16(_mm_max_epi16(a, b), a)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm_cmpeq_epi16(_mm_max_epi16(a, b), a) }
     }
 
     /// Horizontal signed max, through the unsigned horizontal min (32767 - v reverses the order).
     #[inline(always)]
     unsafe fn hmax(v: __m128i) -> i16 {
-        let k = _mm_set1_epi16(i16::MAX);
-        (32767 - i32::from(_mm_extract_epi16::<0>(_mm_minpos_epu16(_mm_sub_epi16(k, v))) as u16))
-            as i16
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let k = _mm_set1_epi16(i16::MAX);
+            (32767
+                - i32::from(_mm_extract_epi16::<0>(_mm_minpos_epu16(_mm_sub_epi16(k, v))) as u16))
+                as i16
+        }
     }
 
     /// See the NEON `bounds`; same results.
@@ -1846,81 +1872,85 @@ mod dense {
     /// of 64.
     #[target_feature(enable = "ssse3,sse4.1")]
     pub(super) unsafe fn bounds(s: &mut Scratch, p: &Params, nd: usize) -> Option<bool> {
-        let l = nd.div_ceil(64) * 8;
-        let nt = 8 * l;
-        if i64::from(p.a) * s.nhits as i64 + i64::from(p.c) * (nt + l) as i64 > 32000 {
-            return None;
-        }
-        debug_assert!(s.cnt.len() >= nt && s.minrow.len() >= nt);
-        for v in [&mut s.dp, &mut s.dm, &mut s.bnd] {
-            if v.len() < nt {
-                v.resize(nt, 0);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let l = nd.div_ceil(64) * 8;
+            let nt = 8 * l;
+            if i64::from(p.a) * s.nhits as i64 + i64::from(p.c) * (nt + l) as i64 > 32000 {
+                return None;
             }
-        }
-        let (zero, big, small) = (
-            _mm_setzero_si128(),
-            _mm_set1_epi16(i16::MAX),
-            _mm_set1_epi16(i16::MIN),
-        );
-        let (wa, wc) = (_mm_set1_epi16(p.a as i16), _mm_set1_epi16(p.c as i16));
-        let cnt = s.cnt.as_ptr() as *const i16;
-        let (dp, dm) = (s.dp.as_mut_ptr(), s.dm.as_mut_ptr());
-        let (cp, mb, xa);
-        {
-            let (mut pv, mut rm, mut mx, mut bestl) = (zero, big, small, small);
-            let mut t = 0;
-            while t < l {
-                let mut c: [__m128i; 8] = std::array::from_fn(|k| ld(cnt.add(k * l + t)));
-                tr8(&mut c);
-                for (k, &ck) in c.iter().enumerate() {
-                    pv = _mm_add_epi16(pv, _mm_sub_epi16(_mm_mullo_epi16(ck, wa), wc));
-                    st(dp.add((t + k) * 8), pv);
-                    st(dm.add((t + k) * 8), rm);
-                    bestl = _mm_max_epi16(bestl, _mm_subs_epi16(pv, rm));
-                    rm = _mm_min_epi16(rm, pv);
-                    mx = _mm_max_epi16(mx, pv);
+            debug_assert!(s.cnt.len() >= nt && s.minrow.len() >= nt);
+            for v in [&mut s.dp, &mut s.dm, &mut s.bnd] {
+                if v.len() < nt {
+                    v.resize(nt, 0);
                 }
-                t += 8;
             }
-            let mut x = pv;
-            x = _mm_add_epi16(x, ext!(7, zero, x));
-            x = _mm_add_epi16(x, ext!(6, zero, x));
-            x = _mm_add_epi16(x, ext!(4, zero, x));
-            cp = ext!(7, zero, x);
-            let mut g = _mm_add_epi16(cp, rm);
-            g = _mm_min_epi16(g, ext!(7, big, g));
-            g = _mm_min_epi16(g, ext!(6, big, g));
-            g = _mm_min_epi16(g, ext!(4, big, g));
-            mb = _mm_min_epi16(ext!(7, zero, g), zero);
-            let h = _mm_add_epi16(cp, mx);
-            let mut hs = _mm_max_epi16(h, ext!(1, h, small));
-            hs = _mm_max_epi16(hs, ext!(2, hs, small));
-            hs = _mm_max_epi16(hs, ext!(4, hs, small));
-            xa = ext!(1, hs, small);
-            let best = _mm_max_epi16(bestl, _mm_sub_epi16(h, mb));
-            if p.base() + i32::from(hmax(best)) < p.minsc {
-                return Some(false);
+            let (zero, big, small) = (
+                _mm_setzero_si128(),
+                _mm_set1_epi16(i16::MAX),
+                _mm_set1_epi16(i16::MIN),
+            );
+            let (wa, wc) = (_mm_set1_epi16(p.a as i16), _mm_set1_epi16(p.c as i16));
+            let cnt = s.cnt.as_ptr() as *const i16;
+            let (dp, dm) = (s.dp.as_mut_ptr(), s.dm.as_mut_ptr());
+            let (cp, mb, xa);
+            {
+                let (mut pv, mut rm, mut mx, mut bestl) = (zero, big, small, small);
+                let mut t = 0;
+                while t < l {
+                    let mut c: [__m128i; 8] = std::array::from_fn(|k| ld(cnt.add(k * l + t)));
+                    tr8(&mut c);
+                    for (k, &ck) in c.iter().enumerate() {
+                        pv = _mm_add_epi16(pv, _mm_sub_epi16(_mm_mullo_epi16(ck, wa), wc));
+                        st(dp.add((t + k) * 8), pv);
+                        st(dm.add((t + k) * 8), rm);
+                        bestl = _mm_max_epi16(bestl, _mm_subs_epi16(pv, rm));
+                        rm = _mm_min_epi16(rm, pv);
+                        mx = _mm_max_epi16(mx, pv);
+                    }
+                    t += 8;
+                }
+                let mut x = pv;
+                x = _mm_add_epi16(x, ext!(7, zero, x));
+                x = _mm_add_epi16(x, ext!(6, zero, x));
+                x = _mm_add_epi16(x, ext!(4, zero, x));
+                cp = ext!(7, zero, x);
+                let mut g = _mm_add_epi16(cp, rm);
+                g = _mm_min_epi16(g, ext!(7, big, g));
+                g = _mm_min_epi16(g, ext!(6, big, g));
+                g = _mm_min_epi16(g, ext!(4, big, g));
+                mb = _mm_min_epi16(ext!(7, zero, g), zero);
+                let h = _mm_add_epi16(cp, mx);
+                let mut hs = _mm_max_epi16(h, ext!(1, h, small));
+                hs = _mm_max_epi16(hs, ext!(2, hs, small));
+                hs = _mm_max_epi16(hs, ext!(4, hs, small));
+                xa = ext!(1, hs, small);
+                let best = _mm_max_epi16(bestl, _mm_sub_epi16(h, mb));
+                if p.base() + i32::from(hmax(best)) < p.minsc {
+                    return Some(false);
+                }
             }
+            let basev = _mm_set1_epi16(p.base() as i16);
+            let ml = _mm_sub_epi16(mb, cp);
+            let mut sx = _mm_subs_epi16(xa, cp);
+            let bnd = s.bnd.as_mut_ptr();
+            let mut t = l;
+            while t > 0 {
+                t -= 8;
+                let mut bd = [zero; 8];
+                for k in (0..8).rev() {
+                    let o = (t + k) * 8;
+                    sx = _mm_max_epi16(sx, ld(dp.add(o)));
+                    bd[k] =
+                        _mm_add_epi16(basev, _mm_sub_epi16(sx, _mm_min_epi16(ml, ld(dm.add(o)))));
+                }
+                tr8(&mut bd);
+                for (k, &b) in bd.iter().enumerate() {
+                    st(bnd.add(k * l + t), b);
+                }
+            }
+            Some(true)
         }
-        let basev = _mm_set1_epi16(p.base() as i16);
-        let ml = _mm_sub_epi16(mb, cp);
-        let mut sx = _mm_subs_epi16(xa, cp);
-        let bnd = s.bnd.as_mut_ptr();
-        let mut t = l;
-        while t > 0 {
-            t -= 8;
-            let mut bd = [zero; 8];
-            for k in (0..8).rev() {
-                let o = (t + k) * 8;
-                sx = _mm_max_epi16(sx, ld(dp.add(o)));
-                bd[k] = _mm_add_epi16(basev, _mm_sub_epi16(sx, _mm_min_epi16(ml, ld(dm.add(o)))));
-            }
-            tr8(&mut bd);
-            for (k, &b) in bd.iter().enumerate() {
-                st(bnd.add(k * l + t), b);
-            }
-        }
-        Some(true)
     }
 
     /// See the NEON `components`; same results.
@@ -1935,103 +1965,107 @@ mod dense {
         nd: usize,
         out: &mut Vec<Comp>,
     ) {
-        out.clear();
-        let nw = nd.div_ceil(64);
-        for v in [&mut s.mw, &mut s.hw] {
-            v.clear();
-            v.resize(nw, 0);
-        }
-        let tv = _mm_set1_epi16(tau.clamp(-32768, 32767) as i16);
-        let zero = _mm_setzero_si128();
-        let (bnd, cnt) = (s.bnd.as_ptr(), s.cnt.as_ptr() as *const i16);
-        for w in 0..nw {
-            let (mut mwb, mut hwb) = (0u64, 0u64);
-            for g in 0..4 {
-                let at = w * 64 + g * 16;
-                let ge = _mm_packs_epi16(cge(ld(bnd.add(at)), tv), cge(ld(bnd.add(at + 8)), tv));
-                let empty = _mm_packs_epi16(
-                    _mm_cmpeq_epi16(ld(cnt.add(at)), zero),
-                    _mm_cmpeq_epi16(ld(cnt.add(at + 8)), zero),
-                );
-                mwb |= u64::from(_mm_movemask_epi8(ge) as u32 as u16) << (16 * g);
-                hwb |= u64::from(_mm_movemask_epi8(_mm_andnot_si128(empty, ge)) as u32 as u16)
-                    << (16 * g);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            out.clear();
+            let nw = nd.div_ceil(64);
+            for v in [&mut s.mw, &mut s.hw] {
+                v.clear();
+                v.resize(nw, 0);
             }
-            s.mw[w] = mwb;
-            s.hw[w] = hwb;
-        }
-        if !nd.is_multiple_of(64) {
-            let keep = (1u64 << (nd % 64)) - 1;
-            s.mw[nw - 1] &= keep;
-            s.hw[nw - 1] &= keep;
-        }
-        let next = |bits: &[u64], from: usize, inv: u64| -> usize {
-            let mut w = from / 64;
-            if w >= nw {
-                return nd;
-            }
-            let mut x = (bits[w] ^ inv) & (!0u64 << (from % 64));
-            loop {
-                if x != 0 {
-                    return (w * 64 + x.trailing_zeros() as usize).min(nd);
+            let tv = _mm_set1_epi16(tau.clamp(-32768, 32767) as i16);
+            let zero = _mm_setzero_si128();
+            let (bnd, cnt) = (s.bnd.as_ptr(), s.cnt.as_ptr() as *const i16);
+            for w in 0..nw {
+                let (mut mwb, mut hwb) = (0u64, 0u64);
+                for g in 0..4 {
+                    let at = w * 64 + g * 16;
+                    let ge =
+                        _mm_packs_epi16(cge(ld(bnd.add(at)), tv), cge(ld(bnd.add(at + 8)), tv));
+                    let empty = _mm_packs_epi16(
+                        _mm_cmpeq_epi16(ld(cnt.add(at)), zero),
+                        _mm_cmpeq_epi16(ld(cnt.add(at + 8)), zero),
+                    );
+                    mwb |= u64::from(_mm_movemask_epi8(ge) as u32 as u16) << (16 * g);
+                    hwb |= u64::from(_mm_movemask_epi8(_mm_andnot_si128(empty, ge)) as u32 as u16)
+                        << (16 * g);
                 }
-                w += 1;
+                s.mw[w] = mwb;
+                s.hw[w] = hwb;
+            }
+            if !nd.is_multiple_of(64) {
+                let keep = (1u64 << (nd % 64)) - 1;
+                s.mw[nw - 1] &= keep;
+                s.hw[nw - 1] &= keep;
+            }
+            let next = |bits: &[u64], from: usize, inv: u64| -> usize {
+                let mut w = from / 64;
                 if w >= nw {
                     return nd;
                 }
-                x = bits[w] ^ inv;
-            }
-        };
-        const IO: [i16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-        let io = ld(IO.as_ptr());
-        let minrow = s.minrow.as_ptr() as *const i16;
-        let mut d = next(&s.mw, 0, 0);
-        while d < nd {
-            let (a, b) = (d, next(&s.mw, d, !0));
-            let mut dmax = None;
-            let mut w = (b - 1) / 64;
-            loop {
-                let lo_mask = if w == a / 64 { !0u64 << (a % 64) } else { !0 };
-                let hi_mask = if w == (b - 1) / 64 {
-                    !0u64 >> (63 - (b - 1) % 64)
-                } else {
-                    !0
-                };
-                let x = s.hw[w] & lo_mask & hi_mask;
-                if x != 0 {
-                    dmax = Some(w * 64 + 63 - x.leading_zeros() as usize);
-                    break;
+                let mut x = (bits[w] ^ inv) & (!0u64 << (from % 64));
+                loop {
+                    if x != 0 {
+                        return (w * 64 + x.trailing_zeros() as usize).min(nd);
+                    }
+                    w += 1;
+                    if w >= nw {
+                        return nd;
+                    }
+                    x = bits[w] ^ inv;
                 }
-                if w == a / 64 {
-                    break;
+            };
+            const IO: [i16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            let io = ld(IO.as_ptr());
+            let minrow = s.minrow.as_ptr() as *const i16;
+            let mut d = next(&s.mw, 0, 0);
+            while d < nd {
+                let (a, b) = (d, next(&s.mw, d, !0));
+                let mut dmax = None;
+                let mut w = (b - 1) / 64;
+                loop {
+                    let lo_mask = if w == a / 64 { !0u64 << (a % 64) } else { !0 };
+                    let hi_mask = if w == (b - 1) / 64 {
+                        !0u64 >> (63 - (b - 1) % 64)
+                    } else {
+                        !0
+                    };
+                    let x = s.hw[w] & lo_mask & hi_mask;
+                    if x != 0 {
+                        dmax = Some(w * 64 + 63 - x.leading_zeros() as usize);
+                        break;
+                    }
+                    if w == a / 64 {
+                        break;
+                    }
+                    w -= 1;
                 }
-                w -= 1;
-            }
-            if let Some(dmax) = dmax {
-                let (va, vb) = (_mm_set1_epi16(a as i16), _mm_set1_epi16(b as i16));
-                let (mut mx, mut mn) = (_mm_set1_epi16(i16::MIN), _mm_set1_epi16(-1));
-                let (smin, umax) = (_mm_set1_epi16(i16::MIN), _mm_set1_epi16(-1));
-                let mut x = a & !7;
-                while x < b {
-                    let pos = _mm_add_epi16(io, _mm_set1_epi16(x as i16));
-                    let inr = _mm_andnot_si128(cge(pos, vb), cge(pos, va));
-                    let c = ld(cnt.add(x));
-                    mx = _mm_max_epi16(mx, _mm_blendv_epi8(smin, ld(bnd.add(x)), inr));
-                    let take = _mm_andnot_si128(_mm_cmpeq_epi16(c, zero), inr);
-                    mn = _mm_min_epu16(mn, _mm_blendv_epi8(umax, ld(minrow.add(x)), take));
-                    x += 8;
+                if let Some(dmax) = dmax {
+                    let (va, vb) = (_mm_set1_epi16(a as i16), _mm_set1_epi16(b as i16));
+                    let (mut mx, mut mn) = (_mm_set1_epi16(i16::MIN), _mm_set1_epi16(-1));
+                    let (smin, umax) = (_mm_set1_epi16(i16::MIN), _mm_set1_epi16(-1));
+                    let mut x = a & !7;
+                    while x < b {
+                        let pos = _mm_add_epi16(io, _mm_set1_epi16(x as i16));
+                        let inr = _mm_andnot_si128(cge(pos, vb), cge(pos, va));
+                        let c = ld(cnt.add(x));
+                        mx = _mm_max_epi16(mx, _mm_blendv_epi8(smin, ld(bnd.add(x)), inr));
+                        let take = _mm_andnot_si128(_mm_cmpeq_epi16(c, zero), inr);
+                        mn = _mm_min_epu16(mn, _mm_blendv_epi8(umax, ld(minrow.add(x)), take));
+                        x += 8;
+                    }
+                    out.push(Comp {
+                        ub: i32::from(hmax(mx)),
+                        i0: i32::from(_mm_extract_epi16::<0>(_mm_minpos_epu16(mn)) as u16),
+                        dlo: a as i32 - off,
+                        dhi: b as i32 - 1 - off,
+                        dmaxhit: dmax as i32 - off,
+                        kf: 0,
+                        kl: 0,
+                    });
                 }
-                out.push(Comp {
-                    ub: i32::from(hmax(mx)),
-                    i0: i32::from(_mm_extract_epi16::<0>(_mm_minpos_epu16(mn)) as u16),
-                    dlo: a as i32 - off,
-                    dhi: b as i32 - 1 - off,
-                    dmaxhit: dmax as i32 - off,
-                    kf: 0,
-                    kl: 0,
-                });
+                d = next(&s.mw, b, 0);
             }
-            d = next(&s.mw, b, 0);
         }
     }
 }
@@ -2715,6 +2749,7 @@ pub(crate) mod tests {
                 Some(false) => Decision::Fail,
                 Some(true) => {
                     let mut d19 = Vec::new();
+                    // SAFETY: NEON is aarch64 baseline; `s` was loaded for this window.
                     unsafe { dense::components(s, p.minsc, off, nd, &mut d19) };
                     let got = hull_of(&d19, p, off, len1);
                     if let Decision::Hull { .. } = want {
@@ -2737,6 +2772,7 @@ pub(crate) mod tests {
                         let t1 = round1_threshold(p.minsc, ub2);
                         let (mut ct, mut dt) = (Vec::new(), Vec::new());
                         components(s, p, t1, off, nd, true, &mut ct);
+                        // SAFETY: as above.
                         unsafe { dense::components(s, t1, off, nd, &mut dt) };
                         assert_eq!(
                             ct.iter().map(key).collect::<Vec<_>>(),

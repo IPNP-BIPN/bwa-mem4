@@ -431,6 +431,7 @@ fn calibrate(have_512: bool, have_2: bool, have_sse: bool) -> Tier {
     // SAFETY of each closure: the feature it needs was detected above, and the jobs are read-only
     // short sequences well inside the u8 kernel's value bounds (h0 = 10, query < 128 bases).
     let sse = time(&|| {
+        // SAFETY: see the comment above the closures.
         let _ = unsafe {
             sse41::batched_extend_sse41_u8::<true>(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100)
         };
@@ -439,6 +440,7 @@ fn calibrate(have_512: bool, have_2: bool, have_sse: bool) -> Tier {
     let mut best_time = sse;
     if have_2 {
         let t = time(&|| {
+            // SAFETY: see the comment above the closures.
             let _ = unsafe {
                 avx2::batched_extend_avx2_u8::<true>(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100)
             };
@@ -452,6 +454,7 @@ fn calibrate(have_512: bool, have_2: bool, have_sse: bool) -> Tier {
     }
     if have_512 {
         let t = time(&|| {
+            // SAFETY: see the comment above the closures.
             let _ = unsafe {
                 avx512::batched_extend_avx512_u8::<true>(&jobs, 5, &mat, 6, 1, 6, 1, 100, 5, 100)
             };
@@ -480,27 +483,30 @@ unsafe fn sw_kernel_u8<const INL_SBT: bool>(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
-    match extend_tier() {
-        Tier::Avx512 => {
-            return avx512::batched_extend_avx512_u8::<{ INL_SBT }>(
-                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
+    // SAFETY: the caller upholds this function's `# Safety` contract.
+    unsafe {
+        match extend_tier() {
+            Tier::Avx512 => {
+                return avx512::batched_extend_avx512_u8::<{ INL_SBT }>(
+                    jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+            Tier::Avx2 => {
+                return avx2::batched_extend_avx2_u8::<{ INL_SBT }>(
+                    jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+            Tier::Sse41 => {
+                return sse41::batched_extend_sse41_u8::<{ INL_SBT }>(
+                    jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+            Tier::Scalar => {}
         }
-        Tier::Avx2 => {
-            return avx2::batched_extend_avx2_u8::<{ INL_SBT }>(
-                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
-        }
-        Tier::Sse41 => {
-            return sse41::batched_extend_sse41_u8::<{ INL_SBT }>(
-                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
-        }
-        Tier::Scalar => {}
+        batched_extend_scalar(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        )
     }
-    batched_extend_scalar(
-        jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-    )
 }
 
 /// # Safety
@@ -519,27 +525,30 @@ unsafe fn sw_kernel_i16<const INL_SBT: bool>(
     end_bonus: i32,
     zdrop: i32,
 ) -> Vec<ExtendResult> {
-    match extend_tier() {
-        Tier::Avx512 => {
-            return avx512::batched_extend_avx512_i16::<{ INL_SBT }>(
-                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
+    // SAFETY: the caller upholds this function's `# Safety` contract.
+    unsafe {
+        match extend_tier() {
+            Tier::Avx512 => {
+                return avx512::batched_extend_avx512_i16::<{ INL_SBT }>(
+                    jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+            Tier::Avx2 => {
+                return avx2::batched_extend_avx2_i16::<{ INL_SBT }>(
+                    jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+            Tier::Sse41 => {
+                return sse41::batched_extend_sse41_i16::<{ INL_SBT }>(
+                    jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+                )
+            }
+            Tier::Scalar => {}
         }
-        Tier::Avx2 => {
-            return avx2::batched_extend_avx2_i16::<{ INL_SBT }>(
-                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
-        }
-        Tier::Sse41 => {
-            return sse41::batched_extend_sse41_i16::<{ INL_SBT }>(
-                jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-            )
-        }
-        Tier::Scalar => {}
+        batched_extend_scalar(
+            jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
+        )
     }
-    batched_extend_scalar(
-        jobs, m, mat, o_del, e_del, o_ins, e_ins, w0, end_bonus, zdrop,
-    )
 }
 /// Element type / kernel alias for the current SIMD ISA: NEON on aarch64, AVX2 on x86_64.
 #[cfg(target_arch = "aarch64")]
@@ -628,6 +637,8 @@ fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u1
     // Whole 16-column blocks then lie wholly below or wholly at or past `cap`.
     debug_assert!(cap <= 128 && cap.is_multiple_of(16));
     let n = q.len();
+    // Same length as `q`, so the block loads below need no bounds check.
+    let t = &t[..n];
     let (mut bits, mut total) = (0u128, 0i32);
     #[cfg_attr(
         not(any(target_arch = "aarch64", target_arch = "x86_64")),
@@ -638,9 +649,10 @@ fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u1
     // SAFETY: NEON is part of the aarch64 baseline; every load reads 16 bytes below `n` of slices
     // `n` long.
     unsafe {
+        use bwa_core::simd::*;
         use std::arch::aarch64::*;
         while col + 16 <= n {
-            let (a, b) = (vld1q_u8(q.as_ptr().add(col)), vld1q_u8(t.as_ptr().add(col)));
+            let (a, b) = (ld_u8(q, col), ld_u8(t, col));
             if vmaxvq_u8(vmaxq_u8(a, b)) >= 4 {
                 return None;
             }
@@ -673,11 +685,12 @@ fn mismatch_scan(q: &[u8], t: &[u8], x_threshold: i32, cap: usize) -> Option<(u1
     // SAFETY: SSE2 is part of the x86_64 baseline; every load reads 16 bytes below `n` of slices
     // `n` long.
     unsafe {
+        use bwa_core::simd::*;
         use std::arch::x86_64::*;
         let three = _mm_set1_epi8(3);
         while col + 16 <= n {
-            let a = _mm_loadu_si128(q.as_ptr().add(col).cast());
-            let b = _mm_loadu_si128(t.as_ptr().add(col).cast());
+            let a = ld128(q, col);
+            let b = ld128(t, col);
             // A code >= 4 has a bit above the low two: `max(a, b, 3) != 3` finds it.
             let hi = _mm_max_epu8(_mm_max_epu8(a, b), three);
             if _mm_movemask_epi8(_mm_cmpeq_epi8(hi, three)) != 0xFFFF {
@@ -1170,6 +1183,7 @@ pub fn prefetch<T>(p: *const T) {
         std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
     }
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: as above.
     unsafe {
         std::arch::x86_64::_mm_prefetch(p.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
     }
@@ -2110,22 +2124,22 @@ pub(crate) fn fill_fast(dst: &mut [u8], b: u8) {
 /// with `a` the largest power of two `<= len`, so that the two cover the sequence: the boundary
 /// tile of `piece16` read without touching a byte outside it.
 ///
-/// # Safety
-/// `p` valid for `len` bytes, `1 <= len < 16`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-unsafe fn short_ends(p: *const u8, len: usize) -> (u64, u64, usize) {
+fn short_ends(s: &[u8]) -> (u64, u64, usize) {
+    let len = s.len();
+    debug_assert!((1..16).contains(&len));
     if len >= 8 {
-        let w = |o: usize| (p.add(o) as *const u64).read_unaligned();
+        let w = |o: usize| u64::from_ne_bytes(s[o..o + 8].try_into().unwrap());
         (w(0), w(len - 8), 8)
     } else if len >= 4 {
-        let w = |o: usize| u64::from((p.add(o) as *const u32).read_unaligned());
+        let w = |o: usize| u64::from(u32::from_ne_bytes(s[o..o + 4].try_into().unwrap()));
         (w(0), w(len - 4), 4)
     } else if len >= 2 {
-        let w = |o: usize| u64::from((p.add(o) as *const u16).read_unaligned());
+        let w = |o: usize| u64::from(u16::from_ne_bytes(s[o..o + 2].try_into().unwrap()));
         (w(0), w(len - 2), 2)
     } else {
-        (u64::from(*p), u64::from(*p), 1)
+        (u64::from(s[0]), u64::from(s[0]), 1)
     }
 }
 
@@ -2397,8 +2411,9 @@ fn block_mismatches(q: &[u8], t: &[u8]) -> Option<u64> {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: NEON is part of the aarch64 baseline; both loads read the 16 bytes asserted above.
     unsafe {
+        use bwa_core::simd::*;
         use std::arch::aarch64::*;
-        let (a, b) = (vld1q_u8(q.as_ptr()), vld1q_u8(t.as_ptr()));
+        let (a, b) = (ld_u8(q, 0), ld_u8(t, 0));
         if vmaxvq_u8(vmaxq_u8(a, b)) >= 4 {
             return None;
         }
@@ -2411,11 +2426,9 @@ fn block_mismatches(q: &[u8], t: &[u8]) -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: SSE2 is part of the x86_64 baseline; both loads read the 16 bytes asserted above.
     unsafe {
+        use bwa_core::simd::*;
         use std::arch::x86_64::*;
-        let (a, b) = (
-            _mm_loadu_si128(q.as_ptr() as *const __m128i),
-            _mm_loadu_si128(t.as_ptr() as *const __m128i),
-        );
+        let (a, b) = (ld128(q, 0), ld128(t, 0));
         // A code >= 4 has a bit above the low two; `max_epu8` then a compare against 3 finds it.
         if _mm_movemask_epi8(_mm_cmpeq_epi8(
             _mm_max_epu8(_mm_max_epu8(a, b), _mm_set1_epi8(3)),
@@ -2715,7 +2728,7 @@ macro_rules! define_sw_kernel {
         /// One `ExtendResult` per job in input order, byte-identical to `ksw_extend2` per job.
         #[target_feature(enable = $feat)]
         #[allow(clippy::too_many_arguments)]
-        pub unsafe fn $name<const INL_SBT: bool>(
+        pub fn $name<const INL_SBT: bool>(
             jobs: &[ExtendJob],
             m: usize,
             mat: &[i8],
@@ -2798,7 +2811,7 @@ macro_rules! define_sw_kernel {
                     tab[0] = (bias + i32::from(mat[0])) as $elem;
                     tab[1..4].fill((bias + i32::from(mat[1])) as $elem);
                 }
-                let $tp = tab.as_ptr() as *const u8;
+                let $tp: &[$elem; 32] = &tab;
                 $tblld
             };
             let twelve_v = $dup(if $tab5 { 4 } else { 12 });
@@ -3017,11 +3030,12 @@ macro_rules! define_sw_kernel {
                         st.end[l] = st.qlen[l] as $trk;
                         st.done[l] = false;
                     }
-                    let qlen_v = $lds(qlen_e.as_ptr());
-                    let mut ramp_v = $lds(ramp.as_ptr());
-                    for j in 1..=jmax {
+                    let qlen_v = $lds(&qlen_e, 0);
+                    let mut ramp_v = $lds(&ramp, 0);
+                    // One cut for the whole ramp, so the loop has no per-column bounds check.
+                    for (j, col) in (1..).zip(&mut eh.as_chunks_mut::<LANES>().0[1..=jmax]) {
                         let keep = $cge(qlen_v, $dup(j as $elem));
-                        $sts(eh.as_mut_ptr().add(j * LANES), $bsl(keep, ramp_v, zero_v));
+                        $sts(col, 0, $bsl(keep, ramp_v, zero_v));
                         ramp_v = $max($sub(ramp_v, e_ins_v), zero_v);
                     }
                 }
@@ -3142,10 +3156,23 @@ macro_rules! define_sw_kernel {
                             *run = false;
                             continue;
                         }
+                        // One `LANES`-vector per column, all four views cut to `lim`, the shortest:
+                        // that cut is provably in bounds, and every column loop below stops at
+                        // `min(lim)`, so LLVM drops the per-column bounds checks with no per-row
+                        // check either. The `min` is a no-op on every row whose columns are in
+                        // bounds, which the raw-pointer form required anyway (`gbeg >= 0` always;
+                        // the `max` tells LLVM so).
+                        let gbeg = gbeg.max(0);
+                        let (qc, ehh) = (qcode.as_chunks::<LANES>().0, eh_h.as_chunks_mut::<LANES>().0);
+                        let (ehe, sbc) = (eh_e.as_chunks_mut::<LANES>().0, sbt_buf.as_chunks_mut::<LANES>().0);
+                        let lim = qc.len().min(ehh.len()).min(ehe.len()).min(sbc.len());
+                        let (qc, ehh, ehe, sbc) = (&qc[..lim], &mut ehh[..lim], &mut ehe[..lim], &mut sbc[..lim]);
+                        debug_assert!(gend <= lim as i32);
+                        let gcols = (gend.max(0) as usize).min(lim);
 
                         // Move the row-local scalars into vectors. `h1_v` was just computed per lane
                         // (the first-column value), the rest start at their identity.
-                        let mut h1_v = $lds(h1.as_ptr());
+                        let mut h1_v = $lds(&h1, 0);
                         let mut f_v = zero_v;
                         let mut rowmax_v = zero_v;
                         // `mj = -1` as the C does; for the u8 kernel this is 255, which is fine because
@@ -3157,11 +3184,11 @@ macro_rules! define_sw_kernel {
                         // empty band. Inactive lanes' slots are written with computed values in the
                         // unmasked range and never read again: a lane never reactivates, and every
                         // reader is under `active`.
-                        let beg_v = $lds(beg_lane.as_ptr());
-                        let end_v = $lds(end_lane.as_ptr());
-                        let active_v = $ldu(active_lane.as_ptr());
+                        let beg_v = $lds(&beg_lane, 0);
+                        let end_v = $lds(&end_lane, 0);
+                        let active_v = $ldu(&active_lane, 0);
                         // All-ones, the value `band` provably takes in the unmasked range.
-                        let ones_v = $ldu([<$umask>::MAX; LANES].as_ptr());
+                        let ones_v = $ldu(&([<$umask>::MAX; LANES]), 0);
                         // First and last column of this row whose stored H or E is non-zero, per lane,
                         // kept by the column loop so the band tightening below reads them instead of
                         // scanning the row (fg-labs/bwa-mem3's `BSW8_NF_TRACK`). `unseen_v` is all-ones
@@ -3169,7 +3196,7 @@ macro_rules! define_sw_kernel {
                         let mut unseen_v = ones_v;
                         let mut first_v = zero_v;
                         let mut last_v = zero_v;
-                        let t_v = $lds(tcode.as_ptr().add(i as usize * LANES)); // this row's target base per lane
+                        let t_v = $lds(tcode, i as usize * LANES); // this row's target base per lane
                         let t_is_n = $cge(t_v, amb_v); // target base is N — constant across the row
                         let t_key = $bsl(t_is_n, twelve_v, t_v); // `tab_v`'s row half of the index
 
@@ -3186,9 +3213,8 @@ macro_rules! define_sw_kernel {
                         // cannot do itself, unlike the ALU rewrites of #48A and #48D which it had
                         // already done.
                         if !INL_SBT {
-                            for j in gbeg..gend {
-                                let col_base = j as usize * LANES;
-                                let q_v = $lds(qcode.as_ptr().add(col_base));
+                            for j in gbeg as usize..gcols {
+                                let q_v = $lds(&qc[j], 0);
                                 // One biased value per cell: N wins over the equality test, exactly as
                                 // the split form's `is_n` blend sat outermost on both halves.
                                 let sbt = if $sbt_tbl {
@@ -3199,7 +3225,7 @@ macro_rules! define_sw_kernel {
                                     let is_n = $orru(t_is_n, $cge(q_v, amb_v));
                                     $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
                                 };
-                                $sts(sbt_buf.as_mut_ptr().add(col_base), sbt);
+                                $sts(&mut sbc[j], 0, sbt);
                             }
                         }
 
@@ -3217,11 +3243,10 @@ macro_rules! define_sw_kernel {
                         // all-ones, so all nine fold away. Same shape as the rescue kernel's padding regime, and
                         // the same byte-identity argument: a provably constant mask folded, not a mask dropped.
                         macro_rules! column {
-                                    ($j:expr, $masked:literal, $share_oe:literal) => {{
+                                    ($j:expr, $masked:literal, $share_oe:literal, $qc:ident, $ehh:ident, $ehe:ident, $sbc:ident) => {{
                                         let j = $j;
                                     // Byte offset of column `j` in every SoA buffer (all lanes of that column
                                     // sit contiguously, which is the whole point of the layout).
-                                    let col_base = j as usize * LANES;
                                     // The column index itself broadcast to every lane, so the band compares
                                     // and the `mj` update can be done lane-wise against per-lane bounds.
                                     let j_v = $dup(j as $elem);
@@ -3257,7 +3282,7 @@ macro_rules! define_sw_kernel {
                                     // and, since the pre-pass went from a pair of values to one, half the loads
                                     // and half the stores the pre-pass form originally cost.
                                     let sbt = if INL_SBT {
-                                        let q_v = $lds(qcode.as_ptr().add(col_base));
+                                        let q_v = $lds(&$qc[j], 0);
                                         if $sbt_tbl {
                                             let ($tt, $tk, $tq) = (tab_v, t_key, q_v);
                                             $tblx
@@ -3267,23 +3292,23 @@ macro_rules! define_sw_kernel {
                                             $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
                                         }
                                     } else {
-                                        $lds(sbt_buf.as_ptr().add(col_base))
+                                        $lds(&$sbc[j], 0)
                                     };
 
-                                    let m_v = $lds(eh_h.as_ptr().add(col_base)); // H(i-1, j-1)
+                                    let m_v = $lds(&$ehh[j], 0); // H(i-1, j-1)
                                                                                  // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
                                                                                  // deletion state ENTERING cell (i, j), so it is indexed (i, j) here and in
                                                                                  // the scalar path. Same convention as the C ("eh[j] = { H(i-1,j-1), E(i,j) }",
                                                                                  // `ksw.cpp:479`); labelling it E(i-1, j) would make the two paths look like
                                                                                  // they hold different values when they hold the same one.
-                                    let e_v = $lds(eh_e.as_ptr().add(col_base)); // E(i, j)
+                                    let e_v = $lds(&$ehe[j], 0); // E(i, j)
 
                                     // eh_h[j] <- h1 (old) for in-band lanes; out-of-band keep old m_v.
                                     // The mask has to be applied on the *store*, not skipped around, because all
                                     // lanes share the store instruction: writing back the value just loaded is
                                     // how an out-of-band lane is left untouched.
                                     let h_st = if $masked { $bsl(band, h1_v, m_v) } else { h1_v };
-                                    $sts(eh_h.as_mut_ptr().add(col_base), h_st);
+                                    $sts(&mut $ehh[j], 0, h_st);
 
                                     // M = ((m + (bias + score)) - bias); m==0 -> local restart (0). Saturating
                                     // for u8, plain for signed; identical either way in the guaranteed range,
@@ -3325,7 +3350,7 @@ macro_rules! define_sw_kernel {
                                     let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
                                     let e_new = $max($sub(e_v, e_del_v), open_del_v);
                                     let e_st = if $masked { $bsl(band, e_new, e_v) } else { e_new };
-                                    $sts(eh_e.as_mut_ptr().add(col_base), e_st);
+                                    $sts(&mut $ehe[j], 0, e_st);
                                     // What the C's band scans test at this column, `eh[j].h == 0 &&
                                     // eh[j].e == 0`, on the values just stored.
                                     let dead = $ceqz($orr(h_st, e_st));
@@ -3363,25 +3388,41 @@ macro_rules! define_sw_kernel {
                         // bwa's stock `-O 6,6 -E 1,1` opens both gap kinds at one cost, so one `M - oe` feeds both
                         // recurrences. Tested per row, not per cell: this branch never moves and the column
                         // loops below stay free of it.
+                        // Each range runs in `usize` up to `hi <= lim`, the views' length, so LLVM folds
+                        // away the per-column bounds check on `qc`/`ehh`/`ehe`/`sbc` (it was 2
+                        // instructions and a branch per column of the hottest loop in the program). The
+                        // views are `column!` arguments so the macro reads these bindings.
                         if oe_del == oe_ins {
-                            for j in gbeg..fast_lo {
-                                column!(j, true, true);
+                            let (lo, hi) = (gbeg.max(0) as usize, (fast_lo.max(0) as usize).min(lim));
+                            debug_assert!(fast_lo.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, true, true, qc, ehh, ehe, sbc);
                             }
-                            for j in fast_lo..fast_hi {
-                                column!(j, false, true);
+                            let (lo, hi) = (fast_lo.max(0) as usize, (fast_hi.max(0) as usize).min(lim));
+                            debug_assert!(fast_hi.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, false, true, qc, ehh, ehe, sbc);
                             }
-                            for j in fast_hi.max(fast_lo)..gend {
-                                column!(j, true, true);
+                            let (lo, hi) = (fast_hi.max(fast_lo).max(0) as usize, (gend.max(0) as usize).min(lim));
+                            debug_assert!(gend.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, true, true, qc, ehh, ehe, sbc);
                             }
                         } else {
-                            for j in gbeg..fast_lo {
-                                column!(j, true, false);
+                            let (lo, hi) = (gbeg.max(0) as usize, (fast_lo.max(0) as usize).min(lim));
+                            debug_assert!(fast_lo.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, true, false, qc, ehh, ehe, sbc);
                             }
-                            for j in fast_lo..fast_hi {
-                                column!(j, false, false);
+                            let (lo, hi) = (fast_lo.max(0) as usize, (fast_hi.max(0) as usize).min(lim));
+                            debug_assert!(fast_hi.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, false, false, qc, ehh, ehe, sbc);
                             }
-                            for j in fast_hi.max(fast_lo)..gend {
-                                column!(j, true, false);
+                            let (lo, hi) = (fast_hi.max(fast_lo).max(0) as usize, (gend.max(0) as usize).min(lim));
+                            debug_assert!(gend.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, true, false, qc, ehh, ehe, sbc);
                             }
                         }
 
@@ -3396,15 +3437,15 @@ macro_rules! define_sw_kernel {
                         let mut h1_out = [0 as $elem; LANES];
                         let mut rowmax_out = [0 as $elem; LANES];
                         let mut mj_out = [0 as $elem; LANES];
-                        $sts(h1_out.as_mut_ptr(), h1_v);
-                        $sts(rowmax_out.as_mut_ptr(), rowmax_v);
-                        $sts(mj_out.as_mut_ptr(), mj_v);
+                        $sts(&mut h1_out, 0, h1_v);
+                        $sts(&mut rowmax_out, 0, rowmax_v);
+                        $sts(&mut mj_out, 0, mj_v);
                         let mut first_out = [0 as $elem; LANES];
                         let mut last_out = [0 as $elem; LANES];
                         let mut seen_out = [0 as $elem; LANES];
-                        $sts(first_out.as_mut_ptr(), first_v);
-                        $sts(last_out.as_mut_ptr(), last_v);
-                        $sts(seen_out.as_mut_ptr(), $bsl(unseen_v, zero_v, $dup(1 as $elem)));
+                        $sts(&mut first_out, 0, first_v);
+                        $sts(&mut last_out, 0, last_v);
+                        $sts(&mut seen_out, 0, $bsl(unseen_v, zero_v, $dup(1 as $elem)));
 
                         if $rowvec {
                             // SAFETY: as for `prologue16`.
@@ -3475,6 +3516,7 @@ macro_rules! define_sw_kernel {
                                 let mut last_live = i32::from(end[l]) - 1;
                                 // SAFETY: see above.
                                 while last_live >= i32::from(beg[l])
+                                    // SAFETY: `last_live` is within this lane's band `beg..end`, inside the row `hp` points to.
                                     && unsafe {
                                         *hp.add(last_live as usize * LANES + l) == 0
                                             && *ep.add(last_live as usize * LANES + l) == 0
@@ -3687,45 +3729,52 @@ macro_rules! define_sw_kernel {
 /// (no `band_width`).
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_row {
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
 
     /// Sixteen bytes from `p` widened to i16.
     #[target_feature(enable = "avx2")]
     unsafe fn widen16(p: *const u8) -> __m256i {
-        _mm256_cvtepu8_epi16(_mm_loadu_si128(p as *const __m128i))
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm256_cvtepu8_epi16(_mm_loadu_si128(p as *const __m128i)) }
     }
 
     /// Sixteen i16 in `0..256` narrowed to sixteen bytes stored at `p`.
     #[target_feature(enable = "avx2")]
     unsafe fn narrow16(p: *mut u8, v: __m256i) {
-        let b = _mm_packus_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
-        _mm_storeu_si128(p as *mut __m128i, b);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let b = _mm_packus_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+            _mm_storeu_si128(p as *mut __m128i, b);
+        }
     }
 
     /// One bit per i16 lane of a mask.
     #[target_feature(enable = "avx2")]
-    unsafe fn bits16(m: __m256i) -> u64 {
+    fn bits16(m: __m256i) -> u64 {
         let b = _mm_packs_epi16(_mm256_castsi256_si128(m), _mm256_extracti128_si256::<1>(m));
         _mm_movemask_epi8(b) as u32 as u64
     }
 
     #[target_feature(enable = "avx2")]
     unsafe fn ld(p: *const i16) -> __m256i {
-        _mm256_loadu_si256(p as *const __m256i)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm256_loadu_si256(p as *const __m256i) }
     }
 
     #[target_feature(enable = "avx2")]
     unsafe fn st(p: *mut i16, v: __m256i) {
-        _mm256_storeu_si256(p as *mut __m256i, v)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe { _mm256_storeu_si256(p as *mut __m256i, v) }
     }
 
     #[target_feature(enable = "avx2")]
-    unsafe fn sel(m: __m256i, t: __m256i, f: __m256i) -> __m256i {
+    fn sel(m: __m256i, t: __m256i, f: __m256i) -> __m256i {
         _mm256_blendv_epi8(f, t, m)
     }
 
     #[target_feature(enable = "avx2")]
-    unsafe fn hmin(v: __m256i) -> i16 {
+    fn hmin(v: __m256i) -> i16 {
         let x = _mm_min_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
         let x = _mm_min_epi16(x, _mm_srli_si128::<8>(x));
         let x = _mm_min_epi16(x, _mm_srli_si128::<4>(x));
@@ -3733,7 +3782,7 @@ pub(crate) mod x86_row {
     }
 
     #[target_feature(enable = "avx2")]
-    unsafe fn hmax(v: __m256i) -> i16 {
+    fn hmax(v: __m256i) -> i16 {
         let x = _mm_max_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
         let x = _mm_max_epi16(x, _mm_srli_si128::<8>(x));
         let x = _mm_max_epi16(x, _mm_srli_si128::<4>(x));
@@ -3759,49 +3808,52 @@ pub(crate) mod x86_row {
         beg: *mut i16,
         end: *mut i16,
     ) -> u64 {
-        let lb = _mm256_setr_epi16(
-            1,
-            2,
-            4,
-            8,
-            16,
-            32,
-            64,
-            128,
-            256,
-            512,
-            1024,
-            2048,
-            4096,
-            8192,
-            16384,
-            i16::MIN,
-        );
-        let zero = _mm256_setzero_si256();
-        let (one, two) = (_mm256_set1_epi16(1), _mm256_set1_epi16(2));
-        let mut scan = 0u64;
-        for o in (0..N).step_by(16) {
-            let b16 = ((live >> o) & 0xffff) as u16;
-            if b16 == 0 {
-                continue;
-            }
-            let m = _mm256_cmpeq_epi16(_mm256_and_si256(_mm256_set1_epi16(b16 as i16), lb), lb);
-            let e = ld(end.add(o));
-            let sn = _mm256_cmpgt_epi16(widen16(seen.add(o)), zero);
-            let fl = sel(sn, _mm256_min_epi16(widen16(first.add(o)), e), e);
-            st(beg.add(o), sel(m, fl, ld(beg.add(o))));
-            let lst = widen16(last.add(o));
-            let hz = _mm256_cmpeq_epi16(widen16(h1.add(o)), zero);
-            let ll = sel(hz, sel(sn, lst, _mm256_sub_epi16(fl, one)), e);
-            let need = _mm256_andnot_si256(
-                _mm256_cmpgt_epi16(e, lst),
-                _mm256_and_si256(m, _mm256_and_si256(hz, sn)),
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let lb = _mm256_setr_epi16(
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                i16::MIN,
             );
-            let ne = _mm256_min_epi16(_mm256_add_epi16(ll, two), ld(qlen.add(o)));
-            st(end.add(o), sel(_mm256_andnot_si256(need, m), ne, e));
-            scan |= bits16(need) << o;
+            let zero = _mm256_setzero_si256();
+            let (one, two) = (_mm256_set1_epi16(1), _mm256_set1_epi16(2));
+            let mut scan = 0u64;
+            for o in (0..N).step_by(16) {
+                let b16 = ((live >> o) & 0xffff) as u16;
+                if b16 == 0 {
+                    continue;
+                }
+                let m = _mm256_cmpeq_epi16(_mm256_and_si256(_mm256_set1_epi16(b16 as i16), lb), lb);
+                let e = ld(end.add(o));
+                let sn = _mm256_cmpgt_epi16(widen16(seen.add(o)), zero);
+                let fl = sel(sn, _mm256_min_epi16(widen16(first.add(o)), e), e);
+                st(beg.add(o), sel(m, fl, ld(beg.add(o))));
+                let lst = widen16(last.add(o));
+                let hz = _mm256_cmpeq_epi16(widen16(h1.add(o)), zero);
+                let ll = sel(hz, sel(sn, lst, _mm256_sub_epi16(fl, one)), e);
+                let need = _mm256_andnot_si256(
+                    _mm256_cmpgt_epi16(e, lst),
+                    _mm256_and_si256(m, _mm256_and_si256(hz, sn)),
+                );
+                let ne = _mm256_min_epi16(_mm256_add_epi16(ll, two), ld(qlen.add(o)));
+                st(end.add(o), sel(_mm256_andnot_si256(need, m), ne, e));
+                scan |= bits16(need) << o;
+            }
+            scan
         }
-        scan
     }
 
     /// As `neon_row::prologue`, over `N` lanes.
@@ -3828,60 +3880,63 @@ pub(crate) mod x86_row {
         active_lane: *mut u8,
         bias: u8,
     ) -> (i32, i32, i32, i32, u64) {
-        let iv = _mm256_set1_epi16(i as i16);
-        let i1 = _mm256_set1_epi16(i as i16 + 1);
-        let mut nbits = 0u64;
-        let zero = _mm256_setzero_si256();
-        let (one, ff) = (_mm256_set1_epi16(1), _mm256_set1_epi16(0xff));
-        let biasv = _mm256_set1_epi16(i16::from(bias));
-        // Exact: `h0 < 256`, so a penalty of 256 or more leaves 0 as the true one does.
-        let pen = _mm256_set1_epi16((o_del + e_del * (i + 1)).clamp(0, 256) as i16);
-        let (vmax, vmin) = (_mm256_set1_epi16(i16::MAX), _mm256_set1_epi16(i16::MIN));
-        let (mut gb, mut ge, mut fl, mut fh) = (vmax, zero, vmin, vmax);
-        for o in (0..N).step_by(16) {
-            let tl = ld(tlen.add(o));
-            let a = _mm256_andnot_si256(
-                _mm256_cmpgt_epi16(widen16(done.add(o) as *const u8), zero),
-                _mm256_cmpgt_epi16(tl, iv),
-            );
-            nbits |= bits16(_mm256_and_si256(a, _mm256_cmpgt_epi16(tl, i1))) << o;
-            let wv = ld(w.add(o));
-            let (b0, e0) = (ld(beg.add(o)), ld(end.add(o)));
-            let b = _mm256_max_epi16(b0, _mm256_sub_epi16(iv, wv));
-            let e = _mm256_min_epi16(
-                _mm256_min_epi16(e0, _mm256_add_epi16(_mm256_add_epi16(iv, wv), one)),
-                ld(qlen.add(o)),
-            );
-            st(beg.add(o), sel(a, b, b0));
-            st(end.add(o), sel(a, e, e0));
-            let h = _mm256_max_epi16(_mm256_sub_epi16(ld(h0.add(o)), pen), zero);
-            let hq = _mm256_and_si256(_mm256_and_si256(_mm256_cmpeq_epi16(b, zero), h), a);
-            gb = _mm256_min_epi16(gb, sel(a, b, vmax));
-            ge = _mm256_max_epi16(ge, sel(a, e, zero));
-            fl = _mm256_max_epi16(fl, sel(a, b, vmin));
-            fh = _mm256_min_epi16(fh, sel(a, e, vmax));
-            narrow16(h1.add(o), hq);
-            let xb = _mm256_and_si256(_mm256_xor_si256(_mm256_and_si256(b, ff), biasv), a);
-            let xe = _mm256_and_si256(_mm256_xor_si256(_mm256_and_si256(e, ff), biasv), a);
-            narrow16(beg_lane.add(o), xb);
-            narrow16(end_lane.add(o), xe);
-            narrow16(active_lane.add(o), _mm256_and_si256(a, ff));
-            narrow16(active.add(o) as *mut u8, _mm256_and_si256(a, one));
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let iv = _mm256_set1_epi16(i as i16);
+            let i1 = _mm256_set1_epi16(i as i16 + 1);
+            let mut nbits = 0u64;
+            let zero = _mm256_setzero_si256();
+            let (one, ff) = (_mm256_set1_epi16(1), _mm256_set1_epi16(0xff));
+            let biasv = _mm256_set1_epi16(i16::from(bias));
+            // Exact: `h0 < 256`, so a penalty of 256 or more leaves 0 as the true one does.
+            let pen = _mm256_set1_epi16((o_del + e_del * (i + 1)).clamp(0, 256) as i16);
+            let (vmax, vmin) = (_mm256_set1_epi16(i16::MAX), _mm256_set1_epi16(i16::MIN));
+            let (mut gb, mut ge, mut fl, mut fh) = (vmax, zero, vmin, vmax);
+            for o in (0..N).step_by(16) {
+                let tl = ld(tlen.add(o));
+                let a = _mm256_andnot_si256(
+                    _mm256_cmpgt_epi16(widen16(done.add(o) as *const u8), zero),
+                    _mm256_cmpgt_epi16(tl, iv),
+                );
+                nbits |= bits16(_mm256_and_si256(a, _mm256_cmpgt_epi16(tl, i1))) << o;
+                let wv = ld(w.add(o));
+                let (b0, e0) = (ld(beg.add(o)), ld(end.add(o)));
+                let b = _mm256_max_epi16(b0, _mm256_sub_epi16(iv, wv));
+                let e = _mm256_min_epi16(
+                    _mm256_min_epi16(e0, _mm256_add_epi16(_mm256_add_epi16(iv, wv), one)),
+                    ld(qlen.add(o)),
+                );
+                st(beg.add(o), sel(a, b, b0));
+                st(end.add(o), sel(a, e, e0));
+                let h = _mm256_max_epi16(_mm256_sub_epi16(ld(h0.add(o)), pen), zero);
+                let hq = _mm256_and_si256(_mm256_and_si256(_mm256_cmpeq_epi16(b, zero), h), a);
+                gb = _mm256_min_epi16(gb, sel(a, b, vmax));
+                ge = _mm256_max_epi16(ge, sel(a, e, zero));
+                fl = _mm256_max_epi16(fl, sel(a, b, vmin));
+                fh = _mm256_min_epi16(fh, sel(a, e, vmax));
+                narrow16(h1.add(o), hq);
+                let xb = _mm256_and_si256(_mm256_xor_si256(_mm256_and_si256(b, ff), biasv), a);
+                let xe = _mm256_and_si256(_mm256_xor_si256(_mm256_and_si256(e, ff), biasv), a);
+                narrow16(beg_lane.add(o), xb);
+                narrow16(end_lane.add(o), xe);
+                narrow16(active_lane.add(o), _mm256_and_si256(a, ff));
+                narrow16(active.add(o) as *mut u8, _mm256_and_si256(a, one));
+            }
+            // The sentinels map back to the i32 ones the scalar arm returns; every real value is
+            // in `0..256`.
+            let wide = |v: i16| match v {
+                i16::MAX => i32::MAX,
+                i16::MIN => i32::MIN,
+                v => i32::from(v),
+            };
+            (
+                wide(hmin(gb)),
+                i32::from(hmax(ge)),
+                wide(hmax(fl)),
+                wide(hmin(fh)),
+                nbits,
+            )
         }
-        // The sentinels map back to the i32 ones the scalar arm returns; every real value is
-        // in `0..256`.
-        let wide = |v: i16| match v {
-            i16::MAX => i32::MAX,
-            i16::MIN => i32::MIN,
-            v => i32::from(v),
-        };
-        (
-            wide(hmin(gb)),
-            i32::from(hmax(ge)),
-            wide(hmax(fl)),
-            wide(hmin(fh)),
-            nbits,
-        )
     }
 
     /// As `neon_row::epilogue`, over `N` lanes; returns one bit per lane still live.
@@ -3913,96 +3968,99 @@ pub(crate) mod x86_row {
         h0: *const i16,
         stop: Option<(i32, i32)>,
     ) -> u64 {
-        let iv = _mm256_set1_epi16(i as i16);
-        let zero = _mm256_setzero_si256();
-        let one = _mm256_set1_epi16(1);
-        // The z-drop test as in `neon_row::epilogue`: `L > min(a * e, 256)` (u16 product of
-        // the saturated `a` and `e`), where `L = mx - rm - zdrop < 256`, is exact.
-        let (ed, ei) = (
-            _mm256_set1_epi16(e_del.clamp(0, 255) as i16),
-            _mm256_set1_epi16(e_ins.clamp(0, 255) as i16),
-        );
-        let zd = _mm256_set1_epi16(zdrop.clamp(0, 1024) as i16);
-        let (c255, c256) = (_mm256_set1_epi16(255), _mm256_set1_epi16(256));
-        let zdrop_on = _mm256_set1_epi16(if zdrop > 0 { -1 } else { 0 });
-        // The exact stop's `(max_sc, end_bonus)`, clamped as in `neon_row::epilogue`.
-        let (sc_v, eb_v) = stop.map_or((zero, zero), |(sc, eb)| {
-            (
-                _mm256_set1_epi16(sc.clamp(0, 127) as i16),
-                _mm256_set1_epi16(eb.clamp(0, 1024) as i16),
-            )
-        });
-        let ivp1 = _mm256_set1_epi16(i as i16 + 1);
-        let mut live_bits = 0u64;
-        for o in (0..N).step_by(16) {
-            let a = _mm256_cmpgt_epi16(widen16(active.add(o) as *const u8), zero);
-            let h1 = widen16(h1_out.add(o));
-            let rm = widen16(rowmax_out.add(o));
-            let mj = widen16(mj_out.add(o));
-            let (mx, mi, mjj) = (ld(max.add(o)), ld(max_i.add(o)), ld(max_j.add(o)));
-            let gs = ld(gscore.add(o));
-            let g_upd = _mm256_andnot_si256(
-                _mm256_cmpgt_epi16(gs, h1),
-                _mm256_and_si256(a, _mm256_cmpeq_epi16(ld(end.add(o)), ld(qlen.add(o)))),
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let iv = _mm256_set1_epi16(i as i16);
+            let zero = _mm256_setzero_si256();
+            let one = _mm256_set1_epi16(1);
+            // The z-drop test as in `neon_row::epilogue`: `L > min(a * e, 256)` (u16 product of
+            // the saturated `a` and `e`), where `L = mx - rm - zdrop < 256`, is exact.
+            let (ed, ei) = (
+                _mm256_set1_epi16(e_del.clamp(0, 255) as i16),
+                _mm256_set1_epi16(e_ins.clamp(0, 255) as i16),
             );
-            st(max_ie.add(o), sel(g_upd, iv, ld(max_ie.add(o))));
-            let gs = sel(g_upd, h1, gs);
-            st(gscore.add(o), gs);
-            let improve = _mm256_and_si256(a, _mm256_cmpgt_epi16(rm, mx));
-            let off = _mm256_abs_epi16(_mm256_sub_epi16(mj, iv));
-            let (di, dj) = (_mm256_sub_epi16(iv, mi), _mm256_sub_epi16(mj, mjj));
-            let ad = _mm256_min_epu16(_mm256_abs_epi16(_mm256_sub_epi16(di, dj)), c255);
-            let dd = _mm256_mullo_epi16(ad, sel(_mm256_cmpgt_epi16(di, dj), ed, ei));
-            let l = _mm256_sub_epi16(_mm256_sub_epi16(mx, rm), zd);
-            let drops = _mm256_cmpgt_epi16(l, _mm256_min_epu16(dd, c256));
-            let mut dead = _mm256_and_si256(
-                a,
-                _mm256_or_si256(
-                    _mm256_cmpeq_epi16(rm, zero),
-                    _mm256_and_si256(_mm256_andnot_si256(improve, zdrop_on), drops),
-                ),
-            );
-            let mo = ld(max_off.add(o));
-            st(
-                max_off.add(o),
-                sel(
-                    _mm256_and_si256(improve, _mm256_cmpgt_epi16(off, mo)),
-                    off,
-                    mo,
-                ),
-            );
-            let mx = sel(improve, rm, mx);
-            if stop.is_some() {
-                // The exact stop (see `exact_stop_enabled`), on the updated `max` and `gscore`.
-                let b = ld(beg.add(o));
-                let rem = _mm256_sub_epi16(ld(tlen.add(o)), ivp1);
-                let steps = _mm256_min_epi16(rem, _mm256_sub_epi16(ld(qlen.add(o)), b));
-                let vmax = sel(
-                    _mm256_cmpeq_epi16(b, zero),
-                    _mm256_max_epi16(rm, ld(h0.add(o))),
-                    rm,
+            let zd = _mm256_set1_epi16(zdrop.clamp(0, 1024) as i16);
+            let (c255, c256) = (_mm256_set1_epi16(255), _mm256_set1_epi16(256));
+            let zdrop_on = _mm256_set1_epi16(if zdrop > 0 { -1 } else { 0 });
+            // The exact stop's `(max_sc, end_bonus)`, clamped as in `neon_row::epilogue`.
+            let (sc_v, eb_v) = stop.map_or((zero, zero), |(sc, eb)| {
+                (
+                    _mm256_set1_epi16(sc.clamp(0, 127) as i16),
+                    _mm256_set1_epi16(eb.clamp(0, 1024) as i16),
+                )
+            });
+            let ivp1 = _mm256_set1_epi16(i as i16 + 1);
+            let mut live_bits = 0u64;
+            for o in (0..N).step_by(16) {
+                let a = _mm256_cmpgt_epi16(widen16(active.add(o) as *const u8), zero);
+                let h1 = widen16(h1_out.add(o));
+                let rm = widen16(rowmax_out.add(o));
+                let mj = widen16(mj_out.add(o));
+                let (mx, mi, mjj) = (ld(max.add(o)), ld(max_i.add(o)), ld(max_j.add(o)));
+                let gs = ld(gscore.add(o));
+                let g_upd = _mm256_andnot_si256(
+                    _mm256_cmpgt_epi16(gs, h1),
+                    _mm256_and_si256(a, _mm256_cmpeq_epi16(ld(end.add(o)), ld(qlen.add(o)))),
                 );
-                let bound = _mm256_adds_epi16(vmax, _mm256_mullo_epi16(steps, sc_v));
-                let open = _mm256_or_si256(
-                    _mm256_cmpgt_epi16(bound, mx),
-                    _mm256_andnot_si256(
-                        _mm256_cmpgt_epi16(gs, bound),
-                        _mm256_cmpgt_epi16(_mm256_adds_epi16(bound, eb_v), mx),
+                st(max_ie.add(o), sel(g_upd, iv, ld(max_ie.add(o))));
+                let gs = sel(g_upd, h1, gs);
+                st(gscore.add(o), gs);
+                let improve = _mm256_and_si256(a, _mm256_cmpgt_epi16(rm, mx));
+                let off = _mm256_abs_epi16(_mm256_sub_epi16(mj, iv));
+                let (di, dj) = (_mm256_sub_epi16(iv, mi), _mm256_sub_epi16(mj, mjj));
+                let ad = _mm256_min_epu16(_mm256_abs_epi16(_mm256_sub_epi16(di, dj)), c255);
+                let dd = _mm256_mullo_epi16(ad, sel(_mm256_cmpgt_epi16(di, dj), ed, ei));
+                let l = _mm256_sub_epi16(_mm256_sub_epi16(mx, rm), zd);
+                let drops = _mm256_cmpgt_epi16(l, _mm256_min_epu16(dd, c256));
+                let mut dead = _mm256_and_si256(
+                    a,
+                    _mm256_or_si256(
+                        _mm256_cmpeq_epi16(rm, zero),
+                        _mm256_and_si256(_mm256_andnot_si256(improve, zdrop_on), drops),
                     ),
                 );
-                dead = _mm256_or_si256(dead, _mm256_andnot_si256(open, a));
+                let mo = ld(max_off.add(o));
+                st(
+                    max_off.add(o),
+                    sel(
+                        _mm256_and_si256(improve, _mm256_cmpgt_epi16(off, mo)),
+                        off,
+                        mo,
+                    ),
+                );
+                let mx = sel(improve, rm, mx);
+                if stop.is_some() {
+                    // The exact stop (see `exact_stop_enabled`), on the updated `max` and `gscore`.
+                    let b = ld(beg.add(o));
+                    let rem = _mm256_sub_epi16(ld(tlen.add(o)), ivp1);
+                    let steps = _mm256_min_epi16(rem, _mm256_sub_epi16(ld(qlen.add(o)), b));
+                    let vmax = sel(
+                        _mm256_cmpeq_epi16(b, zero),
+                        _mm256_max_epi16(rm, ld(h0.add(o))),
+                        rm,
+                    );
+                    let bound = _mm256_adds_epi16(vmax, _mm256_mullo_epi16(steps, sc_v));
+                    let open = _mm256_or_si256(
+                        _mm256_cmpgt_epi16(bound, mx),
+                        _mm256_andnot_si256(
+                            _mm256_cmpgt_epi16(gs, bound),
+                            _mm256_cmpgt_epi16(_mm256_adds_epi16(bound, eb_v), mx),
+                        ),
+                    );
+                    dead = _mm256_or_si256(dead, _mm256_andnot_si256(open, a));
+                }
+                st(max.add(o), mx);
+                st(max_i.add(o), sel(improve, iv, mi));
+                st(max_j.add(o), sel(improve, mj, mjj));
+                let d = _mm256_or_si256(
+                    widen16(done.add(o) as *const u8),
+                    _mm256_and_si256(dead, one),
+                );
+                narrow16(done.add(o) as *mut u8, d);
+                live_bits |= bits16(_mm256_andnot_si256(dead, a)) << o;
             }
-            st(max.add(o), mx);
-            st(max_i.add(o), sel(improve, iv, mi));
-            st(max_j.add(o), sel(improve, mj, mjj));
-            let d = _mm256_or_si256(
-                widen16(done.add(o) as *const u8),
-                _mm256_and_si256(dead, one),
-            );
-            narrow16(done.add(o) as *mut u8, d);
-            live_bits |= bits16(_mm256_andnot_si256(dead, a)) << o;
+            live_bits
         }
-        live_bits
     }
 
     /// Where the unpack network of [`t16`] leaves row `c`: vector `BITREV[c]`.
@@ -4015,11 +4073,14 @@ pub(crate) mod x86_row {
     /// # Safety
     /// `src` holds 16 rows of 16 bytes at stride `ss`, `dst` 16 at stride `ds`.
     pub(crate) unsafe fn t16(src: *const u8, ss: usize, dst: *mut u8, ds: usize) {
-        let mut v = [_mm_setzero_si128(); 16];
-        for (l, x) in v.iter_mut().enumerate() {
-            *x = _mm_loadu_si128(src.add(l * ss) as *const __m128i);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let mut v = [_mm_setzero_si128(); 16];
+            for (l, x) in v.iter_mut().enumerate() {
+                *x = _mm_loadu_si128(src.add(l * ss) as *const __m128i);
+            }
+            t16v(v, dst, ds);
         }
-        t16v(v, dst, ds);
     }
 
     /// [`t16`] on 16 rows already in registers: byte `c` of `v[l]` goes to byte `l` of the row at
@@ -4029,22 +4090,25 @@ pub(crate) mod x86_row {
     /// `dst` holds 16 rows at stride `ds`.
     #[inline(always)]
     unsafe fn t16v(v: [__m128i; 16], dst: *mut u8, ds: usize) {
-        macro_rules! round {
-            ($v:ident, $lo:ident, $hi:ident) => {{
-                let mut o = [_mm_setzero_si128(); 16];
-                for k in 0..8 {
-                    o[k] = $lo($v[2 * k], $v[2 * k + 1]);
-                    o[k + 8] = $hi($v[2 * k], $v[2 * k + 1]);
-                }
-                o
-            }};
-        }
-        let v = round!(v, _mm_unpacklo_epi8, _mm_unpackhi_epi8);
-        let v = round!(v, _mm_unpacklo_epi16, _mm_unpackhi_epi16);
-        let v = round!(v, _mm_unpacklo_epi32, _mm_unpackhi_epi32);
-        let v = round!(v, _mm_unpacklo_epi64, _mm_unpackhi_epi64);
-        for (c, &r) in BITREV.iter().enumerate() {
-            _mm_storeu_si128(dst.add(c * ds) as *mut __m128i, v[r]);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            macro_rules! round {
+                ($v:ident, $lo:ident, $hi:ident) => {{
+                    let mut o = [_mm_setzero_si128(); 16];
+                    for k in 0..8 {
+                        o[k] = $lo($v[2 * k], $v[2 * k + 1]);
+                        o[k + 8] = $hi($v[2 * k], $v[2 * k + 1]);
+                    }
+                    o
+                }};
+            }
+            let v = round!(v, _mm_unpacklo_epi8, _mm_unpackhi_epi8);
+            let v = round!(v, _mm_unpacklo_epi16, _mm_unpackhi_epi16);
+            let v = round!(v, _mm_unpacklo_epi32, _mm_unpackhi_epi32);
+            let v = round!(v, _mm_unpacklo_epi64, _mm_unpackhi_epi64);
+            for (c, &r) in BITREV.iter().enumerate() {
+                _mm_storeu_si128(dst.add(c * ds) as *mut __m128i, v[r]);
+            }
         }
     }
 
@@ -4059,11 +4123,11 @@ pub(crate) mod x86_row {
     /// SSSE3; `b` a multiple of 16 (so a sequence under 16 bytes has only the tile at 0).
     #[target_feature(enable = "ssse3")]
     #[inline]
-    pub(crate) unsafe fn piece16(seq: &[u8], b: usize) -> __m128i {
+    pub(crate) fn piece16(seq: &[u8], b: usize) -> __m128i {
         debug_assert_eq!(b % 16, 0);
-        let (p, len) = (seq.as_ptr(), seq.len());
+        let len = seq.len();
         if b + 16 <= len {
-            return _mm_loadu_si128(p.add(b) as *const __m128i);
+            return ld128(seq, b);
         }
         if b >= len {
             return _mm_setzero_si128();
@@ -4074,9 +4138,9 @@ pub(crate) mod x86_row {
         if len >= 16 {
             // `seq[b + t]` is byte `t + 16 - r` of the last 16.
             let idx = _mm_or_si128(_mm_add_epi8(iota, _mm_set1_epi8((16 - r) as i8)), past);
-            return _mm_shuffle_epi8(_mm_loadu_si128(p.add(len - 16) as *const __m128i), idx);
+            return _mm_shuffle_epi8(ld128(seq, len - 16), idx);
         }
-        let (lo, hi, a) = super::short_ends(p, len);
+        let (lo, hi, a) = super::short_ends(seq);
         // Byte `t < a` is byte `t` of `lo`; byte `a <= t < len` is byte `t - (len - a)` of `hi`.
         let low = _mm_cmplt_epi8(iota, _mm_set1_epi8(a as i8));
         let idx = _mm_or_si128(
@@ -4105,14 +4169,19 @@ pub(crate) mod x86_row {
         qcode: *mut u8,
         tcode: *mut u8,
     ) {
-        for blk in 0..N / 16 {
-            let js = jobs.get(blk * 16..).unwrap_or(&[]);
-            let q: [&[u8]; 16] = std::array::from_fn(|l| js.get(l).map_or(&[][..], |j| j.query));
-            let t: [&[u8]; 16] = std::array::from_fn(|l| js.get(l).map_or(&[][..], |j| j.target));
-            for (seqs, n, dst) in [(&q, cols, qcode), (&t, rows, tcode)] {
-                for b in (0..n).step_by(16) {
-                    let v = std::array::from_fn(|l| piece16(seqs[l], b));
-                    t16v(v, dst.add(b * N + blk * 16), N);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            for blk in 0..N / 16 {
+                let js = jobs.get(blk * 16..).unwrap_or(&[]);
+                let q: [&[u8]; 16] =
+                    std::array::from_fn(|l| js.get(l).map_or(&[][..], |j| j.query));
+                let t: [&[u8]; 16] =
+                    std::array::from_fn(|l| js.get(l).map_or(&[][..], |j| j.target));
+                for (seqs, n, dst) in [(&q, cols, qcode), (&t, rows, tcode)] {
+                    for b in (0..n).step_by(16) {
+                        let v = std::array::from_fn(|l| piece16(seqs[l], b));
+                        t16v(v, dst.add(b * N + blk * 16), N);
+                    }
                 }
             }
         }
@@ -4150,6 +4219,7 @@ pub(crate) mod x86_row {
                 (jobs.iter().map(|j| j.target.len()).max().unwrap() + 1).next_multiple_of(16);
             const N: usize = 32;
             let (mut q, mut t) = (vec![0u8; cols * N], vec![0u8; rows * N]);
+            // SAFETY: `q` and `t` hold `cols * N` and `rows * N` bytes, as `fill_soa` requires.
             unsafe { super::fill_soa::<N>(&jobs, cols, rows, q.as_mut_ptr(), t.as_mut_ptr()) };
             let (mut q0, mut t0) = (vec![0u8; cols * N], vec![0u8; rows * N]);
             for (l, j) in jobs.iter().enumerate() {
@@ -4213,6 +4283,7 @@ mod piece16_tests {
                     );
                 }
                 #[cfg(target_arch = "x86_64")]
+                // SAFETY: SSE2 is x86_64 baseline; the store is in bounds of the destination array.
                 unsafe {
                     std::arch::x86_64::_mm_storeu_si128(
                         got.as_mut_ptr().cast(),
@@ -4261,6 +4332,7 @@ mod tighten_tests {
             let seen: [u8; N] = std::array::from_fn(|_| (next() % 2) as u8);
             let h1: [u8; N] = std::array::from_fn(|_| (next() % 3) as u8);
             let (mut beg, mut e) = (beg0, end);
+            // SAFETY: the arrays are `N` lanes each, as `tighten` requires.
             let sc = unsafe {
                 row::tighten::<N>(
                     live,
@@ -4368,6 +4440,7 @@ mod tighten_tests {
             let (mut mx, mut mi, mut mjj) = (t(&max0), t(&max_i0), t(&max_j0));
             let (mut mie, mut gs, mut mo) = (t(&max_ie0), t(&gscore0), t(&max_off0));
             let mut done = done0;
+            // SAFETY: the arrays are `N` lanes each, as `epilogue` requires.
             let live = unsafe {
                 row::epilogue::<N>(
                     i,
@@ -4446,6 +4519,7 @@ mod tighten_tests {
 /// a select, over 16 lanes as two `int16x8_t` (`trk = i16`: every index and score is below 256).
 #[cfg(target_arch = "aarch64")]
 mod neon_row {
+    use bwa_core::simd::*;
     use std::arch::aarch64::*;
 
     /// As `x86_row::tighten`, over 16 lanes as two `int16x8_t`.
@@ -4464,37 +4538,40 @@ mod neon_row {
         beg: *mut i16,
         end: *mut i16,
     ) -> u64 {
-        debug_assert!(N == 16);
-        const LB: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-        let lv = vcombine_u8(vdup_n_u8(live as u8), vdup_n_u8((live >> 8) as u8));
-        let m = widen_mask(vtstq_u8(lv, vld1q_u8(LB.as_ptr())));
-        let sn = widen_mask(vld1q_u8(seen));
-        let hz = widen_mask(vceqzq_u8(vld1q_u8(h1)));
-        let (fs, ls) = (widen_u8(vld1q_u8(first)), widen_u8(vld1q_u8(last)));
-        let (one, two) = (vdupq_n_s16(1), vdupq_n_s16(2));
-        let mut need = [vdupq_n_s16(0); 2];
-        for k in 0..2 {
-            let e = vld1q_s16(end.add(8 * k));
-            let fl = vbslq_s16(sn[k], vminq_s16(fs[k], e), e);
-            vst1q_s16(
-                beg.add(8 * k),
-                vbslq_s16(m[k], fl, vld1q_s16(beg.add(8 * k))),
-            );
-            let ll = vbslq_s16(hz[k], vbslq_s16(sn[k], ls[k], vsubq_s16(fl, one)), e);
-            let nd = vandq_u16(
-                vandq_u16(m[k], hz[k]),
-                vandq_u16(sn[k], vcgeq_s16(ls[k], e)),
-            );
-            let ne = vminq_s16(vaddq_s16(ll, two), vld1q_s16(qlen.add(8 * k)));
-            vst1q_s16(end.add(8 * k), vbslq_s16(vbicq_u16(m[k], nd), ne, e));
-            need[k] = vreinterpretq_s16_u16(nd);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            debug_assert!(N == 16);
+            const LB: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let lv = vcombine_u8(vdup_n_u8(live as u8), vdup_n_u8((live >> 8) as u8));
+            let m = widen_mask(vtstq_u8(lv, ld_u8(&LB, 0)));
+            let sn = widen_mask(vld1q_u8(seen));
+            let hz = widen_mask(vceqzq_u8(vld1q_u8(h1)));
+            let (fs, ls) = (widen_u8(vld1q_u8(first)), widen_u8(vld1q_u8(last)));
+            let (one, two) = (vdupq_n_s16(1), vdupq_n_s16(2));
+            let mut need = [vdupq_n_s16(0); 2];
+            for k in 0..2 {
+                let e = vld1q_s16(end.add(8 * k));
+                let fl = vbslq_s16(sn[k], vminq_s16(fs[k], e), e);
+                vst1q_s16(
+                    beg.add(8 * k),
+                    vbslq_s16(m[k], fl, vld1q_s16(beg.add(8 * k))),
+                );
+                let ll = vbslq_s16(hz[k], vbslq_s16(sn[k], ls[k], vsubq_s16(fl, one)), e);
+                let nd = vandq_u16(
+                    vandq_u16(m[k], hz[k]),
+                    vandq_u16(sn[k], vcgeq_s16(ls[k], e)),
+                );
+                let ne = vminq_s16(vaddq_s16(ll, two), vld1q_s16(qlen.add(8 * k)));
+                vst1q_s16(end.add(8 * k), vbslq_s16(vbicq_u16(m[k], nd), ne, e));
+                need[k] = vreinterpretq_s16_u16(nd);
+            }
+            u64::from(bits(narrow_u8(need)))
         }
-        u64::from(bits(narrow_u8(need)))
     }
 
     /// A 16-lane byte mask (0/1 or 0/0xff per lane) widened to two i16 lane masks.
     #[target_feature(enable = "neon")]
-    unsafe fn widen_mask(m: uint8x16_t) -> [uint16x8_t; 2] {
+    fn widen_mask(m: uint8x16_t) -> [uint16x8_t; 2] {
         let s = vreinterpretq_s8_u8(vtstq_u8(m, m)); // 0xff where nonzero
         [
             vreinterpretq_u16_s16(vmovl_s8(vget_low_s8(s))),
@@ -4504,7 +4581,7 @@ mod neon_row {
 
     /// Sixteen bytes widened to two i16 vectors.
     #[target_feature(enable = "neon")]
-    unsafe fn widen_u8(v: uint8x16_t) -> [int16x8_t; 2] {
+    fn widen_u8(v: uint8x16_t) -> [int16x8_t; 2] {
         [
             vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v))),
             vreinterpretq_s16_u16(vmovl_high_u8(v)),
@@ -4513,19 +4590,19 @@ mod neon_row {
 
     /// Two i16 vectors narrowed to sixteen bytes (the low byte of each lane).
     #[target_feature(enable = "neon")]
-    unsafe fn narrow_u8(v: [int16x8_t; 2]) -> uint8x16_t {
+    fn narrow_u8(v: [int16x8_t; 2]) -> uint8x16_t {
         vuzp1q_u8(vreinterpretq_u8_s16(v[0]), vreinterpretq_u8_s16(v[1]))
     }
 
     /// Two i16 lane masks as one 16-lane byte mask.
     #[target_feature(enable = "neon")]
-    unsafe fn narrow_mask(v: [uint16x8_t; 2]) -> uint8x16_t {
+    fn narrow_mask(v: [uint16x8_t; 2]) -> uint8x16_t {
         vuzp1q_u8(vreinterpretq_u8_u16(v[0]), vreinterpretq_u8_u16(v[1]))
     }
 
     /// One bit per lane of a 16-lane byte mask.
     #[target_feature(enable = "neon")]
-    unsafe fn bits(m: uint8x16_t) -> u32 {
+    fn bits(m: uint8x16_t) -> u32 {
         let n = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
             m,
         ))));
@@ -4564,69 +4641,72 @@ mod neon_row {
         active_lane: *mut u8,
         _bias: u8,
     ) -> (i32, i32, i32, i32, u64) {
-        debug_assert!(N == 16 && _bias == 0);
-        let iv = vdupq_n_s16(i as i16);
-        let i1 = vdupq_n_s16(i as i16 + 1);
-        let zero = vdupq_n_s16(0);
-        let not_done = widen_mask(vceqzq_u8(vld1q_u8(done as *const u8)));
-        // Exact: `h0 < 256`, so a penalty of 256 or more leaves 0 as the true one does.
-        let pen = vdupq_n_s16((o_del + e_del * (i + 1)).clamp(0, 256) as i16);
-        let (mut bq, mut wq, mut hq) = ([zero; 2], [zero; 2], [zero; 2]);
-        let (mut act, mut nxt) = ([vdupq_n_u16(0); 2], [vdupq_n_u16(0); 2]);
-        let (mut gb, mut ge) = ([vdupq_n_s16(i16::MAX); 2], [zero; 2]);
-        let (mut fl, mut fh) = ([vdupq_n_s16(i16::MIN); 2], [vdupq_n_s16(i16::MAX); 2]);
-        for q in 0..2 {
-            let o = 8 * q;
-            let tl = vld1q_s16(tlen.add(o));
-            let a = vandq_u16(not_done[q], vcltq_s16(iv, tl));
-            let wv = vld1q_s16(w.add(o));
-            let (b0, e0) = (vld1q_s16(beg.add(o)), vld1q_s16(end.add(o)));
-            let b = vmaxq_s16(b0, vsubq_s16(iv, wv));
-            let e = vminq_s16(
-                vminq_s16(e0, vaddq_s16(vaddq_s16(iv, wv), vdupq_n_s16(1))),
-                vld1q_s16(qlen.add(o)),
-            );
-            vst1q_s16(beg.add(o), vbslq_s16(a, b, b0));
-            vst1q_s16(end.add(o), vbslq_s16(a, e, e0));
-            let h = vmaxq_s16(vsubq_s16(vld1q_s16(h0.add(o)), pen), zero);
-            hq[q] = vandq_s16(vbslq_s16(vceqzq_s16(b), h, zero), vreinterpretq_s16_u16(a));
-            gb[q] = vbslq_s16(a, b, gb[q]);
-            ge[q] = vbslq_s16(a, e, ge[q]);
-            fl[q] = vbslq_s16(a, b, fl[q]);
-            fh[q] = vbslq_s16(a, e, fh[q]);
-            bq[q] = vandq_s16(b, vreinterpretq_s16_u16(a));
-            wq[q] = vandq_s16(vmaxq_s16(vsubq_s16(e, b), zero), vreinterpretq_s16_u16(a));
-            act[q] = a;
-            nxt[q] = vandq_u16(a, vcltq_s16(i1, tl));
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            debug_assert!(N == 16 && _bias == 0);
+            let iv = vdupq_n_s16(i as i16);
+            let i1 = vdupq_n_s16(i as i16 + 1);
+            let zero = vdupq_n_s16(0);
+            let not_done = widen_mask(vceqzq_u8(vld1q_u8(done as *const u8)));
+            // Exact: `h0 < 256`, so a penalty of 256 or more leaves 0 as the true one does.
+            let pen = vdupq_n_s16((o_del + e_del * (i + 1)).clamp(0, 256) as i16);
+            let (mut bq, mut wq, mut hq) = ([zero; 2], [zero; 2], [zero; 2]);
+            let (mut act, mut nxt) = ([vdupq_n_u16(0); 2], [vdupq_n_u16(0); 2]);
+            let (mut gb, mut ge) = ([vdupq_n_s16(i16::MAX); 2], [zero; 2]);
+            let (mut fl, mut fh) = ([vdupq_n_s16(i16::MIN); 2], [vdupq_n_s16(i16::MAX); 2]);
+            for q in 0..2 {
+                let o = 8 * q;
+                let tl = vld1q_s16(tlen.add(o));
+                let a = vandq_u16(not_done[q], vcltq_s16(iv, tl));
+                let wv = vld1q_s16(w.add(o));
+                let (b0, e0) = (vld1q_s16(beg.add(o)), vld1q_s16(end.add(o)));
+                let b = vmaxq_s16(b0, vsubq_s16(iv, wv));
+                let e = vminq_s16(
+                    vminq_s16(e0, vaddq_s16(vaddq_s16(iv, wv), vdupq_n_s16(1))),
+                    vld1q_s16(qlen.add(o)),
+                );
+                vst1q_s16(beg.add(o), vbslq_s16(a, b, b0));
+                vst1q_s16(end.add(o), vbslq_s16(a, e, e0));
+                let h = vmaxq_s16(vsubq_s16(vld1q_s16(h0.add(o)), pen), zero);
+                hq[q] = vandq_s16(vbslq_s16(vceqzq_s16(b), h, zero), vreinterpretq_s16_u16(a));
+                gb[q] = vbslq_s16(a, b, gb[q]);
+                ge[q] = vbslq_s16(a, e, ge[q]);
+                fl[q] = vbslq_s16(a, b, fl[q]);
+                fh[q] = vbslq_s16(a, e, fh[q]);
+                bq[q] = vandq_s16(b, vreinterpretq_s16_u16(a));
+                wq[q] = vandq_s16(vmaxq_s16(vsubq_s16(e, b), zero), vreinterpretq_s16_u16(a));
+                act[q] = a;
+                nxt[q] = vandq_u16(a, vcltq_s16(i1, tl));
+            }
+            vst1q_u8(h1, narrow_u8(hq));
+            vst1q_u8(beg_lane, narrow_u8(bq));
+            vst1q_u8(end_lane, narrow_u8(wq));
+            let a8 = narrow_mask(act);
+            vst1q_u8(active_lane, a8);
+            vst1q_u8(active as *mut u8, vandq_u8(a8, vdupq_n_u8(1)));
+            // The sentinels map back to the i32 ones the scalar arm returns; every real value is
+            // in `0..256`.
+            let gb = vminvq_s16(vminq_s16(gb[0], gb[1]));
+            let gb = if gb == i16::MAX {
+                i32::MAX
+            } else {
+                i32::from(gb)
+            };
+            let ge = i32::from(vmaxvq_s16(vmaxq_s16(ge[0], ge[1])));
+            let fl = vmaxvq_s16(vmaxq_s16(fl[0], fl[1]));
+            let fl = if fl == i16::MIN {
+                i32::MIN
+            } else {
+                i32::from(fl)
+            };
+            let fh = vminvq_s16(vminq_s16(fh[0], fh[1]));
+            let fh = if fh == i16::MAX {
+                i32::MAX
+            } else {
+                i32::from(fh)
+            };
+            (gb, ge, fl, fh, u64::from(bits(narrow_mask(nxt))))
         }
-        vst1q_u8(h1, narrow_u8(hq));
-        vst1q_u8(beg_lane, narrow_u8(bq));
-        vst1q_u8(end_lane, narrow_u8(wq));
-        let a8 = narrow_mask(act);
-        vst1q_u8(active_lane, a8);
-        vst1q_u8(active as *mut u8, vandq_u8(a8, vdupq_n_u8(1)));
-        // The sentinels map back to the i32 ones the scalar arm returns; every real value is
-        // in `0..256`.
-        let gb = vminvq_s16(vminq_s16(gb[0], gb[1]));
-        let gb = if gb == i16::MAX {
-            i32::MAX
-        } else {
-            i32::from(gb)
-        };
-        let ge = i32::from(vmaxvq_s16(vmaxq_s16(ge[0], ge[1])));
-        let fl = vmaxvq_s16(vmaxq_s16(fl[0], fl[1]));
-        let fl = if fl == i16::MIN {
-            i32::MIN
-        } else {
-            i32::from(fl)
-        };
-        let fh = vminvq_s16(vminq_s16(fh[0], fh[1]));
-        let fh = if fh == i16::MAX {
-            i32::MAX
-        } else {
-            i32::from(fh)
-        };
-        (gb, ge, fl, fh, u64::from(bits(narrow_mask(nxt))))
     }
 
     /// Bytes `[b, b + 16)` of `seq`, zero past its end, read without touching memory outside
@@ -4640,23 +4720,23 @@ mod neon_row {
     /// NEON; `b` a multiple of 16 (so a sequence under 16 bytes has only the tile at 0).
     #[target_feature(enable = "neon")]
     #[inline]
-    pub(crate) unsafe fn piece16(seq: &[u8], b: usize) -> uint8x16_t {
+    pub(crate) fn piece16(seq: &[u8], b: usize) -> uint8x16_t {
         debug_assert_eq!(b % 16, 0);
-        let (p, len) = (seq.as_ptr(), seq.len());
+        let len = seq.len();
         if b + 16 <= len {
-            return vld1q_u8(p.add(b));
+            return ld_u8(seq, b);
         }
         if b >= len {
             return vdupq_n_u8(0);
         }
         const IOTA: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        let iota = vld1q_u8(IOTA.as_ptr());
+        let iota = ld_u8(&IOTA, 0);
         if len >= 16 {
             // `seq[b + t]` is byte `t + 16 - r` of the last 16, `r = len - b`.
             let idx = vaddq_u8(iota, vdupq_n_u8((16 - (len - b)) as u8));
-            return vqtbl1q_u8(vld1q_u8(p.add(len - 16)), idx);
+            return vqtbl1q_u8(ld_u8(seq, len - 16), idx);
         }
-        let (lo, hi, a) = super::short_ends(p, len);
+        let (lo, hi, a) = super::short_ends(seq);
         // Byte `t < a` is byte `t` of `lo`; byte `a <= t < len` is byte `t - (len - a)` of `hi`.
         let idx = vbslq_u8(
             vcltq_u8(iota, vdupq_n_u8(a as u8)),
@@ -4685,14 +4765,17 @@ mod neon_row {
         qcode: *mut u8,
         tcode: *mut u8,
     ) {
-        debug_assert!(N == 16 && jobs.len() <= 16);
-        let q: [&[u8]; 16] = std::array::from_fn(|l| jobs.get(l).map_or(&[][..], |j| j.query));
-        let t: [&[u8]; 16] = std::array::from_fn(|l| jobs.get(l).map_or(&[][..], |j| j.target));
-        for (seqs, n, dst) in [(&q, cols, qcode), (&t, rows, tcode)] {
-            for b in (0..n).step_by(16) {
-                let v = std::array::from_fn(|l| piece16(seqs[l], b));
-                for (k, x) in crate::rescue_band::neon::transpose16(v).iter().enumerate() {
-                    vst1q_u8(dst.add((b + k) * 16), *x);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            debug_assert!(N == 16 && jobs.len() <= 16);
+            let q: [&[u8]; 16] = std::array::from_fn(|l| jobs.get(l).map_or(&[][..], |j| j.query));
+            let t: [&[u8]; 16] = std::array::from_fn(|l| jobs.get(l).map_or(&[][..], |j| j.target));
+            for (seqs, n, dst) in [(&q, cols, qcode), (&t, rows, tcode)] {
+                for b in (0..n).step_by(16) {
+                    let v = std::array::from_fn(|l| piece16(seqs[l], b));
+                    for (k, x) in crate::rescue_band::neon::transpose16(v).iter().enumerate() {
+                        vst1q_u8(dst.add((b + k) * 16), *x);
+                    }
                 }
             }
         }
@@ -4728,97 +4811,101 @@ mod neon_row {
         h0: *const i16,
         stop: Option<(i32, i32)>,
     ) -> u64 {
-        debug_assert!(N == 16);
-        let iv = vdupq_n_s16(i as i16);
-        let act = widen_mask(vld1q_u8(active as *const u8));
-        let h1 = widen_u8(vld1q_u8(h1_out));
-        let rm = widen_u8(vld1q_u8(rowmax_out));
-        let mj = widen_u8(vld1q_u8(mj_out));
-        // The z-drop test `mx - rm - a * e > zdrop`, with `a = |di - dj|` and `e` the gap extend
-        // of the longer side, as `L > 0 && L > a * e` for `L = mx - rm - zdrop`. Exact in 16
-        // bits: `mx - rm < 256`, so a `zdrop` past 1024 never fires either way, and `a` and `e`
-        // saturated at 255 keep `a * e` (u16) on the same side of any `L < 256`.
-        let ed = vdupq_n_u16(e_del.clamp(0, 255) as u16);
-        let ei = vdupq_n_u16(e_ins.clamp(0, 255) as u16);
-        let zd = vdupq_n_s16(zdrop.clamp(0, 1024) as i16);
-        let c255 = vdupq_n_u16(255);
-        let zdrop_on = vdupq_n_u16(if zdrop > 0 { !0 } else { 0 });
-        // The exact stop's `(max_sc, end_bonus)`, clamped where the i16 test keeps its outcome:
-        // `steps <= qlen < 256`, so `max_sc <= 127` keeps `B` below 2^15; past 1024 (or below 0)
-        // the `end_bonus` arm is false (or implied by `B <= max`) either way.
-        let (sc_v, eb_v) = stop.map_or((vdupq_n_s16(0), vdupq_n_s16(0)), |(sc, eb)| {
-            (
-                vdupq_n_s16(sc.clamp(0, 127) as i16),
-                vdupq_n_s16(eb.clamp(0, 1024) as i16),
-            )
-        });
-        let ivp1 = vdupq_n_s16(i as i16 + 1);
-        let mut live = [vdupq_n_u16(0); 2];
-        for q in 0..2 {
-            let o = 8 * q;
-            let a = act[q];
-            let (mx, mi, mjj) = (
-                vld1q_s16(max.add(o)),
-                vld1q_s16(max_i.add(o)),
-                vld1q_s16(max_j.add(o)),
-            );
-            let gs = vld1q_s16(gscore.add(o));
-            let g_upd = vandq_u16(
-                vandq_u16(a, vceqq_s16(vld1q_s16(end.add(o)), vld1q_s16(qlen.add(o)))),
-                vcleq_s16(gs, h1[q]),
-            );
-            vst1q_s16(
-                max_ie.add(o),
-                vbslq_s16(g_upd, iv, vld1q_s16(max_ie.add(o))),
-            );
-            let gs = vbslq_s16(g_upd, h1[q], gs);
-            vst1q_s16(gscore.add(o), gs);
-            let improve = vandq_u16(a, vcgtq_s16(rm[q], mx));
-            // `mj` is meaningful once the row max is positive; a zero row terminates the lane,
-            // and every use of `mj` below is selected away otherwise.
-            let off = vabdq_s16(mj[q], iv);
-            let (di, dj) = (vsubq_s16(iv, mi), vsubq_s16(mj[q], mjj));
-            let ad = vminq_u16(vreinterpretq_u16_s16(vabdq_s16(di, dj)), c255);
-            let dd = vmulq_u16(ad, vbslq_u16(vcgtq_s16(di, dj), ed, ei));
-            let l = vsubq_s16(vsubq_s16(mx, rm[q]), zd);
-            let drops = vandq_u16(vcgtzq_s16(l), vcgtq_u16(vreinterpretq_u16_s16(l), dd));
-            let mut dead = vandq_u16(
-                a,
-                vorrq_u16(
-                    vceqzq_s16(rm[q]),
-                    vandq_u16(vbicq_u16(zdrop_on, improve), drops),
-                ),
-            );
-            let mo = vld1q_s16(max_off.add(o));
-            vst1q_s16(
-                max_off.add(o),
-                vbslq_s16(vandq_u16(improve, vcgtq_s16(off, mo)), off, mo),
-            );
-            let mx = vbslq_s16(improve, rm[q], mx);
-            if stop.is_some() {
-                // The exact stop (see `exact_stop_enabled`), on the updated `max` and `gscore`.
-                let b = vld1q_s16(beg.add(o));
-                let rem = vsubq_s16(vld1q_s16(tlen.add(o)), ivp1);
-                let steps = vminq_s16(rem, vsubq_s16(vld1q_s16(qlen.add(o)), b));
-                let vmax = vbslq_s16(vceqzq_s16(b), vmaxq_s16(rm[q], vld1q_s16(h0.add(o))), rm[q]);
-                let bound = vqaddq_s16(vmax, vmulq_s16(steps, sc_v));
-                let open = vorrq_u16(
-                    vcgtq_s16(bound, mx),
-                    vbicq_u16(vcgtq_s16(vqaddq_s16(bound, eb_v), mx), vcgtq_s16(gs, bound)),
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            debug_assert!(N == 16);
+            let iv = vdupq_n_s16(i as i16);
+            let act = widen_mask(vld1q_u8(active as *const u8));
+            let h1 = widen_u8(vld1q_u8(h1_out));
+            let rm = widen_u8(vld1q_u8(rowmax_out));
+            let mj = widen_u8(vld1q_u8(mj_out));
+            // The z-drop test `mx - rm - a * e > zdrop`, with `a = |di - dj|` and `e` the gap extend
+            // of the longer side, as `L > 0 && L > a * e` for `L = mx - rm - zdrop`. Exact in 16
+            // bits: `mx - rm < 256`, so a `zdrop` past 1024 never fires either way, and `a` and `e`
+            // saturated at 255 keep `a * e` (u16) on the same side of any `L < 256`.
+            let ed = vdupq_n_u16(e_del.clamp(0, 255) as u16);
+            let ei = vdupq_n_u16(e_ins.clamp(0, 255) as u16);
+            let zd = vdupq_n_s16(zdrop.clamp(0, 1024) as i16);
+            let c255 = vdupq_n_u16(255);
+            let zdrop_on = vdupq_n_u16(if zdrop > 0 { !0 } else { 0 });
+            // The exact stop's `(max_sc, end_bonus)`, clamped where the i16 test keeps its outcome:
+            // `steps <= qlen < 256`, so `max_sc <= 127` keeps `B` below 2^15; past 1024 (or below 0)
+            // the `end_bonus` arm is false (or implied by `B <= max`) either way.
+            let (sc_v, eb_v) = stop.map_or((vdupq_n_s16(0), vdupq_n_s16(0)), |(sc, eb)| {
+                (
+                    vdupq_n_s16(sc.clamp(0, 127) as i16),
+                    vdupq_n_s16(eb.clamp(0, 1024) as i16),
+                )
+            });
+            let ivp1 = vdupq_n_s16(i as i16 + 1);
+            let mut live = [vdupq_n_u16(0); 2];
+            for q in 0..2 {
+                let o = 8 * q;
+                let a = act[q];
+                let (mx, mi, mjj) = (
+                    vld1q_s16(max.add(o)),
+                    vld1q_s16(max_i.add(o)),
+                    vld1q_s16(max_j.add(o)),
                 );
-                dead = vorrq_u16(dead, vbicq_u16(a, open));
+                let gs = vld1q_s16(gscore.add(o));
+                let g_upd = vandq_u16(
+                    vandq_u16(a, vceqq_s16(vld1q_s16(end.add(o)), vld1q_s16(qlen.add(o)))),
+                    vcleq_s16(gs, h1[q]),
+                );
+                vst1q_s16(
+                    max_ie.add(o),
+                    vbslq_s16(g_upd, iv, vld1q_s16(max_ie.add(o))),
+                );
+                let gs = vbslq_s16(g_upd, h1[q], gs);
+                vst1q_s16(gscore.add(o), gs);
+                let improve = vandq_u16(a, vcgtq_s16(rm[q], mx));
+                // `mj` is meaningful once the row max is positive; a zero row terminates the lane,
+                // and every use of `mj` below is selected away otherwise.
+                let off = vabdq_s16(mj[q], iv);
+                let (di, dj) = (vsubq_s16(iv, mi), vsubq_s16(mj[q], mjj));
+                let ad = vminq_u16(vreinterpretq_u16_s16(vabdq_s16(di, dj)), c255);
+                let dd = vmulq_u16(ad, vbslq_u16(vcgtq_s16(di, dj), ed, ei));
+                let l = vsubq_s16(vsubq_s16(mx, rm[q]), zd);
+                let drops = vandq_u16(vcgtzq_s16(l), vcgtq_u16(vreinterpretq_u16_s16(l), dd));
+                let mut dead = vandq_u16(
+                    a,
+                    vorrq_u16(
+                        vceqzq_s16(rm[q]),
+                        vandq_u16(vbicq_u16(zdrop_on, improve), drops),
+                    ),
+                );
+                let mo = vld1q_s16(max_off.add(o));
+                vst1q_s16(
+                    max_off.add(o),
+                    vbslq_s16(vandq_u16(improve, vcgtq_s16(off, mo)), off, mo),
+                );
+                let mx = vbslq_s16(improve, rm[q], mx);
+                if stop.is_some() {
+                    // The exact stop (see `exact_stop_enabled`), on the updated `max` and `gscore`.
+                    let b = vld1q_s16(beg.add(o));
+                    let rem = vsubq_s16(vld1q_s16(tlen.add(o)), ivp1);
+                    let steps = vminq_s16(rem, vsubq_s16(vld1q_s16(qlen.add(o)), b));
+                    let vmax =
+                        vbslq_s16(vceqzq_s16(b), vmaxq_s16(rm[q], vld1q_s16(h0.add(o))), rm[q]);
+                    let bound = vqaddq_s16(vmax, vmulq_s16(steps, sc_v));
+                    let open = vorrq_u16(
+                        vcgtq_s16(bound, mx),
+                        vbicq_u16(vcgtq_s16(vqaddq_s16(bound, eb_v), mx), vcgtq_s16(gs, bound)),
+                    );
+                    dead = vorrq_u16(dead, vbicq_u16(a, open));
+                }
+                vst1q_s16(max.add(o), mx);
+                vst1q_s16(max_i.add(o), vbslq_s16(improve, iv, mi));
+                vst1q_s16(max_j.add(o), vbslq_s16(improve, mj[q], mjj));
+                live[q] = vbicq_u16(a, dead);
             }
-            vst1q_s16(max.add(o), mx);
-            vst1q_s16(max_i.add(o), vbslq_s16(improve, iv, mi));
-            vst1q_s16(max_j.add(o), vbslq_s16(improve, mj[q], mjj));
-            live[q] = vbicq_u16(a, dead);
+            let live8 = narrow_mask(live);
+            // `done |= dead`: a lane active and not live died this row.
+            let d8 = vld1q_u8(done as *const u8);
+            let a8 = vld1q_u8(active as *const u8);
+            vst1q_u8(done as *mut u8, vorrq_u8(d8, vbicq_u8(a8, live8)));
+            u64::from(bits(live8))
         }
-        let live8 = narrow_mask(live);
-        // `done |= dead`: a lane active and not live died this row.
-        let d8 = vld1q_u8(done as *const u8);
-        let a8 = vld1q_u8(active as *const u8);
-        vst1q_u8(done as *mut u8, vorrq_u8(d8, vbicq_u8(a8, live8)));
-        u64::from(bits(live8))
     }
 }
 
@@ -4833,15 +4920,16 @@ mod neon {
     /// operations where there were four, in the masked columns, which are most of them. From
     /// fg-labs/bwa-mem3 PR #616. `band_bias` is 0: NEON has native unsigned byte compares.
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn band_u8(j: uint8x16_t, beg: uint8x16_t, width: uint8x16_t) -> uint8x16_t {
+    pub(super) fn band_u8(j: uint8x16_t, beg: uint8x16_t, width: uint8x16_t) -> uint8x16_t {
         vcltq_u8(vsubq_u8(j, beg), width)
     }
 
     /// `(j >= beg) & (j < end)` for the NEON i16 kernel. Native signed compares, `band_bias` 0.
     #[target_feature(enable = "neon")]
-    unsafe fn band_s16(j: int16x8_t, beg: int16x8_t, end: int16x8_t) -> uint16x8_t {
+    fn band_s16(j: int16x8_t, beg: int16x8_t, end: int16x8_t) -> uint16x8_t {
         vandq_u16(vcgeq_s16(j, beg), vcltq_s16(j, end))
     }
+    use bwa_core::simd::*;
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::aarch64::*;
 
@@ -4858,9 +4946,9 @@ mod neon {
         8,
         feat = "neon",
         dup = vdupq_n_s16,
-        lds = vld1q_s16,
-        sts = vst1q_s16,
-        ldu = vld1q_u16,
+        lds = ld_s16,
+        sts = st_s16,
+        ldu = ld_u16,
         sub = vsubq_s16,
         max = vmaxq_s16,
         ceqz = vceqzq_s16,
@@ -4894,9 +4982,9 @@ mod neon {
         8,
         feat = "neon",
         dup = vdupq_n_s16,
-        lds = vld1q_s16,
-        sts = vst1q_s16,
-        ldu = vld1q_u16,
+        lds = ld_s16,
+        sts = st_s16,
+        ldu = ld_u16,
         sub = vsubq_s16,
         max = vmaxq_s16,
         ceqz = vceqzq_s16,
@@ -4913,7 +5001,7 @@ mod neon {
         sbt_bias = |bias| bias,
         sbt_tbl = true,
         tab5 = true,
-        tbl_ld = |p| uint8x16x2_t(vld2q_u8(p).0, vld2q_u8(p.add(32)).0),
+        tbl_ld = |p| ld_u8_x2(&p.map(|v| v as u8), 0),
         tbl = |t, k, q| {
             let i = vorrq_s16(vmlaq_s16(q, k, vdupq_n_s16(5)), vdupq_n_s16(-256));
             vreinterpretq_s16_u8(vqtbl2q_u8(t, vreinterpretq_u8_s16(i)))
@@ -4948,9 +5036,9 @@ mod neon {
         16,
         feat = "neon",
         dup = vdupq_n_u8,
-        lds = vld1q_u8,
-        sts = vst1q_u8,
-        ldu = vld1q_u8,
+        lds = ld_u8,
+        sts = st_u8,
+        ldu = ld_u8,
         sub = vqsubq_u8,
         max = vmaxq_u8,
         ceqz = vceqzq_u8,
@@ -4967,7 +5055,7 @@ mod neon {
         sbt_bias = |_bias| 0,
         sbt_tbl = true,
         tab5 = false,
-        tbl_ld = |p| vld1q_u8(p),
+        tbl_ld = |p| ld_u8(p, 0),
         tbl = |t, k, q| vqtbl1q_u8(t, veorq_u8(k, q)),
         rowvec = true,
         trk = i16,
@@ -4982,9 +5070,9 @@ mod neon {
         16,
         feat = "neon",
         dup = vdupq_n_u8,
-        lds = vld1q_u8,
-        sts = vst1q_u8,
-        ldu = vld1q_u8,
+        lds = ld_u8,
+        sts = st_u8,
+        ldu = ld_u8,
         sub = vqsubq_u8,
         max = vmaxq_u8,
         ceqz = vceqzq_u8,
@@ -5001,7 +5089,7 @@ mod neon {
         sbt_bias = |_bias| 0,
         sbt_tbl = true,
         tab5 = true,
-        tbl_ld = |p| vld1q_u8_x2(p),
+        tbl_ld = |p| ld_u8_x2(p, 0),
         tbl = |t, k, q| vqtbl2q_u8(t, vmlaq_u8(q, k, vdupq_n_u8(5))),
         rowvec = true,
         trk = i16,
@@ -5017,6 +5105,7 @@ mod neon {
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
+    use bwa_core::simd::*;
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -5029,7 +5118,7 @@ mod avx2 {
     /// A 256-bit vector whose every byte lane equals `x`.
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn set1_u8(x: u8) -> __m256i {
+    fn set1_u8(x: u8) -> __m256i {
         _mm256_set1_epi8(x as i8)
     }
     /// # Parameters
@@ -5040,42 +5129,11 @@ mod avx2 {
     /// A 256-bit vector whose every 16-bit lane equals `x`.
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn set1_i16(x: i16) -> __m256i {
+    fn set1_i16(x: i16) -> __m256i {
         _mm256_set1_epi16(x)
     }
 
-    // loads/stores: the macro hands typed element pointers into `[$elem; LANES]` / `[$umask; LANES]`
-    // scratch; a 256-bit unaligned move covers the whole array (32 u8 or 16 u16/i16).
-    //
-    // In all five: `p` is the address of the first element of a run of at least LANES elements of
-    // that type (a scratch array, or `buf.as_ptr().add(j * LANES)` inside an SoA `Vec`), which the
-    // kernel guarantees is in bounds. No alignment requirement: these are the unaligned forms. `v`
-    // is the vector to write. Reads/writes exactly 32 bytes.
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn loadu_u8(p: *const u8) -> __m256i {
-        _mm256_loadu_si256(p as *const __m256i)
-    }
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn loadu_u16(p: *const u16) -> __m256i {
-        _mm256_loadu_si256(p as *const __m256i)
-    }
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn loadu_i16(p: *const i16) -> __m256i {
-        _mm256_loadu_si256(p as *const __m256i)
-    }
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn storeu_u8(p: *mut u8, v: __m256i) {
-        _mm256_storeu_si256(p as *mut __m256i, v)
-    }
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn storeu_i16(p: *mut i16, v: __m256i) {
-        _mm256_storeu_si256(p as *mut __m256i, v)
-    }
+    // loads/stores: `bwa_core::simd::{ld,st}{128,256,512}`, bounds-checked slice moves.
 
     // x == 0.
     //
@@ -5083,12 +5141,12 @@ mod avx2 {
     // return the all-ones/all-zero mask "this lane is zero", which drives the local restart.
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn ceqz8(v: __m256i) -> __m256i {
+    fn ceqz8(v: __m256i) -> __m256i {
         _mm256_cmpeq_epi8(v, _mm256_setzero_si256())
     }
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn ceqz16(v: __m256i) -> __m256i {
+    fn ceqz16(v: __m256i) -> __m256i {
         _mm256_cmpeq_epi16(v, _mm256_setzero_si256())
     }
 
@@ -5112,30 +5170,30 @@ mod avx2 {
     /// Forgetting to bias one of the three operands produces total garbage rather than a subtle
     /// drift, which `assert_backend_matches_scalar` catches on its first case.
     #[target_feature(enable = "avx2")]
-    unsafe fn band_epi8(j: __m256i, beg: __m256i, end: __m256i) -> __m256i {
+    fn band_epi8(j: __m256i, beg: __m256i, end: __m256i) -> __m256i {
         _mm256_andnot_si256(_mm256_cmpgt_epi8(beg, j), _mm256_cmpgt_epi8(end, j))
     }
 
     /// `(j >= beg) & (j < end)` for the AVX2 i16 kernel: its compares are already native and signed,
     /// so this is the portable form and `band_bias` is 0.
     #[target_feature(enable = "avx2")]
-    unsafe fn band_epi16(j: __m256i, beg: __m256i, end: __m256i) -> __m256i {
+    fn band_epi16(j: __m256i, beg: __m256i, end: __m256i) -> __m256i {
         _mm256_and_si256(cge_epi16(j, beg), clt_epi16(j, end))
     }
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn cge_epu8(a: __m256i, b: __m256i) -> __m256i {
+    fn cge_epu8(a: __m256i, b: __m256i) -> __m256i {
         _mm256_cmpeq_epi8(_mm256_max_epu8(a, b), a)
     }
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn cge_epi16(a: __m256i, b: __m256i) -> __m256i {
+    fn cge_epi16(a: __m256i, b: __m256i) -> __m256i {
         _mm256_cmpeq_epi16(_mm256_max_epi16(a, b), a)
     }
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn clt_epi16(a: __m256i, b: __m256i) -> __m256i {
+    fn clt_epi16(a: __m256i, b: __m256i) -> __m256i {
         _mm256_xor_si256(cge_epi16(a, b), _mm256_set1_epi8(-1))
     }
 
@@ -5147,7 +5205,7 @@ mod avx2 {
     // taken where the mask is set, `b` where it is clear.
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn bsl256(mask: __m256i, a: __m256i, b: __m256i) -> __m256i {
+    fn bsl256(mask: __m256i, a: __m256i, b: __m256i) -> __m256i {
         _mm256_blendv_epi8(b, a, mask)
     }
 
@@ -5158,9 +5216,9 @@ mod avx2 {
         16,
         feat = "avx2",
         dup = set1_i16,
-        lds = loadu_i16,
-        sts = storeu_i16,
-        ldu = loadu_u16,
+        lds = ld256,
+        sts = st256,
+        ldu = ld256,
         sub = _mm256_sub_epi16,
         max = _mm256_max_epi16,
         ceqz = ceqz16,
@@ -5194,9 +5252,9 @@ mod avx2 {
         16,
         feat = "avx2",
         dup = set1_i16,
-        lds = loadu_i16,
-        sts = storeu_i16,
-        ldu = loadu_u16,
+        lds = ld256,
+        sts = st256,
+        ldu = ld256,
         sub = _mm256_sub_epi16,
         max = _mm256_max_epi16,
         ceqz = ceqz16,
@@ -5214,7 +5272,7 @@ mod avx2 {
         sbt_tbl = true,
         tab5 = true,
         tbl_ld = |p| {
-            let ld = |o: usize| _mm_loadu_si128(p.add(o) as *const __m128i);
+            let ld = |o: usize| ld128(p, o / 2);
             let (lo, hi) = (
                 _mm_packus_epi16(ld(0), ld(16)),
                 _mm_packus_epi16(ld(32), ld(48)),
@@ -5247,9 +5305,9 @@ mod avx2 {
         32,
         feat = "avx2",
         dup = set1_u8,
-        lds = loadu_u8,
-        sts = storeu_u8,
-        ldu = loadu_u8,
+        lds = ld256,
+        sts = st256,
+        ldu = ld256,
         sub = _mm256_subs_epu8,
         max = _mm256_max_epu8,
         ceqz = ceqz8,
@@ -5266,7 +5324,7 @@ mod avx2 {
         sbt_bias = |bias| bias,
         sbt_tbl = true,
         tab5 = false,
-        tbl_ld = |p| _mm256_broadcastsi128_si256(_mm_loadu_si128(p as *const __m128i)),
+        tbl_ld = |p| _mm256_broadcastsi128_si256(ld128(p, 0)),
         tbl = |t, k, q| _mm256_shuffle_epi8(t, _mm256_xor_si256(k, q)),
         rowvec = true,
         trk = i16,
@@ -5283,9 +5341,9 @@ mod avx2 {
         32,
         feat = "avx2",
         dup = set1_u8,
-        lds = loadu_u8,
-        sts = storeu_u8,
-        ldu = loadu_u8,
+        lds = ld256,
+        sts = st256,
+        ldu = ld256,
         sub = _mm256_subs_epu8,
         max = _mm256_max_epu8,
         ceqz = ceqz8,
@@ -5303,10 +5361,7 @@ mod avx2 {
         sbt_tbl = true,
         tab5 = true,
         tbl_ld = |p| {
-            let (lo, hi) = (
-                _mm_loadu_si128(p as *const __m128i),
-                _mm_loadu_si128(p.add(16) as *const __m128i),
-            );
+            let (lo, hi) = (ld128(p, 0), ld128(p, 16));
             (
                 _mm256_broadcastsi128_si256(lo),
                 _mm256_broadcastsi128_si256(_mm_xor_si128(lo, hi)),
@@ -5347,6 +5402,7 @@ mod avx2 {
 #[cfg(target_arch = "x86_64")]
 mod sse41 {
     use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
+    use bwa_core::simd::*;
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -5355,56 +5411,31 @@ mod sse41 {
     /// this kernel reads its lanes as unsigned, so a value above 127 is intended.
     #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn set1_u8(x: u8) -> __m128i {
+    fn set1_u8(x: u8) -> __m128i {
         _mm_set1_epi8(x as i8)
     }
     /// # Returns
     /// A 128-bit vector whose every 16-bit lane equals `x`; negative values are meaningful here.
     #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn set1_i16(x: i16) -> __m128i {
+    fn set1_i16(x: i16) -> __m128i {
         _mm_set1_epi16(x)
     }
 
     // Loads and stores. `p` addresses at least LANES elements of that type (16 u8, or 8 u16/i16),
     // which the kernel guarantees is in bounds; `v` is the vector to write. Unaligned forms, so no
     // alignment requirement, 16 bytes moved.
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    unsafe fn loadu_u8(p: *const u8) -> __m128i {
-        _mm_loadu_si128(p as *const __m128i)
-    }
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    unsafe fn loadu_u16(p: *const u16) -> __m128i {
-        _mm_loadu_si128(p as *const __m128i)
-    }
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    unsafe fn loadu_i16(p: *const i16) -> __m128i {
-        _mm_loadu_si128(p as *const __m128i)
-    }
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    unsafe fn storeu_u8(p: *mut u8, v: __m128i) {
-        _mm_storeu_si128(p as *mut __m128i, v)
-    }
-    #[target_feature(enable = "sse4.1")]
-    #[inline]
-    unsafe fn storeu_i16(p: *mut i16, v: __m128i) {
-        _mm_storeu_si128(p as *mut __m128i, v)
-    }
 
     // x == 0, the mask that drives the local restart. `v` is a vector of DP values, in practice the
     // diagonal predecessor; the result is all-ones in the lanes that were zero.
     #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn ceqz8(v: __m128i) -> __m128i {
+    fn ceqz8(v: __m128i) -> __m128i {
         _mm_cmpeq_epi8(v, _mm_setzero_si128())
     }
     #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn ceqz16(v: __m128i) -> __m128i {
+    fn ceqz16(v: __m128i) -> __m128i {
         _mm_cmpeq_epi16(v, _mm_setzero_si128())
     }
 
@@ -5414,29 +5445,29 @@ mod sse41 {
     // `set1_epi8(-1)` is mask negation (that constant is 0xFF in every byte, an all-ones vector).
     /// `(j >= beg) & (j < end)` in SIGNED space for the SSE4.1 u8 kernel. See the AVX2 twin.
     #[target_feature(enable = "sse4.1")]
-    unsafe fn band_epi8(j: __m128i, beg: __m128i, end: __m128i) -> __m128i {
+    fn band_epi8(j: __m128i, beg: __m128i, end: __m128i) -> __m128i {
         _mm_andnot_si128(_mm_cmpgt_epi8(beg, j), _mm_cmpgt_epi8(end, j))
     }
 
     /// `(j >= beg) & (j < end)` for the SSE4.1 i16 kernel: native signed compares, `band_bias` 0.
     #[target_feature(enable = "sse4.1")]
-    unsafe fn band_epi16(j: __m128i, beg: __m128i, end: __m128i) -> __m128i {
+    fn band_epi16(j: __m128i, beg: __m128i, end: __m128i) -> __m128i {
         _mm_and_si128(cge_epi16(j, beg), clt_epi16(j, end))
     }
 
     #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn cge_epu8(a: __m128i, b: __m128i) -> __m128i {
+    fn cge_epu8(a: __m128i, b: __m128i) -> __m128i {
         _mm_cmpeq_epi8(_mm_max_epu8(a, b), a)
     }
     #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn cge_epi16(a: __m128i, b: __m128i) -> __m128i {
+    fn cge_epi16(a: __m128i, b: __m128i) -> __m128i {
         _mm_cmpeq_epi16(_mm_max_epi16(a, b), a)
     }
     #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn clt_epi16(a: __m128i, b: __m128i) -> __m128i {
+    fn clt_epi16(a: __m128i, b: __m128i) -> __m128i {
         _mm_xor_si128(cge_epi16(a, b), _mm_set1_epi8(-1))
     }
 
@@ -5446,7 +5477,7 @@ mod sse41 {
     /// kernel can reuse this byte-granular blend (its masks are all-ones across both bytes).
     #[target_feature(enable = "sse4.1")]
     #[inline]
-    unsafe fn bsl128(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+    fn bsl128(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
         _mm_blendv_epi8(b, a, mask)
     }
 
@@ -5457,9 +5488,9 @@ mod sse41 {
         8,
         feat = "sse4.1",
         dup = set1_i16,
-        lds = loadu_i16,
-        sts = storeu_i16,
-        ldu = loadu_u16,
+        lds = ld128,
+        sts = st128,
+        ldu = ld128,
         sub = _mm_sub_epi16,
         max = _mm_max_epi16,
         ceqz = ceqz16,
@@ -5493,9 +5524,9 @@ mod sse41 {
         8,
         feat = "sse4.1",
         dup = set1_i16,
-        lds = loadu_i16,
-        sts = storeu_i16,
-        ldu = loadu_u16,
+        lds = ld128,
+        sts = st128,
+        ldu = ld128,
         sub = _mm_sub_epi16,
         max = _mm_max_epi16,
         ceqz = ceqz16,
@@ -5513,7 +5544,7 @@ mod sse41 {
         sbt_tbl = true,
         tab5 = true,
         tbl_ld = |p| {
-            let ld = |o: usize| _mm_loadu_si128(p.add(o) as *const __m128i);
+            let ld = |o: usize| ld128(p, o / 2);
             let (lo, hi) = (
                 _mm_packus_epi16(ld(0), ld(16)),
                 _mm_packus_epi16(ld(32), ld(48)),
@@ -5543,9 +5574,9 @@ mod sse41 {
         16,
         feat = "sse4.1",
         dup = set1_u8,
-        lds = loadu_u8,
-        sts = storeu_u8,
-        ldu = loadu_u8,
+        lds = ld128,
+        sts = st128,
+        ldu = ld128,
         sub = _mm_subs_epu8,
         max = _mm_max_epu8,
         ceqz = ceqz8,
@@ -5562,7 +5593,7 @@ mod sse41 {
         sbt_bias = |bias| bias,
         sbt_tbl = true,
         tab5 = false,
-        tbl_ld = |p| _mm_loadu_si128(p as *const __m128i),
+        tbl_ld = |p| ld128(p, 0),
         tbl = |t, k, q| _mm_shuffle_epi8(t, _mm_xor_si128(k, q)),
         rowvec = false,
         trk = i32,
@@ -5579,9 +5610,9 @@ mod sse41 {
         16,
         feat = "sse4.1",
         dup = set1_u8,
-        lds = loadu_u8,
-        sts = storeu_u8,
-        ldu = loadu_u8,
+        lds = ld128,
+        sts = st128,
+        ldu = ld128,
         sub = _mm_subs_epu8,
         max = _mm_max_epu8,
         ceqz = ceqz8,
@@ -5599,10 +5630,7 @@ mod sse41 {
         sbt_tbl = true,
         tab5 = true,
         tbl_ld = |p| {
-            let (lo, hi) = (
-                _mm_loadu_si128(p as *const __m128i),
-                _mm_loadu_si128(p.add(16) as *const __m128i),
-            );
+            let (lo, hi) = (ld128(p, 0), ld128(p, 16));
             (lo, _mm_xor_si128(lo, hi))
         },
         tbl = |t, k, q| {
@@ -5630,6 +5658,7 @@ mod sse41 {
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use super::{clamp_band, default_result, tight_band_bound, tight_band_enabled};
+    use bwa_core::simd::*;
     use bwa_extend::{ExtendJob, ExtendResult};
     use std::arch::x86_64::*;
 
@@ -5638,65 +5667,40 @@ mod avx512 {
     /// kernel treats lanes as unsigned, so values above 127 are intended.
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn set1_u8(x: u8) -> __m512i {
+    fn set1_u8(x: u8) -> __m512i {
         _mm512_set1_epi8(x as i8)
     }
     /// # Returns
     /// A 512-bit vector whose every 16-bit lane equals `x`.
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn set1_i16(x: i16) -> __m512i {
+    fn set1_i16(x: i16) -> __m512i {
         _mm512_set1_epi16(x)
     }
 
     // Loads and stores: `p` addresses at least LANES elements of that type (64 u8, or 32 u16/i16),
     // which the kernel guarantees is in bounds. Unaligned forms, 64 bytes moved.
-    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-    #[inline]
-    unsafe fn loadu_u8(p: *const u8) -> __m512i {
-        _mm512_loadu_si512(p as *const __m512i)
-    }
-    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-    #[inline]
-    unsafe fn loadu_u16(p: *const u16) -> __m512i {
-        _mm512_loadu_si512(p as *const __m512i)
-    }
-    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-    #[inline]
-    unsafe fn loadu_i16(p: *const i16) -> __m512i {
-        _mm512_loadu_si512(p as *const __m512i)
-    }
-    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-    #[inline]
-    unsafe fn storeu_u8(p: *mut u8, v: __m512i) {
-        _mm512_storeu_si512(p as *mut __m512i, v)
-    }
-    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
-    #[inline]
-    unsafe fn storeu_i16(p: *mut i16, v: __m512i) {
-        _mm512_storeu_si512(p as *mut __m512i, v)
-    }
 
     // Comparisons. Each returns the all-ones/all-zero VECTOR the shared macro body expects, built
     // from the opmask with `movm`. `v`/`a`/`b` are vectors of DP values or column indices.
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn ceqz8(v: __m512i) -> __m512i {
+    fn ceqz8(v: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpeq_epi8_mask(v, _mm512_setzero_si512()))
     }
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn ceqz16(v: __m512i) -> __m512i {
+    fn ceqz16(v: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(v, _mm512_setzero_si512()))
     }
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn ceq8(a: __m512i, b: __m512i) -> __m512i {
+    fn ceq8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpeq_epi8_mask(a, b))
     }
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn ceq16(a: __m512i, b: __m512i) -> __m512i {
+    fn ceq16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpeq_epi16_mask(a, b))
     }
     /// Unsigned `a >= b`. Native here, unlike AVX2 where it has to be recovered from `max`.
@@ -5707,32 +5711,34 @@ mod avx512 {
     /// `clt_epu8` rather than the max/cmpeq emulation AVX2 gets, so there is nothing to rewrite here
     /// and `band_bias` is 0. That is why its column loop is 38 instructions against AVX2's 54.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
-    unsafe fn band_epu8(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
+    fn band_epu8(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
         _mm512_and_si512(cge_epu8(j, beg), clt_epu8(j, end))
     }
 
     /// `(j >= beg) & (j < end)` for the AVX-512 i16 kernel. Native signed compares, `band_bias` 0.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq")]
-    unsafe fn band_epi16(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
+    fn band_epi16(j: __m512i, beg: __m512i, end: __m512i) -> __m512i {
         _mm512_and_si512(cge_epi16(j, beg), clt_epi16(j, end))
     }
 
-    unsafe fn cge_epu8(a: __m512i, b: __m512i) -> __m512i {
+    #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
+    #[inline]
+    fn cge_epu8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmpge_epu8_mask(a, b))
     }
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn clt_epu8(a: __m512i, b: __m512i) -> __m512i {
+    fn clt_epu8(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi8(_mm512_cmplt_epu8_mask(a, b))
     }
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn cge_epi16(a: __m512i, b: __m512i) -> __m512i {
+    fn cge_epi16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmpge_epi16_mask(a, b))
     }
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn clt_epi16(a: __m512i, b: __m512i) -> __m512i {
+    fn clt_epi16(a: __m512i, b: __m512i) -> __m512i {
         _mm512_movm_epi16(_mm512_cmplt_epi16_mask(a, b))
     }
 
@@ -5741,7 +5747,7 @@ mod avx512 {
     /// 32-bit lane granularity of the intrinsic is irrelevant.
     #[target_feature(enable = "avx512bw,avx512vl,avx512dq")]
     #[inline]
-    unsafe fn bsl512(mask: __m512i, a: __m512i, b: __m512i) -> __m512i {
+    fn bsl512(mask: __m512i, a: __m512i, b: __m512i) -> __m512i {
         _mm512_ternarylogic_epi32(mask, a, b, 0xCA)
     }
 
@@ -5752,9 +5758,9 @@ mod avx512 {
         32,
         feat = "avx512bw,avx512vl,avx512dq",
         dup = set1_i16,
-        lds = loadu_i16,
-        sts = storeu_i16,
-        ldu = loadu_u16,
+        lds = ld512,
+        sts = st512,
+        ldu = ld512,
         sub = _mm512_sub_epi16,
         max = _mm512_max_epi16,
         ceqz = ceqz16,
@@ -5787,9 +5793,9 @@ mod avx512 {
         32,
         feat = "avx512bw,avx512vl,avx512dq",
         dup = set1_i16,
-        lds = loadu_i16,
-        sts = storeu_i16,
-        ldu = loadu_u16,
+        lds = ld512,
+        sts = st512,
+        ldu = ld512,
         sub = _mm512_sub_epi16,
         max = _mm512_max_epi16,
         ceqz = ceqz16,
@@ -5806,7 +5812,7 @@ mod avx512 {
         sbt_bias = |bias| bias,
         sbt_tbl = true,
         tab5 = true,
-        tbl_ld = |p| _mm512_loadu_si512(p as *const _),
+        tbl_ld = |p| ld512(p, 0),
         tbl = |t, k, q| {
             let i = _mm512_add_epi16(_mm512_add_epi16(_mm512_slli_epi16::<2>(k), k), q);
             _mm512_permutexvar_epi16(i, t)
@@ -5823,9 +5829,9 @@ mod avx512 {
         64,
         feat = "avx512bw,avx512vl,avx512dq",
         dup = set1_u8,
-        lds = loadu_u8,
-        sts = storeu_u8,
-        ldu = loadu_u8,
+        lds = ld512,
+        sts = st512,
+        ldu = ld512,
         sub = _mm512_subs_epu8,
         max = _mm512_max_epu8,
         ceqz = ceqz8,
@@ -5842,7 +5848,7 @@ mod avx512 {
         sbt_bias = |bias| bias,
         sbt_tbl = true,
         tab5 = false,
-        tbl_ld = |p| _mm512_broadcast_i32x4(_mm_loadu_si128(p as *const __m128i)),
+        tbl_ld = |p| _mm512_broadcast_i32x4(ld128(p, 0)),
         tbl = |t, k, q| _mm512_shuffle_epi8(t, _mm512_xor_si512(k, q)),
         rowvec = true,
         trk = i16,
@@ -5859,9 +5865,9 @@ mod avx512 {
         64,
         feat = "avx512bw,avx512vl,avx512dq",
         dup = set1_u8,
-        lds = loadu_u8,
-        sts = storeu_u8,
-        ldu = loadu_u8,
+        lds = ld512,
+        sts = st512,
+        ldu = ld512,
         sub = _mm512_subs_epu8,
         max = _mm512_max_epu8,
         ceqz = ceqz8,
@@ -5879,10 +5885,7 @@ mod avx512 {
         sbt_tbl = true,
         tab5 = true,
         tbl_ld = |p| {
-            let (lo, hi) = (
-                _mm_loadu_si128(p as *const __m128i),
-                _mm_loadu_si128(p.add(16) as *const __m128i),
-            );
+            let (lo, hi) = (ld128(p, 0), ld128(p, 16));
             (
                 _mm512_broadcast_i32x4(lo),
                 _mm512_broadcast_i32x4(_mm_xor_si128(lo, hi)),
@@ -6325,6 +6328,7 @@ mod neon_verify {
 
         let once = |inl: bool| -> f64 {
             let t0 = std::time::Instant::now();
+            // SAFETY: NEON is aarch64 baseline; the jobs fit the kernel's ceilings, as in the test above.
             let out = unsafe {
                 if inl {
                     batched_extend_neon_u8::<true>(
@@ -7078,17 +7082,20 @@ mod x86_extend_bench {
         // Called directly rather than through the dispatch, so the kernels are exercised even where
         // feature detection is unavailable; on a native runner this is the same code the dispatch
         // selects.
+        // SAFETY: SSE4.1 and AVX2 run under Rosetta and on every CI runner; the jobs fit the u8 kernel.
         bench("sse41_u8", &|| unsafe {
             super::sse41::batched_extend_sse41_u8::<true>(
                 &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
             )
         });
+        // SAFETY: as above.
         bench("avx2_u8", &|| unsafe {
             super::avx2::batched_extend_avx2_u8::<true>(
                 &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
             )
         });
         if bwa_extend::has_avx512() {
+            // SAFETY: avx512 detected; as above.
             bench("avx512_u8", &|| unsafe {
                 super::avx512::batched_extend_avx512_u8::<true>(
                     &jobs, 5, &mat, o_del, e_del, o_ins, e_ins, 100, 5, 100,
@@ -7905,6 +7912,7 @@ mod mat5_tests {
                             );
                         }
                         #[cfg(target_arch = "x86_64")]
+                        // SAFETY: SSE4.1 runs on every x86_64 test host; the jobs fit the kernel.
                         unsafe {
                             assert_eq!(
                                 super::sse41::batched_extend_sse41_i16_mat5::<true>(

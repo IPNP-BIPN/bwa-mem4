@@ -167,15 +167,14 @@ pub fn diag_score(mat: &[i8; 25], r: &[u8], q: &[u8]) -> i32 {
 
 /// [`diag_score`]'s whole 16-base steps on NEON: their sum and the bases they covered.
 #[cfg(target_arch = "aarch64")]
-unsafe fn diag_score_neon(tab: &[i8; 32], r: &[u8], q: &[u8]) -> (i32, usize) {
+#[target_feature(enable = "neon")]
+fn diag_score_neon(tab: &[i8; 32], r: &[u8], q: &[u8]) -> (i32, usize) {
+    use bwa_core::simd::*;
     use std::arch::aarch64::*;
-    let t = int8x16x2_t(vld1q_s8(tab.as_ptr()), vld1q_s8(tab.as_ptr().add(16)));
+    let t = int8x16x2_t(ld_s8(tab, 0), ld_s8(tab, 16));
     let (mut acc, steps) = (vdupq_n_s32(0), r.len() / 16);
-    for k in 0..steps {
-        let (rv, qv) = (
-            vld1q_u8(r.as_ptr().add(16 * k)),
-            vld1q_u8(q.as_ptr().add(16 * k)),
-        );
+    for (rk, qk) in r.as_chunks::<16>().0.iter().zip(q.as_chunks::<16>().0) {
+        let (rv, qv) = (ld_u8(rk, 0), ld_u8(qk, 0));
         let v = vqtbl2q_s8(t, vmlaq_u8(qv, rv, vdupq_n_u8(5)));
         acc = vpadalq_s16(acc, vpaddlq_s8(v));
     }
@@ -187,16 +186,13 @@ unsafe fn diag_score_neon(tab: &[i8; 32], r: &[u8], q: &[u8]) -> (i32, usize) {
 /// is negative below 16), and the signed bytes sum through `psadbw` biased by 128.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn diag_score_ssse3(tab: &[i8; 32], r: &[u8], q: &[u8]) -> (i32, usize) {
+fn diag_score_ssse3(tab: &[i8; 32], r: &[u8], q: &[u8]) -> (i32, usize) {
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
-    let (lo, hi) = (
-        _mm_loadu_si128(tab.as_ptr().cast()),
-        _mm_loadu_si128(tab.as_ptr().add(16).cast()),
-    );
+    let (lo, hi) = (ld128(tab, 0), ld128(tab, 16));
     let (mut acc, bias, steps) = (_mm_setzero_si128(), _mm_set1_epi8(-128), r.len() / 16);
-    for k in 0..steps {
-        let rv = _mm_loadu_si128(r.as_ptr().add(16 * k).cast());
-        let qv = _mm_loadu_si128(q.as_ptr().add(16 * k).cast());
+    for (rk, qk) in r.as_chunks::<16>().0.iter().zip(q.as_chunks::<16>().0) {
+        let (rv, qv) = (ld128(rk, 0), ld128(qk, 0));
         // Codes below 8: the 16-bit shift carries nothing across bytes.
         let idx = _mm_add_epi8(_mm_add_epi8(_mm_slli_epi16(rv, 2), rv), qv);
         let up = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));

@@ -616,17 +616,17 @@ fn query_profile_row(row: &mut [i8], query: &[u8], mat_row: &[i8]) {
         let mut tab = [0i8; 16];
         tab[..mat_row.len()].copy_from_slice(mat_row);
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: NEON is mandatory on AArch64; every load and store is 16 bytes inside
-        // `query[j..]` / `row[j..]` with `j + 16 <= len`.
+        // SAFETY: NEON is mandatory on AArch64.
         unsafe {
+            use bwa_core::simd::*;
             use std::arch::aarch64::*;
-            let t = vld1q_u8(tab.as_ptr().cast());
+            let t = vreinterpretq_u8_s8(ld_s8(&tab, 0));
             while j + 16 <= query.len() {
-                let idx = vld1q_u8(query.as_ptr().add(j));
+                let idx = ld_u8(query, j);
                 if usize::from(vmaxvq_u8(idx)) >= mat_row.len() {
                     break;
                 }
-                vst1q_u8(row.as_mut_ptr().add(j).cast(), vqtbl1q_u8(t, idx));
+                st_s8(row, j, vreinterpretq_s8_u8(vqtbl1q_u8(t, idx)));
                 j += 16;
             }
         }
@@ -644,19 +644,20 @@ fn query_profile_row(row: &mut [i8], query: &[u8], mat_row: &[i8]) {
 /// [`query_profile_row`]'s x86 blocks: `pshufb` over the 16-entry table. Returns where they stopped.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn query_profile_ssse3(row: &mut [i8], query: &[u8], tab: &[i8; 16], n: usize) -> usize {
+fn query_profile_ssse3(row: &mut [i8], query: &[u8], tab: &[i8; 16], n: usize) -> usize {
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
-    let t = _mm_loadu_si128(tab.as_ptr().cast());
+    let t = ld128(tab, 0);
     // Codes `0..n` are kept; `min(idx, n - 1) == idx` fails for any larger one, and for bytes with
     // the top bit set, which `pshufb` would turn into 0.
     let lim = _mm_set1_epi8((n - 1) as i8);
     let mut j = 0;
     while j + 16 <= query.len() {
-        let idx = _mm_loadu_si128(query.as_ptr().add(j).cast());
+        let idx = ld128(query, j);
         if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(idx, lim), idx)) != 0xffff {
             break;
         }
-        _mm_storeu_si128(row.as_mut_ptr().add(j).cast(), _mm_shuffle_epi8(t, idx));
+        st128(row, j, _mm_shuffle_epi8(t, idx));
         j += 16;
     }
     j

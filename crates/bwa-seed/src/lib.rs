@@ -134,6 +134,7 @@
 //!    [`smem_round_2_batched`], [`BwtSeedSlot`], [`bwt_seed_strategy_batched`]), which is those
 //!    same three algorithms re-expressed as resumable state machines. It adds no logic; if the
 //!    state machine and the straight-line version ever disagree, the straight-line one is right.
+#![forbid(unsafe_code)]
 
 use bwa_core::MemOpt;
 use bwa_index::{FmIndex, Smem};
@@ -234,25 +235,14 @@ fn prefetch_ahead() -> usize {
 /// and the last; a longer read's walk streams on from there. No effect on any result.
 #[inline(always)]
 fn prefetch_read(r: Option<&[u8]>) {
-    let Some(r) = r else { return };
-    let last = r.len().saturating_sub(1);
+    let Some(r) = r.filter(|r| !r.is_empty()) else {
+        return;
+    };
     for off in (0..r.len().min(256))
         .step_by(64)
-        .chain(std::iter::once(last))
+        .chain(std::iter::once(r.len() - 1))
     {
-        let p = r.as_ptr().wrapping_add(off);
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: a prefetch never faults, whatever the address.
-        unsafe {
-            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
-        }
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: as above.
-        unsafe {
-            std::arch::x86_64::_mm_prefetch(p.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
-        }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let _ = p;
+        bwa_core::simd::prefetch(&r[off]);
     }
 }
 

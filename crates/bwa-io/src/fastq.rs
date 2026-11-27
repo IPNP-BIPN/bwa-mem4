@@ -145,6 +145,7 @@ fn is_acgt(b: u8) -> bool {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
+    use bwa_core::simd::*;
     use std::arch::aarch64::*;
     // SAFETY: NEON is baseline on aarch64; reads 64 bytes of `src`, writes 16 of `dst`.
     unsafe {
@@ -163,7 +164,7 @@ fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
         let all = vandq_u8(vandq_u8(hit(q.0), hit(q.1)), vandq_u8(hit(q.2), hit(q.3)));
         let lo = vorrq_u8(code(q.0), vshlq_n_u8::<2>(code(q.1)));
         let hi = vorrq_u8(vshlq_n_u8::<4>(code(q.2)), vshlq_n_u8::<6>(code(q.3)));
-        vst1q_u8(dst.as_mut_ptr(), vorrq_u8(lo, hi));
+        st_u8(dst, 0, vorrq_u8(lo, hi));
         vminvq_u8(all) == 0xFF
     }
 }
@@ -173,6 +174,7 @@ fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
     // SAFETY: SSE2 is baseline on x86-64; reads 64 bytes of `src`, writes 16 of `dst`.
     unsafe {
@@ -185,7 +187,7 @@ fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
         let mut all = _mm_set1_epi8(-1);
         let mut w = [_mm_setzero_si128(); 4];
         for (k, wk) in w.iter_mut().enumerate() {
-            let v = _mm_loadu_si128(src.as_ptr().add(16 * k).cast());
+            let v = ld128(src, 16 * k);
             let u = _mm_and_si128(v, mdf);
             let ac = _mm_or_si128(eq(u, b'A'), eq(u, b'C'));
             all = _mm_and_si128(
@@ -203,7 +205,7 @@ fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
             *wk = _mm_and_si128(_mm_or_si128(lo, hi), mff);
         }
         let b = _mm_packus_epi16(_mm_packs_epi32(w[0], w[1]), _mm_packs_epi32(w[2], w[3]));
-        _mm_storeu_si128(dst.as_mut_ptr().cast(), b);
+        st128(dst, 0, b);
         _mm_movemask_epi8(all) == 0xFFFF
     }
 }
@@ -216,70 +218,52 @@ fn pack64(src: &[u8; 64], dst: &mut [u8; 16]) -> bool {
     src.iter().all(|&b| is_acgt(b))
 }
 
-/// Write the 64 codes 16 packed bytes hold to `dst`. NEON: an interleaving `st4` puts lane `j` of
-/// shift `k` at byte `4j + k`.
-///
-/// # Safety
-///
-/// `dst` must be valid for 64 bytes of writes.
+/// Write the 64 codes 16 packed bytes hold to `dst[..64]`. NEON: an interleaving `st4` puts lane
+/// `j` of shift `k` at byte `4j + k`.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn unpack16(src: &[u8; 16], dst: *mut u8) {
+fn unpack16(src: &[u8; 16], dst: &mut [u8; 64]) {
+    use bwa_core::simd::*;
     use std::arch::aarch64::*;
-    // SAFETY: NEON is baseline on aarch64; reads 16 bytes of `src`, writes the 64 the caller vouches for.
+    // SAFETY: NEON is baseline on aarch64.
     unsafe {
-        let (v, m3) = (vld1q_u8(src.as_ptr()), vdupq_n_u8(3));
+        let (v, m3) = (ld_u8(src, 0), vdupq_n_u8(3));
         let codes = uint8x16x4_t(
             vandq_u8(v, m3),
             vandq_u8(vshrq_n_u8::<2>(v), m3),
             vandq_u8(vshrq_n_u8::<4>(v), m3),
             vshrq_n_u8::<6>(v),
         );
-        vst4q_u8(dst, codes);
+        st4_u8(dst, 0, codes);
     }
 }
 
 /// [`unpack16`] in SSE2: byte then 16-bit unpacks do the interleave.
-///
-/// # Safety
-///
-/// `dst` must be valid for 64 bytes of writes.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn unpack16(src: &[u8; 16], dst: *mut u8) {
+fn unpack16(src: &[u8; 16], dst: &mut [u8; 64]) {
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
-    // SAFETY: SSE2 is baseline on x86-64; reads 16 bytes of `src`, writes the 64 the caller vouches for.
+    // SAFETY: SSE2 is baseline on x86-64.
     unsafe {
-        let (v, m3) = (_mm_loadu_si128(src.as_ptr().cast()), _mm_set1_epi8(3));
+        let (v, m3) = (ld128(src, 0), _mm_set1_epi8(3));
         let c0 = _mm_and_si128(v, m3);
         let c1 = _mm_and_si128(_mm_srli_epi16::<2>(v), m3);
         let c2 = _mm_and_si128(_mm_srli_epi16::<4>(v), m3);
         let c3 = _mm_and_si128(_mm_srli_epi16::<6>(v), m3);
         let (lo01, hi01) = (_mm_unpacklo_epi8(c0, c1), _mm_unpackhi_epi8(c0, c1));
         let (lo23, hi23) = (_mm_unpacklo_epi8(c2, c3), _mm_unpackhi_epi8(c2, c3));
-        let p = dst.cast::<__m128i>();
-        _mm_storeu_si128(p, _mm_unpacklo_epi16(lo01, lo23));
-        _mm_storeu_si128(p.add(1), _mm_unpackhi_epi16(lo01, lo23));
-        _mm_storeu_si128(p.add(2), _mm_unpacklo_epi16(hi01, hi23));
-        _mm_storeu_si128(p.add(3), _mm_unpackhi_epi16(hi01, hi23));
+        st128(dst, 0, _mm_unpacklo_epi16(lo01, lo23));
+        st128(dst, 16, _mm_unpackhi_epi16(lo01, lo23));
+        st128(dst, 32, _mm_unpacklo_epi16(hi01, hi23));
+        st128(dst, 48, _mm_unpackhi_epi16(hi01, hi23));
     }
 }
 
-/// # Safety
-///
-/// `dst` must be valid for 64 bytes of writes.
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-unsafe fn unpack16(src: &[u8; 16], dst: *mut u8) {
-    for (j, &b) in src.iter().enumerate() {
-        // SAFETY: bytes 4j..4j + 4 of the 64 the caller vouches for.
-        unsafe {
-            dst.add(4 * j).cast::<[u8; 4]>().write_unaligned([
-                b & 3,
-                b >> 2 & 3,
-                b >> 4 & 3,
-                b >> 6,
-            ])
-        };
+fn unpack16(src: &[u8; 16], dst: &mut [u8; 64]) {
+    for (d, &b) in dst.chunks_exact_mut(4).zip(src) {
+        d.copy_from_slice(&[b & 3, b >> 2 & 3, b >> 4 & 3, b >> 6]);
     }
 }
 
@@ -306,13 +290,13 @@ fn pack_acgt(seq: &[u8], out: &mut Vec<u8>) -> bool {
 
 /// Append the first `n` codes `packed` holds (four a byte, low bits first; `packed` may run past
 /// them). Every read is unpacked three times (seeding, mate rescue, SAM), so this is SIMD all the
-/// way, straight into `out`'s spare capacity: a short last block is padded.
+/// way, 64 codes per block straight into `out`, trimmed to `n` after: a short last block is padded.
 fn unpack_codes(packed: &[u8], n: usize, out: &mut Vec<u8>) {
     assert!(n <= 4 * packed.len());
     let at = out.len();
     out.reserve(64 * packed.len().div_ceil(16));
-    let mut pad = [0u8; 16];
-    for (k, block) in packed.chunks(16).enumerate() {
+    let (mut pad, mut codes) = ([0u8; 16], [0u8; 64]);
+    for block in packed.chunks(16) {
         let src: &[u8; 16] = match block.try_into() {
             Ok(full) => full,
             Err(_) => {
@@ -320,11 +304,11 @@ fn unpack_codes(packed: &[u8], n: usize, out: &mut Vec<u8>) {
                 &pad
             }
         };
-        // SAFETY: the reserve left 64 bytes of spare capacity per block past `at`.
-        unsafe { unpack16(src, out.as_mut_ptr().add(at + 64 * k)) };
+        // Whole 64-code blocks, the last one trimmed below: a fixed-size copy each.
+        unpack16(src, &mut codes);
+        out.extend_from_slice(&codes);
     }
-    // SAFETY: the blocks wrote every byte below `at + 4 * packed.len()`, which covers `at + n`.
-    unsafe { out.set_len(at + n) };
+    out.truncate(at + n);
 }
 
 impl Record {

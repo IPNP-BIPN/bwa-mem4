@@ -1171,20 +1171,18 @@ fn insert_inline(v: &mut Vec<u64>, at: usize, x: u64) {
         return;
     }
     v.push(x);
-    let p = v.as_mut_ptr();
-    let mut j = v.len() - 1;
-    // SAFETY: `at <= j < v.len()`, and every access is inside `at..=j`.
-    unsafe {
-        while j >= at + 2 {
-            let pair = p.add(j - 2).cast::<[u64; 2]>().read_unaligned();
-            p.add(j - 1).cast::<[u64; 2]>().write_unaligned(pair);
-            j -= 2;
-        }
-        if j > at {
-            *p.add(j) = *p.add(j - 1);
-        }
-        *p.add(at) = x;
+    let s = &mut v[at..];
+    // Two keys a step from the end, as fixed-size windows of `s`: `2 <= j < s.len()` bounds both.
+    let mut j = s.len() - 1;
+    while j >= 2 {
+        let pair: [u64; 2] = s[j - 2..j].try_into().unwrap();
+        s[j - 1..j + 1].copy_from_slice(&pair);
+        j -= 2;
     }
+    if j > 0 {
+        s[j] = s[j - 1];
+    }
+    s[0] = x;
 }
 
 thread_local! {

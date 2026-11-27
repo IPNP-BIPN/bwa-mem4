@@ -149,10 +149,13 @@ pub unsafe fn advise_hugepage(ptr: *const u8, len: usize) {
         if !ptr.is_null() && len > 0 && !disabled() {
             // Cast away const: `madvise` takes `void *` by POSIX convention even though this
             // particular advice does not modify the range.
-            let (start, aligned_len) =
-                page_aligned_range(ptr as usize, len, sysconf(SC_PAGESIZE).max(1) as usize);
+            // SAFETY: `sysconf` only reads a system constant.
+            let page = unsafe { sysconf(SC_PAGESIZE) }.max(1) as usize;
+            let (start, aligned_len) = page_aligned_range(ptr as usize, len, page);
             if aligned_len > 0 {
-                madvise(start as *mut core::ffi::c_void, aligned_len, MADV_HUGEPAGE);
+                // SAFETY: the caller promises the range exists for this call; `madvise` never
+                // reads or writes through it, and an ignored advice changes nothing.
+                unsafe { madvise(start as *mut core::ffi::c_void, aligned_len, MADV_HUGEPAGE) };
             }
         }
     }

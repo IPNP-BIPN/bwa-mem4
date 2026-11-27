@@ -17,6 +17,7 @@ repository.workspace = true
 name = "bwa_neon"
 
 [dependencies]
+bwa-core = { workspace = true }
 bwa-extend = { workspace = true }
 
 [lints]

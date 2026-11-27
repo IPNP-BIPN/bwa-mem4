@@ -331,26 +331,28 @@ pub(crate) fn unpack_pac_base(pac: &[u8], l_pac: i64, pos: i64) -> u8 {
 /// # Parameters
 /// - `pac`: the whole mapped `.pac`, including its trailer bytes, which are never indexed here.
 /// - `start`: first FORWARD-strand position to unpack; `start + len` must not exceed `l_pac`.
-/// - `out`: destination, filled with exactly `len` bases, one per byte, codes 0..=3.
+/// - `out`: the bases appended, one per byte, codes 0..=3. Reserve `len + 16` first: the vector
+///   paths push a whole last vector and trim it.
 /// - `XOR`: 0, or 3 to complement every base on the way out.
 #[inline]
 fn unpack_pac_fwd<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
-        // SAFETY: neon detected; `out` has `len + 16` bytes of room, as every caller reserves.
+        // SAFETY: neon detected.
         unsafe { unpack_fwd_neon::<XOR>(pac, start, len, out) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("ssse3") {
-        // SAFETY: ssse3 detected; `out` has `len + 16` bytes of room, as every caller reserves.
+        // SAFETY: ssse3 detected.
         unsafe { unpack_fwd_ssse3::<XOR>(pac, start, len, out) };
         return;
     }
     // The whole range on a build with neither vector path.
-    for pos in start..start + len as i64 {
-        out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
-    }
+    out.extend(
+        (start..start + len as i64)
+            .map(|pos| ((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR),
+    );
 }
 
 /// Unpack `[rb, re)` of the DOUBLED 2L coordinate space into a fresh byte vector, one base per byte.
@@ -409,19 +411,19 @@ const SPREAD: ([[u8; 16]; 4], [[i8; 16]; 4]) = {
 
 /// Forward bases `[p, p + 16)` at any alignment: the five packed bytes holding them come from one
 /// 8-byte load, spread and shifted by the tables of `p % 4`.
-///
-/// # Safety
-/// NEON present, `p >= 0` and `(p >> 2) + 8 <= pac.len()`.
+/// Panics unless `p >= 0` and `(p >> 2) + 8 <= pac.len()`.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn unpack16(
+#[target_feature(enable = "neon")]
+#[inline]
+fn unpack16(
     pac: &[u8],
     p: i64,
     idx: std::arch::aarch64::uint8x16_t,
     sh: std::arch::aarch64::int8x16_t,
 ) -> std::arch::aarch64::uint8x16_t {
     use std::arch::aarch64::*;
-    let w = (pac.as_ptr().add((p >> 2) as usize) as *const u64).read_unaligned();
+    let i = (p >> 2) as usize;
+    let w = u64::from_ne_bytes(pac[i..i + 8].try_into().unwrap());
     let v = vqtbl1q_u8(vreinterpretq_u8_u64(vdupq_n_u64(w)), idx);
     vandq_u8(vshlq_u8(v, sh), vdupq_n_u8(3))
 }
@@ -432,14 +434,15 @@ unsafe fn unpack16(
 /// reversed first, and `b`'s low field is then the first one out. `xor` 3 complements every base
 /// (`!b` on the packed byte complements all four), 0 leaves them.
 ///
-/// # Safety
-/// NEON present, `p >= 0`, `(p >> 2) + 16 <= pac.len()`, and `dst` valid for 64 bytes.
+/// Panics unless `p >= 0` and `(p >> 2) + 16 <= pac.len()`.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn unpack64(pac: &[u8], p: i64, rev: bool, xor: u8, dst: *mut u8) {
+#[target_feature(enable = "neon")]
+#[inline]
+fn unpack64(pac: &[u8], p: i64, rev: bool, xor: u8, dst: &mut [u8; 64]) {
+    use bwa_core::simd::*;
     use std::arch::aarch64::*;
     let q = veorq_u8(
-        vld1q_u8(pac.as_ptr().add((p >> 2) as usize)),
+        ld_u8(pac, (p >> 2) as usize),
         vdupq_n_u8(xor.wrapping_mul(0x55)),
     );
     let m = vdupq_n_u8(3);
@@ -452,7 +455,7 @@ unsafe fn unpack64(pac: &[u8], p: i64, rev: bool, xor: u8, dst: *mut u8) {
             vandq_u8(vshrq_n_u8::<4>(q), m),
             vshrq_n_u8::<6>(q),
         );
-        vst4q_u8(dst, f);
+        st4_u8(dst, 0, f);
     } else {
         let f = uint8x16x4_t(
             vshrq_n_u8::<6>(q),
@@ -460,7 +463,7 @@ unsafe fn unpack64(pac: &[u8], p: i64, rev: bool, xor: u8, dst: *mut u8) {
             vandq_u8(vshrq_n_u8::<2>(q), m),
             vandq_u8(q, m),
         );
-        vst4q_u8(dst, f);
+        st4_u8(dst, 0, f);
     }
 }
 
@@ -473,108 +476,106 @@ const UNPACK64_MIN: usize = 67;
 /// per step from any alignment, the last step stored whole and trimmed, so no base goes one at a
 /// time except the (at most three) before the boundary and within 8 bytes of the end of `pac`.
 ///
-/// # Safety
-/// NEON present; `out` has room for `len + 16` bytes past its length.
+/// `out` as for [`unpack_pac_fwd`].
 #[cfg(target_arch = "aarch64")]
-unsafe fn unpack_fwd_neon<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+#[target_feature(enable = "neon")]
+fn unpack_fwd_neon<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    use bwa_core::simd::*;
     use std::arch::aarch64::*;
-    let end = start + len as i64;
+    let scalar = |p: i64| ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3) ^ XOR;
+    let (end, len0) = (start + len as i64, out.len());
     let mut pos = start;
     if len >= UNPACK64_MIN {
         while pos & 3 != 0 {
-            out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
+            out.push(scalar(pos));
             pos += 1;
         }
         // `pos + 64 <= end <= l_pac`, so the 16 bytes from `pos >> 2` are inside `pac`.
+        let mut b = [0u8; 64];
         while pos + 64 <= end {
-            let n = out.len();
-            unpack64(pac, pos, false, XOR, out.as_mut_ptr().add(n));
-            out.set_len(n + 64);
+            unpack64(pac, pos, false, XOR, &mut b);
+            out.extend_from_slice(&b);
             pos += 64;
         }
     }
     let o = (pos & 3) as usize;
-    let (idx, sh) = (
-        vld1q_u8(SPREAD.0[o].as_ptr()),
-        vld1q_s8(SPREAD.1[o].as_ptr()),
-    );
+    let (idx, sh) = (ld_u8(&SPREAD.0[o], 0), ld_s8(&SPREAD.1[o], 0));
+    let mut b = [0u8; 16];
     while pos < end && ((pos >> 2) as usize) + 8 <= pac.len() {
-        let v = veorq_u8(unpack16(pac, pos, idx, sh), vdupq_n_u8(XOR));
-        let n = out.len();
-        vst1q_u8(out.as_mut_ptr().add(n), v);
-        out.set_len(n + (end - pos).min(16) as usize);
+        // Whole vectors, the last one trimmed below: a fixed-size copy each.
+        st_u8(
+            &mut b,
+            0,
+            veorq_u8(unpack16(pac, pos, idx, sh), vdupq_n_u8(XOR)),
+        );
+        out.extend_from_slice(&b);
         pos += 16;
     }
     while pos < end {
-        out.push(((pac[(pos >> 2) as usize] >> ((3 - (pos & 3)) << 1)) & 3) ^ XOR);
+        out.push(scalar(pos));
         pos += 1;
     }
+    out.truncate(len0 + len);
 }
 
 /// [`unpack_pac_fwd`] of `[start, start + len)` reversed, and complemented when `XOR` is 3, in one
 /// NEON pass: the sixteen source bases ending where the output has got to, reversed (`rev64` + a
 /// half swap) and `^ XOR`, walking the source from its end. The last step is stored whole and
 /// trimmed; a step whose source word would leave `pac` or start before 0 goes base by base.
-/// Appends to `out`, which must have room for `len + 16` bytes.
+/// `out` as for [`unpack_pac_fwd`].
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 fn unpack_pac_rev_neon<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    use bwa_core::simd::*;
     use std::arch::aarch64::*;
     let scalar = |p: i64| ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3) ^ XOR;
     // Exclusive source end: output base `o` is source base `end - 1 - o`, `^ XOR`. A long
     // window first takes its top bases down to a byte boundary, then 64 per step ([`unpack64`]);
     // what is left below goes on as a shorter window.
-    let mut end = start + len as i64;
+    let (mut end, want) = (start + len as i64, out.len() + len);
     if len >= UNPACK64_MIN {
         while end & 3 != 0 {
             out.push(scalar(end - 1));
             end -= 1;
         }
+        // `end <= l_pac`, so the 16 bytes from `(end - 64) >> 2` are inside `pac`.
+        let mut b = [0u8; 64];
         while end - 64 >= start {
-            let n = out.len();
-            // SAFETY: NEON is present (checked by the caller); `end <= l_pac`, so the 16 bytes
-            // from `(end - 64) >> 2` are inside `pac`, and the store stays inside the `len + 16`
-            // bytes reserved past the length.
-            unsafe { unpack64(pac, end - 64, true, XOR, out.as_mut_ptr().add(n)) };
-            unsafe { out.set_len(n + 64) };
+            unpack64(pac, end - 64, true, XOR, &mut b);
+            out.extend_from_slice(&b);
             end -= 64;
         }
     }
     let len = (end - start) as usize;
-    // SAFETY: NEON is present (checked by the caller); `unpack16` is called only where its bounds
-    // hold, and the stores stay inside `out`'s reserved capacity (`len + 16` past its length).
-    unsafe {
-        let off = ((end - 16) & 3) as usize;
-        let (idx, sh) = (
-            vld1q_u8(SPREAD.0[off].as_ptr()),
-            vld1q_s8(SPREAD.1[off].as_ptr()),
-        );
-        let xor = vdupq_n_u8(XOR);
-        let mut o = 0usize;
-        while o < len {
-            let k = (len - o).min(16);
-            let s0 = end - o as i64 - 16;
-            if s0 >= 0 && ((s0 >> 2) as usize) + 8 <= pac.len() {
-                let r = vrev64q_u8(unpack16(pac, s0, idx, sh));
-                let r = veorq_u8(vextq_u8(r, r, 8), xor);
-                let n = out.len();
-                vst1q_u8(out.as_mut_ptr().add(n), r);
-                out.set_len(n + k);
-            } else {
-                for i in 0..k {
-                    out.push(scalar(end - 1 - (o + i) as i64));
-                }
+    let off = ((end - 16) & 3) as usize;
+    let (idx, sh) = (ld_u8(&SPREAD.0[off], 0), ld_s8(&SPREAD.1[off], 0));
+    let xor = vdupq_n_u8(XOR);
+    let mut b = [0u8; 16];
+    let mut o = 0usize;
+    while o < len {
+        let s0 = end - o as i64 - 16;
+        if s0 >= 0 && ((s0 >> 2) as usize) + 8 <= pac.len() {
+            // A whole vector, the last one trimmed below: a fixed-size copy each.
+            let r = vrev64q_u8(unpack16(pac, s0, idx, sh));
+            st_u8(&mut b, 0, veorq_u8(vextq_u8(r, r, 8), xor));
+            out.extend_from_slice(&b);
+        } else {
+            for i in 0..(len - o).min(16) {
+                out.push(scalar(end - 1 - (o + i) as i64));
             }
-            o += 16;
         }
+        o += 16;
     }
+    out.truncate(want);
 }
 
 /// The four 2-bit fields of each byte of `q`, base 0 of the byte first (`rev`: last first, for
 /// bytes already in reversed order). A 16-bit shift is safe on byte data: what leaks in from the
 /// neighbouring byte lands above bit 1 and the `& 3` drops it.
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn fields_x86(q: std::arch::x86_64::__m128i, rev: bool) -> [std::arch::x86_64::__m128i; 4] {
+#[target_feature(enable = "ssse3")]
+#[inline]
+fn fields_x86(q: std::arch::x86_64::__m128i, rev: bool) -> [std::arch::x86_64::__m128i; 4] {
     use std::arch::x86_64::*;
     let m = _mm_set1_epi8(3);
     let (s6, s4, s2, s0) = (
@@ -593,8 +594,9 @@ unsafe fn fields_x86(q: std::arch::x86_64::__m128i, rev: bool) -> [std::arch::x8
 /// Sixteen bases from the four packed bytes of `word` (first byte lowest), `rev` last first:
 /// fields split by [`fields_x86`], then interleaved by two rounds of unpacks.
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn unpack16_x86(word: u32, rev: bool) -> std::arch::x86_64::__m128i {
+#[target_feature(enable = "ssse3")]
+#[inline]
+fn unpack16_x86(word: u32, rev: bool) -> std::arch::x86_64::__m128i {
     use std::arch::x86_64::*;
     let w = if rev { word.swap_bytes() } else { word };
     let [f0, f1, f2, f3] = fields_x86(_mm_cvtsi32_si128(w as i32), rev);
@@ -604,15 +606,15 @@ unsafe fn unpack16_x86(word: u32, rev: bool) -> std::arch::x86_64::__m128i {
 /// The x86 twin of [`unpack64`] (`p % 4 == 0`): bases `[p, p + 64)` from their 16 packed bytes in
 /// one load, `rev` last first, `^ xor`, the fields of [`fields_x86`] interleaved into four stores.
 ///
-/// # Safety
-/// SSSE3, `p >= 0`, `(p >> 2) + 16 <= pac.len()`, and `dst` valid for 64 bytes.
+/// Panics unless `p >= 0` and `(p >> 2) + 16 <= pac.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 #[inline]
-unsafe fn unpack64_x86(pac: &[u8], p: i64, rev: bool, xor: u8, dst: *mut u8) {
+fn unpack64_x86(pac: &[u8], p: i64, rev: bool, xor: u8, dst: &mut [u8; 64]) {
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
     let mut q = _mm_xor_si128(
-        _mm_loadu_si128(pac.as_ptr().add((p >> 2) as usize).cast()),
+        ld128(pac, (p >> 2) as usize),
         _mm_set1_epi8(xor.wrapping_mul(0x55) as i8),
     );
     if rev {
@@ -624,11 +626,10 @@ unsafe fn unpack64_x86(pac: &[u8], p: i64, rev: bool, xor: u8, dst: *mut u8) {
     let [f0, f1, f2, f3] = fields_x86(q, rev);
     let (a_lo, a_hi) = (_mm_unpacklo_epi8(f0, f1), _mm_unpackhi_epi8(f0, f1));
     let (b_lo, b_hi) = (_mm_unpacklo_epi8(f2, f3), _mm_unpackhi_epi8(f2, f3));
-    let d = dst.cast::<__m128i>();
-    _mm_storeu_si128(d, _mm_unpacklo_epi16(a_lo, b_lo));
-    _mm_storeu_si128(d.add(1), _mm_unpackhi_epi16(a_lo, b_lo));
-    _mm_storeu_si128(d.add(2), _mm_unpacklo_epi16(a_hi, b_hi));
-    _mm_storeu_si128(d.add(3), _mm_unpackhi_epi16(a_hi, b_hi));
+    st128(dst, 0, _mm_unpacklo_epi16(a_lo, b_lo));
+    st128(dst, 16, _mm_unpackhi_epi16(a_lo, b_lo));
+    st128(dst, 32, _mm_unpacklo_epi16(a_hi, b_hi));
+    st128(dst, 48, _mm_unpackhi_epi16(a_hi, b_hi));
 }
 
 /// [`unpack_pac_fwd`] on SSSE3, the structure of [`unpack_fwd_neon`]: at most three bases one at a
@@ -636,91 +637,81 @@ unsafe fn unpack64_x86(pac: &[u8], p: i64, rev: bool, xor: u8, dst: *mut u8) {
 /// one stored whole and trimmed. SSSE3 and chosen at runtime because the release artefact is built
 /// at the x86-64 baseline; `pshufb` is the one instruction here past SSE2.
 ///
-/// # Safety
-/// SSSE3; `out` has room for `len + 16` bytes past its length.
+/// `out` as for [`unpack_pac_fwd`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn unpack_fwd_ssse3<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
-    use std::arch::x86_64::*;
+fn unpack_fwd_ssse3<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    use bwa_core::simd::*;
     let scalar = |p: i64| ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3) ^ XOR;
-    let end = start + len as i64;
+    let (end, want) = (start + len as i64, out.len() + len);
     let mut pos = start;
     while pos < end && pos & 3 != 0 {
         out.push(scalar(pos));
         pos += 1;
     }
     // `pos + 64 <= end <= l_pac`, so the 16 bytes from `pos >> 2` are inside `pac`.
+    let mut b = [0u8; 64];
     while pos + 64 <= end {
-        let n = out.len();
-        unpack64_x86(pac, pos, false, XOR, out.as_mut_ptr().add(n));
-        out.set_len(n + 64);
+        unpack64_x86(pac, pos, false, XOR, &mut b);
+        out.extend_from_slice(&b);
         pos += 64;
     }
     let xor = u32::from(XOR).wrapping_mul(0x5555_5555);
+    let mut b = [0u8; 16];
     while pos < end && ((pos >> 2) as usize) + 4 <= pac.len() {
-        let word = (pac.as_ptr().add((pos >> 2) as usize) as *const u32).read_unaligned();
-        let n = out.len();
-        _mm_storeu_si128(
-            out.as_mut_ptr().add(n).cast(),
-            unpack16_x86(word ^ xor, false),
-        );
-        out.set_len(n + (end - pos).min(16) as usize);
+        let i = (pos >> 2) as usize;
+        let word = u32::from_ne_bytes(pac[i..i + 4].try_into().unwrap());
+        // A whole vector, the last one trimmed below: a fixed-size copy each.
+        st128(&mut b, 0, unpack16_x86(word ^ xor, false));
+        out.extend_from_slice(&b);
         pos += 16;
     }
     while pos < end {
         out.push(scalar(pos));
         pos += 1;
     }
+    out.truncate(want);
 }
 
 /// [`unpack_pac_fwd`] of `[start, start + len)` reversed, and complemented when `XOR` is 3, in one
 /// SSSE3 pass, as [`unpack_pac_rev_neon`] does on aarch64: the source is walked from its end, at
 /// most three bases one at a time to a byte boundary, then 64 per step ([`unpack64_x86`]), then
-/// sixteen per step with the last one stored whole and trimmed. Appends to `out`, which must have
-/// room for `len + 16` bytes.
-///
-/// # Safety
-/// SSSE3.
+/// sixteen per step with the last one stored whole and trimmed. `out` as for [`unpack_pac_fwd`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn unpack_pac_rev_ssse3<const XOR: u8>(
-    pac: &[u8],
-    start: i64,
-    len: usize,
-    out: &mut Vec<u8>,
-) {
-    use std::arch::x86_64::*;
+fn unpack_pac_rev_ssse3<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
+    use bwa_core::simd::*;
     let scalar = |p: i64| ((pac[(p >> 2) as usize] >> ((3 - (p & 3)) << 1)) & 3) ^ XOR;
     // Output base `o` is source base `end - 1 - o`, `^ XOR`.
-    let mut end = start + len as i64;
+    let (mut end, want) = (start + len as i64, out.len() + len);
     while end > start && end & 3 != 0 {
         out.push(scalar(end - 1));
         end -= 1;
     }
     // `end <= l_pac`, so the 16 bytes from `(end - 64) >> 2` are inside `pac`.
+    let mut b = [0u8; 64];
     while end - 64 >= start {
-        let n = out.len();
-        unpack64_x86(pac, end - 64, true, XOR, out.as_mut_ptr().add(n));
-        out.set_len(n + 64);
+        unpack64_x86(pac, end - 64, true, XOR, &mut b);
+        out.extend_from_slice(&b);
         end -= 64;
     }
     // The 16 bases below `end`, keeping as many as the window still wants: `end` is a byte
     // boundary at most `l_pac`, so the 4 bytes up to `end >> 2` are inside `pac`.
     let xor = u32::from(XOR).wrapping_mul(0x5555_5555);
+    let mut b = [0u8; 16];
     while end > start && end >= 16 {
-        let word = (pac.as_ptr().add(((end - 16) >> 2) as usize) as *const u32).read_unaligned();
-        let n = out.len();
-        _mm_storeu_si128(
-            out.as_mut_ptr().add(n).cast(),
-            unpack16_x86(word ^ xor, true),
-        );
-        out.set_len(n + (end - start).min(16) as usize);
+        let i = ((end - 16) >> 2) as usize;
+        let word = u32::from_ne_bytes(pac[i..i + 4].try_into().unwrap());
+        // A whole vector, the last one trimmed below: a fixed-size copy each.
+        st128(&mut b, 0, unpack16_x86(word ^ xor, true));
+        out.extend_from_slice(&b);
         end -= 16;
     }
     while end > start {
         out.push(scalar(end - 1));
         end -= 1;
     }
+    out.truncate(want);
 }
 
 pub(crate) fn unpack_pac_range_into(pac: &[u8], l_pac: i64, rb: i64, re: i64, out: &mut Vec<u8>) {
@@ -735,6 +726,7 @@ pub(crate) fn unpack_pac_range_append(pac: &[u8], l_pac: i64, rb: i64, re: i64, 
         return;
     }
     let len0 = out.len();
+    // 16 bytes of slack: the vector paths push a whole last vector and trim it.
     out.reserve(len + 16);
     if re <= l_pac {
         unpack_pac_fwd::<0>(pac, rb, len, out);
@@ -743,9 +735,7 @@ pub(crate) fn unpack_pac_range_append(pac: &[u8], l_pac: i64, rb: i64, re: i64, 
         // (complementary codes sum to 3 in bwa's A=0 C=1 G=2 T=3 order).
         unpack_pac_rev::<3>(pac, 2 * l_pac - re, len, out);
     } else {
-        for p in rb..re {
-            out.push(unpack_pac_base(pac, l_pac, p));
-        }
+        out.extend((rb..re).map(|p| unpack_pac_base(pac, l_pac, p)));
     }
     debug_assert_eq!(out.len(), len0 + len);
 }
@@ -765,6 +755,7 @@ pub(crate) fn unpack_pac_range_append_rev(
         return;
     }
     let len0 = out.len();
+    // 16 bytes of slack: the vector paths push a whole last vector and trim it.
     out.reserve(len + 16);
     if re <= l_pac {
         unpack_pac_rev::<0>(pac, rb, len, out);
@@ -773,24 +764,23 @@ pub(crate) fn unpack_pac_range_append_rev(
         // forward range `[2L - re, 2L - rb)` in order, complemented.
         unpack_pac_fwd::<3>(pac, 2 * l_pac - re, len, out);
     } else {
-        for p in (rb..re).rev() {
-            out.push(unpack_pac_base(pac, l_pac, p));
-        }
+        out.extend((rb..re).rev().map(|p| unpack_pac_base(pac, l_pac, p)));
     }
     debug_assert_eq!(out.len(), len0 + len);
 }
 
-/// Forward bases `[start, start + len)` appended last first, `^ XOR` (3: complemented). `out` must
+/// Forward bases `[start, start + len)` appended last first, `^ XOR` (3: complemented). `out` should
 /// have room for `len + 16` bytes past its length.
 fn unpack_pac_rev<const XOR: u8>(pac: &[u8], start: i64, len: usize, out: &mut Vec<u8>) {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
-        unpack_pac_rev_neon::<XOR>(pac, start, len, out);
+        // SAFETY: neon detected.
+        unsafe { unpack_pac_rev_neon::<XOR>(pac, start, len, out) };
         return;
     }
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("ssse3") {
-        // SAFETY: ssse3 detected; the caller reserved `len + 16` bytes.
+        // SAFETY: ssse3 detected.
         unsafe { unpack_pac_rev_ssse3::<XOR>(pac, start, len, out) };
         return;
     }
@@ -1039,6 +1029,7 @@ impl FmIndex {
         // `get_occ` lands here at a computed, unpredictable address. See `crate::hugepage` for why
         // this cannot change output.
         let mut cp_occ = Vec::<CpOcc>::with_capacity(cp_size);
+        // SAFETY: a hint on the vector's own reserved capacity; it never reads or writes the memory.
         unsafe {
             crate::hugepage::advise_hugepage(
                 cp_occ.as_ptr() as *const u8,
@@ -1127,6 +1118,7 @@ impl FmIndex {
         let entries_per_word = 64usize >> sa_hi_log2;
         let mut sa_hi = vec![0u64; sa_size.div_ceil(entries_per_word)];
         // 97 MB on GRCh38, walked randomly by `get_sa` alongside `sa_ls_word`.
+        // SAFETY: a hint on the vector's own live buffer; it never reads or writes the memory.
         unsafe {
             crate::hugepage::advise_hugepage(sa_hi.as_ptr() as *const u8, sa_hi.len() * 8);
         }
@@ -1202,6 +1194,7 @@ impl FmIndex {
         // effectively random. A file-backed mapping only takes huge pages on a kernel and
         // filesystem that support it (Linux >= 5.7 plus a THP-capable fs), so treat this one as a
         // bonus rather than a load-bearing hint; it costs one ignored syscall where unsupported.
+        // SAFETY: a hint on the live mapping; it never reads or writes the memory.
         unsafe { crate::hugepage::advise_hugepage(pac.as_ptr(), pac.len()) };
 
         let mut fm = FmIndex {
@@ -1236,6 +1229,7 @@ impl FmIndex {
         // hints its table the same way).
         let n = seed_jump_level_off(SEED_JUMP_DEPTH + 1);
         let mut table = Vec::<SeedJump>::with_capacity(n);
+        // SAFETY: a hint on the vector's own reserved capacity; it never reads or writes the memory.
         unsafe {
             crate::hugepage::advise_hugepage(
                 table.as_ptr() as *const u8,
@@ -1558,6 +1552,7 @@ impl FmIndex {
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     fn occ4_narrow(&self, block: &CpOcc, row: i64) -> [u32; 4] {
+        use bwa_core::simd::*;
         use std::arch::aarch64::*;
         // SAFETY: NEON is mandatory on AArch64, and the one load reads the four `u32`s of `block`.
         let mut occ: [u32; 4] = unsafe {
@@ -1572,7 +1567,7 @@ impl FmIndex {
                 vcntq_u8(vreinterpretq_u8_u64(gt)),
             );
             let halves = vpaddlq_u8(bytes);
-            let counts = vld1q_u32(block.cp_count.as_ptr());
+            let counts = ld_u32(&block.cp_count, 0);
             std::mem::transmute(vpadalq_u16(counts, halves))
         };
         if row >> CP_SHIFT == self.sentinel_block {
@@ -1715,6 +1710,8 @@ impl FmIndex {
         debug_assert!(((pp >> CP_SHIFT) as usize) < cp.len());
         // SAFETY: `pp` is a row of a live interval, at most `ref_seq_len`, and the blocks cover
         // every row up to and including it (`get_occ` indexes the same block checked).
+        // Unchecked because the checks on these six SMEM lookups measured +0.5% cycles and +1.2%
+        // instructions (chr21 200k pairs, -t1, M4).
         let b = unsafe { cp.get_unchecked((pp >> CP_SHIFT) as usize) };
         // AArch64 has no scalar popcount: computed in GPRs, the count crosses to the vector unit
         // and back on the `k` chain. Planes and mask go straight into vector registers instead (a
@@ -1999,6 +1996,7 @@ impl FmIndex {
         let c = 3 - aj;
         #[cfg(target_arch = "aarch64")]
         if !self.wide {
+            use bwa_core::simd::*;
             use std::arch::aarch64::*;
             let sp = smem.l;
             let ep = smem.l + smem.s;
@@ -2015,9 +2013,9 @@ impl FmIndex {
             let o_ep = self.occ4_narrow(bep, ep);
             // SAFETY: NEON is mandatory on AArch64; the loads read four-element local arrays.
             let (kc, sc, sgt) = unsafe {
-                let (vsp, vep) = (vld1q_u32(o_sp.as_ptr()), vld1q_u32(o_ep.as_ptr()));
+                let (vsp, vep) = (ld_u32(&o_sp, 0), ld_u32(&o_ep, 0));
                 let d = vsubq_u32(vep, vsp);
-                let lane = vld1q_u32([0u32, 1, 2, 3].as_ptr());
+                let lane = ld_u32(&([0u32, 1, 2, 3]), 0);
                 let cv = vdupq_n_u32(c as u32);
                 let (eq, gt) = (vceqq_u32(lane, cv), vcgtq_u32(lane, cv));
                 (
@@ -2042,6 +2040,7 @@ impl FmIndex {
         // left x86 juggling selects and spills in the seeding drivers this inlines into.
         #[cfg(target_arch = "x86_64")]
         if !self.wide {
+            use bwa_core::simd::*;
             use std::arch::x86_64::*;
             // Base `c`'s rows are `(hi ^ hx) & (lo ^ lx)`, the rows above it
             // `(hi & mh) | (lo & ml) | (hi & lo & mhl)`: `[hx, lx, mh, ml, mhl]`.
@@ -2082,7 +2081,7 @@ impl FmIndex {
                     _mm_load_si128(bep.cp_count.as_ptr().cast()),
                     _mm_load_si128(bsp.cp_count.as_ptr().cast()),
                 );
-                let x = _mm_and_si128(d, _mm_loadu_si128(ABOVE[c & 3].as_ptr().cast()));
+                let x = _mm_and_si128(d, ld128(&(ABOVE[c & 3]), 0));
                 let x = _mm_add_epi32(x, _mm_shuffle_epi32::<0b01_00_11_10>(x));
                 let x = _mm_add_epi32(x, _mm_shuffle_epi32::<0b10_11_00_01>(x));
                 (_mm_cvtsi128_si32(x) as u32)
@@ -2304,12 +2303,14 @@ impl FmIndex {
     #[inline]
     fn prefetch_cp(&self, pos: i64) {
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: the address is only prefetched, which never faults or reads architecturally.
         unsafe {
             // Address of the checkpoint block covering row `pos`.
             let p = self.cp_occ.as_ptr().add((pos >> CP_SHIFT) as usize);
             std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
         }
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: the address is only prefetched, which never faults or reads architecturally.
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
             _mm_prefetch(
@@ -2327,6 +2328,7 @@ impl FmIndex {
     #[inline]
     fn prefetch_sa_sample(&self, idx: usize) {
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: the addresses are only prefetched, which never faults or reads architecturally.
         unsafe {
             let ls = self.sa_ls_word.as_ptr().add(idx);
             let hi = self.sa_hi.as_ptr().add((idx << self.sa_hi_log2) >> 6);
@@ -2334,6 +2336,7 @@ impl FmIndex {
             std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) hi, options(nostack, readonly, preserves_flags));
         }
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: the addresses are only prefetched, which never faults or reads architecturally.
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
             _mm_prefetch(self.sa_ls_word.as_ptr().add(idx) as *const i8, _MM_HINT_T0);
@@ -2526,6 +2529,7 @@ impl FmIndex {
         // SAFETY: NEON is mandatory on AArch64. Each `unpack16` reads pac bytes `[p >> 2, +8)`,
         // checked against `pac.len()`; each read load is `q[j..j + 16]`, checked against `q.len()`.
         unsafe {
+            use bwa_core::simd::*;
             use std::arch::aarch64::*;
             // Index of the first lane set in `ne` (0xFF lanes), 16 when none is.
             let first = |ne: uint8x16_t| -> usize {
@@ -2537,15 +2541,9 @@ impl FmIndex {
             let pac = text;
             if t < l_pac {
                 let o = (t & 3) as usize;
-                let (idx, sh) = (
-                    vld1q_u8(SPREAD.0[o].as_ptr()),
-                    vld1q_s8(SPREAD.1[o].as_ptr()),
-                );
+                let (idx, sh) = (ld_u8(&SPREAD.0[o], 0), ld_s8(&SPREAD.1[o], 0));
                 while j + 16 <= q.len() && t + 16 <= l_pac && ((t >> 2) as usize) + 8 <= pac.len() {
-                    let ne = vmvnq_u8(vceqq_u8(
-                        unpack16(pac, t, idx, sh),
-                        vld1q_u8(q.as_ptr().add(j)),
-                    ));
+                    let ne = vmvnq_u8(vceqq_u8(unpack16(pac, t, idx, sh), ld_u8(q, j)));
                     let k = first(ne);
                     if k < 16 {
                         return j + k;
@@ -2557,10 +2555,7 @@ impl FmIndex {
                 // Text `t..t + 16` is forward `[2L - t - 16, 2L - t)` reversed and complemented.
                 let s0 = 2 * l_pac - t - 16;
                 let o = (s0 & 3) as usize;
-                let (idx, sh) = (
-                    vld1q_u8(SPREAD.0[o].as_ptr()),
-                    vld1q_s8(SPREAD.1[o].as_ptr()),
-                );
+                let (idx, sh) = (ld_u8(&SPREAD.0[o], 0), ld_s8(&SPREAD.1[o], 0));
                 let three = vdupq_n_u8(3);
                 while j + 16 <= q.len()
                     && 2 * l_pac - t - 16 >= 0
@@ -2568,7 +2563,7 @@ impl FmIndex {
                 {
                     let r = vrev64q_u8(unpack16(pac, 2 * l_pac - t - 16, idx, sh));
                     let x = veorq_u8(vextq_u8(r, r, 8), three);
-                    let ne = vmvnq_u8(vceqq_u8(x, vld1q_u8(q.as_ptr().add(j))));
+                    let ne = vmvnq_u8(vceqq_u8(x, ld_u8(q, j)));
                     let k = first(ne);
                     if k < 16 {
                         return j + k;
@@ -2582,12 +2577,12 @@ impl FmIndex {
         // SAFETY: SSE2 is part of x86-64. Each word load reads pac bytes `[p >> 2, +4)`, checked
         // against `pac.len()`; each read load is `q[j..j + 16]`, checked against `q.len()`.
         unsafe {
+            use bwa_core::simd::*;
             use std::arch::x86_64::*;
             let pac = text;
             // The first base of `q[j..j + 16]` that differs from `x`, 16 when none does.
             let first = |x: __m128i, j: usize| -> u32 {
-                let eq =
-                    _mm_movemask_epi8(_mm_cmpeq_epi8(x, _mm_loadu_si128(q.as_ptr().add(j).cast())));
+                let eq = _mm_movemask_epi8(_mm_cmpeq_epi8(x, ld128(q, j)));
                 (!eq as u32 & 0xFFFF).trailing_zeros().min(16)
             };
             if t < l_pac {

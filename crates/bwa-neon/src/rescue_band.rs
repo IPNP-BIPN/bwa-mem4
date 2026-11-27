@@ -348,95 +348,98 @@ impl Batch {
         max_sc: i32,
         out: &mut [KswAlignResult],
     ) {
-        if self.parents.is_empty() {
-            return;
-        }
-        let gaps = [
-            (o_del + e_del) as u8,
-            e_del as u8,
-            (o_ins + e_ins) as u8,
-            e_ins as u8,
-        ];
-        let tbl = crate::matesw::u8_score_table(mat);
-        self.work.mat5 = mat5_of(mat);
-        let probe = crate::matesw::cells::enabled();
-        let t_all = probe.then(std::time::Instant::now);
-        let cells0 = self.work.cells;
-        // ---- round 1 ----
-        self.jobs.clear();
-        self.pool.clear();
-        for pi in 0..self.parents.len() {
-            self.add_jobs(pi, 1, false, 0, 0);
-        }
-        self.run_jobs(jobs, &tbl, gaps, minsc, max_sc);
-        self.r2.clear();
-        for pi in 0..self.parents.len() {
-            self.finish(pi, minsc, max_sc);
-            let p = &self.parents[pi];
-            let z = (p.s + max_sc - 1) / max_sc;
-            // A lazy parent's `t1` is at most its score, so its bands held every alignment
-            // scoring `S` and round 1 gave `S`, `te` and `qe` exactly.
-            debug_assert!(!p.lazy || p.s >= p.t1);
-            let done = p.lazy
-                || p.t1 == minsc
-                || (p.s >= p.t1 && (p.s2 >= p.t1 || (p.te - z <= p.hb && p.te + z >= p.he)));
-            if done {
-                write(p, &mut out[p.job as usize]);
-            } else {
-                self.r2.push(pi as u32);
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            if self.parents.is_empty() {
+                return;
             }
-        }
-        // ---- round 2: the components at `minsc`, skipping those confined to `(te - Z, te)` with a
-        //      bound below the round-1 `S` when that `S` (`>= T1`) is already exact ----
-        if let Some(t0) = t_all {
-            use crate::matesw::cells::*;
-            use std::sync::atomic::Ordering::Relaxed;
-            BAND_R2.fetch_add(self.r2.len() as u64, Relaxed);
-            BAND_CELLS.fetch_add(
-                (self.work.cells - cells0) * self.work.lanes() as u64,
-                Relaxed,
-            );
-            BAND_KERNEL_NS.fetch_add(self.work.kernel_ns, Relaxed);
-            BAND_OTHER_NS.fetch_add(
-                t0.elapsed().as_nanos() as u64 - self.work.kernel_ns,
-                Relaxed,
-            );
-            self.work.kernel_ns = 0;
-        }
-        if self.r2.is_empty() {
-            return;
-        }
-        let t_all = probe.then(std::time::Instant::now);
-        let cells0 = self.work.cells;
-        self.jobs.clear();
-        self.pool.clear();
-        for i in 0..self.r2.len() {
-            let pi = self.r2[i] as usize;
-            let p = &self.parents[pi];
-            let (sh, teh) = if p.s >= p.t1 { (p.s, p.te) } else { (0, 0) };
-            let zh = (sh + max_sc - 1) / max_sc;
-            self.add_jobs(pi, 2, sh >= minsc, teh - zh, teh);
-        }
-        self.run_jobs(jobs, &tbl, gaps, minsc, max_sc);
-        for i in 0..self.r2.len() {
-            let pi = self.r2[i] as usize;
-            self.finish(pi, minsc, max_sc);
-            let p = &self.parents[pi];
-            write(p, &mut out[p.job as usize]);
-        }
-        if let Some(t0) = t_all {
-            use crate::matesw::cells::*;
-            use std::sync::atomic::Ordering::Relaxed;
-            BAND_CELLS.fetch_add(
-                (self.work.cells - cells0) * self.work.lanes() as u64,
-                Relaxed,
-            );
-            BAND_KERNEL_NS.fetch_add(self.work.kernel_ns, Relaxed);
-            BAND_OTHER_NS.fetch_add(
-                t0.elapsed().as_nanos() as u64 - self.work.kernel_ns,
-                Relaxed,
-            );
-            self.work.kernel_ns = 0;
+            let gaps = [
+                (o_del + e_del) as u8,
+                e_del as u8,
+                (o_ins + e_ins) as u8,
+                e_ins as u8,
+            ];
+            let tbl = crate::matesw::u8_score_table(mat);
+            self.work.mat5 = mat5_of(mat);
+            let probe = crate::matesw::cells::enabled();
+            let t_all = probe.then(std::time::Instant::now);
+            let cells0 = self.work.cells;
+            // ---- round 1 ----
+            self.jobs.clear();
+            self.pool.clear();
+            for pi in 0..self.parents.len() {
+                self.add_jobs(pi, 1, false, 0, 0);
+            }
+            self.run_jobs(jobs, &tbl, gaps, minsc, max_sc);
+            self.r2.clear();
+            for pi in 0..self.parents.len() {
+                self.finish(pi, minsc, max_sc);
+                let p = &self.parents[pi];
+                let z = (p.s + max_sc - 1) / max_sc;
+                // A lazy parent's `t1` is at most its score, so its bands held every alignment
+                // scoring `S` and round 1 gave `S`, `te` and `qe` exactly.
+                debug_assert!(!p.lazy || p.s >= p.t1);
+                let done = p.lazy
+                    || p.t1 == minsc
+                    || (p.s >= p.t1 && (p.s2 >= p.t1 || (p.te - z <= p.hb && p.te + z >= p.he)));
+                if done {
+                    write(p, &mut out[p.job as usize]);
+                } else {
+                    self.r2.push(pi as u32);
+                }
+            }
+            // ---- round 2: the components at `minsc`, skipping those confined to `(te - Z, te)` with a
+            //      bound below the round-1 `S` when that `S` (`>= T1`) is already exact ----
+            if let Some(t0) = t_all {
+                use crate::matesw::cells::*;
+                use std::sync::atomic::Ordering::Relaxed;
+                BAND_R2.fetch_add(self.r2.len() as u64, Relaxed);
+                BAND_CELLS.fetch_add(
+                    (self.work.cells - cells0) * self.work.lanes() as u64,
+                    Relaxed,
+                );
+                BAND_KERNEL_NS.fetch_add(self.work.kernel_ns, Relaxed);
+                BAND_OTHER_NS.fetch_add(
+                    t0.elapsed().as_nanos() as u64 - self.work.kernel_ns,
+                    Relaxed,
+                );
+                self.work.kernel_ns = 0;
+            }
+            if self.r2.is_empty() {
+                return;
+            }
+            let t_all = probe.then(std::time::Instant::now);
+            let cells0 = self.work.cells;
+            self.jobs.clear();
+            self.pool.clear();
+            for i in 0..self.r2.len() {
+                let pi = self.r2[i] as usize;
+                let p = &self.parents[pi];
+                let (sh, teh) = if p.s >= p.t1 { (p.s, p.te) } else { (0, 0) };
+                let zh = (sh + max_sc - 1) / max_sc;
+                self.add_jobs(pi, 2, sh >= minsc, teh - zh, teh);
+            }
+            self.run_jobs(jobs, &tbl, gaps, minsc, max_sc);
+            for i in 0..self.r2.len() {
+                let pi = self.r2[i] as usize;
+                self.finish(pi, minsc, max_sc);
+                let p = &self.parents[pi];
+                write(p, &mut out[p.job as usize]);
+            }
+            if let Some(t0) = t_all {
+                use crate::matesw::cells::*;
+                use std::sync::atomic::Ordering::Relaxed;
+                BAND_CELLS.fetch_add(
+                    (self.work.cells - cells0) * self.work.lanes() as u64,
+                    Relaxed,
+                );
+                BAND_KERNEL_NS.fetch_add(self.work.kernel_ns, Relaxed);
+                BAND_OTHER_NS.fetch_add(
+                    t0.elapsed().as_nanos() as u64 - self.work.kernel_ns,
+                    Relaxed,
+                );
+                self.work.kernel_ns = 0;
+            }
         }
     }
 
@@ -482,90 +485,95 @@ impl Batch {
         minsc: i32,
         max_sc: i32,
     ) {
-        let n = self.jobs.len();
-        self.order.clear();
-        self.order.extend(
-            self.jobs
-                .iter()
-                .enumerate()
-                .map(|(i, j)| u64::from(j.key) << 32 | i as u64),
-        );
-        self.order.sort_unstable();
-        let gl = self.work.lanes();
-        // Once per call, not per group (a `memset` of the whole array each time): a group writes
-        // and reads only its first `nl` lanes.
-        let mut lanes = [kernel::Lane::default(); kernel::L];
-        for g in (0..n).step_by(gl) {
-            let nl = gl.min(n - g);
-            let (mut wmax, mut omax) = (1, i32::MIN);
-            for l in 0..nl {
-                let j = &self.jobs[self.order[g + l] as u32 as usize];
-                let b = &j.band;
-                let kj = &jobs[self.parents[j.parent as usize].job as usize];
-                lanes[l] = kernel::Lane {
-                    q: kj.query,
-                    t: &kj.target[b.r0 as usize..=b.r1 as usize],
-                    quanta: kj.query.len().div_ceil(16) as i32 * 16,
-                    o: b.r0 - b.dlo,
-                    w: b.dhi - b.dlo + 1,
-                    target: 0,
-                    thr: minsc.clamp(0, 255) as u8,
-                };
-                wmax = wmax.max(lanes[l].w);
-                omax = omax.max(lanes[l].o);
-            }
-            // Band shift: a lane narrower than the group gets its spare diagonals below its band
-            // whenever that moves its query offset up toward the group's largest, so the lanes'
-            // live columns line up and the per-row union shrinks. The lane only gains diagonals.
-            for lane in lanes[..nl].iter_mut() {
-                lane.o += (omax - lane.o).min(wmax - lane.w);
-            }
-            // Timed only for the probe: two clock reads per group were paid on every run.
-            let t0 = crate::matesw::cells::enabled().then(std::time::Instant::now);
-            self.work.run(&lanes[..nl], wmax as usize, tbl, gaps);
-            if let Some(t0) = t0 {
-                self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
-            }
-            for l in 0..nl {
-                let ji = self.order[g + l] as u32 as usize;
-                let (pi, b) = (self.jobs[ji].parent as usize, self.jobs[ji].band);
-                let p = &mut self.parents[pi];
-                let g8 = i32::from(self.work.gmax[l]);
-                let (te, qe) = if g8 > 0 {
-                    (b.r0 + self.work.te[l], i32::from(self.work.qe[l]))
-                } else {
-                    (-1, 0)
-                };
-                let nrows = (b.r1 - b.r0 + 1) as usize;
-                if p.lazy {
-                    // No row maxima: `score2` is the caller's to compute.
-                    if g8 > p.s || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)))
-                    {
-                        (p.s, p.te, p.qe) = (g8, te, qe);
-                    }
-                    continue;
-                }
-                let rl = self.work.lane_rows(l, nrows);
-                if p.buf < 0 {
-                    // The parent's only band: its outputs are the parent's.
-                    (p.s, p.te, p.qe) = (g8, te, qe);
-                    (p.s2, p.te2) = if g8 >= minsc {
-                        score2(rl, b.r0, g8, te, minsc, max_sc)
-                    } else {
-                        (-1, -1)
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let n = self.jobs.len();
+            self.order.clear();
+            self.order.extend(
+                self.jobs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, j)| u64::from(j.key) << 32 | i as u64),
+            );
+            self.order.sort_unstable();
+            let gl = self.work.lanes();
+            // Once per call, not per group (a `memset` of the whole array each time): a group writes
+            // and reads only its first `nl` lanes.
+            let mut lanes = [kernel::Lane::default(); kernel::L];
+            for g in (0..n).step_by(gl) {
+                let nl = gl.min(n - g);
+                let (mut wmax, mut omax) = (1, i32::MIN);
+                for l in 0..nl {
+                    let j = &self.jobs[self.order[g + l] as u32 as usize];
+                    let b = &j.band;
+                    let kj = &jobs[self.parents[j.parent as usize].job as usize];
+                    lanes[l] = kernel::Lane {
+                        q: kj.query,
+                        t: &kj.target[b.r0 as usize..=b.r1 as usize],
+                        quanta: kj.query.len().div_ceil(16) as i32 * 16,
+                        o: b.r0 - b.dlo,
+                        w: b.dhi - b.dlo + 1,
+                        target: 0,
+                        thr: minsc.clamp(0, 255) as u8,
                     };
-                } else {
-                    // Every row of a band below `minsc` is too (`g8` is their max), and `score2`
-                    // reads no row below `minsc`: such a band would leave it unchanged.
-                    if g8 >= minsc {
-                        let buf = &mut self.pool[p.buf as usize + (b.r0 - p.hb) as usize..];
-                        for (x, &v) in buf[..nrows].iter_mut().zip(rl) {
-                            *x = (*x).max(v);
+                    wmax = wmax.max(lanes[l].w);
+                    omax = omax.max(lanes[l].o);
+                }
+                // Band shift: a lane narrower than the group gets its spare diagonals below its band
+                // whenever that moves its query offset up toward the group's largest, so the lanes'
+                // live columns line up and the per-row union shrinks. The lane only gains diagonals.
+                for lane in lanes[..nl].iter_mut() {
+                    lane.o += (omax - lane.o).min(wmax - lane.w);
+                }
+                // Timed only for the probe: two clock reads per group were paid on every run.
+                let t0 = crate::matesw::cells::enabled().then(std::time::Instant::now);
+                self.work.run(&lanes[..nl], wmax as usize, tbl, gaps);
+                if let Some(t0) = t0 {
+                    self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
+                }
+                for l in 0..nl {
+                    let ji = self.order[g + l] as u32 as usize;
+                    let (pi, b) = (self.jobs[ji].parent as usize, self.jobs[ji].band);
+                    let p = &mut self.parents[pi];
+                    let g8 = i32::from(self.work.gmax[l]);
+                    let (te, qe) = if g8 > 0 {
+                        (b.r0 + self.work.te[l], i32::from(self.work.qe[l]))
+                    } else {
+                        (-1, 0)
+                    };
+                    let nrows = (b.r1 - b.r0 + 1) as usize;
+                    if p.lazy {
+                        // No row maxima: `score2` is the caller's to compute.
+                        if g8 > p.s
+                            || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)))
+                        {
+                            (p.s, p.te, p.qe) = (g8, te, qe);
                         }
+                        continue;
                     }
-                    if g8 > p.s || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)))
-                    {
+                    let rl = self.work.lane_rows(l, nrows);
+                    if p.buf < 0 {
+                        // The parent's only band: its outputs are the parent's.
                         (p.s, p.te, p.qe) = (g8, te, qe);
+                        (p.s2, p.te2) = if g8 >= minsc {
+                            score2(rl, b.r0, g8, te, minsc, max_sc)
+                        } else {
+                            (-1, -1)
+                        };
+                    } else {
+                        // Every row of a band below `minsc` is too (`g8` is their max), and `score2`
+                        // reads no row below `minsc`: such a band would leave it unchanged.
+                        if g8 >= minsc {
+                            let buf = &mut self.pool[p.buf as usize + (b.r0 - p.hb) as usize..];
+                            for (x, &v) in buf[..nrows].iter_mut().zip(rl) {
+                                *x = (*x).max(v);
+                            }
+                        }
+                        if g8 > p.s
+                            || (g8 == p.s && g8 > 0 && (te < p.te || (te == p.te && qe < p.qe)))
+                        {
+                            (p.s, p.te, p.qe) = (g8, te, qe);
+                        }
                     }
                 }
             }
@@ -596,87 +604,90 @@ impl Batch {
         max_sc: i32,
         out: &mut [(i32, i32, i32)],
     ) {
-        let gaps = [
-            (o_del + e_del) as u8,
-            e_del as u8,
-            (o_ins + e_ins) as u8,
-            e_ins as u8,
-        ];
-        let tbl = crate::matesw::u8_score_table(mat);
-        self.work.mat5 = mat5_of(mat);
-        self.jobs.clear();
-        for (i, &(q, t, s)) in jobs.iter().enumerate() {
-            let (len2, nrows) = (q.len() as i32, t.len() as i32);
-            let dmax = ((max_sc * len2 - s - o_del) / e_del).max(0);
-            let imax = ((max_sc * len2 - s - o_ins) / (max_sc + e_ins)).max(0);
-            let b = Band {
-                r0: 0,
-                r1: nrows - 1,
-                dlo: -imax,
-                dhi: dmax,
-                ub: s,
-            };
-            self.jobs.push(Job {
-                parent: i as u32,
-                band: b,
-                key: width_bucket(b.dhi - b.dlo + 1) << 16 | nrows.min(65535) as u32,
-            });
-        }
-        let n = self.jobs.len();
-        self.order.clear();
-        self.order.extend(
-            self.jobs
-                .iter()
-                .enumerate()
-                .map(|(i, j)| u64::from(j.key) << 32 | i as u64),
-        );
-        self.order.sort_unstable();
-        let gl = self.work.lanes();
-        // Once per call, not per group (a `memset` of the whole array each time): a group writes
-        // and reads only its first `nl` lanes.
-        let mut lanes = [kernel::Lane::default(); kernel::L];
-        for g in (0..n).step_by(gl) {
-            let nl = gl.min(n - g);
-            let (mut wmax, mut omax) = (1, i32::MIN);
-            for l in 0..nl {
-                let j = &self.jobs[self.order[g + l] as u32 as usize];
-                let (q, t, s) = jobs[j.parent as usize];
-                lanes[l] = kernel::Lane {
-                    q,
-                    t,
-                    quanta: q.len().div_ceil(16) as i32 * 16,
-                    o: -j.band.dlo,
-                    w: j.band.dhi - j.band.dlo + 1,
-                    target: s as u8,
-                    thr: s as u8,
+        // SAFETY: the caller upholds this function's `# Safety` contract.
+        unsafe {
+            let gaps = [
+                (o_del + e_del) as u8,
+                e_del as u8,
+                (o_ins + e_ins) as u8,
+                e_ins as u8,
+            ];
+            let tbl = crate::matesw::u8_score_table(mat);
+            self.work.mat5 = mat5_of(mat);
+            self.jobs.clear();
+            for (i, &(q, t, s)) in jobs.iter().enumerate() {
+                let (len2, nrows) = (q.len() as i32, t.len() as i32);
+                let dmax = ((max_sc * len2 - s - o_del) / e_del).max(0);
+                let imax = ((max_sc * len2 - s - o_ins) / (max_sc + e_ins)).max(0);
+                let b = Band {
+                    r0: 0,
+                    r1: nrows - 1,
+                    dlo: -imax,
+                    dhi: dmax,
+                    ub: s,
                 };
-                wmax = wmax.max(lanes[l].w);
-                omax = omax.max(lanes[l].o);
+                self.jobs.push(Job {
+                    parent: i as u32,
+                    band: b,
+                    key: width_bucket(b.dhi - b.dlo + 1) << 16 | nrows.min(65535) as u32,
+                });
             }
-            for lane in lanes[..nl].iter_mut() {
-                lane.o += (omax - lane.o).min(wmax - lane.w);
+            let n = self.jobs.len();
+            self.order.clear();
+            self.order.extend(
+                self.jobs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, j)| u64::from(j.key) << 32 | i as u64),
+            );
+            self.order.sort_unstable();
+            let gl = self.work.lanes();
+            // Once per call, not per group (a `memset` of the whole array each time): a group writes
+            // and reads only its first `nl` lanes.
+            let mut lanes = [kernel::Lane::default(); kernel::L];
+            for g in (0..n).step_by(gl) {
+                let nl = gl.min(n - g);
+                let (mut wmax, mut omax) = (1, i32::MIN);
+                for l in 0..nl {
+                    let j = &self.jobs[self.order[g + l] as u32 as usize];
+                    let (q, t, s) = jobs[j.parent as usize];
+                    lanes[l] = kernel::Lane {
+                        q,
+                        t,
+                        quanta: q.len().div_ceil(16) as i32 * 16,
+                        o: -j.band.dlo,
+                        w: j.band.dhi - j.band.dlo + 1,
+                        target: s as u8,
+                        thr: s as u8,
+                    };
+                    wmax = wmax.max(lanes[l].w);
+                    omax = omax.max(lanes[l].o);
+                }
+                for lane in lanes[..nl].iter_mut() {
+                    lane.o += (omax - lane.o).min(wmax - lane.w);
+                }
+                let t0 = crate::matesw::cells::enabled().then(std::time::Instant::now);
+                self.work.run(&lanes[..nl], wmax as usize, &tbl, gaps);
+                if let Some(t0) = t0 {
+                    self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
+                }
+                for l in 0..nl {
+                    let i = self.jobs[self.order[g + l] as u32 as usize].parent as usize;
+                    let g8 = i32::from(self.work.gmax[l]);
+                    out[i] = if g8 > 0 {
+                        (g8, self.work.te[l], i32::from(self.work.qe[l]))
+                    } else {
+                        (0, -1, -1)
+                    };
+                }
             }
-            let t0 = crate::matesw::cells::enabled().then(std::time::Instant::now);
-            self.work.run(&lanes[..nl], wmax as usize, &tbl, gaps);
-            if let Some(t0) = t0 {
-                self.work.kernel_ns += t0.elapsed().as_nanos() as u64;
+            // Flushed here, or the next `run` subtracts this pass's kernel time from its own clock
+            // and the probe's "other" wraps around.
+            if crate::matesw::cells::enabled() {
+                crate::matesw::cells::BAND_KERNEL_NS
+                    .fetch_add(self.work.kernel_ns, std::sync::atomic::Ordering::Relaxed);
+                self.work.kernel_ns = 0;
             }
-            for l in 0..nl {
-                let i = self.jobs[self.order[g + l] as u32 as usize].parent as usize;
-                let g8 = i32::from(self.work.gmax[l]);
-                out[i] = if g8 > 0 {
-                    (g8, self.work.te[l], i32::from(self.work.qe[l]))
-                } else {
-                    (0, -1, -1)
-                };
-            }
-        }
-        // Flushed here, or the next `run` subtracts this pass's kernel time from its own clock
-        // and the probe's "other" wraps around.
-        if crate::matesw::cells::enabled() {
-            crate::matesw::cells::BAND_KERNEL_NS
-                .fetch_add(self.work.kernel_ns, std::sync::atomic::Ordering::Relaxed);
-            self.work.kernel_ns = 0;
         }
     }
 
@@ -1035,6 +1046,7 @@ fn write(p: &Parent, o: &mut KswAlignResult) {
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod neon {
     use super::RING;
+    use bwa_core::simd::*;
     use std::arch::aarch64::*;
 
     pub(super) const L: usize = 16;
@@ -1097,48 +1109,56 @@ pub(crate) mod neon {
     /// Transpose 16 lane-major rows of `stride` bytes (`n` of them used, a multiple of 16) into
     /// position-major vectors at `dst`.
     ///
-    /// # Safety
-    /// NEON; `src` holds `16 * stride` bytes, `dst` `n * 16`.
+    /// Panics unless `src` holds `16 * stride` bytes and `dst` `n * 16`.
     #[target_feature(enable = "neon")]
-    pub(crate) unsafe fn transpose_to(src: *const u8, stride: usize, n: usize, dst: *mut u8) {
-        let mut b = 0;
-        while b < n {
-            let mut v = [vdupq_n_u8(0); 16];
-            for (l, x) in v.iter_mut().enumerate() {
-                *x = vld1q_u8(src.add(l * stride + b));
+    pub(crate) fn transpose_to(src: &[u8], stride: usize, n: usize, dst: &mut [u8]) {
+        // The 16 source rows and the destination blocks cut once per call, so every access in the
+        // loop indexes a view whose length LLVM sees equal to the loop bound: no per-vector bounds
+        // check (32 per 16x16 block when each access was `l * stride + b` on the whole slice).
+        let rows: [&[[u8; 16]]; 16] = std::array::from_fn(|l| src[l * stride..][..n].as_chunks().0);
+        for (bi, out) in dst[..n * 16]
+            .as_chunks_mut::<16>()
+            .0
+            .as_chunks_mut::<16>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let v = transpose16(std::array::from_fn(|l| ld_u8(&rows[l][bi], 0)));
+            for (o, x) in out.iter_mut().zip(v) {
+                st_u8(o, 0, x);
             }
-            let v = transpose16(v);
-            for (t, x) in v.iter().enumerate() {
-                vst1q_u8(dst.add((b + t) * 16), *x);
-            }
-            b += 16;
         }
     }
 
     /// The inverse: `n` position-major vectors (a multiple of 16) at `src` into 16 lane-major rows
     /// of `stride` bytes at `dst`.
     ///
-    /// # Safety
-    /// NEON; `src` holds `n * 16` bytes, `dst` `16 * stride`.
+    /// Panics unless `src` holds `n * 16` bytes and `dst` `16 * stride`.
     #[target_feature(enable = "neon")]
-    unsafe fn transpose_from(src: *const u8, n: usize, dst: *mut u8, stride: usize) {
-        let mut b = 0;
-        while b < n {
-            let mut v = [vdupq_n_u8(0); 16];
-            for (t, x) in v.iter_mut().enumerate() {
-                *x = vld1q_u8(src.add((b + t) * 16));
+    fn transpose_from(src: &[u8], n: usize, dst: &mut [u8], stride: usize) {
+        // As in `transpose_to`: views cut once, so the loop has no per-vector bounds checks.
+        let mut it = dst[..16 * stride].chunks_exact_mut(stride);
+        let mut rows: [&mut [[u8; 16]]; 16] =
+            std::array::from_fn(|_| it.next().unwrap()[..n].as_chunks_mut().0);
+        for (bi, blk) in src[..n * 16]
+            .as_chunks::<16>()
+            .0
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let v = transpose16(std::array::from_fn(|t| ld_u8(&blk[t], 0)));
+            for (row, x) in rows.iter_mut().zip(v) {
+                st_u8(&mut row[bi], 0, x);
             }
-            let v = transpose16(v);
-            for (l, x) in v.iter().enumerate() {
-                vst1q_u8(dst.add(l * stride + b), *x);
-            }
-            b += 16;
         }
     }
 
     /// 16x16 byte transpose in registers: `out[t][l] = v[l][t]`.
     #[target_feature(enable = "neon")]
-    pub(crate) unsafe fn transpose16(v: [uint8x16_t; 16]) -> [uint8x16_t; 16] {
+    pub(crate) fn transpose16(v: [uint8x16_t; 16]) -> [uint8x16_t; 16] {
         let mut a = v;
         // Bytes.
         for i in 0..8 {
@@ -1195,16 +1215,19 @@ pub(crate) mod neon {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            match (gaps[0] == gaps[2], self.mat5.is_some()) {
-                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
-                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
-                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
-                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
+            // SAFETY: the caller upholds this function's `# Safety` contract.
+            unsafe {
+                match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                    (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                    (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                    (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                    (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
+                }
             }
         }
 
         #[target_feature(enable = "neon")]
-        unsafe fn run_impl<const SHARE: bool, const MAT5: bool>(
+        fn run_impl<const SHARE: bool, const MAT5: bool>(
             &mut self,
             lanes: &[Lane],
             w: usize,
@@ -1234,9 +1257,8 @@ pub(crate) mod neon {
             self.e[..(w + 9) * L].fill(0);
             let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
             let mut ob = [0u8; L];
-            let st = self.st.as_mut_ptr();
             for l in 0..L {
-                let row = std::slice::from_raw_parts_mut(st.add(l * stride), npp);
+                let row = &mut self.st[l * stride..l * stride + npp];
                 crate::batched::fill_fast(row, DEAD);
                 let Some(lane) = lanes.get(l) else { continue };
                 let pq0 = c - lane.o; // `p` where `j = 0`
@@ -1257,9 +1279,9 @@ pub(crate) mod neon {
                 ominq = ominq.min(lane.o - lane.quanta + 1);
                 omaskq = omaskq.max(lane.o - lane.quanta + 1);
             }
-            transpose_to(st, stride, npp, self.a.as_mut_ptr());
+            transpose_to(&self.st, stride, npp, &mut self.a);
             for l in 0..L {
-                let row = std::slice::from_raw_parts_mut(st.add(l * stride), nrp);
+                let row = &mut self.st[l * stride..l * stride + nrp];
                 let Some(lane) = lanes.get(l) else {
                     crate::batched::fill_fast(row, RPAD);
                     continue;
@@ -1286,11 +1308,11 @@ pub(crate) mod neon {
                     }
                 }
             }
-            transpose_to(st, stride, nrp, self.refv.as_mut_ptr());
+            transpose_to(&self.st, stride, nrp, &mut self.refv);
 
             // ---- DP ----
-            let tblv = vld1q_u8(tbl.as_ptr());
-            let tbl5v = vld1q_u8_x2(self.mat5.unwrap_or([0; 32]).as_ptr());
+            let tblv = ld_u8(tbl, 0);
+            let tbl5v = ld_u8_x2(&self.mat5.unwrap_or([0; 32]), 0);
             let zero = vdupq_n_u8(0);
             let one = vdupq_n_u8(1);
             let deadv = vdupq_n_u8(DEAD);
@@ -1301,19 +1323,37 @@ pub(crate) mod neon {
                 vdupq_n_u8(gaps[2]),
                 vdupq_n_u8(gaps[3]),
             );
-            let ov = vld1q_u8(ob.as_ptr());
+            let ov = ld_u8(&ob, 0);
             let mut tb = [0u8; L];
             for (l, lane) in lanes.iter().enumerate() {
                 tb[l] = lane.target;
             }
             let early = tb.iter().any(|&t| t > 0);
-            let tgt = vld1q_u8(tb.as_ptr());
+            let tgt = ld_u8(&tb, 0);
+            // The DP addresses its buffers through raw pointers: the four skewed rows' ring slots,
+            // E and the band query all move by one vector per step, and checked indexing put a
+            // compare and a branch on each of the step's nine accesses (the kernel is near the NEON
+            // bound, so those are not free). Every offset formed below stays inside the buffer
+            // `fit` sized above: H and E have their 3 slack vectors before slot 0 and the few past
+            // `w - 1` that the masked cells touch, `a` covers `npp` positions, `r` `nrp` rows.
             let a = self.a.as_ptr();
-            let e = self.e.as_mut_ptr().add(3 * L);
+            let e = self.e.as_mut_ptr().wrapping_add(3 * L);
             let rout = self.r.as_mut_ptr();
-            let h0p = self.h.as_mut_ptr().add(3 * L);
+            let h0p = self.h.as_mut_ptr().wrapping_add(3 * L);
             // Row `x`'s H (`x` = -1: slot RING - 1, still zero).
-            let slot = |x: usize| h0p.add(x % RING * hs * L);
+            let slot = |x: usize| h0p.wrapping_add(x % RING * hs * L);
+            macro_rules! ldp {
+                ($p:expr) => {
+                    // SAFETY: an in-bounds vector of a buffer `fit` sized; see above.
+                    unsafe { vld1q_u8($p) }
+                };
+            }
+            macro_rules! stp {
+                ($p:expr, $v:expr) => {
+                    // SAFETY: an in-bounds vector of a buffer `fit` sized; see above.
+                    unsafe { vst1q_u8($p, $v) }
+                };
+            }
             let li = L as isize;
             let mut gmax = zero;
             // `te` as its low and high bytes per lane, written with the row on every improving
@@ -1333,14 +1373,14 @@ pub(crate) mod neon {
             for (l, lane) in lanes.iter().enumerate() {
                 th[l] = lane.thr;
             }
-            let thrv = vld1q_u8(th.as_ptr());
+            let thrv = ld_u8(&th, 0);
             let qe_scan =
                 |buf: *const u8, row: i32, msk: uint8x16_t, gmax: uint8x16_t, qev: uint8x16_t| {
                     let (kl, kh) = (0.max(row + ominq), wm1.min(row + omax));
                     let mut jv = vaddq_u8(vdupq_n_u8((row - kl) as u8), ov);
                     let mut best = zero;
                     for k in kl..=kh {
-                        let eq = vceqq_u8(vld1q_u8(buf.add(k as usize * L)), gmax);
+                        let eq = vceqq_u8(ldp!(buf.add(k as usize * L)), gmax);
                         best = vbslq_u8(eq, jv, best);
                         jv = vsubq_u8(jv, one);
                     }
@@ -1409,7 +1449,7 @@ pub(crate) mod neon {
             // Row bookkeeping: publish the row max, update the lanes' best.
             macro_rules! finish_row {
                 ($row:expr, $rmax:expr, $rref:expr) => {{
-                    vst1q_u8(rout.add($row * L), $rmax);
+                    stp!(rout.add($row * L), $rmax);
                     let imp = vandq_u8(vcgtq_u8($rmax, gmax), vcltq_u8($rref, rpadv));
                     gmax = vbslq_u8(imp, $rmax, gmax);
                     te_lo = vbslq_u8(imp, vdupq_n_u8($row as u8), te_lo);
@@ -1441,10 +1481,10 @@ pub(crate) mod neon {
                     // steps when the bottom is clamped, `k < 0`) are masked to 0, which is their
                     // value; their loads and stores land in the buffers' zero slack.
                     self.cells += 4 * (khi - klo + 1).max(0) as u64;
-                    let rref0 = vld1q_u8(self.refv.as_ptr().add(r * L));
-                    let rref1 = vld1q_u8(self.refv.as_ptr().add((r + 1) * L));
-                    let rref2 = vld1q_u8(self.refv.as_ptr().add((r + 2) * L));
-                    let rref3 = vld1q_u8(self.refv.as_ptr().add((r + 3) * L));
+                    let rref0 = ld_u8(&self.refv, r * L);
+                    let rref1 = ld_u8(&self.refv, (r + 1) * L);
+                    let rref2 = ld_u8(&self.refv, (r + 2) * L);
+                    let rref3 = ld_u8(&self.refv, (r + 3) * L);
                     let (mut f0, mut f1, mut f2, mut f3) = (zero, zero, zero, zero);
                     let (mut d1, mut d2, mut d3) = (zero, zero, zero);
                     let (mut rmax0, mut rmax1, mut rmax2, mut rmax3) = (zero, zero, zero, zero);
@@ -1462,18 +1502,18 @@ pub(crate) mod neon {
                                     None
                                 }
                             };
-                            let q = vld1q_u8(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            let e0 = vld1q_u8(e.offset(ko * li));
-                            let d0 = vld1q_u8(hp.offset(ko * li));
+                            let q = ldp!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                            let e0 = ldp!(e.offset(ko * li));
+                            let d0 = ldp!(hp.offset(ko * li));
                             let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), $live);
                             let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), $live);
                             let (h2, e3) = cell!(d2, e2, f2, q, rref2, rmax2, valid(2), $live);
                             let (h3, e4) = cell!(d3, e3, f3, q, rref3, rmax3, valid(3), $live);
-                            vst1q_u8(hr0.offset(ko * li), h0);
-                            vst1q_u8(hr1.offset((ko + 1) * li), h1);
-                            vst1q_u8(hr2.offset((ko + 2) * li), h2);
-                            vst1q_u8(hc.offset((ko + 3) * li), h3);
-                            vst1q_u8(e.offset((ko + 4) * li), e4);
+                            stp!(hr0.offset(ko * li), h0);
+                            stp!(hr1.offset((ko + 1) * li), h1);
+                            stp!(hr2.offset((ko + 2) * li), h2);
+                            stp!(hc.offset((ko + 3) * li), h3);
+                            stp!(e.offset((ko + 4) * li), e4);
                             (d1, d2, d3) = (h0, h1, h2);
                             k -= 1;
                         }};
@@ -1497,7 +1537,7 @@ pub(crate) mod neon {
                     finish_row!(r + 2, rmax2, rref2);
                     finish_row!(r + 3, rmax3, rref3);
                     // Row `r + 4` reads row `r + 3` up to `khi + 4`; row `r + 3` wrote up to `khi + 3`.
-                    vst1q_u8(hc.offset((khi + 4).max(0) as isize * li), zero);
+                    stp!(hc.offset((khi + 4).max(0) as isize * li), zero);
                     r += 4;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
@@ -1508,17 +1548,17 @@ pub(crate) mod neon {
                     }
                     let hc = slot(r);
                     self.cells += (khi - klo + 1).max(0) as u64;
-                    let rref = vld1q_u8(self.refv.as_ptr().add(r * L));
+                    let rref = ld_u8(&self.refv, r * L);
                     let (mut f, mut rmax) = (zero, zero);
                     macro_rules! step1 {
                         ($live:expr) => {{
                             let ko = k as isize;
-                            let q = vld1q_u8(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            let e0 = vld1q_u8(e.offset(ko * li));
-                            let d0 = vld1q_u8(hp.offset(ko * li));
+                            let q = ldp!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                            let e0 = ldp!(e.offset(ko * li));
+                            let d0 = ldp!(hp.offset(ko * li));
                             let (h, e1) = cell!(d0, e0, f, q, rref, rmax, None, $live);
-                            vst1q_u8(hc.offset(ko * li), h);
-                            vst1q_u8(e.offset((ko + 1) * li), e1);
+                            stp!(hc.offset(ko * li), h);
+                            stp!(e.offset((ko + 1) * li), e1);
                             k -= 1;
                         }};
                     }
@@ -1529,7 +1569,7 @@ pub(crate) mod neon {
                         step1!(true);
                     }
                     finish_row!(r, rmax, rref);
-                    vst1q_u8(hc.offset((khi + 1).max(0) as isize * li), zero);
+                    stp!(hc.offset((khi + 1).max(0) as isize * li), zero);
                     r += 1;
                     if early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xff {
                         break;
@@ -1538,10 +1578,10 @@ pub(crate) mod neon {
             }
             let x0 = r.saturating_sub(RING);
             due!(x0, r - x0);
-            vst1q_u8(self.gmax.as_mut_ptr(), gmax);
+            st_u8(&mut self.gmax, 0, gmax);
             let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
-            vst1q_u8(lo.as_mut_ptr(), te_lo);
-            vst1q_u8(hi.as_mut_ptr(), te_hi);
+            st_u8(&mut lo, 0, te_lo);
+            st_u8(&mut hi, 0, te_hi);
             self.te = std::array::from_fn(|l| {
                 if self.gmax[l] > 0 {
                     i32::from(lo[l]) | i32::from(hi[l]) << 8
@@ -1549,12 +1589,12 @@ pub(crate) mod neon {
                     -1
                 }
             });
-            vst1q_u8(self.qe.as_mut_ptr(), qev);
+            st_u8(&mut self.qe, 0, qev);
             // Row maxima back to lane-major, zero past `nr`.
             self.rstride = nrp;
             fit(&mut self.rl, nrp * L);
             self.r[nr * L..nrp * L].fill(0);
-            transpose_from(self.r.as_ptr(), nrp, self.rl.as_mut_ptr(), nrp);
+            transpose_from(&self.r, nrp, &mut self.rl, nrp);
         }
     }
 }
@@ -1573,6 +1613,7 @@ pub(crate) mod neon {
 mod avx2 {
     use super::RING;
     use crate::batched::{x86_row::t16, ABuf};
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
 
     pub(super) const L: usize = 32;
@@ -1641,11 +1682,14 @@ mod avx2 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            match (gaps[0] == gaps[2], self.mat5.is_some()) {
-                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
-                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
-                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
-                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
+            // SAFETY: the caller upholds this function's `# Safety` contract.
+            unsafe {
+                match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                    (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                    (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                    (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                    (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
+                }
             }
         }
 
@@ -1657,382 +1701,386 @@ mod avx2 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            let nr = lanes.iter().map(|l| l.t.len()).max().unwrap_or(0);
-            let np = nr + w - 1;
-            let c = w as i32 - 1;
-            let (npp, nrp) = ((np + 4).next_multiple_of(16), nr.next_multiple_of(16));
-            let stride = npp.max(nrp);
-            let hs = w + 7;
-            fit(&mut self.st, 16 * stride);
-            self.a.fit(npp * L, 0);
-            self.refv.fit(nrp * L, 0);
-            self.h.fit(RING * hs * L, HZ);
-            self.e.fit((w + 9) * L, HZ);
-            self.r.fit(nrp * L, 0);
-            // Only row -1's slot, as the NEON kernel's.
-            self.h[(RING - 1) * hs * L..RING * hs * L].fill(HZ);
-            self.e[..(w + 9) * L].fill(HZ);
-            let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
-            let mut ob = [0u8; L];
-            // The SoA buffers through a lane-major staging area, 16 lanes at a time, and 16x16
-            // transposes (as the NEON kernel): the query in band layout, then the reference rows.
-            let st = self.st.as_mut_ptr();
-            for blk in 0..L / 16 {
-                for i in 0..16 {
-                    let row = std::slice::from_raw_parts_mut(st.add(i * stride), npp);
-                    crate::batched::fill_fast(row, DEAD);
-                    let l = blk * 16 + i;
-                    let Some(lane) = lanes.get(l) else { continue };
-                    let pq0 = c - lane.o;
-                    let len2 = lane.q.len() as i32;
-                    let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
-                    if p0 < p1 {
-                        crate::batched::copy_fast(
-                            &mut row[p0 as usize..p1 as usize],
-                            &lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize],
+            // SAFETY: the caller upholds this function's `# Safety` contract.
+            unsafe {
+                let nr = lanes.iter().map(|l| l.t.len()).max().unwrap_or(0);
+                let np = nr + w - 1;
+                let c = w as i32 - 1;
+                let (npp, nrp) = ((np + 4).next_multiple_of(16), nr.next_multiple_of(16));
+                let stride = npp.max(nrp);
+                let hs = w + 7;
+                fit(&mut self.st, 16 * stride);
+                self.a.fit(npp * L, 0);
+                self.refv.fit(nrp * L, 0);
+                self.h.fit(RING * hs * L, HZ);
+                self.e.fit((w + 9) * L, HZ);
+                self.r.fit(nrp * L, 0);
+                // Only row -1's slot, as the NEON kernel's.
+                self.h[(RING - 1) * hs * L..RING * hs * L].fill(HZ);
+                self.e[..(w + 9) * L].fill(HZ);
+                let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
+                let mut ob = [0u8; L];
+                // The SoA buffers through a lane-major staging area, 16 lanes at a time, and 16x16
+                // transposes (as the NEON kernel): the query in band layout, then the reference rows.
+                let st = self.st.as_mut_ptr();
+                for blk in 0..L / 16 {
+                    for i in 0..16 {
+                        let row = std::slice::from_raw_parts_mut(st.add(i * stride), npp);
+                        crate::batched::fill_fast(row, DEAD);
+                        let l = blk * 16 + i;
+                        let Some(lane) = lanes.get(l) else { continue };
+                        let pq0 = c - lane.o;
+                        let len2 = lane.q.len() as i32;
+                        let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
+                        if p0 < p1 {
+                            crate::batched::copy_fast(
+                                &mut row[p0 as usize..p1 as usize],
+                                &lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize],
+                            );
+                        }
+                        let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
+                        if p0 < p1 {
+                            crate::batched::fill_fast(&mut row[p0 as usize..p1 as usize], QPAD);
+                        }
+                        ob[l] = lane.o as u8;
+                        omax = omax.max(lane.o);
+                        ominq = ominq.min(lane.o - lane.quanta + 1);
+                        omaskq = omaskq.max(lane.o - lane.quanta + 1);
+                    }
+                    for b in (0..npp).step_by(16) {
+                        t16(
+                            st.add(b),
+                            stride,
+                            self.a.as_mut_ptr().add(b * L + blk * 16),
+                            L,
                         );
                     }
-                    let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
-                    if p0 < p1 {
-                        crate::batched::fill_fast(&mut row[p0 as usize..p1 as usize], QPAD);
-                    }
-                    ob[l] = lane.o as u8;
-                    omax = omax.max(lane.o);
-                    ominq = ominq.min(lane.o - lane.quanta + 1);
-                    omaskq = omaskq.max(lane.o - lane.quanta + 1);
-                }
-                for b in (0..npp).step_by(16) {
-                    t16(
-                        st.add(b),
-                        stride,
-                        self.a.as_mut_ptr().add(b * L + blk * 16),
-                        L,
-                    );
-                }
-                for i in 0..16 {
-                    let row = std::slice::from_raw_parts_mut(st.add(i * stride), nrp);
-                    let Some(lane) = lanes.get(blk * 16 + i) else {
-                        crate::batched::fill_fast(row, RPAD);
-                        continue;
-                    };
-                    crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
-                    crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
-                    // `MAT5`: targets as `5 * b` (see the NEON kernel), else N re-encoded as 12.
-                    if MAT5 {
-                        for b in row[..lane.t.len()].iter_mut() {
-                            *b *= 5;
-                        }
-                    } else if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
-                        for b in row[..lane.t.len()].iter_mut() {
-                            if *b == 4 {
-                                *b = 12;
+                    for i in 0..16 {
+                        let row = std::slice::from_raw_parts_mut(st.add(i * stride), nrp);
+                        let Some(lane) = lanes.get(blk * 16 + i) else {
+                            crate::batched::fill_fast(row, RPAD);
+                            continue;
+                        };
+                        crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
+                        crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
+                        // `MAT5`: targets as `5 * b` (see the NEON kernel), else N re-encoded as 12.
+                        if MAT5 {
+                            for b in row[..lane.t.len()].iter_mut() {
+                                *b *= 5;
+                            }
+                        } else if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
+                            for b in row[..lane.t.len()].iter_mut() {
+                                if *b == 4 {
+                                    *b = 12;
+                                }
                             }
                         }
                     }
+                    for b in (0..nrp).step_by(16) {
+                        t16(
+                            st.add(b),
+                            stride,
+                            self.refv.as_mut_ptr().add(b * L + blk * 16),
+                            L,
+                        );
+                    }
                 }
-                for b in (0..nrp).step_by(16) {
-                    t16(
-                        st.add(b),
-                        stride,
-                        self.refv.as_mut_ptr().add(b * L + blk * 16),
-                        L,
-                    );
+                // The signed table in both 128-bit halves.
+                let t128 = ld128(tbl, 0);
+                let tblv = _mm256_set_m128i(t128, t128);
+                // `MAT5`: the 32 cells as their low 16 and `low ^ high`, read at `i = 5 t + q` by two
+                // in-lane shuffles (`batched`'s `tab5`): every pad code has bit 7 and the saturating
+                // add keeps it, so both read 0; `i - 16`'s sign zeroes the second for `i < 16`.
+                let (t5lo, t5hi) = {
+                    let t5 = self.mat5.unwrap_or([0; 32]);
+                    let lo = ld128(&t5, 0);
+                    let hi = _mm_xor_si128(lo, ld128(&t5, 16));
+                    (_mm256_set_m128i(lo, lo), _mm256_set_m128i(hi, hi))
+                };
+                let sixteen = _mm256_set1_epi8(16);
+                let hz = _mm256_set1_epi8(HZ as i8);
+                let nil = _mm256_setzero_si256();
+                let one = _mm256_set1_epi8(1);
+                let deadv = _mm256_set1_epi8(DEAD as i8);
+                // `dead ^ 0x7F`: -128 on a dead lane, 127 on a live one, the bound `min` clamps H to.
+                let x7f = _mm256_set1_epi8(0x7F);
+                let (oe_del, e_del, oe_ins, e_ins) = (
+                    _mm256_set1_epi8(gaps[0] as i8),
+                    _mm256_set1_epi8(gaps[1] as i8),
+                    _mm256_set1_epi8(gaps[2] as i8),
+                    _mm256_set1_epi8(gaps[3] as i8),
+                );
+                let ov = ld256(&ob, 0);
+                // Targets in the H domain; an absent lane's (HZ) is always reached.
+                let mut tb = [HZ; L];
+                for (l, lane) in lanes.iter().enumerate() {
+                    tb[l] = lane.target ^ HZ;
                 }
-            }
-            // The signed table in both 128-bit halves.
-            let t128 = _mm_loadu_si128(tbl.as_ptr() as *const __m128i);
-            let tblv = _mm256_set_m128i(t128, t128);
-            // `MAT5`: the 32 cells as their low 16 and `low ^ high`, read at `i = 5 t + q` by two
-            // in-lane shuffles (`batched`'s `tab5`): every pad code has bit 7 and the saturating
-            // add keeps it, so both read 0; `i - 16`'s sign zeroes the second for `i < 16`.
-            let (t5lo, t5hi) = {
-                let t5 = self.mat5.unwrap_or([0; 32]);
-                let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
-                let hi = _mm_xor_si128(lo, _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i));
-                (_mm256_set_m128i(lo, lo), _mm256_set_m128i(hi, hi))
-            };
-            let sixteen = _mm256_set1_epi8(16);
-            let hz = _mm256_set1_epi8(HZ as i8);
-            let nil = _mm256_setzero_si256();
-            let one = _mm256_set1_epi8(1);
-            let deadv = _mm256_set1_epi8(DEAD as i8);
-            // `dead ^ 0x7F`: -128 on a dead lane, 127 on a live one, the bound `min` clamps H to.
-            let x7f = _mm256_set1_epi8(0x7F);
-            let (oe_del, e_del, oe_ins, e_ins) = (
-                _mm256_set1_epi8(gaps[0] as i8),
-                _mm256_set1_epi8(gaps[1] as i8),
-                _mm256_set1_epi8(gaps[2] as i8),
-                _mm256_set1_epi8(gaps[3] as i8),
-            );
-            let ov = _mm256_loadu_si256(ob.as_ptr() as *const __m256i);
-            // Targets in the H domain; an absent lane's (HZ) is always reached.
-            let mut tb = [HZ; L];
-            for (l, lane) in lanes.iter().enumerate() {
-                tb[l] = lane.target ^ HZ;
-            }
-            let early = lanes.iter().any(|l| l.target > 0);
-            let tgt = _mm256_loadu_si256(tb.as_ptr() as *const __m256i);
-            let a = self.a.as_ptr();
-            let e = self.e.as_mut_ptr().add(3 * L);
-            let rout = self.r.as_mut_ptr();
-            let h0p = self.h.as_mut_ptr().add(3 * L);
-            // Row `x`'s H (`x` = -1: slot RING - 1, still zero).
-            let slot = |x: usize| h0p.add(x % RING * hs * L);
-            let li = L as isize;
-            let mut gmax = hz;
-            // `te` as its low and high bytes per lane, written with the row on every improving
-            // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
-            let (mut te_lo, mut te_hi, mut qev) = (nil, nil, nil);
-            let wm1 = w as i32 - 1;
-            // `qe` from H as the NEON kernel's `qe_scan` and `due`; `thrv` in the H domain.
-            let mut pm = nil;
-            let mut th = [HZ; L];
-            for (l, lane) in lanes.iter().enumerate() {
-                th[l] = lane.thr ^ HZ;
-            }
-            let thrv = _mm256_loadu_si256(th.as_ptr() as *const __m256i);
+                let early = lanes.iter().any(|l| l.target > 0);
+                let tgt = ld256(&tb, 0);
+                let a = self.a.as_ptr();
+                let e = self.e.as_mut_ptr().add(3 * L);
+                let rout = self.r.as_mut_ptr();
+                let h0p = self.h.as_mut_ptr().add(3 * L);
+                // Row `x`'s H (`x` = -1: slot RING - 1, still zero).
+                let slot = |x: usize| h0p.add(x % RING * hs * L);
+                let li = L as isize;
+                let mut gmax = hz;
+                // `te` as its low and high bytes per lane, written with the row on every improving
+                // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
+                let (mut te_lo, mut te_hi, mut qev) = (nil, nil, nil);
+                let wm1 = w as i32 - 1;
+                // `qe` from H as the NEON kernel's `qe_scan` and `due`; `thrv` in the H domain.
+                let mut pm = nil;
+                let mut th = [HZ; L];
+                for (l, lane) in lanes.iter().enumerate() {
+                    th[l] = lane.thr ^ HZ;
+                }
+                let thrv = ld256(&th, 0);
 
-            macro_rules! ld {
-                ($p:expr) => {
-                    _mm256_loadu_si256($p as *const __m256i)
-                };
-            }
-            macro_rules! st {
-                ($p:expr, $v:expr) => {
-                    _mm256_storeu_si256($p as *mut __m256i, $v)
-                };
-            }
-            macro_rules! qe_scan {
-                ($buf:expr, $row:expr, $msk:expr) => {{
-                    let (kl, kh) = (0.max($row + ominq), wm1.min($row + omax));
-                    let mut jv = _mm256_add_epi8(_mm256_set1_epi8(($row - kl) as i8), ov);
-                    let mut best = nil;
-                    for k in kl..=kh {
-                        let eq = _mm256_cmpeq_epi8(ld!($buf.add(k as usize * L)), gmax);
-                        best = _mm256_blendv_epi8(best, jv, eq);
-                        jv = _mm256_sub_epi8(jv, one);
-                    }
-                    qev = _mm256_blendv_epi8(qev, best, $msk);
-                }};
-            }
-            // One cell, as the NEON kernel's (gaps open from G = max(diagonal, E)): `d` the
-            // diagonal H, `ein` the E carry, `f` the row's F carry (updated), `top` whether a cell
-            // past `w - 1` is valid (`None`: it is), `clamp` the live bound (`None`: no dead lane
-            // here). Returns `(H, E for the row below)`.
-            macro_rules! cell {
-                ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
-                 $clamp:expr) => {{
-                    let sc = if MAT5 {
-                        let i = _mm256_adds_epu8($rref, $q);
-                        _mm256_xor_si256(
-                            _mm256_shuffle_epi8(t5lo, i),
-                            _mm256_shuffle_epi8(t5hi, _mm256_subs_epi8(i, sixteen)),
-                        )
-                    } else {
-                        _mm256_shuffle_epi8(tblv, _mm256_xor_si256($q, $rref))
+                macro_rules! ld {
+                    ($p:expr) => {
+                        _mm256_loadu_si256($p as *const __m256i)
                     };
-                    let mut h0 = _mm256_max_epi8(_mm256_adds_epi8($d, sc), $ein);
-                    let ok: Option<bool> = $top;
-                    if ok == Some(false) {
-                        h0 = hz;
-                    }
-                    let mut h = _mm256_max_epi8(h0, $f);
-                    if ok == Some(false) {
-                        h = hz;
-                    }
-                    let cl: Option<__m256i> = $clamp;
-                    let hl = match cl {
-                        Some(b) => _mm256_min_epi8(h, b),
-                        None => h,
+                }
+                macro_rules! st {
+                    ($p:expr, $v:expr) => {
+                        _mm256_storeu_si256($p as *mut __m256i, $v)
                     };
-                    $rmax = _mm256_max_epi8($rmax, hl);
-                    let t = _mm256_subs_epi8(h0, oe_del);
-                    let eout = _mm256_max_epi8(t, _mm256_subs_epi8($ein, e_del));
-                    let ti = if SHARE {
-                        t
-                    } else {
-                        _mm256_subs_epi8(h0, oe_ins)
-                    };
-                    $f = _mm256_max_epi8(ti, _mm256_subs_epi8($f, e_ins));
-                    (h, eout)
-                }};
-            }
-            // Row bookkeeping: publish the row max, update the lanes' best, close the runs of
-            // improving rows that ended on the previous row. `$buf` holds this row's H.
-            // Rows `x0..x0 + n` (`n <= RING`), as the NEON kernel's `due`.
-            macro_rules! due {
-                ($x0:expr, $n:expr) => {{
-                    let (x0, n): (usize, usize) = ($x0, $n);
-                    // `off < n` unsigned, as `min(off, n - 1) == off`.
-                    let off = _mm256_sub_epi8(te_lo, _mm256_set1_epi8(x0 as i8));
-                    let near = _mm256_cmpeq_epi8(
-                        _mm256_min_epu8(off, _mm256_set1_epi8(n.max(1) as i8 - 1)),
-                        off,
-                    );
-                    if n > 0 && _mm256_movemask_epi8(_mm256_and_si256(near, pm)) != 0 {
-                        for x in x0..x0 + n {
-                            let m = _mm256_and_si256(
-                                _mm256_cmpeq_epi8(te_lo, _mm256_set1_epi8(x as i8)),
-                                pm,
-                            );
-                            if _mm256_movemask_epi8(m) != 0 {
-                                qe_scan!(slot(x), x as i32, m);
-                                pm = _mm256_andnot_si256(m, pm);
+                }
+                macro_rules! qe_scan {
+                    ($buf:expr, $row:expr, $msk:expr) => {{
+                        let (kl, kh) = (0.max($row + ominq), wm1.min($row + omax));
+                        let mut jv = _mm256_add_epi8(_mm256_set1_epi8(($row - kl) as i8), ov);
+                        let mut best = nil;
+                        for k in kl..=kh {
+                            let eq = _mm256_cmpeq_epi8(ld!($buf.add(k as usize * L)), gmax);
+                            best = _mm256_blendv_epi8(best, jv, eq);
+                            jv = _mm256_sub_epi8(jv, one);
+                        }
+                        qev = _mm256_blendv_epi8(qev, best, $msk);
+                    }};
+                }
+                // One cell, as the NEON kernel's (gaps open from G = max(diagonal, E)): `d` the
+                // diagonal H, `ein` the E carry, `f` the row's F carry (updated), `top` whether a cell
+                // past `w - 1` is valid (`None`: it is), `clamp` the live bound (`None`: no dead lane
+                // here). Returns `(H, E for the row below)`.
+                macro_rules! cell {
+                    ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
+                     $clamp:expr) => {{
+                        let sc = if MAT5 {
+                            let i = _mm256_adds_epu8($rref, $q);
+                            _mm256_xor_si256(
+                                _mm256_shuffle_epi8(t5lo, i),
+                                _mm256_shuffle_epi8(t5hi, _mm256_subs_epi8(i, sixteen)),
+                            )
+                        } else {
+                            _mm256_shuffle_epi8(tblv, _mm256_xor_si256($q, $rref))
+                        };
+                        let mut h0 = _mm256_max_epi8(_mm256_adds_epi8($d, sc), $ein);
+                        let ok: Option<bool> = $top;
+                        if ok == Some(false) {
+                            h0 = hz;
+                        }
+                        let mut h = _mm256_max_epi8(h0, $f);
+                        if ok == Some(false) {
+                            h = hz;
+                        }
+                        let cl: Option<__m256i> = $clamp;
+                        let hl = match cl {
+                            Some(b) => _mm256_min_epi8(h, b),
+                            None => h,
+                        };
+                        $rmax = _mm256_max_epi8($rmax, hl);
+                        let t = _mm256_subs_epi8(h0, oe_del);
+                        let eout = _mm256_max_epi8(t, _mm256_subs_epi8($ein, e_del));
+                        let ti = if SHARE {
+                            t
+                        } else {
+                            _mm256_subs_epi8(h0, oe_ins)
+                        };
+                        $f = _mm256_max_epi8(ti, _mm256_subs_epi8($f, e_ins));
+                        (h, eout)
+                    }};
+                }
+                // Row bookkeeping: publish the row max, update the lanes' best, close the runs of
+                // improving rows that ended on the previous row. `$buf` holds this row's H.
+                // Rows `x0..x0 + n` (`n <= RING`), as the NEON kernel's `due`.
+                macro_rules! due {
+                    ($x0:expr, $n:expr) => {{
+                        let (x0, n): (usize, usize) = ($x0, $n);
+                        // `off < n` unsigned, as `min(off, n - 1) == off`.
+                        let off = _mm256_sub_epi8(te_lo, _mm256_set1_epi8(x0 as i8));
+                        let near = _mm256_cmpeq_epi8(
+                            _mm256_min_epu8(off, _mm256_set1_epi8(n.max(1) as i8 - 1)),
+                            off,
+                        );
+                        if n > 0 && _mm256_movemask_epi8(_mm256_and_si256(near, pm)) != 0 {
+                            for x in x0..x0 + n {
+                                let m = _mm256_and_si256(
+                                    _mm256_cmpeq_epi8(te_lo, _mm256_set1_epi8(x as i8)),
+                                    pm,
+                                );
+                                if _mm256_movemask_epi8(m) != 0 {
+                                    qe_scan!(slot(x), x as i32, m);
+                                    pm = _mm256_andnot_si256(m, pm);
+                                }
                             }
                         }
-                    }
-                }};
-            }
-            // Row bookkeeping: publish the row max, update the lanes' best.
-            macro_rules! finish_row {
-                ($row:expr, $rmax:expr, $rref:expr) => {{
-                    st!(rout.add($row * L), _mm256_xor_si256($rmax, hz));
-                    let imp = _mm256_andnot_si256(
-                        _mm256_cmpgt_epi8(nil, $rref),
-                        _mm256_cmpgt_epi8($rmax, gmax),
-                    );
-                    gmax = _mm256_blendv_epi8(gmax, $rmax, imp);
-                    te_lo = _mm256_blendv_epi8(te_lo, _mm256_set1_epi8($row as i8), imp);
-                    if $row >= 256 {
-                        te_hi = _mm256_blendv_epi8(te_hi, _mm256_set1_epi8(($row >> 8) as i8), imp);
-                    }
-                    pm = _mm256_or_si256(
-                        pm,
-                        _mm256_andnot_si256(_mm256_cmpgt_epi8(thrv, $rmax), imp),
-                    );
-                }};
-            }
+                    }};
+                }
+                // Row bookkeeping: publish the row max, update the lanes' best.
+                macro_rules! finish_row {
+                    ($row:expr, $rmax:expr, $rref:expr) => {{
+                        st!(rout.add($row * L), _mm256_xor_si256($rmax, hz));
+                        let imp = _mm256_andnot_si256(
+                            _mm256_cmpgt_epi8(nil, $rref),
+                            _mm256_cmpgt_epi8($rmax, gmax),
+                        );
+                        gmax = _mm256_blendv_epi8(gmax, $rmax, imp);
+                        te_lo = _mm256_blendv_epi8(te_lo, _mm256_set1_epi8($row as i8), imp);
+                        if $row >= 256 {
+                            te_hi =
+                                _mm256_blendv_epi8(te_hi, _mm256_set1_epi8(($row >> 8) as i8), imp);
+                        }
+                        pm = _mm256_or_si256(
+                            pm,
+                            _mm256_andnot_si256(_mm256_cmpgt_epi8(thrv, $rmax), imp),
+                        );
+                    }};
+                }
 
-            let mut r = 0usize;
-            while r < nr {
-                let ri = r as i32;
-                let khi = wm1.min(ri + omax);
-                let klo = 0.max(ri + ominq);
-                let kun = klo.max(ri + omaskq);
-                let mut k = khi;
-                let hp = slot(r + RING - 1);
-                if r + 1 < nr {
-                    // Rows `r`, `r + 1` take the slots of `r - RING..`: read those first.
-                    if r >= RING {
-                        due!(r - RING, 2);
-                    }
-                    let (hr0, hc) = (slot(r), slot(r + 1));
-                    self.cells += 2 * (khi - klo + 1).max(0) as u64;
-                    let rref0 = ld!(self.refv.as_ptr().add(r * L));
-                    let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
-                    let (mut f0, mut f1, mut d1) = (hz, hz, hz);
-                    let (mut rmax0, mut rmax1) = (hz, hz);
-                    macro_rules! step2 {
-                        ($mask:expr, $live:expr) => {{
-                            let ko = k as isize;
-                            let valid = |i: i32| -> Option<bool> {
-                                if $mask {
-                                    Some((0..=wm1).contains(&(k + i)))
+                let mut r = 0usize;
+                while r < nr {
+                    let ri = r as i32;
+                    let khi = wm1.min(ri + omax);
+                    let klo = 0.max(ri + ominq);
+                    let kun = klo.max(ri + omaskq);
+                    let mut k = khi;
+                    let hp = slot(r + RING - 1);
+                    if r + 1 < nr {
+                        // Rows `r`, `r + 1` take the slots of `r - RING..`: read those first.
+                        if r >= RING {
+                            due!(r - RING, 2);
+                        }
+                        let (hr0, hc) = (slot(r), slot(r + 1));
+                        self.cells += 2 * (khi - klo + 1).max(0) as u64;
+                        let rref0 = ld!(self.refv.as_ptr().add(r * L));
+                        let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
+                        let (mut f0, mut f1, mut d1) = (hz, hz, hz);
+                        let (mut rmax0, mut rmax1) = (hz, hz);
+                        macro_rules! step2 {
+                            ($mask:expr, $live:expr) => {{
+                                let ko = k as isize;
+                                let valid = |i: i32| -> Option<bool> {
+                                    if $mask {
+                                        Some((0..=wm1).contains(&(k + i)))
+                                    } else {
+                                        None
+                                    }
+                                };
+                                let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                                // DEAD is the only query code at or above 0xC0.
+                                let clamp = if $live {
+                                    Some(_mm256_xor_si256(_mm256_cmpeq_epi8(q, deadv), x7f))
                                 } else {
                                     None
-                                }
-                            };
-                            let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            // DEAD is the only query code at or above 0xC0.
-                            let clamp = if $live {
-                                Some(_mm256_xor_si256(_mm256_cmpeq_epi8(q, deadv), x7f))
-                            } else {
-                                None
-                            };
-                            let e0 = ld!(e.offset(ko * li));
-                            let d0 = ld!(hp.offset(ko * li));
-                            let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), clamp);
-                            let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), clamp);
-                            st!(hr0.offset(ko * li), h0);
-                            st!(hc.offset((ko + 1) * li), h1);
-                            st!(e.offset((ko + 2) * li), e2);
-                            d1 = h0;
-                            k -= 1;
-                        }};
+                                };
+                                let e0 = ld!(e.offset(ko * li));
+                                let d0 = ld!(hp.offset(ko * li));
+                                let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), clamp);
+                                let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), clamp);
+                                st!(hr0.offset(ko * li), h0);
+                                st!(hc.offset((ko + 1) * li), h1);
+                                st!(e.offset((ko + 2) * li), e2);
+                                d1 = h0;
+                                k -= 1;
+                            }};
+                        }
+                        while k >= klo && k > wm1 - 1 {
+                            step2!(true, true);
+                        }
+                        while k >= kun {
+                            step2!(false, false);
+                        }
+                        while k >= klo {
+                            step2!(false, true);
+                        }
+                        let kend = (ri + ominq).max(-1);
+                        while k >= kend {
+                            step2!(true, true);
+                        }
+                        finish_row!(r, rmax0, rref0);
+                        finish_row!(r + 1, rmax1, rref1);
+                        // Row `r + 2` reads row `r + 1` up to `khi + 2`; row `r + 1` wrote up to `khi + 1`.
+                        st!(hc.offset((khi + 2).max(0) as isize * li), hz);
+                        r += 2;
+                    } else {
+                        if r >= RING {
+                            due!(r - RING, 1);
+                        }
+                        let hc = slot(r);
+                        self.cells += (khi - klo + 1).max(0) as u64;
+                        let rref = ld!(self.refv.as_ptr().add(r * L));
+                        let (mut f, mut rmax) = (hz, hz);
+                        macro_rules! step1 {
+                            ($live:expr) => {{
+                                let ko = k as isize;
+                                let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                                let clamp = if $live {
+                                    Some(_mm256_xor_si256(_mm256_cmpeq_epi8(q, deadv), x7f))
+                                } else {
+                                    None
+                                };
+                                let e0 = ld!(e.offset(ko * li));
+                                let d0 = ld!(hp.offset(ko * li));
+                                let (h, e1) = cell!(d0, e0, f, q, rref, rmax, None, clamp);
+                                st!(hc.offset(ko * li), h);
+                                st!(e.offset((ko + 1) * li), e1);
+                                k -= 1;
+                            }};
+                        }
+                        while k >= kun {
+                            step1!(false);
+                        }
+                        while k >= klo {
+                            step1!(true);
+                        }
+                        finish_row!(r, rmax, rref);
+                        st!(hc.offset((khi + 1).max(0) as isize * li), hz);
+                        r += 1;
                     }
-                    while k >= klo && k > wm1 - 1 {
-                        step2!(true, true);
+                    if early && _mm256_movemask_epi8(_mm256_cmpgt_epi8(tgt, gmax)) == 0 {
+                        break;
                     }
-                    while k >= kun {
-                        step2!(false, false);
-                    }
-                    while k >= klo {
-                        step2!(false, true);
-                    }
-                    let kend = (ri + ominq).max(-1);
-                    while k >= kend {
-                        step2!(true, true);
-                    }
-                    finish_row!(r, rmax0, rref0);
-                    finish_row!(r + 1, rmax1, rref1);
-                    // Row `r + 2` reads row `r + 1` up to `khi + 2`; row `r + 1` wrote up to `khi + 1`.
-                    st!(hc.offset((khi + 2).max(0) as isize * li), hz);
-                    r += 2;
-                } else {
-                    if r >= RING {
-                        due!(r - RING, 1);
-                    }
-                    let hc = slot(r);
-                    self.cells += (khi - klo + 1).max(0) as u64;
-                    let rref = ld!(self.refv.as_ptr().add(r * L));
-                    let (mut f, mut rmax) = (hz, hz);
-                    macro_rules! step1 {
-                        ($live:expr) => {{
-                            let ko = k as isize;
-                            let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            let clamp = if $live {
-                                Some(_mm256_xor_si256(_mm256_cmpeq_epi8(q, deadv), x7f))
-                            } else {
-                                None
-                            };
-                            let e0 = ld!(e.offset(ko * li));
-                            let d0 = ld!(hp.offset(ko * li));
-                            let (h, e1) = cell!(d0, e0, f, q, rref, rmax, None, clamp);
-                            st!(hc.offset(ko * li), h);
-                            st!(e.offset((ko + 1) * li), e1);
-                            k -= 1;
-                        }};
-                    }
-                    while k >= kun {
-                        step1!(false);
-                    }
-                    while k >= klo {
-                        step1!(true);
-                    }
-                    finish_row!(r, rmax, rref);
-                    st!(hc.offset((khi + 1).max(0) as isize * li), hz);
-                    r += 1;
                 }
-                if early && _mm256_movemask_epi8(_mm256_cmpgt_epi8(tgt, gmax)) == 0 {
-                    break;
-                }
-            }
-            let x0 = r.saturating_sub(RING);
-            due!(x0, r - x0);
-            st!(self.gmax.as_mut_ptr(), _mm256_xor_si256(gmax, hz));
-            let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
-            st!(lo.as_mut_ptr(), te_lo);
-            st!(hi.as_mut_ptr(), te_hi);
-            st!(self.qe.as_mut_ptr(), qev);
-            self.te = std::array::from_fn(|l| {
-                if self.gmax[l] > 0 {
-                    i32::from(lo[l]) | i32::from(hi[l]) << 8
-                } else {
-                    -1
-                }
-            });
-            // Row maxima to lane-major, zero past `nr`.
-            self.rstride = nrp;
-            fit(&mut self.rl, nrp * L);
-            self.r[nr * L..nrp * L].fill(0);
-            for blk in 0..L / 16 {
-                for b in (0..nrp).step_by(16) {
-                    t16(
-                        self.r.as_ptr().add(b * L + blk * 16),
-                        L,
-                        self.rl.as_mut_ptr().add(blk * 16 * nrp + b),
-                        nrp,
-                    );
+                let x0 = r.saturating_sub(RING);
+                due!(x0, r - x0);
+                st!(self.gmax.as_mut_ptr(), _mm256_xor_si256(gmax, hz));
+                let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
+                st!(lo.as_mut_ptr(), te_lo);
+                st!(hi.as_mut_ptr(), te_hi);
+                st!(self.qe.as_mut_ptr(), qev);
+                self.te = std::array::from_fn(|l| {
+                    if self.gmax[l] > 0 {
+                        i32::from(lo[l]) | i32::from(hi[l]) << 8
+                    } else {
+                        -1
+                    }
+                });
+                // Row maxima to lane-major, zero past `nr`.
+                self.rstride = nrp;
+                fit(&mut self.rl, nrp * L);
+                self.r[nr * L..nrp * L].fill(0);
+                for blk in 0..L / 16 {
+                    for b in (0..nrp).step_by(16) {
+                        t16(
+                            self.r.as_ptr().add(b * L + blk * 16),
+                            L,
+                            self.rl.as_mut_ptr().add(blk * 16 * nrp + b),
+                            nrp,
+                        );
+                    }
                 }
             }
         }
@@ -2046,6 +2094,7 @@ mod avx512 {
     use super::avx2::HZ;
     use super::RING;
     use crate::batched::{x86_row::t16, ABuf};
+    use bwa_core::simd::*;
     use std::arch::x86_64::*;
 
     pub(super) const L: usize = 64;
@@ -2117,11 +2166,14 @@ mod avx512 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            match (gaps[0] == gaps[2], self.mat5.is_some()) {
-                (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
-                (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
-                (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
-                (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
+            // SAFETY: the caller upholds this function's `# Safety` contract.
+            unsafe {
+                match (gaps[0] == gaps[2], self.mat5.is_some()) {
+                    (true, false) => self.run_impl::<true, false>(lanes, w, tbl, gaps),
+                    (false, false) => self.run_impl::<false, false>(lanes, w, tbl, gaps),
+                    (true, true) => self.run_impl::<true, true>(lanes, w, tbl, gaps),
+                    (false, true) => self.run_impl::<false, true>(lanes, w, tbl, gaps),
+                }
             }
         }
 
@@ -2133,428 +2185,437 @@ mod avx512 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            let nr = lanes.iter().map(|l| l.t.len()).max().unwrap_or(0);
-            let np = nr + w - 1;
-            let c = w as i32 - 1;
-            let (npp, nrp) = ((np + 4).next_multiple_of(16), nr.next_multiple_of(16));
-            let stride = npp.max(nrp);
-            let hs = w + 7;
-            fit(&mut self.st, 16 * stride);
-            self.a.fit(npp * L, 0);
-            self.refv.fit(nrp * L, 0);
-            self.h.fit(RING * hs * L, HZ);
-            self.e.fit((w + 9) * L, HZ);
-            self.r.fit(nrp * L, 0);
-            // Only row -1's slot, as the NEON kernel's.
-            self.h[(RING - 1) * hs * L..RING * hs * L].fill(HZ);
-            self.e[..(w + 9) * L].fill(HZ);
-            let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
-            let mut ob = [0u8; L];
-            // The SoA buffers through a lane-major staging area, 16 lanes at a time, and 16x16
-            // transposes (as the NEON kernel): the query in band layout, then the reference rows.
-            let st = self.st.as_mut_ptr();
-            for blk in 0..L / 16 {
-                for i in 0..16 {
-                    let row = std::slice::from_raw_parts_mut(st.add(i * stride), npp);
-                    crate::batched::fill_fast(row, DEAD);
-                    let l = blk * 16 + i;
-                    let Some(lane) = lanes.get(l) else { continue };
-                    let pq0 = c - lane.o;
-                    let len2 = lane.q.len() as i32;
-                    let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
-                    if p0 < p1 {
-                        crate::batched::copy_fast(
-                            &mut row[p0 as usize..p1 as usize],
-                            &lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize],
+            // SAFETY: the caller upholds this function's `# Safety` contract.
+            unsafe {
+                let nr = lanes.iter().map(|l| l.t.len()).max().unwrap_or(0);
+                let np = nr + w - 1;
+                let c = w as i32 - 1;
+                let (npp, nrp) = ((np + 4).next_multiple_of(16), nr.next_multiple_of(16));
+                let stride = npp.max(nrp);
+                let hs = w + 7;
+                fit(&mut self.st, 16 * stride);
+                self.a.fit(npp * L, 0);
+                self.refv.fit(nrp * L, 0);
+                self.h.fit(RING * hs * L, HZ);
+                self.e.fit((w + 9) * L, HZ);
+                self.r.fit(nrp * L, 0);
+                // Only row -1's slot, as the NEON kernel's.
+                self.h[(RING - 1) * hs * L..RING * hs * L].fill(HZ);
+                self.e[..(w + 9) * L].fill(HZ);
+                let (mut omax, mut ominq, mut omaskq) = (i32::MIN, i32::MAX, i32::MIN);
+                let mut ob = [0u8; L];
+                // The SoA buffers through a lane-major staging area, 16 lanes at a time, and 16x16
+                // transposes (as the NEON kernel): the query in band layout, then the reference rows.
+                let st = self.st.as_mut_ptr();
+                for blk in 0..L / 16 {
+                    for i in 0..16 {
+                        let row = std::slice::from_raw_parts_mut(st.add(i * stride), npp);
+                        crate::batched::fill_fast(row, DEAD);
+                        let l = blk * 16 + i;
+                        let Some(lane) = lanes.get(l) else { continue };
+                        let pq0 = c - lane.o;
+                        let len2 = lane.q.len() as i32;
+                        let (p0, p1) = (pq0.max(0), (pq0 + len2).min(np as i32));
+                        if p0 < p1 {
+                            crate::batched::copy_fast(
+                                &mut row[p0 as usize..p1 as usize],
+                                &lane.q[(p0 - pq0) as usize..(p1 - pq0) as usize],
+                            );
+                        }
+                        let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
+                        if p0 < p1 {
+                            crate::batched::fill_fast(&mut row[p0 as usize..p1 as usize], QPAD);
+                        }
+                        ob[l] = lane.o as u8;
+                        omax = omax.max(lane.o);
+                        ominq = ominq.min(lane.o - lane.quanta + 1);
+                        omaskq = omaskq.max(lane.o - lane.quanta + 1);
+                    }
+                    for b in (0..npp).step_by(16) {
+                        t16(
+                            st.add(b),
+                            stride,
+                            self.a.as_mut_ptr().add(b * L + blk * 16),
+                            L,
                         );
                     }
-                    let (p0, p1) = ((pq0 + len2).max(0), (pq0 + lane.quanta).min(np as i32));
-                    if p0 < p1 {
-                        crate::batched::fill_fast(&mut row[p0 as usize..p1 as usize], QPAD);
-                    }
-                    ob[l] = lane.o as u8;
-                    omax = omax.max(lane.o);
-                    ominq = ominq.min(lane.o - lane.quanta + 1);
-                    omaskq = omaskq.max(lane.o - lane.quanta + 1);
-                }
-                for b in (0..npp).step_by(16) {
-                    t16(
-                        st.add(b),
-                        stride,
-                        self.a.as_mut_ptr().add(b * L + blk * 16),
-                        L,
-                    );
-                }
-                for i in 0..16 {
-                    let row = std::slice::from_raw_parts_mut(st.add(i * stride), nrp);
-                    let Some(lane) = lanes.get(blk * 16 + i) else {
-                        crate::batched::fill_fast(row, RPAD);
-                        continue;
-                    };
-                    crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
-                    crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
-                    // `MAT5`: targets as `5 * b` (see the NEON kernel), else N re-encoded as 12.
-                    if MAT5 {
-                        for b in row[..lane.t.len()].iter_mut() {
-                            *b *= 5;
-                        }
-                    } else if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
-                        for b in row[..lane.t.len()].iter_mut() {
-                            if *b == 4 {
-                                *b = 12;
+                    for i in 0..16 {
+                        let row = std::slice::from_raw_parts_mut(st.add(i * stride), nrp);
+                        let Some(lane) = lanes.get(blk * 16 + i) else {
+                            crate::batched::fill_fast(row, RPAD);
+                            continue;
+                        };
+                        crate::batched::copy_fast(&mut row[..lane.t.len()], lane.t);
+                        crate::batched::fill_fast(&mut row[lane.t.len()..], RPAD);
+                        // `MAT5`: targets as `5 * b` (see the NEON kernel), else N re-encoded as 12.
+                        if MAT5 {
+                            for b in row[..lane.t.len()].iter_mut() {
+                                *b *= 5;
+                            }
+                        } else if lane.t.iter().fold(0u8, |m, &b| m | b) & !3 != 0 {
+                            for b in row[..lane.t.len()].iter_mut() {
+                                if *b == 4 {
+                                    *b = 12;
+                                }
                             }
                         }
                     }
+                    for b in (0..nrp).step_by(16) {
+                        t16(
+                            st.add(b),
+                            stride,
+                            self.refv.as_mut_ptr().add(b * L + blk * 16),
+                            L,
+                        );
+                    }
                 }
-                for b in (0..nrp).step_by(16) {
-                    t16(
-                        st.add(b),
-                        stride,
-                        self.refv.as_mut_ptr().add(b * L + blk * 16),
-                        L,
-                    );
+                // The signed table in every 128-bit lane.
+                let tblv = _mm512_broadcast_i32x4(ld128(tbl, 0));
+                // `MAT5`: as the AVX2 kernel's.
+                let (t5lo, t5hi) = {
+                    let t5 = self.mat5.unwrap_or([0; 32]);
+                    let lo = ld128(&t5, 0);
+                    let hi = _mm_xor_si128(lo, ld128(&t5, 16));
+                    (_mm512_broadcast_i32x4(lo), _mm512_broadcast_i32x4(hi))
+                };
+                let sixteen = _mm512_set1_epi8(16);
+                let hz = _mm512_set1_epi8(HZ as i8);
+                let nil = _mm512_setzero_si512();
+                let one = _mm512_set1_epi8(1);
+                let deadv = _mm512_set1_epi8(DEAD as i8);
+                let rpadv = _mm512_set1_epi8(RPAD as i8);
+                let (oe_del, e_del, oe_ins, e_ins) = (
+                    _mm512_set1_epi8(gaps[0] as i8),
+                    _mm512_set1_epi8(gaps[1] as i8),
+                    _mm512_set1_epi8(gaps[2] as i8),
+                    _mm512_set1_epi8(gaps[3] as i8),
+                );
+                let ov = ld512(&ob, 0);
+                // Targets in the H domain; an absent lane's (HZ) is always reached.
+                let mut tb = [HZ; L];
+                for (l, lane) in lanes.iter().enumerate() {
+                    tb[l] = lane.target ^ HZ;
                 }
-            }
-            // The signed table in every 128-bit lane.
-            let tblv = _mm512_broadcast_i32x4(_mm_loadu_si128(tbl.as_ptr() as *const __m128i));
-            // `MAT5`: as the AVX2 kernel's.
-            let (t5lo, t5hi) = {
-                let t5 = self.mat5.unwrap_or([0; 32]);
-                let lo = _mm_loadu_si128(t5.as_ptr() as *const __m128i);
-                let hi = _mm_xor_si128(lo, _mm_loadu_si128(t5.as_ptr().add(16) as *const __m128i));
-                (_mm512_broadcast_i32x4(lo), _mm512_broadcast_i32x4(hi))
-            };
-            let sixteen = _mm512_set1_epi8(16);
-            let hz = _mm512_set1_epi8(HZ as i8);
-            let nil = _mm512_setzero_si512();
-            let one = _mm512_set1_epi8(1);
-            let deadv = _mm512_set1_epi8(DEAD as i8);
-            let rpadv = _mm512_set1_epi8(RPAD as i8);
-            let (oe_del, e_del, oe_ins, e_ins) = (
-                _mm512_set1_epi8(gaps[0] as i8),
-                _mm512_set1_epi8(gaps[1] as i8),
-                _mm512_set1_epi8(gaps[2] as i8),
-                _mm512_set1_epi8(gaps[3] as i8),
-            );
-            let ov = _mm512_loadu_si512(ob.as_ptr() as *const _);
-            // Targets in the H domain; an absent lane's (HZ) is always reached.
-            let mut tb = [HZ; L];
-            for (l, lane) in lanes.iter().enumerate() {
-                tb[l] = lane.target ^ HZ;
-            }
-            let early = lanes.iter().any(|l| l.target > 0);
-            let tgt = _mm512_loadu_si512(tb.as_ptr() as *const _);
-            let a = self.a.as_ptr();
-            let e = self.e.as_mut_ptr().add(3 * L);
-            let rout = self.r.as_mut_ptr();
-            let h0p = self.h.as_mut_ptr().add(3 * L);
-            // Row `x`'s H (`x` = -1: slot RING - 1, still zero).
-            let slot = |x: usize| h0p.add(x % RING * hs * L);
-            let li = L as isize;
-            let mut gmax = hz;
-            // `te` as its low and high bytes per lane, written with the row on every improving
-            // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
-            let (mut te_lo, mut te_hi, mut qev) = (nil, nil, nil);
-            let wm1 = w as i32 - 1;
-            // `qe` from H as the NEON kernel's `qe_scan` and `due`; `thrv` in the H domain.
-            let mut pm: __mmask64 = 0;
-            let mut th = [HZ; L];
-            for (l, lane) in lanes.iter().enumerate() {
-                th[l] = lane.thr ^ HZ;
-            }
-            let thrv = _mm512_loadu_si512(th.as_ptr() as *const _);
+                let early = lanes.iter().any(|l| l.target > 0);
+                let tgt = ld512(&tb, 0);
+                let a = self.a.as_ptr();
+                let e = self.e.as_mut_ptr().add(3 * L);
+                let rout = self.r.as_mut_ptr();
+                let h0p = self.h.as_mut_ptr().add(3 * L);
+                // Row `x`'s H (`x` = -1: slot RING - 1, still zero).
+                let slot = |x: usize| h0p.add(x % RING * hs * L);
+                let li = L as isize;
+                let mut gmax = hz;
+                // `te` as its low and high bytes per lane, written with the row on every improving
+                // row; a lane that never improves keeps `gmax == 0` and reads back as -1.
+                let (mut te_lo, mut te_hi, mut qev) = (nil, nil, nil);
+                let wm1 = w as i32 - 1;
+                // `qe` from H as the NEON kernel's `qe_scan` and `due`; `thrv` in the H domain.
+                let mut pm: __mmask64 = 0;
+                let mut th = [HZ; L];
+                for (l, lane) in lanes.iter().enumerate() {
+                    th[l] = lane.thr ^ HZ;
+                }
+                let thrv = ld512(&th, 0);
 
-            macro_rules! ld {
-                ($p:expr) => {
-                    _mm512_loadu_si512($p as *const _)
-                };
-            }
-            macro_rules! st {
-                ($p:expr, $v:expr) => {
-                    _mm512_storeu_si512($p as *mut _, $v)
-                };
-            }
-            macro_rules! qe_scan {
-                ($buf:expr, $row:expr, $msk:expr) => {{
-                    let (kl, kh) = (0.max($row + ominq), wm1.min($row + omax));
-                    let mut jv = _mm512_add_epi8(_mm512_set1_epi8(($row - kl) as i8), ov);
-                    let mut best = nil;
-                    for k in kl..=kh {
-                        let eq = _mm512_cmpeq_epi8_mask(ld!($buf.add(k as usize * L)), gmax);
-                        best = _mm512_mask_mov_epi8(best, eq, jv);
-                        jv = _mm512_sub_epi8(jv, one);
-                    }
-                    qev = _mm512_mask_mov_epi8(qev, $msk, best);
-                }};
-            }
-            // One cell, as the AVX2 kernel's; `live` is the mask of lanes on a live cell (`None`:
-            // all).
-            macro_rules! cell {
-                ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
-                 $live:expr) => {{
-                    let sc = if MAT5 {
-                        let i = _mm512_adds_epu8($rref, $q);
-                        _mm512_xor_si512(
-                            _mm512_shuffle_epi8(t5lo, i),
-                            _mm512_shuffle_epi8(t5hi, _mm512_subs_epi8(i, sixteen)),
-                        )
-                    } else {
-                        _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref))
+                macro_rules! ld {
+                    ($p:expr) => {
+                        _mm512_loadu_si512($p as *const _)
                     };
-                    let mut h0 = _mm512_max_epi8(_mm512_adds_epi8($d, sc), $ein);
-                    let ok: Option<bool> = $top;
-                    if ok == Some(false) {
-                        h0 = hz;
-                    }
-                    let mut h = _mm512_max_epi8(h0, $f);
-                    if ok == Some(false) {
-                        h = hz;
-                    }
-                    let lv: Option<__mmask64> = $live;
-                    $rmax = match lv {
-                        Some(m) => _mm512_mask_max_epi8($rmax, m, $rmax, h),
-                        None => _mm512_max_epi8($rmax, h),
+                }
+                macro_rules! st {
+                    ($p:expr, $v:expr) => {
+                        _mm512_storeu_si512($p as *mut _, $v)
                     };
-                    let t = _mm512_subs_epi8(h0, oe_del);
-                    let eout = _mm512_max_epi8(t, _mm512_subs_epi8($ein, e_del));
-                    let ti = if SHARE {
-                        t
-                    } else {
-                        _mm512_subs_epi8(h0, oe_ins)
-                    };
-                    $f = _mm512_max_epi8(ti, _mm512_subs_epi8($f, e_ins));
-                    (h, eout)
-                }};
-            }
-            // Rows `x0..x0 + n` (`n <= RING`), as the NEON kernel's `due`.
-            macro_rules! due {
-                ($x0:expr, $n:expr) => {{
-                    let (x0, n): (usize, usize) = ($x0, $n);
-                    let off = _mm512_sub_epi8(te_lo, _mm512_set1_epi8(x0 as i8));
-                    if _mm512_mask_cmplt_epu8_mask(pm, off, _mm512_set1_epi8(n as i8)) != 0 {
-                        for x in x0..x0 + n {
-                            let m =
-                                _mm512_mask_cmpeq_epi8_mask(pm, te_lo, _mm512_set1_epi8(x as i8));
-                            if m != 0 {
-                                qe_scan!(slot(x), x as i32, m);
-                                pm &= !m;
+                }
+                macro_rules! qe_scan {
+                    ($buf:expr, $row:expr, $msk:expr) => {{
+                        let (kl, kh) = (0.max($row + ominq), wm1.min($row + omax));
+                        let mut jv = _mm512_add_epi8(_mm512_set1_epi8(($row - kl) as i8), ov);
+                        let mut best = nil;
+                        for k in kl..=kh {
+                            let eq = _mm512_cmpeq_epi8_mask(ld!($buf.add(k as usize * L)), gmax);
+                            best = _mm512_mask_mov_epi8(best, eq, jv);
+                            jv = _mm512_sub_epi8(jv, one);
+                        }
+                        qev = _mm512_mask_mov_epi8(qev, $msk, best);
+                    }};
+                }
+                // One cell, as the AVX2 kernel's; `live` is the mask of lanes on a live cell (`None`:
+                // all).
+                macro_rules! cell {
+                    ($d:expr, $ein:expr, $f:ident, $q:expr, $rref:expr, $rmax:ident, $top:expr,
+                     $live:expr) => {{
+                        let sc = if MAT5 {
+                            let i = _mm512_adds_epu8($rref, $q);
+                            _mm512_xor_si512(
+                                _mm512_shuffle_epi8(t5lo, i),
+                                _mm512_shuffle_epi8(t5hi, _mm512_subs_epi8(i, sixteen)),
+                            )
+                        } else {
+                            _mm512_shuffle_epi8(tblv, _mm512_xor_si512($q, $rref))
+                        };
+                        let mut h0 = _mm512_max_epi8(_mm512_adds_epi8($d, sc), $ein);
+                        let ok: Option<bool> = $top;
+                        if ok == Some(false) {
+                            h0 = hz;
+                        }
+                        let mut h = _mm512_max_epi8(h0, $f);
+                        if ok == Some(false) {
+                            h = hz;
+                        }
+                        let lv: Option<__mmask64> = $live;
+                        $rmax = match lv {
+                            Some(m) => _mm512_mask_max_epi8($rmax, m, $rmax, h),
+                            None => _mm512_max_epi8($rmax, h),
+                        };
+                        let t = _mm512_subs_epi8(h0, oe_del);
+                        let eout = _mm512_max_epi8(t, _mm512_subs_epi8($ein, e_del));
+                        let ti = if SHARE {
+                            t
+                        } else {
+                            _mm512_subs_epi8(h0, oe_ins)
+                        };
+                        $f = _mm512_max_epi8(ti, _mm512_subs_epi8($f, e_ins));
+                        (h, eout)
+                    }};
+                }
+                // Rows `x0..x0 + n` (`n <= RING`), as the NEON kernel's `due`.
+                macro_rules! due {
+                    ($x0:expr, $n:expr) => {{
+                        let (x0, n): (usize, usize) = ($x0, $n);
+                        let off = _mm512_sub_epi8(te_lo, _mm512_set1_epi8(x0 as i8));
+                        if _mm512_mask_cmplt_epu8_mask(pm, off, _mm512_set1_epi8(n as i8)) != 0 {
+                            for x in x0..x0 + n {
+                                let m = _mm512_mask_cmpeq_epi8_mask(
+                                    pm,
+                                    te_lo,
+                                    _mm512_set1_epi8(x as i8),
+                                );
+                                if m != 0 {
+                                    qe_scan!(slot(x), x as i32, m);
+                                    pm &= !m;
+                                }
                             }
                         }
-                    }
-                }};
-            }
-            // Row bookkeeping: publish the row max, update the lanes' best.
-            macro_rules! finish_row {
-                ($row:expr, $rmax:expr, $rref:expr) => {{
-                    st!(rout.add($row * L), _mm512_xor_si512($rmax, hz));
-                    let imp =
-                        _mm512_cmpgt_epi8_mask($rmax, gmax) & _mm512_cmplt_epu8_mask($rref, rpadv);
-                    gmax = _mm512_mask_mov_epi8(gmax, imp, $rmax);
-                    te_lo = _mm512_mask_mov_epi8(te_lo, imp, _mm512_set1_epi8($row as i8));
-                    if $row >= 256 {
-                        te_hi =
-                            _mm512_mask_mov_epi8(te_hi, imp, _mm512_set1_epi8(($row >> 8) as i8));
-                    }
-                    pm |= imp & _mm512_cmpge_epi8_mask($rmax, thrv);
-                }};
-            }
+                    }};
+                }
+                // Row bookkeeping: publish the row max, update the lanes' best.
+                macro_rules! finish_row {
+                    ($row:expr, $rmax:expr, $rref:expr) => {{
+                        st!(rout.add($row * L), _mm512_xor_si512($rmax, hz));
+                        let imp = _mm512_cmpgt_epi8_mask($rmax, gmax)
+                            & _mm512_cmplt_epu8_mask($rref, rpadv);
+                        gmax = _mm512_mask_mov_epi8(gmax, imp, $rmax);
+                        te_lo = _mm512_mask_mov_epi8(te_lo, imp, _mm512_set1_epi8($row as i8));
+                        if $row >= 256 {
+                            te_hi = _mm512_mask_mov_epi8(
+                                te_hi,
+                                imp,
+                                _mm512_set1_epi8(($row >> 8) as i8),
+                            );
+                        }
+                        pm |= imp & _mm512_cmpge_epi8_mask($rmax, thrv);
+                    }};
+                }
 
-            let mut r = 0usize;
-            while r < nr {
-                let ri = r as i32;
-                let khi = wm1.min(ri + omax);
-                let klo = 0.max(ri + ominq);
-                let kun = klo.max(ri + omaskq);
-                let mut k = khi;
-                let hp = slot(r + RING - 1);
-                if r + 3 < nr {
-                    // Four rows per step, skewed, as the NEON kernel's (32 vector registers hold
-                    // them: the AVX2 kernel's 16 hold two). Their slots are those of `r - RING..`.
-                    if r >= RING {
-                        due!(r - RING, 4);
-                    }
-                    let (hr0, hr1, hr2, hc) = (slot(r), slot(r + 1), slot(r + 2), slot(r + 3));
-                    self.cells += 4 * (khi - klo + 1).max(0) as u64;
-                    let rref0 = ld!(self.refv.as_ptr().add(r * L));
-                    let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
-                    let rref2 = ld!(self.refv.as_ptr().add((r + 2) * L));
-                    let rref3 = ld!(self.refv.as_ptr().add((r + 3) * L));
-                    let (mut f0, mut f1, mut f2, mut f3) = (hz, hz, hz, hz);
-                    let (mut d1, mut d2, mut d3) = (hz, hz, hz);
-                    let (mut rmax0, mut rmax1, mut rmax2, mut rmax3) = (hz, hz, hz, hz);
-                    macro_rules! step4 {
-                        ($mask:expr, $live:expr) => {{
-                            let ko = k as isize;
-                            let valid = |i: i32| -> Option<bool> {
-                                if $mask {
-                                    Some((0..=wm1).contains(&(k + i)))
+                let mut r = 0usize;
+                while r < nr {
+                    let ri = r as i32;
+                    let khi = wm1.min(ri + omax);
+                    let klo = 0.max(ri + ominq);
+                    let kun = klo.max(ri + omaskq);
+                    let mut k = khi;
+                    let hp = slot(r + RING - 1);
+                    if r + 3 < nr {
+                        // Four rows per step, skewed, as the NEON kernel's (32 vector registers hold
+                        // them: the AVX2 kernel's 16 hold two). Their slots are those of `r - RING..`.
+                        if r >= RING {
+                            due!(r - RING, 4);
+                        }
+                        let (hr0, hr1, hr2, hc) = (slot(r), slot(r + 1), slot(r + 2), slot(r + 3));
+                        self.cells += 4 * (khi - klo + 1).max(0) as u64;
+                        let rref0 = ld!(self.refv.as_ptr().add(r * L));
+                        let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
+                        let rref2 = ld!(self.refv.as_ptr().add((r + 2) * L));
+                        let rref3 = ld!(self.refv.as_ptr().add((r + 3) * L));
+                        let (mut f0, mut f1, mut f2, mut f3) = (hz, hz, hz, hz);
+                        let (mut d1, mut d2, mut d3) = (hz, hz, hz);
+                        let (mut rmax0, mut rmax1, mut rmax2, mut rmax3) = (hz, hz, hz, hz);
+                        macro_rules! step4 {
+                            ($mask:expr, $live:expr) => {{
+                                let ko = k as isize;
+                                let valid = |i: i32| -> Option<bool> {
+                                    if $mask {
+                                        Some((0..=wm1).contains(&(k + i)))
+                                    } else {
+                                        None
+                                    }
+                                };
+                                let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                                let live = if $live {
+                                    Some(_mm512_cmplt_epu8_mask(q, deadv))
                                 } else {
                                     None
-                                }
-                            };
-                            let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            let live = if $live {
-                                Some(_mm512_cmplt_epu8_mask(q, deadv))
-                            } else {
-                                None
-                            };
-                            let e0 = ld!(e.offset(ko * li));
-                            let d0 = ld!(hp.offset(ko * li));
-                            let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), live);
-                            let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), live);
-                            let (h2, e3) = cell!(d2, e2, f2, q, rref2, rmax2, valid(2), live);
-                            let (h3, e4) = cell!(d3, e3, f3, q, rref3, rmax3, valid(3), live);
-                            st!(hr0.offset(ko * li), h0);
-                            st!(hr1.offset((ko + 1) * li), h1);
-                            st!(hr2.offset((ko + 2) * li), h2);
-                            st!(hc.offset((ko + 3) * li), h3);
-                            st!(e.offset((ko + 4) * li), e4);
-                            (d1, d2, d3) = (h0, h1, h2);
-                            k -= 1;
-                        }};
-                    }
-                    while k >= klo && k > wm1 - 3 {
-                        step4!(true, true);
-                    }
-                    while k >= kun {
-                        step4!(false, false);
-                    }
-                    while k >= klo {
-                        step4!(false, true);
-                    }
-                    // Bottom clamped at 0: rows `r+1..r+3` still have cells `k+i` in `0..i`.
-                    let kend = (ri + ominq).max(-3);
-                    while k >= kend {
-                        step4!(true, true);
-                    }
-                    finish_row!(r, rmax0, rref0);
-                    finish_row!(r + 1, rmax1, rref1);
-                    finish_row!(r + 2, rmax2, rref2);
-                    finish_row!(r + 3, rmax3, rref3);
-                    // Row `r + 4` reads row `r + 3` up to `khi + 4`; row `r + 3` wrote up to `khi + 3`.
-                    st!(hc.offset((khi + 4).max(0) as isize * li), hz);
-                    r += 4;
-                } else if r + 1 < nr {
-                    // Rows `r`, `r + 1` take the slots of `r - RING..`: read those first.
-                    if r >= RING {
-                        due!(r - RING, 2);
-                    }
-                    let (hr0, hc) = (slot(r), slot(r + 1));
-                    self.cells += 2 * (khi - klo + 1).max(0) as u64;
-                    let rref0 = ld!(self.refv.as_ptr().add(r * L));
-                    let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
-                    let (mut f0, mut f1, mut d1) = (hz, hz, hz);
-                    let (mut rmax0, mut rmax1) = (hz, hz);
-                    macro_rules! step2 {
-                        ($mask:expr, $live:expr) => {{
-                            let ko = k as isize;
-                            let valid = |i: i32| -> Option<bool> {
-                                if $mask {
-                                    Some((0..=wm1).contains(&(k + i)))
+                                };
+                                let e0 = ld!(e.offset(ko * li));
+                                let d0 = ld!(hp.offset(ko * li));
+                                let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), live);
+                                let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), live);
+                                let (h2, e3) = cell!(d2, e2, f2, q, rref2, rmax2, valid(2), live);
+                                let (h3, e4) = cell!(d3, e3, f3, q, rref3, rmax3, valid(3), live);
+                                st!(hr0.offset(ko * li), h0);
+                                st!(hr1.offset((ko + 1) * li), h1);
+                                st!(hr2.offset((ko + 2) * li), h2);
+                                st!(hc.offset((ko + 3) * li), h3);
+                                st!(e.offset((ko + 4) * li), e4);
+                                (d1, d2, d3) = (h0, h1, h2);
+                                k -= 1;
+                            }};
+                        }
+                        while k >= klo && k > wm1 - 3 {
+                            step4!(true, true);
+                        }
+                        while k >= kun {
+                            step4!(false, false);
+                        }
+                        while k >= klo {
+                            step4!(false, true);
+                        }
+                        // Bottom clamped at 0: rows `r+1..r+3` still have cells `k+i` in `0..i`.
+                        let kend = (ri + ominq).max(-3);
+                        while k >= kend {
+                            step4!(true, true);
+                        }
+                        finish_row!(r, rmax0, rref0);
+                        finish_row!(r + 1, rmax1, rref1);
+                        finish_row!(r + 2, rmax2, rref2);
+                        finish_row!(r + 3, rmax3, rref3);
+                        // Row `r + 4` reads row `r + 3` up to `khi + 4`; row `r + 3` wrote up to `khi + 3`.
+                        st!(hc.offset((khi + 4).max(0) as isize * li), hz);
+                        r += 4;
+                    } else if r + 1 < nr {
+                        // Rows `r`, `r + 1` take the slots of `r - RING..`: read those first.
+                        if r >= RING {
+                            due!(r - RING, 2);
+                        }
+                        let (hr0, hc) = (slot(r), slot(r + 1));
+                        self.cells += 2 * (khi - klo + 1).max(0) as u64;
+                        let rref0 = ld!(self.refv.as_ptr().add(r * L));
+                        let rref1 = ld!(self.refv.as_ptr().add((r + 1) * L));
+                        let (mut f0, mut f1, mut d1) = (hz, hz, hz);
+                        let (mut rmax0, mut rmax1) = (hz, hz);
+                        macro_rules! step2 {
+                            ($mask:expr, $live:expr) => {{
+                                let ko = k as isize;
+                                let valid = |i: i32| -> Option<bool> {
+                                    if $mask {
+                                        Some((0..=wm1).contains(&(k + i)))
+                                    } else {
+                                        None
+                                    }
+                                };
+                                let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                                let live = if $live {
+                                    Some(_mm512_cmplt_epu8_mask(q, deadv))
                                 } else {
                                     None
-                                }
-                            };
-                            let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            let live = if $live {
-                                Some(_mm512_cmplt_epu8_mask(q, deadv))
-                            } else {
-                                None
-                            };
-                            let e0 = ld!(e.offset(ko * li));
-                            let d0 = ld!(hp.offset(ko * li));
-                            let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), live);
-                            let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), live);
-                            st!(hr0.offset(ko * li), h0);
-                            st!(hc.offset((ko + 1) * li), h1);
-                            st!(e.offset((ko + 2) * li), e2);
-                            d1 = h0;
-                            k -= 1;
-                        }};
+                                };
+                                let e0 = ld!(e.offset(ko * li));
+                                let d0 = ld!(hp.offset(ko * li));
+                                let (h0, e1) = cell!(d0, e0, f0, q, rref0, rmax0, valid(0), live);
+                                let (h1, e2) = cell!(d1, e1, f1, q, rref1, rmax1, valid(1), live);
+                                st!(hr0.offset(ko * li), h0);
+                                st!(hc.offset((ko + 1) * li), h1);
+                                st!(e.offset((ko + 2) * li), e2);
+                                d1 = h0;
+                                k -= 1;
+                            }};
+                        }
+                        while k >= klo && k > wm1 - 1 {
+                            step2!(true, true);
+                        }
+                        while k >= kun {
+                            step2!(false, false);
+                        }
+                        while k >= klo {
+                            step2!(false, true);
+                        }
+                        let kend = (ri + ominq).max(-1);
+                        while k >= kend {
+                            step2!(true, true);
+                        }
+                        finish_row!(r, rmax0, rref0);
+                        finish_row!(r + 1, rmax1, rref1);
+                        // Row `r + 2` reads row `r + 1` up to `khi + 2`; row `r + 1` wrote up to `khi + 1`.
+                        st!(hc.offset((khi + 2).max(0) as isize * li), hz);
+                        r += 2;
+                    } else {
+                        if r >= RING {
+                            due!(r - RING, 1);
+                        }
+                        let hc = slot(r);
+                        self.cells += (khi - klo + 1).max(0) as u64;
+                        let rref = ld!(self.refv.as_ptr().add(r * L));
+                        let (mut f, mut rmax) = (hz, hz);
+                        macro_rules! step1 {
+                            ($live:expr) => {{
+                                let ko = k as isize;
+                                let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
+                                let live = if $live {
+                                    Some(_mm512_cmplt_epu8_mask(q, deadv))
+                                } else {
+                                    None
+                                };
+                                let e0 = ld!(e.offset(ko * li));
+                                let d0 = ld!(hp.offset(ko * li));
+                                let (h, e1) = cell!(d0, e0, f, q, rref, rmax, None, live);
+                                st!(hc.offset(ko * li), h);
+                                st!(e.offset((ko + 1) * li), e1);
+                                k -= 1;
+                            }};
+                        }
+                        while k >= kun {
+                            step1!(false);
+                        }
+                        while k >= klo {
+                            step1!(true);
+                        }
+                        finish_row!(r, rmax, rref);
+                        st!(hc.offset((khi + 1).max(0) as isize * li), hz);
+                        r += 1;
                     }
-                    while k >= klo && k > wm1 - 1 {
-                        step2!(true, true);
+                    if early && _mm512_cmpge_epi8_mask(gmax, tgt) == u64::MAX {
+                        break;
                     }
-                    while k >= kun {
-                        step2!(false, false);
-                    }
-                    while k >= klo {
-                        step2!(false, true);
-                    }
-                    let kend = (ri + ominq).max(-1);
-                    while k >= kend {
-                        step2!(true, true);
-                    }
-                    finish_row!(r, rmax0, rref0);
-                    finish_row!(r + 1, rmax1, rref1);
-                    // Row `r + 2` reads row `r + 1` up to `khi + 2`; row `r + 1` wrote up to `khi + 1`.
-                    st!(hc.offset((khi + 2).max(0) as isize * li), hz);
-                    r += 2;
-                } else {
-                    if r >= RING {
-                        due!(r - RING, 1);
-                    }
-                    let hc = slot(r);
-                    self.cells += (khi - klo + 1).max(0) as u64;
-                    let rref = ld!(self.refv.as_ptr().add(r * L));
-                    let (mut f, mut rmax) = (hz, hz);
-                    macro_rules! step1 {
-                        ($live:expr) => {{
-                            let ko = k as isize;
-                            let q = ld!(a.offset((r as isize + w as isize - 1 - ko) * li));
-                            let live = if $live {
-                                Some(_mm512_cmplt_epu8_mask(q, deadv))
-                            } else {
-                                None
-                            };
-                            let e0 = ld!(e.offset(ko * li));
-                            let d0 = ld!(hp.offset(ko * li));
-                            let (h, e1) = cell!(d0, e0, f, q, rref, rmax, None, live);
-                            st!(hc.offset(ko * li), h);
-                            st!(e.offset((ko + 1) * li), e1);
-                            k -= 1;
-                        }};
-                    }
-                    while k >= kun {
-                        step1!(false);
-                    }
-                    while k >= klo {
-                        step1!(true);
-                    }
-                    finish_row!(r, rmax, rref);
-                    st!(hc.offset((khi + 1).max(0) as isize * li), hz);
-                    r += 1;
                 }
-                if early && _mm512_cmpge_epi8_mask(gmax, tgt) == u64::MAX {
-                    break;
-                }
-            }
-            let x0 = r.saturating_sub(RING);
-            due!(x0, r - x0);
-            st!(self.gmax.as_mut_ptr(), _mm512_xor_si512(gmax, hz));
-            let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
-            st!(lo.as_mut_ptr(), te_lo);
-            st!(hi.as_mut_ptr(), te_hi);
-            st!(self.qe.as_mut_ptr(), qev);
-            self.te = std::array::from_fn(|l| {
-                if self.gmax[l] > 0 {
-                    i32::from(lo[l]) | i32::from(hi[l]) << 8
-                } else {
-                    -1
-                }
-            });
-            // Row maxima to lane-major, zero past `nr`.
-            self.rstride = nrp;
-            fit(&mut self.rl, nrp * L);
-            self.r[nr * L..nrp * L].fill(0);
-            for blk in 0..L / 16 {
-                for b in (0..nrp).step_by(16) {
-                    t16(
-                        self.r.as_ptr().add(b * L + blk * 16),
-                        L,
-                        self.rl.as_mut_ptr().add(blk * 16 * nrp + b),
-                        nrp,
-                    );
+                let x0 = r.saturating_sub(RING);
+                due!(x0, r - x0);
+                st!(self.gmax.as_mut_ptr(), _mm512_xor_si512(gmax, hz));
+                let (mut lo, mut hi) = ([0u8; L], [0u8; L]);
+                st!(lo.as_mut_ptr(), te_lo);
+                st!(hi.as_mut_ptr(), te_hi);
+                st!(self.qe.as_mut_ptr(), qev);
+                self.te = std::array::from_fn(|l| {
+                    if self.gmax[l] > 0 {
+                        i32::from(lo[l]) | i32::from(hi[l]) << 8
+                    } else {
+                        -1
+                    }
+                });
+                // Row maxima to lane-major, zero past `nr`.
+                self.rstride = nrp;
+                fit(&mut self.rl, nrp * L);
+                self.r[nr * L..nrp * L].fill(0);
+                for blk in 0..L / 16 {
+                    for b in (0..nrp).step_by(16) {
+                        t16(
+                            self.r.as_ptr().add(b * L + blk * 16),
+                            L,
+                            self.rl.as_mut_ptr().add(blk * 16 * nrp + b),
+                            nrp,
+                        );
+                    }
                 }
             }
         }
@@ -2628,21 +2689,24 @@ mod x86 {
             tbl: &[u8; 16],
             gaps: [u8; 4],
         ) {
-            let n = lanes.len();
-            if self.wide {
-                self.w5.mat5 = self.mat5;
-                self.w5.run(lanes, w, tbl, gaps);
-                self.gmax[..n].copy_from_slice(&self.w5.gmax[..n]);
-                self.te[..n].copy_from_slice(&self.w5.te[..n]);
-                self.qe[..n].copy_from_slice(&self.w5.qe[..n]);
-                self.cells = self.w5.cells;
-            } else {
-                self.w2.mat5 = self.mat5;
-                self.w2.run(lanes, w, tbl, gaps);
-                self.gmax[..n].copy_from_slice(&self.w2.gmax[..n]);
-                self.te[..n].copy_from_slice(&self.w2.te[..n]);
-                self.qe[..n].copy_from_slice(&self.w2.qe[..n]);
-                self.cells = self.w2.cells;
+            // SAFETY: the caller upholds this function's `# Safety` contract.
+            unsafe {
+                let n = lanes.len();
+                if self.wide {
+                    self.w5.mat5 = self.mat5;
+                    self.w5.run(lanes, w, tbl, gaps);
+                    self.gmax[..n].copy_from_slice(&self.w5.gmax[..n]);
+                    self.te[..n].copy_from_slice(&self.w5.te[..n]);
+                    self.qe[..n].copy_from_slice(&self.w5.qe[..n]);
+                    self.cells = self.w5.cells;
+                } else {
+                    self.w2.mat5 = self.mat5;
+                    self.w2.run(lanes, w, tbl, gaps);
+                    self.gmax[..n].copy_from_slice(&self.w2.gmax[..n]);
+                    self.te[..n].copy_from_slice(&self.w2.te[..n]);
+                    self.qe[..n].copy_from_slice(&self.w2.qe[..n]);
+                    self.cells = self.w2.cells;
+                }
             }
         }
     }
@@ -2893,12 +2957,14 @@ mod tests {
                 })
                 .collect();
             let n5 = 33 + next() % 32;
+            // SAFETY: the feature this `Work` needs was detected when it was made; `lanes` fits it.
             unsafe { w5.run(&lanes[..n5], w, &tbl, gaps) };
             for half in 0..2 {
                 let (lo, hi) = (half * 32, (half * 32 + 32).min(n5));
                 if lo >= hi {
                     continue;
                 }
+                // SAFETY: as above.
                 unsafe { w2.run(&lanes[lo..hi], w, &tbl, gaps) };
                 for l in lo..hi {
                     let k = l - lo;
@@ -3114,6 +3180,7 @@ mod tests {
             nhull += hulls.len() as u64;
             let t0 = std::time::Instant::now();
             for _ in 0..reps {
+                // SAFETY: NEON is aarch64 baseline; `b` was built for these jobs.
                 unsafe { b.run(&kj, &mat, 6, 1, 6, 1, 19, 1, &mut out) };
             }
             t_band += t0.elapsed().as_nanos();
