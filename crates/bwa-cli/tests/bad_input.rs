@@ -77,7 +77,10 @@ fn damaged_index_files_are_named() {
     let text = std::fs::read_to_string(&ann).unwrap();
     let (_, rest) = text.split_once(' ').unwrap();
     std::fs::write(&ann, format!("1000 {rest}")).unwrap();
-    assert_refused(&run(), "mixed index from two builds");
+    assert_refused(
+        &run(),
+        ".ann: 1 contigs cover 200001 bases, header says 1000",
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
