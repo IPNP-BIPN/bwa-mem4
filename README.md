@@ -18,8 +18,8 @@ code tells you not to use them.
 | Single-end | byte-identical on **353,517,767** records |
 | Paired-end | byte-identical on **707,312,349** records |
 | ALT contigs | byte-identical on the real GRCh38 analysis set, 261 ALT contigs |
-| Speed | SE **8.04x**, PE **8.81x** vs bwa-mem2 2.3 on the full 30x sample at `-t12` (4.5.0); **1.29x (SE) to 1.46x (PE)** faster than fg-labs/bwa-mem3 0.17 on GIAB, see [below](#against-fg-labsbwa-mem3); index build **3.57x** |
-| Memory vs bwa-mem3 | peak RSS **9.4 GB vs 13.3** (PE) and **8.9 vs 12.6** (SE) on 2M GIAB pairs at `-t8` against 0.17, same SAM bytes |
+| Speed | SE **8.04x**, PE **8.81x** vs bwa-mem2 2.3 on the full 30x sample at `-t12` (4.5.0); **1.40x (SE) to 1.54x (PE)** faster than fg-labs/bwa-mem3 0.18 on GIAB (Apple M4), see [below](#against-fg-labsbwa-mem3); index build **3.57x** |
+| Memory vs bwa-mem3 | peak RSS **9.4 GB vs 13.3** (PE) and **8.8 vs 12.6** (SE) on 2M GIAB pairs at `-t8` against 0.18, same SAM bytes |
 | Memory | peak RSS on the full 30x sample SE **9.5 GB** vs 23.2, PE **9.8 GB** vs 22.8 against bwa-mem2; index build 73.8 GB vs 78.7 |
 | Output | SAM, BGZF-compressed SAM, BAM, CRAM |
 | Option surface | all three subcommands, and **every one of the 35 options `bwa-mem2 mem` accepts**; 64 of 64 per-option SAM parity cases pass |
@@ -82,21 +82,23 @@ cloud runners, not the headline ratio.
 
 ### Against fg-labs/bwa-mem3
 
-[fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.17.0 run with `--compat=bwa-mem2`, its
+[fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) 0.18.0 run with `--compat=bwa-mem2`, its
 mode that reproduces bwa-mem2. Every row below produces the same SAM bytes from both tools, and
 the same bytes as bwa-mem2 on GIAB (md5 checked on each run).
 
-Apple M4 Max, 15 Nov 2026, bwa-mem4 4.5.0 (plain `cargo build --release`, not PGO) and bwa-mem3
-0.17.0 (built from its tag with `make arm64`), `-t8 -K 100000000`, the two tools interleaved, best
-of two:
+Apple M4 Max, 17 Nov 2026, bwa-mem4 at the bwa-mem3 0.18 catch-up (plain `cargo build --release`,
+not PGO) and bwa-mem3 0.18.0 (built from its tag with `make arm64`), `-t8 -K 100000000`, the two
+tools interleaved, best of two:
 
-| reads | bwa-mem4 | bwa-mem3 0.17.0 | speedup | CPU cycles, mem4 / mem3 | peak RSS, mem4 / mem3 |
+| reads | bwa-mem4 | bwa-mem3 0.18.0 | speedup | CPU cycles, mem4 / mem3 | peak RSS, mem4 / mem3 |
 |---|---|---|---|---|---|
-| GIAB HG002, 2M pairs PE | 14.2 s | 20.7 s | **1.46x** | 402 / 617 G | 9.4 / 13.3 GB |
-| GIAB HG002, 2M reads SE | 4.61 s | 5.93 s | **1.29x** | 125 / 177 G | 8.9 / 12.6 GB |
-| chr21, 1M simulated pairs | 4.90 s | 8.10 s | **1.65x** | 139 / 245 G | 1.6 / 1.6 GB |
+| GIAB HG002, 2M pairs PE | 12.85 s | 19.74 s | **1.54x** | 401 / 612 G | 9.4 / 13.3 GB |
+| GIAB HG002, 2M reads SE | 4.33 s | 6.05 s | **1.40x** | 124 / 176 G | 8.8 / 12.6 GB |
 
-Against 0.16.0 (14 Nov) the same runs gave 1.50x, 1.37x and 1.68x; 0.17.0 mostly cut its memory.
+The chr21 simulated row was measured against 0.17.0 only (15 Nov): 4.90 s against 8.10 s, 1.65x.
+Against 0.16.0 (14 Nov) the GIAB runs gave 1.50x and 1.37x, against 0.17.0 (15 Nov) 1.46x and
+1.29x; the fork's own measurement puts 0.18.0 at 1.00x of 0.17.0, so the change is host noise
+and this tree's #718 port, not a slower fork.
 
 On other CPUs (`head-to-head` workflow, 15 Nov 2026, 4-vCPU GitHub runners, chr21, 2M pairs,
 4.5.0's code, bwa-mem3 0.17.0 and bwa-mem2 2.3 from bioconda, the same records from all three;
@@ -278,6 +280,7 @@ IDX=testdata/tiny/tiny.fa R1=/tmp/ci_1.fq R2=/tmp/ci_2.fq \
 
 ```sh
 bash scripts/alt_parity.sh     # ALT contigs: real GRCh38 analysis set + the real bwakit .alt
+bash scripts/alt_project_diff.sh   # --alt-project against bwa-mem3 0.18 on the fork's ALT fixtures
 bash scripts/giab_publication.sh   # the real thing: index + full 30x SE/PE, both tools, ~8 h
 ```
 
@@ -323,11 +326,26 @@ Since 4.5.0, `bwa-mem4 index --meth` and `bwa-mem4 mem --meth[=emseq|taps|5base]
 directional bisulfite, EM-seq, TAPS and Illumina 5-base reads with the methylation mode of
 fg-labs/bwa-mem3, ported to Rust, options spelled as in bwa-mem3. `--pbat` (or `--meth=pbat`)
 adds PBAT libraries, which bwa-mem3 does not have. Its SAM output is byte-identical to bwa-mem3
-0.17 on the test sets; as in 0.17, bare `--meth` now scores EM-seq as `genomic`, and
+0.18 on the test sets, `--md` and `--tie-break name` included, and `index --meth --meth-only`
+writes the fork's seven files; as in 0.17, bare `--meth` scores EM-seq as `genomic`, and
 `--meth-scoring collapsed` gives 4.5.0's output (bwa-mem3 0.16's). Against 0.16 it ran at
 0.53-0.66 of bwa-mem3's CPU cycles on Apple M4 (150 and 250 bp, `-t1`) and 0.67-0.89 of its wall
 time on x86. Without `--meth` nothing changes.
 Details, options and validation: [docs/meth-mode.md](docs/meth-mode.md).
+
+## ALT projection (`--alt-project`)
+
+`mem --alt-project keep-alt|primary [--alt-project-exclude-bed FILE]` is fg-labs/bwa-mem3 0.18's
+ALT projection (#775, #802): alignments to ALT contigs are lifted onto the primary assembly through
+`<idxbase>.alt` before pairing and MAPQ, so an ALT haplotype can decide where a read goes. A lifted
+record is re-aligned to the primary reference, keeps the ALT score as AS and names its ALT in
+`XL:Z`. A hit the lift cannot describe (an `.alt` clip, an end in an ALT insertion, less than half
+aligned, ALT indels wider than `-w`, 1022 or the re-alignment band) stays on its ALT under
+`keep-alt`; `primary` drops it, leaves the ALT `@SQ` out, and writes a read left with no hit
+unmapped with `OA:Z`. `--alt-project-exclude-bed` (plain or gzipped BED) skips each `.alt` line
+whose primary footprint overlaps an interval. Refused with `-j` and `--meth`. Output is
+byte-identical to bwa-mem3 0.18 on the fork's own ALT fixtures, both modes, SE and PE, with and
+without the BED (`scripts/alt_project_diff.sh`); without the option nothing changes.
 
 ## GPU
 

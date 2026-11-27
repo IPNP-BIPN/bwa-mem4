@@ -40,11 +40,21 @@ pub struct IndexArgs {
     /// Repeatable. Without this, `mem -x ont2d`/`pacbio` builds and caches one on first use.
     #[arg(long = "mmi", value_name = "PRESET")]
     pub mmi: Vec<String>,
-    // fg-labs/bwa-mem3 0.16's `index --meth`, same files, so its indexes and ours interchange.
-    /// Also build the bisulfite seed index for `mem --meth`: `<prefix>.meth.fa` (each contig
-    /// G->A as `r<name>`, then C->T as `f<name>`) and its index `<prefix>.meth.*`.
+    // fg-labs/bwa-mem3 0.18's `index --meth`, same files, so its indexes and ours interchange.
+    /// Also build the bisulfite seed index for `mem --meth`, `<prefix>.meth.*`, from each contig
+    /// G->A as `r<name>` then C->T as `f<name>`. Neither index gets a `.0123`.
     #[arg(long = "meth")]
     pub meth: bool,
+    /// With --meth, pack the original without its FM-index: seven index files, for
+    /// methylation alignment only.
+    #[arg(long = "meth-only")]
+    pub meth_only: bool,
+    /// With --meth, keep the converted reference as `<prefix>.meth.fa` (removed otherwise).
+    #[arg(long = "keep-meth-fasta")]
+    pub keep_meth_fasta: bool,
+    /// With --meth, replace an existing index instead of refusing.
+    #[arg(long = "force")]
+    pub force: bool,
 }
 
 /// Build the index and report elapsed time on stderr.
@@ -73,12 +83,12 @@ pub fn run(args: IndexArgs) -> anyhow::Result<()> {
     // Defaulting the prefix to the FASTA path is bwa's behaviour, not just a convenience: it is
     // why a bare path can be passed to both `index` and `mem`.
     let prefix = args.prefix.clone().unwrap_or_else(|| args.fasta.clone());
-    bwa_index::build_index_with_prefix(&args.fasta, &prefix)?;
     if args.meth {
-        let meth_prefix = PathBuf::from(format!("{}.meth", prefix.display()));
-        let meth_fa = PathBuf::from(format!("{}.fa", meth_prefix.display()));
-        bwa_index::write_meth_fasta(&args.fasta, &meth_fa)?;
-        bwa_index::build_index_with_prefix(&meth_fa, &meth_prefix)?;
+        build_meth(&args, &prefix)?;
+    } else if args.meth_only || args.keep_meth_fasta || args.force {
+        anyhow::bail!("--meth-only, --keep-meth-fasta and --force require --meth");
+    } else {
+        bwa_index::build_index_with_prefix(&args.fasta, &prefix)?;
     }
     eprintln!(
         "[bwa-mem4 index] built index for {} in {:.3}s",
@@ -95,6 +105,69 @@ pub fn run(args: IndexArgs) -> anyhow::Result<()> {
             path.display(),
             t.elapsed().as_secs_f64()
         );
+    }
+    Ok(())
+}
+
+/// `index --meth`, as fg-labs/bwa-mem3 0.18's `meth_index_build`: the original reference (packed
+/// only under `--meth-only`), the seed index `<prefix>.meth.*`, neither with `.0123`, the source `.alt`
+/// copied beside a relocated prefix, and `<prefix>.meth.fa` removed unless `--keep-meth-fasta`.
+/// An existing index file is an error unless `--force`, which removes the known ones first.
+///
+/// shortcut: the conversion is written as `<prefix>.meth.fa` rather than in a TMPDIR scratch, and
+/// the fork's preflights (source aliases, symlinks, memory budget) are not ported; upgrade if a
+/// user indexes into a directory that cannot hold one more copy of the reference.
+fn build_meth(args: &IndexArgs, prefix: &std::path::Path) -> anyhow::Result<()> {
+    let p = prefix.display().to_string();
+    if p.is_empty() || p.ends_with('/') || p.ends_with(".meth") {
+        anyhow::bail!("invalid methylation output prefix (must not end in .meth)");
+    }
+    let alt_src = PathBuf::from(format!("{}.alt", args.fasta.display()));
+    let alt_dst = PathBuf::from(format!("{p}.alt"));
+    let in_place = std::path::absolute(&args.fasta)? == std::path::absolute(prefix)?;
+    let mut remove = Vec::new();
+    for ext in [
+        "amb",
+        "ann",
+        "pac",
+        "bwt.2bit.64",
+        "0123",
+        "meth.amb",
+        "meth.ann",
+        "meth.pac",
+        "meth.bwt.2bit.64",
+        "meth.0123",
+        "meth.fa",
+        "alt",
+    ] {
+        let path = PathBuf::from(format!("{p}.{ext}"));
+        // The source's own `.alt` is an input when the index is built in place.
+        if !path.exists() || (ext == "alt" && in_place) {
+            continue;
+        }
+        if !args.force {
+            anyhow::bail!(
+                "output exists: {}; use --force to replace known index artifacts",
+                path.display()
+            );
+        }
+        remove.push(path);
+    }
+    for path in remove {
+        std::fs::remove_file(path)?;
+    }
+    // No `.0123` (as the fork, which writes it only on request): nothing loads it.
+    bwa_index::build_index_parts(&args.fasta, prefix, false, !args.meth_only)?;
+    let meth_prefix = PathBuf::from(format!("{p}.meth"));
+    let meth_fa = PathBuf::from(format!("{p}.meth.fa"));
+    bwa_index::write_meth_fasta(&args.fasta, &meth_fa)?;
+    bwa_index::build_index_parts(&meth_fa, &meth_prefix, false, true)?;
+    if !args.keep_meth_fasta {
+        std::fs::remove_file(&meth_fa)?;
+    }
+    // Without the copy a relocated index silently loses its ALT contigs.
+    if !in_place && alt_src.exists() {
+        std::fs::copy(&alt_src, &alt_dst)?;
     }
     Ok(())
 }
