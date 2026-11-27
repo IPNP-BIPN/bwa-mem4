@@ -1172,10 +1172,11 @@ fn insert_inline(v: &mut Vec<u64>, at: usize, x: u64) {
     }
     v.push(x);
     let s = &mut v[at..];
+    // Two keys a step from the end, as fixed-size windows of `s`: `2 <= j < s.len()` bounds both.
     let mut j = s.len() - 1;
     while j >= 2 {
-        let pair = [s[j - 2], s[j - 1]];
-        s[j - 1..=j].copy_from_slice(&pair);
+        let pair: [u64; 2] = s[j - 2..j].try_into().unwrap();
+        s[j - 1..j + 1].copy_from_slice(&pair);
         j -= 2;
     }
     if j > 0 {

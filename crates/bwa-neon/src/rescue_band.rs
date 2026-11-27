@@ -1112,17 +1112,22 @@ pub(crate) mod neon {
     /// Panics unless `src` holds `16 * stride` bytes and `dst` `n * 16`.
     #[target_feature(enable = "neon")]
     pub(crate) fn transpose_to(src: &[u8], stride: usize, n: usize, dst: &mut [u8]) {
-        let mut b = 0;
-        while b < n {
-            let mut v = [vdupq_n_u8(0); 16];
-            for (l, x) in v.iter_mut().enumerate() {
-                *x = ld_u8(src, l * stride + b);
+        // The 16 source rows and the destination blocks cut once per call, so every access in the
+        // loop indexes a view whose length LLVM sees equal to the loop bound: no per-vector bounds
+        // check (32 per 16x16 block when each access was `l * stride + b` on the whole slice).
+        let rows: [&[[u8; 16]]; 16] = std::array::from_fn(|l| src[l * stride..][..n].as_chunks().0);
+        for (bi, out) in dst[..n * 16]
+            .as_chunks_mut::<16>()
+            .0
+            .as_chunks_mut::<16>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let v = transpose16(std::array::from_fn(|l| ld_u8(&rows[l][bi], 0)));
+            for (o, x) in out.iter_mut().zip(v) {
+                st_u8(o, 0, x);
             }
-            let v = transpose16(v);
-            for (t, x) in v.iter().enumerate() {
-                st_u8(dst, (b + t) * 16, *x);
-            }
-            b += 16;
         }
     }
 
@@ -1132,17 +1137,22 @@ pub(crate) mod neon {
     /// Panics unless `src` holds `n * 16` bytes and `dst` `16 * stride`.
     #[target_feature(enable = "neon")]
     fn transpose_from(src: &[u8], n: usize, dst: &mut [u8], stride: usize) {
-        let mut b = 0;
-        while b < n {
-            let mut v = [vdupq_n_u8(0); 16];
-            for (t, x) in v.iter_mut().enumerate() {
-                *x = ld_u8(src, (b + t) * 16);
+        // As in `transpose_to`: views cut once, so the loop has no per-vector bounds checks.
+        let mut it = dst[..16 * stride].chunks_exact_mut(stride);
+        let mut rows: [&mut [[u8; 16]]; 16] =
+            std::array::from_fn(|_| it.next().unwrap()[..n].as_chunks_mut().0);
+        for (bi, blk) in src[..n * 16]
+            .as_chunks::<16>()
+            .0
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let v = transpose16(std::array::from_fn(|t| ld_u8(&blk[t], 0)));
+            for (row, x) in rows.iter_mut().zip(v) {
+                st_u8(&mut row[bi], 0, x);
             }
-            let v = transpose16(v);
-            for (l, x) in v.iter().enumerate() {
-                st_u8(dst, l * stride + b, *x);
-            }
-            b += 16;
         }
     }
 

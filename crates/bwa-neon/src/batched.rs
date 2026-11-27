@@ -3032,9 +3032,10 @@ macro_rules! define_sw_kernel {
                     }
                     let qlen_v = $lds(&qlen_e, 0);
                     let mut ramp_v = $lds(&ramp, 0);
-                    for j in 1..=jmax {
+                    // One cut for the whole ramp, so the loop has no per-column bounds check.
+                    for (j, col) in (1..).zip(&mut eh.as_chunks_mut::<LANES>().0[1..=jmax]) {
                         let keep = $cge(qlen_v, $dup(j as $elem));
-                        $sts(eh, j * LANES, $bsl(keep, ramp_v, zero_v));
+                        $sts(col, 0, $bsl(keep, ramp_v, zero_v));
                         ramp_v = $max($sub(ramp_v, e_ins_v), zero_v);
                     }
                 }
@@ -3155,15 +3156,19 @@ macro_rules! define_sw_kernel {
                             *run = false;
                             continue;
                         }
-                        // The row's columns `gbeg..gend` as one `LANES`-vector per column, cut at
-                        // `gend` so the column loops' accesses need no bounds check (`gbeg >= 0`
-                        // always; the `max` tells LLVM so).
+                        // One `LANES`-vector per column, all four views cut to `lim`, the shortest:
+                        // that cut is provably in bounds, and every column loop below stops at
+                        // `min(lim)`, so LLVM drops the per-column bounds checks with no per-row
+                        // check either. The `min` is a no-op on every row whose columns are in
+                        // bounds, which the raw-pointer form required anyway (`gbeg >= 0` always;
+                        // the `max` tells LLVM so).
                         let gbeg = gbeg.max(0);
-                        let gcols = gend.max(0) as usize;
-                        let qc = &qcode.as_chunks::<LANES>().0[..gcols];
-                        let ehh = &mut eh_h.as_chunks_mut::<LANES>().0[..gcols];
-                        let ehe = &mut eh_e.as_chunks_mut::<LANES>().0[..gcols];
-                        let sbc = &mut sbt_buf.as_chunks_mut::<LANES>().0[..gcols];
+                        let (qc, ehh) = (qcode.as_chunks::<LANES>().0, eh_h.as_chunks_mut::<LANES>().0);
+                        let (ehe, sbc) = (eh_e.as_chunks_mut::<LANES>().0, sbt_buf.as_chunks_mut::<LANES>().0);
+                        let lim = qc.len().min(ehh.len()).min(ehe.len()).min(sbc.len());
+                        let (qc, ehh, ehe, sbc) = (&qc[..lim], &mut ehh[..lim], &mut ehe[..lim], &mut sbc[..lim]);
+                        debug_assert!(gend <= lim as i32);
+                        let gcols = (gend.max(0) as usize).min(lim);
 
                         // Move the row-local scalars into vectors. `h1_v` was just computed per lane
                         // (the first-column value), the rest start at their identity.
@@ -3208,8 +3213,8 @@ macro_rules! define_sw_kernel {
                         // cannot do itself, unlike the ALU rewrites of #48A and #48D which it had
                         // already done.
                         if !INL_SBT {
-                            for j in gbeg..gend {
-                                let q_v = $lds(&qc[j as usize], 0);
+                            for j in gbeg as usize..gcols {
+                                let q_v = $lds(&qc[j], 0);
                                 // One biased value per cell: N wins over the equality test, exactly as
                                 // the split form's `is_n` blend sat outermost on both halves.
                                 let sbt = if $sbt_tbl {
@@ -3220,7 +3225,7 @@ macro_rules! define_sw_kernel {
                                     let is_n = $orru(t_is_n, $cge(q_v, amb_v));
                                     $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
                                 };
-                                $sts(&mut sbc[j as usize], 0, sbt);
+                                $sts(&mut sbc[j], 0, sbt);
                             }
                         }
 
@@ -3238,7 +3243,7 @@ macro_rules! define_sw_kernel {
                         // all-ones, so all nine fold away. Same shape as the rescue kernel's padding regime, and
                         // the same byte-identity argument: a provably constant mask folded, not a mask dropped.
                         macro_rules! column {
-                                    ($j:expr, $masked:literal, $share_oe:literal) => {{
+                                    ($j:expr, $masked:literal, $share_oe:literal, $qc:ident, $ehh:ident, $ehe:ident, $sbc:ident) => {{
                                         let j = $j;
                                     // Byte offset of column `j` in every SoA buffer (all lanes of that column
                                     // sit contiguously, which is the whole point of the layout).
@@ -3277,7 +3282,7 @@ macro_rules! define_sw_kernel {
                                     // and, since the pre-pass went from a pair of values to one, half the loads
                                     // and half the stores the pre-pass form originally cost.
                                     let sbt = if INL_SBT {
-                                        let q_v = $lds(&qc[j as usize], 0);
+                                        let q_v = $lds(&$qc[j], 0);
                                         if $sbt_tbl {
                                             let ($tt, $tk, $tq) = (tab_v, t_key, q_v);
                                             $tblx
@@ -3287,23 +3292,23 @@ macro_rules! define_sw_kernel {
                                             $bsl(is_n, sbt_npen_v, $bsl(is_eq, sbt_match_v, sbt_mism_v))
                                         }
                                     } else {
-                                        $lds(&sbc[j as usize], 0)
+                                        $lds(&$sbc[j], 0)
                                     };
 
-                                    let m_v = $lds(&ehh[j as usize], 0); // H(i-1, j-1)
+                                    let m_v = $lds(&$ehh[j], 0); // H(i-1, j-1)
                                                                                  // E(i, j), one lane per job. Written while row i-1 was walked, but it is the
                                                                                  // deletion state ENTERING cell (i, j), so it is indexed (i, j) here and in
                                                                                  // the scalar path. Same convention as the C ("eh[j] = { H(i-1,j-1), E(i,j) }",
                                                                                  // `ksw.cpp:479`); labelling it E(i-1, j) would make the two paths look like
                                                                                  // they hold different values when they hold the same one.
-                                    let e_v = $lds(&ehe[j as usize], 0); // E(i, j)
+                                    let e_v = $lds(&$ehe[j], 0); // E(i, j)
 
                                     // eh_h[j] <- h1 (old) for in-band lanes; out-of-band keep old m_v.
                                     // The mask has to be applied on the *store*, not skipped around, because all
                                     // lanes share the store instruction: writing back the value just loaded is
                                     // how an out-of-band lane is left untouched.
                                     let h_st = if $masked { $bsl(band, h1_v, m_v) } else { h1_v };
-                                    $sts(&mut ehh[j as usize], 0, h_st);
+                                    $sts(&mut $ehh[j], 0, h_st);
 
                                     // M = ((m + (bias + score)) - bias); m==0 -> local restart (0). Saturating
                                     // for u8, plain for signed; identical either way in the guaranteed range,
@@ -3345,7 +3350,7 @@ macro_rules! define_sw_kernel {
                                     let open_del_v = $max($sub(bigm_v, oe_del_v), zero_v);
                                     let e_new = $max($sub(e_v, e_del_v), open_del_v);
                                     let e_st = if $masked { $bsl(band, e_new, e_v) } else { e_new };
-                                    $sts(&mut ehe[j as usize], 0, e_st);
+                                    $sts(&mut $ehe[j], 0, e_st);
                                     // What the C's band scans test at this column, `eh[j].h == 0 &&
                                     // eh[j].e == 0`, on the values just stored.
                                     let dead = $ceqz($orr(h_st, e_st));
@@ -3383,25 +3388,41 @@ macro_rules! define_sw_kernel {
                         // bwa's stock `-O 6,6 -E 1,1` opens both gap kinds at one cost, so one `M - oe` feeds both
                         // recurrences. Tested per row, not per cell: this branch never moves and the column
                         // loops below stay free of it.
+                        // Each range runs in `usize` up to `hi <= lim`, the views' length, so LLVM folds
+                        // away the per-column bounds check on `qc`/`ehh`/`ehe`/`sbc` (it was 2
+                        // instructions and a branch per column of the hottest loop in the program). The
+                        // views are `column!` arguments so the macro reads these bindings.
                         if oe_del == oe_ins {
-                            for j in gbeg..fast_lo {
-                                column!(j, true, true);
+                            let (lo, hi) = (gbeg.max(0) as usize, (fast_lo.max(0) as usize).min(lim));
+                            debug_assert!(fast_lo.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, true, true, qc, ehh, ehe, sbc);
                             }
-                            for j in fast_lo..fast_hi {
-                                column!(j, false, true);
+                            let (lo, hi) = (fast_lo.max(0) as usize, (fast_hi.max(0) as usize).min(lim));
+                            debug_assert!(fast_hi.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, false, true, qc, ehh, ehe, sbc);
                             }
-                            for j in fast_hi.max(fast_lo)..gend {
-                                column!(j, true, true);
+                            let (lo, hi) = (fast_hi.max(fast_lo).max(0) as usize, (gend.max(0) as usize).min(lim));
+                            debug_assert!(gend.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, true, true, qc, ehh, ehe, sbc);
                             }
                         } else {
-                            for j in gbeg..fast_lo {
-                                column!(j, true, false);
+                            let (lo, hi) = (gbeg.max(0) as usize, (fast_lo.max(0) as usize).min(lim));
+                            debug_assert!(fast_lo.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, true, false, qc, ehh, ehe, sbc);
                             }
-                            for j in fast_lo..fast_hi {
-                                column!(j, false, false);
+                            let (lo, hi) = (fast_lo.max(0) as usize, (fast_hi.max(0) as usize).min(lim));
+                            debug_assert!(fast_hi.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, false, false, qc, ehh, ehe, sbc);
                             }
-                            for j in fast_hi.max(fast_lo)..gend {
-                                column!(j, true, false);
+                            let (lo, hi) = (fast_hi.max(fast_lo).max(0) as usize, (gend.max(0) as usize).min(lim));
+                            debug_assert!(gend.max(0) as usize <= lim);
+                            for j in lo..hi {
+                                    column!(j, true, false, qc, ehh, ehe, sbc);
                             }
                         }
 
