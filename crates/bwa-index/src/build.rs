@@ -790,6 +790,7 @@ fn write_amb(path: &Path, l_pac: i64, n_seqs: i32, ambs: &[AmbRec]) -> Result<()
 /// If `bref` is empty (there is then no row 0 predecessor), or if the suffix array contains no
 /// row with `sa[i] == 0`, which would mean the constructor is broken.
 #[cfg(not(feature = "capsa"))]
+#[allow(clippy::type_complexity)]
 fn build_bwt_and_samples(
     bref: &[u8],
     n: usize,
@@ -839,6 +840,7 @@ fn build_bwt_and_samples(
 /// `k`-th call carries our `sa[k + 1]`. Our row 0 is the empty suffix (`sa[0] = 2L`), which the
 /// callback never sees, so it is filled before the walk starts.
 #[cfg(feature = "capsa")]
+#[allow(clippy::type_complexity)]
 fn build_bwt_and_samples(
     bref: &[u8],
     n: usize,
