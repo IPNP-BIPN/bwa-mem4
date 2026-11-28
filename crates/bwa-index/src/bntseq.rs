@@ -544,6 +544,8 @@ fn parse_ann(text: &[u8]) -> Result<BntSeq> {
     // `n_seqs` is read from an untrusted file, so `max(0)` keeps a negative count from panicking in
     // the capacity computation; the loop below would then simply not execute.
     let mut contigs = Vec::with_capacity(n_seqs.max(0) as usize);
+    // Contigs must tile `[0, l_pac)` in order: `pos2rid` and `contigs[0]` lookups assume it.
+    let mut next_offset = 0i64;
     for i in 0..n_seqs {
         let name_line = lines
             .next()
@@ -581,6 +583,12 @@ fn parse_ann(text: &[u8]) -> Result<BntSeq> {
         let offset: i64 = next_parse(&mut stat_fields, ".ann offset")?;
         let len: i32 = next_parse(&mut stat_fields, ".ann len")?;
         let n_ambs: i32 = next_parse(&mut stat_fields, ".ann n_ambs")?;
+        if offset != next_offset || len < 0 {
+            return Err(fmt_err(&format!(
+                ".ann: contig {i} at {offset} (len {len}) does not follow the previous one"
+            )));
+        }
+        next_offset += i64::from(len);
 
         contigs.push(Contig {
             gi,
@@ -592,6 +600,12 @@ fn parse_ann(text: &[u8]) -> Result<BntSeq> {
             // `.ann` does not record it. Set later by `apply_alt` from the optional `.alt` file.
             is_alt: false,
         });
+    }
+
+    if next_offset != l_pac || n_seqs < 1 {
+        return Err(fmt_err(&format!(
+            ".ann: {n_seqs} contigs cover {next_offset} bases, header says {l_pac}"
+        )));
     }
 
     Ok(BntSeq {
@@ -698,11 +712,20 @@ mod tests {
         assert_eq!(bns.contigs[0].offset, 0);
     }
 
+    /// An `.ann` whose contigs do not tile `[0, l_pac)` is refused, not trusted.
+    #[test]
+    fn ann_must_tile_the_reference() {
+        assert!(parse_ann(b"8 2 11\n0 a (null)\n0 4 0\n0 b (null)\n4 4 0\n").is_ok());
+        assert!(parse_ann(b"10 0 11\n").is_err());
+        assert!(parse_ann(b"8 2 11\n0 a (null)\n0 4 0\n0 b (null)\n5 3 0\n").is_err());
+        assert!(parse_ann(b"9 2 11\n0 a (null)\n0 4 0\n0 b (null)\n4 4 0\n").is_err());
+    }
+
     #[test]
     fn comment_is_what_the_c_reads_back_from_ann() {
         let long = "x".repeat(9000);
         let text = format!(
-            "40 5 11\n0 a (null)\n0 8 0\n0 b dna:chr\tb c\r\n8 8 0\n0 c\r\n16 8 0\n0 d {long}\n24 8 0\n0 e \n32 8 0\n"
+            "48 5 11\n0 a (null)\n0 8 0\n0 b dna:chr\tb c\r\n8 8 0\n0 c\r\n16 8 0\n0 d {long}\n24 8 0\n0 e \n32 8 0\n"
         );
         let mut text = text.into_bytes();
         text.extend_from_slice(b"0 f caf\xe9\n40 8 0\n");
