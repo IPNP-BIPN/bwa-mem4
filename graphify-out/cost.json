@@ -1,0 +1,13 @@
+{
+  "runs": [
+    {
+      "date": "2026-11-26T21:58:14.147982+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 160,
+      "note": "semantic pass by 3 host subagents, ~660k subagent tokens total (not split in/out)"
+    }
+  ],
+  "total_input_tokens": 0,
+  "total_output_tokens": 0
+}

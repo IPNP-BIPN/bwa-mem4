@@ -425,6 +425,16 @@ fn local_sw_score_matches_independent_implementation() {
                          round {round}, qlen={qlen} tlen={tlen}"
                     );
                     checked_spans += 1;
+                } else {
+                    // `mem_matesw` drops the rescue on `qb < 0`, so the sentinel must mean exactly
+                    // "below minsc": a failed reverse pass at a clearing score would drop real
+                    // rescues here and in every kernel compared against this scalar reference.
+                    assert!(
+                        r.score < minsc,
+                        "qb = -1 at score {} >= minsc {minsc}: start recovery failed, A={a} B={b} \
+                         O={o_del},{o_ins} E={e_del},{e_ins} round {round}, qlen={qlen} tlen={tlen}",
+                        r.score
+                    );
                 }
             }
             if symmetric && qlen.is_multiple_of(LANES) {
