@@ -772,7 +772,7 @@ fn write_amb(path: &Path, l_pac: i64, n_seqs: i32, ambs: &[AmbRec]) -> Result<()
 ///   empty suffix has no predecessor. Mirrors `FMI_search.cpp:170-199`. Length `n`; the tail past
 ///   the last full checkpoint block keeps [`DUMMY_CHAR`], the C's aligned-buffer padding.
 /// * `sentinel_index`: the unique ROW (not position) with `sa[i] == 0`.
-/// * `sa_samples[k] = sa[8k]`, `sa_count` of them (see [`SA_SAMPLE_STRIDE`]).
+/// * `(sa_ls_word, sa_ms_byte)[k]`: `sa[8k]` split 40-bit, `sa_count` of them (see [`SA_SAMPLE_STRIDE`]).
 ///
 /// # Parameters
 ///
@@ -783,18 +783,19 @@ fn write_amb(path: &Path, l_pac: i64, n_seqs: i32, ambs: &[AmbRec]) -> Result<()
 ///
 /// # Returns
 ///
-/// `(bwt, sentinel_index, sa_samples)`. Errors only on the `capsa` path, which does file I/O.
+/// `(bwt, sentinel_index, sa_ls_word, sa_ms_byte)`. Errors only on the `capsa` path, which does file I/O.
 ///
 /// # Panics
 ///
 /// If `bref` is empty (there is then no row 0 predecessor), or if the suffix array contains no
 /// row with `sa[i] == 0`, which would mean the constructor is broken.
 #[cfg(not(feature = "capsa"))]
+#[allow(clippy::type_complexity)]
 fn build_bwt_and_samples(
     bref: &[u8],
     n: usize,
     sa_count: usize,
-) -> Result<(Vec<u8>, i64, Vec<i64>)> {
+) -> Result<(Vec<u8>, i64, Vec<u32>, Vec<u8>)> {
     // Length N = 2L+1, sa[0] = 2L. Default: in-tree memory-efficient SA-IS. With `--features
     // libsais` the same array is produced by libsais-rs instead (faster build; a suffix array is
     // UNIQUE so the result is byte-identical, gated by scripts/index_diff.sh).
@@ -822,11 +823,13 @@ fn build_bwt_and_samples(
         .par_iter()
         .position_any(|&sa_value| sa_value == 0)
         .expect("suffix array must contain the sentinel (0)") as i64;
-    let sa_samples: Vec<i64> = (0..sa_count)
+    // Split straight into the 5-byte on-disk form while `sa` is alive: an i64 copy here was 3 bytes
+    // a sample (2.3 GB on GRCh38) more at the build's peak.
+    let (sa_ls_word, sa_ms_byte): (Vec<u32>, Vec<u8>) = (0..sa_count)
         .into_par_iter()
-        .map(|k| sa[k * SA_SAMPLE_STRIDE])
-        .collect();
-    Ok((bwt, sentinel_index, sa_samples))
+        .map(|k| split_sa_sample(sa[k * SA_SAMPLE_STRIDE]))
+        .unzip();
+    Ok((bwt, sentinel_index, sa_ls_word, sa_ms_byte))
 }
 
 /// Streaming (`--features capsa`) counterpart of [`build_bwt_and_samples`]: the same three outputs,
@@ -837,21 +840,23 @@ fn build_bwt_and_samples(
 /// `k`-th call carries our `sa[k + 1]`. Our row 0 is the empty suffix (`sa[0] = 2L`), which the
 /// callback never sees, so it is filled before the walk starts.
 #[cfg(feature = "capsa")]
+#[allow(clippy::type_complexity)]
 fn build_bwt_and_samples(
     bref: &[u8],
     n: usize,
     sa_count: usize,
-) -> Result<(Vec<u8>, i64, Vec<i64>)> {
+) -> Result<(Vec<u8>, i64, Vec<u32>, Vec<u8>)> {
     let two_l = bref.len();
     assert!(two_l > 0, "reference must be non-empty");
     debug_assert_eq!(n, two_l + 1);
 
     let mut bwt = vec![DUMMY_CHAR; n];
-    let mut sa_samples = vec![0i64; sa_count];
+    let mut sa_ls_word = vec![0u32; sa_count];
+    let mut sa_ms_byte = vec![0u8; sa_count];
     // Row 0 is the empty suffix: `sa[0] = 2L != 0`, so it is NOT the sentinel row, and its
     // preceding character is the last base of the 2L reference.
     bwt[0] = bref[two_l - 1];
-    sa_samples[0] = two_l as i64;
+    (sa_ls_word[0], sa_ms_byte[0]) = split_sa_sample(two_l as i64);
 
     // `-1` means "not seen yet"; the assert below turns a constructor that never emits row 0 into a
     // build failure rather than a silently wrong index.
@@ -870,7 +875,10 @@ fn build_bwt_and_samples(
             bref[(sa_value - 1) as usize]
         };
         if row.is_multiple_of(SA_SAMPLE_STRIDE) {
-            sa_samples[row / SA_SAMPLE_STRIDE] = sa_value;
+            (
+                sa_ls_word[row / SA_SAMPLE_STRIDE],
+                sa_ms_byte[row / SA_SAMPLE_STRIDE],
+            ) = split_sa_sample(sa_value);
         }
         row += 1;
         Ok(())
@@ -881,7 +889,14 @@ fn build_bwt_and_samples(
         sentinel_index >= 0,
         "suffix array must contain the sentinel (0)"
     );
-    Ok((bwt, sentinel_index, sa_samples))
+    Ok((bwt, sentinel_index, sa_ls_word, sa_ms_byte))
+}
+
+/// A sampled SA value (a 2L-space POSITION) as the format's low u32 and high byte (`int8_t` in the
+/// C; bit 39 is never set at genome scale).
+fn split_sa_sample(v: i64) -> (u32, u8) {
+    let v = v as u64;
+    ((v & 0xFFFF_FFFF) as u32, ((v >> 32) & 0xFF) as u8)
 }
 
 /// `.bwt.2bit.64`: `[ref_seq_len:i64 | count[5]:i64 | CP_OCC[] | sa_ms_byte[]:i8 | sa_ls_word[]:u32
@@ -1021,13 +1036,13 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     // them: the BWT (`bwt[i] = 4 (sentinel) if sa[i]==0 else bref[sa[i]-1]`; the textbook transform,
     // where row `i` ends with the character PRECEDING suffix `sa[i]` and `sa[i]==0` has no predecessor,
     // mirroring `FMI_search.cpp:170-199`); `sentinel_index`, the unique ROW whose suffix starts at
-    // position 0; and `sa_samples[k] = sa[8k]`. The default array backend materializes the full SA and
+    // position 0; and the samples `sa[8k]`. The default array backend materializes the full SA and
     // fills these in parallel; the `capsa` streaming backend fills them row-by-row from CaPS-SA's
     // external-memory emit callback, so the 8-byte-per-row SA is never resident (only `bwt`, at 1
     // byte/row). Both backends produce byte-identical output (a suffix array is UNIQUE). `bwt` is
     // indexed by ROW (length N); out-of-range tail rows keep `DUMMY_CHAR` (6), the C's aligned-buffer
     // padding, which the checkpoint loop below substitutes for rows past the end.
-    let (bwt, sentinel_index, sa_samples) = build_bwt_and_samples(bref, n, sa_count)?;
+    let (bwt, sentinel_index, sa_ls_word, sa_ms_byte) = build_bwt_and_samples(bref, n, sa_count)?;
 
     // CP_OCC checkpoints, one per 64-base block. `one_hot[block_index]` is independent per block; `cp_count[block_index]`
     // is the running base-count prefix over prior blocks. Compute both per block in parallel, then a
@@ -1103,16 +1118,8 @@ fn write_fm_index(path: &Path, bref: &[u8]) -> Result<()> {
     // position is never set, but it does mean a reader MUST sign-extend consistently (we mirror it
     // with `i8` in `FmIndex`, not `u8`).
     // ---- Step E: the sampled suffix array ------------------------------------------------------
-    // `sa_samples[k]` is already `sa[8k]`, produced by `build_bwt_and_samples` above (which is what
-    // lets the streaming backend avoid ever holding `sa`). All that remains is the 40-bit split.
-    let (sa_ls_word, sa_ms_byte): (Vec<u32>, Vec<u8>) = sa_samples
-        .par_iter()
-        .map(|&sample| {
-            // `v` is a 2L-space reference POSITION (the suffix start for row `8k`), not a row.
-            let v = sample as u64;
-            ((v & 0xFFFF_FFFF) as u32, ((v >> 32) & 0xFF) as u8)
-        })
-        .unzip();
+    // `sa[8k]`, already split 40-bit by `build_bwt_and_samples` above (which is what lets the
+    // streaming backend avoid ever holding `sa`).
     debug_assert_eq!(sa_ms_byte.len(), sa_count);
 
     // Serialize. Field ORDER here is the format: header, counts, all checkpoints, then the two SA
